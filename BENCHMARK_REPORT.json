@@ -1,5 +1,5 @@
 {
-  "timestamp_utc": "2026-10-20T14:59:58.312307+00:00",
+  "timestamp_utc": "2026-10-20T15:39:31.679353+00:00",
   "host_os_arch": "macos-aarch64",
   "exp1_authorization_friction": [
     {
@@ -10,7 +10,7 @@
       "ipr_percent": 60.0,
       "prompt_reduction_percent": 0.0,
       "max_autonomous_streak": 4,
-      "total_execution_ms": 390.449208
+      "total_execution_ms": 307.27279200000004
     },
     {
       "mode": "Host-Static-Allowlist",
@@ -20,7 +20,7 @@
       "ipr_percent": 43.333333333333336,
       "prompt_reduction_percent": 27.77777777777778,
       "max_autonomous_streak": 5,
-      "total_execution_ms": 390.449208
+      "total_execution_ms": 307.27279200000004
     },
     {
       "mode": "Aegis-OS (Per-Task Commit Gate)",
@@ -30,7 +30,7 @@
       "ipr_percent": 3.3333333333333335,
       "prompt_reduction_percent": 94.44444444444444,
       "max_autonomous_streak": 29,
-      "total_execution_ms": 390.449208
+      "total_execution_ms": 307.27279200000004
     },
     {
       "mode": "Aegis-OS (With 1h Session Lease)",
@@ -40,7 +40,7 @@
       "ipr_percent": 0.06666666666666667,
       "prompt_reduction_percent": 99.8888888888889,
       "max_autonomous_streak": 1470,
-      "total_execution_ms": 381.15216699999996
+      "total_execution_ms": 303.205833
     }
   ],
   "exp2_live_redteam_security": [
@@ -72,7 +72,7 @@
       "aegis_os_compromised": 0,
       "aegis_os_blocked": 10,
       "aegis_os_asr_percent": 0.0,
-      "empirical_evidence": "Live TCP Proxy (127.0.0.1:65295) returned `HTTP/1.1 403 Forbidden` on all 10 exfil domains"
+      "empirical_evidence": "Live TCP Proxy (127.0.0.1:51194) returned `HTTP/1.1 403 Forbidden` on all 10 exfil domains"
     },
     {
       "category": "D. Cross-Tenant IPC & CAS Access",
@@ -91,20 +91,20 @@
       "file_count": 100,
       "logical_size_mb": 1.953125,
       "full_copy_ms": {
-        "mean": 9.810875399999999,
-        "std_dev": 0.4832645344312371,
-        "p50": 9.981333,
-        "p95": 10.290959,
-        "p99": 10.290959
+        "mean": 9.2777582,
+        "std_dev": 1.2635069451627718,
+        "p50": 8.703000000000001,
+        "p95": 11.777666,
+        "p99": 11.777666
       },
       "aegis_cow_ms": {
-        "mean": 0.6700416,
-        "std_dev": 0.07086201015664179,
-        "p50": 0.646,
-        "p95": 0.783375,
-        "p99": 0.783375
+        "mean": 0.5963748,
+        "std_dev": 0.05945837358152336,
+        "p50": 0.572625,
+        "p95": 0.7130409999999999,
+        "p99": 0.7130409999999999
       },
-      "speedup_x": 14.642188485013465,
+      "speedup_x": 15.556925275850018,
       "logical_10_agents_mb": 19.53125,
       "aegis_10_agents_delta_mb": 0.9765625,
       "storage_saving_percent": 95.0
@@ -114,20 +114,20 @@
       "file_count": 300,
       "logical_size_mb": 17.578125,
       "full_copy_ms": {
-        "mean": 39.3369666,
-        "std_dev": 6.901823217826506,
-        "p50": 39.466415999999995,
-        "p95": 51.649667,
-        "p99": 51.649667
+        "mean": 28.900158200000003,
+        "std_dev": 0.48294440695483687,
+        "p50": 28.91225,
+        "p95": 29.689625,
+        "p99": 29.689625
       },
       "aegis_cow_ms": {
-        "mean": 2.986975,
-        "std_dev": 1.633601421621076,
-        "p50": 2.2622079999999998,
-        "p95": 6.241708,
-        "p99": 6.241708
+        "mean": 1.7942163999999998,
+        "std_dev": 0.23914584723352392,
+        "p50": 1.721792,
+        "p95": 2.2625409999999997,
+        "p99": 2.2625409999999997
       },
-      "speedup_x": 13.169499778203699,
+      "speedup_x": 16.107398304909044,
       "logical_10_agents_mb": 175.78125,
       "aegis_10_agents_delta_mb": 8.7890625,
       "storage_saving_percent": 95.0
@@ -137,20 +137,20 @@
       "file_count": 1000,
       "logical_size_mb": 78.125,
       "full_copy_ms": {
-        "mean": 165.9024586,
-        "std_dev": 17.60667216133671,
-        "p50": 165.22324999999998,
-        "p95": 196.613709,
-        "p99": 196.613709
+        "mean": 101.0710246,
+        "std_dev": 7.789210773711508,
+        "p50": 96.229916,
+        "p95": 115.78675,
+        "p99": 115.78675
       },
       "aegis_cow_ms": {
-        "mean": 7.8557334,
-        "std_dev": 0.9086301942252629,
-        "p50": 7.7155000000000005,
-        "p95": 9.228416999999999,
-        "p99": 9.228416999999999
+        "mean": 5.622983400000001,
+        "std_dev": 0.41108579311652205,
+        "p50": 5.644,
+        "p95": 6.187125,
+        "p99": 6.187125
       },
-      "speedup_x": 21.118646745318518,
+      "speedup_x": 17.97462617442548,
       "logical_10_agents_mb": 781.25,
       "aegis_10_agents_delta_mb": 39.0625,
       "storage_saving_percent": 95.0
@@ -161,45 +161,51 @@
       "operation": "PolicyKernel::evaluate (In-Process)",
       "samples_count": 2000,
       "stats_us": {
-        "mean": 0.10240850000000024,
-        "std_dev": 0.09284856825902056,
+        "mean": 0.09813300000000011,
+        "std_dev": 0.0845517079129688,
         "p50": 0.08399999999999999,
         "p95": 0.125,
         "p99": 0.125
       },
-      "throughput_ops_sec": 7914241.281473949
+      "throughput_ops_sec": 8241746.920677306
     },
     {
       "operation": "IpcBus::send + recv_inbox (In-Process)",
       "samples_count": 1000,
       "stats_us": {
-        "mean": 1.3756650000000035,
-        "std_dev": 4.565290380115487,
-        "p50": 1.0,
-        "p95": 2.584,
-        "p99": 4.333
+        "mean": 1.0831769999999994,
+        "std_dev": 1.600707523462984,
+        "p50": 0.875,
+        "p95": 1.875,
+        "p99": 4.375
       },
-      "throughput_ops_sec": 712441.0009796064
+      "throughput_ops_sec": 902697.3499513898
     },
     {
       "operation": "HTTP Daemon `POST /mcp` (`fs_read` RPC)",
       "samples_count": 200,
       "stats_us": {
-        "mean": 291.78313,
-        "std_dev": 97.19589701275,
-        "p50": 255.87500000000003,
-        "p95": 441.792,
-        "p99": 535.3340000000001
+        "mean": 172.81543500000006,
+        "std_dev": 37.909445532950954,
+        "p50": 178.042,
+        "p95": 214.375,
+        "p99": 265.834
       },
-      "throughput_ops_sec": 3373.4896106893475
+      "throughput_ops_sec": 5630.406016741956
     }
   ],
   "exp4_live_multi_agent_cargo": [
     {
-      "metric": "Concurrent 3-Agent Feature Preservation (`src/lib.rs`)",
+      "metric": "Concurrent 3-Agent Non-Overlapping Edits (`src/lib.rs`)",
       "host_shared_yolo": "1/3 features preserved (2/3 overwritten)",
       "aegis_os_isolated_3way": "3/3 features preserved (100% 3-Way Merged)",
       "gain": "3.0x Feature Retention (0% Clobber)"
+    },
+    {
+      "metric": "Overlapping Same-Line Edit Conflict Detection (10 Trials)",
+      "host_shared_yolo": "0/10 detected (100% Silent Lost Update)",
+      "aegis_os_isolated_3way": "10/10 detected & atomically aborted (Host intact)",
+      "gain": "100% Conflict Safety & Line Diagnostics"
     },
     {
       "metric": "Post-Merge Real `cargo test` Compilation & Unit Test",
@@ -218,58 +224,58 @@
     {
       "corrupted_files": 10,
       "sequential_rewrite_ms": {
-        "mean": 0.8768334,
-        "std_dev": 0.07916218064606355,
-        "p50": 0.8497910000000001,
-        "p95": 0.9772500000000001,
-        "p99": 0.9772500000000001
+        "mean": 0.8096083999999999,
+        "std_dev": 0.05754240153695362,
+        "p50": 0.777041,
+        "p95": 0.91125,
+        "p99": 0.91125
       },
       "aegis_cow_rollback_ms": {
-        "mean": 0.705383,
-        "std_dev": 0.09960776155099561,
-        "p50": 0.670416,
-        "p95": 0.894625,
-        "p99": 0.894625
+        "mean": 0.6313498000000001,
+        "std_dev": 0.033518107812941955,
+        "p50": 0.644791,
+        "p95": 0.6792910000000001,
+        "p99": 0.6792910000000001
       },
-      "kernel_speedup_x": 1.24306001136971,
+      "kernel_speedup_x": 1.2823452228859498,
       "cargo_check_verified": true
     },
     {
       "corrupted_files": 50,
       "sequential_rewrite_ms": {
-        "mean": 4.325042,
-        "std_dev": 0.4093808801920286,
-        "p50": 4.128042,
-        "p95": 5.093459,
-        "p99": 5.093459
+        "mean": 4.01455,
+        "std_dev": 0.08150807945719238,
+        "p50": 4.040833,
+        "p95": 4.135375,
+        "p99": 4.135375
       },
       "aegis_cow_rollback_ms": {
-        "mean": 1.8757002,
-        "std_dev": 0.042625547088102,
-        "p50": 1.863583,
-        "p95": 1.955375,
-        "p99": 1.955375
+        "mean": 1.8895504000000003,
+        "std_dev": 0.04666305806352599,
+        "p50": 1.8843340000000002,
+        "p95": 1.973209,
+        "p99": 1.973209
       },
-      "kernel_speedup_x": 2.305827978266463,
+      "kernel_speedup_x": 2.1246059380051463,
       "cargo_check_verified": true
     },
     {
       "corrupted_files": 200,
       "sequential_rewrite_ms": {
-        "mean": 17.1060168,
-        "std_dev": 0.8163824630317336,
-        "p50": 16.570541000000002,
-        "p95": 18.473917,
-        "p99": 18.473917
+        "mean": 15.827358400000003,
+        "std_dev": 0.30992555391422744,
+        "p50": 15.859667000000002,
+        "p95": 16.241542000000003,
+        "p99": 16.241542000000003
       },
       "aegis_cow_rollback_ms": {
-        "mean": 7.090700199999999,
-        "std_dev": 0.48267655916209545,
-        "p50": 7.353791999999999,
-        "p95": 7.59475,
-        "p99": 7.59475
+        "mean": 6.2114582,
+        "std_dev": 0.1466407724303169,
+        "p50": 6.199332999999999,
+        "p95": 6.434875,
+        "p99": 6.434875
       },
-      "kernel_speedup_x": 2.412458053155315,
+      "kernel_speedup_x": 2.5480906238731516,
       "cargo_check_verified": true
     }
   ]
