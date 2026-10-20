@@ -274,7 +274,7 @@ impl PolicyEngine for AegisPolicyKernel {
         match ctx.action.as_str() {
             "fs_read" | "fs_write" | "fs_edit" | "fs_delete" | "fs_list" | "fs_glob"
             | "fs_grep" | "workspace_status" | "workspace_snapshot" | "workspace_diff"
-            | "workspace_rollback" => Ok(PolicyDecision::Allow {
+            | "workspace_rollback" | "workspace_sync" => Ok(PolicyDecision::Allow {
                 matched_rule: "cedar:default:cow_workspace_auto_allow".to_string(),
             }),
 

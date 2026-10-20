@@ -432,6 +432,26 @@ impl CoWWorkspace {
         hex::encode(hasher.finalize())
     }
 
+    /// Returns true if `sub` appears in order as a line-by-line subsequence of `sup`.
+    fn is_subsequence(sub: &[&str], sup: &[&str]) -> bool {
+        if sub.is_empty() {
+            return true;
+        }
+        if sub.len() > sup.len() {
+            return false;
+        }
+        let mut si = 0usize;
+        for &line in sup {
+            if line == sub[si] {
+                si += 1;
+                if si == sub.len() {
+                    return true;
+                }
+            }
+        }
+        false
+    }
+
     /// Computes edit hunks transforming `base` lines into `target` lines via Longest Common Subsequence (LCS).
     /// Each hunk represents replacing `base[base_start..base_end]` with `replacement`.
     fn compute_lcs_diff_hunks<'a>(
@@ -548,6 +568,28 @@ impl CoWWorkspace {
                         oi += 1;
                     } else if th.0 == oh.0 && th.1 == oh.1 && th.2 == oh.2 {
                         // Identical change in both `theirs` and `ours` (False conflict)
+                        merged.extend_from_slice(&base_lines[b_pos..th.0]);
+                        merged.extend_from_slice(&th.2);
+                        b_pos = th.1;
+                        ti += 1;
+                        oi += 1;
+                    } else if th.0 == oh.0
+                        && th.1 == oh.1
+                        && !th.2.is_empty()
+                        && Self::is_subsequence(&th.2, &oh.2)
+                    {
+                        // Superset merge: `ours` already incorporates all lines of `theirs` in order plus additions
+                        merged.extend_from_slice(&base_lines[b_pos..oh.0]);
+                        merged.extend_from_slice(&oh.2);
+                        b_pos = oh.1;
+                        ti += 1;
+                        oi += 1;
+                    } else if th.0 == oh.0
+                        && th.1 == oh.1
+                        && !oh.2.is_empty()
+                        && Self::is_subsequence(&oh.2, &th.2)
+                    {
+                        // Superset merge: `theirs` already incorporates all lines of `ours` in order plus additions
                         merged.extend_from_slice(&base_lines[b_pos..th.0]);
                         merged.extend_from_slice(&th.2);
                         b_pos = th.1;

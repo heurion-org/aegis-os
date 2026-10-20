@@ -2,27 +2,202 @@
 
 use aos_core::{AgentIdentity, IpcKind, MessageDeliveryStatus};
 use aos_mcp_gateway::AegisRuntimeKernel;
+use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use std::path::{Path, PathBuf};
 
-/// Handle `PreInvocation` hook: non-destructively peeks the agent's IPC inbox,
-/// injects newly arrived messages (`MessageDeliveryStatus::Unread`) via `injectSteps.systemMessage`,
-/// marks them delivered (`MessageDeliveryStatus::Delivered`), and emits periodic `ephemeralMessage`
-/// reminders for un-acknowledged messages.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+struct CollaborationRadarState {
+    peers: Vec<String>,
+    peer_claims: Vec<String>,
+    active_tasks: Vec<String>,
+}
+
+async fn compute_radar_delta(
+    runtime_dir: &Path,
+    kernel: &AegisRuntimeKernel,
+    identity: &AgentIdentity,
+) -> Option<String> {
+    let mut peers: Vec<String> = kernel
+        .ipc
+        .list_all_peers()
+        .await
+        .unwrap_or_default()
+        .into_iter()
+        .filter(|p| {
+            p.online && !(p.org_id == identity.org_id && p.agent_id == identity.agent_id)
+        })
+        .map(|p| {
+            let skill_ids: Vec<String> = p.skills.iter().map(|s| s.id.clone()).collect();
+            let skills_tag = if skill_ids.is_empty() {
+                String::new()
+            } else {
+                format!(" skills=[{}]", skill_ids.join(","))
+            };
+            let summary_tag = p
+                .summary
+                .as_deref()
+                .filter(|s| !s.is_empty())
+                .map(|s| format!(" — {}", s))
+                .unwrap_or_default();
+            format!(
+                "{}/{} (role={}{}{})",
+                p.org_id, p.agent_id, p.role, skills_tag, summary_tag
+            )
+        })
+        .collect();
+    peers.sort();
+
+    let (claims_table, _) = kernel
+        .load_claims(&identity.org_id)
+        .await
+        .unwrap_or_default();
+    let mut peer_claims: Vec<String> = claims_table
+        .into_iter()
+        .filter(|(_, c)| c.owner != identity.agent_id)
+        .map(|(glob, c)| {
+            let note_tag = if c.note.is_empty() {
+                String::new()
+            } else {
+                format!(" ({})", c.note)
+            };
+            format!("`{}` claimed by `{}`{}", glob, c.owner, note_tag)
+        })
+        .collect();
+    peer_claims.sort();
+
+    let mut active_tasks: Vec<String> = kernel
+        .ipc
+        .list_tasks(Some(&identity.org_id), None)
+        .await
+        .unwrap_or_default()
+        .into_iter()
+        .filter(|t| !t.state.is_terminal())
+        .map(|t| {
+            format!(
+                "`{}` [{:?}] `{}` -> `{}`: \"{}\"",
+                t.id, t.state, t.from_agent, t.to_agent, t.subject
+            )
+        })
+        .collect();
+    active_tasks.sort();
+
+    let current = CollaborationRadarState {
+        peers,
+        peer_claims,
+        active_tasks,
+    };
+
+    let radar_dir = runtime_dir.join("sessions").join("radar");
+    let _ = std::fs::create_dir_all(&radar_dir);
+    let radar_path = radar_dir.join(format!("{}__{}.json", identity.org_id, identity.agent_id));
+    let prev: Option<CollaborationRadarState> = std::fs::read_to_string(&radar_path)
+        .ok()
+        .and_then(|s| serde_json::from_str(&s).ok());
+
+    let is_empty = current.peers.is_empty()
+        && current.peer_claims.is_empty()
+        && current.active_tasks.is_empty();
+
+    if prev.as_ref() == Some(&current) || (prev.is_none() && is_empty) {
+        return None;
+    }
+
+    if let Ok(serialized) = serde_json::to_string_pretty(&current) {
+        let _ = std::fs::write(&radar_path, serialized);
+    }
+
+    let mut lines = vec![format!(
+        "[Aegis-OS Live Collaboration Radar] Multi-agent state updated for `{}/{}`:",
+        identity.org_id, identity.agent_id
+    )];
+    if !current.peers.is_empty() {
+        lines.push(format!(
+            "- Live Peers ({}): {}",
+            current.peers.len(),
+            current.peers.join("; ")
+        ));
+    }
+    if !current.peer_claims.is_empty() {
+        lines.push(format!(
+            "- Peer File Claims (coordinate before editing): {}",
+            current.peer_claims.join("; ")
+        ));
+    }
+    if !current.active_tasks.is_empty() {
+        lines.push(format!(
+            "- In-Flight A2A Tasks ({}): {}",
+            current.active_tasks.len(),
+            current.active_tasks.join("; ")
+        ));
+    }
+    if is_empty {
+        lines.push("- All peer claims and in-flight A2A tasks have cleared.".to_string());
+    }
+
+    Some(lines.join("\n"))
+}
+
+/// Handle `PreInvocation` hook:
+/// 1. Continuously auto-rebases the agent's CoW shadow workspace from the host (`refresh_agent_workspace`)
+///    and surfaces fast-forwarded/merged files or non-destructive conflict alerts.
+/// 2. Non-destructively peeks the agent's IPC inbox, injects newly arrived messages (`MessageDeliveryStatus::Unread`),
+///    and marks them delivered (`MessageDeliveryStatus::Delivered`).
+/// 3. Computes the Live Collaboration Radar delta (online peers, active file claims, in-flight A2A tasks)
+///    and injects updates automatically when state changes.
 pub async fn handle_pre_invocation(
     runtime_dir: &Path,
     kernel: &AegisRuntimeKernel,
     identity: &AgentIdentity,
 ) -> Value {
     let _ = kernel.ipc.touch_peer(identity).await;
+
+    let mut system_sections: Vec<String> = Vec::new();
+
+    if let Ok(refresh) = kernel.refresh_agent_workspace(identity).await {
+        if !refresh.fast_forwarded.is_empty()
+            || !refresh.merged.is_empty()
+            || !refresh.added_from_host.is_empty()
+        {
+            let mut synced = Vec::new();
+            synced.extend(refresh.fast_forwarded.iter().map(|p| format!("{} (ff)", p)));
+            synced.extend(
+                refresh
+                    .merged
+                    .iter()
+                    .map(|p| format!("{} (3-way merged)", p)),
+            );
+            synced.extend(
+                refresh
+                    .added_from_host
+                    .iter()
+                    .map(|p| format!("{} (new)", p)),
+            );
+            system_sections.push(format!(
+                "[Aegis-OS Auto-Rebase] Synced {} peer-updated file(s) from host into your CoW shadow workspace: {}",
+                synced.len(),
+                synced.join(", ")
+            ));
+        }
+        if !refresh.conflicts.is_empty() {
+            let details = if refresh.conflict_details.is_empty() {
+                refresh.conflicts.join("; ")
+            } else {
+                refresh.conflict_details.join(" | ")
+            };
+            system_sections.push(format!(
+                "[Aegis-OS Merge Conflict Alert] {} file(s) have overlapping edits between host and your shadow workspace: {}. Call `mcp_aegis-os_workspace_sync` or `mcp_aegis-os_fs_read` to inspect and reconcile before committing.",
+                refresh.conflicts.len(),
+                details
+            ));
+        }
+    }
+
     let unread = kernel
         .ipc
         .peek_inbox(&identity.org_id, &identity.agent_id, 20)
         .await
         .unwrap_or_default();
-    if unread.is_empty() {
-        return json!({});
-    }
 
     let mut newly_arrived = Vec::new();
     let mut pending_ack = Vec::new();
@@ -72,9 +247,17 @@ pub async fn handle_pre_invocation(
             .mark_delivered(&identity.org_id, &identity.agent_id, &delivered_ids)
             .await;
 
+        system_sections.push(lines.join("\n"));
+    }
+
+    if let Some(radar_msg) = compute_radar_delta(runtime_dir, kernel, identity).await {
+        system_sections.push(radar_msg);
+    }
+
+    if !system_sections.is_empty() {
         return json!({
             "injectSteps": [{
-                "systemMessage": lines.join("\n")
+                "systemMessage": system_sections.join("\n\n")
             }]
         });
     }
@@ -306,5 +489,59 @@ mod tests {
             .unwrap();
         let s4 = handle_stop_gate(&rt, &kernel, &receiver, &json!({}), 2).await;
         assert_eq!(s4, json!({}));
+    }
+
+    #[tokio::test]
+    async fn test_pre_invocation_auto_rebase_and_live_collaboration_radar() {
+        let temp = tempfile::tempdir().unwrap();
+        let rt = temp.path().join("rt");
+        let repo = temp.path().join("repo");
+        std::fs::create_dir_all(&repo).unwrap();
+        std::fs::write(repo.join("shared.rs"), "pub fn v1() {}\n").unwrap();
+
+        let kernel = AegisRuntimeKernel::new(&rt).await.unwrap();
+        let peer_a = AgentIdentity::new("org1", "agy-aaaaaa", "Lead");
+        let peer_b = AgentIdentity::new("org1", "agy-bbbbbb", "Peer");
+
+        for id in [&peer_a, &peer_b] {
+            kernel
+                .ensure_agent_environment(
+                    id.clone(),
+                    &repo,
+                    IsolationTier::NativeOsSandbox,
+                    vec!["*".to_string()],
+                )
+                .await
+                .unwrap();
+        }
+
+        // Initial PreInvocation for peer_b records initial live peer state
+        let init_out = handle_pre_invocation(&rt, &kernel, &peer_b).await;
+        let init_msg = init_out["injectSteps"][0]["systemMessage"].as_str().unwrap();
+        assert!(init_msg.contains("[Aegis-OS Live Collaboration Radar]"));
+        assert!(init_msg.contains("org1/agy-aaaaaa"));
+
+        // Peer A claims a file and commits an update to shared.rs on the host
+        kernel
+            .call_tool(
+                &peer_a,
+                "coord_claim",
+                json!({ "paths": ["paper/main.tex"], "note": "Updating evaluation section" }),
+            )
+            .await
+            .unwrap();
+        std::fs::write(repo.join("shared.rs"), "pub fn v1() {}\npub fn v2() {}\n").unwrap();
+
+        // Next PreInvocation for peer_b automatically rebases shared.rs AND surfaces the new file claim!
+        let next_out = handle_pre_invocation(&rt, &kernel, &peer_b).await;
+        let next_msg = next_out["injectSteps"][0]["systemMessage"].as_str().unwrap();
+        assert!(next_msg.contains("[Aegis-OS Auto-Rebase]"));
+        assert!(next_msg.contains("shared.rs (ff)"));
+        assert!(next_msg.contains("[Aegis-OS Live Collaboration Radar]"));
+        assert!(next_msg.contains("`paper/main.tex` claimed by `agy-aaaaaa`"));
+
+        // Subsequent PreInvocation with no further changes is completely silent
+        let quiet_out = handle_pre_invocation(&rt, &kernel, &peer_b).await;
+        assert!(quiet_out.get("injectSteps").is_none());
     }
 }

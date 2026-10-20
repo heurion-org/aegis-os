@@ -383,6 +383,18 @@ impl AegisRuntimeKernel {
         Ok(env)
     }
 
+    /// Triggers an automatic CoW rebase (`refresh_from_host`) for an already-initialized Agent environment.
+    pub async fn refresh_agent_workspace(
+        &self,
+        identity: &AgentIdentity,
+    ) -> anyhow::Result<aos_core::RefreshReport> {
+        let key = Self::agent_key(&identity.org_id, &identity.agent_id);
+        let Some(env) = self.agents.read().await.get(&key).cloned() else {
+            return Ok(aos_core::RefreshReport::default());
+        };
+        env.workspace.refresh_from_host().await
+    }
+
     async fn authorize_and_audit(
         &self,
         identity: &AgentIdentity,
@@ -436,6 +448,10 @@ impl AegisRuntimeKernel {
             .get(&key)
             .cloned()
             .with_context(|| format!("Agent environment '{}' is not initialized", key))?;
+
+        if tool_name == "workspace_commit" {
+            let _ = env.workspace.refresh_from_host().await;
+        }
 
         let mut target_org = args
             .get("target_org_id")
@@ -689,6 +705,7 @@ impl AegisRuntimeKernel {
             }
 
             "workspace_status" => {
+                let refresh = env.workspace.refresh_from_host().await?;
                 let diffs = env.workspace.diff(None).await?;
                 let snapshots = env.workspace.list_snapshots().await?;
                 let unread_ipc = self
@@ -696,15 +713,31 @@ impl AegisRuntimeKernel {
                     .recv_inbox(&identity.org_id, &identity.agent_id, true, 50)
                     .await?;
                 let escalations = self.policy.list_escalations(&identity.org_id).await?;
+                let (claims, _) = self.load_claims(&identity.org_id).await.unwrap_or_default();
                 Ok(json!({
                     "identity": identity,
                     "shadow_root": env.workspace.shadow_root(),
                     "host_source_root": env.workspace.host_source_root(),
+                    "auto_refresh": refresh,
                     "uncommitted_changes_count": diffs.len(),
                     "uncommitted_changes": diffs,
+                    "active_claims": claims,
                     "snapshots": snapshots,
                     "unread_ipc_messages_count": unread_ipc.len(),
                     "pending_escalations": escalations
+                }))
+            }
+
+            "workspace_sync" => {
+                let refresh = env.workspace.refresh_from_host().await?;
+                let diffs = env.workspace.diff(None).await?;
+                let (claims, _) = self.load_claims(&identity.org_id).await.unwrap_or_default();
+                Ok(json!({
+                    "status": if refresh.conflicts.is_empty() { "synced" } else { "conflicts_detected" },
+                    "refresh_report": refresh,
+                    "uncommitted_changes_count": diffs.len(),
+                    "uncommitted_changes": diffs,
+                    "active_claims": claims
                 }))
             }
 
@@ -719,9 +752,15 @@ impl AegisRuntimeKernel {
 
             "workspace_diff" => {
                 let snap_id = args.get("snapshot_id").and_then(|v| v.as_str());
+                let refresh = if snap_id.is_none() {
+                    Some(env.workspace.refresh_from_host().await?)
+                } else {
+                    None
+                };
                 let diffs = env.workspace.diff(snap_id).await?;
                 Ok(json!({
                     "base": snap_id.unwrap_or("host_source"),
+                    "auto_refresh": refresh,
                     "changes": diffs
                 }))
             }
@@ -742,6 +781,12 @@ impl AegisRuntimeKernel {
                 let filter_paths: Option<Vec<String>> = args
                     .get("paths")
                     .and_then(|v| serde_json::from_value(v.clone()).ok());
+                let overwrite_binaries = args
+                    .get("overwrite_binaries")
+                    .and_then(|v| v.as_bool())
+                    .unwrap_or(false);
+                // Refresh from host first so untouched peer-modified files (including binaries) fast-forward cleanly.
+                let refresh = env.workspace.refresh_from_host().await?;
                 // Coordination guard: refuse to land files that a live peer has claimed.
                 let mut touched = env.workspace.changed_since_baseline().await?;
                 if let Some(ref allow) = filter_paths {
@@ -750,10 +795,14 @@ impl AegisRuntimeKernel {
                 if let Some(msg) = self.claim_conflict_for_paths(identity, &touched).await? {
                     bail!("{}", msg);
                 }
-                let committed = env.workspace.commit_to_host(filter_paths).await?;
+                let committed = env
+                    .workspace
+                    .commit_to_host_with_options(filter_paths, overwrite_binaries)
+                    .await?;
                 Ok(json!({
                     "status": "committed_to_host",
                     "host_root": env.workspace.host_source_root(),
+                    "auto_refresh": refresh,
                     "committed_files": committed
                 }))
             }
@@ -1337,6 +1386,11 @@ impl AegisRuntimeKernel {
                     "inputSchema": { "type": "object", "properties": {} }
                 },
                 {
+                    "name": "workspace_sync",
+                    "description": "[Zero-Prompt] Rebase and 3-way merge host commits from peer Agents into your CoW shadow workspace, updating file mtimes and returning a detailed RefreshReport (including any conflict_details).",
+                    "inputSchema": { "type": "object", "properties": {} }
+                },
+                {
                     "name": "workspace_snapshot",
                     "description": "[Zero-Prompt] Create an instant point-in-time CoW snapshot of the shadow workspace.",
                     "inputSchema": {
@@ -1346,7 +1400,7 @@ impl AegisRuntimeKernel {
                 },
                 {
                     "name": "workspace_diff",
-                    "description": "[Zero-Prompt] Inspect all uncommitted file changes in the shadow workspace relative to the host or a snapshot.",
+                    "description": "[Zero-Prompt] Auto-rebase against host and inspect all uncommitted file changes in the shadow workspace relative to the host or a snapshot.",
                     "inputSchema": {
                         "type": "object",
                         "properties": { "snapshot_id": { "type": "string" } }
@@ -1363,11 +1417,15 @@ impl AegisRuntimeKernel {
                 },
                 {
                     "name": "workspace_commit",
-                    "description": "[Lease-Gated] Atomically commit shadow workspace changes back to the host directory.",
+                    "description": "[Lease-Gated] Auto-rebase against host, 3-way merge non-overlapping text hunks, and atomically commit shadow workspace changes back to the host directory.",
                     "inputSchema": {
                         "type": "object",
                         "properties": {
-                            "paths": { "type": "array", "items": { "type": "string" } }
+                            "paths": { "type": "array", "items": { "type": "string" } },
+                            "overwrite_binaries": {
+                                "type": "boolean",
+                                "description": "If true, allow your shadow copy of concurrently modified binary artifacts (e.g. PDFs) to overwrite the host copy."
+                            }
                         }
                     }
                 },
