@@ -268,19 +268,12 @@ async fn main() -> anyhow::Result<()> {
 
         Commands::McpStdio => {
             let kernel = AegisRuntimeKernel::new(&cli.runtime_dir).await?;
-            kernel
-                .ensure_agent_environment(
-                    identity.clone(),
-                    &workspace,
-                    IsolationTier::NativeOsSandbox,
-                    vec!["*".to_string()],
-                )
-                .await?;
-            kernel.serve_stdio(identity).await?;
+            let auto_org = cli.org == "auto" || cli.org.is_empty();
+            kernel.serve_stdio_lazy(identity, workspace, auto_org).await?;
         }
 
-        Commands::AgyHook { event, strict_cow } => {
-            handle_agy_hook(&event, strict_cow, &identity, &workspace, &cli.runtime_dir).await?;
+        Commands::AgyHook { ref event, strict_cow } => {
+            handle_agy_hook(&event, strict_cow, &cli, &workspace).await?;
         }
 
         Commands::Workspace { action } => {
@@ -560,8 +553,9 @@ pub async fn install_global_clients(
         &agy_hooks_path,
         |root| {
             let obj = root.as_object_mut().unwrap();
+            obj.remove("aegis-os-global-guard");
             obj.insert(
-                "aegis-os-global-guard".to_string(),
+                "aegis-os-runtime-guard".to_string(),
                 json!({
                     "enabled": true,
                     "SessionStart": [
@@ -741,22 +735,117 @@ async fn run_doctor(home_dir: &Path) -> anyhow::Result<()> {
 // AGY & Claude Code Hook Handler (`SessionStart` & `PreToolUse`)
 // ============================================================================
 
-pub async fn handle_agy_hook(
+/// Resolves the true active project workspace from the AGY/Claude Hook `stdin` JSON payload.
+/// Fixes Bug 1: When `~/.gemini/config/hooks.json` or `.agents/hooks.json` executes, CWD is the directory
+/// containing `hooks.json` (`~/.gemini/config` or `<repo>/.agents`), while the true project directory is
+/// passed via `payload["workspacePaths"][0]` (AGY) or `payload["cwd"]` (Claude Code).
+fn resolve_effective_hook_workspace(
+    cli_workspace: &Path,
+    payload: &Value,
+    runtime_dir: &Path,
+) -> PathBuf {
+    let from_payload = payload
+        .get("workspacePaths")
+        .and_then(|v| v.as_array())
+        .and_then(|arr| arr.first())
+        .and_then(|v| v.as_str())
+        .or_else(|| payload.get("workspacePath").and_then(|v| v.as_str()))
+        .or_else(|| payload.get("cwd").and_then(|v| v.as_str()));
+
+    let mut candidate = if let Some(p_str) = from_payload {
+        PathBuf::from(p_str.strip_prefix("file://").unwrap_or(p_str))
+    } else {
+        cli_workspace.to_path_buf()
+    };
+
+    let cand_str = candidate.to_string_lossy().to_string();
+    if cand_str.ends_with("/.agents") || cand_str.ends_with("/.agent") {
+        if let Some(parent) = candidate.parent() {
+            candidate = parent.to_path_buf();
+        }
+    } else if cand_str.ends_with("/.gemini/config") {
+        let saved_file = runtime_dir.join("active_workspace.txt");
+        if let Ok(saved) = std::fs::read_to_string(&saved_file) {
+            let p = PathBuf::from(saved.trim());
+            if p.exists() {
+                candidate = p;
+            }
+        }
+    }
+
+    // If `candidate` is an umbrella parent directory (no `.git` or `Cargo.toml` at root),
+    // inspect tool arguments (`Path` or `CommandLine`) to pinpoint the active child repository.
+    if !candidate.join(".git").exists() && !candidate.join("Cargo.toml").exists() {
+        let tool_args = payload
+            .get("toolCall")
+            .and_then(|tc| tc.get("args"))
+            .cloned()
+            .unwrap_or_else(|| json!({}));
+        let hint_str = tool_args
+            .get("Path")
+            .and_then(|v| v.as_str())
+            .or_else(|| tool_args.get("CommandLine").and_then(|v| v.as_str()))
+            .unwrap_or("");
+        let cand_prefix = candidate.to_string_lossy().to_string();
+        if let Some(pos) = hint_str.find(&cand_prefix) {
+            let after = &hint_str[pos + cand_prefix.len()..];
+            let sub_name = after
+                .trim_start_matches('/')
+                .split(|c: char| c == '/' || c.is_whitespace() || c == '"' || c == '\'')
+                .next()
+                .unwrap_or("");
+            if !sub_name.is_empty() {
+                let sub_path = candidate.join(sub_name);
+                if sub_path.is_dir() && (sub_path.join(".git").exists() || sub_path.join("Cargo.toml").exists()) {
+                    candidate = sub_path;
+                }
+            }
+        }
+        if !candidate.join(".git").exists() && candidate.join("aegis-os").join("Cargo.toml").exists() {
+            candidate = candidate.join("aegis-os");
+        }
+    }
+
+    let canonical = std::fs::canonicalize(&candidate).unwrap_or(candidate);
+    let canon_str = canonical.to_string_lossy();
+    if !canon_str.ends_with("/.gemini/config")
+        && !canon_str.ends_with("/.agents")
+        && !canon_str.ends_with("/.agent")
+    {
+        let _ = std::fs::create_dir_all(runtime_dir);
+        let _ = std::fs::write(
+            runtime_dir.join("active_workspace.txt"),
+            canon_str.as_bytes(),
+        );
+    }
+    canonical
+}
+
+async fn handle_agy_hook(
     event: &str,
     strict_cow: bool,
-    identity: &AgentIdentity,
-    workspace: &Path,
-    runtime_dir: &Path,
+    cli: &Cli,
+    cli_workspace: &Path,
 ) -> anyhow::Result<()> {
     let mut stdin_buf = String::new();
     let _ = std::io::stdin().read_to_string(&mut stdin_buf);
     let payload: Value = serde_json::from_str(&stdin_buf).unwrap_or_else(|_| json!({}));
 
-    let kernel = AegisRuntimeKernel::new(runtime_dir).await?;
+    let effective_workspace =
+        resolve_effective_hook_workspace(cli_workspace, &payload, &cli.runtime_dir);
+    let identity = resolve_identity(
+        &cli.org,
+        &cli.agent,
+        &cli.client,
+        &cli.role,
+        &effective_workspace,
+    );
+
+    let kernel = AegisRuntimeKernel::new(&cli.runtime_dir).await?;
     let env = kernel
         .ensure_agent_environment(
             identity.clone(),
-            workspace,
+            &effective_workspace,
             IsolationTier::NativeOsSandbox,
             vec!["*".to_string()],
         )
@@ -769,15 +858,23 @@ pub async fn handle_agy_hook(
                 .recv_inbox(&identity.org_id, &identity.agent_id, true, 10)
                 .await?;
             let peers = kernel.ipc.list_peers(&identity.org_id).await?;
+            // Fixes Bug 4: Emit AGY-compliant `injectSteps` -> `systemMessage` contract (`docs/hooks.md`)
+            let msg = format!(
+                "[Aegis OS Runtime Active] Organization: `{}` | Agent Principal: `{}` | CoW Shadow Workspace: `{}` | Online Peers: {} | Unread IPC Messages: {}.",
+                identity.org_id,
+                identity.agent_id,
+                env.workspace.shadow_root().display(),
+                peers.len(),
+                unread.len()
+            );
             let out = json!({
-                "aegisOsSession": {
-                    "status": "initialized",
-                    "orgId": identity.org_id,
-                    "agentId": identity.agent_id,
-                    "shadowWorkspace": env.workspace.shadow_root(),
-                    "unreadIpcCount": unread.len(),
-                    "onlinePeersCount": peers.len()
-                }
+                "injectSteps": [
+                    {
+                        "systemMessage": {
+                            "systemMessage": msg
+                        }
+                    }
+                ]
             });
             println!("{}", serde_json::to_string(&out)?);
         }
@@ -836,6 +933,14 @@ pub async fn handle_agy_hook(
                             "reason": "Blocked by Aegis OS Ring-0 Policy: privilege escalation or sensitive credential access is forbidden."
                         }))?
                     );
+                    return Ok(());
+                }
+
+                // Fixes Bug 2: Idempotency check so global + workspace hooks never double-wrap `CommandLine`!
+                if cmd_line.contains("/upper_workspace\"")
+                    || cmd_line.contains("/cow_workspace/")
+                {
+                    println!("{}", serde_json::to_string(&json!({ "decision": "allow" }))?);
                     return Ok(());
                 }
 

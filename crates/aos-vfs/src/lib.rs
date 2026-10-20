@@ -58,7 +58,7 @@ impl CoWWorkspace {
             tokio::fs::create_dir_all(&shadow_root).await?;
             tokio::fs::create_dir_all(&baseline_root).await?;
             Self::cow_sync_dir(&host_source_root, &shadow_root).await?;
-            Self::cow_sync_dir(&host_source_root, &baseline_root).await?;
+            Self::cow_sync_dir(&shadow_root, &baseline_root).await?;
             tokio::fs::write(&init_marker, Utc::now().to_rfc3339()).await?;
         }
 
@@ -116,8 +116,39 @@ impl CoWWorkspace {
         Ok(())
     }
 
+    fn is_ignored_dir_name(name: &str) -> bool {
+        matches!(
+            name,
+            ".aegis_os" | ".git" | "target" | "node_modules" | ".gemini"
+        )
+    }
+
+    fn contains_ignored_subdir(dir: &Path, max_depth: usize) -> bool {
+        if max_depth == 0 {
+            return false;
+        }
+        let Ok(rd) = std::fs::read_dir(dir) else {
+            return false;
+        };
+        for entry in rd.flatten() {
+            let name = entry.file_name();
+            let name_str = name.to_string_lossy();
+            if Self::is_ignored_dir_name(&name_str) {
+                return true;
+            }
+            if max_depth > 1
+                && entry.file_type().map(|ft| ft.is_dir()).unwrap_or(false)
+                && Self::contains_ignored_subdir(&entry.path(), max_depth - 1)
+            {
+                return true;
+            }
+        }
+        false
+    }
+
     /// Clones an entire directory tree using macOS APFS directory-level `clonefile(2)` in a single
-    /// atomic kernel metadata operation (O(1) time & zero disk blocks), falling back to per-file CoW copy.
+    /// atomic kernel metadata operation (O(1) time & zero disk blocks) while automatically skipping
+    /// heavy build/VCS directories (`.git`, `target`, `node_modules`, `.aegis_os`, `.gemini`).
     pub async fn cow_sync_dir(src: &Path, dst: &Path) -> anyhow::Result<()> {
         if dst.exists() {
             tokio::fs::remove_dir_all(dst).await?;
@@ -127,7 +158,7 @@ impl CoWWorkspace {
         }
 
         #[cfg(target_os = "macos")]
-        {
+        if !Self::contains_ignored_subdir(src, 1) {
             use std::ffi::CString;
             use std::os::unix::ffi::OsStrExt;
             if let (Ok(c_src), Ok(c_dst)) = (
@@ -142,13 +173,37 @@ impl CoWWorkspace {
         }
 
         tokio::fs::create_dir_all(dst).await?;
-        let mut entries = Self::collect_files(src).await?;
-        for (rel_path, full_src) in entries.drain(..) {
-            let target = dst.join(&rel_path);
-            if let Some(parent) = target.parent() {
-                tokio::fs::create_dir_all(parent).await?;
+        let mut stack = vec![(src.to_path_buf(), dst.to_path_buf())];
+        while let Some((cur_src, cur_dst)) = stack.pop() {
+            let mut rd = tokio::fs::read_dir(&cur_src).await?;
+            while let Some(entry) = rd.next_entry().await? {
+                let name = entry.file_name().to_string_lossy().to_string();
+                if Self::is_ignored_dir_name(&name) {
+                    continue;
+                }
+                let entry_src = entry.path();
+                let entry_dst = cur_dst.join(&name);
+                let ft = entry.file_type().await?;
+                if ft.is_dir() {
+                    #[cfg(target_os = "macos")]
+                    if !Self::contains_ignored_subdir(&entry_src, 1) {
+                        use std::ffi::CString;
+                        use std::os::unix::ffi::OsStrExt;
+                        if let (Ok(c_src), Ok(c_dst)) = (
+                            CString::new(entry_src.as_os_str().as_bytes()),
+                            CString::new(entry_dst.as_os_str().as_bytes()),
+                        ) {
+                            if unsafe { libc::clonefile(c_src.as_ptr(), c_dst.as_ptr(), 0) } == 0 {
+                                continue;
+                            }
+                        }
+                    }
+                    tokio::fs::create_dir_all(&entry_dst).await?;
+                    stack.push((entry_src, entry_dst));
+                } else if ft.is_file() {
+                    Self::cow_clone_file(&entry_src, &entry_dst).await?;
+                }
             }
-            Self::cow_clone_file(&full_src, &target).await?;
         }
         Ok(())
     }

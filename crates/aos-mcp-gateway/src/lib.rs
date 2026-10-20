@@ -1138,10 +1138,81 @@ impl AegisRuntimeKernel {
         Ok(response)
     }
 
+    fn extract_workspace_from_init_params(params: &Value) -> Option<PathBuf> {
+        let raw_uri = params
+            .get("rootUri")
+            .and_then(|v| v.as_str())
+            .or_else(|| params.get("rootPath").and_then(|v| v.as_str()))
+            .or_else(|| {
+                params
+                    .get("workspaceFolders")
+                    .and_then(|v| v.as_array())
+                    .and_then(|arr| arr.first())
+                    .and_then(|f| f.get("uri").or_else(|| f.get("path")))
+                    .and_then(|v| v.as_str())
+            })
+            .or_else(|| {
+                params
+                    .get("roots")
+                    .and_then(|v| v.as_array())
+                    .and_then(|arr| arr.first())
+                    .and_then(|f| f.get("uri").or_else(|| f.get("path")))
+                    .and_then(|v| v.as_str())
+            })?;
+        let cleaned = raw_uri.strip_prefix("file://").unwrap_or(raw_uri);
+        let p = PathBuf::from(cleaned);
+        if p.exists() {
+            Some(std::fs::canonicalize(&p).unwrap_or(p))
+        } else {
+            None
+        }
+    }
+
+    fn resolve_workspace_fallback(&self, current_ws: &Path) -> PathBuf {
+        let s = current_ws.to_string_lossy();
+        if s.ends_with("/.gemini/config") || s.ends_with("/.agents") || s.ends_with("/.agent") {
+            let saved_file = self.runtime_data_root.join("active_workspace.txt");
+            if let Ok(saved) = std::fs::read_to_string(&saved_file) {
+                let p = PathBuf::from(saved.trim());
+                if p.exists() {
+                    return std::fs::canonicalize(&p).unwrap_or(p);
+                }
+            }
+            if s.ends_with("/.agents") || s.ends_with("/.agent") {
+                if let Some(parent) = current_ws.parent() {
+                    return parent.to_path_buf();
+                }
+            }
+        }
+        current_ws.to_path_buf()
+    }
+
     pub async fn serve_stdio(&self, identity: AgentIdentity) -> anyhow::Result<()> {
+        let cwd = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
+        self.serve_stdio_lazy(identity, cwd, false).await
+    }
+
+    /// Serves MCP over `stdio` with instant (<0.5 ms) `initialize` and `tools/list` handshakes,
+    /// deferring `ensure_agent_environment` (CoW cloning) until the first `tools/call` or `resources/read`
+    /// and dynamically resolving the workspace path from `initialize` `rootUri`/`workspaceFolders` or AGY hook state.
+    pub async fn serve_stdio_lazy(
+        &self,
+        mut identity: AgentIdentity,
+        initial_workspace: PathBuf,
+        auto_org: bool,
+    ) -> anyhow::Result<()> {
         let stdin = tokio::io::stdin();
         let mut stdout = tokio::io::stdout();
         let mut reader = BufReader::new(stdin).lines();
+        let mut active_workspace = self.resolve_workspace_fallback(&initial_workspace);
+        if auto_org {
+            if let Some(name) = active_workspace.file_name() {
+                let name_str = name.to_string_lossy().to_string();
+                if name_str != "config" && !name_str.is_empty() {
+                    identity.org_id = name_str;
+                }
+            }
+        }
 
         while let Some(line) = reader.next_line().await? {
             if line.trim().is_empty() {
@@ -1151,6 +1222,52 @@ impl AegisRuntimeKernel {
                 Ok(v) => v,
                 Err(_) => continue,
             };
+            let method = req.get("method").and_then(|v| v.as_str()).unwrap_or("");
+
+            // JSON-RPC 2.0 notifications (e.g. `notifications/initialized`) have no `id` and MUST NOT receive a response!
+            if req.get("id").is_none() || method.starts_with("notifications/") {
+                continue;
+            }
+
+            if method == "initialize" {
+                if let Some(params) = req.get("params") {
+                    if let Some(ws_from_init) = Self::extract_workspace_from_init_params(params) {
+                        active_workspace = ws_from_init;
+                        let _ = std::fs::write(
+                            self.runtime_data_root.join("active_workspace.txt"),
+                            active_workspace.to_string_lossy().as_bytes(),
+                        );
+                    }
+                }
+                active_workspace = self.resolve_workspace_fallback(&active_workspace);
+                if auto_org {
+                    if let Some(name) = active_workspace.file_name() {
+                        let name_str = name.to_string_lossy().to_string();
+                        if name_str != "config" && !name_str.is_empty() {
+                            identity.org_id = name_str;
+                        }
+                    }
+                }
+            } else if method == "tools/call" || method == "resources/read" {
+                active_workspace = self.resolve_workspace_fallback(&active_workspace);
+                if auto_org {
+                    if let Some(name) = active_workspace.file_name() {
+                        let name_str = name.to_string_lossy().to_string();
+                        if name_str != "config" && !name_str.is_empty() {
+                            identity.org_id = name_str;
+                        }
+                    }
+                }
+                let _ = self
+                    .ensure_agent_environment(
+                        identity.clone(),
+                        &active_workspace,
+                        IsolationTier::NativeOsSandbox,
+                        vec!["*".to_string()],
+                    )
+                    .await?;
+            }
+
             let response = self.handle_jsonrpc_message(&identity, req).await?;
             let out_line = format!("{}\n", serde_json::to_string(&response)?);
             stdout.write_all(out_line.as_bytes()).await?;
