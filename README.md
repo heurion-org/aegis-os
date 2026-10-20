@@ -143,3 +143,20 @@ cargo run --release --bin aegis-os -- bench --report-out BENCHMARK_REPORT.md
 - [`crates/aos-mcp-gateway`](crates/aos-mcp-gateway): Unified MCP JSON-RPC & Google A2A server over `stdio` and HTTP (`POST /mcp`, `GET /.well-known/agent.json`, `POST /a2a`).
 - [`crates/aos-cli`](crates/aos-cli): Unified `aegis-os` binary (`install`, `doctor`, `top`, `daemon`, `agy-hook`, `workspace`, `policy`, `ipc`, `bench`, `demo`), MCP-first routing, and `PreInvocation` Live Collaboration Radar.
 - [`paper/`](paper): LaTeX preprint (`main.tex`, `references.bib`, `aegis_os_arxiv_preprint.pdf`) and automated arXiv submission packager (`build_arxiv.sh`, `arxiv_submission.tar.gz`).
+
+---
+
+## Roadmap: Aegis Cloud PaaS (`aegis-cloud`)
+
+We are evolving **Aegis OS** from a local workstation runtime into a **Multi-Tenant Cloud Agent Runtime PaaS** — *"The Cloudflare Workers + Neon Branching for Multi-Agent Systems"*:
+
+### Phase 1: Linux Cloud Runtime, Multi-Tenant Control Plane, Git-to-PR & Embedded Approval UI
+- [ ] **Linux `ioctl(FICLONE)` Reflink CoW & Scale-to-Zero Compute Pool**: Native zero-copy CoW workspace branching (`< 10 ms`) on Linux Btrfs/XFS cloud hosts alongside macOS APFS `clonefile`, paired with Linux `bwrap` / Firecracker MicroVM confinement and auto-idle `pause()` / `resume()`.
+- [ ] **Multi-Tenant API Gateway & Bearer Token Auth (`ak_live_*`)**: Scoped tenant API keys (`POST /v1/tenants/keys`), hosted Streamable HTTP + SSE MCP (`POST /v1/mcp`, `GET /v1/events/stream`), and hosted Google A2A hub (`POST /v1/a2a`) with method/path-scoped `$AOS_SECRET_*` vault rules (`POST /v1/vault/secrets`).
+- [ ] **Cloud Git Workspace Provisioning & Automated PR Export**: Provision shared project workspaces directly from GitHub repositories (`POST /v1/workspaces`), fork parallel agent CoW branches in milliseconds, reconcile concurrent edits via the 4-Tier LCS Diff3 Engine, and export merged changes directly to a GitHub branch / Pull Request (`POST /v1/workspaces/:id/pr`).
+- [ ] **Embedded Web Mission Control & HITL Approval Dashboard**: Single-binary Web UI served by `aegis-os daemon` (`GET /dashboard`) displaying live CoW workspace diffs, active peers/claims, A2A task states, and one-click boundary approvals (`[Approve Once]`, `[Grant 1h Lease]`, `[Deny]`).
+
+### Phase 2: Lark / Slack Webhooks, Cloud SDKs & Enterprise BYOC
+- [ ] **Lark (Feishu) & Slack Interactive Approval Webhooks**: Push interactive diff summaries and lease approval buttons directly to Lark and Slack channels whenever cloud agents hit `R0b` / `R4` boundaries.
+- [ ] **Python & TypeScript Cloud SDKs (`aegis-cloud`)**: Ergonomic SDKs for orchestrating multi-agent swarms across Claude API, OpenAI Responses API, LangGraph, AutoGen, and CrewAI.
+- [ ] **Usage Metering & Time-Travel Trajectory Replay**: Per-tenant CPU-ms / CoW storage metering and interactive replay of `aos-recorder` flight logs and CoW snapshots.
