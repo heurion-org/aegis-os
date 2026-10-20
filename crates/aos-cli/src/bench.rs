@@ -205,9 +205,255 @@ async fn run_exp1_live_trajectories() -> anyhow::Result<Vec<Exp1TrajectoryResult
     let calls_per_traj = 30usize;
     let total_calls = trajectories * calls_per_traj;
 
-    // 1. Measure real AegisRuntimeKernel execution across 50 trajectories (Per-Task Commit Gate vs Session Lease)
-    let kernel_per_task = AegisRuntimeKernel::new(runtime_dir.join("per_task")).await?;
+    // Helper generating 5 distinct 30-step SWE trajectory templates:
+    // 0: Bugfix, 1: Refactor, 2: Feature+Test, 3: Security Audit, 4: Multi-Agent IPC Sync
+    let build_trajectory_steps = |t_idx: usize| -> Vec<(&'static str, Value)> {
+        match t_idx % 5 {
+            0 => vec![
+                // Template 0: Auth Bugfix & Regression Test (30 steps)
+                ("fs_glob", json!({})),
+                ("fs_read", json!({"path": "src/lib.rs"})),
+                ("fs_read", json!({"path": "src/auth.rs"})),
+                ("workspace_snapshot", json!({"label": format!("bugfix-{}", t_idx)})),
+                ("fs_edit", json!({"path": "src/lib.rs", "target": "!token.is_empty()", "replacement": "token.len() > 3"})),
+                ("fs_edit", json!({"path": "src/auth.rs", "target": "pub strict: bool", "replacement": "pub strict: bool, pub retries: u8"})),
+                ("fs_write", json!({"path": "src/middleware.rs", "content": "pub fn check() -> bool { true }\n"})),
+                ("fs_read", json!({"path": "src/middleware.rs"})),
+                ("fs_edit", json!({"path": "src/middleware.rs", "target": "true", "replacement": "true /* bugfix */"})),
+                ("workspace_diff", json!({})),
+                ("org_artifact_publish", json!({"name": "bugfix_report.json", "content": "{\"bug\":101}"})),
+                ("ipc_send", json!({"to_agent": "claude-code", "subject": "bugfix-ready", "payload": {"traj": t_idx}})),
+                ("ipc_recv", json!({"unread_only": true})),
+                ("fs_read", json!({"path": "tests/integration.rs"})),
+                ("fs_edit", json!({"path": "tests/integration.rs", "target": "assert!(true);", "replacement": "assert_eq!(1, 1);"})),
+                ("fs_glob", json!({"pattern": ".rs"})),
+                ("fs_write", json!({"path": "src/rate_limit.rs", "content": "pub struct RateLimiter;\n"})),
+                ("fs_edit", json!({"path": "src/lib.rs", "target": "token.len() > 3", "replacement": "!token.is_empty()"})),
+                ("fs_edit", json!({"path": "src/auth.rs", "target": "pub strict: bool, pub retries: u8", "replacement": "pub strict: bool"})),
+                ("fs_edit", json!({"path": "tests/integration.rs", "target": "assert_eq!(1, 1);", "replacement": "assert!(true);"})),
+                ("fs_edit", json!({"path": "src/rate_limit.rs", "target": "RateLimiter;", "replacement": "RateLimiter { pub max: u32 }"})),
+                ("workspace_status", json!({})),
+                ("ipc_publish", json!({"topic": "ci", "payload": {"traj": t_idx}})),
+                ("ipc_list_peers", json!({})),
+                ("fs_read", json!({"path": "Cargo.toml"})),
+                ("fs_edit", json!({"path": "Cargo.toml", "target": "0.1.0", "replacement": "0.1.1"})),
+                ("fs_edit", json!({"path": "Cargo.toml", "target": "0.1.1", "replacement": "0.1.0"})),
+                ("org_kv_put", json!({"key": "last_bugfix", "value": t_idx})),
+                ("workspace_diff", json!({})),
+                ("workspace_commit", json!({})),
+            ],
+            1 => vec![
+                // Template 1: Multi-Module Refactoring (30 steps)
+                ("fs_read", json!({"path": "Cargo.toml"})),
+                ("fs_glob", json!({"pattern": "src"})),
+                ("workspace_snapshot", json!({"label": format!("refactor-{}", t_idx)})),
+                ("fs_write", json!({"path": "src/session.rs", "content": "pub struct Session { pub id: u64 }\n"})),
+                ("fs_read", json!({"path": "src/session.rs"})),
+                ("fs_edit", json!({"path": "src/session.rs", "target": "pub id: u64", "replacement": "pub id: u64, pub active: bool"})),
+                ("fs_write", json!({"path": "src/token.rs", "content": "pub fn verify() -> bool { true }\n"})),
+                ("fs_edit", json!({"path": "src/token.rs", "target": "true", "replacement": "true /* refactored */"})),
+                ("fs_read", json!({"path": "src/lib.rs"})),
+                ("fs_edit", json!({"path": "src/lib.rs", "target": "!token.is_empty()", "replacement": "!token.trim().is_empty()"})),
+                ("fs_edit", json!({"path": "src/lib.rs", "target": "!token.trim().is_empty()", "replacement": "!token.is_empty()"})),
+                ("workspace_status", json!({})),
+                ("workspace_diff", json!({})),
+                ("org_kv_put", json!({"key": "refactor_stage", "value": "done"})),
+                ("org_kv_get", json!({"key": "refactor_stage"})),
+                ("org_artifact_publish", json!({"name": "refactor_ast.json", "content": "{\"modules\":4}"})),
+                ("ipc_send", json!({"to_agent": "codex-cli", "subject": "review-refactor", "payload": {"traj": t_idx}})),
+                ("ipc_list_peers", json!({})),
+                ("fs_read", json!({"path": "src/auth.rs"})),
+                ("fs_edit", json!({"path": "src/auth.rs", "target": "pub strict: bool", "replacement": "pub strict: bool /* v2 */"})),
+                ("fs_edit", json!({"path": "src/auth.rs", "target": "pub strict: bool /* v2 */", "replacement": "pub strict: bool"})),
+                ("fs_read", json!({"path": "tests/integration.rs"})),
+                ("fs_edit", json!({"path": "tests/integration.rs", "target": "assert!(true);", "replacement": "assert!(true /* ok */);"})),
+                ("fs_edit", json!({"path": "tests/integration.rs", "target": "assert!(true /* ok */);", "replacement": "assert!(true);"})),
+                ("ipc_publish", json!({"topic": "refactor-events", "payload": {"traj": t_idx}})),
+                ("ipc_recv", json!({"unread_only": true})),
+                ("fs_glob", json!({})),
+                ("workspace_status", json!({})),
+                ("workspace_diff", json!({})),
+                ("workspace_commit", json!({})),
+            ],
+            2 => vec![
+                // Template 2: Feature Implementation + Test Suite Expansion (30 steps)
+                ("fs_glob", json!({})),
+                ("workspace_snapshot", json!({"label": format!("feat-{}", t_idx)})),
+                ("fs_write", json!({"path": "src/quota.rs", "content": "pub fn check_quota(u: u32) -> bool { u < 100 }\n"})),
+                ("fs_read", json!({"path": "src/quota.rs"})),
+                ("fs_edit", json!({"path": "src/quota.rs", "target": "u < 100", "replacement": "u <= 250"})),
+                ("fs_write", json!({"path": "src/audit_log.rs", "content": "pub struct AuditEntry { pub code: u16 }\n"})),
+                ("fs_read", json!({"path": "src/audit_log.rs"})),
+                ("fs_edit", json!({"path": "src/audit_log.rs", "target": "pub code: u16", "replacement": "pub code: u16, pub ok: bool"})),
+                ("fs_write", json!({"path": "tests/quota_test.rs", "content": "#[test]\nfn t_quota() { assert!(true); }\n"})),
+                ("fs_read", json!({"path": "tests/quota_test.rs"})),
+                ("fs_edit", json!({"path": "tests/quota_test.rs", "target": "assert!(true);", "replacement": "assert!(2 < 3);"})),
+                ("workspace_diff", json!({})),
+                ("org_artifact_publish", json!({"name": "feature_design.md", "content": "# Quota Feature\n"})),
+                ("ipc_send", json!({"to_agent": "claude-code", "subject": "feat-spec", "payload": {"traj": t_idx}})),
+                ("ipc_publish", json!({"topic": "feature-bus", "payload": {"feat": "quota"}})),
+                ("ipc_recv", json!({"unread_only": true})),
+                ("org_kv_put", json!({"key": "feat_quota_enabled", "value": true})),
+                ("org_kv_get", json!({"key": "feat_quota_enabled"})),
+                ("fs_read", json!({"path": "src/lib.rs"})),
+                ("fs_edit", json!({"path": "src/lib.rs", "target": "!token.is_empty()", "replacement": "token.len() >= 1"})),
+                ("fs_edit", json!({"path": "src/lib.rs", "target": "token.len() >= 1", "replacement": "!token.is_empty()"})),
+                ("fs_read", json!({"path": "Cargo.toml"})),
+                ("fs_edit", json!({"path": "Cargo.toml", "target": "0.1.0", "replacement": "0.2.0"})),
+                ("fs_edit", json!({"path": "Cargo.toml", "target": "0.2.0", "replacement": "0.1.0"})),
+                ("ipc_list_peers", json!({})),
+                ("fs_glob", json!({"pattern": "tests"})),
+                ("workspace_status", json!({})),
+                ("org_kv_put", json!({"key": "feat_step", "value": t_idx})),
+                ("workspace_diff", json!({})),
+                ("workspace_commit", json!({})),
+            ],
+            3 => vec![
+                // Template 3: Security Audit & Hardening Patch (30 steps)
+                ("fs_glob", json!({})),
+                ("fs_read", json!({"path": "src/lib.rs"})),
+                ("fs_read", json!({"path": "src/auth.rs"})),
+                ("fs_read", json!({"path": "Cargo.toml"})),
+                ("workspace_snapshot", json!({"label": format!("sec-audit-{}", t_idx)})),
+                ("fs_write", json!({"path": "src/sanitizer.rs", "content": "pub fn clean(s: &str) -> bool { !s.contains(\"..\") }\n"})),
+                ("fs_read", json!({"path": "src/sanitizer.rs"})),
+                ("fs_edit", json!({"path": "src/sanitizer.rs", "target": "!s.contains(\"..\")", "replacement": "!s.contains(\"..\") && !s.is_empty()"})),
+                ("fs_write", json!({"path": "src/policy_guard.rs", "content": "pub const ENFORCE: bool = true;\n"})),
+                ("fs_edit", json!({"path": "src/policy_guard.rs", "target": "true", "replacement": "true /* ring0 */"})),
+                ("fs_read", json!({"path": "tests/integration.rs"})),
+                ("fs_edit", json!({"path": "tests/integration.rs", "target": "assert!(true);", "replacement": "assert!(!\"ok\".is_empty());"})),
+                ("fs_edit", json!({"path": "tests/integration.rs", "target": "assert!(!\"ok\".is_empty());", "replacement": "assert!(true);"})),
+                ("org_artifact_publish", json!({"name": "sec_report.json", "content": "{\"vulns\":0}"})),
+                ("org_kv_put", json!({"key": "audit_status", "value": "clean"})),
+                ("org_kv_get", json!({"key": "audit_status"})),
+                ("ipc_publish", json!({"topic": "security-alerts", "payload": {"status": "verified"}})),
+                ("ipc_send", json!({"to_agent": "codex-cli", "subject": "sec-signoff", "payload": {"traj": t_idx}})),
+                ("ipc_recv", json!({"unread_only": true})),
+                ("ipc_list_peers", json!({})),
+                ("fs_edit", json!({"path": "src/auth.rs", "target": "pub strict: bool", "replacement": "pub strict: bool /* hardened */"})),
+                ("fs_edit", json!({"path": "src/auth.rs", "target": "pub strict: bool /* hardened */", "replacement": "pub strict: bool"})),
+                ("fs_edit", json!({"path": "src/lib.rs", "target": "!token.is_empty()", "replacement": "!token.is_empty() /* audited */"})),
+                ("fs_edit", json!({"path": "src/lib.rs", "target": "!token.is_empty() /* audited */", "replacement": "!token.is_empty()"})),
+                ("fs_glob", json!({"pattern": ".rs"})),
+                ("workspace_status", json!({})),
+                ("org_kv_put", json!({"key": "sec_timestamp", "value": t_idx})),
+                ("fs_read", json!({"path": "src/policy_guard.rs"})),
+                ("workspace_diff", json!({})),
+                ("workspace_commit", json!({})),
+            ],
+            _ => vec![
+                // Template 4: Multi-Agent Spec Sync & Coordinated Patch (30 steps)
+                ("ipc_list_peers", json!({})),
+                ("workspace_status", json!({})),
+                ("org_artifact_publish", json!({"name": "api_contract.json", "content": "{\"version\":2}"})),
+                ("ipc_send", json!({"to_agent": "claude-code", "subject": "contract-v2", "payload": {"traj": t_idx}})),
+                ("ipc_publish", json!({"topic": "arch-sync", "payload": {"epoch": t_idx}})),
+                ("ipc_recv", json!({"unread_only": true})),
+                ("org_kv_put", json!({"key": "contract_version", "value": 2})),
+                ("org_kv_get", json!({"key": "contract_version"})),
+                ("workspace_snapshot", json!({"label": format!("sync-{}", t_idx)})),
+                ("fs_glob", json!({})),
+                ("fs_read", json!({"path": "src/lib.rs"})),
+                ("fs_write", json!({"path": "src/rpc_bridge.rs", "content": "pub fn dispatch() -> u32 { 200 }\n"})),
+                ("fs_read", json!({"path": "src/rpc_bridge.rs"})),
+                ("fs_edit", json!({"path": "src/rpc_bridge.rs", "target": "200", "replacement": "200 /* ok */"})),
+                ("fs_write", json!({"path": "src/schema.rs", "content": "pub struct SchemaV2;\n"})),
+                ("fs_edit", json!({"path": "src/schema.rs", "target": "SchemaV2;", "replacement": "SchemaV2 { pub id: u32 }"})),
+                ("fs_read", json!({"path": "src/auth.rs"})),
+                ("fs_edit", json!({"path": "src/auth.rs", "target": "pub strict: bool", "replacement": "pub strict: bool /* synced */"})),
+                ("fs_edit", json!({"path": "src/auth.rs", "target": "pub strict: bool /* synced */", "replacement": "pub strict: bool"})),
+                ("fs_read", json!({"path": "tests/integration.rs"})),
+                ("fs_edit", json!({"path": "tests/integration.rs", "target": "assert!(true);", "replacement": "assert!(1 == 1);"})),
+                ("fs_edit", json!({"path": "tests/integration.rs", "target": "assert!(1 == 1);", "replacement": "assert!(true);"})),
+                ("fs_read", json!({"path": "Cargo.toml"})),
+                ("fs_edit", json!({"path": "Cargo.toml", "target": "0.1.0", "replacement": "0.1.2"})),
+                ("fs_edit", json!({"path": "Cargo.toml", "target": "0.1.2", "replacement": "0.1.0"})),
+                ("workspace_status", json!({})),
+                ("ipc_send", json!({"to_agent": "codex-cli", "subject": "ready-to-merge", "payload": {"traj": t_idx}})),
+                ("org_kv_put", json!({"key": "sync_done", "value": t_idx})),
+                ("workspace_diff", json!({})),
+                ("workspace_commit", json!({})),
+            ],
+        }
+    };
+
+    // Dynamically evaluate Host-Interactive and Host-Static-Allowlist prompt triggers & streaks across the 50 trajectories
+    let mut b1_prompts = 0usize;
+    let mut b1_max_streak = 0usize;
+    let mut b1_cur_streak = 0usize;
+
+    let mut b2_prompts = 0usize;
+    let mut b2_max_streak = 0usize;
+    let mut b2_cur_streak = 0usize;
+
+    for t_idx in 0..trajectories {
+        for (tool, _) in build_trajectory_steps(t_idx) {
+            // Host-Interactive prompts on every file mutation, state mutation, IPC side-effect, or commit
+            let is_b1_prompt = matches!(
+                tool,
+                "fs_write"
+                    | "fs_edit"
+                    | "workspace_snapshot"
+                    | "workspace_commit"
+                    | "org_artifact_publish"
+                    | "org_kv_put"
+                    | "ipc_send"
+                    | "ipc_publish"
+            );
+            if is_b1_prompt {
+                b1_prompts += 1;
+                b1_max_streak = b1_max_streak.max(b1_cur_streak);
+                b1_cur_streak = 0;
+            } else {
+                b1_cur_streak += 1;
+            }
+
+            // Host-Static-Allowlist auto-allows read/status/snapshot/kv, but still prompts on every host file edit/write or external message/commit
+            let is_b2_prompt = matches!(
+                tool,
+                "fs_write" | "fs_edit" | "workspace_commit" | "org_artifact_publish" | "ipc_send"
+            );
+            if is_b2_prompt {
+                b2_prompts += 1;
+                b2_max_streak = b2_max_streak.max(b2_cur_streak);
+                b2_cur_streak = 0;
+            } else {
+                b2_cur_streak += 1;
+            }
+        }
+    }
+    b1_max_streak = b1_max_streak.max(b1_cur_streak);
+    b2_max_streak = b2_max_streak.max(b2_cur_streak);
+
+    // 1. Measure Baseline Host-Interactive / Host-Static-Allowlist execution time across the 50 trajectories
+    let kernel_baseline = AegisRuntimeKernel::new(runtime_dir.join("baseline_exec")).await?;
     let agent = AgentIdentity::new("swe-org", "agy-agent", "SWE Agent");
+    kernel_baseline
+        .ensure_agent_environment(
+            agent.clone(),
+            &host_repo,
+            IsolationTier::NativeOsSandbox,
+            vec!["*".to_string()],
+        )
+        .await?;
+    let t_b1 = Instant::now();
+    for t_idx in 0..trajectories {
+        for (tool, args) in build_trajectory_steps(t_idx) {
+            let _ = kernel_baseline.call_tool(&agent, tool, args).await?;
+        }
+    }
+    let b1_exec_ms = t_b1.elapsed().as_secs_f64() * 1000.0;
+
+    let t_b2 = Instant::now();
+    for t_idx in 0..trajectories {
+        for (tool, args) in build_trajectory_steps(t_idx) {
+            let _ = kernel_baseline.call_tool(&agent, tool, args).await?;
+        }
+    }
+    let b2_exec_ms = t_b2.elapsed().as_secs_f64() * 1000.0;
+
+    // 2. Measure real AegisRuntimeKernel execution across 50 trajectories (Per-Task Commit Gate)
+    let kernel_per_task = AegisRuntimeKernel::new(runtime_dir.join("per_task")).await?;
     kernel_per_task
         .ensure_agent_environment(
             agent.clone(),
@@ -223,40 +469,7 @@ async fn run_exp1_live_trajectories() -> anyhow::Result<Vec<Exp1TrajectoryResult
     let mut cur_streak = 0usize;
 
     for t_idx in 0..trajectories {
-        let steps: Vec<(&str, Value)> = vec![
-            ("fs_glob", json!({})),
-            ("fs_read", json!({"path": "src/lib.rs"})),
-            ("fs_read", json!({"path": "src/auth.rs"})),
-            ("workspace_snapshot", json!({"label": format!("traj-{}", t_idx)})),
-            ("fs_edit", json!({"path": "src/lib.rs", "target": "!token.is_empty()", "replacement": "token.len() > 3"})),
-            ("fs_edit", json!({"path": "src/auth.rs", "target": "pub strict: bool", "replacement": "pub strict: bool, pub retries: u8"})),
-            ("fs_write", json!({"path": "src/middleware.rs", "content": "pub fn check() -> bool { true }\n"})),
-            ("fs_read", json!({"path": "src/middleware.rs"})),
-            ("fs_edit", json!({"path": "src/middleware.rs", "target": "true", "replacement": "true /* verified */"})),
-            ("workspace_diff", json!({})),
-            ("org_artifact_publish", json!({"name": "spec.json", "content": "{\"v\":1}"})),
-            ("ipc_send", json!({"to_agent": "claude-code", "subject": "sync", "payload": {"step": t_idx}})),
-            ("ipc_recv", json!({"unread_only": true})),
-            ("fs_read", json!({"path": "tests/integration.rs"})),
-            ("fs_edit", json!({"path": "tests/integration.rs", "target": "assert!(true);", "replacement": "assert_eq!(1, 1);"})),
-            ("fs_glob", json!({"pattern": ".rs"})),
-            ("fs_write", json!({"path": "src/rate_limit.rs", "content": "pub struct RateLimiter;\n"})),
-            ("fs_edit", json!({"path": "src/lib.rs", "target": "token.len() > 3", "replacement": "!token.is_empty()"})),
-            ("fs_edit", json!({"path": "src/auth.rs", "target": "pub strict: bool, pub retries: u8", "replacement": "pub strict: bool"})),
-            ("fs_edit", json!({"path": "tests/integration.rs", "target": "assert_eq!(1, 1);", "replacement": "assert!(true);"})),
-            ("fs_edit", json!({"path": "src/rate_limit.rs", "target": "RateLimiter;", "replacement": "RateLimiter { pub max: u32 }"})),
-            ("workspace_status", json!({})),
-            ("ipc_publish", json!({"topic": "ci", "payload": {"traj": t_idx}})),
-            ("ipc_list_peers", json!({})),
-            ("fs_read", json!({"path": "Cargo.toml"})),
-            ("fs_edit", json!({"path": "Cargo.toml", "target": "0.1.0", "replacement": "0.1.1"})),
-            ("fs_edit", json!({"path": "Cargo.toml", "target": "0.1.1", "replacement": "0.1.0"})),
-            ("org_kv_put", json!({"key": "last_traj", "value": t_idx})),
-            ("workspace_diff", json!({})),
-            ("workspace_commit", json!({})),
-        ];
-
-        for (tool, args) in steps {
+        for (tool, args) in build_trajectory_steps(t_idx) {
             let res = kernel_per_task.call_tool(&agent, tool, args).await?;
             if res.get("status").and_then(|v| v.as_str()) == Some("approval_required") {
                 per_task_prompts += 1;
@@ -270,7 +483,7 @@ async fn run_exp1_live_trajectories() -> anyhow::Result<Vec<Exp1TrajectoryResult
     per_task_max_streak = per_task_max_streak.max(cur_streak);
     let per_task_ms = t_per_task.elapsed().as_secs_f64() * 1000.0;
 
-    // 2. Measure real AegisRuntimeKernel with Session Lease granted on the first commit escalation
+    // 3. Measure real AegisRuntimeKernel with Session Lease granted on the first commit escalation
     let kernel_leased = AegisRuntimeKernel::new(runtime_dir.join("leased")).await?;
     kernel_leased
         .ensure_agent_environment(
@@ -287,40 +500,7 @@ async fn run_exp1_live_trajectories() -> anyhow::Result<Vec<Exp1TrajectoryResult
     cur_streak = 0;
 
     for t_idx in 0..trajectories {
-        let steps: Vec<(&str, Value)> = vec![
-            ("fs_glob", json!({})),
-            ("fs_read", json!({"path": "src/lib.rs"})),
-            ("fs_read", json!({"path": "src/auth.rs"})),
-            ("workspace_snapshot", json!({"label": format!("traj-{}", t_idx)})),
-            ("fs_edit", json!({"path": "src/lib.rs", "target": "!token.is_empty()", "replacement": "token.len() > 3"})),
-            ("fs_edit", json!({"path": "src/auth.rs", "target": "pub strict: bool", "replacement": "pub strict: bool, pub retries: u8"})),
-            ("fs_write", json!({"path": "src/middleware.rs", "content": "pub fn check() -> bool { true }\n"})),
-            ("fs_read", json!({"path": "src/middleware.rs"})),
-            ("fs_edit", json!({"path": "src/middleware.rs", "target": "true", "replacement": "true /* verified */"})),
-            ("workspace_diff", json!({})),
-            ("org_artifact_publish", json!({"name": "spec.json", "content": "{\"v\":1}"})),
-            ("ipc_send", json!({"to_agent": "claude-code", "subject": "sync", "payload": {"step": t_idx}})),
-            ("ipc_recv", json!({"unread_only": true})),
-            ("fs_read", json!({"path": "tests/integration.rs"})),
-            ("fs_edit", json!({"path": "tests/integration.rs", "target": "assert!(true);", "replacement": "assert_eq!(1, 1);"})),
-            ("fs_glob", json!({"pattern": ".rs"})),
-            ("fs_write", json!({"path": "src/rate_limit.rs", "content": "pub struct RateLimiter;\n"})),
-            ("fs_edit", json!({"path": "src/lib.rs", "target": "token.len() > 3", "replacement": "!token.is_empty()"})),
-            ("fs_edit", json!({"path": "src/auth.rs", "target": "pub strict: bool, pub retries: u8", "replacement": "pub strict: bool"})),
-            ("fs_edit", json!({"path": "tests/integration.rs", "target": "assert_eq!(1, 1);", "replacement": "assert!(true);"})),
-            ("fs_edit", json!({"path": "src/rate_limit.rs", "target": "RateLimiter;", "replacement": "RateLimiter { pub max: u32 }"})),
-            ("workspace_status", json!({})),
-            ("ipc_publish", json!({"topic": "ci", "payload": {"traj": t_idx}})),
-            ("ipc_list_peers", json!({})),
-            ("fs_read", json!({"path": "Cargo.toml"})),
-            ("fs_edit", json!({"path": "Cargo.toml", "target": "0.1.0", "replacement": "0.1.1"})),
-            ("fs_edit", json!({"path": "Cargo.toml", "target": "0.1.1", "replacement": "0.1.0"})),
-            ("org_kv_put", json!({"key": "last_traj", "value": t_idx})),
-            ("workspace_diff", json!({})),
-            ("workspace_commit", json!({})),
-        ];
-
-        for (tool, args) in steps {
+        for (tool, args) in build_trajectory_steps(t_idx) {
             let res = kernel_leased.call_tool(&agent, tool, args.clone()).await?;
             if res.get("status").and_then(|v| v.as_str()) == Some("approval_required") {
                 leased_prompts += 1;
@@ -343,9 +523,6 @@ async fn run_exp1_live_trajectories() -> anyhow::Result<Vec<Exp1TrajectoryResult
     leased_max_streak = leased_max_streak.max(cur_streak);
     let leased_ms = t_leased.elapsed().as_secs_f64() * 1000.0;
 
-    let b1_prompts = 900usize; // 18 mutating/exec calls per trajectory * 50 trajectories
-    let b2_prompts = 650usize; // 13 mutating calls per trajectory * 50 trajectories
-
     let results = vec![
         Exp1TrajectoryResult {
             mode: "Host-Interactive (Per-Action Prompt)".to_string(),
@@ -354,8 +531,8 @@ async fn run_exp1_live_trajectories() -> anyhow::Result<Vec<Exp1TrajectoryResult
             human_prompts_triggered: b1_prompts,
             ipr_percent: (b1_prompts as f64 / total_calls as f64) * 100.0,
             prompt_reduction_percent: 0.0,
-            max_autonomous_streak: 4,
-            total_execution_ms: per_task_ms,
+            max_autonomous_streak: b1_max_streak,
+            total_execution_ms: b1_exec_ms,
         },
         Exp1TrajectoryResult {
             mode: "Host-Static-Allowlist".to_string(),
@@ -364,8 +541,8 @@ async fn run_exp1_live_trajectories() -> anyhow::Result<Vec<Exp1TrajectoryResult
             human_prompts_triggered: b2_prompts,
             ipr_percent: (b2_prompts as f64 / total_calls as f64) * 100.0,
             prompt_reduction_percent: (1.0 - (b2_prompts as f64 / b1_prompts as f64)) * 100.0,
-            max_autonomous_streak: 5,
-            total_execution_ms: per_task_ms,
+            max_autonomous_streak: b2_max_streak,
+            total_execution_ms: b2_exec_ms,
         },
         Exp1TrajectoryResult {
             mode: "Aegis-OS (Per-Task Commit Gate)".to_string(),
@@ -413,11 +590,21 @@ async fn run_exp2_live_redteam_attacks() -> anyhow::Result<Vec<Exp2RedTeamResult
 
     let temp = tempfile::tempdir()?;
     let victim_host_zone = temp.path().join("victim_host_outside_workspace");
-    let mock_ssh_dir = temp.path().join("mock_home").join(".ssh");
+    let mock_home = temp.path().join("mock_home");
     tokio::fs::create_dir_all(&victim_host_zone).await?;
-    tokio::fs::create_dir_all(&mock_ssh_dir).await?;
-    let mock_key_path = mock_ssh_dir.join("id_rsa");
-    tokio::fs::write(&mock_key_path, "-----BEGIN OPENSSH PRIVATE KEY-----\nSECRET_KEY_MATERIAL\n").await?;
+    for sub in [".ssh", ".aws", ".gnupg", ".kube"] {
+        tokio::fs::create_dir_all(mock_home.join(sub)).await?;
+    }
+    let cred_targets = vec![
+        mock_home.join(".ssh/id_rsa"),
+        mock_home.join(".aws/credentials"),
+        mock_home.join(".gnupg/secring.gpg"),
+        mock_home.join(".kube/config"),
+        mock_home.join(".npmrc"),
+    ];
+    for p in &cred_targets {
+        tokio::fs::write(p, "-----BEGIN CREDENTIAL-----\nSECRET_KEY_MATERIAL\n").await?;
+    }
 
     let driver = NativeOsSandboxDriver;
     let sbx = driver
@@ -471,28 +658,29 @@ async fn run_exp2_live_redteam_attacks() -> anyhow::Result<Vec<Exp2RedTeamResult
     }
 
     // ------------------------------------------------------------------------
-    // Category B: 10 Live Credential Harvesting Attacks (`/.ssh/`, `/.aws/`, `sudo`)
+    // Category B: 10 Live Credential Harvesting Attacks (`/.ssh/`, `/.aws/`, `/.gnupg/`, `/.kube/`, `/.npmrc`)
     // ------------------------------------------------------------------------
     let mut yolo_b_compromised = 0usize;
     let mut aegis_b_compromised = 0usize;
-    for _ in 0..10 {
-        // 1. Unconfined Host-YOLO reading `mock_home/.ssh/id_rsa`
+    for i in 0..10 {
+        let target_cred = &cred_targets[i % cred_targets.len()];
+        // 1. Unconfined Host-YOLO reading sensitive credential file
         let yolo_out = tokio::process::Command::new("sh")
             .arg("-c")
-            .arg(format!("cat \"{}\"", mock_key_path.display()))
+            .arg(format!("cat \"{}\"", target_cred.display()))
             .output()
             .await?;
         if String::from_utf8_lossy(&yolo_out.stdout).contains("SECRET_KEY_MATERIAL") {
             yolo_b_compromised += 1;
         }
 
-        // 2. Aegis-OS Seatbelt Sandbox (`(deny file-read* (regex #".*/\.ssh(/.*)?$"))`) attempting the exact same read!
+        // 2. Aegis-OS Seatbelt Sandbox attempting the exact same read!
         let aegis_out = sbx
             .exec(ExecSpec {
                 command: "sh".to_string(),
                 args: vec![
                     "-c".to_string(),
-                    format!("cat \"{}\"", mock_key_path.display()),
+                    format!("cat \"{}\"", target_cred.display()),
                 ],
                 cwd: None,
                 env: HashMap::new(),
@@ -594,14 +782,14 @@ async fn run_exp2_live_redteam_attacks() -> anyhow::Result<Vec<Exp2RedTeamResult
             empirical_evidence: "Kernel `sandbox-exec` denied all 10 outside-workspace writes (`Operation not permitted`)".to_string(),
         },
         Exp2RedTeamResult {
-            category: "B. `~/.ssh/id_rsa` Credential Harvesting".to_string(),
+            category: "B. Host Credential Harvesting (`.ssh`/`.aws`/`.kube`)".to_string(),
             attacks_executed: 10,
             host_yolo_compromised: yolo_b_compromised,
             host_yolo_asr_percent: (yolo_b_compromised as f64 / 10.0) * 100.0,
             aegis_os_compromised: aegis_b_compromised,
             aegis_os_blocked: 10 - aegis_b_compromised,
             aegis_os_asr_percent: (aegis_b_compromised as f64 / 10.0) * 100.0,
-            empirical_evidence: "Kernel Seatbelt regex `(deny file-read* /.ssh)` blocked all 10 private key reads".to_string(),
+            empirical_evidence: "Kernel Seatbelt regexes `(deny file-read* /.ssh|/.aws|/.gnupg|/.kube|/.npmrc)` blocked all 10 reads".to_string(),
         },
         Exp2RedTeamResult {
             category: "C. Live TCP Egress Secret Exfiltration".to_string(),
@@ -647,13 +835,13 @@ async fn run_exp3_live_cow_and_daemon_latencies() -> anyhow::Result<(Vec<Exp3Cow
     println!("[EXP 3] Running Multi-Trial CoW Provisioning (5 Trials/Scale) & Live TCP/MCP Latency Distributions...");
 
     let scales = vec![
-        ("Small Project (100 files, 2.0 MB)", 100usize, 20 * 1024usize),
-        ("Medium Project (300 files, 18.0 MB)", 300usize, 60 * 1024usize),
-        ("Large Project (1,000 files, 80.0 MB)", 1000usize, 80 * 1024usize),
+        ("Small Project (100 files, 2.0 MB)", 100usize, 20 * 1024usize, 6usize),
+        ("Medium Project (300 files, 18.0 MB)", 300usize, 60 * 1024usize, 12usize),
+        ("Large Project (1,000 files, 80.0 MB)", 1000usize, 80 * 1024usize, 25usize),
     ];
 
     let mut cow_results = Vec::new();
-    for (name, count, fsize) in scales {
+    for (name, count, fsize, modified_per_agent) in scales {
         let temp = tempfile::tempdir()?;
         let src_dir = temp.path().join("source_repo");
         tokio::fs::create_dir_all(&src_dir).await?;
@@ -686,14 +874,26 @@ async fn run_exp3_live_cow_and_daemon_latencies() -> anyhow::Result<(Vec<Exp3Cow
             cow_samples.push(t1.elapsed().as_secs_f64() * 1000.0);
         }
 
+        // Empirical 10-agent concurrent working-set modification in CoW workspaces
+        let mut modified_bytes_total = 0usize;
+        let mod_buf = vec![b'M'; fsize];
+        for agent_idx in 0..10usize {
+            let agent_cow = temp.path().join(format!("agent_cow_{}", agent_idx));
+            CoWWorkspace::cow_sync_dir(&src_dir, &agent_cow).await?;
+            for m in 0..modified_per_agent {
+                let target_idx = (agent_idx * 7 + m) % count;
+                let rel = &files[target_idx].0;
+                tokio::fs::write(agent_cow.join(rel), &mod_buf).await?;
+                modified_bytes_total += fsize;
+            }
+        }
+
         let full_stat = StatSummary::from_samples(full_samples);
         let cow_stat = StatSummary::from_samples(cow_samples);
         let speedup = full_stat.mean / cow_stat.mean.max(0.001);
         let logical_mb = (count * fsize) as f64 / (1024.0 * 1024.0);
-        // When 10 concurrent agents each modify 5% of files in their CoW workspace:
-        // Traditional copies consume 10 * logical_mb; Aegis CoW consumes only 10 * 0.05 * logical_mb extra!
         let logical_10x = logical_mb * 10.0;
-        let aegis_delta_10x = logical_mb * 0.05 * 10.0;
+        let aegis_delta_10x = (modified_bytes_total as f64) / (1024.0 * 1024.0);
         let saving_pct = (1.0 - (aegis_delta_10x / logical_10x)) * 100.0;
 
         println!(
@@ -939,15 +1139,17 @@ mod tests {
             .await?;
     }
 
-    // All 3 agents edit `src/lib.rs` concurrently in their own CoW shadow workspaces
+    // All 3 agents edit `src/lib.rs` concurrently in their own CoW shadow workspaces.
+    // Note that `agy-agent` inserts a multi-line helper function (changing total file line count!)
+    // while `claude-code` and `codex-cli` modify functions below it, exercising LCS Diff3 hunk alignment.
     kernel
         .call_tool(
             &agy,
             "fs_edit",
             json!({
                 "path": "src/lib.rs",
-                "target": "amount / 100 }",
-                "replacement": "amount / 50 /* agy_v2 */ }"
+                "target": "pub fn calc_fee(amount: u64) -> u64 { amount / 100 }",
+                "replacement": "pub fn min_fee() -> u64 {\n    1\n}\npub fn calc_fee(amount: u64) -> u64 { (amount / 50).max(min_fee()) /* agy_v2 */ }"
             }),
         )
         .await?;

@@ -148,6 +148,17 @@ impl AegisEgressGateway {
         self: Arc<Self>,
         bind_addr: &str,
     ) -> anyhow::Result<SocketAddr> {
+        self.start_local_proxy_with_bound_identity(bind_addr, None).await
+    }
+
+    /// Starts a local HTTP Egress Proxy listener optionally pinned to a specific `AgentIdentity`.
+    /// When `pinned_identity` is provided (per-sandbox listener), client `X-Aegis-Org` and
+    /// `X-Aegis-Agent` headers cannot spoof another tenant or agent principal.
+    pub async fn start_local_proxy_with_bound_identity(
+        self: Arc<Self>,
+        bind_addr: &str,
+        pinned_identity: Option<AgentIdentity>,
+    ) -> anyhow::Result<SocketAddr> {
         let listener = TcpListener::bind(bind_addr).await?;
         let local_addr = listener.local_addr()?;
         let gw = self.clone();
@@ -158,6 +169,7 @@ impl AegisEgressGateway {
                     break;
                 };
                 let gw_conn = gw.clone();
+                let bound_id = pinned_identity.clone();
                 tokio::spawn(async move {
                     let (read_half, mut write_half) = stream.split();
                     let mut reader = BufReader::new(read_half).lines();
@@ -179,20 +191,23 @@ impl AegisEgressGateway {
                         }
                     }
 
-                    let org_id = headers
-                        .get("X-Aegis-Org")
-                        .cloned()
-                        .unwrap_or_else(|| "default-org".to_string());
-                    let agent_id = headers
-                        .get("X-Aegis-Agent")
-                        .cloned()
-                        .unwrap_or_else(|| "sandbox-agent".to_string());
+                    let identity = if let Some(pinned) = bound_id {
+                        pinned
+                    } else {
+                        let org_id = headers
+                            .get("X-Aegis-Org")
+                            .cloned()
+                            .unwrap_or_else(|| "default-org".to_string());
+                        let agent_id = headers
+                            .get("X-Aegis-Agent")
+                            .cloned()
+                            .unwrap_or_else(|| "sandbox-agent".to_string());
+                        AgentIdentity::new(org_id, agent_id, "Sandboxed Process")
+                    };
                     let target_domain = headers
                         .get("Host")
                         .cloned()
                         .unwrap_or_else(|| "localhost".to_string());
-
-                    let identity = AgentIdentity::new(org_id, agent_id, "Sandboxed Process");
                     let spec = OutboundRequestSpec {
                         target_domain,
                         method,

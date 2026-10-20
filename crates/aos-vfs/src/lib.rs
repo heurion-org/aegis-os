@@ -194,10 +194,59 @@ impl CoWWorkspace {
         hex::encode(hasher.finalize())
     }
 
-    /// Performs a line-level 3-Way Merge between:
+    /// Computes edit hunks transforming `base` lines into `target` lines via Longest Common Subsequence (LCS).
+    /// Each hunk represents replacing `base[base_start..base_end]` with `replacement`.
+    fn compute_lcs_diff_hunks<'a>(
+        base: &[&'a str],
+        target: &[&'a str],
+    ) -> Vec<(usize, usize, Vec<&'a str>)> {
+        let n = base.len();
+        let m = target.len();
+        let mut dp = vec![vec![0usize; m + 1]; n + 1];
+        for i in (0..n).rev() {
+            for j in (0..m).rev() {
+                if base[i] == target[j] {
+                    dp[i][j] = 1 + dp[i + 1][j + 1];
+                } else {
+                    dp[i][j] = dp[i + 1][j].max(dp[i][j + 1]);
+                }
+            }
+        }
+
+        let mut anchors = Vec::new();
+        let (mut i, mut j) = (0usize, 0usize);
+        while i < n && j < m {
+            if base[i] == target[j] {
+                anchors.push((i, j));
+                i += 1;
+                j += 1;
+            } else if dp[i + 1][j] >= dp[i][j + 1] {
+                i += 1;
+            } else {
+                j += 1;
+            }
+        }
+        anchors.push((n, m));
+
+        let mut hunks = Vec::new();
+        let mut prev_b = 0usize;
+        let mut prev_t = 0usize;
+        for (curr_b, curr_t) in anchors {
+            if curr_b > prev_b || curr_t > prev_t {
+                hunks.push((prev_b, curr_b, target[prev_t..curr_t].to_vec()));
+            }
+            prev_b = curr_b + 1;
+            prev_t = curr_t + 1;
+        }
+        hunks
+    }
+
+    /// Performs a general LCS/Diff3 3-Way Merge between:
     /// - `base`: The baseline file content when this Agent's CoW workspace was initialized
     /// - `theirs` (`host_current`): The current file content on the host (potentially modified by another Agent!)
     /// - `ours` (`shadow_new`): The modified file content inside this Agent's CoW shadow workspace
+    ///
+    /// Supports arbitrary non-overlapping line insertions, deletions, and replacements.
     pub fn three_way_merge_lines(
         base: &str,
         theirs: &str,
@@ -214,71 +263,81 @@ impl CoWWorkspace {
         let their_lines: Vec<&str> = theirs.lines().collect();
         let our_lines: Vec<&str> = ours.lines().collect();
 
-        // When line counts match the baseline, perform line-by-line non-overlapping resolution
-        if base_lines.len() == their_lines.len() && base_lines.len() == our_lines.len() {
-            let mut merged = Vec::with_capacity(base_lines.len());
-            for i in 0..base_lines.len() {
-                let b = base_lines[i];
-                let t = their_lines[i];
-                let o = our_lines[i];
+        let their_hunks = Self::compute_lcs_diff_hunks(&base_lines, &their_lines);
+        let our_hunks = Self::compute_lcs_diff_hunks(&base_lines, &our_lines);
 
-                if t == b && o == b {
-                    merged.push(b);
-                } else if t == b && o != b {
-                    merged.push(o);
-                } else if o == b && t != b {
-                    merged.push(t);
-                } else if o == t {
-                    merged.push(o);
-                } else {
-                    return Err(format!(
-                        "3-Way Merge Conflict at line {}: Host has `{}`, Agent Shadow has `{}` (Baseline was `{}`)",
-                        i + 1,
-                        t,
-                        o,
-                        b
-                    ));
+        let mut merged: Vec<&str> = Vec::new();
+        let mut b_pos = 0usize;
+        let mut ti = 0usize;
+        let mut oi = 0usize;
+
+        while ti < their_hunks.len() || oi < our_hunks.len() {
+            match (their_hunks.get(ti), our_hunks.get(oi)) {
+                (Some(th), None) => {
+                    merged.extend_from_slice(&base_lines[b_pos..th.0]);
+                    merged.extend_from_slice(&th.2);
+                    b_pos = th.1;
+                    ti += 1;
                 }
+                (None, Some(oh)) => {
+                    merged.extend_from_slice(&base_lines[b_pos..oh.0]);
+                    merged.extend_from_slice(&oh.2);
+                    b_pos = oh.1;
+                    oi += 1;
+                }
+                (Some(th), Some(oh)) => {
+                    // Check if `th` is strictly before `oh` without overlapping
+                    let th_before_oh = if th.0 == th.1 && oh.0 == oh.1 {
+                        th.0 < oh.0
+                    } else {
+                        th.1 <= oh.0 && (th.0 < oh.0 || th.1 < oh.1)
+                    };
+                    let oh_before_th = if th.0 == th.1 && oh.0 == oh.1 {
+                        oh.0 < th.0
+                    } else {
+                        oh.1 <= th.0 && (oh.0 < th.0 || oh.1 < th.1)
+                    };
+
+                    if th_before_oh {
+                        merged.extend_from_slice(&base_lines[b_pos..th.0]);
+                        merged.extend_from_slice(&th.2);
+                        b_pos = th.1;
+                        ti += 1;
+                    } else if oh_before_th {
+                        merged.extend_from_slice(&base_lines[b_pos..oh.0]);
+                        merged.extend_from_slice(&oh.2);
+                        b_pos = oh.1;
+                        oi += 1;
+                    } else if th.0 == oh.0 && th.1 == oh.1 && th.2 == oh.2 {
+                        // Identical change in both `theirs` and `ours` (False conflict)
+                        merged.extend_from_slice(&base_lines[b_pos..th.0]);
+                        merged.extend_from_slice(&th.2);
+                        b_pos = th.1;
+                        ti += 1;
+                        oi += 1;
+                    } else {
+                        let conflict_line = th.0.min(oh.0) + 1;
+                        return Err(format!(
+                            "3-Way Merge Conflict at line {}: Host has `{}`, Agent Shadow has `{}`",
+                            conflict_line,
+                            th.2.join("\\n"),
+                            oh.2.join("\\n")
+                        ));
+                    }
+                }
+                (None, None) => break,
             }
-            let mut result = merged.join("\n");
-            if ours.ends_with('\n') || theirs.ends_with('\n') {
-                result.push('\n');
-            }
-            return Ok(result);
         }
 
-        // If `theirs` only appended lines to `base`, and `ours` modified existing lines (or vice versa):
-        if their_lines.len() > base_lines.len() && our_lines.len() == base_lines.len() {
-            let their_prefix = &their_lines[..base_lines.len()].join("\n");
-            if let Ok(merged_prefix) = Self::three_way_merge_lines(base.trim_end(), their_prefix, ours.trim_end()) {
-                let mut full = merged_prefix;
-                for extra in &their_lines[base_lines.len()..] {
-                    full.push('\n');
-                    full.push_str(extra);
-                }
-                if theirs.ends_with('\n') {
-                    full.push('\n');
-                }
-                return Ok(full);
-            }
+        if b_pos < base_lines.len() {
+            merged.extend_from_slice(&base_lines[b_pos..]);
         }
 
-        if our_lines.len() > base_lines.len() && their_lines.len() == base_lines.len() {
-            let our_prefix = &our_lines[..base_lines.len()].join("\n");
-            if let Ok(merged_prefix) = Self::three_way_merge_lines(base.trim_end(), theirs.trim_end(), our_prefix) {
-                let mut full = merged_prefix;
-                for extra in &our_lines[base_lines.len()..] {
-                    full.push('\n');
-                    full.push_str(extra);
-                }
-                if ours.ends_with('\n') {
-                    full.push('\n');
-                }
-                return Ok(full);
-            }
+        let mut result = merged.join("\n");
+        if ours.ends_with('\n') || theirs.ends_with('\n') {
+            result.push('\n');
         }
-
-        Err("3-Way Merge Conflict: concurrent structural line insertions/deletions on the same file".to_string())
+        Ok(result)
     }
 }
 
@@ -872,6 +931,16 @@ mod tests {
             .unwrap_err()
             .to_string()
             .contains("3-Way Merge Conflict at line 1"));
+
+        // Verify LCS Diff3 multi-line insertion + deletion + modification across unequal line counts!
+        let base_src = "fn a() {\n    let x = 1;\n}\nfn b() {\n    let y = 2;\n}\n";
+        let their_src = "fn a() {\n    // inserted comment 1\n    // inserted comment 2\n    let x = 10;\n}\nfn b() {\n    let y = 2;\n}\n";
+        let our_src = "fn a() {\n    let x = 1;\n}\nfn b() {\n    let y = 20;\n    let z = 30;\n}\n";
+        let merged_src = CoWWorkspace::three_way_merge_lines(base_src, their_src, our_src).unwrap();
+        assert_eq!(
+            merged_src,
+            "fn a() {\n    // inserted comment 1\n    // inserted comment 2\n    let x = 10;\n}\nfn b() {\n    let y = 20;\n    let z = 30;\n}\n"
+        );
     }
 
     #[tokio::test]

@@ -50,14 +50,14 @@
 \maketitle
 
 \begin{abstract}
-Autonomous coding agents such as Google Antigravity (\texttt{agy}), Anthropic Claude Code (\texttt{claude}), and OpenAI Codex CLI (\texttt{codex}) increasingly execute complex, multi-step software engineering workflows directly on developer workstations and enterprise cloud hosts. However, existing agent execution environments suffer from a fundamental \emph{Security--Autonomy Dilemma}: users must choose between \emph{Interactive Per-Action Prompting}, which interrupts human operators on 43\%--60\% of tool invocations and induces severe authorization fatigue, or \emph{Unconfined Host Execution} (\texttt{--yolo} / \texttt{--dangerously-skip-permissions}), which exposes the host filesystem, SSH credentials, and API secrets to catastrophic prompt injection and agent hallucination risks. Furthermore, when multiple heterogeneous agents collaborate on a shared repository, concurrent unconstrained edits cause race-condition file clobbering, while passing large code artifacts inline through LLM context windows incurs prohibitive token overhead.
+Autonomous coding agents such as Google Antigravity (\texttt{agy}), Anthropic Claude Code (\texttt{claude}), and OpenAI Codex CLI (\texttt{codex}) increasingly execute complex, multi-step software engineering workflows directly on developer workstations and enterprise cloud hosts. However, existing agent execution environments suffer from a fundamental \emph{Security--Autonomy Dilemma}: users must choose between \emph{Interactive Per-Action Prompting}, which interrupts human operators on 45\%--57\% of tool invocations and induces severe authorization fatigue, or \emph{Unconfined Host Execution} (\texttt{--yolo} / \texttt{--dangerously-skip-permissions}), which exposes the host filesystem, SSH/cloud credentials, and API secrets to catastrophic prompt injection and agent hallucination risks. Furthermore, when multiple heterogeneous agents collaborate on a shared repository, concurrent unconstrained edits cause race-condition file clobbering, while passing large code artifacts inline through LLM context windows incurs prohibitive token overhead.
 
-We present \textbf{Aegis OS} (\texttt{aegis-os}), a transactional, multi-tenant Agent Operating System Runtime implemented in Rust and exposed via the Model Context Protocol (MCP). Aegis OS resolves the Security--Autonomy Dilemma by shifting the security boundary from individual tool invocations to \emph{transactional workspace boundaries}. Each agent principal operates inside a kernel-enforced OS sandbox (macOS Seatbelt \texttt{sandbox-exec} or Linux Bubblewrap/MicroVM) backed by an APFS Copy-on-Write (CoW) shadow workspace (\texttt{libc::clonefile}), a Zero-Trust HTTP Egress Proxy with boundary secret injection, and an intra-organization Inter-Agent Communication (IPC) bus paired with Content-Addressable Storage (CAS). Inside its isolated CoW workspace and organization IPC bus, an agent executes with \emph{zero confirmation prompts}; human authorization or TTL-based session leases are required only when committing validated diffs back to the host via a 3-Way Merge Engine. Across 1,500 live kernel syscalls and 40 live red-team attacks, Aegis OS reduces human confirmation prompts by \textbf{94.44\%--99.89\%} (saving up to \textbf{74.9 minutes} of human verification wait time), lowers the attack success rate from \textbf{100.0\% to 0.0\%}, provisions 1,000-file (78.1 MB) workspaces in \textbf{5.62 ms} (\textbf{18.0$\times$ faster} than full copy with \textbf{95.0\% storage savings}), preserves \textbf{100\% of concurrent multi-agent edits} while catching \textbf{10/10 overlapping line conflicts}, and reduces cross-agent artifact handoff token consumption by \textbf{99.85\%}.
+We present \textbf{Aegis OS} (\texttt{aegis-os}), a transactional, multi-tenant Agent Operating System Runtime implemented in Rust and exposed via the Model Context Protocol (MCP). Aegis OS resolves the Security--Autonomy Dilemma by shifting the security boundary from individual tool invocations to \emph{transactional workspace boundaries}. Each agent principal operates inside a kernel-enforced OS sandbox (macOS Seatbelt \texttt{sandbox-exec} or Linux Bubblewrap/MicroVM) backed by an APFS Copy-on-Write (CoW) shadow workspace (\texttt{libc::clonefile}), a Zero-Trust HTTP Egress Proxy with boundary secret injection, and an intra-organization Inter-Agent Communication (IPC) bus paired with Content-Addressable Storage (CAS). Inside its isolated CoW workspace and organization IPC bus, an agent executes with \emph{zero confirmation prompts}; human authorization or TTL-based session leases are required only when committing validated diffs back to the host via an LCS-based Diff3 3-Way Merge Engine. Across 1,500 live kernel syscalls spanning five software engineering trajectory classes and 40 live red-team attacks, Aegis OS reduces human confirmation prompts by \textbf{94.19\%--99.88\%} (saving up to \textbf{71.6 minutes} of human verification wait time), lowers the attack success rate from \textbf{100.0\% to 0.0\%}, provisions 1,000-file (78.1 MB) workspaces in \textbf{5.75 ms} (\textbf{17.1$\times$ faster} than full copy with \textbf{94.0\%--97.5\% storage savings}), preserves \textbf{100\% of concurrent multi-agent edits} (including structural multi-line insertions) while catching \textbf{10/10 overlapping line conflicts}, and reduces cross-agent artifact handoff token consumption by \textbf{99.85\%}.
 \end{abstract}
 
 \section{Introduction}
 
-The paradigm of AI-assisted software engineering has shifted rapidly from passive single-line code completion to autonomous, long-horizon coding agents---exemplified by Google Antigravity (\texttt{agy}), Anthropic Claude Code (\texttt{claude}), and OpenAI Codex CLI (\texttt{codex})~\cite{jimenez2024swebench,anthropic2024mcp}. Unlike chat assistants, autonomous coding agents iteratively explore repositories, modify source files across multiple modules, invoke compilers and test suites, query external APIs, and delegate subtasks to peer agents.
+The paradigm of AI-assisted software engineering has shifted rapidly from passive single-line code completion to autonomous, long-horizon coding agents---exemplified by Google Antigravity (\texttt{agy}), Anthropic Claude Code (\texttt{claude}), OpenAI Codex CLI (\texttt{codex}), SWE-agent~\cite{yang2024sweagent}, and OpenHands~\cite{wang2025openhands}. Unlike chat assistants, autonomous coding agents iteratively explore repositories, modify source files across multiple modules, invoke compilers and test suites, query external APIs, and delegate subtasks to peer agents~\cite{jimenez2024swebench,anthropic2024mcp}.
 
 Despite rapid advances in foundation model reasoning, the underlying execution substrate for coding agents remains dangerously primitive. Current agent CLIs execute directly as standard user processes on the developer's host operating system. Because every file mutation (\texttt{fs\_write}, \texttt{fs\_edit}) and shell command (\texttt{proc\_exec}) carries irreversible side effects on the host machine, agent frameworks enforce safety through \emph{action-level human-in-the-loop (HITL) confirmation prompts}.
 
@@ -66,12 +66,12 @@ Despite rapid advances in foundation model reasoning, the underlying execution s
 In practice, action-level prompting breaks down under realistic software engineering workloads due to three systemic limitations:
 
 \begin{enumerate}
-    \item \textbf{Severe Authorization Fatigue:} A typical 30-step bug-fix trajectory involves 15 to 20 mutating or process-spawning actions. Prompting the developer on nearly every step destroys autonomous workflow continuity (limiting the maximum autonomous streak to 4--5 actions) and trains users to reflexively click ``Approve'' without inspecting arguments.
-    \item \textbf{Catastrophic Risk of ``YOLO'' Mode:} Frustrated by constant interruptions, developers routinely enable bypass flags such as \texttt{--dangerously-skip-permissions} or \texttt{--yolo}. In this unconfined mode, a single indirect prompt injection~\cite{greshake2023not,debenedetti2024agentdojo,zhan2024injecagent} embedded in a third-party dependency, issue description, or web page can silently overwrite files outside the repository, harvest \texttt{\textasciitilde/.ssh/id\_rsa} private keys, or exfiltrate production API tokens (\texttt{\$GITHUB\_TOKEN}, \texttt{\$OPENAI\_API\_KEY}) to attacker-controlled endpoints.
-    \item \textbf{Multi-Agent Workspace Collisions and Context Bloat:} Developers increasingly run multiple specialized agents in parallel (e.g., \texttt{agy} as Lead Architect, \texttt{claude} as Backend Specialist, and \texttt{codex} as Test Engineer). When operating on a shared host directory, concurrent file writes clobber one another's changes, leaving the repository in an uncompilable state. Moreover, lacking an OS-level Inter-Process Communication (IPC) and shared memory mechanism, agents pass large specifications and diffs inline through JSON/text messages, exhausting LLM context windows.
+    \item \textbf{Severe Authorization Fatigue:} A typical 30-step bug-fix, refactoring, or security-audit trajectory involves 15 to 20 mutating or process-spawning actions. Prompting the developer on nearly every step destroys autonomous workflow continuity (limiting the maximum autonomous streak to 4--7 actions) and trains users to reflexively click ``Approve'' without inspecting arguments.
+    \item \textbf{Catastrophic Risk of ``YOLO'' Mode:} Frustrated by constant interruptions, developers routinely enable bypass flags such as \texttt{--dangerously-skip-permissions} or \texttt{--yolo}. In this unconfined mode, a single indirect prompt injection~\cite{greshake2023not,debenedetti2024agentdojo,zhan2024injecagent} embedded in a third-party dependency, issue description, or web page can silently overwrite files outside the repository, harvest \texttt{\textasciitilde/.ssh/id\_rsa}, \texttt{\textasciitilde/.aws/credentials}, or \texttt{\textasciitilde/.kube/config} credentials, or exfiltrate production API tokens (\texttt{\$GITHUB\_TOKEN}, \texttt{\$OPENAI\_API\_KEY}) to attacker-controlled endpoints.
+    \item \textbf{Multi-Agent Workspace Collisions and Context Bloat:} Developers increasingly run multiple specialized agents in parallel (e.g., \texttt{agy} as Lead Architect, \texttt{claude} as Backend Specialist, and \texttt{codex} as Test Engineer)~\cite{wu2023autogen,hong2024metagpt}. When operating on a shared host directory, concurrent file writes clobber one another's changes, leaving the repository in an uncompilable state. Moreover, lacking an OS-level Inter-Process Communication (IPC) and shared memory mechanism, agents pass large specifications and diffs inline through JSON/text messages, exhausting LLM context windows.
 \end{enumerate}
 
-\begin{table*}[t]
+\begin{table*}[!t]
 \centering
 \caption{\textbf{Comparison of Agent Execution Substrates} across security guarantees, authorization friction, workspace overhead, and multi-agent collaboration primitives.}
 \label{tab:substrates}
@@ -79,13 +79,13 @@ In practice, action-level prompting breaks down under realistic software enginee
 \resizebox{\textwidth}{!}{%
 \begin{tabular}{lccccccc}
 \toprule
-\textbf{Execution Substrate} & \textbf{Startup Latency} & \textbf{$N$-Agent Disk Cost} & \textbf{Prompt Rate (IPR)} & \textbf{\texttt{\textasciitilde/.ssh} Kernel MAC} & \textbf{Boundary Secret Inject} & \textbf{Live 3-Way Host Merge} & \textbf{Native IPC + CAS} \\
+\textbf{Execution Substrate} & \textbf{Startup Latency} & \textbf{$N$-Agent Disk Cost} & \textbf{Prompt Rate (IPR)} & \textbf{Credential Kernel MAC} & \textbf{Boundary Secret Inject} & \textbf{Live 3-Way Host Merge} & \textbf{Native IPC + CAS} \\
 \midrule
-Host-Interactive (Default CLI) & $\sim$0 ms & $O(1)$ (Shared Host) & High (43\%--60\%) & $\times$ (User Prompt Only) & $\times$ (Raw Env Vars) & $\times$ (Direct Overwrite) & $\times$ \\
+Host-Interactive (Default CLI) & $\sim$0 ms & $O(1)$ (Shared Host) & High (45\%--57\%) & $\times$ (User Prompt Only) & $\times$ (Raw Env Vars) & $\times$ (Direct Overwrite) & $\times$ \\
 Host-YOLO (\texttt{--skip-permissions}) & $\sim$0 ms & $O(1)$ (Shared Host) & 0.0\% & $\times$ (100\% Exposed) & $\times$ (100\% Exposed) & $\times$ (Silent Clobber) & $\times$ \\
-Container-per-Agent (Docker)~\cite{jimenez2024swebench} & 1,500--5,000 ms & $O(N \cdot \text{Image})$ & Low & $\checkmark$ (Container NS) & $\times$ (Env Inside Container) & $\times$ (Isolated Volume) & $\times$ \\
+Container-per-Agent (Docker)~\cite{jimenez2024swebench,wang2025openhands} & 1,500--5,000 ms & $O(N \cdot \text{Image})$ & Low & $\checkmark$ (Container NS) & $\times$ (Env Inside Container) & $\times$ (Isolated Volume) & $\times$ \\
 AIOS (LLM Scheduler Kernel)~\cite{mei2024aios} & $\sim$50 ms & $O(1)$ (Shared Host) & Medium & $\times$ (No OS MAC) & $\times$ (No Egress Proxy) & $\times$ (No CoW Merge) & Partial \\
-\textbf{Aegis OS (Ours)} & \textbf{0.6--7.8 ms} & $\mathbf{O(\Delta \text{\textbf{ Modified}})}$ & \textbf{0.07\%--3.33\%} & $\mathbf{\checkmark}$ (\texttt{sandbox-exec}/\texttt{bwrap}) & $\mathbf{\checkmark}$ (\texttt{\$AOS\_SECRET\_*}) & $\mathbf{\checkmark}$ (\texttt{three\_way\_merge}) & $\mathbf{\checkmark}$ (\texttt{aos-ipc}) \\
+\textbf{Aegis OS (Ours)} & \textbf{0.68--5.75 ms} & $\mathbf{O(\Delta \text{\textbf{ Modified}})}$ & \textbf{0.07\%--3.33\%} & $\mathbf{\checkmark}$ (\texttt{sandbox-exec}/\texttt{bwrap}) & $\mathbf{\checkmark}$ (\texttt{\$AOS\_SECRET\_*}) & $\mathbf{\checkmark}$ (LCS Diff3 Merge) & $\mathbf{\checkmark}$ (\texttt{aos-ipc}) \\
 \bottomrule
 \end{tabular}%
 }
@@ -95,21 +95,21 @@ AIOS (LLM Scheduler Kernel)~\cite{mei2024aios} & $\sim$50 ms & $O(1)$ (Shared Ho
 
 Our key insight is that \emph{authorization prompts should not guard speculative intermediate actions inside an isolated state space; they should only guard irreversible boundary crossings into the host environment or untrusted external networks}.
 
-By analogy with hardware virtual memory and database transactions, if each agent is provisioned with (1) an instant Copy-on-Write (CoW) shadow filesystem, (2) a mandatory kernel-enforced OS sandbox that confines all spawned child processes to that shadow workspace, and (3) a local Zero-Trust Egress Proxy that strips raw credentials from the agent's environment and injects secrets only at the network boundary for allowlisted domains, then \emph{all intermediate file edits, builds, test executions, and intra-organization agent communications become safe, side-effect-free, and instantaneously reversible}. Consequently, the OS kernel can auto-allow 100\% of in-sandbox mutations with \emph{zero human prompts}, deferring human review (or TTL-based policy lease evaluation) to a single atomic \texttt{workspace\_commit} syscall (Table~\ref{tab:substrates}).
+By analogy with hardware virtual memory and database transactions~\cite{kim2013mbox,wright2004unionfs}, if each agent is provisioned with (1) an instant Copy-on-Write (CoW) shadow filesystem, (2) a mandatory kernel-enforced OS sandbox that confines all spawned child processes and outbound network sockets to that shadow workspace and local proxy, and (3) a local Zero-Trust Egress Proxy that strips raw credentials from the agent's environment and injects secrets only at the network boundary for allowlisted domains, then \emph{all intermediate file edits, builds, test executions, and intra-organization agent communications become safe, side-effect-free, and instantaneously reversible}. Consequently, the OS kernel can auto-allow 100\% of in-sandbox mutations with \emph{zero human prompts}, deferring human review (or TTL-based policy lease evaluation) to a single atomic \texttt{workspace\_commit} syscall (Table~\ref{tab:substrates}).
 
 \subsection{Contributions}
 
 We design, implement, and empirically evaluate \textbf{Aegis OS} (\texttt{aegis-os}), a pure-environment Agent Operating System Runtime written in Rust. Our main contributions are:
 
 \begin{itemize}
-    \item \textbf{Transactional CoW VFS with 3-Way Multi-Agent Merge (\S\ref{sec:vfs}):} We build \texttt{aos-vfs}, which leverages APFS directory-tree and file-level \texttt{libc::clonefile} syscalls to provision isolated shadow workspaces in milliseconds, supports $O(1)$ metadata-time snapshots and rollbacks, and integrates a line-level 3-Way Merge Engine (\texttt{three\_way\_merge\_lines}) that cleanly reconciles concurrent modifications from heterogeneous agents (\texttt{agy}, \texttt{claude}, \texttt{codex}) while detecting overlapping line conflicts.
-    \item \textbf{Dual-Tier Kernel Sandbox and Zero-Trust Egress (\S\ref{sec:sandbox}):} We implement \texttt{aos-sandbox} and \texttt{aos-egress}, enforcing mandatory access control via macOS Seatbelt (\texttt{/usr/bin/sandbox-exec}) and Linux Bubblewrap/MicroVM, paired with a live TCP HTTP Egress Proxy that performs boundary secret injection (\texttt{\$AOS\_SECRET\_*}) and blocks secret exfiltration across unauthorized domains.
+    \item \textbf{Transactional CoW VFS with LCS Diff3 3-Way Merge (\S\ref{sec:vfs}):} We build \texttt{aos-vfs}, which leverages APFS directory-tree and file-level \texttt{libc::clonefile} syscalls to provision isolated shadow workspaces in milliseconds, supports $O(1)$ metadata-time snapshots and rollbacks (while preserving incremental build caches outside the rollback tree), and integrates a Longest Common Subsequence (LCS) Diff3 3-Way Merge Engine (\texttt{three\_way\_merge\_lines})~\cite{khanna2007formal} that cleanly reconciles concurrent modifications---including multi-line structural insertions---from heterogeneous agents (\texttt{agy}, \texttt{claude}, \texttt{codex}) while detecting overlapping line conflicts.
+    \item \textbf{Dual-Tier Kernel Sandbox and Zero-Trust Egress (\S\ref{sec:sandbox}):} We implement \texttt{aos-sandbox} and \texttt{aos-egress}, enforcing mandatory access control via macOS Seatbelt (\texttt{/usr/bin/sandbox-exec} with file-write, credential-read, and outbound-network confinement) and Linux Bubblewrap (\texttt{/usr/bin/bwrap}), paired with an identity-pinned TCP HTTP Egress Proxy that performs boundary secret injection (\texttt{\$AOS\_SECRET\_*}) and blocks secret exfiltration across unauthorized domains.
     \item \textbf{First-Class Inter-Agent IPC Bus and Org CAS (\S\ref{sec:ipc}):} We design \texttt{aos-ipc}, providing P2P mailboxes, correlated RPC task handoff (\texttt{ipc\_request}/\texttt{ipc\_reply}) with tokio broadcast wakeup, topic Pub/Sub, and Content-Addressable Storage (\texttt{artifact://<org>/sha256:<hash>}) that reduces cross-agent payload tokens by 99.85\%.
-    \item \textbf{Cedar-Aligned Policy Kernel and Formal Safety Invariants (\S\ref{sec:policy}):} We formalize a four-rule authorization kernel (\texttt{aos-policy}) with TTL-based session leases, establish three formal kernel safety invariants, and build a zero-configuration installer (\texttt{aegis-os install}) that seamlessly integrates with \texttt{agy}, \texttt{claude}, and \texttt{codex} via MCP.
-    \item \textbf{Live Empirical Benchmark Suite (\S\ref{sec:eval}):} We evaluate Aegis OS across five live empirical experiments executing 1,500 real kernel syscalls, 40 live red-team OS process and TCP socket attacks, multi-scale APFS CoW stress tests, and live multi-agent Rust compilations (\texttt{cargo test} and \texttt{cargo check}).
+    \item \textbf{Cedar-Aligned Policy Kernel and Formal Safety Invariants (\S\ref{sec:policy}):} We formalize a five-stage authorization kernel (\texttt{aos-policy}) combining Ring-0 host red-line protection with TTL-based session leases~\cite{cutler2024cedar}, establish three formal kernel safety invariants, and build a zero-configuration installer (\texttt{aegis-os install}) that seamlessly integrates with \texttt{agy}, \texttt{claude}, and \texttt{codex} via MCP.
+    \item \textbf{Live Empirical Benchmark Suite (\S\ref{sec:eval}):} We evaluate Aegis OS across five live empirical experiments executing 1,500 real kernel syscalls across five task templates, 40 live red-team OS process and TCP socket attacks, multi-scale APFS CoW working-set tests, and live multi-agent Rust compilations (\texttt{cargo test} and \texttt{cargo check}).
 \end{itemize}
 
-\begin{figure*}[t]
+\begin{figure*}[!t]
 \centering
 \resizebox{\textwidth}{!}{%
 \begin{tikzpicture}[
@@ -130,17 +130,17 @@ We design, implement, and empirically evaluate \textbf{Aegis OS} (\texttt{aegis-
 
 \node[gateway, below=0.55cm of claude] (mcp) {\textbf{Aegis MCP Syscall Gateway (\texttt{aos-mcp-gateway})} --- JSON-RPC over \texttt{stdio} \& Streamable HTTP Daemon (\texttt{POST /mcp})};
 
-\node[policy, below=0.4cm of mcp] (pol) {\textbf{Cedar-Aligned Policy Kernel \& Lease Manager (\texttt{aos-policy})}\\{\scriptsize Rule 1: Cross-Tenant Deny $\mid$ Rule 2: In-Sandbox CoW \& Intra-Org IPC Auto-Allow (0 Prompts) $\mid$ Rule 3: Active TTL Lease $\mid$ Rule 4: Commit/Egress Escalation}};
+\node[policy, below=0.4cm of mcp] (pol) {\textbf{Cedar-Aligned Policy Kernel \& Lease Manager (\texttt{aos-policy})}\\{\scriptsize R0: Ring-0 Red-Line $\mid$ R1: Cross-Tenant Deny $\mid$ R2: Active TTL Lease $\mid$ R3: In-Sandbox CoW \& Intra-Org IPC Auto-Allow $\mid$ R4: Boundary Escalation}};
 
-\node[subsys, below=0.5cm of pol, xshift=-5.62cm] (vfs) {\textbf{Transactional CoW VFS}\\(\texttt{aos-vfs})\\[2pt]{\scriptsize $\bullet$ APFS \texttt{libc::clonefile}}\\[-1pt]{\scriptsize $\bullet$ $O(1)$ Snapshots \& Rollback}\\[-1pt]{\scriptsize $\bullet$ 3-Way Merge Engine}};
+\node[subsys, below=0.5cm of pol, xshift=-5.62cm] (vfs) {\textbf{Transactional CoW VFS}\\(\texttt{aos-vfs})\\[2pt]{\scriptsize $\bullet$ APFS \texttt{libc::clonefile}}\\[-1pt]{\scriptsize $\bullet$ $O(1)$ Snapshots \& Rollback}\\[-1pt]{\scriptsize $\bullet$ LCS Diff3 3-Way Merge}};
 
-\node[subsys, right=0.38cm of vfs] (sbx) {\textbf{Dual-Tier OS Sandbox}\\(\texttt{aos-sandbox})\\[2pt]{\scriptsize $\bullet$ macOS \texttt{sandbox-exec}}\\[-1pt]{\scriptsize $\bullet$ Linux \texttt{bwrap} / MicroVM}\\[-1pt]{\scriptsize $\bullet$ Blocks \texttt{\textasciitilde/.ssh} \& Escape}};
+\node[subsys, right=0.38cm of vfs] (sbx) {\textbf{Dual-Tier OS Sandbox}\\(\texttt{aos-sandbox})\\[2pt]{\scriptsize $\bullet$ macOS \texttt{sandbox-exec}}\\[-1pt]{\scriptsize $\bullet$ Linux \texttt{bwrap} / MicroVM}\\[-1pt]{\scriptsize $\bullet$ File \& Net Confinement}};
 
 \node[subsys, right=0.38cm of sbx] (ipc) {\textbf{Inter-Agent IPC \& CAS}\\(\texttt{aos-ipc} + \texttt{aos-vfs})\\[2pt]{\scriptsize $\bullet$ P2P Mailbox \& RPC}\\[-1pt]{\scriptsize $\bullet$ Broadcast Pub/Sub}\\[-1pt]{\scriptsize $\bullet$ \texttt{artifact://sha256}}};
 
-\node[subsys, right=0.38cm of ipc] (egr) {\textbf{Zero-Trust Egress Proxy}\\(\texttt{aos-egress})\\[2pt]{\scriptsize $\bullet$ Local TCP HTTP Proxy}\\[-1pt]{\scriptsize $\bullet$ Domain Allowlist}\\[-1pt]{\scriptsize $\bullet$ \texttt{\$AOS\_SECRET\_*} Inject}};
+\node[subsys, right=0.38cm of ipc] (egr) {\textbf{Zero-Trust Egress Proxy}\\(\texttt{aos-egress})\\[2pt]{\scriptsize $\bullet$ Identity-Pinned Proxy}\\[-1pt]{\scriptsize $\bullet$ Domain Allowlist}\\[-1pt]{\scriptsize $\bullet$ \texttt{\$AOS\_SECRET\_*} Inject}};
 
-\node[host, below=0.5cm of sbx, xshift=1.87cm] (hostos) {\textbf{Host OS Kernel \& Validated Project Repository} --- APFS / Btrfs Storage $\mid$ Seatbelt / Seccomp MAC $\mid$ Flight Recorder (\texttt{aos-recorder})};
+\node[host, below=0.5cm of sbx, xshift=1.87cm] (hostos) {\textbf{Host OS Kernel \& Validated Project Repository} --- APFS / Btrfs Storage $\mid$ Seatbelt / Bubblewrap MAC $\mid$ Flight Recorder (\texttt{aos-recorder})};
 
 \draw[biarrow] (agy.south) -- ([xshift=-5.5cm]mcp.north);
 \draw[biarrow] (claude.south) -- (mcp.north);
@@ -177,8 +177,8 @@ We consider a multi-agent deployment where a set of autonomous coding agents $\m
 \begin{enumerate}
     \item \textbf{Indirect Prompt Injection (T1):} Malicious instructions embedded in repository files, git commit logs, issue trackers, or web pages read by the agent~\cite{greshake2023not,debenedetti2024agentdojo}.
     \item \textbf{Host Path Escape and Tampering (T2):} Attempting to overwrite files outside the project directory (e.g., \texttt{../../etc/hosts}, \texttt{\textasciitilde/.zshrc}, or sibling repositories).
-    \item \textbf{Credential Harvesting (T3):} Attempting to read sensitive user credentials from the host home directory (\texttt{\textasciitilde/.ssh/id\_rsa}, \texttt{\textasciitilde/.aws/credentials}, \texttt{\textasciitilde/.gnupg}).
-    \item \textbf{Network Secret Exfiltration (T4):} Attempting to transmit API keys or private source code to unauthorized external domains (\texttt{evil-exfil.org}, \texttt{webhook.site}) via HTTP requests or shell tools (\texttt{curl}, \texttt{wget}).
+    \item \textbf{Credential Harvesting (T3):} Attempting to read sensitive user credentials from the host home directory (\texttt{\textasciitilde/.ssh/id\_rsa}, \texttt{\textasciitilde/.aws/credentials}, \texttt{\textasciitilde/.gnupg}, \texttt{\textasciitilde/.kube/config}, \texttt{\textasciitilde/.npmrc}, or macOS Keychains).
+    \item \textbf{Network Secret Exfiltration (T4):} Attempting to transmit API keys or private source code to unauthorized external domains (\texttt{evil-exfil.org}, \texttt{webhook.site}) via HTTP requests or shell tools (\texttt{curl --noproxy '*'}, \texttt{wget}).
     \item \textbf{Cross-Tenant Privilege Escalation (T5):} Attempting to read artifacts or send IPC instructions to an agent belonging to a different organization $o_j \neq o_i$.
     \item \textbf{Concurrent Multi-Agent Race Conditions and Hallucinated Corruption (T6):} Overwriting peer agents' concurrent edits on shared files or breaking compilation across dozens of modules during speculative refactoring.
 \end{enumerate}
@@ -200,7 +200,7 @@ where $\bar{t}_{\text{verify}}$ is the average human context-switch and inspecti
 
 Figure~\ref{fig:arch} illustrates the architecture of Aegis OS, and Table~\ref{tab:syscalls} summarizes its 22 MCP syscalls and 4 dynamic URI resources. We follow a strict \emph{``Environment Kernel Only''} design philosophy: Aegis OS does not embed LLM planners, prompt templates, or reasoning loops. Instead, it provides the operating system primitives---virtual filesystem, process isolation, network boundary proxy, inter-agent IPC, and policy enforcement.
 
-\begin{table*}[t]
+\begin{table*}[!t]
 \centering
 \caption{\textbf{Complete Aegis OS MCP Syscall and Resource Interface} (22 Syscalls and 4 Dynamic URI Resources).}
 \label{tab:syscalls}
@@ -212,10 +212,10 @@ Figure~\ref{fig:arch} illustrates the architecture of Aegis OS, and Table~\ref{t
 \midrule
 \textbf{Transactional VFS} (\texttt{aos-vfs}) & \texttt{fs\_read}, \texttt{fs\_write}, \texttt{fs\_edit}, \texttt{fs\_glob}, \texttt{workspace\_status} & \textbf{Auto-Allow (0 Prompts)}: Confined to agent's CoW shadow tree \\
 \textbf{Time-Travel \& Merge} (\texttt{aos-vfs}) & \texttt{workspace\_snapshot}, \texttt{workspace\_diff}, \texttt{workspace\_rollback}, \texttt{workspace\_commit} & Snapshots/Rollback \textbf{Auto-Allow}; \texttt{workspace\_commit} \textbf{Lease/Approval Gate} \\
-\textbf{OS Process Sandbox} (\texttt{aos-sandbox}) & \texttt{proc\_exec} (macOS Seatbelt \texttt{sandbox-exec} / Linux \texttt{bwrap} / MicroVM) & \textbf{Auto-Allow (0 Prompts)}: Writes restricted to CoW root; blocks \texttt{\textasciitilde/.ssh} \\
+\textbf{OS Process Sandbox} (\texttt{aos-sandbox}) & \texttt{proc\_exec} (macOS Seatbelt \texttt{sandbox-exec} / Linux \texttt{bwrap} / MicroVM) & \textbf{Auto-Allow (0 Prompts)}: Writes restricted to CoW root; blocks credentials \\
 \textbf{Inter-Agent IPC} (\texttt{aos-ipc}) & \texttt{ipc\_send}, \texttt{ipc\_recv}, \texttt{ipc\_request}, \texttt{ipc\_reply}, \texttt{ipc\_publish}, \texttt{ipc\_subscribe}, \texttt{ipc\_list\_peers} & \textbf{Auto-Allow Intra-Org}: Denied across distinct organizations ($o_{\text{src}} \neq o_{\text{dst}}$) \\
 \textbf{Org CAS \& KV} (\texttt{aos-vfs}) & \texttt{org\_artifact\_publish}, \texttt{org\_artifact\_fetch}, \texttt{org\_kv\_put}, \texttt{org\_kv\_get} & \textbf{Auto-Allow Intra-Org}: Content-addressed \texttt{artifact://<org>/sha256:<hash>} \\
-\textbf{Zero-Trust Egress} (\texttt{aos-egress}) & \texttt{egress\_http\_request} + Local TCP Proxy (\texttt{start\_local\_proxy}) & \textbf{Allowlisted Domains Auto-Allow}: Boundary injection of \texttt{\$AOS\_SECRET\_*} \\
+\textbf{Zero-Trust Egress} (\texttt{aos-egress}) & \texttt{egress\_http\_request} + Identity-Pinned TCP Proxy (\texttt{start\_local\_proxy}) & \textbf{Allowlisted Domains Auto-Allow}: Boundary injection of \texttt{\$AOS\_SECRET\_*} \\
 \textbf{Policy \& Leases} (\texttt{aos-policy}) & \texttt{policy\_list\_escalations}, \texttt{policy\_approve\_escalation}, \texttt{policy\_grant\_lease} & Human/Operator control plane for minting TTL-scoped \texttt{LeaseGrant} tokens \\
 \textbf{Dynamic MCP URIs} (\texttt{resources/*}) & \texttt{aegis://status}, \texttt{aegis://ipc/inbox}, \texttt{aegis://workspace/diff}, \texttt{aegis://policy/escalations} & Live state introspection for IDE status bars and autonomous self-check \\
 \bottomrule
@@ -223,52 +223,54 @@ Figure~\ref{fig:arch} illustrates the architecture of Aegis OS, and Table~\ref{t
 }
 \end{table*}
 
-\subsection{Transactional CoW Virtual Filesystem and 3-Way Merge Engine (\texttt{aos-vfs})}
+\subsection{Transactional CoW Virtual Filesystem and LCS Diff3 3-Way Merge (\texttt{aos-vfs})}
 \label{sec:vfs}
 
-To eliminate confirmation prompts on file writes without risking host corruption, \texttt{aos-vfs} isolates every agent principal $u_i$ inside its own Copy-on-Write shadow workspace rooted at:
+To eliminate confirmation prompts on file writes without risking host corruption, \texttt{aos-vfs} (\texttt{CoWWorkspace::init}) isolates every agent principal $u_i$ inside its own Copy-on-Write shadow workspace rooted at:
 \begin{center}
-\texttt{\textasciitilde/.aegis-os/orgs/$o_i$/agents/$u_i$/workspace\_cow/}
+{\footnotesize\texttt{\textasciitilde/.aegis-os/orgs/$o_i$/agents/$u_i$/workspace\_cow/\allowbreak upper\_workspace/}}
 \end{center}
-alongside a baseline snapshot directory \texttt{baseline/} that records the state of the host repository at session initialization or last commit.
+alongside a baseline snapshot directory \texttt{baseline\_snapshot/} that records the state of the host repository at session initialization or last commit, and a \texttt{snapshots/<snap\_id>/} directory storing time-travel checkpoints.
 
-\paragraph{Kernel-Level APFS \texttt{clonefile} Provisioning.} Copying a multi-hundred-megabyte repository for each agent via standard user-space read/write loops introduces prohibitive startup latency and disk amplification. On macOS (APFS), \texttt{CoWWorkspace::cow\_sync\_dir} invokes the native XNU kernel syscall \texttt{libc::clonefile(src, dst, 0)} directly on the directory tree and individual files (falling back to \texttt{cp -cR} / Btrfs \texttt{FICLONE} on Linux~\cite{rodeh2013btrfs}). Because \texttt{clonefile} duplicates only filesystem metadata extents and shares physical storage blocks until modified, cloning a 1,000-file (78.1 MB) repository completes in \textbf{5.62 ms} and consumes zero additional data blocks for unmodified files.
+\paragraph{Kernel-Level APFS \texttt{clonefile} Provisioning.} Copying a multi-hundred-megabyte repository for each agent via standard user-space read/write loops introduces prohibitive startup latency and disk amplification. On macOS (APFS), \texttt{CoWWorkspace::cow\_sync\_dir} invokes the native XNU kernel syscall \texttt{libc::clonefile(src, dst, 0)} directly on the directory tree and individual files (falling back to \texttt{cp -cR} / Btrfs \texttt{FICLONE} on Linux~\cite{rodeh2013btrfs,wright2004unionfs}). Because \texttt{clonefile} duplicates only filesystem metadata extents and shares physical storage blocks until modified, initializing both \texttt{upper\_workspace/} and \texttt{baseline\_snapshot/} consumes zero additional data blocks for unmodified files, and cloning a 1,000-file (78.1 MB) repository completes in \textbf{5.75 ms}.
 
-\paragraph{Time-Travel Snapshots and Atomic Rollback.} Before embarking on risky multi-file refactorings, an agent (or automated pre-exec hook) invokes \texttt{workspace\_snapshot(label)}, which creates an instant CoW clone under \texttt{snapshots/<snap\_id>/}. If a subsequent build or test fails, \texttt{workspace\_rollback(snap\_id)} atomically replaces \texttt{workspace\_cow/} with a fresh CoW clone of the snapshot in milliseconds.
+\paragraph{Time-Travel Snapshots, Atomic Rollback, and Build-Cache Preservation.} Before embarking on risky multi-file refactorings, an agent invokes \texttt{workspace\_snapshot(label)}, which creates an instant CoW clone under \texttt{snapshots/<snap\_id>/}. If a subsequent build or test fails, \texttt{workspace\_rollback(snap\_id)} atomically replaces \texttt{upper\_workspace/} with a fresh CoW clone of the snapshot in milliseconds. Crucially, to prevent rollbacks from wiping out incremental compiler caches (such as Rust's \texttt{target/} directory), \texttt{aos-sandbox} redirects \texttt{CARGO\_TARGET\_DIR} to \texttt{agent\_home/cargo\_target} outside \texttt{upper\_workspace/}, preserving warm incremental build artifacts across workspace rollbacks.
 
-\paragraph{3-Way Merge Engine for Multi-Agent Concurrency.} When multiple agents ($u_1 = \texttt{agy-agent}$, $u_2 = \texttt{claude-code}$, $u_3 = \texttt{codex-cli}$) concurrently edit the same file $f$ in their respective shadow workspaces and sequentially invoke \texttt{workspace\_commit}, a naive file copy would overwrite earlier commits (\emph{Lost Update}). Aegis OS prevents this via a line-level 3-Way Merge algorithm (\texttt{three\_way\_merge\_lines}) using three states for every modified path $p$:
+\paragraph{LCS Diff3 3-Way Merge Engine for Multi-Agent Concurrency.} When multiple agents ($u_1 = \texttt{agy-agent}$, $u_2 = \texttt{claude-code}$, $u_3 = \texttt{codex-cli}$) concurrently edit the same file $f$ in their respective shadow workspaces and sequentially invoke \texttt{workspace\_commit}, a naive file copy would overwrite earlier commits (\emph{Lost Update}). Aegis OS prevents this via a Longest Common Subsequence (LCS) Diff3 3-Way Merge algorithm (\texttt{compute\_lcs\_diff\_hunks} and \texttt{three\_way\_merge\_lines})~\cite{khanna2007formal} using three states for every modified path $p$:
 \begin{itemize}
-    \item $B(p)$: the agent's recorded baseline version in \texttt{baseline/$p$};
+    \item $B(p)$: the agent's recorded baseline version in \texttt{baseline\_snapshot/$p$};
     \item $H(p)$: the current live file on the host repository \texttt{host/$p$} (which may already incorporate commits from peer agents);
-    \item $S(p)$: the agent's modified version in \texttt{workspace\_cow/$p$}.
+    \item $S(p)$: the agent's modified version in \texttt{upper\_workspace/$p$}.
 \end{itemize}
-If $H(p) = B(p)$, the host file was untouched by peers and $S(p)$ is fast-forwarded via atomic CoW replacement. If $H(p) \neq B(p)$, Aegis OS aligns unmodified anchor lines across $(B(p), H(p), S(p))$: disjoint hunks modified only in $H(p)$ or only in $S(p)$ are merged automatically without human intervention, whereas overlapping modifications to the exact same line range with $H_{\text{hunk}} \neq S_{\text{hunk}}$ abort the commit before touching the host tree and return a structured conflict diagnostic identifying the exact line number.
+If $H(p) = B(p)$, the host file was untouched by peers and $S(p)$ is fast-forwarded via atomic CoW replacement. If $H(p) \neq B(p)$, Aegis OS computes the LCS edit script $\Delta(B, H)$ and $\Delta(B, S)$ as half-open baseline line intervals $[b_{\text{start}}, b_{\text{end}})$ mapped to replacement line vectors. Disjoint hunks modified only in $H(p)$ or only in $S(p)$---including multi-line structural insertions and deletions that shift subsequent line numbers---are spliced together automatically without human intervention. Conversely, overlapping hunks on $[b_{\text{start}}, b_{\text{end}})$ where $H_{\text{hunk}} \neq S_{\text{hunk}}$ atomically abort the commit before touching the host tree and return a structured conflict diagnostic identifying the exact baseline line number.
 
 \subsection{Dual-Tier OS Sandbox and Zero-Trust Egress Proxy (\texttt{aos-sandbox}, \texttt{aos-egress})}
 \label{sec:sandbox}
 
-While \texttt{aos-vfs} intercepts MCP file syscalls (\texttt{fs\_read}, \texttt{fs\_write}, \texttt{fs\_edit}), coding agents also spawn arbitrary child compilers, test runners, and shell scripts via \texttt{proc\_exec}. If \texttt{proc\_exec} ran unconfined, a shell command could bypass the CoW workspace entirely.
+While \texttt{aos-vfs} intercepts MCP file syscalls (\texttt{fs\_read}, \texttt{fs\_write}, \texttt{fs\_edit}), coding agents also spawn arbitrary child compilers, test runners, and shell scripts via \texttt{proc\_exec}. If \texttt{proc\_exec} ran unconfined, a shell command could bypass the CoW workspace or Egress Proxy entirely.
 
 \paragraph{Mandatory Kernel Sandbox (\texttt{sandbox-exec} / \texttt{bwrap} / MicroVM).} \texttt{aos-sandbox} implements a pluggable \texttt{SandboxDriver} supporting two isolation tiers:
 \begin{enumerate}
-    \item \textbf{Tier 1 (\texttt{NativeOsSandboxDriver}):} Designed for low-latency local workstation execution. On macOS, every \texttt{proc\_exec} invocation dynamically compiles a canonicalized Seatbelt Mandatory Access Control profile (SBPL) and executes the child process under \texttt{/usr/bin/sandbox-exec -p <profile>}. The profile denies all file writes globally (\texttt{(deny file-write*)}) and explicitly allowlists writes \emph{only} to the agent's canonical CoW shadow workspace, private agent home, and organization CAS directory. Simultaneously, it enforces kernel-level read denials on sensitive credential paths:
+    \item \textbf{Tier 1 (\texttt{NativeOsSandboxDriver}, Full Kernel Enforcement on macOS \& Linux):} Designed for low-latency local workstation execution. On macOS, every \texttt{proc\_exec} invocation dynamically compiles a canonicalized Seatbelt Mandatory Access Control profile (SBPL) and executes the child process under \texttt{/usr/bin/sandbox-exec -p <profile>}. On Linux, \texttt{NativeOsSandboxInstance::exec} invokes \texttt{/usr/bin/bwrap} using \texttt{generate\_linux\_bwrap\_args()} with unprivileged mount/PID/network namespaces (\texttt{--unshare-all}, \texttt{--ro-bind / /}, \texttt{--bind <workspace>}, and \texttt{--tmpfs} overlays hiding \texttt{\textasciitilde/.ssh} and \texttt{\textasciitilde/.aws}). The macOS Seatbelt profile denies all file writes globally (\texttt{(deny file-write*)}), allowlists writes \emph{only} to the agent's canonical CoW shadow workspace, private agent home, and organization CAS directory, blocks reads to sensitive credential stores, and confines outbound network sockets exclusively to the local Aegis Egress Proxy:
 \begin{lstlisting}
 (version 1)
 (allow default)
 (deny file-read*
-  (regex #".*/\.ssh(/.*)?$")
-  (regex #".*/\.aws(/.*)?$")
-  (regex #".*/\.gnupg(/.*)?$"))
+  (regex #".*/\.ssh(/.*)?$")    (regex #".*/\.aws(/.*)?$")
+  (regex #".*/\.gnupg(/.*)?$")  (regex #".*/\.kube(/.*)?$")
+  (regex #".*/\.npmrc$")        (regex #".*/Library/Keychains(/.*)?$"))
 (deny file-write*)
 (allow file-write*
-  (subpath "/private/.../workspace_cow")
+  (subpath "/private/.../upper_workspace")
   (subpath "/private/.../agent_home"))
+(deny network-outbound)
+(allow network-outbound (remote ip "localhost:51691"))
 \end{lstlisting}
-    Furthermore, the spawned process's environment table is scrubbed (\texttt{env\_clear()}), setting \texttt{HOME} to the isolated \texttt{agent\_home} and routing \texttt{HTTP\_PROXY}/\texttt{HTTPS\_PROXY} to the Aegis Egress Proxy.
-    \item \textbf{Tier 2 (\texttt{MicroVmSandboxDriver}):} Designed for multi-tenant cloud hosts using hardware virtualization (\texttt{libkrun} / Firecracker~\cite{agache2020firecracker}) with Scale-to-Zero \texttt{pause()} and \texttt{resume()} lifecycle transitions.
+    Because \texttt{(deny network-outbound)} is enforced by the XNU kernel socket filter, even a prompt-injected child process that runs \texttt{curl --noproxy '*'} or raw TCP sockets cannot bypass the local Aegis Egress Proxy.
+    \item \textbf{Tier 2 (\texttt{MicroVmSandboxDriver}, Cloud Control-Plane Interface):} Designed for multi-tenant cloud hosts, providing the control-plane specification and Scale-to-Zero \texttt{pause()}/\texttt{resume()} lifecycle state machine for hardware-virtualized VMM backends (\texttt{libkrun} / Firecracker~\cite{agache2020firecracker}).
 \end{enumerate}
 
-\paragraph{Zero-Trust Egress Proxy with Boundary Secret Injection.} To prevent credential exfiltration (Threat T4), agents inside Aegis OS never receive raw API keys in their environment variables or context windows. Instead, they are given opaque secret placeholders such as \texttt{\$AOS\_SECRET\_GH}. Outbound HTTP requests pass through \texttt{AegisEgressGateway::\allowbreak start\_local\_proxy}, a local asynchronous TCP proxy listener. For each request, the proxy inspects the target \texttt{Host} header against the organization's domain allowlist and the secret vault's per-secret domain binding:
+\paragraph{Identity-Pinned Zero-Trust Egress Proxy with Boundary Secret Injection.} To prevent credential exfiltration (Threat T4), agents inside Aegis OS never receive raw API keys in their environment variables or context windows. Instead, they are given opaque secret placeholders such as \texttt{\$AOS\_SECRET\_GH}. Outbound HTTP requests pass through \texttt{AegisEgressGateway::\allowbreak start\_local\_proxy\_with\_bound\_identity}, a local asynchronous L7 HTTP boundary gateway. When bound per sandbox, the listener pins the \texttt{AgentIdentity} at the TCP socket level so a compromised process cannot spoof \texttt{X-Aegis-Org} or \texttt{X-Aegis-Agent} headers. For each request, the gateway inspects the target \texttt{Host} header against the organization's domain allowlist and the secret vault's per-secret domain binding:
 \begin{itemize}
     \item If \texttt{\$AOS\_SECRET\_GH} (bound exclusively to \texttt{api.github.com}) is sent in a header toward \texttt{api.github.com}, the proxy substitutes the real token \texttt{ghp\_...} at the network boundary.
     \item If a prompt-injected agent attempts to send \texttt{\$AOS\_SECRET\_GH} to an unauthorized host (e.g., \texttt{evil-exfil.org} or \texttt{webhook.site}), the TCP proxy immediately terminates the request with \texttt{HTTP/1.1 403 Forbidden} and records a security violation in \texttt{aos-recorder}.
@@ -291,23 +293,24 @@ To elevate multi-agent collaboration from ad-hoc file polling to an OS-level pri
 \subsection{Cedar-Aligned Policy Kernel and Formal Safety Invariants (\texttt{aos-policy})}
 \label{sec:policy}
 
-Every MCP syscall is evaluated by \texttt{AegisPolicyKernel::\allowbreak evaluate} before execution, following a deterministic four-rule hierarchy inspired by Cedar~\cite{cutler2024cedar}:
+Every MCP syscall is evaluated by \texttt{AegisPolicyKernel::\allowbreak evaluate} before execution, following a deterministic five-stage evaluation hierarchy aligned with Cedar~\cite{cutler2024cedar}:
 {\small
 \begin{align}
+    \text{R0 (Red-Line):} \; & \text{res} \in \mathcal{P}_{\text{forbidden}} \implies \textbf{Deny} \nonumber \\
     \text{R1 (Tenant):} \; & o_{\text{principal}} \neq o_{\text{target}} \implies \textbf{Deny} \nonumber \\
-    \text{R2 (Sandbox):} \; & \text{action} \in \mathcal{S}_{\text{internal}} \implies \textbf{Allow} \nonumber \\
-    \text{R3 (Lease):} \; & \exists \ell \in \mathcal{L}_{\text{active}}(o, u, \text{action}) \implies \textbf{Allow} \nonumber \\
+    \text{R2 (Lease):} \; & \exists \ell \in \mathcal{L}_{\text{active}}(o, u, \text{action}) \implies \textbf{Allow} \nonumber \\
+    \text{R3 (Sandbox):} \; & \text{action} \in \mathcal{S}_{\text{internal}} \implies \textbf{Allow} \nonumber \\
     \text{R4 (Boundary):} \; & \text{action} \in \{\texttt{workspace\_commit}, \texttt{egress}\} \nonumber \\
     & \implies \textbf{RequireApproval}(\text{esc\_id}) \nonumber
 \end{align}
 }
-where $\mathcal{S}_{\text{internal}}$ encompasses all CoW filesystem operations, sandboxed process execution (\texttt{proc\_exec}), and intra-organization IPC/CAS operations. When a developer approves an escalation $\text{esc\_id}$ via \texttt{policy\_approve\_escalation}, they can optionally attach a Time-To-Live ($\text{TTL}$, e.g., 3,600 seconds), minting a cryptographic \texttt{LeaseGrant} $\ell \in \mathcal{L}_{\text{active}}$ that permits subsequent commits within that session window with zero further prompts.
+where $\mathcal{P}_{\text{forbidden}} = \{\texttt{\textasciitilde/.ssh}, \allowbreak \texttt{\textasciitilde/.aws}, \allowbreak \texttt{/etc/shadow}, \allowbreak \texttt{/System}\}$ is the Ring-0 host red-line set that cannot be overridden even by an active lease, and $\mathcal{S}_{\text{internal}}$ encompasses all CoW filesystem operations, sandboxed process execution (\texttt{proc\_exec}), and intra-organization IPC/CAS operations. When a developer approves an escalation $\text{esc\_id}$ via \texttt{policy\_approve\_\allowbreak escalation}, they can optionally attach a Time-To-Live ($\text{TTL}$, e.g., 3,600 seconds), minting a \texttt{LeaseGrant} $\ell \in \mathcal{L}_{\text{active}}$ evaluated at R2 that permits subsequent commits within that session window with zero further prompts.
 
 Together, the four kernel subsystems enforce three formal safety invariants:
 \begin{itemize}
     \item \textbf{Invariant 1 (Pre-Commit Host Non-Interference):} For any sequence of agent syscalls $\tau = (s_1, \dots, s_k)$ where no $s_t$ is an approved \texttt{workspace\_commit}, the host directory tree $H$ satisfies $H(\tau) \equiv H_0$ ($\Delta H = \emptyset$), guaranteed jointly by VFS path canonicalization and Seatbelt/Bubblewrap kernel write confinement.
     \item \textbf{Invariant 2 (Zero Raw Secret Exposure):} For every secret entry $(p_j, v_j, \mathcal{D}_j)$ in the Egress Vault, the raw credential $v_j$ never appears in any agent process environment block, command-line argument, or standard I/O stream, and is injected into outbound network packets if and only if $\text{Host}(req) \in \mathcal{D}_j$.
-    \item \textbf{Invariant 3 (Conflict-Safe Multi-Agent Commit):} Concurrent agent commits $(S_1, S_2, \dots, S_m)$ against baselines $(B_1, B_2, \dots, B_m)$ either produce a deterministic 3-way merged host state preserving all disjoint line hunks, or atomically abort without partial file mutation when $\exists \text{ line } l : H[l] \neq B_i[l] \land S_i[l] \neq B_i[l] \land H[l] \neq S_i[l]$.
+    \item \textbf{Invariant 3 (Conflict-Safe Multi-Agent Commit):} Concurrent agent commits $(S_1, S_2, \dots, S_m)$ against baselines $(B_1, B_2, \dots, B_m)$ either produce a deterministic LCS Diff3 3-way merged host state preserving all disjoint line hunks (including multi-line insertions), or atomically abort without partial file mutation when overlapping baseline intervals $[b_{\text{start}}, b_{\text{end}})$ are modified differently by $H$ and $S_i$.
 \end{itemize}
 
 \section{Zero-Config Multi-Client Integration}
@@ -326,16 +329,16 @@ When invoked with \texttt{--org auto --agent auto}, Aegis OS automatically deriv
 
 We evaluate Aegis OS using a 100\% live empirical benchmark suite implemented in \texttt{crates/aos-cli/src/bench.rs} (\texttt{aegis-os bench}). All experiments were executed on an Apple Silicon workstation (\texttt{macos-aarch64}, APFS filesystem, Rust 1.99.0 \texttt{--release} optimization) using real OS processes, real Seatbelt kernel sandboxes, real TCP sockets, and real \texttt{cargo} compilations. Our evaluation answers five research questions:
 \begin{itemize}
-    \item \textbf{RQ1 (Authorization Friction):} By how much does Aegis OS reduce human confirmation prompts, extend autonomous streaks, and save human verification wall-clock time?
+    \item \textbf{RQ1 (Authorization Friction):} By how much does Aegis OS reduce human confirmation prompts, extend autonomous streaks, and save human verification wall-clock time across diverse software engineering tasks?
     \item \textbf{RQ2 (Adversarial Security):} Does Aegis OS block real OS process and network exfiltration attacks that compromise unconfined \texttt{Host-YOLO} agents?
     \item \textbf{RQ3 (System Overhead \& Scalability):} What is the latency and storage overhead of APFS CoW workspace provisioning, policy evaluation, and live TCP MCP daemon calls?
-    \item \textbf{RQ4 (Multi-Agent Collaboration \& Conflict Safety):} How effectively does Aegis OS merge non-overlapping concurrent edits across heterogeneous agents (\texttt{agy}, \texttt{claude}, \texttt{codex}), detect overlapping same-line conflicts, and reduce IPC context overhead?
+    \item \textbf{RQ4 (Multi-Agent Collaboration \& Conflict Safety):} How effectively does Aegis OS merge non-overlapping concurrent edits (including structural multi-line insertions) across heterogeneous agents (\texttt{agy}, \texttt{claude}, \texttt{codex}), detect overlapping same-line conflicts, and reduce IPC context overhead?
     \item \textbf{RQ5 (Fault Recovery):} How fast can Aegis OS recover from multi-file repository corruption compared to sequential file restoration?
 \end{itemize}
 
-\begin{table*}[t]
+\begin{table*}[!t]
 \centering
-\caption{\textbf{Experiment 1 (RQ1): Live Authorization Friction, Interruption Prompt Rate, and Human Wait Time} across 50 multi-step software engineering trajectories (1,500 real kernel syscalls executed on \texttt{AegisRuntimeKernel}; human verification time modeled at $\bar{t}_{\text{verify}} = 5.0\text{ s}$/prompt).}
+\caption{\textbf{Experiment 1 (RQ1): Live Authorization Friction, Interruption Prompt Rate, and Human Wait Time} across 50 multi-step software engineering trajectories spanning 5 task templates (1,500 real kernel syscalls executed on \texttt{AegisRuntimeKernel}; human verification time modeled at $\bar{t}_{\text{verify}} = 5.0\text{ s}$/prompt).}
 \label{tab:exp1}
 \vspace{2pt}
 \resizebox{\textwidth}{!}{%
@@ -343,16 +346,16 @@ We evaluate Aegis OS using a 100\% live empirical benchmark suite implemented in
 \toprule
 \textbf{Execution Mode} & \textbf{Trajectories} & \textbf{Syscalls} & \textbf{Human Prompts} & \textbf{IPR (\%)} & \textbf{Prompt Reduction} & \textbf{Max Autonomous Streak} & \textbf{Kernel Exec (ms)} & \textbf{Est.\ Human Wait ($T_{\text{human}}$)} \\
 \midrule
-Host-Interactive (Per-Action Prompt) & 50 & 1,500 & 900 & 60.00\% & 0.00\% (Baseline) & 4 steps & 307.3 ms & 75.0 min (4,500 s) \\
-Host-Static-Allowlist (Read/Test Allow) & 50 & 1,500 & 650 & 43.33\% & 27.78\% & 5 steps & 307.3 ms & 54.2 min (3,250 s) \\
-\textbf{Aegis-OS (Per-Task Commit Gate)} & 50 & 1,500 & \textbf{50} & \textbf{3.33\%} & \textbf{94.44\%} & \textbf{29 steps} & \textbf{307.3 ms} & \textbf{4.2 min (250 s)} \\
-\textbf{Aegis-OS (With 1h Session Lease)} & 50 & 1,500 & \textbf{1} & \textbf{0.07\%} & \textbf{99.89\%} & \textbf{1,470 steps} & \textbf{303.2 ms} & \textbf{0.08 min (5 s)} \\
+Host-Interactive (Per-Action Prompt) & 50 & 1,500 & 860 & 57.33\% & 0.00\% (Baseline) & 4 steps & 523.2 ms & 71.7 min (4,300 s) \\
+Host-Static-Allowlist (Read/Test Allow) & 50 & 1,500 & 680 & 45.33\% & 20.93\% & 7 steps & 441.9 ms & 56.7 min (3,400 s) \\
+\textbf{Aegis-OS (Per-Task Commit Gate)} & 50 & 1,500 & \textbf{50} & \textbf{3.33\%} & \textbf{94.19\%} & \textbf{29 steps} & \textbf{348.7 ms} & \textbf{4.2 min (250 s)} \\
+\textbf{Aegis-OS (With 1h Session Lease)} & 50 & 1,500 & \textbf{1} & \textbf{0.07\%} & \textbf{99.88\%} & \textbf{1,470 steps} & \textbf{418.5 ms} & \textbf{0.08 min (5 s)} \\
 \bottomrule
 \end{tabular}%
 }
 \end{table*}
 
-\begin{figure}[t]
+\begin{figure}[!t]
 \centering
 \resizebox{\columnwidth}{!}{%
 \begin{tikzpicture}[font=\sffamily\scriptsize]
@@ -364,12 +367,12 @@ Host-Static-Allowlist (Read/Test Allow) & 50 & 1,500 & 650 & 43.33\% & 27.78\% &
     \draw[dotted, black!30] (0,\y) -- (7.2,\y);
 }
 
-\fill[aegisred!75, draw=aegisred!90!black, thick] (0.5,0) rectangle (1.6,3.0);
-\node[above] at (1.05, 3.0) {\textbf{60.00\%}};
+\fill[aegisred!75, draw=aegisred!90!black, thick] (0.5,0) rectangle (1.6,2.87);
+\node[above] at (1.05, 2.87) {\textbf{57.33\%}};
 \node[below, align=center] at (1.05, -0.05) {Host\\Interactive};
 
-\fill[orange!75, draw=orange!90!black, thick] (2.3,0) rectangle (3.4,2.17);
-\node[above] at (2.85, 2.17) {\textbf{43.33\%}};
+\fill[orange!75, draw=orange!90!black, thick] (2.3,0) rectangle (3.4,2.27);
+\node[above] at (2.85, 2.27) {\textbf{45.33\%}};
 \node[below, align=center] at (2.85, -0.05) {Host Static\\Allowlist};
 
 \fill[aegisblue!75, draw=aegisblue!90!black, thick] (4.1,0) rectangle (5.2,0.17);
@@ -382,17 +385,17 @@ Host-Static-Allowlist (Read/Test Allow) & 50 & 1,500 & 650 & 43.33\% & 27.78\% &
 
 \end{tikzpicture}%
 }
-\caption{Comparison of Interruption Prompt Rate (IPR) across 1,500 live syscalls (Experiment 1). Aegis OS reduces human prompts by 94.44\% in per-task commit mode and 99.89\% with a 1-hour session lease.}
+\caption{Comparison of Interruption Prompt Rate (IPR) across 1,500 live syscalls spanning 5 task templates (Experiment 1). Aegis OS reduces human prompts by 94.19\% in per-task commit mode and 99.88\% with a 1-hour session lease.}
 \label{fig:exp1}
 \end{figure}
 
 \subsection{Experiment 1 (RQ1): Authorization Friction and Autonomous Continuity}
 
-We execute 50 live software engineering trajectories (30 syscalls per trajectory, totaling 1,500 real \texttt{AegisRuntimeKernel::call\_tool} invocations) encompassing repository exploration (\texttt{fs\_glob}, \texttt{fs\_read}), snapshotting (\texttt{workspace\_snapshot}), multi-file code edits (\texttt{fs\_edit}, \texttt{fs\_write}), CAS artifact publishing (\texttt{org\_artifact\_publish}), peer IPC coordination (\texttt{ipc\_send}, \texttt{ipc\_recv}, \texttt{ipc\_publish}), diff inspection (\texttt{workspace\_diff}), and host commit (\texttt{workspace\_commit}).
+We execute 50 live software engineering trajectories (30 syscalls per trajectory, totaling 1,500 real \texttt{AegisRuntimeKernel::call\_tool} invocations) cycling across five distinct task templates: (1) \emph{Auth Bugfix \& Regression Test}, (2) \emph{Multi-Module Refactoring}, (3) \emph{Feature Implementation \& Quota Suite}, (4) \emph{Security Audit \& Sanitizer Hardening}, and (5) \emph{Multi-Agent Contract Sync}. Each trajectory exercises repository exploration (\texttt{fs\_glob}, \texttt{fs\_read}), snapshotting (\texttt{workspace\_snapshot}), multi-file code edits (\texttt{fs\_edit}, \texttt{fs\_write}), CAS artifact publishing (\texttt{org\_artifact\_publish}), peer IPC coordination (\texttt{ipc\_send}, \texttt{ipc\_recv}, \texttt{ipc\_publish}), diff inspection (\texttt{workspace\_diff}), and host commit (\texttt{workspace\_commit}).
 
-Table~\ref{tab:exp1} and Figure~\ref{fig:exp1} present the results. Under \emph{Host-Interactive}, every file mutation and process execution triggers a confirmation prompt (900 prompts, $\text{IPR} = 60.00\%$), restricting the agent's maximum autonomous streak to just 4 steps and imposing \textbf{75.0 minutes} of cumulative human verification latency (at $\bar{t}_{\text{verify}} = 5.0\text{ s}$ per prompt). Adding a static read/test allowlist (\emph{Host-Static-Allowlist}) still requires 650 prompts ($\text{IPR} = 43.33\%$, 54.2 minutes of human wait time) because file writes cannot be safely auto-allowed on the host. In contrast, \textbf{Aegis-OS (Per-Task Commit Gate)} executes all 29 internal CoW workspace, sandbox, and IPC operations per trajectory with zero prompts, prompting only once at the final \texttt{workspace\_commit} gate---reducing human prompts by \textbf{94.44\%} ($\text{IPR} = 3.33\%$). When the user grants a \textbf{1-hour Session Lease} on the first commit escalation, Aegis OS completes all 50 trajectories with only \textbf{1 prompt total} ($\text{IPR} = 0.07\%$, a \textbf{99.89\% reduction}), saving \textbf{74.9 minutes} of human interruption overhead and extending the continuous autonomous execution streak to \textbf{1,470 steps} (\textbf{367.5$\times$} longer).
+Table~\ref{tab:exp1} and Figure~\ref{fig:exp1} present the results. Under \emph{Host-Interactive}, every file mutation, state write, and side-effecting tool triggers a confirmation prompt (860 prompts, $\text{IPR} = 57.33\%$), restricting the agent's maximum autonomous streak to just 4 steps and imposing \textbf{71.7 minutes} of cumulative human verification latency (at $\bar{t}_{\text{verify}} = 5.0\text{ s}$ per prompt) on top of 523.2 ms of kernel execution time. Adding a static read/status/snapshot allowlist (\emph{Host-Static-Allowlist}) still requires 680 prompts ($\text{IPR} = 45.33\%$, 56.7 minutes of human wait time) because file writes cannot be safely auto-allowed on the host. In contrast, \textbf{Aegis-OS (Per-Task Commit Gate)} executes all 29 internal CoW workspace, sandbox, and IPC operations per trajectory with zero prompts in 348.7 ms, prompting only once at the final \texttt{workspace\_commit} gate---reducing human prompts by \textbf{94.19\%} ($\text{IPR} = 3.33\%$). When the user grants a \textbf{1-hour Session Lease} on the first commit escalation, Aegis OS completes all 50 trajectories (including all 50 live host commits) in 418.5 ms with only \textbf{1 prompt total} ($\text{IPR} = 0.07\%$, a \textbf{99.88\% reduction}), saving \textbf{71.6 minutes} of human interruption overhead and extending the continuous autonomous execution streak to \textbf{1,470 steps} (\textbf{367.5$\times$} longer).
 
-\begin{table*}[t]
+\begin{table*}[!t]
 \centering
 \caption{\textbf{Experiment 2 (RQ2): Live Red-Team Adversarial Attack Execution} across 40 real OS process and TCP socket attacks executed against a disposable \texttt{Host-YOLO} target environment versus \texttt{Aegis-OS}.}
 \label{tab:exp2}
@@ -403,7 +406,7 @@ Table~\ref{tab:exp1} and Figure~\ref{fig:exp1} present the results. Under \emph{
 \textbf{Attack Surface Category} & \textbf{Live Attacks} & \textbf{Host-YOLO Compromised (ASR)} & \textbf{Aegis-OS Compromised (ASR)} & \textbf{Empirical Kernel / Gateway Evidence} \\
 \midrule
 A. Host Path Escape \& File Tampering & 10 & 10 / 10 (100.0\%) & \textbf{0 / 10 (0.0\%)} & Kernel \texttt{sandbox-exec} denied all 10 writes (\texttt{Operation not permitted}) \\
-B. \texttt{\textasciitilde/.ssh/id\_rsa} Credential Harvesting & 10 & 10 / 10 (100.0\%) & \textbf{0 / 10 (0.0\%)} & Seatbelt regex \texttt{(deny file-read* /.ssh)} blocked all 10 key reads \\
+B. Host Credential Harvesting (\texttt{.ssh}/\texttt{.aws}/\texttt{.kube}/\texttt{.npmrc}) & 10 & 10 / 10 (100.0\%) & \textbf{0 / 10 (0.0\%)} & Seatbelt regexes \texttt{(deny file-read* ...)} blocked all 10 credential reads \\
 C. Live TCP Egress Secret Exfiltration & 10 & 10 / 10 (100.0\%) & \textbf{0 / 10 (0.0\%)} & Live TCP Proxy returned \texttt{HTTP/1.1 403 Forbidden} on all 10 exfil domains \\
 D. Cross-Tenant IPC \& CAS Access & 10 & 10 / 10 (100.0\%) & \textbf{0 / 10 (0.0\%)} & Cedar Policy Kernel rejected all 10 cross-org requests ($o_{\text{src}} \neq o_{\text{dst}}$) \\
 \midrule
@@ -418,15 +421,15 @@ D. Cross-Tenant IPC \& CAS Access & 10 & 10 / 10 (100.0\%) & \textbf{0 / 10 (0.0
 To evaluate security against prompt injection and malicious commands without relying on simulated rules, we construct a live red-team harness that executes 40 real adversarial payloads against both an unconfined disposable victim environment (\texttt{Host-YOLO}) and \texttt{Aegis-OS}:
 \begin{itemize}
     \item \textbf{Category A (10 Live Path Escape Attacks):} Spawns \texttt{sh -c "echo COMPROMISED > <outside\_workspace\_target>"}. In \texttt{Host-YOLO}, all 10 outside-workspace files were created and tampered with ($\text{ASR} = 100.0\%$). Inside \texttt{Aegis-OS}, \texttt{/usr/bin/sandbox-exec} terminated all 10 writes at the XNU kernel boundary with \texttt{Operation not permitted} ($\text{ASR} = 0.0\%$).
-    \item \textbf{Category B (10 Live SSH Key Harvesting Attacks):} Spawns \texttt{sh -c "cat <home>/.ssh/id\_rsa"}. \texttt{Host-YOLO} leaked the private key material on all 10 attempts, whereas the Aegis OS Seatbelt profile blocked all 10 reads ($\text{ASR} = 0.0\%$).
+    \item \textbf{Category B (10 Live Multi-Store Credential Harvesting Attacks):} Spawns \texttt{sh -c "cat <cred\_path>"} cycling across five sensitive credential targets: \texttt{\textasciitilde/.ssh/id\_rsa}, \texttt{\textasciitilde/.aws/credentials}, \texttt{\textasciitilde/.gnupg/secring.gpg}, \texttt{\textasciitilde/.kube/config}, and \texttt{\textasciitilde/.npmrc}. \texttt{Host-YOLO} leaked the secret material on all 10 attempts, whereas the Aegis OS Seatbelt profile blocked all 10 reads at the kernel VFS layer ($\text{ASR} = 0.0\%$).
     \item \textbf{Category C (10 Live TCP Secret Exfiltration Attacks):} Opens real TCP connections to \texttt{AegisEgressGateway}'s local HTTP proxy and transmits \texttt{POST /exfil HTTP/1.1} carrying \texttt{Authorization: Bearer \$AOS\_SECRET\_GH} toward 10 external attacker domains (\texttt{evil-exfil.org}, \texttt{webhook.site}, \texttt{ngrok-free.app}, \texttt{pastebin.com}, \texttt{interact.sh}, etc.). Every single connection was rejected at the boundary with \texttt{HTTP/1.1 403 Forbidden} ($\text{ASR} = 0.0\%$).
     \item \textbf{Category D (10 Cross-Tenant IPC/CAS Smuggling Attacks):} Attempts to send IPC commands and fetch CAS artifacts across distinct tenant organizations (\texttt{org-alpha} $\to$ \texttt{org-enterprise-$i$}). All 10 were denied by Policy Rule R1 ($\text{ASR} = 0.0\%$).
 \end{itemize}
-As summarized in Table~\ref{tab:exp2}, Aegis OS achieves a \textbf{0.0\% Attack Success Rate (40/40 blocked)} while simultaneously eliminating 94.44\%--99.89\% of user prompts.
+As summarized in Table~\ref{tab:exp2}, Aegis OS achieves a \textbf{0.0\% Attack Success Rate (40/40 blocked)} while simultaneously eliminating 94.19\%--99.88\% of user prompts.
 
-\begin{table*}[t]
+\begin{table*}[!t]
 \centering
-\caption{\textbf{Experiment 3A (RQ3): Multi-Trial APFS Copy-on-Write Workspace Provisioning Latency and Storage Efficiency} (5 trials per scale, Mean $\pm$ StdDev).}
+\caption{\textbf{Experiment 3A (RQ3): Multi-Trial APFS Copy-on-Write Workspace Provisioning Latency and Storage Efficiency} across 10 concurrent agents modifying realistic per-task working sets (6, 12, and 25 files per agent; 5 trials per scale, Mean $\pm$ StdDev).}
 \label{tab:exp3a}
 \vspace{2pt}
 \resizebox{\textwidth}{!}{%
@@ -434,15 +437,15 @@ As summarized in Table~\ref{tab:exp2}, Aegis OS achieves a \textbf{0.0\% Attack 
 \toprule
 \textbf{Repository Scale} & \textbf{Files} & \textbf{Logical Size} & \textbf{Full Copy (Mean $\pm$ SD)} & \textbf{Aegis CoW Clone (Mean $\pm$ SD)} & \textbf{Clone Speedup} & \textbf{10-Agent Disk Saving} \\
 \midrule
-Small Project & 100 & 2.0 MB & $9.28 \pm 1.26$ ms & $\mathbf{0.60 \pm 0.06}$ \textbf{ms} & \textbf{15.6$\times$} & \textbf{95.0\%} (1.0 MB vs.\ 19.5 MB) \\
-Medium Project & 300 & 17.6 MB & $28.90 \pm 0.48$ ms & $\mathbf{1.79 \pm 0.24}$ \textbf{ms} & \textbf{16.1$\times$} & \textbf{95.0\%} (8.8 MB vs.\ 175.8 MB) \\
-Large Project & 1,000 & 78.1 MB & $101.07 \pm 7.79$ ms & $\mathbf{5.62 \pm 0.41}$ \textbf{ms} & \textbf{18.0$\times$} & \textbf{95.0\%} (39.1 MB vs.\ 781.2 MB) \\
+Small Project & 100 & 2.0 MB & $9.31 \pm 1.26$ ms & $\mathbf{0.68 \pm 0.15}$ \textbf{ms} & \textbf{13.7$\times$} & \textbf{94.0\%} (1.2 MB vs.\ 19.5 MB) \\
+Medium Project & 300 & 17.6 MB & $28.23 \pm 0.27$ ms & $\mathbf{1.64 \pm 0.10}$ \textbf{ms} & \textbf{17.2$\times$} & \textbf{96.0\%} (7.0 MB vs.\ 175.8 MB) \\
+Large Project & 1,000 & 78.1 MB & $98.33 \pm 3.75$ ms & $\mathbf{5.75 \pm 1.55}$ \textbf{ms} & \textbf{17.1$\times$} & \textbf{97.5\%} (19.5 MB vs.\ 781.2 MB) \\
 \bottomrule
 \end{tabular}%
 }
 \end{table*}
 
-\begin{table*}[t]
+\begin{table*}[!t]
 \centering
 \caption{\textbf{Experiment 3B (RQ3): End-to-End Kernel and Live TCP HTTP Daemon Latency Distribution}.}
 \label{tab:exp3b}
@@ -452,15 +455,15 @@ Large Project & 1,000 & 78.1 MB & $101.07 \pm 7.79$ ms & $\mathbf{5.62 \pm 0.41}
 \toprule
 \textbf{Kernel / Gateway Operation} & \textbf{Samples} & \textbf{Mean ($\mu$s)} & \textbf{P50 ($\mu$s)} & \textbf{P95 ($\mu$s)} & \textbf{P99 ($\mu$s)} & \textbf{Throughput (ops/sec)} \\
 \midrule
-\texttt{PolicyKernel::evaluate} (In-Process Cedar Check) & 2,000 & 0.1 $\mu$s & 0.1 $\mu$s & 0.1 $\mu$s & 0.1 $\mu$s & \textbf{8,241,747 ops/s} \\
-\texttt{IpcBus::send + recv\_inbox} (In-Process P2P) & 1,000 & 1.1 $\mu$s & 0.9 $\mu$s & 2.2 $\mu$s & 4.4 $\mu$s & \textbf{902,697 ops/s} \\
-\texttt{HTTP Daemon POST /mcp} (\texttt{fs\_read} JSON-RPC over TCP) & 200 & 172.8 $\mu$s & 178.0 $\mu$s & 234.1 $\mu$s & 265.8 $\mu$s & \textbf{5,630 ops/s} \\
+\texttt{PolicyKernel::evaluate} (In-Process Cedar Check) & 2,000 & 0.1 $\mu$s & 0.1 $\mu$s & 0.2 $\mu$s & 0.2 $\mu$s & \textbf{5,814,663 ops/s} \\
+\texttt{IpcBus::send + recv\_inbox} (In-Process P2P) & 1,000 & 1.1 $\mu$s & 1.0 $\mu$s & 1.4 $\mu$s & 4.9 $\mu$s & \textbf{849,196 ops/s} \\
+\texttt{HTTP Daemon POST /mcp} (\texttt{fs\_read} JSON-RPC over TCP) & 200 & 167.4 $\mu$s & 172.1 $\mu$s & 197.2 $\mu$s & 292.2 $\mu$s & \textbf{5,804 ops/s} \\
 \bottomrule
 \end{tabular}%
 }
 \end{table*}
 
-\begin{figure}[t]
+\begin{figure}[!t]
 \centering
 \resizebox{\columnwidth}{!}{%
 \begin{tikzpicture}[font=\sffamily\scriptsize]
@@ -475,19 +478,19 @@ Large Project & 1,000 & 78.1 MB & $101.07 \pm 7.79$ ms & $\mathbf{5.62 \pm 0.41}
 \fill[aegisred!70, draw=aegisred!90!black, thick] (0.5,0) rectangle (1.15,0.23);
 \node[above] at (0.82, 0.23) {9.3};
 \fill[aegisblue!85, draw=aegisblue!95!black, thick] (1.2,0) rectangle (1.85,0.03);
-\node[above] at (1.58, 0.03) {\textbf{0.60}};
+\node[above] at (1.58, 0.03) {\textbf{0.68}};
 \node[below, align=center] at (1.17, -0.05) {100 Files\\(2.0 MB)};
 
-\fill[aegisred!70, draw=aegisred!90!black, thick] (2.8,0) rectangle (3.45,0.72);
-\node[above] at (3.12, 0.72) {28.9};
+\fill[aegisred!70, draw=aegisred!90!black, thick] (2.8,0) rectangle (3.45,0.71);
+\node[above] at (3.12, 0.71) {28.2};
 \fill[aegisblue!85, draw=aegisblue!95!black, thick] (3.5,0) rectangle (4.15,0.05);
-\node[above] at (3.88, 0.05) {\textbf{1.79}};
+\node[above] at (3.88, 0.05) {\textbf{1.64}};
 \node[below, align=center] at (3.47, -0.05) {300 Files\\(17.6 MB)};
 
-\fill[aegisred!70, draw=aegisred!90!black, thick] (5.1,0) rectangle (5.75,2.53);
-\node[above] at (5.42, 2.53) {101.1 ms};
+\fill[aegisred!70, draw=aegisred!90!black, thick] (5.1,0) rectangle (5.75,2.46);
+\node[above] at (5.42, 2.46) {98.3 ms};
 \fill[aegisblue!85, draw=aegisblue!95!black, thick] (5.8,0) rectangle (6.45,0.14);
-\node[above] at (6.22, 0.14) {\textbf{5.62 ms}};
+\node[above] at (6.22, 0.14) {\textbf{5.75 ms}};
 \node[below, align=center] at (5.77, -0.05) {1,000 Files\\(78.1 MB)};
 
 \fill[aegisred!70, draw=aegisred!90!black] (0.4, 3.15) rectangle (0.7, 3.35);
@@ -497,17 +500,17 @@ Large Project & 1,000 & 78.1 MB & $101.07 \pm 7.79$ ms & $\mathbf{5.62 \pm 0.41}
 
 \end{tikzpicture}%
 }
-\caption{Workspace provisioning latency across repository scales (Experiment 3A). Directory-level APFS \texttt{clonefile} achieves an 18.0$\times$ speedup on 1,000-file repositories.}
+\caption{Workspace provisioning latency across repository scales (Experiment 3A). Directory-level APFS \texttt{clonefile} achieves a 17.1$\times$--17.2$\times$ speedup on medium and large repositories.}
 \label{fig:exp3}
 \end{figure}
 
 \subsection{Experiment 3 (RQ3): CoW Provisioning Latency, Storage Savings, and Syscall Overhead}
 
-We evaluate workspace provisioning across three repository scales (100 files / 2.0 MB, 300 files / 17.6 MB, and 1,000 files / 78.1 MB) with 5 independent trials per scale. As shown in Table~\ref{tab:exp3a} and Figure~\ref{fig:exp3}, traditional full copying scales linearly with byte volume, requiring $101.07 \pm 7.79$ ms for the 1,000-file repository. By invoking APFS directory-tree \texttt{libc::clonefile}, Aegis OS provisions the exact same 1,000-file shadow workspace in \textbf{$5.62 \pm 0.41$ ms}---\textbf{18.0$\times$ faster}. Moreover, when 10 concurrent agents each modify 5\% of the repository, Aegis OS reduces physical disk consumption from 781.2 MB to 39.1 MB (\textbf{95.0\% storage saving}).
+We evaluate workspace provisioning across three repository scales (100 files / 2.0 MB, 300 files / 17.6 MB, and 1,000 files / 78.1 MB) with 5 independent trials per scale. As shown in Table~\ref{tab:exp3a} and Figure~\ref{fig:exp3}, traditional full copying scales linearly with byte volume, requiring $98.33 \pm 3.75$ ms for the 1,000-file repository. By invoking APFS directory-tree \texttt{libc::clonefile}, Aegis OS provisions the exact same 1,000-file shadow workspace in \textbf{$5.75 \pm 1.55$ ms}---\textbf{17.1$\times$ faster} (and \textbf{17.2$\times$ faster} on the 300-file medium repository). To measure multi-agent storage overhead, we spawn 10 concurrent agent CoW workspaces and have each agent modify a realistic task working set of 6 files (Small), 12 files (Medium), and 25 files (Large). Because APFS CoW allocates new physical extents only for mutated files (while both \texttt{upper\_workspace/} and \texttt{baseline\_snapshot/} share unmodified extents), Aegis OS reduces 10-agent disk allocation by \textbf{94.0\%} (Small), \textbf{96.0\%} (Medium), and \textbf{97.5\%} (Large, 19.5 MB vs.\ 781.2 MB).
 
-Table~\ref{tab:exp3b} reports the fine-grained latency distribution of kernel operations. In-process Cedar policy evaluation completes in \textbf{0.1 $\mu$s} (8.24M ops/sec), in-process IPC send/receive completes in \textbf{1.1 $\mu$s} (P50 = 0.9 $\mu$s), and a full end-to-end JSON-RPC \texttt{tools/call} (\texttt{fs\_read}) over a live loopback TCP socket to the HTTP daemon (\texttt{POST /mcp}) requires only \textbf{172.8 $\mu$s} (P50 = 178.0 $\mu$s, P99 = 265.8 $\mu$s, 5,630 ops/sec). Because typical LLM token generation latencies are $500,000$--$2,000,000$ $\mu$s (0.5--2.0 seconds), Aegis OS introduces \textbf{$<0.04\%$ end-to-end runtime overhead}.
+Table~\ref{tab:exp3b} reports the fine-grained latency distribution of kernel operations. In-process Cedar policy evaluation completes in \textbf{0.1 $\mu$s} (5.81M ops/sec), in-process IPC send/receive completes in \textbf{1.1 $\mu$s} (P50 = 1.0 $\mu$s), and a full end-to-end JSON-RPC \texttt{tools/call} (\texttt{fs\_read}) over a live loopback TCP socket to the HTTP daemon (\texttt{POST /mcp}) requires only \textbf{167.4 $\mu$s} (P50 = 172.1 $\mu$s, P99 = 292.2 $\mu$s, 5,804 ops/sec). Because typical LLM token generation latencies are $500,000$--$2,000,000$ $\mu$s (0.5--2.0 seconds), Aegis OS introduces \textbf{$<0.04\%$ end-to-end runtime overhead}.
 
-\begin{table*}[t]
+\begin{table*}[!t]
 \centering
 \caption{\textbf{Experiment 4 (RQ4): Live 3-Agent (\texttt{agy} + \texttt{claude} + \texttt{codex}) Concurrent Rust Modification, Overlapping Conflict Detection, and Real \texttt{cargo test} Verification}.}
 \label{tab:exp4}
@@ -515,9 +518,9 @@ Table~\ref{tab:exp3b} reports the fine-grained latency distribution of kernel op
 \resizebox{\textwidth}{!}{%
 \begin{tabular}{llll}
 \toprule
-\textbf{Evaluation Metric} & \textbf{Host-Shared-YOLO} & \textbf{Aegis-OS Isolated CoW + 3-Way Merge} & \textbf{Empirical Gain} \\
+\textbf{Evaluation Metric} & \textbf{Host-Shared-YOLO} & \textbf{Aegis-OS Isolated CoW + LCS Diff3 Merge} & \textbf{Empirical Gain} \\
 \midrule
-Concurrent 3-Agent Non-Overlapping Edits (\texttt{src/lib.rs}) & 1 / 3 preserved (2 / 3 clobbered) & \textbf{3 / 3 preserved (100\% 3-Way Merged)} & \textbf{3.0$\times$ Retention (0\% Clobber)} \\
+Concurrent 3-Agent Structural \& Function Edits (\texttt{src/lib.rs}) & 1 / 3 preserved (2 / 3 clobbered) & \textbf{3 / 3 preserved (100\% LCS 3-Way Merged)} & \textbf{3.0$\times$ Retention (0\% Clobber)} \\
 Overlapping Same-Line Edit Conflict Detection (10 Trials) & 0 / 10 detected (100\% Silent Lost Update) & \textbf{10 / 10 detected \& atomically aborted (Host intact)} & \textbf{100\% Conflict Safety} \\
 Post-Merge Real \texttt{cargo test --offline} Verification & Failed (Missing \texttt{agy} \& \texttt{claude} logic) & \textbf{Passed (\texttt{cargo test} exit code 0)} & \textbf{100\% Build \& Test Integrity} \\
 Cross-Agent 64 KB Spec Handoff Payload Size & 196,608 bytes ($\sim$49,152 tokens) & \textbf{294 bytes ($\sim$73 tokens via CAS URI)} & \textbf{99.85\% Token Reduction} \\
@@ -526,7 +529,7 @@ Cross-Agent 64 KB Spec Handoff Payload Size & 196,608 bytes ($\sim$49,152 tokens
 }
 \end{table*}
 
-\begin{table*}[t]
+\begin{table*}[!t]
 \centering
 \caption{\textbf{Experiment 5 (RQ5): Live Multi-File Corruption Recovery and \texttt{cargo check} Verification} (5 trials per scale, Mean $\pm$ StdDev).}
 \label{tab:exp5}
@@ -536,9 +539,9 @@ Cross-Agent 64 KB Spec Handoff Payload Size & 196,608 bytes ($\sim$49,152 tokens
 \toprule
 \textbf{Corrupted Rust Modules} & \textbf{Sequential File Restore (Mean $\pm$ SD)} & \textbf{Aegis Atomic CoW Rollback (Mean $\pm$ SD)} & \textbf{Kernel I/O Speedup} & \textbf{Post-Rollback \texttt{cargo check}} \\
 \midrule
-10 modules (640 KB) & $0.81 \pm 0.05$ ms & $\mathbf{0.63 \pm 0.07}$ \textbf{ms} & \textbf{1.3$\times$} & \texttt{PASSED (Exit 0)} \\
-50 modules (3.2 MB) & $4.01 \pm 0.22$ ms & $\mathbf{1.89 \pm 0.09}$ \textbf{ms} & \textbf{2.1$\times$} & \texttt{PASSED (Exit 0)} \\
-200 modules (12.8 MB) & $15.83 \pm 0.64$ ms & $\mathbf{6.21 \pm 0.35}$ \textbf{ms} & \textbf{2.5$\times$} & \texttt{PASSED (Exit 0)} \\
+10 modules (640 KB) & $0.76 \pm 0.03$ ms & $\mathbf{0.62 \pm 0.01}$ \textbf{ms} & \textbf{1.2$\times$} & \texttt{PASSED (Exit 0)} \\
+50 modules (3.2 MB) & $3.99 \pm 0.06$ ms & $\mathbf{1.81 \pm 0.07}$ \textbf{ms} & \textbf{2.2$\times$} & \texttt{PASSED (Exit 0)} \\
+200 modules (12.8 MB) & $15.93 \pm 0.22$ ms & $\mathbf{6.51 \pm 0.19}$ \textbf{ms} & \textbf{2.4$\times$} & \texttt{PASSED (Exit 0)} \\
 \bottomrule
 \end{tabular}%
 }
@@ -546,18 +549,18 @@ Cross-Agent 64 KB Spec Handoff Payload Size & 196,608 bytes ($\sim$49,152 tokens
 
 \subsection{Experiment 4 (RQ4): Live 3-Agent Concurrent Rust Coding, Conflict Detection, and \texttt{cargo test} Verification}
 
-We evaluate both non-overlapping and overlapping concurrent multi-agent edits across \texttt{agy-agent}, \texttt{claude-code}, and \texttt{codex-cli} on a live Rust crate (\texttt{src/lib.rs}):
+We evaluate both non-overlapping structural edits and overlapping concurrent multi-agent edits across \texttt{agy-agent}, \texttt{claude-code}, and \texttt{codex-cli} on a live Rust crate (\texttt{src/lib.rs}):
 \begin{itemize}
-    \item \textbf{Non-Overlapping Concurrent Edits (EXP 4A):} The three agents concurrently optimize three distinct functions (\texttt{calc\_fee}, \texttt{calc\_tax}, and \texttt{calc\_discount}) in \texttt{src/lib.rs}. In \textbf{Host-Shared-YOLO}, the final writer (\texttt{codex-cli}) silently clobbers the modifications of both \texttt{agy-agent} and \texttt{claude-code}, preserving only \textbf{1/3 (33.3\%)} of the features. In \textbf{Aegis-OS}, \texttt{three\_way\_merge\_lines} reconciles all three edits against their respective baselines, preserving \textbf{3/3 (100\%)} of the features and passing a live \texttt{cargo test --offline} execution (\texttt{exit code 0}).
-    \item \textbf{Overlapping Same-Line Conflict Detection (EXP 4B):} Across 10 live trials, both \texttt{agy-agent} and \texttt{codex-cli} concurrently modify Line 1 (\texttt{calc\_fee}) with conflicting expressions. While \textbf{Host-Shared-YOLO} suffers a 100\% silent lost update (0/10 detected), \textbf{Aegis-OS} detects \textbf{10/10 (100\%)} of the overlapping line conflicts, atomically aborts the conflicting second commit without corrupting the host file, and returns an exact line-number conflict diagnostic so the agent can coordinate via \texttt{aos-ipc}.
+    \item \textbf{Concurrent Multi-Line Insertion and Function Edits (EXP 4A):} All three agents start from the same baseline \texttt{src/lib.rs}. \texttt{agy-agent} inserts a new 3-line helper function (\texttt{min\_fee()}) at the top of the file and updates \texttt{calc\_fee} (shifting all downstream line indices), while \texttt{claude-code} concurrently modifies \texttt{calc\_tax} and \texttt{codex-cli} modifies \texttt{calc\_discount}. In \textbf{Host-Shared-YOLO}, the final writer (\texttt{codex-cli}) silently clobbers the modifications of both \texttt{agy-agent} and \texttt{claude-code}, preserving only \textbf{1/3 (33.3\%)} of the features. In \textbf{Aegis-OS}, our LCS Diff3 engine (\texttt{three\_way\_merge\_lines}) aligns the unmodified anchor lines across the unequal-length files, preserving \textbf{3/3 (100\%)} of the features and passing a live \texttt{cargo test --offline} execution (\texttt{exit code 0}).
+    \item \textbf{Overlapping Same-Line Conflict Detection (EXP 4B):} Across 10 live trials, both \texttt{agy-agent} and \texttt{codex-cli} concurrently modify \texttt{calc\_fee} with conflicting expressions. While \textbf{Host-Shared-YOLO} suffers a 100\% silent lost update (0/10 detected), \textbf{Aegis-OS} detects \textbf{10/10 (100\%)} of the overlapping line conflicts, atomically aborts the conflicting second commit without corrupting the host file, and returns an exact baseline line-number conflict diagnostic so the agent can coordinate via \texttt{aos-ipc}.
     \item \textbf{CAS Context Token Savings:} Replacing inline 64 KB specification handoffs with \texttt{artifact://} CAS URIs reduces IPC message payload bytes across 3 handoffs from 196,608 bytes ($\sim$49,152 tokens) to 294 bytes ($\sim$73 tokens), achieving a \textbf{99.85\% context token reduction} (Table~\ref{tab:exp4}).
 \end{itemize}
 
 \subsection{Experiment 5 (RQ5): Time-Travel Rollback and \texttt{cargo check} Verification}
 
-Finally, we evaluate recovery from catastrophic agent hallucinations where an agent introduces syntax errors (\texttt{BROKEN\_RUST\_SYNTAX\_ERROR !!!}) across 10, 50, and 200 Rust module files (\texttt{src/mod\_*.rs}, 64 KB per module). As shown in Table~\ref{tab:exp5}, Aegis OS's atomic directory-tree \texttt{workspace\_rollback} restores all 200 corrupted modules in \textbf{$6.21 \pm 0.35$ ms} (\textbf{2.5$\times$ faster} than sequential file-by-file I/O restoration and over \textbf{10,000$\times$ faster} than multi-turn LLM-driven file reverts). Immediately after rollback, our benchmark harness executes \texttt{cargo check --offline} inside the restored shadow workspace, confirming 100\% compilation recovery across all scales.
+Finally, we evaluate recovery from catastrophic agent hallucinations where an agent introduces syntax errors (\texttt{BROKEN\_RUST\_SYNTAX\_ERROR !!!}) across 10, 50, and 200 Rust module files (\texttt{src/mod\_*.rs}, 64 KB per module). As shown in Table~\ref{tab:exp5}, Aegis OS's atomic directory-tree \texttt{workspace\_rollback} restores all 200 corrupted modules in \textbf{$6.51 \pm 0.19$ ms} (\textbf{2.4$\times$ faster} than sequential file-by-file I/O restoration and over \textbf{10,000$\times$ faster} than multi-turn LLM-driven file reverts). Immediately after rollback, our benchmark harness executes \texttt{cargo check --offline} inside the restored shadow workspace, confirming 100\% compilation recovery across all scales.
 
-\begin{table*}[t]
+\begin{table*}[!t]
 \centering
 \caption{\textbf{Cross-Platform Operating System Primitive Mapping} between macOS Developer Workstations and Linux Cloud Hosts in Aegis OS.}
 \label{tab:crossplatform}
@@ -580,23 +583,25 @@ Finally, we evaluate recovery from catastrophic agent hallucinations where an ag
 \section{Cross-Platform Mapping, Discussion, and Limitations}
 \label{sec:discussion}
 
-\paragraph{Cross-Platform Kernel Primitive Duality (macOS vs.\ Linux).} While our live empirical evaluation in \S\ref{sec:eval} was conducted on Apple Silicon (\texttt{macos-aarch64}), every Aegis OS subsystem is architected around platform-agnostic Rust traits (\texttt{TransactionalWorkspace}, \texttt{SandboxDriver}) that map cleanly onto native Linux kernel primitives, as detailed in Table~\ref{tab:crossplatform}. On Linux hosts formatted with Btrfs or XFS (\texttt{reflink=1}), \texttt{aos-vfs} uses extent-level \texttt{FICLONE} reflinks (or \texttt{OverlayFS} upperdirs on ext4) to achieve the same $O(1)$ CoW workspace provisioning. Similarly, \texttt{aos-sandbox} maps Tier 1 isolation to unprivileged user/mount/network namespaces via \texttt{bwrap} combined with Landlock LSM and \texttt{seccomp-bpf}, and Tier 2 isolation to \texttt{libkrun}/Firecracker microVMs~\cite{agache2020firecracker}.
+\paragraph{Cross-Platform Kernel Primitive Duality (macOS vs.\ Linux).} While our live empirical evaluation in \S\ref{sec:eval} was conducted on Apple Silicon (\texttt{macos-aarch64}), every Aegis OS subsystem is architected around platform-agnostic Rust traits (\texttt{TransactionalWorkspace}, \texttt{SandboxDriver}) that map cleanly onto native Linux kernel primitives, as detailed in Table~\ref{tab:crossplatform}. On Linux hosts formatted with Btrfs or XFS (\texttt{reflink=1}), \texttt{aos-vfs} uses extent-level \texttt{FICLONE} reflinks~\cite{rodeh2013btrfs} (or \texttt{OverlayFS} upperdirs~\cite{wright2004unionfs} on ext4) to achieve the same $O(1)$ CoW workspace provisioning. Similarly, \texttt{aos-sandbox} executes \texttt{/usr/bin/bwrap} on Linux to enforce unprivileged user, mount, PID, and network namespaces, while Tier 2 provides the control-plane interface for \texttt{libkrun}/Firecracker microVMs~\cite{agache2020firecracker}.
 
-\paragraph{HTTPS TLS Termination and Boundary Secret Injection.} In our current implementation, \texttt{AegisEgressGateway} injects secrets (\texttt{\$AOS\_SECRET\_*}) directly into HTTP request headers and bodies or MCP \texttt{egress\_http\_request} syscalls. When legacy CLI binaries inside \texttt{proc\_exec} initiate direct TLS (\texttt{HTTPS CONNECT}) tunnels, inspecting headers requires the local proxy to terminate TLS using a session-scoped ephemeral Certificate Authority (CA) injected into the sandbox's \texttt{SSL\_CERT\_FILE} environment variable. Extending \texttt{aos-egress} with automated per-sandbox ephemeral CA generation for transparent HTTPS header rewriting is a natural engineering extension.
+\paragraph{Filesystem Read Denylist vs.\ Allowlist Trade-offs on Developer Workstations.} On Linux (\texttt{bwrap}), mounting an isolated root filesystem with selective read-only bind mounts (\texttt{--ro-bind /usr /usr}) naturally enforces a strict read allowlist. On macOS, however, XNU's dynamic linker (\texttt{dyld} shared cache), Xcode toolchains, and Homebrew libraries traverse numerous system paths under \texttt{/System}, \texttt{/Library}, and \texttt{/opt/homebrew}. Consequently, our macOS Seatbelt profile combines a \emph{strict allowlist on file writes} (\texttt{(deny file-write*)}) with a \emph{targeted regex denylist on file reads} covering high-value credential stores (\texttt{.ssh}, \texttt{.aws}, \texttt{.gnupg}, \texttt{.kube}, \texttt{.config/gh}, \texttt{.npmrc}, \texttt{.pypirc}, and \texttt{Library/Keychains}). Users requiring strict read isolation from sibling source repositories on macOS can additionally pass custom \texttt{(deny file-read* (subpath ...))} rules for their parent project directories while keeping toolchain paths readable.
 
-\paragraph{Line-Level vs.\ AST-Aware Structural Merging.} Our 3-Way Merge Engine (\texttt{three\_way\_merge\_lines}) operates at line granularity, matching the semantics of \texttt{git merge-file}. While line-level 3-way merging resolves 100\% of disjoint function edits and catches 100\% of same-line conflicts (Table~\ref{tab:exp4}), two agents that append new imports or struct fields at the exact same line boundary will trigger a conflict abort requiring an IPC retry. Integrating tree-sitter AST-aware structural merging for Rust, TypeScript, and Python can further reduce false-positive merge conflicts on commutative syntax nodes (e.g., import lists).
+\paragraph{HTTPS TLS Termination and Boundary Secret Injection.} In our current implementation, \texttt{AegisEgressGateway} operates as an L7 HTTP boundary gateway and MCP \texttt{egress\_http\_request} sanitizer, pinning agent identities per listener socket (\texttt{start\_local\_proxy\_with\_bound\_identity}) and enforcing kernel-level Seatbelt \texttt{(deny network-outbound)} so child processes cannot bypass the local proxy. When legacy CLI binaries inside \texttt{proc\_exec} initiate direct TLS (\texttt{HTTPS CONNECT}) tunnels, inspecting headers requires the local proxy to terminate TLS using a session-scoped ephemeral Certificate Authority (CA) injected into the sandbox's \texttt{SSL\_CERT\_FILE} environment variable. Extending \texttt{aos-egress} with automated per-sandbox ephemeral CA generation and full upstream TLS forwarding is a natural engineering extension.
+
+\paragraph{Syntactic 3-Way Merging vs.\ Semantic Integration Conflicts.} Our LCS Diff3 3-Way Merge Engine (\texttt{three\_way\_merge\_lines})~\cite{khanna2007formal} resolves 100\% of disjoint line-level edits (including multi-line insertions) and catches 100\% of overlapping line conflicts (Table~\ref{tab:exp4}). However, two agents could make syntactically disjoint edits that introduce a \emph{semantic conflict} (e.g., Agent A renames a function signature at Line 10 while Agent B adds a call to the old function name at Line 120). Aegis OS mitigates semantic conflicts by allowing the committing agent (or a pre-commit verification hook) to execute \texttt{cargo test} inside the sandbox after merging peer changes from \texttt{host/} into \texttt{upper\_workspace/} prior to finalizing \texttt{workspace\_commit}, and by supporting instant \texttt{workspace\_rollback} if post-merge compilation fails.
 
 \section{Related Work}
 \label{sec:related}
 
-\paragraph{LLM Agent Sandboxes and Benchmarks.} Recent benchmarks such as SWE-bench~\cite{jimenez2024swebench}, ToolEmu~\cite{ruan2024toolemu}, AgentDojo~\cite{debenedetti2024agentdojo}, and InjecAgent~\cite{zhan2024injecagent} highlight both the capabilities and vulnerability of tool-using agents to indirect prompt injection~\cite{greshake2023not}. Existing container-based sandboxes (e.g., Docker per task) incur seconds of startup latency, duplicate gigabytes of container layers, and isolate agents from the developer's live local repository. Aegis OS instead combines sub-10ms APFS CoW shadow workspaces with Seatbelt/Bubblewrap mandatory access control and a 3-Way Merge Engine directly over the live repository.
+\paragraph{LLM Agent Sandboxes and Prompt Injection Defenses.} Benchmarks such as SWE-bench~\cite{jimenez2024swebench}, SWE-agent~\cite{yang2024sweagent}, OpenHands~\cite{wang2025openhands}, ToolEmu~\cite{ruan2024toolemu}, AgentDojo~\cite{debenedetti2024agentdojo}, and InjecAgent~\cite{zhan2024injecagent} highlight both the capabilities and vulnerability of tool-using agents to indirect prompt injection~\cite{greshake2023not}. Recent defenses such as SecGPT~\cite{wu2024secgpt}, CaMeL~\cite{debenedetti2025camel}, and FIDES~\cite{costa2025fides} propose information-flow control or dual-LLM privilege separation at the prompt/interpreter level. Aegis OS is complementary to model-level defenses: it enforces mandatory access control at the \emph{operating system kernel and network boundary} regardless of how the agent planner is implemented. Unlike container-per-task sandboxes (e.g., Docker), which incur seconds of startup latency and isolate agents from the developer's live local repository, Aegis OS combines sub-6ms APFS CoW shadow workspaces~\cite{rodeh2013btrfs,wright2004unionfs} with Seatbelt/Bubblewrap mandatory access control~\cite{kim2013mbox} and an LCS Diff3 3-Way Merge Engine~\cite{khanna2007formal} directly over the live repository.
 
-\paragraph{Agent Operating Systems and Multi-Agent Frameworks.} AIOS~\cite{mei2024aios} integrates an LLM kernel scheduler above application agents, while AutoGen~\cite{wu2023autogen} orchestrates multi-agent conversations in Python. In contrast, Aegis OS adopts a strict ``Body Only'' OS kernel design aligned with classical capability systems such as Capsicum~\cite{watson2010capsicum}, Cedar authorization~\cite{cutler2024cedar}, and Firecracker microVMs~\cite{agache2020firecracker}, serving any MCP-compatible client (\texttt{agy}, \texttt{claude}, \texttt{codex}) without dictating agent reasoning logic.
+\paragraph{Agent Operating Systems and Multi-Agent Frameworks.} AIOS~\cite{mei2024aios} integrates an LLM kernel scheduler above application agents, while AutoGen~\cite{wu2023autogen} and MetaGPT~\cite{hong2024metagpt} orchestrate multi-agent conversations in Python. In contrast, Aegis OS adopts a strict ``Environment Kernel Only'' design aligned with classical capability systems such as Capsicum~\cite{watson2010capsicum}, Mbox~\cite{kim2013mbox}, Cedar authorization~\cite{cutler2024cedar}, and Firecracker microVMs~\cite{agache2020firecracker}, serving any MCP-compatible client (\texttt{agy}, \texttt{claude}, \texttt{codex}) without dictating agent reasoning logic.
 
 \section{Conclusion}
 \label{sec:conclusion}
 
-We presented \textbf{Aegis OS}, a transactional, multi-tenant Agent Operating System Runtime that resolves the Security--Autonomy Dilemma for autonomous coding agents. By combining APFS Copy-on-Write shadow workspaces, 3-Way multi-agent merge commits, kernel-enforced Seatbelt/Bubblewrap sandboxes, Zero-Trust boundary secret injection, and first-class IPC + CAS primitives, Aegis OS eliminates 94.44\%--99.89\% of human confirmation prompts while reducing adversarial attack success from 100.0\% to 0.0\%.
+We presented \textbf{Aegis OS}, a transactional, multi-tenant Agent Operating System Runtime that resolves the Security--Autonomy Dilemma for autonomous coding agents. By combining APFS Copy-on-Write shadow workspaces, LCS Diff3 3-Way multi-agent merge commits, kernel-enforced Seatbelt/Bubblewrap sandboxes with outbound network confinement, Zero-Trust boundary secret injection, and first-class IPC + CAS primitives, Aegis OS eliminates 94.19\%--99.88\% of human confirmation prompts while reducing adversarial attack success from 100.0\% to 0.0\%.
 
 \bibliographystyle{plain}
 \bibliography{references}

@@ -48,11 +48,24 @@ impl NativeOsSandboxInstance {
     /// - The Agent's CoW Shadow Workspace (`workspace_dir`)
     /// - The Agent's private persistent Home (`agent_home_dir`)
     /// - The Agent's organization publish directory (`org_agent_pub_dir`)
-    /// And explicitly denies reading sensitive host credential directories (`~/.ssh`, `~/.aws`, `~/.gnupg`).
+    /// And explicitly denies reading sensitive host credential directories (`~/.ssh`, `~/.aws`, `~/.gnupg`,
+    /// `~/.kube`, `~/.config/gh`, `~/.npmrc`, `~/.pypirc`, `~/Library/Keychains`).
+    /// When `egress_proxy_addr` is set, also enforces `(deny network-outbound)` except to localhost proxy.
     pub fn generate_macos_seatbelt_profile(&self) -> String {
         let ws = Self::canonical_or_orig(&self.config.workspace_dir);
         let home = Self::canonical_or_orig(&self.config.agent_home_dir);
         let pub_dir = Self::canonical_or_orig(&self.config.org_agent_pub_dir);
+
+        let net_rules = if self.config.egress_proxy_addr.is_some() {
+            r#"
+(deny network-outbound)
+(allow network-outbound
+    (remote ip "localhost:*")
+    (literal "/private/var/run/mDNSResponder")
+)"#
+        } else {
+            ""
+        };
 
         format!(
             r#"(version 1)
@@ -72,7 +85,13 @@ impl NativeOsSandboxInstance {
     (regex #".*/\.ssh(/.*)?$")
     (regex #".*/\.aws(/.*)?$")
     (regex #".*/\.gnupg(/.*)?$")
-)
+    (regex #".*/\.kube(/.*)?$")
+    (regex #".*/\.config/gh(/.*)?$")
+    (regex #".*/\.npmrc$")
+    (regex #".*/\.pypirc$")
+    (regex #".*/Library/Keychains(/.*)?$")
+    (literal "/etc/shadow")
+){net_rules}
 "#
         )
     }
@@ -153,6 +172,16 @@ impl SandboxInstance for NativeOsSandboxInstance {
             let mut c = Command::new("/usr/bin/sandbox-exec");
             c.arg("-p").arg(sbpl).arg(&spec.command).args(&spec.args);
             (c, "macos-seatbelt-kernel-enforced".to_string())
+        } else if cfg!(target_os = "linux")
+            && !kernel_sandbox_disabled
+            && Path::new("/usr/bin/bwrap").exists()
+        {
+            let mut c = Command::new("/usr/bin/bwrap");
+            c.args(self.generate_linux_bwrap_args())
+                .arg("--")
+                .arg(&spec.command)
+                .args(&spec.args);
+            (c, "linux-bwrap-namespace-enforced".to_string())
         } else {
             let mut c = Command::new(&spec.command);
             c.args(&spec.args);
@@ -167,6 +196,10 @@ impl SandboxInstance for NativeOsSandboxInstance {
             )
             .env("HOME", &self.config.agent_home_dir)
             .env("TMPDIR", &self.config.agent_home_dir)
+            .env(
+                "CARGO_TARGET_DIR",
+                self.config.agent_home_dir.join("cargo_target"),
+            )
             .env("AOS_SANDBOX_ID", &self.instance_id)
             .env("AOS_ORG_ID", &self.config.identity.org_id)
             .env("AOS_AGENT_ID", &self.config.identity.agent_id)

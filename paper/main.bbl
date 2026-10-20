@@ -13,6 +13,12 @@ Alexandru Agache, Marc Brooker, Alexandra Iordache, Anthony Liguori, Rolf
   applications to external systems.
 \newblock \url{https://modelcontextprotocol.io}, 2024.
 
+\bibitem{costa2025fides}
+Manuel Costa, Boris Köpf, Aecio Ribeiro, Andrew Roscoe, Mark Russinovich, and
+  M.~Schut.
+\newblock Securing {AI} agents with information-flow control.
+\newblock {\em arXiv preprint arXiv:2505.23643}, 2025.
+
 \bibitem{cutler2024cedar}
 Joseph~W. Cutler, Craig Disselkoen, Aaron Eline, Shaobo He, Kyle Headley,
   Michael Hicks, Kesha Hietala, Eleftherios Ioannidis, John Kastner, Anwar
@@ -22,6 +28,12 @@ Joseph~W. Cutler, Craig Disselkoen, Aaron Eline, Shaobo He, Kyle Headley,
   authorization.
 \newblock {\em Proceedings of the ACM on Programming Languages},
   8(OOPSLA1):670--697, 2024.
+
+\bibitem{debenedetti2025camel}
+Edoardo Debenedetti, Ilia Shumailov, Tianqi Fan, Jamie Soares, Nicholas Cano,
+  Mathias Payer, and Florian Tram{\`e}r.
+\newblock Defeating prompt injections by design.
+\newblock {\em arXiv preprint arXiv:2503.18813}, 2025.
 
 \bibitem{debenedetti2024agentdojo}
 Edoardo Debenedetti, Jie Zhang, Mislav Balunovi{\'c}, Luca Beurer-Kellner, Marc
@@ -39,12 +51,34 @@ Kai Greshake, Sahar Abdelnabi, Shailesh Mishra, Christoph Endres, Thorsten
 \newblock In {\em Proceedings of the 16th ACM Workshop on Artificial
   Intelligence and Security (AISec)}, pages 79--90, 2023.
 
+\bibitem{hong2024metagpt}
+Sirui Hong, Mingchen Zhuge, Jonathan Chen, Xiawu Zheng, Yuheng Cheng, Jinlin
+  Wang, Ceyao Zhang, Zili Wang, Steven Ka~Shing Yau, Zijuan Lin, Liyang Zhou,
+  Chenyu Ran, Lingfeng Xiao, Chenglin Wu, and J{\"u}rgen Schmidhuber.
+\newblock {MetaGPT}: Meta programming for a multi-agent collaborative
+  framework.
+\newblock In {\em Twelfth International Conference on Learning Representations
+  (ICLR)}, 2024.
+
 \bibitem{jimenez2024swebench}
 Carlos~E. Jimenez, John Yang, Alexander Wettig, Shunyu Yao, Kexin Pei, Ofir
   Press, and Karthik~R. Narasimhan.
 \newblock {SWE-bench}: Can language models resolve real-world {GitHub} issues?
 \newblock In {\em Twelfth International Conference on Learning Representations
   (ICLR)}, 2024.
+
+\bibitem{khanna2007formal}
+Sanjeev Khanna, Keshav Kunal, and Benjamin~C. Pierce.
+\newblock A formal investigation of {Diff3}.
+\newblock In {\em 27th International Conference on Foundations of Software
+  Technology and Theoretical Computer Science (FSTTCS)}, pages 485--496.
+  Springer, 2007.
+
+\bibitem{kim2013mbox}
+Taesoo Kim and Nickolai Zeldovich.
+\newblock Practical sandboxing for non-root users.
+\newblock In {\em 2013 USENIX Annual Technical Conference (USENIX ATC 13)},
+  pages 139--144. USENIX Association, 2013.
 
 \bibitem{mei2024aios}
 Kai Mei, Xi~Zhu, Wujiang Xu, Wenyue Hua, Mingyu Jin, Zelong Li, Shuyuan Xu,
@@ -65,11 +99,30 @@ Yangjun Ruan, Honghua Dong, Andrew Wang, Silviu Pitis, Yongchao Zhou, Jimmy Ba,
 \newblock In {\em Twelfth International Conference on Learning Representations
   (ICLR)}, 2024.
 
+\bibitem{wang2025openhands}
+Xingyao Wang, Boxuan Li, Yufan Song, Frank~F. Xu, Xiangru Tang, Mingchen Zhuge,
+  Jiayi Pan, Yueqi Song, Bowen Li, Jaskirat Singh, Hoang~H. Tran, Fuqiang Li,
+  Ren Ma, Mingzhang Zheng, Bill Qian, Yanjun Shao, Niklas Muennighoff, Yizhe
+  Zhang, Binyuan Hui, Junyang Lin, Robert Brennan, Hao Peng, Heng Ji, and
+  Graham Neubig.
+\newblock {OpenHands}: An open platform for {AI} software developers as
+  generalist agents.
+\newblock In {\em Thirteenth International Conference on Learning
+  Representations (ICLR)}, 2025.
+
 \bibitem{watson2010capsicum}
 Robert N.~M. Watson, Jonathan Anderson, Ben Laurie, and Kris Kennaway.
 \newblock Capsicum: Practical capabilities for {UNIX}.
 \newblock In {\em 19th USENIX Security Symposium (USENIX Security 10)}, pages
   29--46. USENIX Association, 2010.
+
+\bibitem{wright2004unionfs}
+Charles~P. Wright, Jay Dave, Puja Gupta, Harikesavan Krishnan, David~P.
+  Quigley, Erez Zadok, and Mohammad~Nayyer Zubair.
+\newblock Versatility and {Unix} semantics in a fan-out unification file
+  system.
+\newblock In {\em ACM Transactions on Storage (TOS)}, volume~2, pages 74--105,
+  2006.
 
 \bibitem{wu2023autogen}
 Qingyun Wu, Gagan Bansal, Jieyu Zhang, Yiran Wu, Beibin Li, Erkang Zhu,
@@ -78,6 +131,20 @@ Qingyun Wu, Gagan Bansal, Jieyu Zhang, Yiran Wu, Beibin Li, Erkang Zhu,
 \newblock {AutoGen}: Enabling next-gen {LLM} applications via multi-agent
   conversation.
 \newblock In {\em First Conference on Language Modeling (COLM)}, 2024.
+
+\bibitem{wu2024secgpt}
+Yuhao Wu, Franziska Roesner, Tadayoshi Kohno, Ning Zhang, and Umar Iqbal.
+\newblock {SecGPT}: An execution isolation architecture for large language
+  model based systems.
+\newblock {\em arXiv preprint arXiv:2403.04960}, 2024.
+
+\bibitem{yang2024sweagent}
+John Yang, Carlos~E. Jimenez, Alexander Wettig, Kilian Lieret, Shunyu Yao,
+  Karthik Narasimhan, and Ofir Press.
+\newblock {SWE-agent}: Agent-computer interfaces enable automated software
+  engineering.
+\newblock In {\em Advances in Neural Information Processing Systems (NeurIPS)},
+  volume~37, 2024.
 
 \bibitem{zhan2024injecagent}
 Qiusi Zhan, Zhixiang Liang, Zifan Ying, and Daniel Kang.

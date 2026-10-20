@@ -1,21 +1,26 @@
 ================================================================================
-ARXIV WEB SUBMISSION METADATA (Strictly formatted per Trevor Campbell's Guide)
+ARXIV SUBMISSION METADATA (Ready to Copy-Paste into https://arxiv.org/submit)
 ================================================================================
 
-[Title] (Initial Caps, No LaTeX formatting):
-Aegis OS: A Transactional Multi-Tenant Operating System Runtime for Eliminating Authorization Fatigue in Autonomous Coding Agents
-
-[Authors] (Comma-separated full names, NO "and", No LaTeX formatting):
-Hui Zhao (huizhao@heurion.org)
-
-[Primary Category]:
+[Primary Category]
 cs.OS (Operating Systems)
 
-[Cross-List Categories]:
-cs.MA (Multiagent Systems), cs.CR (Cryptography and Security), cs.SE (Software Engineering), cs.AI (Artificial Intelligence)
+[Secondary Cross-List Categories]
+cs.CR (Cryptography and Security)
+cs.AI (Artificial Intelligence)
+cs.MA (Multiagent Systems)
+cs.SE (Software Engineering)
 
-[Comments]:
-11 pages, 3 figures, 9 tables. Open-source runtime and benchmark suite: https://github.com/heurion-org/aegis-os
+[Title]
+Aegis OS: A Transactional Multi-Tenant Operating System Runtime for Eliminating Authorization Fatigue in Autonomous Coding Agents
 
-[Abstract] (Single continuous plain-text block, NO line breaks, NO LaTeX commands):
-Autonomous coding agents such as Google Antigravity (agy), Anthropic Claude Code (claude), and OpenAI Codex CLI (codex) increasingly execute complex, multi-step software engineering workflows directly on developer workstations and enterprise cloud hosts. However, existing agent execution environments suffer from a fundamental Security-Autonomy Dilemma: users must choose between Interactive Per-Action Prompting, which interrupts human operators on 43% to 60% of tool invocations and induces severe authorization fatigue, or Unconfined Host Execution (--yolo / --dangerously-skip-permissions), which exposes the host filesystem, SSH credentials, and API secrets to catastrophic prompt injection and agent hallucination risks. Furthermore, when multiple heterogeneous agents collaborate on a shared repository, concurrent unconstrained edits cause race-condition file clobbering, while passing large code artifacts inline through LLM context windows incurs prohibitive token overhead. We present Aegis OS (aegis-os), a transactional, multi-tenant Agent Operating System Runtime implemented in Rust and exposed via the Model Context Protocol (MCP). Aegis OS resolves the Security-Autonomy Dilemma by shifting the security boundary from individual tool invocations to transactional workspace boundaries. Each agent principal operates inside a kernel-enforced OS sandbox (macOS Seatbelt sandbox-exec or Linux Bubblewrap/MicroVM) backed by an APFS Copy-on-Write (CoW) shadow workspace (libc::clonefile), a Zero-Trust HTTP Egress Proxy with boundary secret injection, and an intra-organization Inter-Agent Communication (IPC) bus paired with Content-Addressable Storage (CAS). Inside its isolated CoW workspace and organization IPC bus, an agent executes with zero confirmation prompts; human authorization or TTL-based session leases are required only when committing validated diffs back to the host via a 3-Way Merge Engine. Across 1,500 live kernel syscalls and 40 live red-team attacks, Aegis OS reduces human confirmation prompts by 94.44% to 99.89% (saving up to 74.9 minutes of human verification wait time), lowers the attack success rate from 100.0% to 0.0%, provisions 1,000-file (78.1 MB) workspaces in 5.62 ms (18.0x faster than full copy with 95.0% storage savings), preserves 100% of concurrent multi-agent edits while catching 10/10 overlapping line conflicts, and reduces cross-agent artifact handoff token consumption by 99.85%.
+[Authors]
+Hui Zhao (huizhao@heurion.org)
+
+[Comments]
+9 pages, 3 TikZ figures, 8 tables. Open-source Rust implementation and reproducible benchmark suite available at https://github.com/heurion-org/aegis-os
+
+[Abstract (Plain Text for arXiv Web Form — Under 1,920 characters)]
+Autonomous coding agents such as Google Antigravity (agy), Anthropic Claude Code (claude), and OpenAI Codex CLI (codex) increasingly execute complex, multi-step software engineering workflows directly on developer workstations and enterprise cloud hosts. However, existing agent execution environments suffer from a fundamental Security-Autonomy Dilemma: users must choose between Interactive Per-Action Prompting, which interrupts human operators on 45%-57% of tool invocations and induces severe authorization fatigue, or Unconfined Host Execution (--yolo / --dangerously-skip-permissions), which exposes the host filesystem, SSH/cloud credentials, and API secrets to catastrophic prompt injection and agent hallucination risks. Furthermore, when multiple heterogeneous agents collaborate on a shared repository, concurrent unconstrained edits cause race-condition file clobbering, while passing large code artifacts inline through LLM context windows incurs prohibitive token overhead.
+
+We present Aegis OS (aegis-os), a transactional, multi-tenant Agent Operating System Runtime implemented in Rust and exposed via the Model Context Protocol (MCP). Aegis OS resolves the Security-Autonomy Dilemma by shifting the security boundary from individual tool invocations to transactional workspace boundaries. Each agent principal operates inside a kernel-enforced OS sandbox (macOS Seatbelt sandbox-exec or Linux Bubblewrap/MicroVM) backed by an APFS Copy-on-Write (CoW) shadow workspace (libc::clonefile), a Zero-Trust HTTP Egress Proxy with boundary secret injection, and an intra-organization Inter-Agent Communication (IPC) bus paired with Content-Addressable Storage (CAS). Across 1,500 live kernel syscalls and 40 live red-team attacks, Aegis OS reduces human confirmation prompts by 94.19%-99.88% (saving up to 71.6 minutes of human wait time), lowers attack success rate from 100.0% to 0.0%, provisions 1,000-file (78.1 MB) workspaces in 5.75 ms (17.1x faster than full copy with 94.0%-97.5% storage savings), preserves 100% of concurrent multi-agent edits while catching 10/10 overlapping line conflicts, and reduces cross-agent artifact handoff tokens by 99.85%.
