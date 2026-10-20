@@ -5,7 +5,8 @@
 //! and developer CLI commands share peer discovery and mailboxes seamlessly.
 
 use aos_core::{
-    AgentIdentity, IpcBus, IpcEnvelope, IpcKind, MessageDeliveryStatus, PeerInfo, PeerLiveness,
+    A2AArtifact, A2APart, A2ATask, A2ATaskState, A2ATaskStatusUpdate, AgentIdentity, AgentSkill,
+    IpcBus, IpcEnvelope, IpcKind, MessageDeliveryStatus, PeerInfo, PeerLiveness,
 };
 use anyhow::{bail, Context};
 use async_trait::async_trait;
@@ -22,6 +23,8 @@ struct PersistedIpcState {
     peers: HashMap<String, HashMap<String, PeerInfo>>,
     mailboxes: HashMap<String, Vec<IpcEnvelope>>,
     msg_index: HashMap<String, IpcEnvelope>,
+    #[serde(default)]
+    tasks: HashMap<String, A2ATask>,
 }
 
 pub struct AegisIpcBus {
@@ -32,6 +35,8 @@ pub struct AegisIpcBus {
     mailboxes: Arc<RwLock<HashMap<String, Vec<IpcEnvelope>>>>,
     /// Key: `msg_id` -> `IpcEnvelope` index for fast lookup & RPC reply correlation
     msg_index: Arc<RwLock<HashMap<String, IpcEnvelope>>>,
+    /// Key: `task_id` -> Stateful Google A2A `A2ATask`
+    tasks: Arc<RwLock<HashMap<String, A2ATask>>>,
     /// Key: `org_id::agent_id` -> Real-time wakeup notification channel
     wakeup_channels: Arc<RwLock<HashMap<String, broadcast::Sender<IpcEnvelope>>>>,
 }
@@ -61,6 +66,7 @@ impl AegisIpcBus {
             peers: Arc::new(RwLock::new(initial.peers)),
             mailboxes: Arc::new(RwLock::new(initial.mailboxes)),
             msg_index: Arc::new(RwLock::new(initial.msg_index)),
+            tasks: Arc::new(RwLock::new(initial.tasks)),
             wakeup_channels: Arc::new(RwLock::new(HashMap::new())),
         }
     }
@@ -72,6 +78,7 @@ impl AegisIpcBus {
                     *self.peers.write().await = parsed.peers;
                     *self.mailboxes.write().await = parsed.mailboxes;
                     *self.msg_index.write().await = parsed.msg_index;
+                    *self.tasks.write().await = parsed.tasks;
                 }
             }
         }
@@ -86,6 +93,7 @@ impl AegisIpcBus {
                 peers: self.peers.read().await.clone(),
                 mailboxes: self.mailboxes.read().await.clone(),
                 msg_index: self.msg_index.read().await.clone(),
+                tasks: self.tasks.read().await.clone(),
             };
             let bytes = serde_json::to_vec_pretty(&state)?;
             tokio::fs::write(path, bytes).await?;
@@ -97,10 +105,21 @@ impl AegisIpcBus {
         format!("{}::{}", org_id, agent_id)
     }
 
-    fn validate_attachments(org_id: &str, attachments: &[String]) -> anyhow::Result<()> {
+    fn validate_attachments(
+        org_id: &str,
+        from_agent: &str,
+        attachments: &[String],
+    ) -> anyhow::Result<()> {
         let expected_prefix = format!("artifact://{}/", org_id);
+        let sender_prefix = from_agent
+            .split_once('/')
+            .map(|(sender_org, _)| format!("artifact://{}/", sender_org));
         for uri in attachments {
-            if !uri.starts_with(&expected_prefix) {
+            let ok = uri.starts_with(&expected_prefix)
+                || sender_prefix
+                    .as_ref()
+                    .map_or(false, |sp| uri.starts_with(sp));
+            if !ok {
                 bail!(
                     "Invalid or cross-organization attachment URI '{}': must start with '{}'",
                     uri,
@@ -207,6 +226,8 @@ impl IpcBus for AegisIpcBus {
             start_time: existing.as_ref().and_then(|e| e.start_time),
             workspace_root: existing.as_ref().and_then(|e| e.workspace_root.clone()),
             liveness: Some(PeerLiveness::Active),
+            summary: existing.as_ref().and_then(|e| e.summary.clone()),
+            skills: existing.as_ref().map(|e| e.skills.clone()).unwrap_or_default(),
         };
 
         self.peers
@@ -267,6 +288,8 @@ impl IpcBus for AegisIpcBus {
                     start_time: None,
                     workspace_root: None,
                     liveness: Some(PeerLiveness::Active),
+                    summary: None,
+                    skills: Vec::new(),
                 });
             entry.last_seen_ms = now_ms;
             entry.online = true;
@@ -287,6 +310,154 @@ impl IpcBus for AegisIpcBus {
         self.flush_to_disk().await
     }
 
+    async fn update_agent_card(
+        &self,
+        identity: &AgentIdentity,
+        summary: Option<String>,
+        skills: Vec<AgentSkill>,
+    ) -> anyhow::Result<PeerInfo> {
+        self.reload_from_disk().await;
+        let now_ms = Utc::now().timestamp_millis();
+        let updated = {
+            let mut peers = self.peers.write().await;
+            let entry = peers
+                .entry(identity.org_id.clone())
+                .or_default()
+                .entry(identity.agent_id.clone())
+                .or_insert_with(|| PeerInfo {
+                    org_id: identity.org_id.clone(),
+                    agent_id: identity.agent_id.clone(),
+                    role: identity.role.clone(),
+                    capabilities: identity.capabilities.clone(),
+                    subscribed_topics: vec!["*".to_string()],
+                    online: true,
+                    last_seen_ms: now_ms,
+                    client: None,
+                    pid: None,
+                    start_time: None,
+                    workspace_root: None,
+                    liveness: Some(PeerLiveness::Active),
+                    summary: None,
+                    skills: Vec::new(),
+                });
+            entry.last_seen_ms = now_ms;
+            entry.online = true;
+            entry.liveness = Some(PeerLiveness::Active);
+            if let Some(s) = summary {
+                entry.summary = Some(s);
+            }
+            if !skills.is_empty() {
+                entry.skills = skills;
+            }
+            entry.clone()
+        };
+        self.flush_to_disk().await?;
+        Ok(updated)
+    }
+
+    async fn update_task_state(
+        &self,
+        actor: &AgentIdentity,
+        task_id: &str,
+        state: A2ATaskState,
+        message: Option<String>,
+        artifacts: Vec<A2AArtifact>,
+    ) -> anyhow::Result<A2ATask> {
+        self.reload_from_disk().await;
+        let now_ms = Utc::now().timestamp_millis();
+        let actor_addr = format!("{}/{}", actor.org_id, actor.agent_id);
+        let task = {
+            let mut tasks = self.tasks.write().await;
+            let t = tasks
+                .get_mut(task_id)
+                .with_context(|| format!("A2A task '{}' not found", task_id))?;
+            t.state = state;
+            t.updated_at_ms = now_ms;
+            if !artifacts.is_empty() {
+                t.artifacts.extend(artifacts);
+            }
+            t.history.push(A2ATaskStatusUpdate {
+                state,
+                actor: actor_addr.clone(),
+                message: message.clone(),
+                timestamp_ms: now_ms,
+            });
+            t.clone()
+        };
+
+        // When a task transitions to `input-required`, proactively push a high-priority notification
+        // to the original requester's inbox so `PreInvocation` / `Stop` hooks wake the requester up.
+        if state == A2ATaskState::InputRequired {
+            let (req_org, req_agent) = task
+                .from_agent
+                .split_once('/')
+                .map(|(o, a)| (o.to_string(), a.to_string()))
+                .unwrap_or_else(|| (task.org_id.clone(), task.from_agent.clone()));
+            let notif = IpcEnvelope {
+                msg_id: format!("a2a-inreq-{}", &Uuid::new_v4().to_string()[..8]),
+                org_id: req_org.clone(),
+                from_agent: if req_org == actor.org_id {
+                    actor.agent_id.clone()
+                } else {
+                    actor_addr
+                },
+                to_target: req_agent.clone(),
+                kind: IpcKind::DirectMessage,
+                subject: format!("[A2A input-required] {} (task={})", task.subject, task.id),
+                payload: serde_json::json!({
+                    "a2a_event": "TaskStatusUpdateEvent",
+                    "task_id": task.id,
+                    "context_id": task.context_id,
+                    "state": state,
+                    "message": message,
+                }),
+                attachments: Vec::new(),
+                status: MessageDeliveryStatus::Unread,
+                created_at_ms: now_ms,
+            };
+            self.deliver_to_agent(&req_org, &req_agent, notif).await;
+        }
+
+        self.flush_to_disk().await?;
+        Ok(task)
+    }
+
+    async fn get_task(&self, task_id: &str) -> anyhow::Result<Option<A2ATask>> {
+        self.reload_from_disk().await;
+        Ok(self.tasks.read().await.get(task_id).cloned())
+    }
+
+    async fn list_tasks(
+        &self,
+        org_id: Option<&str>,
+        agent_id: Option<&str>,
+    ) -> anyhow::Result<Vec<A2ATask>> {
+        self.reload_from_disk().await;
+        let mut out: Vec<A2ATask> = self
+            .tasks
+            .read()
+            .await
+            .values()
+            .filter(|t| {
+                let org_ok = org_id.map_or(true, |o| {
+                    t.org_id == o
+                        || t.from_agent.starts_with(&format!("{}/", o))
+                        || t.to_agent.starts_with(&format!("{}/", o))
+                });
+                let agent_ok = agent_id.map_or(true, |a| {
+                    t.from_agent == a
+                        || t.to_agent == a
+                        || t.from_agent.ends_with(&format!("/{}", a))
+                        || t.to_agent.ends_with(&format!("/{}", a))
+                });
+                org_ok && agent_ok
+            })
+            .cloned()
+            .collect();
+        out.sort_by(|a, b| b.updated_at_ms.cmp(&a.updated_at_ms));
+        Ok(out)
+    }
+
     async fn send(&self, mut envelope: IpcEnvelope) -> anyhow::Result<IpcEnvelope> {
         self.reload_from_disk().await;
         if envelope.msg_id.is_empty() {
@@ -295,7 +466,7 @@ impl IpcBus for AegisIpcBus {
         envelope.created_at_ms = Utc::now().timestamp_millis();
         envelope.status = MessageDeliveryStatus::Unread;
 
-        Self::validate_attachments(&envelope.org_id, &envelope.attachments)?;
+        Self::validate_attachments(&envelope.org_id, &envelope.from_agent, &envelope.attachments)?;
 
         match &envelope.kind {
             IpcKind::TopicBroadcast { topic } => {
@@ -336,6 +507,45 @@ impl IpcBus for AegisIpcBus {
                     .strip_prefix("agent:")
                     .unwrap_or(&envelope.to_target)
                     .to_string();
+
+                if matches!(envelope.kind, IpcKind::TaskRequest { .. }) {
+                    let context_id = envelope
+                        .payload
+                        .get("context_id")
+                        .and_then(|v| v.as_str())
+                        .map(|s| s.to_string())
+                        .unwrap_or_else(|| format!("ctx-{}", &envelope.msg_id));
+                    let from_canonical = if envelope.from_agent.contains('/') {
+                        envelope.from_agent.clone()
+                    } else {
+                        format!("{}/{}", envelope.org_id, envelope.from_agent)
+                    };
+                    let to_canonical = format!("{}/{}", envelope.org_id, target_agent);
+                    let a2a_task = A2ATask {
+                        id: envelope.msg_id.clone(),
+                        context_id,
+                        org_id: envelope.org_id.clone(),
+                        from_agent: from_canonical.clone(),
+                        to_agent: to_canonical,
+                        subject: envelope.subject.clone(),
+                        state: A2ATaskState::Submitted,
+                        parts: envelope.a2a_parts(),
+                        artifacts: Vec::new(),
+                        history: vec![A2ATaskStatusUpdate {
+                            state: A2ATaskState::Submitted,
+                            actor: from_canonical,
+                            message: Some(envelope.subject.clone()),
+                            timestamp_ms: envelope.created_at_ms,
+                        }],
+                        created_at_ms: envelope.created_at_ms,
+                        updated_at_ms: envelope.created_at_ms,
+                    };
+                    self.tasks
+                        .write()
+                        .await
+                        .insert(envelope.msg_id.clone(), a2a_task);
+                }
+
                 self.deliver_to_agent(&envelope.org_id, &target_agent, envelope.clone())
                     .await;
             }
@@ -400,6 +610,19 @@ impl IpcBus for AegisIpcBus {
 
             msg.status = MessageDeliveryStatus::Acked;
         }
+        if let Some(task) = self.tasks.write().await.get_mut(msg_id) {
+            if task.state == A2ATaskState::Submitted {
+                let now_ms = Utc::now().timestamp_millis();
+                task.state = A2ATaskState::Working;
+                task.updated_at_ms = now_ms;
+                task.history.push(A2ATaskStatusUpdate {
+                    state: A2ATaskState::Working,
+                    actor: format!("{}/{}", org_id, agent_id),
+                    message: Some("Task acknowledged and in progress".to_string()),
+                    timestamp_ms: now_ms,
+                });
+            }
+        }
         self.flush_to_disk().await?;
         Ok(())
     }
@@ -447,6 +670,44 @@ impl IpcBus for AegisIpcBus {
                 m.status = MessageDeliveryStatus::Replied;
             }
         }
+
+        if let Some(task) = self.tasks.write().await.get_mut(original_msg_id) {
+            let now_ms = Utc::now().timestamp_millis();
+            let next_state = if success {
+                A2ATaskState::Completed
+            } else {
+                A2ATaskState::Failed
+            };
+            task.state = next_state;
+            task.updated_at_ms = now_ms;
+            let mut artifact_parts = Vec::new();
+            if !payload.is_null() {
+                artifact_parts.push(A2APart::Data {
+                    data: payload.clone(),
+                });
+            }
+            for uri in &attachments {
+                artifact_parts.push(A2APart::File {
+                    uri: uri.clone(),
+                    mime_type: Some("application/octet-stream".to_string()),
+                    name: None,
+                });
+            }
+            if !artifact_parts.is_empty() {
+                task.artifacts.push(A2AArtifact {
+                    name: format!("reply-{}", original_msg_id),
+                    description: Some(format!("Task output from {}/{}", responder.org_id, responder.agent_id)),
+                    parts: artifact_parts,
+                });
+            }
+            task.history.push(A2ATaskStatusUpdate {
+                state: next_state,
+                actor: format!("{}/{}", responder.org_id, responder.agent_id),
+                message: Some(format!("Re: {}", original.subject)),
+                timestamp_ms: now_ms,
+            });
+        }
+
         self.flush_to_disk().await?;
 
         let response_env = IpcEnvelope {
@@ -837,5 +1098,95 @@ mod tests {
             .unwrap();
         assert_eq!(fe_inbox.len(), 1);
         assert_eq!(fe_inbox[0].msg_id, reply.msg_id);
+    }
+
+    #[tokio::test]
+    async fn test_a2a_agent_card_and_task_state_lifecycle() {
+        let bus = AegisIpcBus::new();
+        let planner = AgentIdentity::new("repo-frontend", "agy-plan", "Planner");
+        let worker = AgentIdentity::new("repo-backend", "claude-work", "Backend Worker");
+        bus.register_peer(&planner, vec!["*".to_string()]).await.unwrap();
+        bus.register_peer(&worker, vec!["*".to_string()]).await.unwrap();
+
+        let peer = bus
+            .update_agent_card(
+                &worker,
+                Some("Owns crates/aos-vfs/** and OpenAPI contracts".to_string()),
+                vec![AgentSkill {
+                    id: "vfs-merge".to_string(),
+                    name: "VFS 3-Way Merge".to_string(),
+                    description: "Implements LCS Diff3 merges in aos-vfs".to_string(),
+                    tags: vec!["rust".to_string(), "vfs".to_string()],
+                }],
+            )
+            .await
+            .unwrap();
+        let card = peer.to_agent_card("http://127.0.0.1:7080");
+        assert_eq!(card.address, "repo-backend/claude-work");
+        assert_eq!(card.skills.len(), 1);
+        assert_eq!(card.skills[0].id, "vfs-merge");
+
+        let req = bus
+            .send(IpcEnvelope {
+                msg_id: String::new(),
+                org_id: "repo-backend".to_string(),
+                from_agent: "repo-frontend/agy-plan".to_string(),
+                to_target: "claude-work".to_string(),
+                kind: IpcKind::TaskRequest {
+                    timeout_secs: Some(60),
+                },
+                subject: "Add refresh_from_host benchmark".to_string(),
+                payload: json!({"context_id": "ctx-bench-1", "scale": 200}),
+                attachments: vec!["artifact://repo-backend/sha256:1234".to_string()],
+                status: MessageDeliveryStatus::Unread,
+                created_at_ms: 0,
+            })
+            .await
+            .unwrap();
+
+        // 1. Task starts in `submitted` with Text + Data + File parts
+        let t0 = bus.get_task(&req.msg_id).await.unwrap().unwrap();
+        assert_eq!(t0.state, A2ATaskState::Submitted);
+        assert_eq!(t0.context_id, "ctx-bench-1");
+        assert_eq!(t0.parts.len(), 3);
+
+        // 2. Acking transitions `submitted` -> `working`
+        bus.ack("repo-backend", "claude-work", &req.msg_id)
+            .await
+            .unwrap();
+        let t1 = bus.get_task(&req.msg_id).await.unwrap().unwrap();
+        assert_eq!(t1.state, A2ATaskState::Working);
+
+        // 3. Transitioning to `input-required` automatically notifies the requester's inbox
+        bus.update_task_state(
+            &worker,
+            &req.msg_id,
+            A2ATaskState::InputRequired,
+            Some("Should we include warm-cache or cold-cache runs?".to_string()),
+            vec![],
+        )
+        .await
+        .unwrap();
+        let planner_inbox = bus
+            .peek_inbox("repo-frontend", "agy-plan", 10)
+            .await
+            .unwrap();
+        assert_eq!(planner_inbox.len(), 1);
+        assert!(planner_inbox[0].subject.contains("[A2A input-required]"));
+
+        // 4. Replying transitions to `completed` and attaches output A2AArtifact
+        bus.reply(
+            &worker,
+            &req.msg_id,
+            true,
+            json!({"p50_ms": 2.33}),
+            vec!["artifact://repo-backend/sha256:5678".to_string()],
+        )
+        .await
+        .unwrap();
+        let t2 = bus.get_task(&req.msg_id).await.unwrap().unwrap();
+        assert_eq!(t2.state, A2ATaskState::Completed);
+        assert_eq!(t2.artifacts.len(), 1);
+        assert_eq!(t2.history.len(), 4);
     }
 }

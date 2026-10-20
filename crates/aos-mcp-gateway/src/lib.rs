@@ -5,11 +5,13 @@
 //! Supports both Stdio MCP transport and cross-process disk-synchronized state
 //! for multi-agent AGY workflows.
 
+#![recursion_limit = "512"]
+
 use aos_core::{
-    claims, AgentIdentity, AuditEvent, ExecSpec, FlightRecorder, IpcBus, IpcEnvelope, IpcKind,
-    IsolationTier, LeaseGrant, MessageDeliveryStatus, OrgSharedStorage, PolicyContext,
-    PolicyDecision, PolicyEngine, ResourceLimits, SandboxConfig, SandboxDriver, SandboxInstance,
-    TransactionalWorkspace,
+    claims, A2AArtifact, A2ATaskState, AgentIdentity, AgentSkill, AuditEvent, ExecSpec,
+    FlightRecorder, IpcBus, IpcEnvelope, IpcKind, IsolationTier, LeaseGrant, MessageDeliveryStatus,
+    OrgSharedStorage, PolicyContext, PolicyDecision, PolicyEngine, ResourceLimits, SandboxConfig,
+    SandboxDriver, SandboxInstance, TransactionalWorkspace,
 };
 use aos_egress::AegisEgressGateway;
 use aos_ipc::AegisIpcBus;
@@ -231,6 +233,30 @@ impl AegisRuntimeKernel {
                 Ok(entry) => {
                     if !changed.is_empty() {
                         let verb = if tool_name == "coord_claim" { "claimed" } else { "released" };
+                        if tool_name == "coord_claim" {
+                            let claim_summary = if note.is_empty() {
+                                format!("Owns {}", changed.join(", "))
+                            } else {
+                                format!("Owns {} ({})", changed.join(", "), note)
+                            };
+                            let claim_skills: Vec<AgentSkill> = changed
+                                .iter()
+                                .map(|g| AgentSkill {
+                                    id: format!("claim:{}", g),
+                                    name: format!("Claimed {}", g),
+                                    description: claim_summary.clone(),
+                                    tags: vec![
+                                        "claimed".to_string(),
+                                        identity.org_id.clone(),
+                                        g.clone(),
+                                    ],
+                                })
+                                .collect();
+                            let _ = self
+                                .ipc
+                                .update_agent_card(identity, Some(claim_summary), claim_skills)
+                                .await;
+                        }
                         self.announce_coordination(
                             identity,
                             format!("[coord] {} {} {}", identity.agent_id, verb, changed.join(", ")),
@@ -826,12 +852,30 @@ impl AegisRuntimeKernel {
                     .get("scope")
                     .and_then(|v| v.as_str())
                     .unwrap_or("all");
+                let skill_tag = args
+                    .get("skill_tag")
+                    .and_then(|v| v.as_str())
+                    .map(|s| s.to_lowercase());
                 let peers = self.ipc.list_peers(&identity.org_id).await?;
                 let all_peers = self.ipc.list_all_peers().await?;
                 let global_peers: Vec<Value> = all_peers
                     .into_iter()
                     .filter(|p| p.online)
+                    .filter(|p| {
+                        skill_tag.as_ref().map_or(true, |tag| {
+                            p.capabilities.iter().any(|c| c.to_lowercase().contains(tag))
+                                || p.skills.iter().any(|s| {
+                                    s.id.to_lowercase().contains(tag)
+                                        || s.name.to_lowercase().contains(tag)
+                                        || s.tags.iter().any(|t| t.to_lowercase().contains(tag))
+                                })
+                                || p.summary
+                                    .as_ref()
+                                    .map_or(false, |sum| sum.to_lowercase().contains(tag))
+                        })
+                    })
                     .map(|p| {
+                        let card = p.to_agent_card("http://127.0.0.1:7080");
                         json!({
                             "address": p.address(),
                             "org_id": p.org_id,
@@ -842,6 +886,9 @@ impl AegisRuntimeKernel {
                             "liveness": p.liveness,
                             "online": p.online,
                             "workspace_root": p.workspace_root,
+                            "summary": p.summary,
+                            "skills": card.skills,
+                            "agent_card": card,
                             "last_seen_ms": p.last_seen_ms,
                             "is_self": p.org_id == identity.org_id && p.agent_id == identity.agent_id,
                         })
@@ -862,6 +909,90 @@ impl AegisRuntimeKernel {
                         "global_peers": global_peers
                     }))
                 }
+            }
+
+            "ipc_update_card" => {
+                let summary = args
+                    .get("summary")
+                    .and_then(|v| v.as_str())
+                    .map(|s| s.to_string());
+                let skills: Vec<AgentSkill> = args
+                    .get("skills")
+                    .and_then(|v| serde_json::from_value(v.clone()).ok())
+                    .unwrap_or_default();
+                let updated = self.ipc.update_agent_card(identity, summary, skills).await?;
+                Ok(json!({
+                    "status": "updated",
+                    "address": updated.address(),
+                    "agent_card": updated.to_agent_card("http://127.0.0.1:7080")
+                }))
+            }
+
+            "ipc_task_update" => {
+                let task_id = args
+                    .get("task_id")
+                    .or_else(|| args.get("id"))
+                    .and_then(|v| v.as_str())
+                    .context("Missing 'task_id'")?;
+                let raw_state = args
+                    .get("state")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("working");
+                let state = match raw_state {
+                    "submitted" => A2ATaskState::Submitted,
+                    "working" => A2ATaskState::Working,
+                    "input-required" | "input_required" => A2ATaskState::InputRequired,
+                    "completed" => A2ATaskState::Completed,
+                    "failed" => A2ATaskState::Failed,
+                    "canceled" | "cancelled" => A2ATaskState::Canceled,
+                    "rejected" => A2ATaskState::Rejected,
+                    other => bail!("Invalid A2A task state '{}'", other),
+                };
+                let message = args
+                    .get("message")
+                    .and_then(|v| v.as_str())
+                    .map(|s| s.to_string());
+                let artifacts: Vec<A2AArtifact> = args
+                    .get("artifacts")
+                    .and_then(|v| serde_json::from_value(v.clone()).ok())
+                    .unwrap_or_default();
+                let task = self
+                    .ipc
+                    .update_task_state(identity, task_id, state, message, artifacts)
+                    .await?;
+                Ok(serde_json::to_value(task)?)
+            }
+
+            "ipc_task_get" => {
+                let task_id = args
+                    .get("task_id")
+                    .or_else(|| args.get("id"))
+                    .and_then(|v| v.as_str())
+                    .context("Missing 'task_id'")?;
+                let task = self
+                    .ipc
+                    .get_task(task_id)
+                    .await?
+                    .with_context(|| format!("A2A task '{}' not found", task_id))?;
+                Ok(serde_json::to_value(task)?)
+            }
+
+            "ipc_task_list" => {
+                let scope = args
+                    .get("scope")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("all");
+                let org_filter = if scope == "org" {
+                    Some(identity.org_id.as_str())
+                } else {
+                    None
+                };
+                let agent_filter = args.get("agent_id").and_then(|v| v.as_str());
+                let tasks = self.ipc.list_tasks(org_filter, agent_filter).await?;
+                Ok(json!({
+                    "tasks_count": tasks.len(),
+                    "tasks": tasks
+                }))
             }
 
             "ipc_send" | "ipc_request" => {
@@ -1286,7 +1417,7 @@ impl AegisRuntimeKernel {
                 },
                 {
                     "name": "ipc_list_peers",
-                    "description": "[Zero-Prompt] Discover both current-Organization peers (`peers`) and the Global Workstation Peer List across all active repositories (`global_peers`, with `<org_id>/<agent_id>` address, client, PID, liveness, and `workspace_root`). Automatically prunes exited client processes.",
+                    "description": "[Zero-Prompt] Discover both current-Organization peers (`peers`) and the Global Workstation Peer List across all active repositories (`global_peers`, with Google A2A `agent_card`, `<org_id>/<agent_id>` address, `skills`, client, PID, liveness, and `workspace_root`). Automatically prunes exited client processes.",
                     "inputSchema": {
                         "type": "object",
                         "properties": {
@@ -1294,7 +1425,71 @@ impl AegisRuntimeKernel {
                                 "type": "string",
                                 "enum": ["all", "global", "org"],
                                 "description": "Optional scope ('all' default returns both org `peers` and workstation-wide `global_peers`)."
+                            },
+                            "skill_tag": {
+                                "type": "string",
+                                "description": "Optional A2A skill ID, tag, or keyword filter."
                             }
+                        }
+                    }
+                },
+                {
+                    "name": "ipc_update_card",
+                    "description": "[Zero-Prompt] Update this Agent's Google A2A `AgentCard` (`summary` and advertised `skills`) in the global peer registry.",
+                    "inputSchema": {
+                        "type": "object",
+                        "properties": {
+                            "summary": { "type": "string" },
+                            "skills": {
+                                "type": "array",
+                                "items": {
+                                    "type": "object",
+                                    "properties": {
+                                        "id": { "type": "string" },
+                                        "name": { "type": "string" },
+                                        "description": { "type": "string" },
+                                        "tags": { "type": "array", "items": { "type": "string" } }
+                                    },
+                                    "required": ["id", "name"]
+                                }
+                            }
+                        }
+                    }
+                },
+                {
+                    "name": "ipc_task_update",
+                    "description": "[Zero-Prompt] Transition a Google A2A `Task` state (`working`, `input-required`, `completed`, `failed`, `canceled`, `rejected`) and optionally attach output `artifacts`.",
+                    "inputSchema": {
+                        "type": "object",
+                        "properties": {
+                            "task_id": { "type": "string" },
+                            "state": {
+                                "type": "string",
+                                "enum": ["submitted", "working", "input-required", "completed", "failed", "canceled", "rejected"]
+                            },
+                            "message": { "type": "string" },
+                            "artifacts": { "type": "array" }
+                        },
+                        "required": ["task_id", "state"]
+                    }
+                },
+                {
+                    "name": "ipc_task_get",
+                    "description": "[Zero-Prompt] Retrieve a stateful Google A2A `Task` by `task_id` (including `state`, `parts`, `artifacts`, and transition `history`).",
+                    "inputSchema": {
+                        "type": "object",
+                        "properties": { "task_id": { "type": "string" } },
+                        "required": ["task_id"]
+                    }
+                },
+                {
+                    "name": "ipc_task_list",
+                    "description": "[Zero-Prompt] List stateful Google A2A `Task`s across the current Organization or global workstation.",
+                    "inputSchema": {
+                        "type": "object",
+                        "properties": {
+                            "scope": { "type": "string", "enum": ["all", "org"] },
+                            "agent_id": { "type": "string" }
                         }
                     }
                 },
@@ -1493,6 +1688,8 @@ impl AegisRuntimeKernel {
                         { "uri": "aegis://ipc/inbox", "name": "Agent IPC Mailbox" },
                         { "uri": "aegis://org/peers", "name": "Organization Active Peers" },
                         { "uri": "aegis://global/peers", "name": "Global Workstation Peers Across All Repositories" },
+                        { "uri": "aegis://a2a/agent-cards", "name": "Google A2A Agent Cards Across Workstation" },
+                        { "uri": "aegis://a2a/tasks", "name": "Google A2A Stateful Tasks" },
                         { "uri": "aegis://org/shared/catalog", "name": "Organization CAS Artifact Catalog" }
                     ]
                 }
@@ -1508,8 +1705,12 @@ impl AegisRuntimeKernel {
                         self.call_tool(identity, "ipc_recv", json!({ "unread_only": true }))
                             .await?
                     }
-                    "aegis://org/peers" | "agentos://org/peers" | "aegis://global/peers" => {
+                    "aegis://org/peers" | "agentos://org/peers" | "aegis://global/peers"
+                    | "aegis://a2a/agent-cards" => {
                         self.call_tool(identity, "ipc_list_peers", json!({})).await?
+                    }
+                    "aegis://a2a/tasks" => {
+                        self.call_tool(identity, "ipc_task_list", json!({})).await?
                     }
                     "aegis://org/shared/catalog" | "agentos://org/shared/catalog" => {
                         let arts = self.org_storage.list_artifacts(&identity.org_id).await?;
@@ -1527,6 +1728,138 @@ impl AegisRuntimeKernel {
                             "text": serde_json::to_string_pretty(&payload)?
                         }]
                     }
+                })
+            }
+            // Google A2A Protocol JSON-RPC 2.0 Methods (`agent/card`, `tasks/send`, `tasks/get`, `tasks/cancel`, `tasks/list`)
+            "agent/card" | "agent/authenticatedExtendedCard" => {
+                let peers = self.ipc.list_all_peers().await.unwrap_or_default();
+                let cards: Vec<_> = peers
+                    .into_iter()
+                    .filter(|p| p.online)
+                    .map(|p| p.to_agent_card("http://127.0.0.1:7080"))
+                    .collect();
+                json!({
+                    "jsonrpc": "2.0",
+                    "id": id,
+                    "result": {
+                        "protocol": "google-a2a/0.2",
+                        "self_address": format!("{}/{}", identity.org_id, identity.agent_id),
+                        "agents": cards
+                    }
+                })
+            }
+            "tasks/send" | "message/send" => {
+                let params = req.get("params").cloned().unwrap_or_else(|| json!({}));
+                let to_agent = params
+                    .get("to_agent")
+                    .or_else(|| params.get("agent"))
+                    .and_then(|v| v.as_str())
+                    .unwrap_or(&identity.agent_id);
+                let subject = params
+                    .get("subject")
+                    .or_else(|| {
+                        params
+                            .get("message")
+                            .and_then(|m| m.get("parts"))
+                            .and_then(|p| p.as_array())
+                            .and_then(|arr| arr.first())
+                            .and_then(|part| part.get("text"))
+                    })
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("A2A Task");
+                let payload = params
+                    .get("payload")
+                    .or_else(|| params.get("message"))
+                    .cloned()
+                    .unwrap_or_else(|| json!({}));
+                let attachments: Vec<String> = params
+                    .get("attachments")
+                    .and_then(|v| serde_json::from_value(v.clone()).ok())
+                    .unwrap_or_default();
+                match self
+                    .call_tool(
+                        identity,
+                        "ipc_request",
+                        json!({
+                            "to_agent": to_agent,
+                            "subject": subject,
+                            "payload": payload,
+                            "attachments": attachments
+                        }),
+                    )
+                    .await
+                {
+                    Ok(sent) => {
+                        let task_id = sent.get("msg_id").and_then(|v| v.as_str()).unwrap_or("");
+                        let task = self.ipc.get_task(task_id).await.ok().flatten();
+                        json!({
+                            "jsonrpc": "2.0",
+                            "id": id,
+                            "result": task.map(|t| serde_json::to_value(t).unwrap_or(sent.clone())).unwrap_or(sent)
+                        })
+                    }
+                    Err(e) => json!({
+                        "jsonrpc": "2.0",
+                        "id": id,
+                        "error": { "code": -32001, "message": e.to_string() }
+                    }),
+                }
+            }
+            "tasks/get" => {
+                let params = req.get("params").cloned().unwrap_or_else(|| json!({}));
+                let task_id = params
+                    .get("id")
+                    .or_else(|| params.get("task_id"))
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("");
+                match self.ipc.get_task(task_id).await {
+                    Ok(Some(task)) => json!({
+                        "jsonrpc": "2.0",
+                        "id": id,
+                        "result": task
+                    }),
+                    _ => json!({
+                        "jsonrpc": "2.0",
+                        "id": id,
+                        "error": { "code": -32004, "message": format!("A2A task '{}' not found", task_id) }
+                    }),
+                }
+            }
+            "tasks/cancel" => {
+                let params = req.get("params").cloned().unwrap_or_else(|| json!({}));
+                let task_id = params
+                    .get("id")
+                    .or_else(|| params.get("task_id"))
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("");
+                let reason = params
+                    .get("reason")
+                    .and_then(|v| v.as_str())
+                    .map(|s| s.to_string())
+                    .or_else(|| Some("Canceled via A2A tasks/cancel".to_string()));
+                match self
+                    .ipc
+                    .update_task_state(identity, task_id, A2ATaskState::Canceled, reason, vec![])
+                    .await
+                {
+                    Ok(task) => json!({
+                        "jsonrpc": "2.0",
+                        "id": id,
+                        "result": task
+                    }),
+                    Err(e) => json!({
+                        "jsonrpc": "2.0",
+                        "id": id,
+                        "error": { "code": -32004, "message": e.to_string() }
+                    }),
+                }
+            }
+            "tasks/list" => {
+                let tasks = self.ipc.list_tasks(None, None).await.unwrap_or_default();
+                json!({
+                    "jsonrpc": "2.0",
+                    "id": id,
+                    "result": { "tasks": tasks }
                 })
             }
             "tools/call" => {
@@ -1817,8 +2150,46 @@ impl AegisRuntimeKernel {
                             "HTTP/1.1 200 OK",
                             json!({ "status": "ok", "service": "aegis-os-daemon", "version": "0.2.0" }).to_string(),
                         )
+                    } else if method == "GET"
+                        && (full_target.starts_with("/.well-known/agent.json")
+                            || full_target.starts_with("/.well-known/agent-card.json"))
+                    {
+                        let base_url = format!("http://{}", local_addr);
+                        let all_peers = k.ipc.list_all_peers().await.unwrap_or_default();
+                        let cards: Vec<_> = all_peers
+                            .iter()
+                            .filter(|p| p.online)
+                            .map(|p| p.to_agent_card(&base_url))
+                            .collect();
+                        let skills: Vec<_> = cards
+                            .iter()
+                            .flat_map(|c| c.skills.clone())
+                            .collect();
+                        (
+                            "HTTP/1.1 200 OK",
+                            json!({
+                                "name": "aegis-os-workstation-gateway",
+                                "description": "Aegis OS Policy-Governed Multi-Agent A2A & MCP Gateway",
+                                "url": format!("{}/a2a", base_url),
+                                "version": "0.2.0",
+                                "protocolVersion": "0.2.0",
+                                "capabilities": {
+                                    "streaming": true,
+                                    "pushNotifications": true,
+                                    "stateTransitionHistory": true,
+                                    "aegisPolicyKernel": true
+                                },
+                                "defaultInputModes": ["text/plain", "application/json", "application/octet-stream"],
+                                "defaultOutputModes": ["text/plain", "application/json", "application/octet-stream"],
+                                "skills": skills,
+                                "agents": cards
+                            })
+                            .to_string(),
+                        )
                     } else if method == "GET" && full_target.starts_with("/api/status") {
                         let peers = k.ipc.list_peers(&org_id).await.unwrap_or_default();
+                        let global_peers = k.ipc.list_all_peers().await.unwrap_or_default();
+                        let tasks = k.ipc.list_tasks(None, None).await.unwrap_or_default();
                         let escalations = k.policy.list_escalations(&org_id).await.unwrap_or_default();
                         let leases = k.policy.list_leases(&org_id, None).await.unwrap_or_default();
                         (
@@ -1826,12 +2197,16 @@ impl AegisRuntimeKernel {
                             json!({
                                 "org_id": org_id,
                                 "peers": peers,
+                                "global_peers": global_peers,
+                                "a2a_tasks": tasks,
                                 "pending_escalations": escalations,
                                 "active_leases": leases
                             })
                             .to_string(),
                         )
-                    } else if method == "POST" && full_target.starts_with("/mcp") {
+                    } else if method == "POST"
+                        && (full_target.starts_with("/mcp") || full_target.starts_with("/a2a"))
+                    {
                         let identity = AgentIdentity::new(org_id, agent_id, role);
                         let _ = k
                             .ensure_agent_environment(
@@ -2054,5 +2429,50 @@ mod tests {
         let resp_str = String::from_utf8_lossy(&resp_buf);
         assert!(resp_str.contains("200 OK"));
         assert!(resp_str.contains("aegis-os-runtime"));
+
+        // Verify Google A2A discovery endpoint `GET /.well-known/agent.json`
+        let mut a2a_stream = tokio::net::TcpStream::connect(addr).await.unwrap();
+        let card_req = format!(
+            "GET /.well-known/agent.json HTTP/1.1\r\nHost: {}\r\n\r\n",
+            addr
+        );
+        a2a_stream.write_all(card_req.as_bytes()).await.unwrap();
+        let mut card_buf = Vec::new();
+        tokio::io::AsyncReadExt::read_to_end(&mut a2a_stream, &mut card_buf)
+            .await
+            .unwrap();
+        let card_str = String::from_utf8_lossy(&card_buf);
+        assert!(card_str.contains("200 OK"));
+        assert!(card_str.contains("aegis-os-workstation-gateway"));
+        assert!(card_str.contains("acme/agy-agent"));
+
+        // Verify Google A2A `POST /a2a` `tasks/send` & `tasks/get`
+        let mut task_stream = tokio::net::TcpStream::connect(addr).await.unwrap();
+        let send_body = json!({
+            "jsonrpc": "2.0",
+            "id": 2,
+            "method": "tasks/send",
+            "params": {
+                "to_agent": "acme/agy-agent",
+                "subject": "Verify A2A endpoint",
+                "payload": { "context_id": "ctx-http-a2a" }
+            }
+        })
+        .to_string();
+        let send_req = format!(
+            "POST /a2a HTTP/1.1\r\nHost: {}\r\nX-Aegis-Org: acme\r\nX-Aegis-Agent: agy-agent\r\nContent-Length: {}\r\n\r\n{}",
+            addr,
+            send_body.len(),
+            send_body
+        );
+        task_stream.write_all(send_req.as_bytes()).await.unwrap();
+        let mut send_buf = Vec::new();
+        tokio::io::AsyncReadExt::read_to_end(&mut task_stream, &mut send_buf)
+            .await
+            .unwrap();
+        let send_str = String::from_utf8_lossy(&send_buf);
+        assert!(send_str.contains("200 OK"));
+        assert!(send_str.contains("\"state\":\"submitted\""));
+        assert!(send_str.contains("ctx-http-a2a"));
     }
 }

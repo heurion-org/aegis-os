@@ -612,6 +612,10 @@ pub async fn install_global_clients(
         "coord_claim",
         "coord_release",
         "ipc_list_peers",
+        "ipc_update_card",
+        "ipc_task_update",
+        "ipc_task_get",
+        "ipc_task_list",
         "ipc_send",
         "ipc_request",
         "ipc_reply",
@@ -721,6 +725,10 @@ pub async fn install_global_clients(
         "mcp(aegis-os/org_kv_put)",
         "mcp(aegis-os/org_kv_get)",
         "mcp(aegis-os/ipc_list_peers)",
+        "mcp(aegis-os/ipc_update_card)",
+        "mcp(aegis-os/ipc_task_update)",
+        "mcp(aegis-os/ipc_task_get)",
+        "mcp(aegis-os/ipc_task_list)",
         "mcp(aegis-os/ipc_send)",
         "mcp(aegis-os/ipc_request)",
         "mcp(aegis-os/ipc_reply)",
@@ -865,6 +873,10 @@ You are running inside the **Aegis OS Runtime (`aegis-os`)** with an isolated Co
         "org_kv_put",
         "org_kv_get",
         "ipc_list_peers",
+        "ipc_update_card",
+        "ipc_task_update",
+        "ipc_task_get",
+        "ipc_task_list",
         "ipc_send",
         "ipc_request",
         "ipc_reply",
@@ -1611,16 +1623,37 @@ async fn render_mission_control_top(
         global_peers.len()
     );
     for gp in &global_peers {
+        let skill_ids: Vec<&str> = gp.skills.iter().map(|s| s.id.as_str()).collect();
         println!(
-            "  • {:<26} | Client: {:<6} | PID: {:<7} | Liveness: {:<6} | Workspace: {}",
+            "  • {:<26} | Client: {:<6} | PID: {:<7} | Liveness: {:<6} | Skills: {:?} | Workspace: {}",
             gp.address(),
             gp.client.as_deref().unwrap_or("-"),
             gp.pid.map(|p| p.to_string()).unwrap_or_else(|| "-".to_string()),
             gp.liveness
                 .map(|l| format!("{:?}", l))
                 .unwrap_or_else(|| "Active".to_string()),
+            skill_ids,
             gp.workspace_root.as_deref().unwrap_or("-")
         );
+    }
+
+    let a2a_tasks = kernel.ipc.list_tasks(None, None).await.unwrap_or_default();
+    if !a2a_tasks.is_empty() {
+        println!(
+            "\n[0b] Google A2A Stateful Tasks Across Workstation ({}):",
+            a2a_tasks.len()
+        );
+        for t in a2a_tasks.iter().take(10) {
+            println!(
+                "  • [{}] {:?} | {} -> {} | {} (artifacts: {})",
+                t.id,
+                t.state,
+                t.from_agent,
+                t.to_agent,
+                t.subject,
+                t.artifacts.len()
+            );
+        }
     }
 
     println!("\n[1] Active Agent Sandboxes & CoW Workspaces in Org `{}` ({}):", org_id, peers.len());

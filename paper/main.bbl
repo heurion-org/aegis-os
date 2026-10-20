@@ -1,15 +1,16 @@
 \begin{thebibliography}{10}
 
 \bibitem{agache2020firecracker}
-Alexandru Agache, Marc Brooker, Alexandra Iordache, Anthony Liguori, Rolf
-  Neugebauer, Phil Piwonka, and Diana-Maria Popa.
-\newblock Firecracker: Lightweight virtualization for serverless applications.
+Alexandru Agache, Marc Brooker, Andreea Florescu, Alexandra Iordache, Anthony
+  Liguori, Rolf Neugebauer, Phil Piwonka, and Diana-Maria Popa.
+\newblock {Firecracker}: Lightweight virtualization for serverless
+  applications.
 \newblock In {\em 17th USENIX Symposium on Networked Systems Design and
   Implementation (NSDI 20)}, pages 419--434. USENIX Association, 2020.
 
 \bibitem{akhawe2013alice}
 Devdatta Akhawe and Adrienne~Porter Felt.
-\newblock Alice in warningland: A large-scale field study of browser security
+\newblock Alice in {Warningland}: A large-scale field study of browser security
   warning effectiveness.
 \newblock In {\em 22nd USENIX Security Symposium (USENIX Security 13)}, pages
   257--272. USENIX Association, 2013.
@@ -29,8 +30,9 @@ Sven Apel, J{\"o}rg Liebig, Benjamin Brandl, Christian Lengauer, and Christian
   190--200. ACM, 2011.
 
 \bibitem{costa2025fides}
-Manuel Costa, Boris K{\"o}pf, Aecio Ribeiro, Andrew Roscoe, Mark Russinovich,
-  and Mark Schut.
+Manuel Costa, Boris K{\"o}pf, Aashish Kolluri, Andrew Paverd, Mark Russinovich,
+  Ahmed Salem, Shruti Tople, Lukas Wutschitz, and Santiago
+  Zanella-B{\'e}guelin.
 \newblock Securing {AI} agents with information-flow control.
 \newblock {\em arXiv preprint arXiv:2505.23643}, 2025.
 
@@ -39,14 +41,15 @@ Joseph~W. Cutler, Craig Disselkoen, Aaron Eline, Shaobo He, Kyle Headley,
   Michael Hicks, Kesha Hietala, Eleftherios Ioannidis, John Kastner, Anwar
   Mamat, Darin McAdams, Matt McCutchen, Neha Rungta, Emina Torlak, and Andrew
   Wells.
-\newblock Cedar: A new language for expressive, fast, safe, and analyzable
+\newblock {Cedar}: A new language for expressive, fast, safe, and analyzable
   authorization.
 \newblock {\em Proceedings of the ACM on Programming Languages},
   8(OOPSLA1):670--697, 2024.
 
 \bibitem{debenedetti2025camel}
-Edoardo Debenedetti, Ilia Shumailov, Tianqi Fan, Jamie Soares, Nicholas Cano,
-  Mathias Payer, and Florian Tram{\`e}r.
+Edoardo Debenedetti, Ilia Shumailov, Tianqi Fan, Jamie Hayes, Nicholas Carlini,
+  Daniel Fabian, Christoph Kern, Chongyang Shi, Andreas Terzis, and Florian
+  Tram{\`e}r.
 \newblock Defeating prompt injections by design.
 \newblock {\em arXiv preprint arXiv:2503.18813}, 2025.
 
@@ -61,7 +64,7 @@ Edoardo Debenedetti, Jie Zhang, Mislav Balunovi{\'c}, Luca Beurer-Kellner, Marc
 \bibitem{felt2012android}
 Adrienne~Porter Felt, Elizabeth Ha, Serge Egelman, Ariel Haney, Erika Chin, and
   David Wagner.
-\newblock Android permissions: User attention, comprehension, and behavior.
+\newblock {Android} permissions: User attention, comprehension, and behavior.
 \newblock In {\em Proceedings of the Eighth Symposium on Usable Privacy and
   Security (SOUPS)}, pages 1--14. ACM, 2012.
 
@@ -98,7 +101,7 @@ Sanjeev Khanna, Keshav Kunal, and Benjamin~C. Pierce.
 
 \bibitem{kim2013mbox}
 Taesoo Kim and Nickolai Zeldovich.
-\newblock Practical sandboxing for non-root users.
+\newblock Practical and effective sandboxing for non-root users.
 \newblock In {\em 2013 USENIX Annual Technical Conference (USENIX ATC 13)},
   pages 139--144. USENIX Association, 2013.
 
@@ -147,15 +150,14 @@ Xingyao Wang, Boxuan Li, Yufan Song, Frank~F. Xu, Xiangru Tang, Mingchen Zhuge,
 
 \bibitem{watson2010capsicum}
 Robert N.~M. Watson, Jonathan Anderson, Ben Laurie, and Kris Kennaway.
-\newblock Capsicum: Practical capabilities for {UNIX}.
+\newblock {Capsicum}: Practical capabilities for {UNIX}.
 \newblock In {\em 19th USENIX Security Symposium (USENIX Security 10)}, pages
   29--46. USENIX Association, 2010.
 
 \bibitem{wright2004unionfs}
 Charles~P. Wright, Jay Dave, Puja Gupta, Harikesavan Krishnan, David~P.
   Quigley, Erez Zadok, and Mohammad~Nayyer Zubair.
-\newblock Versatility and {Unix} semantics in a fan-out unification file
-  system.
+\newblock Versatility and {Unix} semantics in namespace unification.
 \newblock {\em ACM Transactions on Storage (TOS)}, 2(1):74--105, 2006.
 
 \bibitem{wu2023autogen}

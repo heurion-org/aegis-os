@@ -347,6 +347,143 @@ pub struct IpcEnvelope {
     pub created_at_ms: i64,
 }
 
+impl IpcEnvelope {
+    /// Synthesizes Google A2A typed `Part`s (`TextPart`, `DataPart`, `FilePart`) from this envelope.
+    pub fn a2a_parts(&self) -> Vec<A2APart> {
+        let mut parts = Vec::new();
+        if !self.subject.is_empty() {
+            parts.push(A2APart::Text {
+                text: self.subject.clone(),
+            });
+        }
+        if !self.payload.is_null() {
+            parts.push(A2APart::Data {
+                data: self.payload.clone(),
+            });
+        }
+        for uri in &self.attachments {
+            parts.push(A2APart::File {
+                uri: uri.clone(),
+                mime_type: Some("application/octet-stream".to_string()),
+                name: None,
+            });
+        }
+        parts
+    }
+}
+
+/// Google A2A Protocol Skill descriptor (`AgentSkill`).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AgentSkill {
+    pub id: String,
+    pub name: String,
+    #[serde(default)]
+    pub description: String,
+    #[serde(default)]
+    pub tags: Vec<String>,
+}
+
+/// Google A2A Protocol `AgentCard` (`/.well-known/agent.json`) synthesized from a registered peer.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct AgentCard {
+    pub name: String,
+    pub address: String,
+    pub org_id: String,
+    pub agent_id: String,
+    pub description: String,
+    pub url: String,
+    pub version: String,
+    pub capabilities: serde_json::Value,
+    pub default_input_modes: Vec<String>,
+    pub default_output_modes: Vec<String>,
+    pub skills: Vec<AgentSkill>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub client: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub workspace_root: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub liveness: Option<PeerLiveness>,
+}
+
+/// Google A2A Protocol Task Lifecycle State (`TaskState`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum A2ATaskState {
+    Submitted,
+    Working,
+    InputRequired,
+    Completed,
+    Failed,
+    Canceled,
+    Rejected,
+}
+
+impl A2ATaskState {
+    pub fn is_terminal(self) -> bool {
+        matches!(
+            self,
+            Self::Completed | Self::Failed | Self::Canceled | Self::Rejected
+        )
+    }
+}
+
+/// Google A2A Protocol typed message/artifact part (`TextPart`, `DataPart`, `FilePart`).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "type", rename_all = "snake_case")]
+pub enum A2APart {
+    Text {
+        text: String,
+    },
+    Data {
+        data: serde_json::Value,
+    },
+    File {
+        uri: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        mime_type: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        name: Option<String>,
+    },
+}
+
+/// Google A2A Protocol Task Artifact (`Artifact`).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct A2AArtifact {
+    pub name: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub description: Option<String>,
+    pub parts: Vec<A2APart>,
+}
+
+/// Timestamped state transition in an `A2ATask` lifecycle history.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct A2ATaskStatusUpdate {
+    pub state: A2ATaskState,
+    pub actor: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub message: Option<String>,
+    pub timestamp_ms: i64,
+}
+
+/// Stateful Google A2A Protocol `Task` managed by `aos-ipc`.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct A2ATask {
+    pub id: String,
+    pub context_id: String,
+    pub org_id: String,
+    pub from_agent: String,
+    pub to_agent: String,
+    pub subject: String,
+    pub state: A2ATaskState,
+    pub parts: Vec<A2APart>,
+    #[serde(default)]
+    pub artifacts: Vec<A2AArtifact>,
+    #[serde(default)]
+    pub history: Vec<A2ATaskStatusUpdate>,
+    pub created_at_ms: i64,
+    pub updated_at_ms: i64,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct PeerInfo {
     pub org_id: String,
@@ -366,12 +503,78 @@ pub struct PeerInfo {
     pub workspace_root: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub liveness: Option<PeerLiveness>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub summary: Option<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub skills: Vec<AgentSkill>,
 }
 
 impl PeerInfo {
     /// Canonical cross-organization address `<org_id>/<agent_id>`.
     pub fn address(&self) -> String {
         format!("{}/{}", self.org_id, self.agent_id)
+    }
+
+    /// Exports this peer as a Google A2A-compliant `AgentCard`.
+    pub fn to_agent_card(&self, base_url: &str) -> AgentCard {
+        let mut skills = self.skills.clone();
+        if skills.is_empty() {
+            for cap in &self.capabilities {
+                skills.push(AgentSkill {
+                    id: cap.clone(),
+                    name: cap.clone(),
+                    description: format!("Capability '{}' advertised by {}", cap, self.address()),
+                    tags: vec![cap.clone(), self.org_id.clone()],
+                });
+            }
+            if skills.is_empty() {
+                skills.push(AgentSkill {
+                    id: format!("{}-coding", self.org_id),
+                    name: format!("{} Workspace Agent", self.org_id),
+                    description: self
+                        .summary
+                        .clone()
+                        .unwrap_or_else(|| format!("{} operating in {}", self.role, self.org_id)),
+                    tags: vec![
+                        self.org_id.clone(),
+                        self.client.clone().unwrap_or_else(|| "aegis".to_string()),
+                    ],
+                });
+            }
+        }
+        AgentCard {
+            name: self.agent_id.clone(),
+            address: self.address(),
+            org_id: self.org_id.clone(),
+            agent_id: self.agent_id.clone(),
+            description: self
+                .summary
+                .clone()
+                .unwrap_or_else(|| format!("{} ({})", self.role, self.address())),
+            url: format!("{}/a2a/{}/{}", base_url.trim_end_matches('/'), self.org_id, self.agent_id),
+            version: "0.2.0".to_string(),
+            capabilities: serde_json::json!({
+                "streaming": true,
+                "pushNotifications": true,
+                "stateTransitionHistory": true,
+                "aegisCowWorkspace": true,
+                "aegisCasAttachments": true
+            }),
+            default_input_modes: vec![
+                "text/plain".to_string(),
+                "application/json".to_string(),
+                "application/octet-stream".to_string(),
+            ],
+            default_output_modes: vec![
+                "text/plain".to_string(),
+                "application/json".to_string(),
+                "application/octet-stream".to_string(),
+            ],
+            skills,
+            client: self.client.clone(),
+            workspace_root: self.workspace_root.clone(),
+            liveness: self.liveness,
+        }
     }
 }
 
@@ -403,6 +606,42 @@ pub trait IpcBus: Send + Sync {
         _workspace_root: Option<String>,
     ) -> anyhow::Result<()> {
         Ok(())
+    }
+
+    /// Update a peer's Google A2A `AgentCard` summary and advertised `AgentSkill`s.
+    async fn update_agent_card(
+        &self,
+        identity: &AgentIdentity,
+        _summary: Option<String>,
+        _skills: Vec<AgentSkill>,
+    ) -> anyhow::Result<PeerInfo> {
+        self.register_peer(identity, vec!["*".to_string()]).await
+    }
+
+    /// Transition an A2A `Task` to a new `A2ATaskState` (`working`, `input-required`, `completed`, `failed`, `canceled`, `rejected`).
+    async fn update_task_state(
+        &self,
+        _actor: &AgentIdentity,
+        task_id: &str,
+        _state: A2ATaskState,
+        _message: Option<String>,
+        _artifacts: Vec<A2AArtifact>,
+    ) -> anyhow::Result<A2ATask> {
+        anyhow::bail!("A2A task '{}' not found", task_id)
+    }
+
+    /// Retrieve a stateful A2A `Task` by ID.
+    async fn get_task(&self, _task_id: &str) -> anyhow::Result<Option<A2ATask>> {
+        Ok(None)
+    }
+
+    /// List stateful A2A `Task`s filtered optionally by organization and/or agent ID.
+    async fn list_tasks(
+        &self,
+        _org_id: Option<&str>,
+        _agent_id: Option<&str>,
+    ) -> anyhow::Result<Vec<A2ATask>> {
+        Ok(Vec::new())
     }
 
     /// Send a DirectMessage, TaskRequest, TaskResponse, or TopicBroadcast.

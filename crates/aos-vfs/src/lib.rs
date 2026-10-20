@@ -757,7 +757,9 @@ impl TransactionalWorkspace for CoWWorkspace {
 
                     if host_dst.exists() {
                         let host_bytes = tokio::fs::read(&host_dst).await?;
-                        if Self::sha256_bytes(&host_bytes) != Self::sha256_bytes(&base_bytes) {
+                        if Self::sha256_bytes(&host_bytes) != Self::sha256_bytes(&base_bytes)
+                            && Self::sha256_bytes(&host_bytes) != Self::sha256_bytes(&shadow_bytes)
+                        {
                             let base_str = String::from_utf8(base_bytes)
                                 .context("Binary file concurrent modification conflict")?;
                             let their_str = String::from_utf8(host_bytes)
