@@ -1170,7 +1170,13 @@ impl AegisRuntimeKernel {
 
     fn resolve_workspace_fallback(&self, current_ws: &Path) -> PathBuf {
         let s = current_ws.to_string_lossy();
-        if s.ends_with("/.gemini/config") || s.ends_with("/.agents") || s.ends_with("/.agent") {
+        let is_umbrella =
+            !current_ws.join(".git").exists() && !current_ws.join("Cargo.toml").exists();
+        if s.ends_with("/.gemini/config")
+            || s.ends_with("/.agents")
+            || s.ends_with("/.agent")
+            || is_umbrella
+        {
             let saved_file = self.runtime_data_root.join("active_workspace.txt");
             if let Ok(saved) = std::fs::read_to_string(&saved_file) {
                 let p = PathBuf::from(saved.trim());

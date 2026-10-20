@@ -901,17 +901,31 @@ async fn handle_agy_hook(
                     .get("Path")
                     .and_then(|v| v.as_str())
                     .unwrap_or("");
-                if target_path.contains("/.gemini/") || target_path.contains("/brain/") {
+                if target_path.contains("/.gemini/")
+                    || target_path.contains("/brain/")
+                    || target_path.contains("/cow_workspace/")
+                    || target_path.contains("/upper_workspace/")
+                {
                     println!("{}", serde_json::to_string(&json!({ "decision": "allow" }))?);
-                } else {
+                    return Ok(());
+                }
+                if let Ok(rel) = Path::new(target_path).strip_prefix(&effective_workspace) {
+                    let shadow_target = env.workspace.shadow_root().join(rel);
+                    if let Some(parent) = shadow_target.parent() {
+                        let _ = std::fs::create_dir_all(parent);
+                    }
                     println!(
                         "{}",
                         serde_json::to_string(&json!({
-                            "decision": "deny",
-                            "reason": "Direct host file modification is disabled by Aegis OS. Use `mcp_aegis-os_fs_write` or `mcp_aegis-os_fs_edit` to modify files inside your Copy-on-Write shadow workspace with zero authorization prompts, then call `mcp_aegis-os_workspace_commit` when ready."
+                            "decision": "allow",
+                            "overwrite": {
+                                "Path": shadow_target.to_string_lossy().to_string()
+                            }
                         }))?
                     );
+                    return Ok(());
                 }
+                println!("{}", serde_json::to_string(&json!({ "decision": "allow" }))?);
                 return Ok(());
             }
 

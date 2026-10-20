@@ -119,7 +119,25 @@ impl CoWWorkspace {
     fn is_ignored_dir_name(name: &str) -> bool {
         matches!(
             name,
-            ".aegis_os" | ".git" | "target" | "node_modules" | ".gemini"
+            ".aegis_os"
+                | ".git"
+                | "target"
+                | "node_modules"
+                | ".gemini"
+                | ".next"
+                | "dist"
+                | "build"
+                | ".venv"
+                | "venv"
+                | "__pycache__"
+                | ".dart_tool"
+                | "Pods"
+                | ".gradle"
+                | ".cache"
+                | ".nexus"
+                | ".agents"
+                | ".turbo"
+                | "coverage"
         )
     }
 
@@ -219,11 +237,7 @@ impl CoWWorkspace {
             while let Some(entry) = rd.next_entry().await? {
                 let path = entry.path();
                 let name = entry.file_name().to_string_lossy().to_string();
-                if name == ".aegis_os"
-                    || name == ".git"
-                    || name == "target"
-                    || name == "node_modules"
-                {
+                if Self::is_ignored_dir_name(&name) {
                     continue;
                 }
                 let ft = entry.file_type().await?;
@@ -448,7 +462,22 @@ impl TransactionalWorkspace for CoWWorkspace {
 
         let mut diffs = Vec::new();
 
+        let fast_meta_skip = current_files.len() > 500;
         for (rel, cur_path) in &current_files {
+            if let Some(base_path) = base_files.get(rel) {
+                if fast_meta_skip {
+                    if let (Ok(cm), Ok(bm)) = (
+                        std::fs::metadata(cur_path),
+                        std::fs::metadata(base_path),
+                    ) {
+                        if cm.len() == bm.len()
+                            && cm.modified().ok() == bm.modified().ok()
+                        {
+                            continue;
+                        }
+                    }
+                }
+            }
             let cur_bytes = tokio::fs::read(cur_path).await?;
             match base_files.get(rel) {
                 None => {
