@@ -1,0 +1,482 @@
+//! Aegis OS Core Kernel Traits & Domain Types (`aos-core`)
+//!
+//! Defines the foundational abstractions for:
+//! - Multi-tenant Organization & Agent Identity (`AgentIdentity`)
+//! - Dual-tier Pluggable Compute Sandbox (`SandboxDriver`, `SandboxInstance`)
+//! - Copy-on-Write Transactional Workspace & Organization CAS Storage (`TransactionalWorkspace`, `OrgSharedStorage`)
+//! - First-class Inter-Agent Communication Bus (`IpcBus`, `IpcEnvelope`, `PeerInfo`)
+//! - Policy Evaluation & Session Lease Management (`PolicyEngine`, `PolicyDecision`, `LeaseScope`)
+//! - Flight Recorder & Time-Travel Audit Trail (`FlightRecorder`, `AuditEvent`)
+
+use async_trait::async_trait;
+use serde::{Deserialize, Serialize};
+use std::collections::HashMap;
+use std::path::{Path, PathBuf};
+
+// ============================================================================
+// 1. Multi-Tenant Identity & Capability Model
+// ============================================================================
+
+/// Represents an authenticated Agent principal operating within an Organization boundary.
+/// In Aegis OS, 1 Agent = 1 isolated OS User/Principal within an Organization tenant.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AgentIdentity {
+    pub org_id: String,
+    pub agent_id: String,
+    pub role: String,
+    pub capabilities: Vec<String>,
+}
+
+impl AgentIdentity {
+    pub fn new(org_id: impl Into<String>, agent_id: impl Into<String>, role: impl Into<String>) -> Self {
+        Self {
+            org_id: org_id.into(),
+            agent_id: agent_id.into(),
+            role: role.into(),
+            capabilities: Vec::new(),
+        }
+    }
+
+    pub fn with_capabilities(mut self, caps: Vec<String>) -> Self {
+        self.capabilities = caps;
+        self
+    }
+
+    pub fn fqn(&self) -> String {
+        format!("org:{}/agent:{}", self.org_id, self.agent_id)
+    }
+}
+
+// ============================================================================
+// 2. Pluggable Sandbox & Compute Isolation Model
+// ============================================================================
+
+/// Pluggable isolation tier supporting both local zero-overhead execution
+/// and cloud multi-tenant hardware virtualization.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum IsolationTier {
+    /// Local Desktop Mode: macOS `sandbox-exec` (Seatbelt) / Linux `bwrap` + `landlock` + `seccomp`
+    NativeOsSandbox,
+    /// Cloud Multi-Tenant Mode: Hardware-virtualized MicroVM (`libkrun` / `Firecracker`)
+    MicroVm,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ResourceLimits {
+    pub cpu_millicores: u32,
+    pub memory_mb: u64,
+    pub disk_quota_mb: u64,
+    pub max_pids: u32,
+}
+
+impl Default for ResourceLimits {
+    fn default() -> Self {
+        Self {
+            cpu_millicores: 2000,
+            memory_mb: 2048,
+            disk_quota_mb: 4096,
+            max_pids: 128,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SandboxConfig {
+    pub identity: AgentIdentity,
+    pub tier: IsolationTier,
+    pub limits: ResourceLimits,
+    /// Path to the Agent's Copy-on-Write shadow workspace upper directory (`/workspace`)
+    pub workspace_dir: PathBuf,
+    /// Path to the Agent's persistent private home directory (`/home/<agent_id>`)
+    pub agent_home_dir: PathBuf,
+    /// Path to the Organization's shared read-only directory (`/org/shared/ro`)
+    pub org_shared_ro_dir: PathBuf,
+    /// Path to the Agent's scoped publish directory within the Organization (`/org/shared/pub/<agent_id>`)
+    pub org_agent_pub_dir: PathBuf,
+    /// Optional local Egress Proxy address (`host:port` or Unix socket)
+    pub egress_proxy_addr: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ExecSpec {
+    pub command: String,
+    pub args: Vec<String>,
+    pub cwd: Option<PathBuf>,
+    pub env: HashMap<String, String>,
+    pub timeout_ms: Option<u64>,
+    pub background: bool,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ExecOutput {
+    pub pid: u32,
+    pub exit_code: Option<i32>,
+    pub stdout: String,
+    pub stderr: String,
+    pub duration_ms: u64,
+    pub sandbox_profile_used: String,
+}
+
+#[async_trait]
+pub trait SandboxInstance: Send + Sync {
+    fn instance_id(&self) -> &str;
+    fn config(&self) -> &SandboxConfig;
+
+    /// Execute a command confined strictly within the sandbox boundary.
+    async fn exec(&self, spec: ExecSpec) -> anyhow::Result<ExecOutput>;
+
+    /// Generate the underlying OS/VM confinement profile for inspection & auditing.
+    fn confinement_profile(&self) -> String;
+
+    /// Pause sandbox for Scale-to-Zero idle hibernation.
+    async fn pause(&self) -> anyhow::Result<()>;
+
+    /// Resume a paused sandbox.
+    async fn resume(&self) -> anyhow::Result<()>;
+
+    /// Tear down the sandbox instance.
+    async fn destroy(&self) -> anyhow::Result<()>;
+}
+
+#[async_trait]
+pub trait SandboxDriver: Send + Sync {
+    fn tier(&self) -> IsolationTier;
+    async fn create_sandbox(&self, config: SandboxConfig) -> anyhow::Result<Box<dyn SandboxInstance>>;
+}
+
+// ============================================================================
+// 3. Transactional CoW File System & Organization Shared Storage
+// ============================================================================
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum DiffChangeType {
+    Added,
+    Modified,
+    Deleted,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct FileDiffEntry {
+    pub relative_path: String,
+    pub change_type: DiffChangeType,
+    pub old_size: Option<u64>,
+    pub new_size: Option<u64>,
+    pub preview_diff: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SnapshotMeta {
+    pub snapshot_id: String,
+    pub label: String,
+    pub created_at_ms: i64,
+    pub file_count: usize,
+}
+
+/// Transactional Copy-on-Write shadow workspace allowing 100% prompt-free file operations
+/// inside the sandbox, with instant rollback and gated commit back to the host.
+#[async_trait]
+pub trait TransactionalWorkspace: Send + Sync {
+    /// Returns the path of the shadow workspace mounted for the Agent.
+    fn shadow_root(&self) -> &Path;
+
+    /// Returns the original host source path backing this CoW workspace.
+    fn host_source_root(&self) -> &Path;
+
+    /// Create an instant point-in-time snapshot of the shadow workspace.
+    async fn create_snapshot(&self, label: &str) -> anyhow::Result<SnapshotMeta>;
+
+    /// List all snapshots created in the current session.
+    async fn list_snapshots(&self) -> anyhow::Result<Vec<SnapshotMeta>>;
+
+    /// Compute the file-level diff between the current shadow workspace and the host source (or a snapshot).
+    async fn diff(&self, snapshot_id: Option<&str>) -> anyhow::Result<Vec<FileDiffEntry>>;
+
+    /// Rollback the shadow workspace to a previous snapshot.
+    async fn rollback(&self, snapshot_id: &str) -> anyhow::Result<()>;
+
+    /// Atomically commit changes from the shadow workspace back to the host source directory.
+    /// (Protected by `Action::"workspace_commit"` in the Policy Engine).
+    async fn commit_to_host(&self, filter_paths: Option<Vec<String>>) -> anyhow::Result<Vec<String>>;
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ArtifactMeta {
+    pub uri: String,
+    pub sha256: String,
+    pub name: String,
+    pub org_id: String,
+    pub publisher_agent_id: String,
+    pub size_bytes: u64,
+    pub content_type: String,
+    pub metadata: serde_json::Value,
+    pub created_at_ms: i64,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct OrgKvEntry {
+    pub namespace: String,
+    pub key: String,
+    pub value: serde_json::Value,
+    pub version: u64,
+    pub updated_by_agent: String,
+    pub updated_at_ms: i64,
+}
+
+#[async_trait]
+pub trait OrgSharedStorage: Send + Sync {
+    /// Publish an immutable artifact into the Organization's Content-Addressable Storage (CAS).
+    /// Returns an `ArtifactMeta` with URI `artifact://<org_id>/sha256:<hash>`.
+    async fn publish_artifact(
+        &self,
+        identity: &AgentIdentity,
+        name: &str,
+        content: &[u8],
+        content_type: &str,
+        metadata: serde_json::Value,
+    ) -> anyhow::Result<ArtifactMeta>;
+
+    /// Fetch an artifact's metadata and raw bytes by its CAS URI or SHA-256 hash.
+    async fn fetch_artifact(
+        &self,
+        identity: &AgentIdentity,
+        uri_or_hash: &str,
+    ) -> anyhow::Result<(ArtifactMeta, Vec<u8>)>;
+
+    /// List all artifacts published within the Agent's Organization.
+    async fn list_artifacts(&self, org_id: &str) -> anyhow::Result<Vec<ArtifactMeta>>;
+
+    /// Put a value into the Organization-scoped KV store with optional CAS version check.
+    async fn kv_put(
+        &self,
+        identity: &AgentIdentity,
+        namespace: &str,
+        key: &str,
+        value: serde_json::Value,
+        expected_version: Option<u64>,
+    ) -> anyhow::Result<OrgKvEntry>;
+
+    /// Get a value from the Organization-scoped KV store.
+    async fn kv_get(
+        &self,
+        org_id: &str,
+        namespace: &str,
+        key: &str,
+    ) -> anyhow::Result<Option<OrgKvEntry>>;
+}
+
+// ============================================================================
+// 4. First-Class Inter-Agent Communication (IPC Bus)
+// ============================================================================
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "type", rename_all = "snake_case")]
+pub enum IpcKind {
+    /// Unicast notification or message to a peer agent
+    DirectMessage,
+    /// Structured task handoff / RPC request expecting a reply
+    TaskRequest { timeout_secs: Option<u64> },
+    /// Structured reply correlated to a previous `TaskRequest`
+    TaskResponse {
+        correlation_id: String,
+        success: bool,
+    },
+    /// Broadcast message on an Organization-scoped topic channel
+    TopicBroadcast { topic: String },
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum MessageDeliveryStatus {
+    Unread,
+    Delivered,
+    Acked,
+    Replied,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct IpcEnvelope {
+    pub msg_id: String,
+    pub org_id: String,
+    pub from_agent: String,
+    /// Target `agent_id` for direct/task messages, or `topic:<name>` for broadcasts
+    pub to_target: String,
+    pub kind: IpcKind,
+    pub subject: String,
+    pub payload: serde_json::Value,
+    /// Zero-copy references to Organization CAS artifacts (`artifact://<org_id>/sha256:...`)
+    pub attachments: Vec<String>,
+    pub status: MessageDeliveryStatus,
+    pub created_at_ms: i64,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PeerInfo {
+    pub org_id: String,
+    pub agent_id: String,
+    pub role: String,
+    pub capabilities: Vec<String>,
+    pub subscribed_topics: Vec<String>,
+    pub online: bool,
+    pub last_seen_ms: i64,
+}
+
+#[async_trait]
+pub trait IpcBus: Send + Sync {
+    /// Register or update an Agent's presence, role, capabilities, and topic subscriptions within its Org.
+    async fn register_peer(
+        &self,
+        identity: &AgentIdentity,
+        subscribed_topics: Vec<String>,
+    ) -> anyhow::Result<PeerInfo>;
+
+    /// Discover peer Agents within the same Organization.
+    async fn list_peers(&self, org_id: &str) -> anyhow::Result<Vec<PeerInfo>>;
+
+    /// Send a DirectMessage, TaskRequest, TaskResponse, or TopicBroadcast.
+    /// Automatically triggers reactive wakeup notifications for subscribed/recipient agents.
+    async fn send(&self, envelope: IpcEnvelope) -> anyhow::Result<IpcEnvelope>;
+
+    /// Receive messages from an Agent's inbox (`unread_only` filters out already Acked/Replied messages).
+    async fn recv_inbox(
+        &self,
+        org_id: &str,
+        agent_id: &str,
+        unread_only: bool,
+        limit: usize,
+    ) -> anyhow::Result<Vec<IpcEnvelope>>;
+
+    /// Acknowledge receipt/completion of a message in the Agent's inbox.
+    async fn ack(&self, org_id: &str, agent_id: &str, msg_id: &str) -> anyhow::Result<()>;
+
+    /// Reply directly to a `TaskRequest` message, automatically linking `correlation_id` and marking original as `Replied`.
+    async fn reply(
+        &self,
+        responder: &AgentIdentity,
+        original_msg_id: &str,
+        success: bool,
+        payload: serde_json::Value,
+        attachments: Vec<String>,
+    ) -> anyhow::Result<IpcEnvelope>;
+
+    /// Subscribe to real-time wakeup events for a given `(org_id, agent_id)`.
+    async fn subscribe_wakeup(
+        &self,
+        org_id: &str,
+        agent_id: &str,
+    ) -> anyhow::Result<tokio::sync::broadcast::Receiver<IpcEnvelope>>;
+}
+
+// ============================================================================
+// 5. Policy Kernel & Session Lease Model
+// ============================================================================
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "decision", rename_all = "snake_case")]
+pub enum PolicyDecision {
+    /// Operation is within safe sandbox/org boundaries or covered by an active Lease
+    Allow { matched_rule: String },
+    /// Operation crosses a boundary and requires user/admin confirmation (or Session Lease)
+    Ask {
+        escalation_id: String,
+        reason: String,
+        suggested_lease_scope: String,
+    },
+    /// Operation violates a hard security boundary (e.g. cross-tenant access or forbidden path)
+    Deny { reason: String },
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PolicyContext {
+    pub principal: AgentIdentity,
+    pub action: String,
+    pub target_org_id: String,
+    pub target_resource: String,
+    pub metadata: serde_json::Value,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct LeaseGrant {
+    pub lease_id: String,
+    pub org_id: String,
+    pub agent_id: String,
+    /// Action pattern (e.g. `workspace_commit`, `egress_connect:api.stripe.com`)
+    pub action_pattern: String,
+    /// Resource prefix or `*`
+    pub resource_pattern: String,
+    pub expires_at_ms: i64,
+    pub granted_by: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum EscalationStatus {
+    Pending,
+    Approved,
+    Denied,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PendingEscalation {
+    pub escalation_id: String,
+    pub org_id: String,
+    pub agent_id: String,
+    pub action: String,
+    pub target_resource: String,
+    pub reason: String,
+    pub suggested_lease_scope: String,
+    pub status: EscalationStatus,
+    pub created_at_ms: i64,
+}
+
+#[async_trait]
+pub trait PolicyEngine: Send + Sync {
+    /// Evaluate whether the requested syscall/action is Allowed, Ask (requires lease/approval), or Denied.
+    async fn evaluate(&self, ctx: &PolicyContext) -> anyhow::Result<PolicyDecision>;
+
+    /// Grant a temporary session lease so subsequent matching operations auto-pass without prompting.
+    async fn grant_lease(&self, lease: LeaseGrant) -> anyhow::Result<LeaseGrant>;
+
+    /// List active leases for an Organization/Agent.
+    async fn list_leases(&self, org_id: &str, agent_id: Option<&str>) -> anyhow::Result<Vec<LeaseGrant>>;
+
+    /// List escalations triggered when an Agent hits a `PolicyDecision::Ask` boundary.
+    async fn list_escalations(&self, org_id: &str) -> anyhow::Result<Vec<PendingEscalation>>;
+
+    /// Approve a pending escalation by ID and automatically issue a Session Lease.
+    async fn approve_escalation(
+        &self,
+        escalation_id: &str,
+        ttl_secs: i64,
+        approved_by: &str,
+    ) -> anyhow::Result<LeaseGrant>;
+}
+
+// ============================================================================
+// 6. Flight Recorder & Audit Log
+// ============================================================================
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct AuditEvent {
+    pub event_id: String,
+    pub timestamp_ms: i64,
+    pub org_id: String,
+    pub agent_id: String,
+    pub action: String,
+    pub resource: String,
+    pub policy_decision: String,
+    pub snapshot_id: Option<String>,
+    pub details: serde_json::Value,
+}
+
+#[async_trait]
+pub trait FlightRecorder: Send + Sync {
+    async fn record(&self, event: AuditEvent) -> anyhow::Result<()>;
+    async fn query_events(
+        &self,
+        org_id: &str,
+        agent_id: Option<&str>,
+        limit: usize,
+    ) -> anyhow::Result<Vec<AuditEvent>>;
+}

@@ -1,0 +1,276 @@
+{
+  "timestamp_utc": "2026-10-20T14:59:58.312307+00:00",
+  "host_os_arch": "macos-aarch64",
+  "exp1_authorization_friction": [
+    {
+      "mode": "Host-Interactive (Per-Action Prompt)",
+      "trajectories_executed": 50,
+      "total_syscalls_executed": 1500,
+      "human_prompts_triggered": 900,
+      "ipr_percent": 60.0,
+      "prompt_reduction_percent": 0.0,
+      "max_autonomous_streak": 4,
+      "total_execution_ms": 390.449208
+    },
+    {
+      "mode": "Host-Static-Allowlist",
+      "trajectories_executed": 50,
+      "total_syscalls_executed": 1500,
+      "human_prompts_triggered": 650,
+      "ipr_percent": 43.333333333333336,
+      "prompt_reduction_percent": 27.77777777777778,
+      "max_autonomous_streak": 5,
+      "total_execution_ms": 390.449208
+    },
+    {
+      "mode": "Aegis-OS (Per-Task Commit Gate)",
+      "trajectories_executed": 50,
+      "total_syscalls_executed": 1500,
+      "human_prompts_triggered": 50,
+      "ipr_percent": 3.3333333333333335,
+      "prompt_reduction_percent": 94.44444444444444,
+      "max_autonomous_streak": 29,
+      "total_execution_ms": 390.449208
+    },
+    {
+      "mode": "Aegis-OS (With 1h Session Lease)",
+      "trajectories_executed": 50,
+      "total_syscalls_executed": 1500,
+      "human_prompts_triggered": 1,
+      "ipr_percent": 0.06666666666666667,
+      "prompt_reduction_percent": 99.8888888888889,
+      "max_autonomous_streak": 1470,
+      "total_execution_ms": 381.15216699999996
+    }
+  ],
+  "exp2_live_redteam_security": [
+    {
+      "category": "A. Host Path Escape & File Tampering",
+      "attacks_executed": 10,
+      "host_yolo_compromised": 10,
+      "host_yolo_asr_percent": 100.0,
+      "aegis_os_compromised": 0,
+      "aegis_os_blocked": 10,
+      "aegis_os_asr_percent": 0.0,
+      "empirical_evidence": "Kernel `sandbox-exec` denied all 10 outside-workspace writes (`Operation not permitted`)"
+    },
+    {
+      "category": "B. `~/.ssh/id_rsa` Credential Harvesting",
+      "attacks_executed": 10,
+      "host_yolo_compromised": 10,
+      "host_yolo_asr_percent": 100.0,
+      "aegis_os_compromised": 0,
+      "aegis_os_blocked": 10,
+      "aegis_os_asr_percent": 0.0,
+      "empirical_evidence": "Kernel Seatbelt regex `(deny file-read* /.ssh)` blocked all 10 private key reads"
+    },
+    {
+      "category": "C. Live TCP Egress Secret Exfiltration",
+      "attacks_executed": 10,
+      "host_yolo_compromised": 10,
+      "host_yolo_asr_percent": 100.0,
+      "aegis_os_compromised": 0,
+      "aegis_os_blocked": 10,
+      "aegis_os_asr_percent": 0.0,
+      "empirical_evidence": "Live TCP Proxy (127.0.0.1:65295) returned `HTTP/1.1 403 Forbidden` on all 10 exfil domains"
+    },
+    {
+      "category": "D. Cross-Tenant IPC & CAS Access",
+      "attacks_executed": 10,
+      "host_yolo_compromised": 10,
+      "host_yolo_asr_percent": 100.0,
+      "aegis_os_compromised": 0,
+      "aegis_os_blocked": 10,
+      "aegis_os_asr_percent": 0.0,
+      "empirical_evidence": "Cedar Policy Kernel rejected all 10 cross-org requests (`principal.org_id != target_org_id`)"
+    }
+  ],
+  "exp3_cow_and_storage": [
+    {
+      "workload_name": "Small Project (100 files, 2.0 MB)",
+      "file_count": 100,
+      "logical_size_mb": 1.953125,
+      "full_copy_ms": {
+        "mean": 9.810875399999999,
+        "std_dev": 0.4832645344312371,
+        "p50": 9.981333,
+        "p95": 10.290959,
+        "p99": 10.290959
+      },
+      "aegis_cow_ms": {
+        "mean": 0.6700416,
+        "std_dev": 0.07086201015664179,
+        "p50": 0.646,
+        "p95": 0.783375,
+        "p99": 0.783375
+      },
+      "speedup_x": 14.642188485013465,
+      "logical_10_agents_mb": 19.53125,
+      "aegis_10_agents_delta_mb": 0.9765625,
+      "storage_saving_percent": 95.0
+    },
+    {
+      "workload_name": "Medium Project (300 files, 18.0 MB)",
+      "file_count": 300,
+      "logical_size_mb": 17.578125,
+      "full_copy_ms": {
+        "mean": 39.3369666,
+        "std_dev": 6.901823217826506,
+        "p50": 39.466415999999995,
+        "p95": 51.649667,
+        "p99": 51.649667
+      },
+      "aegis_cow_ms": {
+        "mean": 2.986975,
+        "std_dev": 1.633601421621076,
+        "p50": 2.2622079999999998,
+        "p95": 6.241708,
+        "p99": 6.241708
+      },
+      "speedup_x": 13.169499778203699,
+      "logical_10_agents_mb": 175.78125,
+      "aegis_10_agents_delta_mb": 8.7890625,
+      "storage_saving_percent": 95.0
+    },
+    {
+      "workload_name": "Large Project (1,000 files, 80.0 MB)",
+      "file_count": 1000,
+      "logical_size_mb": 78.125,
+      "full_copy_ms": {
+        "mean": 165.9024586,
+        "std_dev": 17.60667216133671,
+        "p50": 165.22324999999998,
+        "p95": 196.613709,
+        "p99": 196.613709
+      },
+      "aegis_cow_ms": {
+        "mean": 7.8557334,
+        "std_dev": 0.9086301942252629,
+        "p50": 7.7155000000000005,
+        "p95": 9.228416999999999,
+        "p99": 9.228416999999999
+      },
+      "speedup_x": 21.118646745318518,
+      "logical_10_agents_mb": 781.25,
+      "aegis_10_agents_delta_mb": 39.0625,
+      "storage_saving_percent": 95.0
+    }
+  ],
+  "exp3_e2e_latencies": [
+    {
+      "operation": "PolicyKernel::evaluate (In-Process)",
+      "samples_count": 2000,
+      "stats_us": {
+        "mean": 0.10240850000000024,
+        "std_dev": 0.09284856825902056,
+        "p50": 0.08399999999999999,
+        "p95": 0.125,
+        "p99": 0.125
+      },
+      "throughput_ops_sec": 7914241.281473949
+    },
+    {
+      "operation": "IpcBus::send + recv_inbox (In-Process)",
+      "samples_count": 1000,
+      "stats_us": {
+        "mean": 1.3756650000000035,
+        "std_dev": 4.565290380115487,
+        "p50": 1.0,
+        "p95": 2.584,
+        "p99": 4.333
+      },
+      "throughput_ops_sec": 712441.0009796064
+    },
+    {
+      "operation": "HTTP Daemon `POST /mcp` (`fs_read` RPC)",
+      "samples_count": 200,
+      "stats_us": {
+        "mean": 291.78313,
+        "std_dev": 97.19589701275,
+        "p50": 255.87500000000003,
+        "p95": 441.792,
+        "p99": 535.3340000000001
+      },
+      "throughput_ops_sec": 3373.4896106893475
+    }
+  ],
+  "exp4_live_multi_agent_cargo": [
+    {
+      "metric": "Concurrent 3-Agent Feature Preservation (`src/lib.rs`)",
+      "host_shared_yolo": "1/3 features preserved (2/3 overwritten)",
+      "aegis_os_isolated_3way": "3/3 features preserved (100% 3-Way Merged)",
+      "gain": "3.0x Feature Retention (0% Clobber)"
+    },
+    {
+      "metric": "Post-Merge Real `cargo test` Compilation & Unit Test",
+      "host_shared_yolo": "Failed (Missing `agy_v2` & `claude_v2` logic)",
+      "aegis_os_isolated_3way": "Passed (`cargo test` exit code 0)",
+      "gain": "100% Build Integrity"
+    },
+    {
+      "metric": "Cross-Agent 64KB Spec Handoff Payload Size",
+      "host_shared_yolo": "196,608 bytes (~49,152 tokens inline)",
+      "aegis_os_isolated_3way": "294 bytes (~73 tokens via CAS URI)",
+      "gain": "99.85% Context Token Reduction"
+    }
+  ],
+  "exp5_live_rollback_recovery": [
+    {
+      "corrupted_files": 10,
+      "sequential_rewrite_ms": {
+        "mean": 0.8768334,
+        "std_dev": 0.07916218064606355,
+        "p50": 0.8497910000000001,
+        "p95": 0.9772500000000001,
+        "p99": 0.9772500000000001
+      },
+      "aegis_cow_rollback_ms": {
+        "mean": 0.705383,
+        "std_dev": 0.09960776155099561,
+        "p50": 0.670416,
+        "p95": 0.894625,
+        "p99": 0.894625
+      },
+      "kernel_speedup_x": 1.24306001136971,
+      "cargo_check_verified": true
+    },
+    {
+      "corrupted_files": 50,
+      "sequential_rewrite_ms": {
+        "mean": 4.325042,
+        "std_dev": 0.4093808801920286,
+        "p50": 4.128042,
+        "p95": 5.093459,
+        "p99": 5.093459
+      },
+      "aegis_cow_rollback_ms": {
+        "mean": 1.8757002,
+        "std_dev": 0.042625547088102,
+        "p50": 1.863583,
+        "p95": 1.955375,
+        "p99": 1.955375
+      },
+      "kernel_speedup_x": 2.305827978266463,
+      "cargo_check_verified": true
+    },
+    {
+      "corrupted_files": 200,
+      "sequential_rewrite_ms": {
+        "mean": 17.1060168,
+        "std_dev": 0.8163824630317336,
+        "p50": 16.570541000000002,
+        "p95": 18.473917,
+        "p99": 18.473917
+      },
+      "aegis_cow_rollback_ms": {
+        "mean": 7.090700199999999,
+        "std_dev": 0.48267655916209545,
+        "p50": 7.353791999999999,
+        "p95": 7.59475,
+        "p99": 7.59475
+      },
+      "kernel_speedup_x": 2.412458053155315,
+      "cargo_check_verified": true
+    }
+  ]
+}

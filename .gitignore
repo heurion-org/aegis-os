@@ -1,0 +1,14 @@
+# Rust build artifacts
+/target/
+
+# LaTeX build intermediates
+paper/*.aux
+paper/*.log
+paper/*.out
+paper/*.blg
+paper/*.synctex*
+paper/tmp_arxiv/
+
+# macOS metadata
+.DS_Store
+._*

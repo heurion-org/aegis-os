@@ -1,0 +1,22 @@
+{
+  "aegis-os-runtime-guard": {
+    "PreToolUse": [
+      {
+        "hooks": [
+          {
+            "command": "\"/Users/huizhao/Downloads/workspace/aegis-os/target/debug/aegis-os\" --org \"aegis-team\" --agent \"agy-main\" --role \"Lead Engineer\" --workspace \"/Users/huizhao/Downloads/workspace/aegis-os\" --runtime-dir \"/tmp/aegis-os-runtime\" agy-hook --event PreToolUse --strict-cow",
+            "type": "command"
+          }
+        ],
+        "matcher": "mcp_aegis-os_.*|write_file|edit_file|run_command"
+      }
+    ],
+    "SessionStart": [
+      {
+        "command": "\"/Users/huizhao/Downloads/workspace/aegis-os/target/debug/aegis-os\" --org \"aegis-team\" --agent \"agy-main\" --role \"Lead Engineer\" --workspace \"/Users/huizhao/Downloads/workspace/aegis-os\" --runtime-dir \"/tmp/aegis-os-runtime\" agy-hook --event SessionStart --strict-cow",
+        "type": "command"
+      }
+    ],
+    "enabled": true
+  }
+}

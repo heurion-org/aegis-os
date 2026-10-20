@@ -1,0 +1,82 @@
+\begin{thebibliography}{10}
+
+\bibitem{agache2020firecracker}
+Alexandru Agache, Marc Brooker, Alexandra Iordache, Anthony Liguori, Rolf
+  Neugebauer, Phil Piwonka, and Diana-Maria Popa.
+\newblock Firecracker: Lightweight virtualization for serverless applications.
+\newblock In {\em 17th USENIX Symposium on Networked Systems Design and
+  Implementation (NSDI 20)}, pages 419--434, 2020.
+
+\bibitem{anthropic2024mcp}
+{Anthropic}.
+\newblock Model context protocol ({MCP}): An open protocol for connecting {AI}
+  assistants to systems.
+\newblock \url{https://modelcontextprotocol.io}, 2024.
+
+\bibitem{cutler2024cedar}
+Joseph~W Cutler, Craig Disselkoen, Aaron Eline, Shaobo He, Kyle Headley,
+  Michael Hicks, Kesha Hietala, Eleftherios Ioannidis, John Kastner, Anwar
+  Mamat, et~al.
+\newblock Cedar: A new language for expressive, fast, safe, and analyzable
+  authorization.
+\newblock {\em Proceedings of the ACM on Programming Languages (OOPSLA)},
+  8(OOPSLA1):670--697, 2024.
+
+\bibitem{debenedetti2024agentdojo}
+Edoardo Debenedetti, Jie Zhang, Mislav Balunovi{\'c}, Lukas Beurer-Kellner,
+  Marc Fischer, and Florian Tram{\`e}r.
+\newblock {AgentDojo}: A dynamic environment to evaluate prompt injection
+  attacks and defenses for {LLM} agents.
+\newblock In {\em Advances in Neural Information Processing Systems (NeurIPS)
+  Datasets and Benchmarks Track}, 2024.
+
+\bibitem{greshake2023not}
+Kai Greshake, Sahar Abdelnabi, Shailendra Mishra, Christoph Endres, Thorsten
+  Holz, and Mario Fritz.
+\newblock Not what you've signed up for: Compromising real-world
+  {LLM}-integrated applications with indirect prompt injection.
+\newblock {\em Proceedings of the 16th ACM Workshop on Artificial Intelligence
+  and Security (AISec)}, pages 79--90, 2023.
+
+\bibitem{jimenez2024swebench}
+Carlos~E Jimenez, John Yang, Alexander Wettig, Shunyu Yao, Kexin Pei, Ofir
+  Press, and Karthik~R Narasimhan.
+\newblock {SWE-bench}: Can language models resolve real-world {GitHub} issues?
+\newblock In {\em International Conference on Learning Representations (ICLR)},
+  2024.
+
+\bibitem{mei2024aios}
+Kai Mei, Zelong Li, Shuyuan Xu, Ruosong Ye, Yingqiang Ge, and Yongfeng Zhang.
+\newblock {AIOS}: {LLM} agent operating system.
+\newblock {\em arXiv preprint arXiv:2403.16971}, 2024.
+
+\bibitem{rodeh2013btrfs}
+Ohad Rodeh, Josef Bacik, and Chris Mason.
+\newblock {BTRFS}: The {Linux} b-tree filesystem.
+\newblock volume~9, pages 1--32, 2013.
+
+\bibitem{ruan2024toolemu}
+Yangjun Ruan, Honghua Dong, Andrew Wang, Silviu Pitis, Yongchao Zhou, Jimmy Ba,
+  Yann Dubois, Chris~J Maddison, and Tatsunori Hashimoto.
+\newblock Identifying the risks of {LM} agents with an {LM}-emulated sandbox.
+\newblock {\em arXiv preprint arXiv:2309.15817}, 2024.
+
+\bibitem{watson2010capsicum}
+Robert~NM Watson, Jonathan Anderson, Ben Laurie, and Kris Kennaway.
+\newblock Capsicum: Practical capabilities for {UNIX}.
+\newblock In {\em 19th USENIX Security Symposium (USENIX Security 10)}, 2010.
+
+\bibitem{wu2023autogen}
+Qingyun Wu, Gagan Bansal, Jieyu Zhang, Yiran Wu, Beibin Li, Erkang Zhu,
+  Li~Jiang, Xiaoyun Zhang, Shaokun Zhang, Jiale Liu, et~al.
+\newblock {AutoGen}: Enabling next-gen {LLM} applications via multi-agent
+  conversation.
+\newblock In {\em Conference on Language Modeling (COLM)}, 2024.
+
+\bibitem{zhan2024injecagent}
+Qiusi Zhan, Zhixiang Liang, Zifan Ying, and Daniel Kang.
+\newblock {InjecAgent}: Benchmarking indirect prompt injections in
+  tool-integrated large language model agents.
+\newblock {\em arXiv preprint arXiv:2403.02691}, 2024.
+
+\end{thebibliography}

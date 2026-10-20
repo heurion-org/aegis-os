@@ -1,0 +1,20 @@
+{
+  "mcpServers": {
+    "aegis-os": {
+      "args": [
+        "--org",
+        "aegis-team",
+        "--agent",
+        "agy-main",
+        "--role",
+        "Lead Engineer",
+        "--workspace",
+        "/Users/huizhao/Downloads/workspace/aegis-os",
+        "--runtime-dir",
+        "/tmp/aegis-os-runtime",
+        "mcp-stdio"
+      ],
+      "command": "/Users/huizhao/Downloads/workspace/aegis-os/target/debug/aegis-os"
+    }
+  }
+}

@@ -1,0 +1,21 @@
+================================================================================
+ARXIV WEB SUBMISSION METADATA (Strictly formatted per Trevor Campbell's Guide)
+================================================================================
+
+[Title] (Initial Caps, No LaTeX formatting):
+Aegis OS: A Transactional Multi-Tenant Operating System Runtime for Eliminating Authorization Fatigue in Autonomous Coding Agents
+
+[Authors] (Comma-separated full names, NO "and", No LaTeX formatting):
+Hui Zhao (huizhao@heurion.org)
+
+[Primary Category]:
+cs.OS (Operating Systems)
+
+[Cross-List Categories]:
+cs.MA (Multiagent Systems), cs.CR (Cryptography and Security), cs.SE (Software Engineering), cs.AI (Artificial Intelligence)
+
+[Comments]:
+10 pages, 3 figures, 6 tables
+
+[Abstract] (Single continuous plain-text block, NO line breaks, NO LaTeX commands):
+Autonomous coding agents such as Google Antigravity (agy), Anthropic Claude Code (claude), and OpenAI Codex CLI (codex) increasingly execute complex, multi-step software engineering workflows directly on developer workstations and enterprise cloud hosts. However, existing agent execution environments suffer from a fundamental Security-Autonomy Dilemma: users must choose between Interactive Per-Action Prompting, which interrupts human operators on 43% to 60% of tool invocations and induces severe authorization fatigue, or Unconfined Host Execution (--yolo / --dangerously-skip-permissions), which exposes the host filesystem, SSH credentials, and API secrets to catastrophic prompt injection and agent hallucination risks. Furthermore, when multiple heterogeneous agents collaborate on a shared repository, concurrent unconstrained edits cause race-condition file clobbering, while passing large code artifacts inline through LLM context windows incurs prohibitive token overhead. We present Aegis OS (aegis-os), a transactional, multi-tenant Agent Operating System Runtime implemented in Rust and exposed via the Model Context Protocol (MCP). Aegis OS resolves the Security-Autonomy Dilemma by shifting the security boundary from individual tool invocations to transactional workspace boundaries. Each agent principal operates inside a kernel-enforced OS sandbox (macOS Seatbelt sandbox-exec or Linux Bubblewrap/MicroVM) backed by an APFS Copy-on-Write (CoW) shadow workspace (libc::clonefile), a Zero-Trust HTTP Egress Proxy with boundary secret injection, and an intra-organization Inter-Agent Communication (IPC) bus paired with Content-Addressable Storage (CAS). Inside its isolated CoW workspace and organization IPC bus, an agent executes with zero confirmation prompts; human authorization or TTL-based session leases are required only when committing validated diffs back to the host via a 3-Way Merge Engine. Across 1,500 live kernel syscalls and 40 live red-team attacks, Aegis OS reduces human confirmation prompts by 94.44% to 99.89%, lowers the attack success rate from 100.0% to 0.0%, provisions 1,000-file (78.1 MB) workspaces in 7.86 ms (21.1x faster than full copy with 95.0% storage savings), preserves 100% of concurrent multi-agent edits verified by live cargo test runs, and reduces cross-agent artifact handoff token consumption by 99.85%.
