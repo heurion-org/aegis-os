@@ -4,7 +4,7 @@
       {
         "hooks": [
           {
-            "command": "\"/Users/huizhao/Downloads/workspace/aegis-os/target/debug/aegis-os\" --org \"aegis-team\" --agent \"agy-main\" --role \"Lead Engineer\" --workspace \"/Users/huizhao/Downloads/workspace/aegis-os\" --runtime-dir \"/tmp/aegis-os-runtime\" agy-hook --event PreToolUse --strict-cow",
+            "command": "\"/Users/huizhao/Downloads/workspace/aegis-os/target/release/aegis-os\" --org \"aegis-os\" --agent \"agy-agent\" --role \"Antigravity (AGY) Lead Agent\" --workspace \"/Users/huizhao/Downloads/workspace/aegis-os\" --runtime-dir \"/tmp/aegis-os-runtime\" agy-hook --event PreToolUse --strict-cow",
             "type": "command"
           }
         ],
@@ -13,7 +13,7 @@
     ],
     "SessionStart": [
       {
-        "command": "\"/Users/huizhao/Downloads/workspace/aegis-os/target/debug/aegis-os\" --org \"aegis-team\" --agent \"agy-main\" --role \"Lead Engineer\" --workspace \"/Users/huizhao/Downloads/workspace/aegis-os\" --runtime-dir \"/tmp/aegis-os-runtime\" agy-hook --event SessionStart --strict-cow",
+        "command": "\"/Users/huizhao/Downloads/workspace/aegis-os/target/release/aegis-os\" --org \"aegis-os\" --agent \"agy-agent\" --role \"Antigravity (AGY) Lead Agent\" --workspace \"/Users/huizhao/Downloads/workspace/aegis-os\" --runtime-dir \"/tmp/aegis-os-runtime\" agy-hook --event SessionStart --strict-cow",
         "type": "command"
       }
     ],

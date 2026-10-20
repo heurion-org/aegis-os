@@ -3,18 +3,18 @@
     "aegis-os": {
       "args": [
         "--org",
-        "aegis-team",
+        "aegis-os",
         "--agent",
-        "agy-main",
+        "agy-agent",
         "--role",
-        "Lead Engineer",
+        "Antigravity (AGY) Lead Agent",
         "--workspace",
         "/Users/huizhao/Downloads/workspace/aegis-os",
         "--runtime-dir",
         "/tmp/aegis-os-runtime",
         "mcp-stdio"
       ],
-      "command": "/Users/huizhao/Downloads/workspace/aegis-os/target/debug/aegis-os"
+      "command": "/Users/huizhao/Downloads/workspace/aegis-os/target/release/aegis-os"
     }
   }
 }
