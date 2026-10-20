@@ -444,6 +444,7 @@ impl AegisRuntimeKernel {
             .to_string();
         let target_resource = args
             .get("path")
+            .or_else(|| args.get("target_domain"))
             .or_else(|| args.get("to_agent"))
             .or_else(|| args.get("topic"))
             .or_else(|| args.get("uri"))
@@ -453,6 +454,23 @@ impl AegisRuntimeKernel {
             .to_string();
 
         let mut audit_metadata = args.clone();
+        if tool_name == "workspace_commit" {
+            let filter_paths: Option<Vec<String>> = args
+                .get("paths")
+                .and_then(|v| serde_json::from_value(v.clone()).ok());
+            if let Ok(mut touched) = env.workspace.changed_since_baseline().await {
+                if let Some(ref allow) = filter_paths {
+                    touched.retain(|p| allow.contains(p));
+                }
+                if let Some(obj) = audit_metadata.as_object_mut() {
+                    obj.insert("paths".to_string(), json!(touched));
+                    obj.insert(
+                        "host_root".to_string(),
+                        json!(env.workspace.host_source_root().display().to_string()),
+                    );
+                }
+            }
+        }
         let mut resolved_cross_org_peer: Option<(String, String)> = None;
 
         if matches!(tool_name, "ipc_send" | "ipc_request") {

@@ -184,6 +184,8 @@ pub struct RefreshReport {
     pub added_from_host: Vec<String>,
     pub removed_from_host: Vec<String>,
     pub conflicts: Vec<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub conflict_details: Vec<String>,
 }
 
 impl RefreshReport {
@@ -220,6 +222,15 @@ pub trait TransactionalWorkspace: Send + Sync {
     /// Atomically commit changes from the shadow workspace back to the host source directory.
     /// (Protected by `Action::"workspace_commit"` in the Policy Engine).
     async fn commit_to_host(&self, filter_paths: Option<Vec<String>>) -> anyhow::Result<Vec<String>>;
+
+    /// Atomically commit changes with explicit binary conflict strategy (`overwrite_binaries`).
+    async fn commit_to_host_with_options(
+        &self,
+        filter_paths: Option<Vec<String>>,
+        _overwrite_binaries: bool,
+    ) -> anyhow::Result<Vec<String>> {
+        self.commit_to_host(filter_paths).await
+    }
 
     /// Relative paths whose shadow content differs from this Agent's baseline.
     async fn changed_since_baseline(&self) -> anyhow::Result<Vec<String>> {
@@ -372,7 +383,7 @@ impl IpcEnvelope {
     }
 }
 
-/// Google A2A Protocol Skill descriptor (`AgentSkill`).
+/// Google A2A Protocol Skill descriptor (`AgentSkill`, v0.2.1).
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct AgentSkill {
     pub id: String,

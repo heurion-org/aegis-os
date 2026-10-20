@@ -98,6 +98,12 @@ impl CoWWorkspace {
         Self::cow_clone_file(src, dst).await
     }
 
+    fn touch_mtime(path: &Path) {
+        if let Ok(f) = std::fs::OpenOptions::new().write(true).open(path) {
+            let _ = f.set_modified(std::time::SystemTime::now());
+        }
+    }
+
     /// Relative paths whose shadow content differs from this Agent's baseline, i.e. exactly the set a
     /// `workspace_commit` would touch (unlike `diff()`, which compares against the live host tree and
     /// therefore also reports files that *peers* changed on the host).
@@ -128,7 +134,7 @@ impl CoWWorkspace {
 
     /// Rebases this Agent's shadow onto the *current* host tree so long-lived identities never work on
     /// stale code:
-    /// - host changed, agent did not touch the file  -> fast-forward shadow + baseline
+    /// - host changed, agent did not touch the file  -> fast-forward shadow + baseline (and bump shadow mtime)
     /// - host changed, agent changed it too          -> 3-way merge host changes into the shadow
     ///   (base = baseline, theirs = host, ours = shadow), then advance baseline to host
     /// - overlapping edits / binary / delete-vs-modify -> left untouched and reported as conflicts
@@ -159,6 +165,7 @@ impl CoWWorkspace {
                     match shadow_bytes {
                         Some(sb) if sb == base_bytes => {
                             Self::clone_into(host_path, &shadow_dst).await?;
+                            Self::touch_mtime(&shadow_dst);
                             Self::clone_into(host_path, &base_dst).await?;
                             report.fast_forwarded.push(rel.clone());
                         }
@@ -172,24 +179,41 @@ impl CoWWorkspace {
                                 std::str::from_utf8(&host_bytes),
                                 std::str::from_utf8(&sb),
                             ) {
-                                (Ok(b), Ok(h), Ok(s)) => Self::three_way_merge_lines(b, h, s).ok(),
-                                _ => None,
+                                (Ok(b), Ok(h), Ok(s)) => match Self::three_way_merge_lines(b, h, s) {
+                                    Ok(m) => Ok(m),
+                                    Err(err) => Err(format!("{}: {}", rel, err)),
+                                },
+                                _ => Err(format!(
+                                    "{}: Binary file concurrently modified on host and in shadow",
+                                    rel
+                                )),
                             };
                             match merged {
-                                Some(m) => {
+                                Ok(m) => {
                                     tokio::fs::write(&shadow_dst, m).await?;
+                                    Self::touch_mtime(&shadow_dst);
                                     Self::clone_into(host_path, &base_dst).await?;
                                     report.merged.push(rel.clone());
                                 }
-                                None => report.conflicts.push(rel.clone()),
+                                Err(detail) => {
+                                    report.conflicts.push(rel.clone());
+                                    report.conflict_details.push(detail);
+                                }
                             }
                         }
-                        None => report.conflicts.push(rel.clone()), // agent deleted, host modified
+                        None => {
+                            report.conflicts.push(rel.clone());
+                            report.conflict_details.push(format!(
+                                "{}: Deleted in shadow workspace but modified on host",
+                                rel
+                            ));
+                        }
                     }
                 }
                 None => match shadow_bytes {
                     None => {
                         Self::clone_into(host_path, &shadow_dst).await?;
+                        Self::touch_mtime(&shadow_dst);
                         Self::clone_into(host_path, &base_dst).await?;
                         report.added_from_host.push(rel.clone());
                     }
@@ -197,7 +221,13 @@ impl CoWWorkspace {
                         Self::clone_into(host_path, &base_dst).await?;
                         report.merged.push(rel.clone());
                     }
-                    Some(_) => report.conflicts.push(rel.clone()), // both added, different content
+                    Some(_) => {
+                        report.conflicts.push(rel.clone());
+                        report.conflict_details.push(format!(
+                            "{}: Independently added on host and in shadow with different content",
+                            rel
+                        ));
+                    }
                 },
             }
         }
@@ -219,6 +249,10 @@ impl CoWWorkspace {
                         report.removed_from_host.push(rel.clone());
                     } else {
                         report.conflicts.push(rel.clone());
+                        report.conflict_details.push(format!(
+                            "{}: Deleted on host but modified in shadow workspace",
+                            rel
+                        ));
                     }
                 }
             }
@@ -695,6 +729,18 @@ impl TransactionalWorkspace for CoWWorkspace {
     }
 
     async fn commit_to_host(&self, filter_paths: Option<Vec<String>>) -> anyhow::Result<Vec<String>> {
+        self.commit_to_host_with_options(filter_paths, false).await
+    }
+
+    async fn commit_to_host_with_options(
+        &self,
+        filter_paths: Option<Vec<String>>,
+        overwrite_binaries: bool,
+    ) -> anyhow::Result<Vec<String>> {
+        // First auto-rebase onto the current host tree so any files modified by peers that this
+        // Agent did NOT touch (including regenerated binary artifacts) are fast-forwarded automatically.
+        let _ = self.refresh_from_host().await?;
+
         // Compute diff relative to this Agent's own `baseline_root` so we only touch files this Agent actually changed!
         let base_files: BTreeMap<String, PathBuf> = Self::collect_files(&self.baseline_root)
             .await?
@@ -738,9 +784,23 @@ impl TransactionalWorkspace for CoWWorkspace {
                     if host_dst.exists() {
                         let host_bytes = tokio::fs::read(&host_dst).await?;
                         if Self::sha256_bytes(&host_bytes) != Self::sha256_bytes(&shadow_bytes) {
+                            let is_binary = std::str::from_utf8(&host_bytes).is_err()
+                                || std::str::from_utf8(&shadow_bytes).is_err();
+                            if is_binary && overwrite_binaries {
+                                staged_actions.push(StagedCommitAction::CloneFromShadow {
+                                    rel: rel.clone(),
+                                    shadow_path: shadow_path.clone(),
+                                });
+                                continue;
+                            }
                             bail!(
-                                "3-Way Merge Conflict on newly added file '{}': file was also independently created on host",
-                                rel
+                                "3-Way Merge Conflict on newly added file '{}': file was also independently created on host{}",
+                                rel,
+                                if is_binary {
+                                    " (pass `overwrite_binaries: true` to overwrite binary artifact, or `paths` to commit source files first)"
+                                } else {
+                                    ""
+                                }
                             );
                         }
                     }
@@ -760,24 +820,38 @@ impl TransactionalWorkspace for CoWWorkspace {
                         if Self::sha256_bytes(&host_bytes) != Self::sha256_bytes(&base_bytes)
                             && Self::sha256_bytes(&host_bytes) != Self::sha256_bytes(&shadow_bytes)
                         {
-                            let base_str = String::from_utf8(base_bytes)
-                                .context("Binary file concurrent modification conflict")?;
-                            let their_str = String::from_utf8(host_bytes)
-                                .context("Binary file concurrent modification conflict")?;
-                            let our_str = String::from_utf8(shadow_bytes)
-                                .context("Binary file concurrent modification conflict")?;
-
-                            match Self::three_way_merge_lines(&base_str, &their_str, &our_str) {
-                                Ok(merged_str) => {
-                                    staged_actions.push(StagedCommitAction::WriteMerged {
-                                        rel: rel.clone(),
-                                        shadow_path: shadow_path.clone(),
-                                        merged_content: merged_str,
-                                    });
-                                    continue;
+                            match (
+                                std::str::from_utf8(&base_bytes),
+                                std::str::from_utf8(&host_bytes),
+                                std::str::from_utf8(&shadow_bytes),
+                            ) {
+                                (Ok(base_str), Ok(their_str), Ok(our_str)) => {
+                                    match Self::three_way_merge_lines(base_str, their_str, our_str) {
+                                        Ok(merged_str) => {
+                                            staged_actions.push(StagedCommitAction::WriteMerged {
+                                                rel: rel.clone(),
+                                                shadow_path: shadow_path.clone(),
+                                                merged_content: merged_str,
+                                            });
+                                            continue;
+                                        }
+                                        Err(conflict_err) => {
+                                            bail!("Conflict on '{}': {}", rel, conflict_err);
+                                        }
+                                    }
                                 }
-                                Err(conflict_err) => {
-                                    bail!("Conflict on '{}': {}", rel, conflict_err);
+                                _ => {
+                                    if overwrite_binaries {
+                                        staged_actions.push(StagedCommitAction::CloneFromShadow {
+                                            rel: rel.clone(),
+                                            shadow_path: shadow_path.clone(),
+                                        });
+                                        continue;
+                                    }
+                                    bail!(
+                                        "Binary file concurrent modification conflict on '{}': modified in both host and shadow workspace (pass `overwrite_binaries: true` to overwrite with shadow binary, or `paths` to commit specific source files first)",
+                                        rel
+                                    );
                                 }
                             }
                         }
@@ -816,6 +890,11 @@ impl TransactionalWorkspace for CoWWorkspace {
                         tokio::fs::create_dir_all(parent).await?;
                     }
                     Self::cow_clone_file(&shadow_path, &host_dst).await?;
+                    // Ensure host file mtime is bumped to `now` even when APFS `clonefile(2)`
+                    // preserves the older shadow edit timestamp, so Cargo/build systems detect changes.
+                    if let Ok(f) = std::fs::OpenOptions::new().write(true).open(&host_dst) {
+                        let _ = f.set_modified(std::time::SystemTime::now());
+                    }
                     Self::cow_clone_file(&shadow_path, &base_path).await?;
                     committed.push(rel);
                 }
@@ -1281,5 +1360,81 @@ mod tests {
         assert_eq!(bytes, b"{\"signal\": \"bullish\"}");
 
         assert!(store.fetch_artifact(&outsider, &meta.uri).await.is_err());
+    }
+
+    #[tokio::test]
+    async fn test_binary_fast_forward_and_overwrite_binaries_option() {
+        let temp = tempfile::tempdir().unwrap();
+        let host_dir = temp.path().join("shared_repo");
+        tokio::fs::create_dir_all(&host_dir).await.unwrap();
+        tokio::fs::write(host_dir.join("main.tex"), "line1\nline2\n")
+            .await
+            .unwrap();
+        // Simulated binary PDF artifact (invalid UTF-8 bytes)
+        tokio::fs::write(host_dir.join("main.pdf"), &[0xffu8, 0xd8, 0x00, 0x01])
+            .await
+            .unwrap();
+
+        let ws_a = CoWWorkspace::init(&host_dir, temp.path().join("cow_a"))
+            .await
+            .unwrap();
+        let ws_b = CoWWorkspace::init(&host_dir, temp.path().join("cow_b"))
+            .await
+            .unwrap();
+
+        // Agent A modifies main.tex AND regenerates main.pdf, then commits to host
+        tokio::fs::write(ws_a.shadow_root().join("main.tex"), "PEER_A\nline2\n")
+            .await
+            .unwrap();
+        tokio::fs::write(ws_a.shadow_root().join("main.pdf"), &[0xffu8, 0xd8, 0x00, 0x02])
+            .await
+            .unwrap();
+        ws_a.commit_to_host(None).await.unwrap();
+
+        // Case 1: Agent B ONLY modifies line 2 of main.tex (did NOT touch main.pdf).
+        // When Agent B commits, main.pdf is automatically fast-forwarded from host without conflict!
+        tokio::fs::write(ws_b.shadow_root().join("main.tex"), "line1\nPEER_B\n")
+            .await
+            .unwrap();
+        let committed_b = ws_b.commit_to_host(None).await.unwrap();
+        assert_eq!(committed_b, vec!["main.tex"]);
+        assert_eq!(
+            tokio::fs::read_to_string(host_dir.join("main.tex"))
+                .await
+                .unwrap(),
+            "PEER_A\nPEER_B\n"
+        );
+        assert_eq!(
+            tokio::fs::read(ws_b.shadow_root().join("main.pdf"))
+                .await
+                .unwrap(),
+            vec![0xffu8, 0xd8, 0x00, 0x02]
+        );
+
+        // Case 2: Both Host and Agent B modify main.pdf concurrently
+        tokio::fs::write(host_dir.join("main.pdf"), &[0xffu8, 0xd8, 0x00, 0x03])
+            .await
+            .unwrap();
+        tokio::fs::write(ws_b.shadow_root().join("main.pdf"), &[0xffu8, 0xd8, 0x00, 0x04])
+            .await
+            .unwrap();
+
+        let err = ws_b
+            .commit_to_host_with_options(None, false)
+            .await
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("main.pdf"));
+        assert!(err.contains("overwrite_binaries: true"));
+
+        let ok_committed = ws_b
+            .commit_to_host_with_options(None, true)
+            .await
+            .unwrap();
+        assert_eq!(ok_committed, vec!["main.pdf"]);
+        assert_eq!(
+            tokio::fs::read(host_dir.join("main.pdf")).await.unwrap(),
+            vec![0xffu8, 0xd8, 0x00, 0x04]
+        );
     }
 }

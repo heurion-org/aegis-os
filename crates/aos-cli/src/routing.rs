@@ -192,7 +192,7 @@ const GIT_HOST_SUBCOMMANDS: &[&str] = &[
     "remote", "config", "restore", "init", "clone", "submodule", "gc", "prune", "update-ref",
 ];
 
-fn host_boundary_reason(words: &[String]) -> Option<String> {
+fn host_boundary_reason(words: &[String], full_cmd: &str, host_root: &Path) -> Option<String> {
     let cmd = basename(words.first()?.as_str());
     let sub = words.get(1).map(|s| s.as_str()).unwrap_or("");
     let hit = match cmd {
@@ -221,7 +221,9 @@ fn host_boundary_reason(words: &[String]) -> Option<String> {
     };
     hit.then(|| {
         format!(
-            "[Aegis OS routing] `{}` crosses the host boundary (affects state outside your CoW shadow), so it needs the user's confirmation.",
+            "[Aegis OS Host Command Approval]\n  • What this does: Execute `{}` on your host workspace (`{}`).\n  • Why confirmation is required: `{}` crosses the sandbox boundary and affects host or remote state outside the isolated CoW shadow workspace.",
+            full_cmd,
+            host_root.display(),
             words.join(" ")
         )
     })
@@ -282,12 +284,13 @@ pub fn classify_run_command(cmd: &str, shadow_root: &Path, host_root: &Path) -> 
         if env.iter().any(|e| e == "AOS_HOST=1") {
             return Route::HostBoundary {
                 reason: format!(
-                    "[Aegis OS routing] Agent explicitly requested host execution (AOS_HOST=1): `{}`",
-                    trimmed
+                    "[Aegis OS Host Command Approval]\n  • What this does: Execute `{}` directly on your host workspace (`{}`).\n  • Why confirmation is required: Agent explicitly requested unsandboxed host execution via `AOS_HOST=1`.",
+                    trimmed,
+                    host_root.display()
                 ),
             };
         }
-        if let Some(reason) = host_boundary_reason(&words) {
+        if let Some(reason) = host_boundary_reason(&words, trimmed, host_root) {
             return Route::HostBoundary { reason };
         }
     }

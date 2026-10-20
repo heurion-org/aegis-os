@@ -1087,6 +1087,170 @@ fn resolve_effective_hook_workspace(
     canonical
 }
 
+fn format_lease_duration_en(ttl_secs: i64) -> String {
+    if ttl_secs <= 0 {
+        "One-shot approval (applies only to this single operation; ttl_secs=0)".to_string()
+    } else if ttl_secs < 60 {
+        format!(
+            "Session lease for {}s (auto-approves matching boundary operations for {} seconds)",
+            ttl_secs, ttl_secs
+        )
+    } else if ttl_secs % 3600 == 0 {
+        let hours = ttl_secs / 3600;
+        format!(
+            "Session lease for {} hour(s) ({}s; auto-approves matching boundary operations during lease)",
+            hours, ttl_secs
+        )
+    } else {
+        let mins = ttl_secs / 60;
+        format!(
+            "Session lease for {} minute(s) ({}s; auto-approves matching boundary operations during lease)",
+            mins, ttl_secs
+        )
+    }
+}
+
+fn summarize_file_list(files: &[String], max_items: usize) -> String {
+    if files.is_empty() {
+        "none detected".to_string()
+    } else if files.len() <= max_items {
+        files.join(", ")
+    } else {
+        let shown = files[..max_items].join(", ");
+        format!("{} (+{} more)", shown, files.len() - max_items)
+    }
+}
+
+async fn build_boundary_approval_prompt(
+    sub_tool: &str,
+    inner_args: &Value,
+    identity: &AgentIdentity,
+    effective_workspace: &Path,
+    kernel: &AegisRuntimeKernel,
+    changed_files: &[String],
+) -> String {
+    let host_dir = effective_workspace.display();
+
+    if sub_tool == "policy_approve_escalation" {
+        let esc_id = inner_args
+            .get("escalation_id")
+            .and_then(|v| v.as_str())
+            .unwrap_or("<unspecified>");
+        let ttl_secs = inner_args
+            .get("ttl_secs")
+            .and_then(|v| v.as_i64())
+            .unwrap_or(3600);
+        let scope_desc = format_lease_duration_en(ttl_secs);
+
+        let escalations = kernel
+            .policy
+            .list_escalations(&identity.org_id)
+            .await
+            .unwrap_or_default();
+        if let Some(esc) = escalations.iter().find(|e| e.escalation_id == esc_id) {
+            match esc.action.as_str() {
+                "workspace_commit" => {
+                    let file_summary = summarize_file_list(changed_files, 6);
+                    return format!(
+                        "[Aegis OS Host Commit Approval]\n  • What this does: Merge and write {} modified file(s) from agent `{}/{}`'s isolated CoW shadow workspace into your live host repository (`{}`).\n  • Files in shadow workspace ({}): {}\n  • Escalation details: {}\n  • Approval scope: {}\n  • Escalation ID: {}",
+                        changed_files.len(),
+                        identity.org_id,
+                        identity.agent_id,
+                        host_dir,
+                        changed_files.len(),
+                        file_summary,
+                        esc.reason,
+                        scope_desc,
+                        esc_id
+                    );
+                }
+                "egress_unlisted_domain" | "egress_http_request" => {
+                    return format!(
+                        "[Aegis OS Network Egress Approval]\n  • What this does: Allow agent `{}/{}` to send outbound HTTP request(s) to an unlisted external domain (`{}`).\n  • Escalation details: {}\n  • Approval scope: {}\n  • Escalation ID: {}",
+                        identity.org_id,
+                        identity.agent_id,
+                        esc.target_resource,
+                        esc.reason,
+                        scope_desc,
+                        esc_id
+                    );
+                }
+                "org_artifact_fetch" | "org_kv_get" => {
+                    return format!(
+                        "[Aegis OS Cross-Organization Read Approval]\n  • What this does: Allow agent `{}/{}` to read shared resource `{}` via `{}`.\n  • Escalation details: {}\n  • Approval scope: {}\n  • Escalation ID: {}",
+                        identity.org_id,
+                        identity.agent_id,
+                        esc.target_resource,
+                        esc.action,
+                        esc.reason,
+                        scope_desc,
+                        esc_id
+                    );
+                }
+                other => {
+                    return format!(
+                        "[Aegis OS Boundary Operation Approval]\n  • What this does: Authorize agent `{}/{}` to execute boundary action `{}` on `{}`.\n  • Escalation details: {}\n  • Approval scope: {}\n  • Escalation ID: {}",
+                        identity.org_id,
+                        identity.agent_id,
+                        other,
+                        esc.target_resource,
+                        esc.reason,
+                        scope_desc,
+                        esc_id
+                    );
+                }
+            }
+        }
+
+        let file_summary = summarize_file_list(changed_files, 6);
+        format!(
+            "[Aegis OS Boundary Approval (`policy_approve_escalation`)]\n  • What this does: Approve pending boundary escalation `{}` for agent `{}/{}` on host workspace `{}`.\n  • Pending shadow workspace changes ({}): {}\n  • Approval scope: {}",
+            esc_id,
+            identity.org_id,
+            identity.agent_id,
+            host_dir,
+            changed_files.len(),
+            file_summary,
+            scope_desc
+        )
+    } else {
+        let action_pattern = inner_args
+            .get("action_pattern")
+            .and_then(|v| v.as_str())
+            .unwrap_or("workspace_commit");
+        let resource_pattern = inner_args
+            .get("resource_pattern")
+            .and_then(|v| v.as_str())
+            .unwrap_or("*");
+        let ttl_secs = inner_args
+            .get("ttl_secs")
+            .and_then(|v| v.as_i64())
+            .unwrap_or(3600);
+        let scope_desc = format_lease_duration_en(ttl_secs);
+        let action_explain = if action_pattern == "workspace_commit" || action_pattern == "*" {
+            format!(
+                "Pre-authorize agent `{}/{}` to commit CoW shadow workspace changes into host repository `{}` without prompting on each commit",
+                identity.org_id, identity.agent_id, host_dir
+            )
+        } else {
+            format!(
+                "Pre-authorize agent `{}/{}` for boundary action `{}` on resource `{}`",
+                identity.org_id, identity.agent_id, action_pattern, resource_pattern
+            )
+        };
+        let file_summary = summarize_file_list(changed_files, 6);
+        format!(
+            "[Aegis OS Session Lease Grant (`policy_grant_lease`)]\n  • What this does: {}.\n  • Action / Resource pattern: action=`{}`, resource=`{}`\n  • Current uncommitted shadow files ({}): {}\n  • Lease duration: {}",
+            action_explain,
+            action_pattern,
+            resource_pattern,
+            changed_files.len(),
+            file_summary,
+            scope_desc
+        )
+    }
+}
+
 async fn handle_agy_hook(
     event: &str,
     _strict_cow: bool,
@@ -1273,11 +1437,29 @@ async fn handle_agy_hook(
                         }
                     }
                     if matches!(sub_tool, "policy_approve_escalation" | "policy_grant_lease") {
+                        let inner_args = tool_args
+                            .get("Arguments")
+                            .cloned()
+                            .unwrap_or_else(|| json!({}));
+                        let changed_files = env
+                            .workspace
+                            .changed_since_baseline()
+                            .await
+                            .unwrap_or_default();
+                        let reason = build_boundary_approval_prompt(
+                            sub_tool,
+                            &inner_args,
+                            &identity,
+                            &effective_workspace,
+                            &kernel,
+                            &changed_files,
+                        )
+                        .await;
                         println!(
                             "{}",
                             serde_json::to_string(&json!({
                                 "decision": "ask",
-                                "reason": format!("Aegis OS Boundary Lease / Escalation Approval (`{}`) requires explicit user confirmation.", sub_tool)
+                                "reason": reason
                             }))?
                         );
                         return Ok(());
@@ -1325,11 +1507,25 @@ async fn handle_agy_hook(
                     }
                 }
                 if matches!(short_name, "policy_approve_escalation" | "policy_grant_lease") {
+                    let changed_files = env
+                        .workspace
+                        .changed_since_baseline()
+                        .await
+                        .unwrap_or_default();
+                    let reason = build_boundary_approval_prompt(
+                        short_name,
+                        &tool_args,
+                        &identity,
+                        &effective_workspace,
+                        &kernel,
+                        &changed_files,
+                    )
+                    .await;
                     println!(
                         "{}",
                         serde_json::to_string(&json!({
                             "decision": "ask",
-                            "reason": format!("Aegis OS Boundary Lease / Escalation Approval (`{}`) requires explicit user confirmation.", short_name)
+                            "reason": reason
                         }))?
                     );
                     return Ok(());

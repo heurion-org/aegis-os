@@ -1,7 +1,7 @@
 //! Aegis OS Policy Kernel & Session Lease Manager (`aos-policy`)
 //!
-//! Implements the Cedar-aligned declarative permission model with dynamic Session Leases
-//! and persistent cross-process Escalation Queues (`leases.json` & `escalations.json`).
+//! Implements the Cedar-aligned declarative permission model with dynamic Session Leases,
+//! Google A2A cross-org IPC policies, and persistent Escalation Queues (`leases.json` & `escalations.json`).
 
 use aos_core::{
     EscalationStatus, LeaseGrant, PendingEscalation, PolicyContext, PolicyDecision, PolicyEngine,
@@ -313,11 +313,36 @@ impl PolicyEngine for AegisPolicyKernel {
 
             // 5. Yellow-Zone Boundary Crossing Actions -> Record Escalation & Return Ask:
             "workspace_commit" => {
+                let files_desc = ctx
+                    .metadata
+                    .get("paths")
+                    .and_then(|v| v.as_array())
+                    .map(|arr| {
+                        let names: Vec<&str> = arr.iter().filter_map(|x| x.as_str()).collect();
+                        if names.is_empty() {
+                            String::new()
+                        } else if names.len() <= 6 {
+                            format!(" ({} file(s): {})", names.len(), names.join(", "))
+                        } else {
+                            format!(
+                                " ({} file(s): {}, +{} more)",
+                                names.len(),
+                                names[..6].join(", "),
+                                names.len() - 6
+                            )
+                        }
+                    })
+                    .unwrap_or_default();
+                let host_label = ctx
+                    .metadata
+                    .get("host_root")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or(&ctx.target_resource);
                 self.record_escalation(
                     ctx,
                     format!(
-                        "Agent '{}' requests to commit Copy-on-Write workspace changes back to host directory '{}'",
-                        ctx.principal.agent_id, ctx.target_resource
+                        "Agent '{}' requests to commit Copy-on-Write workspace changes{} back to host directory '{}'",
+                        ctx.principal.agent_id, files_desc, host_label
                     ),
                     "action=workspace_commit, resource=*".to_string(),
                 )

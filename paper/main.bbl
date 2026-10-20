@@ -68,6 +68,12 @@ Adrienne~Porter Felt, Elizabeth Ha, Serge Egelman, Ariel Haney, Erika Chin, and
 \newblock In {\em Proceedings of the Eighth Symposium on Usable Privacy and
   Security (SOUPS)}, pages 1--14. ACM, 2012.
 
+\bibitem{google2025a2a}
+{Google}.
+\newblock {Agent2Agent} ({A2A}) protocol: An open protocol for interoperability
+  between autonomous {AI} agents.
+\newblock \url{https://google.github.io/A2A}, 2025.
+
 \bibitem{greshake2023not}
 Kai Greshake, Sahar Abdelnabi, Shailesh Mishra, Christoph Endres, Thorsten
   Holz, and Mario Fritz.
