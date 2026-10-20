@@ -11,7 +11,7 @@
 
 use aos_core::{
     AgentIdentity, ArtifactMeta, DiffChangeType, FileDiffEntry, OrgKvEntry, OrgSharedStorage,
-    SnapshotMeta, TransactionalWorkspace,
+    RefreshReport, SnapshotMeta, TransactionalWorkspace,
 };
 use anyhow::{bail, Context};
 use async_trait::async_trait;
@@ -89,6 +89,141 @@ impl CoWWorkspace {
         let bytes = serde_json::to_vec_pretty(&list)?;
         tokio::fs::write(&self.snapshots_index_file, bytes).await?;
         Ok(())
+    }
+
+    async fn clone_into(src: &Path, dst: &Path) -> anyhow::Result<()> {
+        if let Some(parent) = dst.parent() {
+            tokio::fs::create_dir_all(parent).await?;
+        }
+        Self::cow_clone_file(src, dst).await
+    }
+
+    /// Relative paths whose shadow content differs from this Agent's baseline, i.e. exactly the set a
+    /// `workspace_commit` would touch (unlike `diff()`, which compares against the live host tree and
+    /// therefore also reports files that *peers* changed on the host).
+    pub async fn changed_since_baseline(&self) -> anyhow::Result<Vec<String>> {
+        let base: BTreeMap<String, PathBuf> =
+            Self::collect_files(&self.baseline_root).await?.into_iter().collect();
+        let shadow: BTreeMap<String, PathBuf> =
+            Self::collect_files(&self.shadow_root).await?.into_iter().collect();
+        let mut out = Vec::new();
+        for (rel, sp) in &shadow {
+            match base.get(rel) {
+                None => out.push(rel.clone()),
+                Some(bp) => {
+                    if tokio::fs::read(sp).await? != tokio::fs::read(bp).await? {
+                        out.push(rel.clone());
+                    }
+                }
+            }
+        }
+        for rel in base.keys() {
+            if !shadow.contains_key(rel) {
+                out.push(rel.clone());
+            }
+        }
+        out.sort();
+        Ok(out)
+    }
+
+    /// Rebases this Agent's shadow onto the *current* host tree so long-lived identities never work on
+    /// stale code:
+    /// - host changed, agent did not touch the file  -> fast-forward shadow + baseline
+    /// - host changed, agent changed it too          -> 3-way merge host changes into the shadow
+    ///   (base = baseline, theirs = host, ours = shadow), then advance baseline to host
+    /// - overlapping edits / binary / delete-vs-modify -> left untouched and reported as conflicts
+    ///   (the eventual `workspace_commit` will surface them precisely)
+    pub async fn refresh_from_host(&self) -> anyhow::Result<RefreshReport> {
+        let host: BTreeMap<String, PathBuf> =
+            Self::collect_files(&self.host_source_root).await?.into_iter().collect();
+        let base: BTreeMap<String, PathBuf> =
+            Self::collect_files(&self.baseline_root).await?.into_iter().collect();
+        let shadow: BTreeMap<String, PathBuf> =
+            Self::collect_files(&self.shadow_root).await?.into_iter().collect();
+        let mut report = RefreshReport::default();
+
+        for (rel, host_path) in &host {
+            let host_bytes = tokio::fs::read(host_path).await?;
+            let shadow_dst = self.shadow_root.join(rel);
+            let base_dst = self.baseline_root.join(rel);
+            let shadow_bytes = match shadow.get(rel) {
+                Some(p) => Some(tokio::fs::read(p).await?),
+                None => None,
+            };
+            match base.get(rel) {
+                Some(base_path) => {
+                    let base_bytes = tokio::fs::read(base_path).await?;
+                    if base_bytes == host_bytes {
+                        continue; // host unchanged since our baseline
+                    }
+                    match shadow_bytes {
+                        Some(sb) if sb == base_bytes => {
+                            Self::clone_into(host_path, &shadow_dst).await?;
+                            Self::clone_into(host_path, &base_dst).await?;
+                            report.fast_forwarded.push(rel.clone());
+                        }
+                        Some(sb) if sb == host_bytes => {
+                            Self::clone_into(host_path, &base_dst).await?;
+                            report.merged.push(rel.clone());
+                        }
+                        Some(sb) => {
+                            let merged = match (
+                                std::str::from_utf8(&base_bytes),
+                                std::str::from_utf8(&host_bytes),
+                                std::str::from_utf8(&sb),
+                            ) {
+                                (Ok(b), Ok(h), Ok(s)) => Self::three_way_merge_lines(b, h, s).ok(),
+                                _ => None,
+                            };
+                            match merged {
+                                Some(m) => {
+                                    tokio::fs::write(&shadow_dst, m).await?;
+                                    Self::clone_into(host_path, &base_dst).await?;
+                                    report.merged.push(rel.clone());
+                                }
+                                None => report.conflicts.push(rel.clone()),
+                            }
+                        }
+                        None => report.conflicts.push(rel.clone()), // agent deleted, host modified
+                    }
+                }
+                None => match shadow_bytes {
+                    None => {
+                        Self::clone_into(host_path, &shadow_dst).await?;
+                        Self::clone_into(host_path, &base_dst).await?;
+                        report.added_from_host.push(rel.clone());
+                    }
+                    Some(sb) if sb == host_bytes => {
+                        Self::clone_into(host_path, &base_dst).await?;
+                        report.merged.push(rel.clone());
+                    }
+                    Some(_) => report.conflicts.push(rel.clone()), // both added, different content
+                },
+            }
+        }
+
+        for (rel, base_path) in &base {
+            if host.contains_key(rel) {
+                continue;
+            }
+            // Deleted on host since our baseline.
+            match shadow.get(rel) {
+                None => {
+                    let _ = tokio::fs::remove_file(base_path).await;
+                    report.removed_from_host.push(rel.clone());
+                }
+                Some(sp) => {
+                    if tokio::fs::read(sp).await? == tokio::fs::read(base_path).await? {
+                        let _ = tokio::fs::remove_file(sp).await;
+                        let _ = tokio::fs::remove_file(base_path).await;
+                        report.removed_from_host.push(rel.clone());
+                    } else {
+                        report.conflicts.push(rel.clone());
+                    }
+                }
+            }
+        }
+        Ok(report)
     }
 
     /// Clones a single file using macOS APFS `clonefile(2)` zero-copy syscall if on macOS,
@@ -551,6 +686,14 @@ impl TransactionalWorkspace for CoWWorkspace {
         Ok(())
     }
 
+    async fn changed_since_baseline(&self) -> anyhow::Result<Vec<String>> {
+        CoWWorkspace::changed_since_baseline(self).await
+    }
+
+    async fn refresh_from_host(&self) -> anyhow::Result<RefreshReport> {
+        CoWWorkspace::refresh_from_host(self).await
+    }
+
     async fn commit_to_host(&self, filter_paths: Option<Vec<String>>) -> anyhow::Result<Vec<String>> {
         // Compute diff relative to this Agent's own `baseline_root` so we only touch files this Agent actually changed!
         let base_files: BTreeMap<String, PathBuf> = Self::collect_files(&self.baseline_root)
@@ -562,9 +705,24 @@ impl TransactionalWorkspace for CoWWorkspace {
             .into_iter()
             .collect();
 
-        let mut committed = Vec::new();
+        enum StagedCommitAction {
+            CloneFromShadow {
+                rel: String,
+                shadow_path: PathBuf,
+            },
+            WriteMerged {
+                rel: String,
+                shadow_path: PathBuf,
+                merged_content: String,
+            },
+            DeleteFile {
+                rel: String,
+            },
+        }
 
-        // 1. Handle Added & Modified files in this Agent's shadow workspace
+        let mut staged_actions = Vec::new();
+
+        // Phase 1: Validate all Added & Modified files and compute 3-Way Merges before mutating any host file
         for (rel, shadow_path) in &shadow_files {
             if let Some(ref allow_list) = filter_paths {
                 if !allow_list.iter().any(|p| p == rel) {
@@ -574,11 +732,9 @@ impl TransactionalWorkspace for CoWWorkspace {
 
             let shadow_bytes = tokio::fs::read(shadow_path).await?;
             let host_dst = self.host_source_root.join(rel);
-            let base_path = self.baseline_root.join(rel);
 
             match base_files.get(rel) {
                 None => {
-                    // File was newly added by this Agent
                     if host_dst.exists() {
                         let host_bytes = tokio::fs::read(&host_dst).await?;
                         if Self::sha256_bytes(&host_bytes) != Self::sha256_bytes(&shadow_bytes) {
@@ -588,28 +744,20 @@ impl TransactionalWorkspace for CoWWorkspace {
                             );
                         }
                     }
-                    if let Some(parent) = host_dst.parent() {
-                        tokio::fs::create_dir_all(parent).await?;
-                    }
-                    if let Some(parent) = base_path.parent() {
-                        tokio::fs::create_dir_all(parent).await?;
-                    }
-                    Self::cow_clone_file(shadow_path, &host_dst).await?;
-                    Self::cow_clone_file(shadow_path, &base_path).await?;
-                    committed.push(rel.clone());
+                    staged_actions.push(StagedCommitAction::CloneFromShadow {
+                        rel: rel.clone(),
+                        shadow_path: shadow_path.clone(),
+                    });
                 }
                 Some(existing_base_path) => {
                     let base_bytes = tokio::fs::read(existing_base_path).await?;
-                    // If this Agent didn't modify the file relative to its baseline, skip it!
                     if Self::sha256_bytes(&base_bytes) == Self::sha256_bytes(&shadow_bytes) {
                         continue;
                     }
 
-                    // Check if host file was concurrently modified by another Agent since `baseline`
                     if host_dst.exists() {
                         let host_bytes = tokio::fs::read(&host_dst).await?;
                         if Self::sha256_bytes(&host_bytes) != Self::sha256_bytes(&base_bytes) {
-                            // Perform 3-Way Merge!
                             let base_str = String::from_utf8(base_bytes)
                                 .context("Binary file concurrent modification conflict")?;
                             let their_str = String::from_utf8(host_bytes)
@@ -619,10 +767,11 @@ impl TransactionalWorkspace for CoWWorkspace {
 
                             match Self::three_way_merge_lines(&base_str, &their_str, &our_str) {
                                 Ok(merged_str) => {
-                                    tokio::fs::write(&host_dst, &merged_str).await?;
-                                    tokio::fs::write(&base_path, &merged_str).await?;
-                                    tokio::fs::write(shadow_path, &merged_str).await?;
-                                    committed.push(rel.clone());
+                                    staged_actions.push(StagedCommitAction::WriteMerged {
+                                        rel: rel.clone(),
+                                        shadow_path: shadow_path.clone(),
+                                        merged_content: merged_str,
+                                    });
                                     continue;
                                 }
                                 Err(conflict_err) => {
@@ -632,17 +781,14 @@ impl TransactionalWorkspace for CoWWorkspace {
                         }
                     }
 
-                    if let Some(parent) = host_dst.parent() {
-                        tokio::fs::create_dir_all(parent).await?;
-                    }
-                    Self::cow_clone_file(shadow_path, &host_dst).await?;
-                    Self::cow_clone_file(shadow_path, &base_path).await?;
-                    committed.push(rel.clone());
+                    staged_actions.push(StagedCommitAction::CloneFromShadow {
+                        rel: rel.clone(),
+                        shadow_path: shadow_path.clone(),
+                    });
                 }
             }
         }
 
-        // 2. Handle files explicitly Deleted by this Agent relative to its baseline
         for (rel, _) in &base_files {
             if !shadow_files.contains_key(rel) {
                 if let Some(ref allow_list) = filter_paths {
@@ -650,15 +796,56 @@ impl TransactionalWorkspace for CoWWorkspace {
                         continue;
                     }
                 }
-                let host_dst = self.host_source_root.join(rel);
-                let base_path = self.baseline_root.join(rel);
-                if host_dst.exists() {
-                    tokio::fs::remove_file(&host_dst).await?;
+                staged_actions.push(StagedCommitAction::DeleteFile { rel: rel.clone() });
+            }
+        }
+
+        // Phase 2: All conflicts cleared; apply staged actions atomically across the commit batch
+        let mut committed = Vec::new();
+        for action in staged_actions {
+            match action {
+                StagedCommitAction::CloneFromShadow { rel, shadow_path } => {
+                    let host_dst = self.host_source_root.join(&rel);
+                    let base_path = self.baseline_root.join(&rel);
+                    if let Some(parent) = host_dst.parent() {
+                        tokio::fs::create_dir_all(parent).await?;
+                    }
+                    if let Some(parent) = base_path.parent() {
+                        tokio::fs::create_dir_all(parent).await?;
+                    }
+                    Self::cow_clone_file(&shadow_path, &host_dst).await?;
+                    Self::cow_clone_file(&shadow_path, &base_path).await?;
+                    committed.push(rel);
                 }
-                if base_path.exists() {
-                    tokio::fs::remove_file(&base_path).await?;
+                StagedCommitAction::WriteMerged {
+                    rel,
+                    shadow_path,
+                    merged_content,
+                } => {
+                    let host_dst = self.host_source_root.join(&rel);
+                    let base_path = self.baseline_root.join(&rel);
+                    if let Some(parent) = host_dst.parent() {
+                        tokio::fs::create_dir_all(parent).await?;
+                    }
+                    if let Some(parent) = base_path.parent() {
+                        tokio::fs::create_dir_all(parent).await?;
+                    }
+                    tokio::fs::write(&host_dst, &merged_content).await?;
+                    tokio::fs::write(&base_path, &merged_content).await?;
+                    tokio::fs::write(&shadow_path, &merged_content).await?;
+                    committed.push(rel);
                 }
-                committed.push(rel.clone());
+                StagedCommitAction::DeleteFile { rel } => {
+                    let host_dst = self.host_source_root.join(&rel);
+                    let base_path = self.baseline_root.join(&rel);
+                    if host_dst.exists() {
+                        tokio::fs::remove_file(&host_dst).await?;
+                    }
+                    if base_path.exists() {
+                        tokio::fs::remove_file(&base_path).await?;
+                    }
+                    committed.push(rel);
+                }
             }
         }
 
@@ -900,6 +1087,46 @@ impl OrgSharedStorage for OrgCasAndKvStore {
 mod tests {
     use super::*;
     use serde_json::json;
+
+    #[tokio::test]
+    async fn test_refresh_from_host_fast_forwards_merges_and_reports_conflicts() {
+        let host = tempfile::tempdir().unwrap();
+        let rt = tempfile::tempdir().unwrap();
+        let h = host.path();
+        std::fs::write(h.join("untouched.rs"), "a\nb\nc\n").unwrap();
+        std::fs::write(h.join("both.rs"), "l1\nl2\nl3\nl4\nl5\n").unwrap();
+        std::fs::write(h.join("clash.rs"), "x = 1\n").unwrap();
+        std::fs::write(h.join("gone.rs"), "bye\n").unwrap();
+        let ws = CoWWorkspace::init(h, rt.path().join("cow")).await.unwrap();
+
+        // Agent edits (in its shadow).
+        std::fs::write(ws.shadow_root().join("both.rs"), "l1\nl2\nl3\nl4\nAGENT\n").unwrap();
+        std::fs::write(ws.shadow_root().join("clash.rs"), "x = 2\n").unwrap();
+        // Peer commits on the host meanwhile.
+        std::fs::write(h.join("untouched.rs"), "a\nB\nc\n").unwrap();
+        std::fs::write(h.join("both.rs"), "PEER\nl2\nl3\nl4\nl5\n").unwrap();
+        std::fs::write(h.join("clash.rs"), "x = 3\n").unwrap();
+        std::fs::write(h.join("new.rs"), "fresh\n").unwrap();
+        std::fs::remove_file(h.join("gone.rs")).unwrap();
+
+        assert_eq!(ws.changed_since_baseline().await.unwrap(), vec!["both.rs", "clash.rs"]);
+        let r = ws.refresh_from_host().await.unwrap();
+        assert_eq!(r.fast_forwarded, vec!["untouched.rs"]);
+        assert_eq!(r.merged, vec!["both.rs"]);
+        assert_eq!(r.added_from_host, vec!["new.rs"]);
+        assert_eq!(r.removed_from_host, vec!["gone.rs"]);
+        assert_eq!(r.conflicts, vec!["clash.rs"]);
+
+        let s = |p: &str| std::fs::read_to_string(ws.shadow_root().join(p)).unwrap();
+        assert_eq!(s("untouched.rs"), "a\nB\nc\n");
+        assert_eq!(s("both.rs"), "PEER\nl2\nl3\nl4\nAGENT\n");
+        assert_eq!(s("clash.rs"), "x = 2\n", "conflicting agent edit preserved");
+        assert!(!ws.shadow_root().join("gone.rs").exists());
+        // After the rebase only the agent's genuine edits remain to be committed.
+        assert_eq!(ws.changed_since_baseline().await.unwrap(), vec!["both.rs", "clash.rs"]);
+        // Idempotent.
+        assert_eq!(ws.refresh_from_host().await.unwrap().total_updates(), 0);
+    }
 
     #[tokio::test]
     async fn test_cow_workspace_snapshot_rollback_and_commit() {

@@ -86,27 +86,11 @@ impl AegisEgressGateway {
         identity: &AgentIdentity,
         req: &OutboundRequestSpec,
     ) -> anyhow::Result<EgressVerdict> {
-        let is_domain_allowed = {
-            let map = self.org_allowed_domains.read().await;
-            map.get(&identity.org_id)
-                .map(|set| set.contains(&req.target_domain) || set.contains("*"))
-                .unwrap_or(false)
-        };
-
-        if !is_domain_allowed {
-            return Ok(EgressVerdict::RequiresEscalation {
-                domain: req.target_domain.clone(),
-                reason: format!(
-                    "Domain '{}' is not in Organization '{}' egress allowlist",
-                    req.target_domain, identity.org_id
-                ),
-            });
-        }
-
         let mut out_headers = req.headers.clone();
         let mut secrets_injected = Vec::new();
         let vault = self.vault.read().await;
 
+        // 1. First inspect all headers for `$AOS_SECRET_*` placeholders and enforce per-secret domain bindings
         for (_header_name, header_val) in out_headers.iter_mut() {
             for (vault_key, secret_entry) in vault.iter() {
                 if !vault_key.starts_with(&format!("{}::", identity.org_id)) {
@@ -116,7 +100,7 @@ impl AegisEgressGateway {
                     if !secret_entry
                         .allowed_domains
                         .iter()
-                        .any(|d| d == &req.target_domain)
+                        .any(|d| d.eq_ignore_ascii_case(&req.target_domain))
                     {
                         return Ok(EgressVerdict::BlockedSecretExfiltration {
                             placeholder: secret_entry.placeholder.clone(),
@@ -128,6 +112,27 @@ impl AegisEgressGateway {
                     secrets_injected.push(secret_entry.placeholder.clone());
                 }
             }
+        }
+
+        // 2. Next enforce Organization-level outbound domain allowlist
+        let is_domain_allowed = {
+            let map = self.org_allowed_domains.read().await;
+            map.get(&identity.org_id)
+                .map(|set| {
+                    set.iter().any(|d| d.eq_ignore_ascii_case(&req.target_domain))
+                        || set.contains("*")
+                })
+                .unwrap_or(false)
+        };
+
+        if !is_domain_allowed {
+            return Ok(EgressVerdict::RequiresEscalation {
+                domain: req.target_domain.clone(),
+                reason: format!(
+                    "Domain '{}' is not in Organization '{}' egress allowlist",
+                    req.target_domain, identity.org_id
+                ),
+            });
         }
 
         for val in out_headers.values() {

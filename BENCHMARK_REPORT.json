@@ -1,5 +1,5 @@
 {
-  "timestamp_utc": "2026-10-20T15:54:31.735078+00:00",
+  "timestamp_utc": "2026-10-20T18:51:49.436427+00:00",
   "host_os_arch": "macos-aarch64",
   "exp1_authorization_friction": [
     {
@@ -10,7 +10,7 @@
       "ipr_percent": 57.333333333333336,
       "prompt_reduction_percent": 0.0,
       "max_autonomous_streak": 4,
-      "total_execution_ms": 523.189667
+      "total_execution_ms": 457.09783300000004
     },
     {
       "mode": "Host-Static-Allowlist",
@@ -20,7 +20,7 @@
       "ipr_percent": 45.33333333333333,
       "prompt_reduction_percent": 20.93023255813954,
       "max_autonomous_streak": 7,
-      "total_execution_ms": 441.931334
+      "total_execution_ms": 496.7185
     },
     {
       "mode": "Aegis-OS (Per-Task Commit Gate)",
@@ -30,7 +30,7 @@
       "ipr_percent": 3.3333333333333335,
       "prompt_reduction_percent": 94.18604651162791,
       "max_autonomous_streak": 29,
-      "total_execution_ms": 348.65625
+      "total_execution_ms": 483.595958
     },
     {
       "mode": "Aegis-OS (With 1h Session Lease)",
@@ -40,7 +40,7 @@
       "ipr_percent": 0.06666666666666667,
       "prompt_reduction_percent": 99.88372093023256,
       "max_autonomous_streak": 1470,
-      "total_execution_ms": 418.53950000000003
+      "total_execution_ms": 469.204875
     }
   ],
   "exp2_live_redteam_security": [
@@ -65,24 +65,24 @@
       "empirical_evidence": "Kernel Seatbelt regexes `(deny file-read* /.ssh|/.aws|/.gnupg|/.kube|/.npmrc)` blocked all 10 reads"
     },
     {
-      "category": "C. Live TCP Egress Secret Exfiltration",
+      "category": "C. Sandbox-to-Proxy & Direct `--noproxy` Egress Exfil",
       "attacks_executed": 10,
       "host_yolo_compromised": 10,
       "host_yolo_asr_percent": 100.0,
       "aegis_os_compromised": 0,
       "aegis_os_blocked": 10,
       "aegis_os_asr_percent": 0.0,
-      "empirical_evidence": "Live TCP Proxy (127.0.0.1:51691) returned `HTTP/1.1 403 Forbidden` on all 10 exfil domains"
+      "empirical_evidence": "Identity-pinned Proxy (127.0.0.1:65393) returned `403` & Seatbelt blocked all `--noproxy` sockets"
     },
     {
-      "category": "D. Cross-Tenant IPC & CAS Access",
+      "category": "D. Cross-Tenant IPC & CAS Access via MCP Gateway",
       "attacks_executed": 10,
       "host_yolo_compromised": 10,
       "host_yolo_asr_percent": 100.0,
       "aegis_os_compromised": 0,
       "aegis_os_blocked": 10,
       "aegis_os_asr_percent": 0.0,
-      "empirical_evidence": "Cedar Policy Kernel rejected all 10 cross-org requests (`principal.org_id != target_org_id`)"
+      "empirical_evidence": "MCP Gateway + Policy Engine rejected all 10 cross-org calls (`principal.org_id != target_org_id`)"
     }
   ],
   "exp3_cow_and_storage": [
@@ -91,20 +91,20 @@
       "file_count": 100,
       "logical_size_mb": 1.953125,
       "full_copy_ms": {
-        "mean": 9.3062832,
-        "std_dev": 1.259851623555631,
-        "p50": 8.706833000000001,
-        "p95": 11.7905,
-        "p99": 11.7905
+        "mean": 9.3347084,
+        "std_dev": 0.277236258220746,
+        "p50": 9.301250000000001,
+        "p95": 9.72225,
+        "p99": 9.72225
       },
       "aegis_cow_ms": {
-        "mean": 0.6768252,
-        "std_dev": 0.1528034559967804,
-        "p50": 0.608917,
-        "p95": 0.9808340000000001,
-        "p99": 0.9808340000000001
+        "mean": 0.7061080000000001,
+        "std_dev": 0.04873451195610768,
+        "p50": 0.693375,
+        "p95": 0.789958,
+        "p99": 0.789958
       },
-      "speedup_x": 13.749906475113514,
+      "speedup_x": 13.219944257818916,
       "logical_10_agents_mb": 19.53125,
       "aegis_10_agents_delta_mb": 1.171875,
       "storage_saving_percent": 94.0
@@ -114,20 +114,20 @@
       "file_count": 300,
       "logical_size_mb": 17.578125,
       "full_copy_ms": {
-        "mean": 28.229266799999998,
-        "std_dev": 0.2665725203207556,
-        "p50": 28.252334,
-        "p95": 28.610291999999998,
-        "p99": 28.610291999999998
+        "mean": 32.0765582,
+        "std_dev": 5.819321294242736,
+        "p50": 29.321291,
+        "p95": 43.700958,
+        "p99": 43.700958
       },
       "aegis_cow_ms": {
-        "mean": 1.6404001999999998,
-        "std_dev": 0.09636757947235154,
-        "p50": 1.657167,
-        "p95": 1.7911249999999999,
-        "p99": 1.7911249999999999
+        "mean": 1.8515168000000002,
+        "std_dev": 0.09449131351060797,
+        "p50": 1.8344170000000002,
+        "p95": 1.96225,
+        "p99": 1.96225
       },
-      "speedup_x": 17.208768201808315,
+      "speedup_x": 17.324475910777583,
       "logical_10_agents_mb": 175.78125,
       "aegis_10_agents_delta_mb": 7.03125,
       "storage_saving_percent": 96.0
@@ -137,20 +137,20 @@
       "file_count": 1000,
       "logical_size_mb": 78.125,
       "full_copy_ms": {
-        "mean": 98.3308752,
-        "std_dev": 3.749592881505797,
-        "p50": 96.76174999999999,
-        "p95": 105.767209,
-        "p99": 105.767209
+        "mean": 113.1284752,
+        "std_dev": 16.414138422974435,
+        "p50": 101.643542,
+        "p95": 138.660334,
+        "p99": 138.660334
       },
       "aegis_cow_ms": {
-        "mean": 5.7527748,
-        "std_dev": 1.5525458945727046,
-        "p50": 5.030792,
-        "p95": 8.843833,
-        "p99": 8.843833
+        "mean": 6.2769417999999995,
+        "std_dev": 0.6522259026332518,
+        "p50": 6.298125,
+        "p95": 7.152458,
+        "p99": 7.152458
       },
-      "speedup_x": 17.09277324744226,
+      "speedup_x": 18.02286508375783,
       "logical_10_agents_mb": 781.25,
       "aegis_10_agents_delta_mb": 19.53125,
       "storage_saving_percent": 97.5
@@ -161,37 +161,61 @@
       "operation": "PolicyKernel::evaluate (In-Process)",
       "samples_count": 2000,
       "stats_us": {
-        "mean": 0.1270805,
-        "std_dev": 0.11569569144851508,
-        "p50": 0.125,
-        "p95": 0.166,
-        "p99": 0.167
+        "mean": 0.31432049999999195,
+        "std_dev": 0.14038790111597937,
+        "p50": 0.29200000000000004,
+        "p95": 0.375,
+        "p99": 0.5
       },
-      "throughput_ops_sec": 5814663.418208037
+      "throughput_ops_sec": 2959674.4358120607
     },
     {
       "operation": "IpcBus::send + recv_inbox (In-Process)",
       "samples_count": 1000,
       "stats_us": {
-        "mean": 1.135412000000002,
-        "std_dev": 1.5581329475548613,
-        "p50": 0.9590000000000001,
-        "p95": 1.375,
-        "p99": 4.875
+        "mean": 1.0552980000000063,
+        "std_dev": 1.6239586488565527,
+        "p50": 0.834,
+        "p95": 1.7910000000000001,
+        "p99": 4.75
       },
-      "throughput_ops_sec": 849196.3206021821
+      "throughput_ops_sec": 924748.5839787307
     },
     {
       "operation": "HTTP Daemon `POST /mcp` (`fs_read` RPC)",
       "samples_count": 200,
       "stats_us": {
-        "mean": 167.39688,
-        "std_dev": 35.95585922872099,
-        "p50": 172.083,
-        "p95": 197.167,
-        "p99": 292.209
+        "mean": 177.11147499999998,
+        "std_dev": 45.432111808712726,
+        "p50": 183.083,
+        "p95": 258.792,
+        "p99": 409.0
       },
-      "throughput_ops_sec": 5803.542877213166
+      "throughput_ops_sec": 5503.116662606284
+    },
+    {
+      "operation": "CoWWorkspace::commit_to_host (3-Way Merge)",
+      "samples_count": 100,
+      "stats_us": {
+        "mean": 424.01545999999985,
+        "std_dev": 48.42147200084277,
+        "p50": 413.083,
+        "p95": 540.2080000000001,
+        "p99": 646.125
+      },
+      "throughput_ops_sec": 2110.0181170375567
+    },
+    {
+      "operation": "NativeOsSandbox::exec (`sandbox-exec` Spawn)",
+      "samples_count": 30,
+      "stats_us": {
+        "mean": 6678.974966666669,
+        "std_dev": 399.90477903808426,
+        "p50": 6557.625,
+        "p95": 7533.125,
+        "p99": 7811.3330000000005
+      },
+      "throughput_ops_sec": 149.72279423538495
     }
   ],
   "exp4_live_multi_agent_cargo": [
@@ -224,58 +248,58 @@
     {
       "corrupted_files": 10,
       "sequential_rewrite_ms": {
-        "mean": 0.7614750000000001,
-        "std_dev": 0.02869997338674722,
-        "p50": 0.776666,
-        "p95": 0.794875,
-        "p99": 0.794875
+        "mean": 0.9002915999999999,
+        "std_dev": 0.062475917182863334,
+        "p50": 0.883958,
+        "p95": 1.003,
+        "p99": 1.003
       },
       "aegis_cow_rollback_ms": {
-        "mean": 0.6179086,
-        "std_dev": 0.014568894722661718,
-        "p50": 0.615459,
-        "p95": 0.6440830000000001,
-        "p99": 0.6440830000000001
+        "mean": 0.75075,
+        "std_dev": 0.04008775831597473,
+        "p50": 0.7509170000000001,
+        "p95": 0.798166,
+        "p99": 0.798166
       },
-      "kernel_speedup_x": 1.2323424532366114,
+      "kernel_speedup_x": 1.1991896103896102,
       "cargo_check_verified": true
     },
     {
       "corrupted_files": 50,
       "sequential_rewrite_ms": {
-        "mean": 3.9868916000000008,
-        "std_dev": 0.06063814033626043,
-        "p50": 3.9963330000000004,
-        "p95": 4.080542,
-        "p99": 4.080542
+        "mean": 4.8161667999999995,
+        "std_dev": 0.315573886171464,
+        "p50": 4.7993749999999995,
+        "p95": 5.2155,
+        "p99": 5.2155
       },
       "aegis_cow_rollback_ms": {
-        "mean": 1.8056002,
-        "std_dev": 0.06839882933618084,
-        "p50": 1.7882079999999998,
-        "p95": 1.9304999999999999,
-        "p99": 1.9304999999999999
+        "mean": 2.3308999999999997,
+        "std_dev": 0.137534062023922,
+        "p50": 2.325625,
+        "p95": 2.547625,
+        "p99": 2.547625
       },
-      "kernel_speedup_x": 2.2080699813834763,
+      "kernel_speedup_x": 2.066226264533013,
       "cargo_check_verified": true
     },
     {
       "corrupted_files": 200,
       "sequential_rewrite_ms": {
-        "mean": 15.9265166,
-        "std_dev": 0.2249846780512828,
-        "p50": 15.938708,
-        "p95": 16.306082999999997,
-        "p99": 16.306082999999997
+        "mean": 20.631875200000003,
+        "std_dev": 3.1396573156547767,
+        "p50": 19.69875,
+        "p95": 26.545917,
+        "p99": 26.545917
       },
       "aegis_cow_rollback_ms": {
-        "mean": 6.509433400000001,
-        "std_dev": 0.18580853318252114,
-        "p50": 6.475417,
-        "p95": 6.770792,
-        "p99": 6.770792
+        "mean": 8.6783332,
+        "std_dev": 1.0196567958905385,
+        "p50": 8.654292,
+        "p95": 10.299249999999999,
+        "p99": 10.299249999999999
       },
-      "kernel_speedup_x": 2.4466824716264854,
+      "kernel_speedup_x": 2.3774006741294516,
       "cargo_check_verified": true
     }
   ]

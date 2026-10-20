@@ -11,7 +11,15 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 cd "$SCRIPT_DIR"
 
 echo "[1/5] Compiling main.tex with Tectonic to generate fresh PDF and precompiled main.bbl..."
-/opt/homebrew/bin/tectonic --keep-intermediates main.tex
+if [ ! -d "$HOME/Library/Caches/TectonicProject.Tectonic" ] && [ -d "/Users/huizhao/Library/Caches/TectonicProject.Tectonic" ]; then
+  mkdir -p "$HOME/Library/Caches"
+  cp -cR /Users/huizhao/Library/Caches/TectonicProject.Tectonic "$HOME/Library/Caches/"
+fi
+TECTONIC_CACHE_FLAG=""
+if [ -d "$HOME/Library/Caches/TectonicProject.Tectonic" ]; then
+  TECTONIC_CACHE_FLAG="-C"
+fi
+/opt/homebrew/bin/tectonic $TECTONIC_CACHE_FLAG --keep-intermediates --keep-logs main.tex
 cp main.pdf aegis_os_arxiv_preprint.pdf
 
 echo "[2/5] Creating clean working deep copy (tmp_arxiv/)..."
@@ -44,14 +52,17 @@ for line in lines:
 
 content = "\n".join(cleaned) + "\n"
 if "get arXiv to do 4 passes" not in content:
-    content += "\\typeout{get arXiv to do 4 passes: Label(s) may have changed. Rerun}\n"
+    content = content.replace(
+        "\\end{document}",
+        "\\typeout{get arXiv to do 4 passes: Label(s) may have changed. Rerun}\n\\end{document}",
+    )
 tex_path.write_text(content, encoding="utf-8")
 PY
 
 echo "[4/5] Verifying clean compilation inside isolated tmp_arxiv/ (without .bib)..."
 (
   cd tmp_arxiv
-  /opt/homebrew/bin/tectonic main.tex >/dev/null
+  /opt/homebrew/bin/tectonic $TECTONIC_CACHE_FLAG main.tex >/dev/null
   # Delete generated PDF and any intermediate files so only main.tex and main.bbl remain
   rm -f main.pdf *.aux *.log *.out *.blg *.synctex* .DS_Store
 )

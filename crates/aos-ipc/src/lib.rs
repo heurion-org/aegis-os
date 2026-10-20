@@ -5,7 +5,7 @@
 //! and developer CLI commands share peer discovery and mailboxes seamlessly.
 
 use aos_core::{
-    AgentIdentity, IpcBus, IpcEnvelope, IpcKind, MessageDeliveryStatus, PeerInfo,
+    AgentIdentity, IpcBus, IpcEnvelope, IpcKind, MessageDeliveryStatus, PeerInfo, PeerLiveness,
 };
 use anyhow::{bail, Context};
 use async_trait::async_trait;
@@ -129,6 +129,45 @@ impl AegisIpcBus {
             let _ = tx.send(env);
         }
     }
+
+    async fn refresh_and_prune_peers(
+        &self,
+        filter_org: Option<&str>,
+    ) -> anyhow::Result<Vec<PeerInfo>> {
+        self.reload_from_disk().await;
+        let now_ms = Utc::now().timestamp_millis();
+        let mut dirty = false;
+        let mut list = Vec::new();
+        {
+            let mut peers = self.peers.write().await;
+            for (org, org_map) in peers.iter_mut() {
+                let mut dead_agents = Vec::new();
+                for (agent_id, p) in org_map.iter_mut() {
+                    if let Some(pid) = p.pid {
+                        if !aos_core::session::is_pid_alive(pid, p.start_time) {
+                            dead_agents.push(agent_id.clone());
+                            dirty = true;
+                            continue;
+                        }
+                    }
+                    let lv = PeerLiveness::classify(p.last_seen_ms, now_ms);
+                    p.liveness = Some(lv);
+                    p.online = lv != PeerLiveness::Gone;
+                    if filter_org.map_or(true, |fo| fo == org) {
+                        list.push(p.clone());
+                    }
+                }
+                for dead in dead_agents {
+                    org_map.remove(&dead);
+                }
+            }
+        }
+        if dirty {
+            let _ = self.flush_to_disk().await;
+        }
+        list.sort_by(|a, b| (&a.org_id, &a.agent_id).cmp(&(&b.org_id, &b.agent_id)));
+        Ok(list)
+    }
 }
 
 #[async_trait]
@@ -139,6 +178,22 @@ impl IpcBus for AegisIpcBus {
         subscribed_topics: Vec<String>,
     ) -> anyhow::Result<PeerInfo> {
         self.reload_from_disk().await;
+        let now_ms = Utc::now().timestamp_millis();
+        let existing = self
+            .peers
+            .read()
+            .await
+            .get(&identity.org_id)
+            .and_then(|m| m.get(&identity.agent_id))
+            .cloned();
+
+        let inferred_client = identity
+            .agent_id
+            .split('-')
+            .next()
+            .filter(|s| matches!(*s, "agy" | "claude" | "codex"))
+            .map(|s| s.to_string());
+
         let info = PeerInfo {
             org_id: identity.org_id.clone(),
             agent_id: identity.agent_id.clone(),
@@ -146,7 +201,12 @@ impl IpcBus for AegisIpcBus {
             capabilities: identity.capabilities.clone(),
             subscribed_topics,
             online: true,
-            last_seen_ms: Utc::now().timestamp_millis(),
+            last_seen_ms: now_ms,
+            client: existing.as_ref().and_then(|e| e.client.clone()).or(inferred_client),
+            pid: existing.as_ref().and_then(|e| e.pid),
+            start_time: existing.as_ref().and_then(|e| e.start_time),
+            workspace_root: existing.as_ref().and_then(|e| e.workspace_root.clone()),
+            liveness: Some(PeerLiveness::Active),
         };
 
         self.peers
@@ -171,14 +231,60 @@ impl IpcBus for AegisIpcBus {
     }
 
     async fn list_peers(&self, org_id: &str) -> anyhow::Result<Vec<PeerInfo>> {
+        self.refresh_and_prune_peers(Some(org_id)).await
+    }
+
+    async fn list_all_peers(&self) -> anyhow::Result<Vec<PeerInfo>> {
+        self.refresh_and_prune_peers(None).await
+    }
+
+    async fn update_peer_metadata(
+        &self,
+        identity: &AgentIdentity,
+        client: Option<String>,
+        pid: Option<u32>,
+        start_time: Option<u64>,
+        workspace_root: Option<String>,
+    ) -> anyhow::Result<()> {
         self.reload_from_disk().await;
-        let peers = self.peers.read().await;
-        let mut list: Vec<PeerInfo> = peers
-            .get(org_id)
-            .map(|m| m.values().cloned().collect())
-            .unwrap_or_default();
-        list.sort_by(|a, b| a.agent_id.cmp(&b.agent_id));
-        Ok(list)
+        let now_ms = Utc::now().timestamp_millis();
+        {
+            let mut peers = self.peers.write().await;
+            let entry = peers
+                .entry(identity.org_id.clone())
+                .or_default()
+                .entry(identity.agent_id.clone())
+                .or_insert_with(|| PeerInfo {
+                    org_id: identity.org_id.clone(),
+                    agent_id: identity.agent_id.clone(),
+                    role: identity.role.clone(),
+                    capabilities: identity.capabilities.clone(),
+                    subscribed_topics: vec!["*".to_string()],
+                    online: true,
+                    last_seen_ms: now_ms,
+                    client: None,
+                    pid: None,
+                    start_time: None,
+                    workspace_root: None,
+                    liveness: Some(PeerLiveness::Active),
+                });
+            entry.last_seen_ms = now_ms;
+            entry.online = true;
+            entry.liveness = Some(PeerLiveness::Active);
+            if let Some(c) = client {
+                entry.client = Some(c);
+            }
+            if let Some(p) = pid {
+                entry.pid = Some(p);
+            }
+            if let Some(st) = start_time {
+                entry.start_time = Some(st);
+            }
+            if let Some(ws) = workspace_root {
+                entry.workspace_root = Some(ws);
+            }
+        }
+        self.flush_to_disk().await
     }
 
     async fn send(&self, mut envelope: IpcEnvelope) -> anyhow::Result<IpcEnvelope> {
@@ -314,13 +420,26 @@ impl IpcBus for AegisIpcBus {
                 .with_context(|| format!("Original message '{}' not found", original_msg_id))?
         };
 
-        if original.org_id != responder.org_id {
-            bail!(
-                "Cross-organization IPC reply forbidden: '{}' != '{}'",
-                responder.org_id,
-                original.org_id
-            );
-        }
+        let (reply_target_org, reply_target_agent, reply_from_agent) =
+            if let Some((orig_from_org, orig_from_agent)) = original.from_agent.split_once('/') {
+                (
+                    orig_from_org.to_string(),
+                    orig_from_agent.to_string(),
+                    format!("{}/{}", responder.org_id, responder.agent_id),
+                )
+            } else if original.org_id != responder.org_id {
+                bail!(
+                    "Cross-organization IPC reply forbidden: '{}' != '{}'",
+                    responder.org_id,
+                    original.org_id
+                );
+            } else {
+                (
+                    responder.org_id.clone(),
+                    original.from_agent.clone(),
+                    responder.agent_id.clone(),
+                )
+            };
 
         let key = Self::mailbox_key(&responder.org_id, &responder.agent_id);
         if let Some(inbox) = self.mailboxes.write().await.get_mut(&key) {
@@ -332,9 +451,9 @@ impl IpcBus for AegisIpcBus {
 
         let response_env = IpcEnvelope {
             msg_id: format!("reply-{}", &Uuid::new_v4().to_string()[..8]),
-            org_id: responder.org_id.clone(),
-            from_agent: responder.agent_id.clone(),
-            to_target: original.from_agent.clone(),
+            org_id: reply_target_org,
+            from_agent: reply_from_agent,
+            to_target: reply_target_agent,
             kind: IpcKind::TaskResponse {
                 correlation_id: original.msg_id.clone(),
                 success,
@@ -362,12 +481,152 @@ impl IpcBus for AegisIpcBus {
         });
         Ok(tx.subscribe())
     }
+
+    async fn peek_inbox(
+        &self,
+        org_id: &str,
+        agent_id: &str,
+        limit: usize,
+    ) -> anyhow::Result<Vec<IpcEnvelope>> {
+        self.reload_from_disk().await;
+        let key = Self::mailbox_key(org_id, agent_id);
+        let mailboxes = self.mailboxes.read().await;
+        Ok(mailboxes
+            .get(&key)
+            .map(|inbox| {
+                inbox
+                    .iter()
+                    .filter(|m| {
+                        !matches!(
+                            m.status,
+                            MessageDeliveryStatus::Acked | MessageDeliveryStatus::Replied
+                        )
+                    })
+                    .take(limit)
+                    .cloned()
+                    .collect()
+            })
+            .unwrap_or_default())
+    }
+
+    async fn mark_delivered(
+        &self,
+        org_id: &str,
+        agent_id: &str,
+        msg_ids: &[String],
+    ) -> anyhow::Result<()> {
+        if msg_ids.is_empty() {
+            return Ok(());
+        }
+        self.reload_from_disk().await;
+        let key = Self::mailbox_key(org_id, agent_id);
+        {
+            let mut mailboxes = self.mailboxes.write().await;
+            if let Some(inbox) = mailboxes.get_mut(&key) {
+                for m in inbox.iter_mut() {
+                    if m.status == MessageDeliveryStatus::Unread && msg_ids.contains(&m.msg_id) {
+                        m.status = MessageDeliveryStatus::Delivered;
+                    }
+                }
+            }
+        }
+        self.flush_to_disk().await
+    }
+
+    async fn touch_peer(&self, identity: &AgentIdentity) -> anyhow::Result<()> {
+        self.reload_from_disk().await;
+        let now_ms = Utc::now().timestamp_millis();
+        let known = {
+            let mut peers = self.peers.write().await;
+            match peers
+                .get_mut(&identity.org_id)
+                .and_then(|m| m.get_mut(&identity.agent_id))
+            {
+                Some(p) => {
+                    p.last_seen_ms = now_ms;
+                    p.online = true;
+                    true
+                }
+                None => false,
+            }
+        };
+        if known {
+            self.flush_to_disk().await
+        } else {
+            self.register_peer(identity, vec!["*".to_string()]).await.map(|_| ())
+        }
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
     use serde_json::json;
+
+    #[tokio::test]
+    async fn test_distinct_session_ids_receive_broadcast_and_peek_is_non_consuming() {
+        // Regression for the shared `agy-agent` principal: two agy windows must be distinct peers,
+        // otherwise the sender-exclusion in topic fan-out delivers to nobody.
+        let bus = AegisIpcBus::new();
+        let a = AgentIdentity::new("aegis-os", "agy-3f2a9c", "AGY");
+        let b = AgentIdentity::new("aegis-os", "agy-81d0e4", "AGY");
+        bus.register_peer(&a, vec!["*".to_string()]).await.unwrap();
+        bus.register_peer(&b, vec!["*".to_string()]).await.unwrap();
+
+        let sent = bus
+            .send(IpcEnvelope {
+                msg_id: String::new(),
+                org_id: "aegis-os".to_string(),
+                from_agent: a.agent_id.clone(),
+                to_target: "topic:topic://coordination".to_string(),
+                kind: IpcKind::TopicBroadcast {
+                    topic: "topic://coordination".to_string(),
+                },
+                subject: "claim crates/aos-vfs/**".to_string(),
+                payload: json!({"ack_required": true}),
+                attachments: vec![],
+                status: MessageDeliveryStatus::Unread,
+                created_at_ms: 0,
+            })
+            .await
+            .unwrap();
+
+        let peek1 = bus.peek_inbox("aegis-os", &b.agent_id, 10).await.unwrap();
+        assert_eq!(peek1.len(), 1);
+        assert_eq!(peek1[0].status, MessageDeliveryStatus::Unread);
+        let peek2 = bus.peek_inbox("aegis-os", &b.agent_id, 10).await.unwrap();
+        assert_eq!(peek2[0].status, MessageDeliveryStatus::Unread, "peek must not consume");
+        assert!(bus.peek_inbox("aegis-os", &a.agent_id, 10).await.unwrap().is_empty());
+
+        bus.mark_delivered("aegis-os", &b.agent_id, &[peek1[0].msg_id.clone()])
+            .await
+            .unwrap();
+        let peek3 = bus.peek_inbox("aegis-os", &b.agent_id, 10).await.unwrap();
+        assert_eq!(peek3[0].status, MessageDeliveryStatus::Delivered);
+        assert!(peek3[0].msg_id.starts_with(&sent.msg_id));
+
+        bus.ack("aegis-os", &b.agent_id, &peek3[0].msg_id).await.unwrap();
+        assert!(bus.peek_inbox("aegis-os", &b.agent_id, 10).await.unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn test_peer_liveness_is_derived_from_heartbeat() {
+        let bus = AegisIpcBus::new();
+        let a = AgentIdentity::new("o", "agy-aaaaaa", "AGY");
+        bus.register_peer(&a, vec!["*".to_string()]).await.unwrap();
+        // Simulate a stale peer.
+        bus.peers
+            .write()
+            .await
+            .get_mut("o")
+            .unwrap()
+            .get_mut("agy-aaaaaa")
+            .unwrap()
+            .last_seen_ms -= PeerLiveness::IDLE_MS + 1;
+        assert!(!bus.list_peers("o").await.unwrap()[0].online);
+        bus.touch_peer(&a).await.unwrap();
+        assert!(bus.list_peers("o").await.unwrap()[0].online);
+    }
 
     #[tokio::test]
     async fn test_p2p_task_handoff_and_rpc_reply_with_wakeup() {
@@ -483,5 +742,100 @@ mod tests {
                 .len(),
             0
         );
+    }
+
+    #[tokio::test]
+    async fn test_global_peers_zombie_pid_pruning_and_cross_org_reply() {
+        let bus = AegisIpcBus::new();
+        let fe = AgentIdentity::new("repo-frontend", "agy-fe1111", "AGY Frontend");
+        let be = AgentIdentity::new("repo-backend", "claude-be2222", "Claude Backend");
+        let zombie = AgentIdentity::new("repo-backend", "agy-zombie", "Exited Session");
+
+        bus.register_peer(&fe, vec!["*".to_string()]).await.unwrap();
+        bus.register_peer(&be, vec!["*".to_string()]).await.unwrap();
+        bus.register_peer(&zombie, vec!["*".to_string()]).await.unwrap();
+
+        let my_pid = std::process::id();
+        bus.update_peer_metadata(
+            &fe,
+            Some("agy".to_string()),
+            Some(my_pid),
+            None,
+            Some("/work/frontend".to_string()),
+        )
+        .await
+        .unwrap();
+        bus.update_peer_metadata(
+            &be,
+            Some("claude".to_string()),
+            Some(my_pid),
+            None,
+            Some("/work/backend".to_string()),
+        )
+        .await
+        .unwrap();
+        // Attach a guaranteed dead PID to the zombie session
+        bus.update_peer_metadata(
+            &zombie,
+            Some("agy".to_string()),
+            Some(999_999_999),
+            Some(12345),
+            Some("/work/backend".to_string()),
+        )
+        .await
+        .unwrap();
+
+        let all_peers = bus.list_all_peers().await.unwrap();
+        let addresses: Vec<String> = all_peers.iter().map(|p| p.address()).collect();
+        assert_eq!(
+            addresses,
+            vec![
+                "repo-backend/claude-be2222".to_string(),
+                "repo-frontend/agy-fe1111".to_string()
+            ],
+            "Zombie PID should be pruned automatically while live cross-org peers are returned"
+        );
+
+        // Cross-org request from repo-frontend/agy-fe1111 -> repo-backend/claude-be2222
+        let req = bus
+            .send(IpcEnvelope {
+                msg_id: String::new(),
+                org_id: "repo-backend".to_string(),
+                from_agent: "repo-frontend/agy-fe1111".to_string(),
+                to_target: "claude-be2222".to_string(),
+                kind: IpcKind::TaskRequest {
+                    timeout_secs: Some(30),
+                },
+                subject: "Verify OpenAPI contract".to_string(),
+                payload: json!({"endpoint": "/v1/peers"}),
+                attachments: vec![],
+                status: MessageDeliveryStatus::Unread,
+                created_at_ms: 0,
+            })
+            .await
+            .unwrap();
+
+        let be_inbox = bus
+            .recv_inbox("repo-backend", "claude-be2222", true, 10)
+            .await
+            .unwrap();
+        assert_eq!(be_inbox.len(), 1);
+        assert_eq!(be_inbox[0].from_agent, "repo-frontend/agy-fe1111");
+
+        // Reply from repo-backend/claude-be2222 routes back to repo-frontend/agy-fe1111
+        let reply = bus
+            .reply(&be, &req.msg_id, true, json!({"schema_ok": true}), vec![])
+            .await
+            .unwrap();
+        assert_eq!(reply.org_id, "repo-frontend");
+        assert_eq!(reply.to_target, "agy-fe1111");
+        assert_eq!(reply.from_agent, "repo-backend/claude-be2222");
+
+        let fe_inbox = bus
+            .recv_inbox("repo-frontend", "agy-fe1111", true, 10)
+            .await
+            .unwrap();
+        assert_eq!(fe_inbox.len(), 1);
+        assert_eq!(fe_inbox[0].msg_id, reply.msg_id);
     }
 }

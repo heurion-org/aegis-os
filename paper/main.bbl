@@ -7,15 +7,30 @@ Alexandru Agache, Marc Brooker, Alexandra Iordache, Anthony Liguori, Rolf
 \newblock In {\em 17th USENIX Symposium on Networked Systems Design and
   Implementation (NSDI 20)}, pages 419--434. USENIX Association, 2020.
 
+\bibitem{akhawe2013alice}
+Devdatta Akhawe and Adrienne~Porter Felt.
+\newblock Alice in warningland: A large-scale field study of browser security
+  warning effectiveness.
+\newblock In {\em 22nd USENIX Security Symposium (USENIX Security 13)}, pages
+  257--272. USENIX Association, 2013.
+
 \bibitem{anthropic2024mcp}
 {Anthropic}.
-\newblock Model context protocol ({MCP}): An open protocol for connecting {AI}
-  applications to external systems.
+\newblock {Model Context Protocol} ({MCP}): An open protocol for connecting
+  {AI} applications to external systems.
 \newblock \url{https://modelcontextprotocol.io}, 2024.
 
+\bibitem{apel2011semistructured}
+Sven Apel, J{\"o}rg Liebig, Benjamin Brandl, Christian Lengauer, and Christian
+  K{\"a}stner.
+\newblock Semistructured merge: Rethinking merge in revision control systems.
+\newblock In {\em Proceedings of the 19th ACM SIGSOFT Symposium and the 13th
+  European Conference on Foundations of Software Engineering (ESEC/FSE)}, pages
+  190--200. ACM, 2011.
+
 \bibitem{costa2025fides}
-Manuel Costa, Boris Köpf, Aecio Ribeiro, Andrew Roscoe, Mark Russinovich, and
-  M.~Schut.
+Manuel Costa, Boris K{\"o}pf, Aecio Ribeiro, Andrew Roscoe, Mark Russinovich,
+  and Mark Schut.
 \newblock Securing {AI} agents with information-flow control.
 \newblock {\em arXiv preprint arXiv:2505.23643}, 2025.
 
@@ -42,6 +57,13 @@ Edoardo Debenedetti, Jie Zhang, Mislav Balunovi{\'c}, Luca Beurer-Kellner, Marc
   attacks and defenses for {LLM} agents.
 \newblock In {\em Advances in Neural Information Processing Systems (NeurIPS)
   Datasets and Benchmarks Track}, volume~37, 2024.
+
+\bibitem{felt2012android}
+Adrienne~Porter Felt, Elizabeth Ha, Serge Egelman, Ariel Haney, Erika Chin, and
+  David Wagner.
+\newblock Android permissions: User attention, comprehension, and behavior.
+\newblock In {\em Proceedings of the Eighth Symposium on Usable Privacy and
+  Security (SOUPS)}, pages 1--14. ACM, 2012.
 
 \bibitem{greshake2023not}
 Kai Greshake, Sahar Abdelnabi, Shailesh Mishra, Christoph Endres, Thorsten
@@ -87,6 +109,19 @@ Kai Mei, Xi~Zhu, Wujiang Xu, Wenyue Hua, Mingyu Jin, Zelong Li, Shuyuan Xu,
 \newblock In {\em Conference on Language Modeling (COLM)}, 2025.
 \newblock arXiv:2403.16971.
 
+\bibitem{nightingale2005speculator}
+Edmund~B. Nightingale, Peter~M. Chen, and Jason Flinn.
+\newblock Speculative execution in a distributed file system.
+\newblock In {\em Proceedings of the ACM SIGOPS 20th Symposium on Operating
+  Systems Principles (SOSP)}, pages 191--205. ACM, 2005.
+
+\bibitem{porter2009txos}
+Donald~E. Porter, Owen~S. Hofmann, Christopher~J. Rossbach, Alexander Benn, and
+  Emmett Witchel.
+\newblock Operating system transactions.
+\newblock In {\em Proceedings of the ACM SIGOPS 22nd Symposium on Operating
+  Systems Principles (SOSP)}, pages 161--176. ACM, 2009.
+
 \bibitem{rodeh2013btrfs}
 Ohad Rodeh, Josef Bacik, and Chris Mason.
 \newblock {BTRFS}: The {Linux} b-tree filesystem.
@@ -121,8 +156,7 @@ Charles~P. Wright, Jay Dave, Puja Gupta, Harikesavan Krishnan, David~P.
   Quigley, Erez Zadok, and Mohammad~Nayyer Zubair.
 \newblock Versatility and {Unix} semantics in a fan-out unification file
   system.
-\newblock In {\em ACM Transactions on Storage (TOS)}, volume~2, pages 74--105,
-  2006.
+\newblock {\em ACM Transactions on Storage (TOS)}, 2(1):74--105, 2006.
 
 \bibitem{wu2023autogen}
 Qingyun Wu, Gagan Bansal, Jieyu Zhang, Yiran Wu, Beibin Li, Erkang Zhu,
@@ -134,9 +168,10 @@ Qingyun Wu, Gagan Bansal, Jieyu Zhang, Yiran Wu, Beibin Li, Erkang Zhu,
 
 \bibitem{wu2024secgpt}
 Yuhao Wu, Franziska Roesner, Tadayoshi Kohno, Ning Zhang, and Umar Iqbal.
-\newblock {SecGPT}: An execution isolation architecture for large language
-  model based systems.
-\newblock {\em arXiv preprint arXiv:2403.04960}, 2024.
+\newblock {IsolateGPT}: An execution isolation architecture for {LLM}-based
+  agentic systems.
+\newblock In {\em Network and Distributed System Security Symposium (NDSS)},
+  2025.
 
 \bibitem{yang2024sweagent}
 John Yang, Carlos~E. Jimenez, Alexander Wettig, Kilian Lieret, Shunyu Yao,

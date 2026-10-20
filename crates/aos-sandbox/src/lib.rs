@@ -11,7 +11,7 @@ use aos_core::{
 };
 use anyhow::bail;
 use async_trait::async_trait;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::process::Stdio;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
@@ -56,20 +56,27 @@ impl NativeOsSandboxInstance {
         let home = Self::canonical_or_orig(&self.config.agent_home_dir);
         let pub_dir = Self::canonical_or_orig(&self.config.org_agent_pub_dir);
 
-        let net_rules = if self.config.egress_proxy_addr.is_some() {
-            r#"
+        let net_rules = if let Some(ref proxy_str) = self.config.egress_proxy_addr {
+            let port_pattern = proxy_str
+                .rsplit_once(':')
+                .map(|(_, port)| port.trim_end_matches('/'))
+                .filter(|p| p.chars().all(|c| c.is_ascii_digit()) && !p.is_empty())
+                .unwrap_or("*");
+            format!(
+                r#"
 (deny network-outbound)
 (allow network-outbound
-    (remote ip "localhost:*")
-    (literal "/private/var/run/mDNSResponder")
+    (remote ip "localhost:{port_pattern}")
 )"#
+            )
         } else {
-            ""
+            String::new()
         };
 
         format!(
             r#"(version 1)
 (allow default)
+(deny appleevent-send)
 (deny file-write*)
 (allow file-write*
     (subpath "{ws}")
@@ -98,9 +105,8 @@ impl NativeOsSandboxInstance {
 
     /// Generates Linux `bwrap` (Bubblewrap) namespace confinement flags.
     pub fn generate_linux_bwrap_args(&self) -> Vec<String> {
-        vec![
+        let mut args = vec![
             "--unshare-all".to_string(),
-            "--share-net".to_string(),
             "--die-with-parent".to_string(),
             "--ro-bind".to_string(),
             "/".to_string(),
@@ -119,7 +125,20 @@ impl NativeOsSandboxInstance {
             self.config.org_agent_pub_dir.to_string_lossy().to_string(),
             "--tmpfs".to_string(),
             "/tmp".to_string(),
-        ]
+        ];
+        if let Ok(host_home) = std::env::var("HOME") {
+            for cred_sub in [".ssh", ".aws", ".gnupg", ".kube"] {
+                let p = Path::new(&host_home).join(cred_sub);
+                if p.exists() {
+                    args.push("--tmpfs".to_string());
+                    args.push(p.to_string_lossy().to_string());
+                }
+            }
+        }
+        if self.config.egress_proxy_addr.is_none() {
+            args.push("--share-net".to_string());
+        }
+        args
     }
 }
 
@@ -209,6 +228,20 @@ impl SandboxInstance for NativeOsSandboxInstance {
             .env("AOS_ORG_AGENT_PUB", &self.config.org_agent_pub_dir)
             .stdout(Stdio::piped())
             .stderr(Stdio::piped());
+
+        // `HOME` is redirected to the agent home, which would hide the host Rust/cargo toolchain
+        // (registry cache, installed toolchains) and make `cargo build/test` fail inside `proc_exec`.
+        // Expose them read-only by path; Seatbelt still denies writes outside the CoW roots.
+        let host_home = std::env::var("HOME").ok().map(PathBuf::from);
+        for (var, default_sub) in [("CARGO_HOME", ".cargo"), ("RUSTUP_HOME", ".rustup")] {
+            let candidate = std::env::var(var)
+                .ok()
+                .map(PathBuf::from)
+                .or_else(|| host_home.as_ref().map(|h| h.join(default_sub)));
+            if let Some(p) = candidate.filter(|p| p.is_dir()) {
+                cmd.env(var, p);
+            }
+        }
 
         if let Some(ref proxy) = self.config.egress_proxy_addr {
             cmd.env("HTTP_PROXY", proxy).env("HTTPS_PROXY", proxy);
@@ -368,6 +401,9 @@ mod tests {
 
     #[tokio::test]
     async fn test_sandbox_isolated_env_and_pause_resume() {
+        if nested_in_aegis_sandbox() {
+            return;
+        }
         let temp = tempfile::tempdir().unwrap();
         let driver = NativeOsSandboxDriver;
         let config = SandboxConfig {
@@ -435,8 +471,22 @@ mod tests {
             .is_ok());
     }
 
+    /// macOS forbids applying a Seatbelt profile from inside another one (`sandbox_apply: Operation not
+    /// permitted`, exit 71). When the test suite itself runs via Aegis `proc_exec`, skip the tests that
+    /// spawn `sandbox-exec`; they are exercised on the host / CI instead.
+    fn nested_in_aegis_sandbox() -> bool {
+        let nested = cfg!(target_os = "macos") && std::env::var_os("AOS_SANDBOX_ID").is_some();
+        if nested {
+            eprintln!("skipping: running inside an Aegis Seatbelt sandbox (nested sandbox_apply is not permitted)");
+        }
+        nested
+    }
+
     #[tokio::test]
     async fn test_macos_seatbelt_enforces_write_boundary() {
+        if nested_in_aegis_sandbox() {
+            return;
+        }
         let temp = tempfile::tempdir().unwrap();
         let forbidden_host_dir = temp.path().join("forbidden_host_zone");
         tokio::fs::create_dir_all(&forbidden_host_dir).await.unwrap();

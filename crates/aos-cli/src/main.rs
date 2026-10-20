@@ -11,6 +11,8 @@
 //! - Cross-Agent IPC across `agy`, `claude`, and `codex` within the same project!
 
 mod bench;
+mod coord;
+mod routing;
 
 use aos_core::{AgentIdentity, IsolationTier};
 use aos_mcp_gateway::AegisRuntimeKernel;
@@ -165,7 +167,11 @@ enum PolicyAction {
 
 #[derive(Subcommand)]
 enum IpcAction {
-    Peers,
+    Peers {
+        /// Only show peers in the current Organization (default shows both current Org and Global Workstation Peers)
+        #[arg(long, default_value_t = false)]
+        org_only: bool,
+    },
     Inbox {
         #[arg(long, default_value_t = false)]
         all: bool,
@@ -190,6 +196,7 @@ fn resolve_identity(
     client: &str,
     raw_role: &str,
     canonical_workspace: &Path,
+    runtime_dir: &Path,
 ) -> AgentIdentity {
     let org_id = if raw_org == "auto" || raw_org.is_empty() {
         canonical_workspace
@@ -202,14 +209,27 @@ fn resolve_identity(
 
     let agent_id = if raw_agent == "auto" || raw_agent.is_empty() {
         if let Ok(env_agent) = std::env::var("AOS_AGENT_ID") {
-            env_agent
-        } else {
-            match client {
-                "agy" => "agy-agent".to_string(),
-                "claude" => "claude-code".to_string(),
-                "codex" => "codex-cli".to_string(),
-                other => format!("{}-agent", other),
+            if !env_agent.trim().is_empty() {
+                env_agent.trim().to_string()
+            } else {
+                aos_core::session::resolve_session_agent_id(runtime_dir, client).unwrap_or_else(
+                    || match client {
+                        "agy" => "agy-agent".to_string(),
+                        "claude" => "claude-code".to_string(),
+                        "codex" => "codex-cli".to_string(),
+                        other => format!("{}-agent", other),
+                    },
+                )
             }
+        } else {
+            aos_core::session::resolve_session_agent_id(runtime_dir, client).unwrap_or_else(|| {
+                match client {
+                    "agy" => "agy-agent".to_string(),
+                    "claude" => "claude-code".to_string(),
+                    "codex" => "codex-cli".to_string(),
+                    other => format!("{}-agent", other),
+                }
+            })
         }
     } else {
         raw_agent.to_string()
@@ -231,9 +251,23 @@ fn resolve_identity(
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
-    let cli = Cli::parse();
+    let mut cli = Cli::parse();
+    if cli.workspace == Path::new(".") {
+        if let Ok(env_ws) = std::env::var("AOS_WORKSPACE") {
+            if !env_ws.trim().is_empty() {
+                cli.workspace = PathBuf::from(env_ws.trim());
+            }
+        }
+    }
     let workspace = std::fs::canonicalize(&cli.workspace).unwrap_or_else(|_| cli.workspace.clone());
-    let identity = resolve_identity(&cli.org, &cli.agent, &cli.client, &cli.role, &workspace);
+    let identity = resolve_identity(
+        &cli.org,
+        &cli.agent,
+        &cli.client,
+        &cli.role,
+        &workspace,
+        &cli.runtime_dir,
+    );
 
     match cli.command {
         Commands::Install { home_dir, dry_run } => {
@@ -269,7 +303,19 @@ async fn main() -> anyhow::Result<()> {
         Commands::McpStdio => {
             let kernel = AegisRuntimeKernel::new(&cli.runtime_dir).await?;
             let auto_org = cli.org == "auto" || cli.org.is_empty();
-            kernel.serve_stdio_lazy(identity, workspace, auto_org).await?;
+            let auto_agent_client = if cli.agent == "auto"
+                || cli.agent.is_empty()
+                || cli.agent == "agy-agent"
+                || cli.agent == "claude-code"
+                || cli.agent == "codex-cli"
+            {
+                Some(cli.client.clone())
+            } else {
+                None
+            };
+            kernel
+                .serve_stdio_lazy(identity, workspace, auto_org, auto_agent_client)
+                .await?;
         }
 
         Commands::AgyHook { ref event, strict_cow } => {
@@ -400,8 +446,11 @@ async fn main() -> anyhow::Result<()> {
                 .await?;
 
             match action {
-                IpcAction::Peers => {
-                    let res = kernel.call_tool(&identity, "ipc_list_peers", json!({})).await?;
+                IpcAction::Peers { org_only } => {
+                    let scope = if org_only { "org" } else { "all" };
+                    let res = kernel
+                        .call_tool(&identity, "ipc_list_peers", json!({ "scope": scope }))
+                        .await?;
                     println!("{}", serde_json::to_string_pretty(&res)?);
                 }
                 IpcAction::Inbox { all } => {
@@ -475,6 +524,29 @@ async fn main() -> anyhow::Result<()> {
 // One-Command Global Installer for AGY, Claude Code & Codex CLI (`aegis-os install`)
 // ============================================================================
 
+fn replace_or_append_aegis_block(existing: &str, block: &str) -> String {
+    const START: &str = "<!-- AEGIS-OS-RUNTIME-START -->";
+    const END: &str = "<!-- AEGIS-OS-RUNTIME-END -->";
+    if let (Some(s), Some(e)) = (existing.find(START), existing.find(END)) {
+        if s <= e {
+            let mut out = String::new();
+            out.push_str(existing[..s].trim_end());
+            if !out.is_empty() {
+                out.push('\n');
+            }
+            out.push_str(block.trim());
+            out.push('\n');
+            let tail = existing[e + END.len()..].trim_start();
+            if !tail.is_empty() {
+                out.push_str(tail);
+                out.push('\n');
+            }
+            return out;
+        }
+    }
+    format!("{}{}", existing, block)
+}
+
 async fn merge_json_file(path: &Path, patch_fn: impl FnOnce(&mut Value), dry_run: bool) -> anyhow::Result<()> {
     let mut root: Value = if path.exists() {
         let content = tokio::fs::read_to_string(path).await.unwrap_or_default();
@@ -525,6 +597,33 @@ pub async fn install_global_clients(
         .join("antigravity-cli")
         .join("settings.json");
 
+    const AGY_EAGER_MCP_TOOLS: &[&str] = &[
+        "fs_read",
+        "fs_write",
+        "fs_edit",
+        "fs_delete",
+        "fs_glob",
+        "proc_exec",
+        "workspace_status",
+        "workspace_snapshot",
+        "workspace_diff",
+        "workspace_rollback",
+        "workspace_commit",
+        "coord_claim",
+        "coord_release",
+        "ipc_list_peers",
+        "ipc_send",
+        "ipc_request",
+        "ipc_reply",
+        "ipc_recv",
+        "ipc_ack",
+        "ipc_publish",
+        "org_artifact_publish",
+        "org_artifact_fetch",
+        "org_kv_put",
+        "org_kv_get",
+    ];
+
     merge_json_file(
         &agy_mcp_path,
         |root| {
@@ -544,7 +643,9 @@ pub async fn install_global_clients(
                             "--agent", "auto",
                             "--runtime-dir", rt_str,
                             "mcp-stdio"
-                        ]
+                        ],
+                        "eagerTools": AGY_EAGER_MCP_TOOLS,
+                        "eager": true
                     }),
                 );
             }
@@ -568,6 +669,12 @@ pub async fn install_global_clients(
                             "command": format!("\"{}\" --client agy --org auto --agent auto --runtime-dir \"{}\" agy-hook --event SessionStart", bin_str, rt_str)
                         }
                     ],
+                    "PreInvocation": [
+                        {
+                            "type": "command",
+                            "command": format!("\"{}\" --client agy --org auto --agent auto --runtime-dir \"{}\" agy-hook --event PreInvocation", bin_str, rt_str)
+                        }
+                    ],
                     "PreToolUse": [
                         {
                             "matcher": "call_mcp_tool|mcp_aegis-os_.*|write_file|edit_file|run_command",
@@ -578,6 +685,12 @@ pub async fn install_global_clients(
                                 }
                             ]
                         }
+                    ],
+                    "Stop": [
+                        {
+                            "type": "command",
+                            "command": format!("\"{}\" --client agy --org auto --agent auto --runtime-dir \"{}\" agy-hook --event Stop", bin_str, rt_str)
+                        }
                     ]
                 }),
             );
@@ -586,8 +699,8 @@ pub async fn install_global_clients(
     )
     .await?;
 
-    // Pre-populate all 23 Aegis OS MCP tools into `~/.gemini/antigravity-cli/settings.json` -> `permissions.allow`
-    // so Antigravity CLI (`agy`) never prompts "Allow calling this tool?" on any `aegis-os/*` tool!
+    // Pre-populate all green-zone Aegis OS MCP tools into `~/.gemini/antigravity-cli/settings.json` -> `permissions.allow`
+    // while keeping boundary lease/escalation approval tools in `permissions.ask` so agents cannot self-approve!
     const AGY_MCP_ALLOW_RULES: &[&str] = &[
         "mcp(aegis-os/*)",
         "mcp(aegis-os/fs_read)",
@@ -601,6 +714,8 @@ pub async fn install_global_clients(
         "mcp(aegis-os/workspace_rollback)",
         "mcp(aegis-os/workspace_commit)",
         "mcp(aegis-os/proc_exec)",
+        "mcp(aegis-os/coord_claim)",
+        "mcp(aegis-os/coord_release)",
         "mcp(aegis-os/org_artifact_publish)",
         "mcp(aegis-os/org_artifact_fetch)",
         "mcp(aegis-os/org_kv_put)",
@@ -610,7 +725,11 @@ pub async fn install_global_clients(
         "mcp(aegis-os/ipc_request)",
         "mcp(aegis-os/ipc_reply)",
         "mcp(aegis-os/ipc_recv)",
+        "mcp(aegis-os/ipc_ack)",
+        "mcp(aegis-os/ipc_subscribe)",
         "mcp(aegis-os/ipc_publish)",
+    ];
+    const AGY_MCP_ASK_RULES: &[&str] = &[
         "mcp(aegis-os/policy_approve_escalation)",
         "mcp(aegis-os/policy_grant_lease)",
     ];
@@ -623,16 +742,38 @@ pub async fn install_global_clients(
                 .unwrap()
                 .entry("permissions")
                 .or_insert_with(|| json!({}));
-            let allow_list = perms
-                .as_object_mut()
-                .unwrap()
-                .entry("allow")
-                .or_insert_with(|| json!([]));
-            if let Some(arr) = allow_list.as_array_mut() {
-                for rule_str in AGY_MCP_ALLOW_RULES {
-                    let rule = Value::String((*rule_str).to_string());
-                    if !arr.contains(&rule) {
-                        arr.push(rule);
+            {
+                let allow_list = perms
+                    .as_object_mut()
+                    .unwrap()
+                    .entry("allow")
+                    .or_insert_with(|| json!([]));
+                if let Some(arr) = allow_list.as_array_mut() {
+                    arr.retain(|v| {
+                        v.as_str()
+                            .map(|s| !AGY_MCP_ASK_RULES.contains(&s))
+                            .unwrap_or(true)
+                    });
+                    for rule_str in AGY_MCP_ALLOW_RULES {
+                        let rule = Value::String((*rule_str).to_string());
+                        if !arr.contains(&rule) {
+                            arr.push(rule);
+                        }
+                    }
+                }
+            }
+            {
+                let ask_list = perms
+                    .as_object_mut()
+                    .unwrap()
+                    .entry("ask")
+                    .or_insert_with(|| json!([]));
+                if let Some(arr) = ask_list.as_array_mut() {
+                    for rule_str in AGY_MCP_ASK_RULES {
+                        let rule = Value::String((*rule_str).to_string());
+                        if !arr.contains(&rule) {
+                            arr.push(rule);
+                        }
                     }
                 }
             }
@@ -643,20 +784,24 @@ pub async fn install_global_clients(
 
     let shared_agent_prompt = r#"
 <!-- AEGIS-OS-RUNTIME-START -->
-## Aegis OS Runtime Integration (Auto-Enabled)
-You have direct access to the **Aegis OS Runtime (`aegis-os`)** MCP Server, pre-authorized for **Zero-Prompt** execution:
-1. **Zero-Prompt Copy-on-Write File System**: Prefer `fs_read`, `fs_write`, `fs_edit`, `fs_delete`, `fs_glob`, `workspace_snapshot`, `workspace_diff`, and `workspace_rollback` (via `aegis-os`) to modify files safely inside your isolated CoW shadow workspace with zero confirmation prompts. Call `workspace_commit` only when ready to merge changes to the host.
-2. **Zero-Prompt Sandboxed Execution**: Prefer `proc_exec` (via `aegis-os`) over `run_command` to execute build/test/git commands inside your isolated OS sandbox without triggering shell confirmation prompts.
-3. **Cross-Agent IPC (`agy` <-> `claude` <-> `codex`)**: Agents running in the same repository share the same Organization ID automatically. Use `ipc_list_peers`, `ipc_send`, `ipc_request`, `ipc_reply`, `ipc_recv`, and `org_artifact_publish` to collaborate with peer Agents!
+## Aegis OS Runtime Integration (Auto-Enabled, MCP-First Enforced)
+You are running inside the **Aegis OS Runtime (`aegis-os`)** with an isolated Copy-on-Write shadow workspace, OS sandbox, and push-based multi-agent IPC bus:
+
+| Intent | REQUIRED Tool (`aegis-os` MCP) | Forbidden / Gated Native Tool |
+|---|---|---|
+| Build / test / lint / git status / scripts | `proc_exec` (`mcp_aegis-os_proc_exec`) | `run_command` (denied for in-repo work) |
+| Read / write / edit / delete repo files | `fs_read`, `fs_write`, `fs_edit`, `fs_delete`, `fs_glob` | `write_file` / `edit_file` (denied for repo files) |
+| Claim / release files when collaborating | `coord_claim`, `coord_release` | Uncoordinated overlapping edits |
+| Multi-agent messaging & task handoff | `ipc_list_peers`, `ipc_send`, `ipc_request`, `ipc_reply`, `ipc_recv`, `ipc_ack` | Manual user relay |
+| Land shadow changes onto host repo | `workspace_diff` -> `workspace_commit` | Direct host mutation |
 <!-- AEGIS-OS-RUNTIME-END -->
 "#;
 
     if !dry_run {
         tokio::fs::create_dir_all(&agy_config_dir).await?;
         let existing_md = tokio::fs::read_to_string(&agy_rules_path).await.unwrap_or_default();
-        if !existing_md.contains("AEGIS-OS-RUNTIME-START") {
-            tokio::fs::write(&agy_rules_path, format!("{}{}", existing_md, shared_agent_prompt)).await?;
-        }
+        let updated_md = replace_or_append_aegis_block(&existing_md, shared_agent_prompt);
+        tokio::fs::write(&agy_rules_path, updated_md).await?;
     }
     println!("[1/3] AGY (Antigravity) configured:");
     println!("      - MCP Server:  {}", agy_mcp_path.display());
@@ -701,6 +846,34 @@ You have direct access to the **Aegis OS Runtime (`aegis-os`)** MCP Server, pre-
     )
     .await?;
 
+    const AEGIS_TOOL_NAMES: &[&str] = &[
+        "fs_read",
+        "fs_write",
+        "fs_edit",
+        "fs_delete",
+        "fs_glob",
+        "workspace_status",
+        "workspace_snapshot",
+        "workspace_diff",
+        "workspace_rollback",
+        "workspace_commit",
+        "proc_exec",
+        "coord_claim",
+        "coord_release",
+        "org_artifact_publish",
+        "org_artifact_fetch",
+        "org_kv_put",
+        "org_kv_get",
+        "ipc_list_peers",
+        "ipc_send",
+        "ipc_request",
+        "ipc_reply",
+        "ipc_recv",
+        "ipc_ack",
+        "ipc_subscribe",
+        "ipc_publish",
+    ];
+
     merge_json_file(
         &claude_settings_path,
         |root| {
@@ -715,9 +888,17 @@ You have direct access to the **Aegis OS Runtime (`aegis-os`)** MCP Server, pre-
                 .entry("allow")
                 .or_insert_with(|| json!([]));
             if let Some(arr) = allow_list.as_array_mut() {
-                let rule = Value::String("mcp__aegis-os__*".to_string());
-                if !arr.contains(&rule) {
-                    arr.push(rule);
+                for base_rule in ["mcp__aegis-os", "mcp__aegis-os__*"] {
+                    let r = Value::String(base_rule.to_string());
+                    if !arr.contains(&r) {
+                        arr.push(r);
+                    }
+                }
+                for tool in AEGIS_TOOL_NAMES {
+                    let r = Value::String(format!("mcp__aegis-os__{}", tool));
+                    if !arr.contains(&r) {
+                        arr.push(r);
+                    }
                 }
             }
         },
@@ -728,13 +909,12 @@ You have direct access to the **Aegis OS Runtime (`aegis-os`)** MCP Server, pre-
     if !dry_run {
         tokio::fs::create_dir_all(&claude_dir).await?;
         let existing_md = tokio::fs::read_to_string(&claude_md_path).await.unwrap_or_default();
-        if !existing_md.contains("AEGIS-OS-RUNTIME-START") {
-            tokio::fs::write(&claude_md_path, format!("{}{}", existing_md, shared_agent_prompt)).await?;
-        }
+        let updated_md = replace_or_append_aegis_block(&existing_md, shared_agent_prompt);
+        tokio::fs::write(&claude_md_path, updated_md).await?;
     }
     println!("\n[2/3] Claude Code (`claude`) configured:");
     println!("      - MCP Server:  {}", claude_mcp_path.display());
-    println!("      - Auto-Allow:  {} (`mcp__aegis-os__*`)", claude_settings_path.display());
+    println!("      - Auto-Allow:  {} (25 `mcp__aegis-os__*` rules)", claude_settings_path.display());
     println!("      - Global Rule: {}", claude_md_path.display());
 
     // ------------------------------------------------------------------------
@@ -750,6 +930,8 @@ You have direct access to the **Aegis OS Runtime (`aegis-os`)** MCP Server, pre-
 [mcp_servers.aegis-os]
 command = "{bin_str}"
 args = ["--client", "codex", "--org", "auto", "--agent", "auto", "--runtime-dir", "{rt_str}", "mcp-stdio"]
+enabled = true
+startup_timeout_sec = 30
 # --- AEGIS-OS-RUNTIME-END ---
 "#
     );
@@ -761,9 +943,8 @@ args = ["--client", "codex", "--org", "auto", "--agent", "auto", "--runtime-dir"
             tokio::fs::write(&codex_toml_path, format!("{}{}", existing_toml, codex_toml_block)).await?;
         }
         let existing_agents = tokio::fs::read_to_string(&codex_agents_md).await.unwrap_or_default();
-        if !existing_agents.contains("AEGIS-OS-RUNTIME-START") {
-            tokio::fs::write(&codex_agents_md, format!("{}{}", existing_agents, shared_agent_prompt)).await?;
-        }
+        let updated_agents = replace_or_append_aegis_block(&existing_agents, shared_agent_prompt);
+        tokio::fs::write(&codex_agents_md, updated_agents).await?;
     }
     println!("\n[3/3] OpenAI Codex (`codex`) configured:");
     println!("      - MCP Server:  {}", codex_toml_path.display());
@@ -805,6 +986,18 @@ fn resolve_effective_hook_workspace(
     payload: &Value,
     runtime_dir: &Path,
 ) -> PathBuf {
+    if let Ok(env_ws) = std::env::var("AOS_WORKSPACE") {
+        let p = PathBuf::from(env_ws.trim());
+        if p.exists() {
+            let canon = std::fs::canonicalize(&p).unwrap_or(p);
+            let _ = std::fs::create_dir_all(runtime_dir);
+            let _ = std::fs::write(
+                runtime_dir.join("active_workspace.txt"),
+                canon.to_string_lossy().as_bytes(),
+            );
+            return canon;
+        }
+    }
     let from_payload = payload
         .get("workspacePaths")
         .and_then(|v| v.as_array())
@@ -884,13 +1077,32 @@ fn resolve_effective_hook_workspace(
 
 async fn handle_agy_hook(
     event: &str,
-    strict_cow: bool,
+    _strict_cow: bool,
     cli: &Cli,
     cli_workspace: &Path,
 ) -> anyhow::Result<()> {
     let mut stdin_buf = String::new();
     let _ = std::io::stdin().read_to_string(&mut stdin_buf);
     let payload: Value = serde_json::from_str(&stdin_buf).unwrap_or_else(|_| json!({}));
+
+    let conversation_id = payload
+        .get("conversationId")
+        .or_else(|| payload.get("session_id"))
+        .or_else(|| payload.get("sessionId"))
+        .and_then(|v| v.as_str());
+
+    if cli.agent == "auto"
+        || cli.agent.is_empty()
+        || cli.agent == "agy-agent"
+        || cli.agent == "claude-code"
+        || cli.agent == "codex-cli"
+    {
+        let _ = aos_core::session::bind_conversation(
+            &cli.runtime_dir,
+            &cli.client,
+            conversation_id,
+        );
+    }
 
     let effective_workspace =
         resolve_effective_hook_workspace(cli_workspace, &payload, &cli.runtime_dir);
@@ -900,8 +1112,10 @@ async fn handle_agy_hook(
         &cli.client,
         &cli.role,
         &effective_workspace,
+        &cli.runtime_dir,
     );
 
+    let session_key = aos_core::session::client_session_key();
     let kernel = AegisRuntimeKernel::new(&cli.runtime_dir).await?;
     let env = kernel
         .ensure_agent_environment(
@@ -911,36 +1125,92 @@ async fn handle_agy_hook(
             vec!["*".to_string()],
         )
         .await?;
+    let _ = kernel
+        .ipc
+        .update_peer_metadata(
+            &identity,
+            Some(cli.client.clone()),
+            session_key.map(|k| k.pid),
+            session_key.map(|k| k.start_time),
+            Some(effective_workspace.display().to_string()),
+        )
+        .await;
+
+    // Deduplicate hooks when both `~/.gemini/config/hooks.json` and `.agents/hooks.json` are active.
+    let step_idx = payload
+        .get("stepIndex")
+        .or_else(|| payload.get("turnIndex"))
+        .and_then(|v| v.as_u64())
+        .unwrap_or(0);
+    let conv_tag = conversation_id.unwrap_or(&identity.agent_id);
 
     match event {
         "SessionStart" => {
+            let guard_key = format!("SessionStart:{}:{}", conv_tag, std::process::id() / 2);
+            let _ = aos_core::session::once_guard(&cli.runtime_dir, &guard_key);
+            let refresh = env.workspace.refresh_from_host().await.unwrap_or_default();
             let unread = kernel
                 .ipc
-                .recv_inbox(&identity.org_id, &identity.agent_id, true, 10)
-                .await?;
-            let peers = kernel.ipc.list_peers(&identity.org_id).await?;
-            // Fixes Bug 4: Emit AGY-compliant `injectSteps` -> `systemMessage` contract (`docs/hooks.md`)
+                .peek_inbox(&identity.org_id, &identity.agent_id, 10)
+                .await
+                .unwrap_or_default();
+            let peers = kernel.ipc.list_peers(&identity.org_id).await.unwrap_or_default();
+            let online_peers: Vec<String> = peers
+                .iter()
+                .filter(|p| p.online && p.agent_id != identity.agent_id)
+                .map(|p| p.agent_id.clone())
+                .collect();
+            let all_peers = kernel.ipc.list_all_peers().await.unwrap_or_default();
+            let global_peers: Vec<String> = all_peers
+                .iter()
+                .filter(|p| p.online && !(p.org_id == identity.org_id && p.agent_id == identity.agent_id))
+                .map(|p| p.address())
+                .collect();
             let msg = format!(
-                "[Aegis OS Runtime Active] Organization: `{}` | Agent Principal: `{}` | CoW Shadow Workspace: `{}` | Online Peers: {} | Unread IPC Messages: {}.",
+                "[Aegis OS Runtime Active] Principal: `{}/{}` | CoW Shadow: `{}` | Same-Org Peers: {:?} | Global Peers: {:?} | Unread IPC: {} | Shadow Rebase Updates: {} (Conflicts: {}).",
                 identity.org_id,
                 identity.agent_id,
                 env.workspace.shadow_root().display(),
-                peers.len(),
-                unread.len()
+                online_peers,
+                global_peers,
+                unread.len(),
+                refresh.total_updates(),
+                refresh.conflicts.len()
             );
             let out = json!({
                 "injectSteps": [
                     {
-                        "systemMessage": {
-                            "systemMessage": msg
-                        }
+                        "systemMessage": msg
                     }
                 ]
             });
             println!("{}", serde_json::to_string(&out)?);
         }
 
+        "PreInvocation" => {
+            let dedup_key = format!("PreInvocation:{}:{}", conv_tag, step_idx);
+            if step_idx > 0 && !aos_core::session::once_guard(&cli.runtime_dir, &dedup_key) {
+                println!("{{}}");
+                return Ok(());
+            }
+            let out = coord::handle_pre_invocation(&cli.runtime_dir, &kernel, &identity).await;
+            println!("{}", serde_json::to_string(&out)?);
+        }
+
+        "Stop" => {
+            let dedup_key = format!("Stop:{}:{}", conv_tag, step_idx);
+            if step_idx > 0 && !aos_core::session::once_guard(&cli.runtime_dir, &dedup_key) {
+                println!("{{}}");
+                return Ok(());
+            }
+            let out = coord::handle_stop_gate(&cli.runtime_dir, &kernel, &identity, &payload, 2).await;
+            println!("{}", serde_json::to_string(&out)?);
+        }
+
         "PreToolUse" => {
+            let _ = kernel.ipc.touch_peer(&identity).await;
+            coord::reset_stop_budget(&cli.runtime_dir, &identity.agent_id);
+
             let tool_name = payload
                 .get("toolCall")
                 .and_then(|tc| tc.get("name"))
@@ -962,6 +1232,44 @@ async fn handle_agy_hook(
                     .and_then(|v| v.as_str())
                     .unwrap_or("*");
                 if server == "aegis-os" {
+                    if matches!(sub_tool, "fs_write" | "fs_edit" | "fs_delete") {
+                        if let Some(rel) = tool_args
+                            .get("Arguments")
+                            .and_then(|a| a.get("path"))
+                            .and_then(|v| v.as_str())
+                        {
+                            let clean = rel.trim_start_matches('/').to_string();
+                            if let Ok(Some(conflict)) =
+                                kernel.claim_conflict_for_paths(&identity, &[clean]).await
+                            {
+                                coord::log_routing_decision(
+                                    &cli.runtime_dir,
+                                    &identity.agent_id,
+                                    sub_tool,
+                                    "deny_claim_conflict",
+                                    &conflict,
+                                );
+                                println!(
+                                    "{}",
+                                    serde_json::to_string(&json!({
+                                        "decision": "deny",
+                                        "reason": conflict
+                                    }))?
+                                );
+                                return Ok(());
+                            }
+                        }
+                    }
+                    if matches!(sub_tool, "policy_approve_escalation" | "policy_grant_lease") {
+                        println!(
+                            "{}",
+                            serde_json::to_string(&json!({
+                                "decision": "ask",
+                                "reason": format!("Aegis OS Boundary Lease / Escalation Approval (`{}`) requires explicit user confirmation.", sub_tool)
+                            }))?
+                        );
+                        return Ok(());
+                    }
                     println!(
                         "{}",
                         serde_json::to_string(&json!({
@@ -980,6 +1288,40 @@ async fn handle_agy_hook(
                 let short_name = tool_name
                     .trim_start_matches("mcp_aegis-os_")
                     .trim_start_matches("mcp__aegis-os__");
+                if matches!(short_name, "fs_write" | "fs_edit" | "fs_delete") {
+                    if let Some(rel) = tool_args.get("path").and_then(|v| v.as_str()) {
+                        let clean = rel.trim_start_matches('/').to_string();
+                        if let Ok(Some(conflict)) =
+                            kernel.claim_conflict_for_paths(&identity, &[clean]).await
+                        {
+                            coord::log_routing_decision(
+                                &cli.runtime_dir,
+                                &identity.agent_id,
+                                short_name,
+                                "deny_claim_conflict",
+                                &conflict,
+                            );
+                            println!(
+                                "{}",
+                                serde_json::to_string(&json!({
+                                    "decision": "deny",
+                                    "reason": conflict
+                                }))?
+                            );
+                            return Ok(());
+                        }
+                    }
+                }
+                if matches!(short_name, "policy_approve_escalation" | "policy_grant_lease") {
+                    println!(
+                        "{}",
+                        serde_json::to_string(&json!({
+                            "decision": "ask",
+                            "reason": format!("Aegis OS Boundary Lease / Escalation Approval (`{}`) requires explicit user confirmation.", short_name)
+                        }))?
+                    );
+                    return Ok(());
+                }
                 println!(
                     "{}",
                     serde_json::to_string(&json!({
@@ -993,36 +1335,67 @@ async fn handle_agy_hook(
                 return Ok(());
             }
 
-            if std::env::var("AOS_FORCE_WRAP_CMD").as_deref() == Ok("1") && matches!(tool_name, "write_file" | "edit_file") {
+            let routing_mode = routing::RoutingMode::from_env();
+
+            if matches!(tool_name, "write_file" | "edit_file") {
                 let target_path = tool_args
                     .get("Path")
                     .and_then(|v| v.as_str())
                     .unwrap_or("");
-                if target_path.contains("/.gemini/")
-                    || target_path.contains("/brain/")
-                    || target_path.contains("/cow_workspace/")
-                    || target_path.contains("/upper_workspace/")
-                {
+
+                if std::env::var("AOS_FORCE_WRAP_CMD").as_deref() == Ok("1") {
+                    if target_path.contains("/.gemini/")
+                        || target_path.contains("/brain/")
+                        || target_path.contains("/cow_workspace/")
+                        || target_path.contains("/upper_workspace/")
+                    {
+                        println!("{}", serde_json::to_string(&json!({ "decision": "allow" }))?);
+                        return Ok(());
+                    }
+                    if let Ok(rel) = Path::new(target_path).strip_prefix(&effective_workspace) {
+                        let shadow_target = env.workspace.shadow_root().join(rel);
+                        if let Some(parent) = shadow_target.parent() {
+                            let _ = std::fs::create_dir_all(parent);
+                        }
+                        println!(
+                            "{}",
+                            serde_json::to_string(&json!({
+                                "decision": "allow",
+                                "overwrite": {
+                                    "Path": shadow_target.to_string_lossy().to_string()
+                                }
+                            }))?
+                        );
+                        return Ok(());
+                    }
                     println!("{}", serde_json::to_string(&json!({ "decision": "allow" }))?);
                     return Ok(());
                 }
-                if let Ok(rel) = Path::new(target_path).strip_prefix(&effective_workspace) {
-                    let shadow_target = env.workspace.shadow_root().join(rel);
-                    if let Some(parent) = shadow_target.parent() {
-                        let _ = std::fs::create_dir_all(parent);
+
+                let mut route =
+                    routing::classify_native_write(Path::new(target_path), &effective_workspace);
+                if let routing::Route::RedirectToMcpFs { ref mut reason } = route {
+                    let rel_path = routing::canonicalize_lossy(Path::new(target_path))
+                        .strip_prefix(routing::canonicalize_lossy(&effective_workspace))
+                        .map(|p| p.to_string_lossy().to_string())
+                        .unwrap_or_else(|_| target_path.to_string());
+                    if let Ok(Some(conflict)) =
+                        kernel.claim_conflict_for_paths(&identity, &[rel_path]).await
+                    {
+                        *reason = format!("{}\n{}", conflict, *reason);
                     }
-                    println!(
-                        "{}",
-                        serde_json::to_string(&json!({
-                            "decision": "allow",
-                            "overwrite": {
-                                "Path": shadow_target.to_string_lossy().to_string()
-                            }
-                        }))?
-                    );
-                    return Ok(());
                 }
-                println!("{}", serde_json::to_string(&json!({ "decision": "allow" }))?);
+                if !matches!(route, routing::Route::Pass) {
+                    coord::log_routing_decision(
+                        &cli.runtime_dir,
+                        &identity.agent_id,
+                        tool_name,
+                        &format!("{}:{}", routing_mode.as_str(), route.kind()),
+                        target_path,
+                    );
+                }
+                let out = route.to_hook_decision(routing_mode);
+                println!("{}", serde_json::to_string(&out)?);
                 return Ok(());
             }
 
@@ -1032,25 +1405,6 @@ async fn handle_agy_hook(
                     .and_then(|v| v.as_str())
                     .unwrap_or("");
 
-                if cmd_line.contains("sudo ")
-                    || cmd_line.starts_with("sudo")
-                    || cmd_line.contains("/.ssh")
-                    || cmd_line.contains("/.aws")
-                {
-                    println!(
-                        "{}",
-                        serde_json::to_string(&json!({
-                            "decision": "deny",
-                            "reason": "Blocked by Aegis OS Ring-0 Policy: privilege escalation or sensitive credential access is forbidden."
-                        }))?
-                    );
-                    return Ok(());
-                }
-
-                // Do NOT rewrite `CommandLine` with `cd "/tmp/..." && ...` unless `--strict-cow` is explicitly requested,
-                // because prepending `cd "..." &&` turns simple commands into compound shell scripts that invalidate
-                // AGY's `command(<bin>)` allowlist in `settings.json` and trigger manual confirmation prompts!
-                // Instead, sandboxed CoW commands use `aegis-os/proc_exec` (pre-authorized in `settings.json` with 0 prompts).
                 if std::env::var("AOS_FORCE_WRAP_CMD").as_deref() == Ok("1")
                     && !cmd_line.contains("/upper_workspace\"")
                     && !cmd_line.contains("/cow_workspace/")
@@ -1073,15 +1427,30 @@ async fn handle_agy_hook(
                     return Ok(());
                 }
 
-                println!(
-                    "{}",
-                    serde_json::to_string(&json!({
-                        "decision": "allow",
-                        "permissionOverrides": [
-                            format!("command({})", cmd_line)
-                        ]
-                    }))?
+                let route = routing::classify_run_command(
+                    cmd_line,
+                    env.workspace.shadow_root(),
+                    &effective_workspace,
                 );
+                if !matches!(route, routing::Route::Pass) {
+                    coord::log_routing_decision(
+                        &cli.runtime_dir,
+                        &identity.agent_id,
+                        "run_command",
+                        &format!("{}:{}", routing_mode.as_str(), route.kind()),
+                        cmd_line,
+                    );
+                }
+                let mut out = route.to_hook_decision(routing_mode);
+                if out.get("decision").and_then(|v| v.as_str()) == Some("allow") {
+                    if let Some(obj) = out.as_object_mut() {
+                        obj.insert(
+                            "permissionOverrides".to_string(),
+                            json!([format!("command({})", cmd_line)]),
+                        );
+                    }
+                }
+                println!("{}", serde_json::to_string(&out)?);
                 return Ok(());
             }
 
@@ -1099,7 +1468,7 @@ async fn handle_agy_hook(
 async fn setup_agy_workspace(
     workspace: &Path,
     org: &str,
-    agent: &str,
+    _agent: &str,
     role: &str,
     runtime_dir: &Path,
     strict_cow: bool,
@@ -1121,21 +1490,37 @@ async fn setup_agy_workspace(
                 {
                     "type": "command",
                     "command": format!(
-                        "\"{bin_str}\" --org \"{org}\" --agent \"{agent}\" --role \"{role}\" --workspace \"{ws_str}\" --runtime-dir \"{rt_str}\" agy-hook --event SessionStart {strict_flag}"
+                        "\"{bin_str}\" --org \"{org}\" --agent auto --role \"{role}\" --workspace \"{ws_str}\" --runtime-dir \"{rt_str}\" agy-hook --event SessionStart {strict_flag}"
+                    )
+                }
+            ],
+            "PreInvocation": [
+                {
+                    "type": "command",
+                    "command": format!(
+                        "\"{bin_str}\" --org \"{org}\" --agent auto --role \"{role}\" --workspace \"{ws_str}\" --runtime-dir \"{rt_str}\" agy-hook --event PreInvocation {strict_flag}"
                     )
                 }
             ],
             "PreToolUse": [
                 {
-                    "matcher": "mcp_aegis-os_.*|write_file|edit_file|run_command",
+                    "matcher": "call_mcp_tool|mcp_aegis-os_.*|write_file|edit_file|run_command",
                     "hooks": [
                         {
                             "type": "command",
                             "command": format!(
-                                "\"{bin_str}\" --org \"{org}\" --agent \"{agent}\" --role \"{role}\" --workspace \"{ws_str}\" --runtime-dir \"{rt_str}\" agy-hook --event PreToolUse {strict_flag}"
+                                "\"{bin_str}\" --org \"{org}\" --agent auto --role \"{role}\" --workspace \"{ws_str}\" --runtime-dir \"{rt_str}\" agy-hook --event PreToolUse {strict_flag}"
                             )
                         }
                     ]
+                }
+            ],
+            "Stop": [
+                {
+                    "type": "command",
+                    "command": format!(
+                        "\"{bin_str}\" --org \"{org}\" --agent auto --role \"{role}\" --workspace \"{ws_str}\" --runtime-dir \"{rt_str}\" agy-hook --event Stop {strict_flag}"
+                    )
                 }
             ]
         }
@@ -1149,11 +1534,17 @@ trigger: always_on
 description: Aegis OS Runtime workflow rules for CoW Shadow Workspace, Sandboxed Execution, and Multi-Agent IPC
 ---
 
-# Aegis OS Runtime Environment Rules
+# Aegis OS Runtime Environment Rules (MCP-First Enforced)
 
-You are operating inside **Aegis OS Runtime** as Principal **`{agent}`** (`{role}`) within Organization **`{org}`**.
-- Use `mcp_aegis-os_fs_read`, `mcp_aegis-os_fs_write`, `mcp_aegis-os_fs_edit`, `mcp_aegis-os_workspace_snapshot`, and `mcp_aegis-os_workspace_diff` for zero-prompt CoW file operations.
-- Use `mcp_aegis-os_ipc_list_peers`, `mcp_aegis-os_ipc_request`, `mcp_aegis-os_ipc_reply`, and `mcp_aegis-os_org_artifact_publish` to collaborate with peer Agents (`agy`, `claude`, `codex`) in Organization `{org}`.
+You are operating inside **Aegis OS Runtime** (`{role}`) within Organization **`{org}`**.
+
+| Intent | REQUIRED Tool (`aegis-os` MCP) | Forbidden / Gated Native Tool |
+|---|---|---|
+| Build / test / lint / git status / scripts | `proc_exec` (`mcp_aegis-os_proc_exec`) | `run_command` (denied for in-repo work) |
+| Read / write / edit / delete repo files | `fs_read`, `fs_write`, `fs_edit`, `fs_delete`, `fs_glob` | `write_file` / `edit_file` (denied for repo files) |
+| Claim / release files when collaborating | `coord_claim`, `coord_release` | Uncoordinated overlapping edits |
+| Multi-agent messaging & task handoff | `ipc_list_peers`, `ipc_send`, `ipc_request`, `ipc_reply`, `ipc_recv`, `ipc_ack` | Manual user relay |
+| Land shadow changes onto host repo | `workspace_diff` -> `workspace_commit` | Direct host mutation |
 "#
     );
     let rules_path = rules_dir.join("aegis-os-workflow.md");
@@ -1165,12 +1556,13 @@ You are operating inside **Aegis OS Runtime** as Principal **`{agent}`** (`{role
                 "command": bin_str,
                 "args": [
                     "--org", org,
-                    "--agent", agent,
+                    "--agent", "auto",
                     "--role", role,
                     "--workspace", ws_str,
                     "--runtime-dir", rt_str,
                     "mcp-stdio"
-                ]
+                ],
+                "eager": true
             }
         }
     });
@@ -1189,6 +1581,13 @@ async fn render_mission_control_top(
     org_id: &str,
     workspace: &Path,
 ) -> anyhow::Result<()> {
+    let global_peers: Vec<_> = kernel
+        .ipc
+        .list_all_peers()
+        .await?
+        .into_iter()
+        .filter(|p| p.online)
+        .collect();
     let peers = kernel.ipc.list_peers(org_id).await?;
     let artifacts = kernel.org_storage.list_artifacts(org_id).await?;
     let escalations = kernel.policy.list_escalations(org_id).await?;
@@ -1207,7 +1606,24 @@ async fn render_mission_control_top(
     );
     println!("└──────────────────────────────────────────────────────────────────────────────────┘");
 
-    println!("\n[1] Active Agent Sandboxes & CoW Workspaces ({}):", peers.len());
+    println!(
+        "\n[0] Global Workstation Peers Across All Repositories ({}):",
+        global_peers.len()
+    );
+    for gp in &global_peers {
+        println!(
+            "  • {:<26} | Client: {:<6} | PID: {:<7} | Liveness: {:<6} | Workspace: {}",
+            gp.address(),
+            gp.client.as_deref().unwrap_or("-"),
+            gp.pid.map(|p| p.to_string()).unwrap_or_else(|| "-".to_string()),
+            gp.liveness
+                .map(|l| format!("{:?}", l))
+                .unwrap_or_else(|| "Active".to_string()),
+            gp.workspace_root.as_deref().unwrap_or("-")
+        );
+    }
+
+    println!("\n[1] Active Agent Sandboxes & CoW Workspaces in Org `{}` ({}):", org_id, peers.len());
     for p in &peers {
         let peer_id = AgentIdentity::new(&p.org_id, &p.agent_id, &p.role);
         let env = kernel
@@ -1300,9 +1716,30 @@ async fn run_end_to_end_multi_client_demo() -> anyhow::Result<()> {
     run_doctor(&fake_home).await?;
 
     // 2. User opens `agy`, `claude`, and `codex` in the `/payment-gateway` directory
-    let agy_id = resolve_identity("auto", "auto", "agy", "Autonomous Coding Agent", &project_repo);
-    let claude_id = resolve_identity("auto", "auto", "claude", "Autonomous Coding Agent", &project_repo);
-    let codex_id = resolve_identity("auto", "auto", "codex", "Autonomous Coding Agent", &project_repo);
+    let agy_id = resolve_identity(
+        "auto",
+        "agy-agent",
+        "agy",
+        "Autonomous Coding Agent",
+        &project_repo,
+        &runtime_dir,
+    );
+    let claude_id = resolve_identity(
+        "auto",
+        "claude-code",
+        "claude",
+        "Autonomous Coding Agent",
+        &project_repo,
+        &runtime_dir,
+    );
+    let codex_id = resolve_identity(
+        "auto",
+        "codex-cli",
+        "codex",
+        "Autonomous Coding Agent",
+        &project_repo,
+        &runtime_dir,
+    );
 
     let kernel = AegisRuntimeKernel::new(&runtime_dir).await?;
     for id in [&agy_id, &claude_id, &codex_id] {

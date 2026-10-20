@@ -13,6 +13,9 @@ use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 
+pub mod claims;
+pub mod session;
+
 // ============================================================================
 // 1. Multi-Tenant Identity & Capability Model
 // ============================================================================
@@ -174,6 +177,24 @@ pub struct SnapshotMeta {
     pub file_count: usize,
 }
 
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RefreshReport {
+    pub fast_forwarded: Vec<String>,
+    pub merged: Vec<String>,
+    pub added_from_host: Vec<String>,
+    pub removed_from_host: Vec<String>,
+    pub conflicts: Vec<String>,
+}
+
+impl RefreshReport {
+    pub fn total_updates(&self) -> usize {
+        self.fast_forwarded.len()
+            + self.merged.len()
+            + self.added_from_host.len()
+            + self.removed_from_host.len()
+    }
+}
+
 /// Transactional Copy-on-Write shadow workspace allowing 100% prompt-free file operations
 /// inside the sandbox, with instant rollback and gated commit back to the host.
 #[async_trait]
@@ -199,6 +220,21 @@ pub trait TransactionalWorkspace: Send + Sync {
     /// Atomically commit changes from the shadow workspace back to the host source directory.
     /// (Protected by `Action::"workspace_commit"` in the Policy Engine).
     async fn commit_to_host(&self, filter_paths: Option<Vec<String>>) -> anyhow::Result<Vec<String>>;
+
+    /// Relative paths whose shadow content differs from this Agent's baseline.
+    async fn changed_since_baseline(&self) -> anyhow::Result<Vec<String>> {
+        Ok(self
+            .diff(None)
+            .await?
+            .into_iter()
+            .map(|d| d.relative_path)
+            .collect())
+    }
+
+    /// Rebase this Agent's shadow workspace onto the current host tree.
+    async fn refresh_from_host(&self) -> anyhow::Result<RefreshReport> {
+        Ok(RefreshReport::default())
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -320,6 +356,23 @@ pub struct PeerInfo {
     pub subscribed_topics: Vec<String>,
     pub online: bool,
     pub last_seen_ms: i64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub client: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub pid: Option<u32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub start_time: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub workspace_root: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub liveness: Option<PeerLiveness>,
+}
+
+impl PeerInfo {
+    /// Canonical cross-organization address `<org_id>/<agent_id>`.
+    pub fn address(&self) -> String {
+        format!("{}/{}", self.org_id, self.agent_id)
+    }
 }
 
 #[async_trait]
@@ -333,6 +386,24 @@ pub trait IpcBus: Send + Sync {
 
     /// Discover peer Agents within the same Organization.
     async fn list_peers(&self, org_id: &str) -> anyhow::Result<Vec<PeerInfo>>;
+
+    /// Discover all live peer Agents across ALL Organizations / workspaces on this workstation,
+    /// automatically pruning zombie peers whose client OS process has exited.
+    async fn list_all_peers(&self) -> anyhow::Result<Vec<PeerInfo>> {
+        Ok(Vec::new())
+    }
+
+    /// Update workstation metadata (`client`, `pid`, `start_time`, `workspace_root`) for a registered peer.
+    async fn update_peer_metadata(
+        &self,
+        _identity: &AgentIdentity,
+        _client: Option<String>,
+        _pid: Option<u32>,
+        _start_time: Option<u64>,
+        _workspace_root: Option<String>,
+    ) -> anyhow::Result<()> {
+        Ok(())
+    }
 
     /// Send a DirectMessage, TaskRequest, TaskResponse, or TopicBroadcast.
     /// Automatically triggers reactive wakeup notifications for subscribed/recipient agents.
@@ -366,6 +437,60 @@ pub trait IpcBus: Send + Sync {
         org_id: &str,
         agent_id: &str,
     ) -> anyhow::Result<tokio::sync::broadcast::Receiver<IpcEnvelope>>;
+
+    /// Non-consuming view of an inbox (does NOT flip `Unread` -> `Delivered`). Used by push hooks
+    /// to decide what to surface into an agent's context. Default falls back to `recv_inbox`.
+    async fn peek_inbox(
+        &self,
+        org_id: &str,
+        agent_id: &str,
+        limit: usize,
+    ) -> anyhow::Result<Vec<IpcEnvelope>> {
+        self.recv_inbox(org_id, agent_id, true, limit).await
+    }
+
+    /// Mark specific messages as `Delivered` (surfaced into the agent's context).
+    async fn mark_delivered(
+        &self,
+        _org_id: &str,
+        _agent_id: &str,
+        _msg_ids: &[String],
+    ) -> anyhow::Result<()> {
+        Ok(())
+    }
+
+    /// Heartbeat: refresh `last_seen_ms` for an already-registered peer (registers if unknown).
+    async fn touch_peer(&self, identity: &AgentIdentity) -> anyhow::Result<()> {
+        self.register_peer(identity, vec!["*".to_string()]).await.map(|_| ())
+    }
+}
+
+/// Liveness classification derived from `PeerInfo::last_seen_ms`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum PeerLiveness {
+    /// Seen within the last 2 minutes (actively working).
+    Active,
+    /// Seen within the last 30 minutes (waiting on its user / between turns).
+    Idle,
+    /// Not seen for 30+ minutes.
+    Gone,
+}
+
+impl PeerLiveness {
+    pub const ACTIVE_MS: i64 = 2 * 60 * 1000;
+    pub const IDLE_MS: i64 = 30 * 60 * 1000;
+
+    pub fn classify(last_seen_ms: i64, now_ms: i64) -> Self {
+        let age = now_ms.saturating_sub(last_seen_ms);
+        if age <= Self::ACTIVE_MS {
+            PeerLiveness::Active
+        } else if age <= Self::IDLE_MS {
+            PeerLiveness::Idle
+        } else {
+            PeerLiveness::Gone
+        }
+    }
 }
 
 // ============================================================================

@@ -6,7 +6,7 @@
 //! for multi-agent AGY workflows.
 
 use aos_core::{
-    AgentIdentity, AuditEvent, ExecSpec, FlightRecorder, IpcBus, IpcEnvelope, IpcKind,
+    claims, AgentIdentity, AuditEvent, ExecSpec, FlightRecorder, IpcBus, IpcEnvelope, IpcKind,
     IsolationTier, LeaseGrant, MessageDeliveryStatus, OrgSharedStorage, PolicyContext,
     PolicyDecision, PolicyEngine, ResourceLimits, SandboxConfig, SandboxDriver, SandboxInstance,
     TransactionalWorkspace,
@@ -84,6 +84,199 @@ impl AegisRuntimeKernel {
         format!("{}::{}", org_id, agent_id)
     }
 
+    /// Agent ids whose heartbeat is Active or Idle in `org_id`.
+    async fn live_peer_ids(&self, org_id: &str) -> std::collections::HashSet<String> {
+        self.ipc
+            .list_peers(org_id)
+            .await
+            .unwrap_or_default()
+            .into_iter()
+            .filter(|p| p.online)
+            .map(|p| p.agent_id)
+            .collect()
+    }
+
+    /// Current claim table and its KV version (None if the key does not exist yet).
+    pub async fn load_claims(&self, org_id: &str) -> anyhow::Result<(claims::ClaimTable, Option<u64>)> {
+        let entry = self
+            .org_storage
+            .kv_get(org_id, claims::CLAIMS_NAMESPACE, claims::CLAIMS_KEY)
+            .await?;
+        Ok(match entry {
+            Some(e) => (claims::parse_claims(&e.value), Some(e.version)),
+            None => (claims::ClaimTable::new(), None),
+        })
+    }
+
+    /// First conflict message for any of `paths` claimed by another live principal.
+    pub async fn claim_conflict_for_paths(
+        &self,
+        identity: &AgentIdentity,
+        paths: &[String],
+    ) -> anyhow::Result<Option<String>> {
+        if paths.is_empty() {
+            return Ok(None);
+        }
+        let (table, _) = self.load_claims(&identity.org_id).await?;
+        if table.is_empty() {
+            return Ok(None);
+        }
+        let live = self.live_peer_ids(&identity.org_id).await;
+        let now_ms = Utc::now().timestamp_millis();
+        for p in paths {
+            if let Some((glob, claim)) =
+                claims::find_conflict(&table, p, &identity.agent_id, now_ms, |o| live.contains(o))
+            {
+                return Ok(Some(claims::conflict_message(glob, claim, p, now_ms)));
+            }
+        }
+        Ok(None)
+    }
+
+    async fn announce_coordination(&self, identity: &AgentIdentity, subject: String, payload: Value) {
+        let _ = self
+            .ipc
+            .send(IpcEnvelope {
+                msg_id: String::new(),
+                org_id: identity.org_id.clone(),
+                from_agent: identity.agent_id.clone(),
+                to_target: "topic:topic://coordination".to_string(),
+                kind: IpcKind::TopicBroadcast {
+                    topic: "topic://coordination".to_string(),
+                },
+                subject,
+                payload,
+                attachments: vec![],
+                status: MessageDeliveryStatus::Unread,
+                created_at_ms: 0,
+            })
+            .await;
+    }
+
+    /// `coord_claim` / `coord_release`: CAS read-modify-write of `coordination/claims` with retries,
+    /// plus an automatic `topic://coordination` broadcast so peers learn about it via push hooks.
+    async fn coord_claims_tool(
+        &self,
+        identity: &AgentIdentity,
+        tool_name: &str,
+        args: &Value,
+    ) -> anyhow::Result<Value> {
+        let paths: Vec<String> = args
+            .get("paths")
+            .and_then(|v| serde_json::from_value(v.clone()).ok())
+            .unwrap_or_default();
+        let ttl_secs = args
+            .get("ttl_secs")
+            .and_then(|v| v.as_i64())
+            .filter(|t| *t > 0)
+            .unwrap_or(claims::DEFAULT_CLAIM_TTL_SECS)
+            .min(24 * 3600);
+        let note = args.get("note").and_then(|v| v.as_str()).unwrap_or("").to_string();
+        if tool_name == "coord_claim" && paths.is_empty() {
+            bail!("coord_claim requires a non-empty 'paths' array (globs relative to the repo root)");
+        }
+
+        for _attempt in 0..5 {
+            let (mut table, version) = self.load_claims(&identity.org_id).await?;
+            let now_ms = Utc::now().timestamp_millis();
+            claims::prune_expired(&mut table, now_ms);
+            let live = self.live_peer_ids(&identity.org_id).await;
+            let mut changed = Vec::new();
+            let mut rejected = Vec::new();
+            let expires_at_ms = now_ms + ttl_secs * 1000;
+
+            if tool_name == "coord_claim" {
+                for glob in &paths {
+                    let probe = glob.replace("**", "x").replace('*', "x").replace('?', "x");
+                    let clash = table.iter().find(|(g, c)| {
+                        c.owner != identity.agent_id
+                            && live.contains(&c.owner)
+                            && (*g == glob
+                                || claims::glob_match(g, &probe)
+                                || claims::glob_match(glob, &g.replace("**", "x").replace('*', "x")))
+                    });
+                    match clash {
+                        Some((g, c)) => rejected.push(json!({"path": glob, "held_by": c.owner, "pattern": g, "expires_at_ms": c.expires_at_ms})),
+                        None => {
+                            table.insert(
+                                glob.clone(),
+                                claims::Claim {
+                                    owner: identity.agent_id.clone(),
+                                    expires_at_ms,
+                                    note: note.clone(),
+                                },
+                            );
+                            changed.push(glob.clone());
+                        }
+                    }
+                }
+            } else {
+                let mine: Vec<String> = table
+                    .iter()
+                    .filter(|(g, c)| c.owner == identity.agent_id && (paths.is_empty() || paths.contains(g)))
+                    .map(|(g, _)| g.clone())
+                    .collect();
+                for g in mine {
+                    table.remove(&g);
+                    changed.push(g);
+                }
+            }
+
+            let value = serde_json::to_value(&table)?;
+            match self
+                .org_storage
+                .kv_put(identity, claims::CLAIMS_NAMESPACE, claims::CLAIMS_KEY, value, version)
+                .await
+            {
+                Ok(entry) => {
+                    if !changed.is_empty() {
+                        let verb = if tool_name == "coord_claim" { "claimed" } else { "released" };
+                        self.announce_coordination(
+                            identity,
+                            format!("[coord] {} {} {}", identity.agent_id, verb, changed.join(", ")),
+                            json!({ "event": verb, "owner": identity.agent_id, "paths": changed, "expires_at_ms": expires_at_ms, "note": note }),
+                        )
+                        .await;
+                    }
+                    return Ok(json!({
+                        "status": if rejected.is_empty() { "ok" } else { "partial" },
+                        "agent_id": identity.agent_id,
+                        "changed": changed,
+                        "rejected": rejected,
+                        "expires_at_ms": if tool_name == "coord_claim" { json!(expires_at_ms) } else { Value::Null },
+                        "claims_version": entry.version
+                    }));
+                }
+                Err(e) if e.to_string().contains("version mismatch") => continue,
+                Err(e) => return Err(e),
+            }
+        }
+        bail!("coord: could not update claims after 5 concurrent-modification retries")
+    }
+
+    /// Compact unread-mail summary piggybacked on every `tools/call` result, so clients without push
+    /// hooks (e.g. Codex) still learn about peer messages on their next tool call.
+    pub async fn inbox_summary(&self, identity: &AgentIdentity) -> Option<Value> {
+        let msgs = self
+            .ipc
+            .peek_inbox(&identity.org_id, &identity.agent_id, 20)
+            .await
+            .ok()?;
+        if msgs.is_empty() {
+            return None;
+        }
+        let subjects: Vec<String> = msgs
+            .iter()
+            .take(3)
+            .map(|m| format!("{} from {}: {}", m.msg_id, m.from_agent, m.subject))
+            .collect();
+        Some(json!({
+            "unread": msgs.len(),
+            "latest": subjects,
+            "hint": "Read with ipc_recv, answer with ipc_send/ipc_reply, then ipc_ack."
+        }))
+    }
+
     pub async fn ensure_agent_environment(
         &self,
         identity: AgentIdentity,
@@ -143,6 +336,16 @@ impl AegisRuntimeKernel {
         self.ipc
             .register_peer(&identity, subscribed_topics)
             .await?;
+        let _ = self
+            .ipc
+            .update_peer_metadata(
+                &identity,
+                None,
+                None,
+                None,
+                Some(host_project_source.as_ref().display().to_string()),
+            )
+            .await;
 
         let env = Arc::new(AgentEnvironment {
             identity,
@@ -208,7 +411,7 @@ impl AegisRuntimeKernel {
             .cloned()
             .with_context(|| format!("Agent environment '{}' is not initialized", key))?;
 
-        let target_org = args
+        let mut target_org = args
             .get("target_org_id")
             .and_then(|v| v.as_str())
             .unwrap_or(&identity.org_id)
@@ -223,6 +426,68 @@ impl AegisRuntimeKernel {
             .unwrap_or("/workspace")
             .to_string();
 
+        let mut audit_metadata = args.clone();
+        let mut resolved_cross_org_peer: Option<(String, String)> = None;
+
+        if matches!(tool_name, "ipc_send" | "ipc_request") {
+            if let Some(raw_to) = args.get("to_agent").and_then(|v| v.as_str()) {
+                let cleaned = raw_to.strip_prefix("agent:").unwrap_or(raw_to);
+                if let Some((org_part, agent_part)) = cleaned.split_once('/') {
+                    let all_peers = self.ipc.list_all_peers().await.unwrap_or_default();
+                    if all_peers
+                        .iter()
+                        .any(|p| p.org_id == org_part && p.agent_id == agent_part)
+                    {
+                        target_org = org_part.to_string();
+                        resolved_cross_org_peer =
+                            Some((org_part.to_string(), agent_part.to_string()));
+                        if let Some(obj) = audit_metadata.as_object_mut() {
+                            obj.insert("workstation_peer_verified".to_string(), json!(true));
+                        }
+                    } else {
+                        target_org = org_part.to_string();
+                        resolved_cross_org_peer =
+                            Some((org_part.to_string(), agent_part.to_string()));
+                    }
+                } else if args.get("target_org_id").is_none() {
+                    // If not found in current org, auto-resolve unique peer ID from global peer list!
+                    let same_org_peers = self
+                        .ipc
+                        .list_peers(&identity.org_id)
+                        .await
+                        .unwrap_or_default();
+                    if !same_org_peers.iter().any(|p| p.agent_id == cleaned) {
+                        let all_peers = self.ipc.list_all_peers().await.unwrap_or_default();
+                        let matches: Vec<_> = all_peers
+                            .into_iter()
+                            .filter(|p| p.online && p.agent_id == cleaned)
+                            .collect();
+                        if matches.len() == 1 {
+                            let matched = &matches[0];
+                            target_org = matched.org_id.clone();
+                            resolved_cross_org_peer =
+                                Some((matched.org_id.clone(), matched.agent_id.clone()));
+                            if let Some(obj) = audit_metadata.as_object_mut() {
+                                obj.insert("workstation_peer_verified".to_string(), json!(true));
+                            }
+                        }
+                    }
+                } else if args.get("scope").and_then(|v| v.as_str()) == Some("global") {
+                    let all_peers = self.ipc.list_all_peers().await.unwrap_or_default();
+                    if all_peers
+                        .iter()
+                        .any(|p| p.org_id == target_org && p.agent_id == cleaned)
+                    {
+                        resolved_cross_org_peer =
+                            Some((target_org.clone(), cleaned.to_string()));
+                        if let Some(obj) = audit_metadata.as_object_mut() {
+                            obj.insert("workstation_peer_verified".to_string(), json!(true));
+                        }
+                    }
+                }
+            }
+        }
+
         if !matches!(
             tool_name,
             "policy_grant_lease" | "policy_approve_escalation" | "policy_list_escalations"
@@ -233,7 +498,7 @@ impl AegisRuntimeKernel {
                     tool_name,
                     &target_org,
                     &target_resource,
-                    args.clone(),
+                    audit_metadata,
                 )
                 .await?
             {
@@ -433,6 +698,14 @@ impl AegisRuntimeKernel {
                 let filter_paths: Option<Vec<String>> = args
                     .get("paths")
                     .and_then(|v| serde_json::from_value(v.clone()).ok());
+                // Coordination guard: refuse to land files that a live peer has claimed.
+                let mut touched = env.workspace.changed_since_baseline().await?;
+                if let Some(ref allow) = filter_paths {
+                    touched.retain(|p| allow.contains(p));
+                }
+                if let Some(msg) = self.claim_conflict_for_paths(identity, &touched).await? {
+                    bail!("{}", msg);
+                }
                 let committed = env.workspace.commit_to_host(filter_paths).await?;
                 Ok(json!({
                     "status": "committed_to_host",
@@ -546,19 +819,65 @@ impl AegisRuntimeKernel {
             // ----------------------------------------------------------------
             // 4. First-Class Inter-Agent Communication (IPC) Tools
             // ----------------------------------------------------------------
+            "coord_claim" | "coord_release" => self.coord_claims_tool(identity, tool_name, &args).await,
+
             "ipc_list_peers" => {
+                let scope = args
+                    .get("scope")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("all");
                 let peers = self.ipc.list_peers(&identity.org_id).await?;
-                Ok(json!({
-                    "org_id": identity.org_id,
-                    "peers": peers
-                }))
+                let all_peers = self.ipc.list_all_peers().await?;
+                let global_peers: Vec<Value> = all_peers
+                    .into_iter()
+                    .filter(|p| p.online)
+                    .map(|p| {
+                        json!({
+                            "address": p.address(),
+                            "org_id": p.org_id,
+                            "agent_id": p.agent_id,
+                            "role": p.role,
+                            "client": p.client,
+                            "pid": p.pid,
+                            "liveness": p.liveness,
+                            "online": p.online,
+                            "workspace_root": p.workspace_root,
+                            "last_seen_ms": p.last_seen_ms,
+                            "is_self": p.org_id == identity.org_id && p.agent_id == identity.agent_id,
+                        })
+                    })
+                    .collect();
+                if scope == "org" {
+                    Ok(json!({
+                        "self_address": format!("{}/{}", identity.org_id, identity.agent_id),
+                        "org_id": identity.org_id,
+                        "peers": peers
+                    }))
+                } else {
+                    Ok(json!({
+                        "self_address": format!("{}/{}", identity.org_id, identity.agent_id),
+                        "org_id": identity.org_id,
+                        "peers": peers,
+                        "global_peers_count": global_peers.len(),
+                        "global_peers": global_peers
+                    }))
+                }
             }
 
             "ipc_send" | "ipc_request" => {
-                let to_agent = args
+                let raw_to_agent = args
                     .get("to_agent")
                     .and_then(|v| v.as_str())
                     .context("Missing 'to_agent'")?;
+                let (dest_org, dest_agent) = match resolved_cross_org_peer {
+                    Some((o, a)) => (o, a),
+                    None => (target_org.clone(), raw_to_agent.to_string()),
+                };
+                let from_field = if dest_org != identity.org_id {
+                    format!("{}/{}", identity.org_id, identity.agent_id)
+                } else {
+                    identity.agent_id.clone()
+                };
                 let subject = args
                     .get("subject")
                     .and_then(|v| v.as_str())
@@ -581,9 +900,9 @@ impl AegisRuntimeKernel {
                     .ipc
                     .send(IpcEnvelope {
                         msg_id: String::new(),
-                        org_id: target_org,
-                        from_agent: identity.agent_id.clone(),
-                        to_target: to_agent.to_string(),
+                        org_id: dest_org,
+                        from_agent: from_field,
+                        to_target: dest_agent,
                         kind,
                         subject: subject.to_string(),
                         payload,
@@ -681,6 +1000,51 @@ impl AegisRuntimeKernel {
                     .ack(&identity.org_id, &identity.agent_id, msg_id)
                     .await?;
                 Ok(json!({ "status": "acked", "msg_id": msg_id }))
+            }
+
+            "ipc_subscribe" => {
+                let topics: Vec<String> = args
+                    .get("topics")
+                    .and_then(|v| serde_json::from_value(v.clone()).ok())
+                    .unwrap_or_else(|| vec!["*".to_string()]);
+                self.ipc.register_peer(identity, topics.clone()).await?;
+                Ok(json!({ "status": "subscribed", "topics": topics }))
+            }
+
+            "egress_http_request" => {
+                let target_domain = args
+                    .get("target_domain")
+                    .and_then(|v| v.as_str())
+                    .context("Missing 'target_domain'")?
+                    .to_string();
+                let method = args
+                    .get("method")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("GET")
+                    .to_string();
+                let path = args
+                    .get("path")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("/")
+                    .to_string();
+                let headers: HashMap<String, String> = args
+                    .get("headers")
+                    .and_then(|v| serde_json::from_value(v.clone()).ok())
+                    .unwrap_or_default();
+
+                let verdict = self
+                    .egress
+                    .inspect_and_inject(
+                        identity,
+                        &aos_egress::OutboundRequestSpec {
+                            target_domain,
+                            method,
+                            path,
+                            headers,
+                        },
+                    )
+                    .await?;
+                Ok(serde_json::to_value(verdict)?)
             }
 
             // ----------------------------------------------------------------
@@ -860,7 +1224,7 @@ impl AegisRuntimeKernel {
                 },
                 {
                     "name": "proc_exec",
-                    "description": "[Zero-Prompt] Execute a command strictly confined inside the Agent's OS Sandbox / MicroVM.",
+                    "description": "[Zero-Prompt] PREFERRED over native shell tools (run_command/Bash): execute a command (e.g. `sh -c \"grep -rn foo crates | head\"`, `cargo test`) kernel-confined inside the Agent's OS sandbox. cwd = your CoW shadow workspace; host files are readable by absolute path; writes stay in the shadow until workspace_commit.",
                     "inputSchema": {
                         "type": "object",
                         "properties": {
@@ -922,16 +1286,25 @@ impl AegisRuntimeKernel {
                 },
                 {
                     "name": "ipc_list_peers",
-                    "description": "[Zero-Prompt Intra-Org] Discover peer Agents, roles, capabilities, and subscribed topics in the Organization.",
-                    "inputSchema": { "type": "object", "properties": {} }
-                },
-                {
-                    "name": "ipc_send",
-                    "description": "[Zero-Prompt Intra-Org] Send a direct point-to-point message (with optional CAS artifact attachments) to a peer Agent.",
+                    "description": "[Zero-Prompt] Discover both current-Organization peers (`peers`) and the Global Workstation Peer List across all active repositories (`global_peers`, with `<org_id>/<agent_id>` address, client, PID, liveness, and `workspace_root`). Automatically prunes exited client processes.",
                     "inputSchema": {
                         "type": "object",
                         "properties": {
-                            "to_agent": { "type": "string" },
+                            "scope": {
+                                "type": "string",
+                                "enum": ["all", "global", "org"],
+                                "description": "Optional scope ('all' default returns both org `peers` and workstation-wide `global_peers`)."
+                            }
+                        }
+                    }
+                },
+                {
+                    "name": "ipc_send",
+                    "description": "[Zero-Prompt] Send a direct point-to-point message to a peer Agent (`to_agent` accepts either `<agent_id>` or global `<org_id>/<agent_id>`).",
+                    "inputSchema": {
+                        "type": "object",
+                        "properties": {
+                            "to_agent": { "type": "string", "description": "Peer `<agent_id>` or global `<org_id>/<agent_id>` address from `ipc_list_peers`." },
                             "subject": { "type": "string" },
                             "payload": { "type": "object" },
                             "attachments": { "type": "array", "items": { "type": "string" } }
@@ -941,11 +1314,11 @@ impl AegisRuntimeKernel {
                 },
                 {
                     "name": "ipc_request",
-                    "description": "[Zero-Prompt Intra-Org] Delegate a structured task to a peer Agent and correlate its `ipc_reply`.",
+                    "description": "[Zero-Prompt] Delegate a structured task to a peer Agent (`to_agent` accepts either `<agent_id>` or global `<org_id>/<agent_id>`) and correlate its `ipc_reply`.",
                     "inputSchema": {
                         "type": "object",
                         "properties": {
-                            "to_agent": { "type": "string" },
+                            "to_agent": { "type": "string", "description": "Peer `<agent_id>` or global `<org_id>/<agent_id>` address from `ipc_list_peers`." },
                             "subject": { "type": "string" },
                             "payload": { "type": "object" },
                             "attachments": { "type": "array", "items": { "type": "string" } },
@@ -992,6 +1365,65 @@ impl AegisRuntimeKernel {
                         },
                         "required": ["topic", "payload"]
                     }
+                },
+                {
+                    "name": "ipc_subscribe",
+                    "description": "[Zero-Prompt Intra-Org] Subscribe this Agent principal to one or more Organization broadcast topics.",
+                    "inputSchema": {
+                        "type": "object",
+                        "properties": {
+                            "topics": { "type": "array", "items": { "type": "string" } }
+                        }
+                    }
+                },
+                {
+                    "name": "ipc_ack",
+                    "description": "[Zero-Prompt Intra-Org] Acknowledge and mark an IPC message ID as processed.",
+                    "inputSchema": {
+                        "type": "object",
+                        "properties": { "msg_id": { "type": "string" } },
+                        "required": ["msg_id"]
+                    }
+                },
+                {
+                    "name": "egress_http_request",
+                    "description": "[Boundary-Sanitized] Inspect an outbound HTTP request against the Organization domain allowlist and inject `$AOS_SECRET_*` tokens at the boundary.",
+                    "inputSchema": {
+                        "type": "object",
+                        "properties": {
+                            "target_domain": { "type": "string" },
+                            "method": { "type": "string" },
+                            "path": { "type": "string" },
+                            "headers": { "type": "object" }
+                        },
+                        "required": ["target_domain"]
+                    }
+                },
+                {
+                    "name": "coord_claim",
+                    "description": "[Zero-Prompt Intra-Org] Claim exclusive write ownership of repo paths/globs (e.g. `crates/aos-vfs/**`) for a TTL. Peers are notified automatically; their writes to claimed paths are blocked until you release or the claim expires.",
+                    "inputSchema": {
+                        "type": "object",
+                        "properties": {
+                            "paths": { "type": "array", "items": { "type": "string" } },
+                            "ttl_secs": { "type": "integer" },
+                            "note": { "type": "string" }
+                        },
+                        "required": ["paths"]
+                    }
+                },
+                {
+                    "name": "coord_release",
+                    "description": "[Zero-Prompt Intra-Org] Release your claims (all of them if `paths` is omitted) and notify peers.",
+                    "inputSchema": {
+                        "type": "object",
+                        "properties": { "paths": { "type": "array", "items": { "type": "string" } } }
+                    }
+                },
+                {
+                    "name": "policy_list_escalations",
+                    "description": "List pending boundary authorization escalations for the Organization.",
+                    "inputSchema": { "type": "object", "properties": {} }
                 },
                 {
                     "name": "policy_approve_escalation",
@@ -1057,10 +1489,11 @@ impl AegisRuntimeKernel {
                 "id": id,
                 "result": {
                     "resources": [
-                        { "uri": "agentos://workspace/status", "name": "CoW Workspace Status & Diffs" },
-                        { "uri": "agentos://ipc/inbox", "name": "Agent IPC Mailbox" },
-                        { "uri": "agentos://org/peers", "name": "Organization Active Peers" },
-                        { "uri": "agentos://org/shared/catalog", "name": "Organization CAS Artifact Catalog" }
+                        { "uri": "aegis://workspace/status", "name": "CoW Workspace Status & Diffs" },
+                        { "uri": "aegis://ipc/inbox", "name": "Agent IPC Mailbox" },
+                        { "uri": "aegis://org/peers", "name": "Organization Active Peers" },
+                        { "uri": "aegis://global/peers", "name": "Global Workstation Peers Across All Repositories" },
+                        { "uri": "aegis://org/shared/catalog", "name": "Organization CAS Artifact Catalog" }
                     ]
                 }
             }),
@@ -1068,17 +1501,17 @@ impl AegisRuntimeKernel {
                 let params = req.get("params").cloned().unwrap_or_else(|| json!({}));
                 let uri = params.get("uri").and_then(|v| v.as_str()).unwrap_or("");
                 let payload = match uri {
-                    "agentos://workspace/status" => {
+                    "aegis://workspace/status" | "agentos://workspace/status" => {
                         self.call_tool(identity, "workspace_status", json!({})).await?
                     }
-                    "agentos://ipc/inbox" => {
+                    "aegis://ipc/inbox" | "agentos://ipc/inbox" => {
                         self.call_tool(identity, "ipc_recv", json!({ "unread_only": true }))
                             .await?
                     }
-                    "agentos://org/peers" => {
+                    "aegis://org/peers" | "agentos://org/peers" | "aegis://global/peers" => {
                         self.call_tool(identity, "ipc_list_peers", json!({})).await?
                     }
-                    "agentos://org/shared/catalog" => {
+                    "aegis://org/shared/catalog" | "agentos://org/shared/catalog" => {
                         let arts = self.org_storage.list_artifacts(&identity.org_id).await?;
                         json!({ "artifacts": arts })
                     }
@@ -1105,16 +1538,27 @@ impl AegisRuntimeKernel {
                     .unwrap_or_else(|| json!({}));
 
                 match self.call_tool(identity, name, arguments).await {
-                    Ok(val) => json!({
-                        "jsonrpc": "2.0",
-                        "id": id,
-                        "result": {
-                            "content": [{
-                                "type": "text",
-                                "text": serde_json::to_string_pretty(&val)?
-                            }]
+                    Ok(mut val) => {
+                        // Push channel for every MCP client (incl. ones without lifecycle hooks):
+                        // piggyback a compact unread-mail summary on each tool result.
+                        if !matches!(name, "ipc_recv" | "ipc_ack") {
+                            if let (Some(inbox), Some(obj)) =
+                                (self.inbox_summary(identity).await, val.as_object_mut())
+                            {
+                                obj.insert("_aegis_inbox".to_string(), inbox);
+                            }
                         }
-                    }),
+                        json!({
+                            "jsonrpc": "2.0",
+                            "id": id,
+                            "result": {
+                                "content": [{
+                                    "type": "text",
+                                    "text": serde_json::to_string_pretty(&val)?
+                                }]
+                            }
+                        })
+                    }
                     Err(err) => json!({
                         "jsonrpc": "2.0",
                         "id": id,
@@ -1169,6 +1613,12 @@ impl AegisRuntimeKernel {
     }
 
     fn resolve_workspace_fallback(&self, current_ws: &Path) -> PathBuf {
+        if let Ok(env_ws) = std::env::var("AOS_WORKSPACE") {
+            let p = PathBuf::from(env_ws.trim());
+            if p.exists() {
+                return std::fs::canonicalize(&p).unwrap_or(p);
+            }
+        }
         let s = current_ws.to_string_lossy();
         let is_umbrella =
             !current_ws.join(".git").exists() && !current_ws.join("Cargo.toml").exists();
@@ -1195,18 +1645,27 @@ impl AegisRuntimeKernel {
 
     pub async fn serve_stdio(&self, identity: AgentIdentity) -> anyhow::Result<()> {
         let cwd = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
-        self.serve_stdio_lazy(identity, cwd, false).await
+        self.serve_stdio_lazy(identity, cwd, false, None).await
     }
 
     /// Serves MCP over `stdio` with instant (<0.5 ms) `initialize` and `tools/list` handshakes,
     /// deferring `ensure_agent_environment` (CoW cloning) until the first `tools/call` or `resources/read`
     /// and dynamically resolving the workspace path from `initialize` `rootUri`/`workspaceFolders` or AGY hook state.
+    ///
+    /// `auto_agent_client`: when the agent id was `auto`, the client name (`agy`, `claude`, ...). The
+    /// principal is then re-resolved per call from the per-session binding written by lifecycle hooks
+    /// (see `aos_core::session`), so every client window is a distinct peer and resumed conversations
+    /// keep their identity.
     pub async fn serve_stdio_lazy(
         &self,
         mut identity: AgentIdentity,
         initial_workspace: PathBuf,
         auto_org: bool,
+        auto_agent_client: Option<String>,
     ) -> anyhow::Result<()> {
+        let session_key = auto_agent_client
+            .as_ref()
+            .and_then(|_| aos_core::session::client_session_key());
         let stdin = tokio::io::stdin();
         let mut stdout = tokio::io::stdout();
         let mut reader = BufReader::new(stdin).lines();
@@ -1264,6 +1723,13 @@ impl AegisRuntimeKernel {
                         }
                     }
                 }
+                if let (Some(client), Some(key)) = (auto_agent_client.as_ref(), session_key.as_ref()) {
+                    identity.agent_id = aos_core::session::resolve_agent_id_for_key(
+                        &self.runtime_data_root,
+                        client,
+                        key,
+                    );
+                }
                 let _ = self
                     .ensure_agent_environment(
                         identity.clone(),
@@ -1272,6 +1738,16 @@ impl AegisRuntimeKernel {
                         vec!["*".to_string()],
                     )
                     .await?;
+                let _ = self
+                    .ipc
+                    .update_peer_metadata(
+                        &identity,
+                        auto_agent_client.clone(),
+                        session_key.map(|k| k.pid),
+                        session_key.map(|k| k.start_time),
+                        Some(active_workspace.display().to_string()),
+                    )
+                    .await;
             }
 
             let response = self.handle_jsonrpc_message(&identity, req).await?;

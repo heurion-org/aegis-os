@@ -1,19 +1,31 @@
 {
   "aegis-os-runtime-guard": {
+    "PreInvocation": [
+      {
+        "command": "\"/Users/huizhao/Downloads/workspace/aegis-os/target/release/aegis-os\" --org \"aegis-os\" --agent auto --role \"Antigravity (AGY) Lead Agent\" --workspace \"/Users/huizhao/Downloads/workspace/aegis-os\" --runtime-dir \"/tmp/aegis-os-runtime\" agy-hook --event PreInvocation --strict-cow",
+        "type": "command"
+      }
+    ],
     "PreToolUse": [
       {
         "hooks": [
           {
-            "command": "\"/Users/huizhao/Downloads/workspace/aegis-os/target/release/aegis-os\" --client agy --org auto --agent auto --runtime-dir \"/tmp/aegis-os-runtime\" agy-hook --event PreToolUse",
+            "command": "\"/Users/huizhao/Downloads/workspace/aegis-os/target/release/aegis-os\" --org \"aegis-os\" --agent auto --role \"Antigravity (AGY) Lead Agent\" --workspace \"/Users/huizhao/Downloads/workspace/aegis-os\" --runtime-dir \"/tmp/aegis-os-runtime\" agy-hook --event PreToolUse --strict-cow",
             "type": "command"
           }
         ],
-        "matcher": "mcp_aegis-os_.*|write_file|edit_file|run_command"
+        "matcher": "call_mcp_tool|mcp_aegis-os_.*|write_file|edit_file|run_command"
       }
     ],
     "SessionStart": [
       {
-        "command": "\"/Users/huizhao/Downloads/workspace/aegis-os/target/release/aegis-os\" --client agy --org auto --agent auto --runtime-dir \"/tmp/aegis-os-runtime\" agy-hook --event SessionStart",
+        "command": "\"/Users/huizhao/Downloads/workspace/aegis-os/target/release/aegis-os\" --org \"aegis-os\" --agent auto --role \"Antigravity (AGY) Lead Agent\" --workspace \"/Users/huizhao/Downloads/workspace/aegis-os\" --runtime-dir \"/tmp/aegis-os-runtime\" agy-hook --event SessionStart --strict-cow",
+        "type": "command"
+      }
+    ],
+    "Stop": [
+      {
+        "command": "\"/Users/huizhao/Downloads/workspace/aegis-os/target/release/aegis-os\" --org \"aegis-os\" --agent auto --role \"Antigravity (AGY) Lead Agent\" --workspace \"/Users/huizhao/Downloads/workspace/aegis-os\" --runtime-dir \"/tmp/aegis-os-runtime\" agy-hook --event Stop --strict-cow",
         "type": "command"
       }
     ],

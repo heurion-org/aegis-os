@@ -105,18 +105,30 @@ impl AegisPolicyKernel {
     async fn check_active_lease(&self, ctx: &PolicyContext) -> Option<LeaseGrant> {
         self.reload_from_disk().await;
         let now_ms = Utc::now().timestamp_millis();
-        let leases = self.leases.read().await;
-        for lease in leases.iter() {
-            if lease.expires_at_ms > now_ms
-                && lease.org_id == ctx.principal.org_id
-                && (lease.agent_id == "*" || lease.agent_id == ctx.principal.agent_id)
-                && Self::matches_pattern(&lease.action_pattern, &ctx.action)
-                && Self::matches_pattern(&lease.resource_pattern, &ctx.target_resource)
-            {
-                return Some(lease.clone());
+        let mut matched_idx = None;
+        let mut matched_lease = None;
+        {
+            let leases = self.leases.read().await;
+            for (idx, lease) in leases.iter().enumerate() {
+                if (lease.expires_at_ms > now_ms || lease.expires_at_ms == -1)
+                    && lease.org_id == ctx.principal.org_id
+                    && (lease.agent_id == "*" || lease.agent_id == ctx.principal.agent_id)
+                    && Self::matches_pattern(&lease.action_pattern, &ctx.action)
+                    && Self::matches_pattern(&lease.resource_pattern, &ctx.target_resource)
+                {
+                    matched_idx = Some(idx);
+                    matched_lease = Some(lease.clone());
+                    break;
+                }
             }
         }
-        None
+        if let (Some(idx), Some(ref l)) = (matched_idx, &matched_lease) {
+            if l.expires_at_ms == -1 {
+                self.leases.write().await.remove(idx);
+                let _ = self.flush_to_disk().await;
+            }
+        }
+        matched_lease
     }
 
     async fn record_escalation(
@@ -151,12 +163,49 @@ impl AegisPolicyKernel {
 #[async_trait]
 impl PolicyEngine for AegisPolicyKernel {
     async fn evaluate(&self, ctx: &PolicyContext) -> anyhow::Result<PolicyDecision> {
-        // 1. Hard Multi-Tenant Boundary Check:
+        // 1. Multi-Tenant / Cross-Organization Boundary Check (R1):
+        //    - Verified local workstation peer discovery & IPC (`workstation_peer_verified = true`) is allowed across directories/repos.
+        //    - Cross-org CAS/KV reads among verified workstation peers escalate to `Ask` (or pass via an active session lease).
+        //    - Unverified cross-tenant access is unconditionally Denied.
         if ctx.principal.org_id != ctx.target_org_id {
-            if let Some(lease) = self.check_active_lease(ctx).await {
-                return Ok(PolicyDecision::Allow {
-                    matched_rule: format!("federated_lease:{}", lease.lease_id),
-                });
+            let workstation_verified = ctx
+                .metadata
+                .get("workstation_peer_verified")
+                .and_then(|v| v.as_bool())
+                .unwrap_or(false);
+            if workstation_verified {
+                if let Some(lease) = self.check_active_lease(ctx).await {
+                    return Ok(PolicyDecision::Allow {
+                        matched_rule: format!("session_lease:{}", lease.lease_id),
+                    });
+                }
+                if matches!(
+                    ctx.action.as_str(),
+                    "ipc_send" | "ipc_request" | "ipc_reply" | "ipc_list_peers"
+                ) {
+                    return Ok(PolicyDecision::Allow {
+                        matched_rule: "aegis:workstation:cross_org_ipc_auto_allow".to_string(),
+                    });
+                }
+                if matches!(ctx.action.as_str(), "org_artifact_fetch" | "org_kv_get") {
+                    return self
+                        .record_escalation(
+                            ctx,
+                            format!(
+                                "Agent '{}/{}' requests cross-organization '{}' from '{}' ({})",
+                                ctx.principal.org_id,
+                                ctx.principal.agent_id,
+                                ctx.action,
+                                ctx.target_org_id,
+                                ctx.target_resource
+                            ),
+                            format!(
+                                "action={}, resource={}",
+                                ctx.action, ctx.target_resource
+                            ),
+                        )
+                        .await;
+                }
             }
             return Ok(PolicyDecision::Deny {
                 reason: format!(
@@ -168,13 +217,43 @@ impl PolicyEngine for AegisPolicyKernel {
 
         // 2. Hard Red-Line Sensitive Host Resource Check:
         for forbidden in &self.forbidden_host_prefixes {
-            if ctx.target_resource.starts_with(forbidden) || ctx.target_resource.contains("/.ssh/") {
+            if ctx.target_resource.starts_with(forbidden)
+                || ctx.target_resource.contains("/.ssh/")
+                || ctx.target_resource.contains("/.aws/")
+                || ctx.target_resource.contains("/.gnupg/")
+                || ctx.target_resource.contains("/.kube/")
+            {
                 return Ok(PolicyDecision::Deny {
                     reason: format!(
-                        "Access to protected host path '{}' is strictly forbidden by Aegis OS Ring-0 policy",
+                        "Access to protected host path '{}' is strictly forbidden by Aegis OS Host Red-Line policy",
                         ctx.target_resource
                     ),
                 });
+            }
+        }
+
+        // 2b. Commit-Time Poisoning Guard: Even if an active session lease exists, committing
+        // modifications to git hooks or shell auto-execution files requires explicit human escalation.
+        if ctx.action == "workspace_commit" {
+            if let Some(paths) = ctx.metadata.get("paths").and_then(|v| v.as_array()) {
+                for p in paths.iter().filter_map(|x| x.as_str()) {
+                    if p.contains(".git/hooks")
+                        || p.contains(".git/config")
+                        || p.ends_with(".envrc")
+                        || p.contains(".github/workflows")
+                    {
+                        return self
+                            .record_escalation(
+                                ctx,
+                                format!(
+                                    "Commit touches sensitive build/hook path '{}' (commit-time poisoning guard bypasses session lease)",
+                                    p
+                                ),
+                                format!("action=workspace_commit_sensitive, resource={}", p),
+                            )
+                            .await;
+                    }
+                }
             }
         }
 
@@ -218,9 +297,10 @@ impl PolicyEngine for AegisPolicyKernel {
             }),
 
             "ipc_register_peer" | "ipc_list_peers" | "ipc_send" | "ipc_request" | "ipc_reply"
-            | "ipc_recv" | "ipc_ack" | "ipc_publish" | "ipc_subscribe" => {
+            | "ipc_recv" | "ipc_ack" | "ipc_publish" | "ipc_subscribe" | "egress_http_request"
+            | "coord_claim" | "coord_release" => {
                 Ok(PolicyDecision::Allow {
-                    matched_rule: "cedar:default:intra_org_ipc_auto_allow".to_string(),
+                    matched_rule: "aegis:default:intra_org_ipc_auto_allow".to_string(),
                 })
             }
 
@@ -331,7 +411,11 @@ impl PolicyEngine for AegisPolicyKernel {
             agent_id: target.agent_id,
             action_pattern: target.action,
             resource_pattern: "*".to_string(),
-            expires_at_ms: Utc::now().timestamp_millis() + (ttl_secs * 1000),
+            expires_at_ms: if ttl_secs <= 0 {
+                -1
+            } else {
+                Utc::now().timestamp_millis() + (ttl_secs * 1000)
+            },
             granted_by: approved_by.to_string(),
         };
 
