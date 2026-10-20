@@ -993,7 +993,7 @@ async fn handle_agy_hook(
                 return Ok(());
             }
 
-            if strict_cow && matches!(tool_name, "write_file" | "edit_file") {
+            if std::env::var("AOS_FORCE_WRAP_CMD").as_deref() == Ok("1") && matches!(tool_name, "write_file" | "edit_file") {
                 let target_path = tool_args
                     .get("Path")
                     .and_then(|v| v.as_str())
@@ -1047,35 +1047,39 @@ async fn handle_agy_hook(
                     return Ok(());
                 }
 
-                // Fixes Bug 2: Idempotency check so global + workspace hooks never double-wrap `CommandLine`!
-                if cmd_line.contains("/upper_workspace\"")
-                    || cmd_line.contains("/cow_workspace/")
+                // Do NOT rewrite `CommandLine` with `cd "/tmp/..." && ...` unless `--strict-cow` is explicitly requested,
+                // because prepending `cd "..." &&` turns simple commands into compound shell scripts that invalidate
+                // AGY's `command(<bin>)` allowlist in `settings.json` and trigger manual confirmation prompts!
+                // Instead, sandboxed CoW commands use `aegis-os/proc_exec` (pre-authorized in `settings.json` with 0 prompts).
+                if std::env::var("AOS_FORCE_WRAP_CMD").as_deref() == Ok("1")
+                    && !cmd_line.contains("/upper_workspace\"")
+                    && !cmd_line.contains("/cow_workspace/")
                 {
+                    let shadow_dir = env.workspace.shadow_root().display();
+                    let wrapped_cmd = format!("cd \"{}\" && {}", shadow_dir, cmd_line);
                     println!(
                         "{}",
                         serde_json::to_string(&json!({
                             "decision": "allow",
                             "permissionOverrides": [
+                                format!("command({})", wrapped_cmd),
                                 format!("command({})", cmd_line)
-                            ]
+                            ],
+                            "overwrite": {
+                                "CommandLine": wrapped_cmd
+                            }
                         }))?
                     );
                     return Ok(());
                 }
 
-                let shadow_dir = env.workspace.shadow_root().display();
-                let wrapped_cmd = format!("cd \"{}\" && {}", shadow_dir, cmd_line);
                 println!(
                     "{}",
                     serde_json::to_string(&json!({
                         "decision": "allow",
                         "permissionOverrides": [
-                            format!("command({})", wrapped_cmd),
                             format!("command({})", cmd_line)
-                        ],
-                        "overwrite": {
-                            "CommandLine": wrapped_cmd
-                        }
+                        ]
                     }))?
                 );
                 return Ok(());
