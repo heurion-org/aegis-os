@@ -520,6 +520,10 @@ pub async fn install_global_clients(
     let agy_mcp_path = agy_config_dir.join("mcp_config.json");
     let agy_hooks_path = agy_config_dir.join("hooks.json");
     let agy_rules_path = agy_config_dir.join("GEMINI.md");
+    let agy_cli_settings_path = home_dir
+        .join(".gemini")
+        .join("antigravity-cli")
+        .join("settings.json");
 
     merge_json_file(
         &agy_mcp_path,
@@ -566,7 +570,7 @@ pub async fn install_global_clients(
                     ],
                     "PreToolUse": [
                         {
-                            "matcher": "mcp_aegis-os_.*|write_file|edit_file|run_command",
+                            "matcher": "call_mcp_tool|mcp_aegis-os_.*|write_file|edit_file|run_command",
                             "hooks": [
                                 {
                                     "type": "command",
@@ -582,12 +586,67 @@ pub async fn install_global_clients(
     )
     .await?;
 
+    // Pre-populate all 23 Aegis OS MCP tools into `~/.gemini/antigravity-cli/settings.json` -> `permissions.allow`
+    // so Antigravity CLI (`agy`) never prompts "Allow calling this tool?" on any `aegis-os/*` tool!
+    const AGY_MCP_ALLOW_RULES: &[&str] = &[
+        "mcp(aegis-os/*)",
+        "mcp(aegis-os/fs_read)",
+        "mcp(aegis-os/fs_write)",
+        "mcp(aegis-os/fs_edit)",
+        "mcp(aegis-os/fs_delete)",
+        "mcp(aegis-os/fs_glob)",
+        "mcp(aegis-os/workspace_status)",
+        "mcp(aegis-os/workspace_snapshot)",
+        "mcp(aegis-os/workspace_diff)",
+        "mcp(aegis-os/workspace_rollback)",
+        "mcp(aegis-os/workspace_commit)",
+        "mcp(aegis-os/proc_exec)",
+        "mcp(aegis-os/org_artifact_publish)",
+        "mcp(aegis-os/org_artifact_fetch)",
+        "mcp(aegis-os/org_kv_put)",
+        "mcp(aegis-os/org_kv_get)",
+        "mcp(aegis-os/ipc_list_peers)",
+        "mcp(aegis-os/ipc_send)",
+        "mcp(aegis-os/ipc_request)",
+        "mcp(aegis-os/ipc_reply)",
+        "mcp(aegis-os/ipc_recv)",
+        "mcp(aegis-os/ipc_publish)",
+        "mcp(aegis-os/policy_approve_escalation)",
+        "mcp(aegis-os/policy_grant_lease)",
+    ];
+
+    merge_json_file(
+        &agy_cli_settings_path,
+        |root| {
+            let perms = root
+                .as_object_mut()
+                .unwrap()
+                .entry("permissions")
+                .or_insert_with(|| json!({}));
+            let allow_list = perms
+                .as_object_mut()
+                .unwrap()
+                .entry("allow")
+                .or_insert_with(|| json!([]));
+            if let Some(arr) = allow_list.as_array_mut() {
+                for rule_str in AGY_MCP_ALLOW_RULES {
+                    let rule = Value::String((*rule_str).to_string());
+                    if !arr.contains(&rule) {
+                        arr.push(rule);
+                    }
+                }
+            }
+        },
+        dry_run,
+    )
+    .await?;
+
     let shared_agent_prompt = r#"
 <!-- AEGIS-OS-RUNTIME-START -->
 ## Aegis OS Runtime Integration (Auto-Enabled)
-You have direct access to the **Aegis OS Runtime (`aegis-os`)** MCP Server:
-1. **Zero-Prompt Copy-on-Write File System**: Use `fs_read`, `fs_write`, `fs_edit`, `fs_delete`, `fs_glob`, `workspace_snapshot`, `workspace_diff`, and `workspace_rollback` to modify files safely inside your isolated CoW shadow workspace without prompting the user. Call `workspace_commit` only when ready to merge changes to the host.
-2. **Sandboxed Execution**: Use `proc_exec` to execute build/test commands inside your isolated OS sandbox.
+You have direct access to the **Aegis OS Runtime (`aegis-os`)** MCP Server, pre-authorized for **Zero-Prompt** execution:
+1. **Zero-Prompt Copy-on-Write File System**: Prefer `fs_read`, `fs_write`, `fs_edit`, `fs_delete`, `fs_glob`, `workspace_snapshot`, `workspace_diff`, and `workspace_rollback` (via `aegis-os`) to modify files safely inside your isolated CoW shadow workspace with zero confirmation prompts. Call `workspace_commit` only when ready to merge changes to the host.
+2. **Zero-Prompt Sandboxed Execution**: Prefer `proc_exec` (via `aegis-os`) over `run_command` to execute build/test/git commands inside your isolated OS sandbox without triggering shell confirmation prompts.
 3. **Cross-Agent IPC (`agy` <-> `claude` <-> `codex`)**: Agents running in the same repository share the same Organization ID automatically. Use `ipc_list_peers`, `ipc_send`, `ipc_request`, `ipc_reply`, `ipc_recv`, and `org_artifact_publish` to collaborate with peer Agents!
 <!-- AEGIS-OS-RUNTIME-END -->
 "#;
@@ -600,8 +659,9 @@ You have direct access to the **Aegis OS Runtime (`aegis-os`)** MCP Server:
         }
     }
     println!("[1/3] AGY (Antigravity) configured:");
-    println!("      - MCP Server: {}", agy_mcp_path.display());
-    println!("      - Auto-Hooks: {}", agy_hooks_path.display());
+    println!("      - MCP Server:  {}", agy_mcp_path.display());
+    println!("      - Auto-Hooks:  {}", agy_hooks_path.display());
+    println!("      - Auto-Allow:  {} (24 `mcp(aegis-os/*)` rules)", agy_cli_settings_path.display());
     println!("      - Global Rule: {}", agy_rules_path.display());
 
     // ------------------------------------------------------------------------
@@ -717,6 +777,7 @@ async fn run_doctor(home_dir: &Path) -> anyhow::Result<()> {
     let checks = vec![
         ("AGY MCP Config", home_dir.join(".gemini/config/mcp_config.json")),
         ("AGY Lifecycle Hooks", home_dir.join(".gemini/config/hooks.json")),
+        ("AGY Auto-Allow Rules", home_dir.join(".gemini/antigravity-cli/settings.json")),
         ("AGY Global Rules", home_dir.join(".gemini/config/GEMINI.md")),
         ("Claude Code MCP Config", home_dir.join(".claude.json")),
         ("Claude Code Permissions", home_dir.join(".claude/settings.json")),
@@ -891,8 +952,44 @@ async fn handle_agy_hook(
                 .cloned()
                 .unwrap_or_else(|| json!({}));
 
+            if tool_name == "call_mcp_tool" {
+                let server = tool_args
+                    .get("ServerName")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("");
+                let sub_tool = tool_args
+                    .get("ToolName")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("*");
+                if server == "aegis-os" {
+                    println!(
+                        "{}",
+                        serde_json::to_string(&json!({
+                            "decision": "allow",
+                            "permissionOverrides": [
+                                "mcp(aegis-os/*)",
+                                format!("mcp(aegis-os/{})", sub_tool)
+                            ]
+                        }))?
+                    );
+                    return Ok(());
+                }
+            }
+
             if tool_name.starts_with("mcp_aegis-os_") || tool_name.starts_with("mcp__aegis-os__") {
-                println!("{}", serde_json::to_string(&json!({ "decision": "allow" }))?);
+                let short_name = tool_name
+                    .trim_start_matches("mcp_aegis-os_")
+                    .trim_start_matches("mcp__aegis-os__");
+                println!(
+                    "{}",
+                    serde_json::to_string(&json!({
+                        "decision": "allow",
+                        "permissionOverrides": [
+                            "mcp(aegis-os/*)",
+                            format!("mcp(aegis-os/{})", short_name)
+                        ]
+                    }))?
+                );
                 return Ok(());
             }
 
@@ -954,7 +1051,15 @@ async fn handle_agy_hook(
                 if cmd_line.contains("/upper_workspace\"")
                     || cmd_line.contains("/cow_workspace/")
                 {
-                    println!("{}", serde_json::to_string(&json!({ "decision": "allow" }))?);
+                    println!(
+                        "{}",
+                        serde_json::to_string(&json!({
+                            "decision": "allow",
+                            "permissionOverrides": [
+                                format!("command({})", cmd_line)
+                            ]
+                        }))?
+                    );
                     return Ok(());
                 }
 
@@ -964,6 +1069,10 @@ async fn handle_agy_hook(
                     "{}",
                     serde_json::to_string(&json!({
                         "decision": "allow",
+                        "permissionOverrides": [
+                            format!("command({})", wrapped_cmd),
+                            format!("command({})", cmd_line)
+                        ],
                         "overwrite": {
                             "CommandLine": wrapped_cmd
                         }
