@@ -1,6 +1,6 @@
 # Aegis OS (`aegis-os`)
 
-**A Transactional Multi-Tenant Operating System Runtime for Eliminating Authorization Fatigue in Autonomous Coding Agents (`agy`, `claude`, `codex`)**
+**A Transactional Multi-Tenant Operating System Runtime & Cloud PaaS for Eliminating Authorization Fatigue in Autonomous Coding Agents (`agy`, `claude`, `codex`)**
 
 [![Rust](https://img.shields.io/badge/Rust-1.99%2B-orange.svg)](https://www.rust-lang.org/)
 [![MCP](https://img.shields.io/badge/Protocol-MCP%202024--11--05-blue.svg)](https://modelcontextprotocol.io/)
@@ -16,20 +16,21 @@ Autonomous coding agents such as **Google Antigravity (`agy`)**, **Anthropic Cla
 2. **Unconfined Execution & In-Place Mutation Risks**: Bypassing prompts (`--yolo` / `--dangerously-skip-permissions`) exposes host files, SSH/cloud credentials (`~/.ssh/id_rsa`, `~/.aws/credentials`, `~/.kube/config`), and raw API tokens (`$GITHUB_TOKEN`) to indirect prompt injection and hallucinated corruption.
 3. **Multi-Agent Workspace Collisions & Context Bloat**: Running multiple agents in parallel over a shared working tree causes silent lost updates, binary build artifact conflicts, and stale incremental compiler caches (`mtime` skew), while passing large specifications inline bloats LLM context windows.
 
-**Aegis OS (`aegis-os`)** resolves this dilemma by shifting the authorization boundary from individual tool calls to **transactional workspace boundaries**:
+**Aegis OS (`aegis-os`)** resolves this dilemma by shifting the authorization boundary from individual tool calls to **transactional workspace boundaries**, operating seamlessly both as a **local workstation runtime** and as a **Multi-Tenant Cloud Agent Runtime PaaS (`aegis-cloud`)**:
 
 ```
 ┌────────────────────────────────────────────────────────────────────────────────────────┐
-│   Google Antigravity (agy)         Claude Code (claude)          OpenAI Codex (codex)  │
-│     Principal: agy-<hex>            Principal: claude-code        Principal: codex-cli │
-└──────────────┬────────────────────────────────┬───────────────────────────────┬────────┘
-               │                                │                               │
-               ▼                                ▼                               ▼
+│   Google Antigravity (agy)      Claude Code (claude)      OpenAI Codex / Cloud Swarms  │
+│     Principal: agy-<hex>         Principal: claude-code     Bearer: ak_live_<token>    │
+└──────────────┬─────────────────────────────┬─────────────────────────────┬─────────────┘
+               │                             │                             │
+               ▼                             ▼                             ▼
 ┌────────────────────────────────────────────────────────────────────────────────────────┐
-│  Aegis MCP & Google A2A Runtime Gateway (aos-mcp-gateway)                              │
-│  • 33 MCP Tools + 7 Dynamic URI Resources (stdio & POST /mcp)                          │
-│  • Google A2A Endpoints (GET /.well-known/agent.json, POST /a2a)                       │
-│  • PreInvocation Auto-Rebase & Zero-Prompt Live Collaboration Radar                    │
+│  Aegis MCP, Google A2A & Cloud PaaS Gateway (aos-mcp-gateway)                          │
+│  • 35 MCP Tools + 7 Dynamic URI Resources (stdio, POST /mcp, POST /v1/mcp)             │
+│  • Google A2A Hub (GET /.well-known/agent.json, POST /a2a, POST /v1/a2a)               │
+│  • Cloud PaaS API (/v1/workspaces, /v1/workspaces/pr, /v1/tenants/keys, /v1/vault/*)   │
+│  • Embedded Vector Web Mission Control & HITL Approval Console (GET /dashboard)        │
 └───────────────────────────────────────────────┬────────────────────────────────────────┘
                                                 ▼
 ┌────────────────────────────────────────────────────────────────────────────────────────┐
@@ -42,9 +43,9 @@ Autonomous coding agents such as **Google Antigravity (`agy`)**, **Anthropic Cla
 │ Transactional VFS │  │ Dual-Tier OS Sandbox  │  │ A2A IPC Bus & CAS    │  │ Zero-Trust Egress  │
 │ (aos-vfs)         │  │ (aos-sandbox)         │  │ (aos-ipc + aos-vfs)  │  │ (aos-egress)       │
 │ • APFS clonefile  │  │ • macOS sandbox-exec  │  │ • Global Peer List   │  │ • Identity-Pinned  │
-│ • Instant Rollback│  │ • Linux bwrap/MicroVM │  │ • A2A AgentCard/Task │  │   Loopback Proxy   │
-│ • 4-Tier LCS Diff3│  │ • Exact Port Filter   │  │ • Enforced Claims    │  │ • $AOS_SECRET_*    │
-│ • mtime Sync      │  │ • Separate cargo cache│  │ • artifact://sha256  │  │   Boundary Inject  │
+│ • Linux FICLONE   │  │ • Linux bwrap/MicroVM │  │ • A2A AgentCard/Task │  │   Loopback Proxy   │
+│ • 4-Tier LCS Diff3│  │ • Exact Port Filter   │  │ • Enforced Claims    │  │ • Domain + Path    │
+│ • Git-to-PR Export│  │ • Separate cargo cache│  │ • artifact://sha256  │  │   $AOS_SECRET_*    │
 └───────────────────┘  └───────────────────────┘  └──────────────────────┘  └────────────────────┘
 ```
 
@@ -52,8 +53,8 @@ Autonomous coding agents such as **Google Antigravity (`agy`)**, **Anthropic Cla
 
 ## Core Architectural Pillars
 
-### 1. Transactional APFS Copy-on-Write VFS & 4-Tier Auto-Rebase/Merge (`aos-vfs`)
-- **Millisecond Shadow Forking**: Clones repositories into `<runtime_dir>/orgs/<org>/agents/<agent>/cow_workspace/upper_workspace/` via macOS APFS `libc::clonefile` in **`0.71–6.28 ms`** (for 100–1,000 files), allocating physical disk blocks only for modified files.
+### 1. Transactional Copy-on-Write VFS & 4-Tier Auto-Rebase/Merge (`aos-vfs`)
+- **Millisecond Zero-Copy Shadow Forking**: Clones repositories into `<runtime_dir>/orgs/<org>/agents/<agent>/cow_workspace/upper_workspace/` via **macOS APFS `libc::clonefile`** or **Linux Btrfs/XFS `ioctl(FICLONE)` reflink** in **`0.71–6.28 ms`** (for 100–1,000 files), allocating physical disk blocks only for modified files.
 - **Continuous Auto-Rebase & `mtime` Sync**: Automatically runs `refresh_from_host()` at every turn start (`PreInvocation`) and workspace tool boundary (`workspace_status`, `workspace_sync`, `workspace_diff`, `workspace_commit`), bumping file `mtime`s on fast-forwarded and merged files so incremental compilers (`cargo`) always recompile peer-updated dependencies.
 - **4-Tier Conflict Resolution Engine (`three_way_merge_lines`)**:
   1. **Tier 1 (Zero-Copy Fast-Forward)**: Untouched text and binary files updated on the host by peer agents are fast-forwarded into the shadow workspace and baseline snapshot automatically.
@@ -61,9 +62,9 @@ Autonomous coding agents such as **Google Antigravity (`agy`)**, **Anthropic Cla
   3. **Tier 3 (Non-Destructive Conflict Isolation)**: True overlapping same-line conflicts never corrupt shadow source files with `<<<<<<<` markers; instead, `RefreshReport.conflict_details` records the exact file, line number, and both versions, pushing an `[Aegis-OS Merge Conflict Alert]` to the agent at `PreInvocation`.
   4. **Tier 4 (Binary Artifact Guard)**: Prevents accidental overwrite of concurrently generated binary artifacts (`.pdf`, `.tar.gz`), supporting scoped `paths` commits or explicit `overwrite_binaries: true`.
 
-### 2. Dual-Tier Kernel Sandbox & Identity-Pinned Egress Proxy (`aos-sandbox`, `aos-egress`)
+### 2. Dual-Tier Kernel Sandbox & Confused-Deputy-Safe Egress Proxy (`aos-sandbox`, `aos-egress`)
 - **Mandatory Access Control**: Executes every `proc_exec` command under macOS Seatbelt (`/usr/bin/sandbox-exec`) or Linux Bubblewrap (`/usr/bin/bwrap --unshare-all`) with a sanitized environment (`env_clear()`), denying all writes outside the shadow workspace (`(deny file-write*)`), blocking reads to `~/.ssh`, `~/.aws`, `~/.gnupg`, `~/.kube`, `~/.npmrc`, and Keychains, and redirecting `CARGO_TARGET_DIR` outside the rollback tree.
-- **Boundary Secret Injection**: Agents receive only opaque `$AOS_SECRET_*` placeholders. Outbound requests traverse an identity-pinned local TCP proxy (`127.0.0.1:<port>`) enforced by Seatbelt `(allow network-outbound (remote ip "localhost:<port>"))`, which injects real credentials only when the destination `Host` matches the secret's domain binding and rejects cross-domain exfiltration with `HTTP/1.1 403 Forbidden`.
+- **Domain + Method + Path-Prefix Boundary Secret Injection**: Agents receive only opaque `$AOS_SECRET_*` placeholders. Outbound requests traverse an identity-pinned local TCP proxy (`127.0.0.1:<port>`) enforced by Seatbelt `(allow network-outbound (remote ip "localhost:<port>"))`, which injects real credentials only when the destination `Host`, HTTP method, and URL path prefix match the secret's `SecretScopeRule` (preventing Confused Deputy attacks across unauthorized API paths) and rejects exfiltration with `HTTP/1.1 403 Forbidden`.
 
 ### 3. Google A2A Inter-Agent IPC, Global Peer Discovery & Live Collaboration Radar (`aos-ipc`, `aos-cli`)
 - **Global Workstation Peer List & Zombie PID Pruning**: Discovers peers across both the current organization and all repositories on the workstation (`ipc_list_peers(scope="global")`, `<org_id>/<agent_id>` addressing), automatically pruning dead or PID-recycled client processes via kernel process start-time verification (`PROC_PIDTBSDINFO` / `/proc/<pid>/stat`).
@@ -72,47 +73,75 @@ Autonomous coding agents such as **Google Antigravity (`agy`)**, **Anthropic Cla
 - **Reference-Based CAS (`FilePart`)**: Publishes large specifications to Content-Addressable Storage (`artifact://<org>/sha256:<hash>`), reducing in-transit IPC payload tokens by **99.85%**.
 
 ### 4. Cedar-Inspired 5-Stage Policy Engine & Commit-Time Poisoning Guards (`aos-policy`)
-- Evaluates every syscall across five priority tiers: **R0a** (Host Red-Line Deny), **R0b** (Commit-Time Hook & CI Guard forcing human review on `.git/hooks/*`, `.git/config`, `.envrc`, `.github/workflows/*` even under an active lease), **R1** (Cross-Tenant Gate), **R2** (One-Shot `ttl=0` or TTL-Scoped `LeaseGrant`), **R3** (Green-Zone Auto-Allow with 0 prompts), and **R4** (Human-Readable Boundary Escalation).
+- Evaluates every syscall across five priority tiers: **R0a** (Host Red-Line Deny), **R0b** (Commit-Time Hook & CI Guard forcing human review on `.git/hooks/*`, `.git/config`, `.envrc`, `.github/workflows/*` even under an active lease), **R1** (Cross-Tenant Gate), **R2** (One-Shot `ttl=0` or TTL-Scoped `LeaseGrant`), **R3** (Green-Zone Auto-Allow with 0 prompts), and **R4** (Human-Readable Boundary Escalation with explicit `approve_escalation` / `deny_escalation`).
+
+### 5. Aegis Cloud PaaS Control Plane, Git-to-PR Pipeline & Vector Web Mission Control (`aos-mcp-gateway::paas`)
+- **Scoped Multi-Tenant API Keys (`ak_live_*`)**: Issues SHA-256 hashed Bearer tokens (`POST /v1/tenants/keys`) cryptographically bound to `(org_id, agent_id, role, workspace_id)`, authenticating remote agent swarms over `POST /v1/mcp` and `POST /v1/a2a` without trusting client-supplied identity headers.
+- **Cloud Git Workspace Provisioning & Automated PR Export**: `POST /v1/workspaces` provisions a base repository and forks parallel CoW agent environments in `<10ms`. When an agent finishes coding, `POST /v1/workspaces/pr` (or the `workspace_export_pr` MCP tool) reconciles changes via the 4-Tier LCS Diff3 Engine, commits onto a dedicated Git branch, and exports the commit SHA, `git format-patch` unified diff, and GitHub Pull Request payload.
+- **Embedded Vector Web Mission Control & HITL Approval Console (`GET /dashboard`)**: Single-binary, pure-SVG 4-view web console served at `http://127.0.0.1:7080/dashboard`:
+  1. **Overview & HITL Approvals**: 3-step architectural mental model banner, clickable KPI cards, one-click boundary escalation queue (`Approve Once (ttl=0)`, `Grant 15m Lease`, `Grant 1h Lease`, `Deny`), interactive escalation simulator (`POST /v1/approvals/simulate`), and split Live Peer Radar + Google A2A Tasks tables.
+  2. **CoW Workspaces & Git-to-PR**: Cloud workspace provisioner and slide-over Unified Diff Patch Inspector modal.
+  3. **Zero-Trust Secret Vault & Active Leases**: Domain + path-prefix `$AOS_SECRET_*` binding and live lease TTL countdowns.
+  4. **Connect Agent & API Keys**: One-click `ak_live_*` key minter that auto-populates copy-pasteable `mcp_config.json` and `curl` snippets.
 
 ---
 
-## MCP Tools, Dynamic URI Resources & A2A Endpoints
+## MCP Tools, Dynamic URI Resources & Cloud PaaS Endpoints
 
-| Subsystem | MCP Tools / Resources / Endpoints | Default Policy & Runtime Semantics |
+| Subsystem | MCP Tools / Resources / HTTP Endpoints | Default Policy & Runtime Semantics |
 | :--- | :--- | :--- |
 | **Transactional VFS** (`aos-vfs`, 7 tools) | `fs_read`, `fs_write`, `fs_edit`, `fs_delete`, `fs_glob`, `workspace_status`, `workspace_sync` | **Auto-Allow (0 Prompts)**: Confined to CoW shadow workspace; auto-rebases from host |
-| **Time-Travel & Merge** (`aos-vfs`, 4 tools) | `workspace_snapshot`, `workspace_diff`, `workspace_rollback`, `workspace_commit` | Snapshots/Diff/Rollback **Auto-Allow**; `workspace_commit` **Approval/Lease Gate** |
+| **Time-Travel, Merge & PR** (`aos-vfs`, 5 tools) | `workspace_snapshot`, `workspace_diff`, `workspace_rollback`, `workspace_commit`, `workspace_export_pr` | Snapshots/Diff/Rollback **Auto-Allow**; `workspace_commit` & `workspace_export_pr` **Approval/Lease Gate** |
 | **OS Process Sandbox** (`aos-sandbox`, 1 tool) | `proc_exec` | **Auto-Allow (0 Prompts)**: Kernel Seatbelt/`bwrap` confinement; blocks credential reads |
 | **Inter-Agent IPC & Claims** (`aos-ipc`, 10 tools) | `ipc_send`, `ipc_recv`, `ipc_request`, `ipc_reply`, `ipc_ack`, `ipc_publish`, `ipc_subscribe`, `ipc_list_peers`, `coord_claim`, `coord_release` | **Auto-Allow Intra-Org & Verified Workstation Peers**: Enforces cooperative file claims |
-| **Google A2A Protocol** (`aos-ipc`, 4 tools + HTTP) | `ipc_update_card`, `ipc_task_update`, `ipc_task_get`, `ipc_task_list` + `GET /.well-known/agent.json`, `POST /a2a` | **Auto-Allow Discovery & Task Lifecycle**: Dynamic `AgentCard` & stateful `A2ATask` RPC |
+| **Google A2A Protocol** (`aos-ipc`, 4 tools + HTTP) | `ipc_update_card`, `ipc_task_update`, `ipc_task_get`, `ipc_task_list` + `GET /.well-known/agent.json`, `POST /a2a`, `POST /v1/a2a` | **Auto-Allow Discovery & Task Lifecycle**: Dynamic `AgentCard` & stateful `A2ATask` RPC |
 | **Org CAS & KV** (`aos-vfs`, 4 tools) | `org_artifact_publish`, `org_artifact_fetch`, `org_kv_put`, `org_kv_get` | **Auto-Allow Intra-Org**: Cross-org `artifact://` `FilePart` fetch gated by Rule R1 |
-| **Zero-Trust Egress** (`aos-egress`, 1 tool) | `egress_http_request` + Pinned TCP Proxy (`127.0.0.1:<port>`) | **Allowlisted Domains Auto-Allow**: Injects `$AOS_SECRET_*` at boundary; blocks exfil (`403`) |
+| **Zero-Trust Egress** (`aos-egress`, 1 tool) | `egress_http_request` + Pinned TCP Proxy (`127.0.0.1:<port>`) | **Allowlisted Domains + Path Prefixes Auto-Allow**: Injects `$AOS_SECRET_*` at boundary; blocks exfil (`403`) |
 | **Policy & Leases** (`aos-policy`, 3 tools) | `policy_list_escalations`, `policy_approve_escalation`, `policy_grant_lease` | Operator control plane for one-shot (`ttl=0`) or TTL-scoped session leases |
+| **Cloud PaaS Control Plane** (`aos-mcp-gateway`) | `GET /dashboard`, `GET /api/status`, `POST /v1/workspaces`, `POST /v1/workspaces/pr`, `POST /v1/tenants/keys`, `POST /v1/vault/secrets`, `POST /v1/approvals/decide`, `POST /v1/approvals/simulate` | Multi-tenant cloud workspace provisioning, Git-to-PR export, `ak_live_*` auth, and Web HITL console |
 | **Dynamic MCP URIs** (7 resources) | `aegis://workspace/status`, `aegis://ipc/inbox`, `aegis://org/peers`, `aegis://global/peers`, `aegis://a2a/agent-cards`, `aegis://a2a/tasks`, `aegis://org/shared/catalog` | Live introspection for IDE status bars, global peer topology, and A2A task tables |
 
 ---
 
-## Quick Start (Zero-Config for `agy`, `claude`, and `codex`)
+## Quick Start
+
+### 1. Local Workstation Setup (`agy`, `claude`, and `codex`)
 
 ```bash
 # 1. Build & globally configure AGY (MCP + lifecycle hooks), Claude Code, and Codex CLI
 cargo run --release --bin aegis-os -- install
 
-# 2. Verify integration health across all 3 clients
-cargo run --release --bin aegis-os -- doctor
+# 2. Start the background daemon & open the Web Mission Control Console
+cargo run --release --bin aegis-os -- up
+# -> Web Mission Control & HITL Approval UI: http://127.0.0.1:7080/dashboard
+# -> Terminal TUI Mission Control:           cargo run --release --bin aegis-os -- top
+```
 
-# 3. Launch the Mission Control dashboard for the current project
-cargo run --release --bin aegis-os -- top
+### 2. Cloud PaaS API & Multi-Agent Git-to-PR Workflow
 
-# 4. Run the persistent HTTP MCP/A2A daemon & Zero-Trust Egress Proxy
-cargo run --release --bin aegis-os -- daemon --listen 127.0.0.1:7080 --egress-listen 127.0.0.1:18080
+```bash
+# 1. Provision a Cloud Workspace with 2 parallel CoW agent branches (<10ms)
+curl -X POST http://127.0.0.1:7080/v1/workspaces \
+  -H "Content-Type: application/json" \
+  -d '{"org_id":"acme","workspace_id":"ws-payments","source_url":".","agents":["coder-alpha","reviewer-beta"]}'
+
+# 2. Mint a scoped tenant API key (ak_live_*) bound to coder-alpha
+curl -X POST http://127.0.0.1:7080/v1/tenants/keys \
+  -H "Content-Type: application/json" \
+  -d '{"org_id":"acme","agent_id":"coder-alpha","workspace_id":"ws-payments","label":"CI Swarm"}'
+
+# 3. Reconcile CoW edits via 4-Tier LCS Diff3 and export a Git branch + Unified Diff Patch
+curl -X POST http://127.0.0.1:7080/v1/workspaces/pr \
+  -H "Authorization: Bearer ak_live_<your_key>" \
+  -H "Content-Type: application/json" \
+  -d '{"org_id":"acme","workspace_id":"ws-payments","agent_id":"coder-alpha","branch_name":"aegis/coder-alpha/feat"}'
 ```
 
 ---
 
 ## Empirical Benchmark Suite (`aegis-os bench`)
 
-Reproduce all unit tests and all five live empirical experiments from our research paper ([`paper/aegis_os_arxiv_preprint.pdf`](paper/aegis_os_arxiv_preprint.pdf) and [`BENCHMARK_REPORT.md`](BENCHMARK_REPORT.md)):
+Reproduce all 38 unit/integration tests and all five live empirical experiments from our research paper ([`paper/aegis_os_arxiv_preprint.pdf`](paper/aegis_os_arxiv_preprint.pdf) and [`BENCHMARK_REPORT.md`](BENCHMARK_REPORT.md)):
 
 ```bash
 cargo test --workspace
@@ -134,14 +163,14 @@ cargo run --release --bin aegis-os -- bench --report-out BENCHMARK_REPORT.md
 ## Workspace Architecture
 
 - [`crates/aos-core`](crates/aos-core): Core traits, syscall contracts, Google A2A state machine (`AgentCard`, `AgentSkill`, `A2ATask`, `A2APart`), session binding, and glob claim primitives.
-- [`crates/aos-policy`](crates/aos-policy): Cedar-inspired 5-stage policy engine (`R0a`–`R4`), commit-time hook/CI poisoning guard, human-readable escalation queue, and TTL session leases.
-- [`crates/aos-vfs`](crates/aos-vfs): APFS `libc::clonefile` CoW shadow workspace, snapshots, 4-tier LCS Diff3 + Superset 3-Way Merge Engine, `mtime` sync, and Org CAS/KV store.
+- [`crates/aos-policy`](crates/aos-policy): Cedar-inspired 5-stage policy engine (`R0a`–`R4`), commit-time hook/CI poisoning guard, human-readable escalation queue (`approve_escalation` / `deny_escalation`), wildcard tenant introspection (`org_id = "*"`), and TTL session leases.
+- [`crates/aos-vfs`](crates/aos-vfs): Cross-platform CoW shadow workspace (macOS APFS `libc::clonefile` + Linux Btrfs/XFS `ioctl(FICLONE)` reflink), snapshots, 4-tier LCS Diff3 + Superset 3-Way Merge Engine, `mtime` sync, and Org CAS/KV store.
 - [`crates/aos-ipc`](crates/aos-ipc): Global & intra-org peer registry with kernel PID zombie pruning, Google A2A task lifecycle, P2P mailboxes, correlated RPC handoff, and topic Pub/Sub.
 - [`crates/aos-sandbox`](crates/aos-sandbox): Dual-tier OS sandbox driver (`NativeOsSandboxDriver` via macOS Seatbelt / Linux `bwrap`, and `MicroVmSandboxDriver`).
-- [`crates/aos-egress`](crates/aos-egress): Identity-pinned Zero-Trust TCP HTTP Egress Proxy with boundary secret injection (`$AOS_SECRET_*`).
+- [`crates/aos-egress`](crates/aos-egress): Identity-pinned Zero-Trust TCP HTTP Egress Proxy with domain, HTTP method, and URL path-prefix boundary secret injection (`$AOS_SECRET_*`).
 - [`crates/aos-recorder`](crates/aos-recorder): Append-only JSONL flight recorder for syscalls and security telemetry.
-- [`crates/aos-mcp-gateway`](crates/aos-mcp-gateway): Unified MCP JSON-RPC & Google A2A server over `stdio` and HTTP (`POST /mcp`, `GET /.well-known/agent.json`, `POST /a2a`).
-- [`crates/aos-cli`](crates/aos-cli): Unified `aegis-os` binary (`install`, `doctor`, `top`, `daemon`, `agy-hook`, `workspace`, `policy`, `ipc`, `bench`, `demo`), MCP-first routing, and `PreInvocation` Live Collaboration Radar.
+- [`crates/aos-mcp-gateway`](crates/aos-mcp-gateway): Unified MCP JSON-RPC & Google A2A server (`lib.rs`) and Cloud PaaS Control Plane & Embedded Vector Web Mission Control Console (`paas.rs`).
+- [`crates/aos-cli`](crates/aos-cli): Unified `aegis-os` binary (`up`, `down`, `status`, `install`, `doctor`, `top`, `daemon`, `agy-hook`, `workspace`, `policy`, `ipc`, `bench`, `demo`), MCP-first routing, and `PreInvocation` Live Collaboration Radar.
 - [`paper/`](paper): LaTeX preprint (`main.tex`, `references.bib`, `aegis_os_arxiv_preprint.pdf`) and automated arXiv submission packager (`build_arxiv.sh`, `arxiv_submission.tar.gz`).
 
 ---
@@ -150,13 +179,13 @@ cargo run --release --bin aegis-os -- bench --report-out BENCHMARK_REPORT.md
 
 We are evolving **Aegis OS** from a local workstation runtime into a **Multi-Tenant Cloud Agent Runtime PaaS** — *"The Cloudflare Workers + Neon Branching for Multi-Agent Systems"*:
 
-### Phase 1: Linux Cloud Runtime, Multi-Tenant Control Plane, Git-to-PR & Embedded Approval UI
+### Phase 1: Linux Cloud Runtime, Multi-Tenant Control Plane, Git-to-PR & Embedded Approval UI (Completed)
 - [x] **Linux `ioctl(FICLONE)` Reflink CoW & Scale-to-Zero Compute Pool**: Native zero-copy CoW workspace branching (`< 10 ms`) on Linux Btrfs/XFS cloud hosts alongside macOS APFS `clonefile`, paired with Linux `bwrap` / Firecracker MicroVM confinement and auto-idle `pause()` / `resume()`.
 - [x] **Multi-Tenant API Gateway & Bearer Token Auth (`ak_live_*`)**: Scoped tenant API keys (`POST /v1/tenants/keys`), hosted Streamable HTTP + SSE MCP (`POST /v1/mcp`), and hosted Google A2A hub (`POST /v1/a2a`) with method/path-scoped `$AOS_SECRET_*` vault rules (`POST /v1/vault/secrets`).
 - [x] **Cloud Git Workspace Provisioning & Automated PR Export**: Provision shared project workspaces directly from GitHub repositories (`POST /v1/workspaces`), fork parallel agent CoW branches in milliseconds, reconcile concurrent edits via the 4-Tier LCS Diff3 Engine, and export merged changes directly to a Git branch / Pull Request (`POST /v1/workspaces/pr`, `workspace_export_pr`).
-- [x] **Embedded Web Mission Control & HITL Approval Dashboard**: Single-binary Web UI served by `aegis-os daemon` (`GET /dashboard`) displaying live CoW workspace diffs, active peers/claims, A2A task states, and one-click boundary approvals (`[Approve Once]`, `[Grant 1h Lease]`, `[Reject / Deny]`).
+- [x] **Embedded Vector Web Mission Control & HITL Approval Console**: Single-binary, pure-SVG 4-view Web UI served by `aegis-os daemon` (`GET /dashboard`) with live CoW workspace provisioning, PR Unified Diff modal inspector, interactive escalation simulator (`POST /v1/approvals/simulate`), and one-click boundary approvals (`[Approve Once]`, `[Grant 15m Lease]`, `[Grant 1h Lease]`, `[Deny]`).
 
-### Phase 2: Lark / Slack Webhooks, Cloud SDKs & Enterprise BYOC
+### Phase 2: Lark / Slack Webhooks, Cloud SDKs & Enterprise BYOC (Next)
 - [ ] **Lark (Feishu) & Slack Interactive Approval Webhooks**: Push interactive diff summaries and lease approval buttons directly to Lark and Slack channels whenever cloud agents hit `R0b` / `R4` boundaries.
 - [ ] **Python & TypeScript Cloud SDKs (`aegis-cloud`)**: Ergonomic SDKs for orchestrating multi-agent swarms across Claude API, OpenAI Responses API, LangGraph, AutoGen, and CrewAI.
 - [ ] **Usage Metering & Time-Travel Trajectory Replay**: Per-tenant CPU-ms / CoW storage metering and interactive replay of `aos-recorder` flight logs and CoW snapshots.

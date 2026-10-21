@@ -2323,7 +2323,7 @@ impl AegisRuntimeKernel {
                             || full_target.starts_with("/ui"))
                     {
                         content_type = "text/html; charset=utf-8";
-                        ("HTTP/1.1 200 OK", paas::DASHBOARD_HTML.to_string())
+                        ("HTTP/1.1 200 OK", paas::render_dashboard_html(&bound_ws_path))
                     } else if method == "GET" && full_target.starts_with("/health") {
                         (
                             "HTTP/1.1 200 OK",
@@ -2585,6 +2585,74 @@ impl AegisRuntimeKernel {
                                     json!({ "error": e.to_string() }).to_string(),
                                 ),
                             }
+                        }
+                    } else if method == "POST" && full_target.starts_with("/v1/approvals/simulate") {
+                        let payload: Value = serde_json::from_str(body_str.trim()).unwrap_or_else(|_| json!({}));
+                        let s_org = payload
+                            .get("org_id")
+                            .and_then(|v| v.as_str())
+                            .filter(|s| !s.is_empty() && *s != "*")
+                            .unwrap_or("aegis-os");
+                        let s_agent = payload
+                            .get("agent_id")
+                            .and_then(|v| v.as_str())
+                            .filter(|s| !s.is_empty())
+                            .unwrap_or("coder-alpha");
+                        let s_action = payload
+                            .get("action")
+                            .and_then(|v| v.as_str())
+                            .filter(|s| !s.is_empty())
+                            .unwrap_or("workspace_commit");
+                        let s_files: Vec<String> = payload
+                            .get("files")
+                            .and_then(|v| serde_json::from_value(v.clone()).ok())
+                            .unwrap_or_else(|| {
+                                vec![
+                                    "src/payment_engine.rs".to_string(),
+                                    "tests/idempotency_test.rs".to_string(),
+                                ]
+                            });
+                        let mut ctx = PolicyContext {
+                            principal: AgentIdentity::new(s_org, s_agent, "Aegis Cloud Agent"),
+                            action: s_action.to_string(),
+                            target_org_id: s_org.to_string(),
+                            target_resource: "/workspace".to_string(),
+                            metadata: json!({
+                                "paths": s_files,
+                                "host_root": bound_ws_path.display().to_string(),
+                                "simulated": true
+                            }),
+                        };
+                        let mut decision = k.policy.evaluate(&ctx).await;
+                        if matches!(decision, Ok(PolicyDecision::Allow { .. })) {
+                            // If `s_agent` already holds an active lease, suffix a fresh instance ID so the demo button always produces a pending escalation.
+                            let fresh_agent = format!("{}-{}", s_agent, &Uuid::new_v4().to_string()[..4]);
+                            ctx.principal = AgentIdentity::new(s_org, &fresh_agent, "Aegis Cloud Agent");
+                            decision = k.policy.evaluate(&ctx).await;
+                        }
+                        match decision {
+                            Ok(PolicyDecision::Ask {
+                                escalation_id,
+                                reason,
+                                suggested_lease_scope,
+                            }) => (
+                                "HTTP/1.1 200 OK",
+                                json!({
+                                    "status": "simulated",
+                                    "escalation_id": escalation_id,
+                                    "reason": reason,
+                                    "suggested_lease_scope": suggested_lease_scope
+                                })
+                                .to_string(),
+                            ),
+                            Ok(other) => (
+                                "HTTP/1.1 200 OK",
+                                json!({ "status": "evaluated", "decision": other }).to_string(),
+                            ),
+                            Err(e) => (
+                                "HTTP/1.1 500 Internal Server Error",
+                                json!({ "error": e.to_string() }).to_string(),
+                            ),
                         }
                     } else if method == "POST"
                         && (full_target.starts_with("/mcp")
@@ -2910,14 +2978,35 @@ mod tests {
             (head.to_string(), parsed)
         }
 
-        // 1. Verify Embedded Web Mission Control Dashboard (`GET /dashboard`)
+        // 1. Verify Embedded Web Mission Control Dashboard (`GET /dashboard`) and simulation endpoint (`POST /v1/approvals/simulate`)
         let (dash_head, dash_body) = http_call(addr, "GET", "/dashboard", None, None).await;
         assert!(dash_head.contains("200 OK"));
         assert!(dash_head.contains("text/html"));
-        assert!(dash_body["html"]
-            .as_str()
-            .unwrap()
-            .contains("Aegis Cloud PaaS — Mission Control"));
+        let html_str = dash_body["html"].as_str().unwrap();
+        assert!(html_str.contains("Aegis Cloud PaaS — Mission Control"));
+        assert!(html_str.contains("<svg"));
+        assert!(!html_str.chars().any(|c| ('\u{1F300}'..='\u{1FAFF}').contains(&c)));
+
+        let (sim_head, sim_resp) = http_call(
+            addr,
+            "POST",
+            "/v1/approvals/simulate",
+            None,
+            Some(json!({ "org_id": "acme-cloud", "agent_id": "demo-agent" })),
+        )
+        .await;
+        assert!(sim_head.contains("200 OK"));
+        assert_eq!(sim_resp["status"], "simulated");
+        let sim_esc_id = sim_resp["escalation_id"].as_str().unwrap();
+        let (_, deny_resp) = http_call(
+            addr,
+            "POST",
+            "/v1/approvals/decide",
+            None,
+            Some(json!({ "escalation_id": sim_esc_id, "decision": "deny" })),
+        )
+        .await;
+        assert_eq!(deny_resp["status"], "denied");
 
         // 2. Provision a Cloud Workspace (`POST /v1/workspaces`) with 2 parallel CoW agent branches
         let (ws_head, ws_resp) = http_call(
