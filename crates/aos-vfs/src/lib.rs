@@ -409,8 +409,15 @@ impl CoWWorkspace {
     /// - Linux (Btrfs / XFS / OCFS2): `libc::ioctl(dst_fd, FICLONE, src_fd)` (`0x40049409`)
     /// Falls back transparently to `tokio::fs::copy` if across filesystems or on non-CoW mounts.
     pub async fn cow_clone_file(src: &Path, dst: &Path) -> anyhow::Result<()> {
+        let (src, dst) = (src.to_path_buf(), dst.to_path_buf());
+        tokio::task::spawn_blocking(move || Self::cow_clone_file_blocking(&src, &dst)).await?
+    }
+
+    /// Blocking implementation of [`Self::cow_clone_file`]. Directory-level callers use it directly
+    /// so a whole tree is cloned on one thread instead of hopping to the blocking pool per file.
+    pub fn cow_clone_file_blocking(src: &Path, dst: &Path) -> anyhow::Result<()> {
         if dst.exists() {
-            let _ = tokio::fs::remove_file(dst).await;
+            let _ = std::fs::remove_file(dst);
         }
         #[cfg(target_os = "macos")]
         {
@@ -495,7 +502,7 @@ impl CoWWorkspace {
                 }
             }
         }
-        tokio::fs::copy(src, dst).await?;
+        std::fs::copy(src, dst)?;
         // Plain copies get mtime = now; keep the source's so unchanged files stay fingerprint-equal.
         if let Ok(m) = std::fs::metadata(src).and_then(|m| m.modified()) {
             if let Ok(f) = std::fs::OpenOptions::new().write(true).open(dst) {
@@ -557,11 +564,16 @@ impl CoWWorkspace {
     /// atomic kernel metadata operation (O(1) time & zero disk blocks) while automatically skipping
     /// heavy build/VCS directories (`.git`, `target`, `node_modules`, `.aegis_os`, `.gemini`).
     pub async fn cow_sync_dir(src: &Path, dst: &Path) -> anyhow::Result<()> {
+        let (src, dst) = (src.to_path_buf(), dst.to_path_buf());
+        tokio::task::spawn_blocking(move || Self::cow_sync_dir_blocking(&src, &dst)).await?
+    }
+
+    fn cow_sync_dir_blocking(src: &Path, dst: &Path) -> anyhow::Result<()> {
         if dst.exists() {
-            tokio::fs::remove_dir_all(dst).await?;
+            std::fs::remove_dir_all(dst)?;
         }
         if let Some(parent) = dst.parent() {
-            tokio::fs::create_dir_all(parent).await?;
+            std::fs::create_dir_all(parent)?;
         }
 
         #[cfg(target_os = "macos")]
@@ -579,18 +591,18 @@ impl CoWWorkspace {
             }
         }
 
-        tokio::fs::create_dir_all(dst).await?;
+        std::fs::create_dir_all(dst)?;
         let mut stack = vec![(src.to_path_buf(), dst.to_path_buf())];
         while let Some((cur_src, cur_dst)) = stack.pop() {
-            let mut rd = tokio::fs::read_dir(&cur_src).await?;
-            while let Some(entry) = rd.next_entry().await? {
+            for entry in std::fs::read_dir(&cur_src)? {
+                let entry = entry?;
                 let name = entry.file_name().to_string_lossy().to_string();
                 if Self::is_ignored_dir_name(&name) {
                     continue;
                 }
                 let entry_src = entry.path();
                 let entry_dst = cur_dst.join(&name);
-                let ft = entry.file_type().await?;
+                let ft = entry.file_type()?;
                 if ft.is_dir() {
                     #[cfg(target_os = "macos")]
                     if !Self::contains_ignored_subdir(&entry_src, 1) {
@@ -605,10 +617,10 @@ impl CoWWorkspace {
                             }
                         }
                     }
-                    tokio::fs::create_dir_all(&entry_dst).await?;
+                    std::fs::create_dir_all(&entry_dst)?;
                     stack.push((entry_src, entry_dst));
                 } else if ft.is_file() {
-                    Self::cow_clone_file(&entry_src, &entry_dst).await?;
+                    Self::cow_clone_file_blocking(&entry_src, &entry_dst)?;
                 }
             }
         }
