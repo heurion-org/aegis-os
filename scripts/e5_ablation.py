@@ -33,7 +33,9 @@ FEATURES = re.compile(r"Aegis-OS:\s*(\d)/3")
 
 
 def run(binary, ablate, extra):
+    binary = os.path.abspath(binary)
     env = dict(os.environ)
+    env["AEGIS_BENCH_ABLATION_FAST"] = "1"
     if ablate == "none":
         env.pop("AOS_ABLATE", None)
     else:

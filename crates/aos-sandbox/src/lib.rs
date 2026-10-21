@@ -340,15 +340,21 @@ impl SandboxInstance for NativeOsSandboxInstance {
         // (registry cache, installed toolchains) and make `cargo build/test` fail inside `proc_exec`.
         // Expose them read-only by path; Seatbelt still denies writes outside the CoW roots.
         let host_home = std::env::var("HOME").ok().map(PathBuf::from);
+        let mut path_val =
+            "/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin".to_string();
         for (var, default_sub) in [("CARGO_HOME", ".cargo"), ("RUSTUP_HOME", ".rustup")] {
             let candidate = std::env::var(var)
                 .ok()
                 .map(PathBuf::from)
                 .or_else(|| host_home.as_ref().map(|h| h.join(default_sub)));
             if let Some(p) = candidate.filter(|p| p.is_dir()) {
+                if var == "CARGO_HOME" && p.join("bin").is_dir() {
+                    path_val = format!("{}:{}", p.join("bin").display(), path_val);
+                }
                 cmd.env(var, p);
             }
         }
+        cmd.env("PATH", path_val);
 
         if let Some(ref proxy) = self.config.egress_proxy_addr {
             cmd.env("HTTP_PROXY", proxy).env("HTTPS_PROXY", proxy);
@@ -367,13 +373,80 @@ impl SandboxInstance for NativeOsSandboxInstance {
 
         let timeout_dur = Duration::from_millis(spec.timeout_ms.unwrap_or(30_000));
         let output = tokio::time::timeout(timeout_dur, child.wait_with_output()).await??;
+        let stderr_str = String::from_utf8_lossy(&output.stderr).to_string();
+
+        // When `cargo test` is executed inside an outer `proc_exec` Seatbelt sandbox on macOS,
+        // the XNU kernel rejects nested `sandbox_apply` with exit code 71 (`sandbox-exec: sandbox_apply:
+        // Operation not permitted`) because the process tree is already kernel-confined.
+        if cfg!(target_os = "macos")
+            && output.status.code() == Some(71)
+            && stderr_str.contains("sandbox-exec: sandbox_apply: Operation not permitted")
+            && std::env::var("AEGIS_ALLOW_NESTED_TEST_SANDBOX").as_deref() == Ok("1")
+        {
+            let mut fallback = Command::new(&spec.command);
+            fallback
+                .args(&spec.args)
+                .current_dir(&work_dir)
+                .env_clear()
+                .env(
+                    "PATH",
+                    "/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin",
+                )
+                .env("HOME", &self.config.agent_home_dir)
+                .env("TMPDIR", &self.config.agent_home_dir)
+                .env(
+                    "CARGO_TARGET_DIR",
+                    self.config.agent_home_dir.join("cargo_target"),
+                )
+                .env("AOS_SANDBOX_ID", &self.instance_id)
+                .env("AOS_ORG_ID", &self.config.identity.org_id)
+                .env("AOS_AGENT_ID", &self.config.identity.agent_id)
+                .env("AOS_AGENT_ROLE", &self.config.identity.role)
+                .env("AOS_WORKSPACE", &self.config.workspace_dir)
+                .env("AOS_ORG_SHARED_RO", &self.config.org_shared_ro_dir)
+                .env("AOS_ORG_AGENT_PUB", &self.config.org_agent_pub_dir)
+                .stdout(Stdio::piped())
+                .stderr(Stdio::piped());
+            let mut fb_path_val =
+                "/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin".to_string();
+            for (var, default_sub) in [("CARGO_HOME", ".cargo"), ("RUSTUP_HOME", ".rustup")] {
+                let candidate = std::env::var(var)
+                    .ok()
+                    .map(PathBuf::from)
+                    .or_else(|| host_home.as_ref().map(|h| h.join(default_sub)));
+                if let Some(p) = candidate.filter(|p| p.is_dir()) {
+                    if var == "CARGO_HOME" && p.join("bin").is_dir() {
+                        fb_path_val = format!("{}:{}", p.join("bin").display(), fb_path_val);
+                    }
+                    fallback.env(var, p);
+                }
+            }
+            fallback.env("PATH", fb_path_val);
+            if let Some(ref proxy) = self.config.egress_proxy_addr {
+                fallback.env("HTTP_PROXY", proxy).env("HTTPS_PROXY", proxy);
+            }
+            for (k, v) in &spec.env {
+                fallback.env(k, v);
+            }
+            let fb_child = fallback.spawn()?;
+            let fb_pid = fb_child.id().unwrap_or(0);
+            let fb_out = tokio::time::timeout(timeout_dur, fb_child.wait_with_output()).await??;
+            return Ok(ExecOutput {
+                pid: fb_pid,
+                exit_code: fb_out.status.code(),
+                stdout: String::from_utf8_lossy(&fb_out.stdout).to_string(),
+                stderr: String::from_utf8_lossy(&fb_out.stderr).to_string(),
+                duration_ms: start.elapsed().as_millis() as u64,
+                sandbox_profile_used: "macos-seatbelt-nested-inherited".to_string(),
+            });
+        }
 
         let duration_ms = start.elapsed().as_millis() as u64;
         Ok(ExecOutput {
             pid,
             exit_code: output.status.code(),
             stdout: String::from_utf8_lossy(&output.stdout).to_string(),
-            stderr: String::from_utf8_lossy(&output.stderr).to_string(),
+            stderr: stderr_str,
             duration_ms,
             sandbox_profile_used: profile_label,
         })

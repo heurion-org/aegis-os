@@ -102,6 +102,29 @@ impl AegisPolicyKernel {
         false
     }
 
+    /// Returns true if a relative workspace path can trigger automatic code execution on the host
+    /// during git operations, directory entry (`direnv`), CI runs, or build-system invocation
+    /// (`build.rs`, `Makefile`, `package.json`, `.cargo/config.toml`, `.vscode/tasks.json`).
+    pub fn is_commit_poisoning_path(p: &str) -> bool {
+        let norm = p.trim_start_matches("./").trim_start_matches('/');
+        let file_name = norm.rsplit('/').next().unwrap_or(norm);
+        norm.contains(".git/hooks")
+            || norm.contains(".git/config")
+            || norm == ".gitmodules"
+            || norm.ends_with(".envrc")
+            || norm.contains(".github/workflows")
+            || norm == ".gitlab-ci.yml"
+            || norm.contains(".cargo/config")
+            || norm.contains(".vscode/tasks.json")
+            || norm.contains(".vscode/launch.json")
+            || file_name == "build.rs"
+            || file_name == "Makefile"
+            || file_name == "GNUmakefile"
+            || file_name == "CMakeLists.txt"
+            || file_name == "package.json"
+            || file_name == "setup.py"
+    }
+
     async fn check_active_lease(&self, ctx: &PolicyContext) -> Option<LeaseGrant> {
         self.reload_from_disk().await;
         let now_ms = Utc::now().timestamp_millis();
@@ -238,19 +261,26 @@ impl PolicyEngine for AegisPolicyKernel {
             }
         }
 
-        // 2b. Commit-Time Poisoning Guard: Even if an active session lease exists, committing
-        // modifications to git hooks or shell auto-execution files requires explicit human escalation.
+        // 2b. Commit-Time Poisoning Guard: Even if an active general session lease exists, committing
+        // modifications to git hooks, direnv, CI workflows, or build scripts (`build.rs`, `Makefile`,
+        // `package.json`, `.cargo/config.toml`) requires explicit human escalation (`workspace_commit_sensitive`).
         if ctx.action == "workspace_commit" && !aos_core::ablated("commit_guard") {
             if let Some(paths) = ctx.metadata.get("paths").and_then(|v| v.as_array()) {
                 for p in paths.iter().filter_map(|x| x.as_str()) {
-                    if p.contains(".git/hooks")
-                        || p.contains(".git/config")
-                        || p.ends_with(".envrc")
-                        || p.contains(".github/workflows")
-                    {
+                    if Self::is_commit_poisoning_path(p) {
+                        let sensitive_ctx = PolicyContext {
+                            principal: ctx.principal.clone(),
+                            action: "workspace_commit_sensitive".to_string(),
+                            target_org_id: ctx.target_org_id.clone(),
+                            target_resource: p.to_string(),
+                            metadata: ctx.metadata.clone(),
+                        };
+                        if self.check_active_lease(&sensitive_ctx).await.is_some() {
+                            continue;
+                        }
                         return self
                             .record_escalation(
-                                ctx,
+                                &sensitive_ctx,
                                 format!(
                                     "Commit touches sensitive build/hook path '{}' (commit-time poisoning guard bypasses session lease)",
                                     p
@@ -437,21 +467,43 @@ impl PolicyEngine for AegisPolicyKernel {
             item.clone()
         };
 
+        let expires_at_ms = if ttl_secs <= 0 {
+            -1
+        } else {
+            Utc::now().timestamp_millis() + (ttl_secs * 1000)
+        };
+        let resource_pattern = if target.action == "workspace_commit_sensitive" {
+            target.target_resource.clone()
+        } else {
+            "*".to_string()
+        };
         let lease = LeaseGrant {
             lease_id: format!("lease-{}", &Uuid::new_v4().to_string()[..8]),
-            org_id: target.org_id,
-            agent_id: target.agent_id,
-            action_pattern: target.action,
-            resource_pattern: "*".to_string(),
-            expires_at_ms: if ttl_secs <= 0 {
-                -1
-            } else {
-                Utc::now().timestamp_millis() + (ttl_secs * 1000)
-            },
+            org_id: target.org_id.clone(),
+            agent_id: target.agent_id.clone(),
+            action_pattern: target.action.clone(),
+            resource_pattern,
+            expires_at_ms,
             granted_by: approved_by.to_string(),
         };
 
-        self.leases.write().await.push(lease.clone());
+        {
+            let mut leases = self.leases.write().await;
+            leases.push(lease.clone());
+            // When approving a sensitive commit path, also ensure a one-shot `workspace_commit`
+            // lease exists so the commit itself succeeds once the R0b guard clears.
+            if target.action == "workspace_commit_sensitive" {
+                leases.push(LeaseGrant {
+                    lease_id: format!("lease-{}", &Uuid::new_v4().to_string()[..8]),
+                    org_id: target.org_id,
+                    agent_id: target.agent_id,
+                    action_pattern: "workspace_commit".to_string(),
+                    resource_pattern: "*".to_string(),
+                    expires_at_ms: -1,
+                    granted_by: approved_by.to_string(),
+                });
+            }
+        }
         self.flush_to_disk().await?;
         Ok(lease)
     }
@@ -555,5 +607,32 @@ mod tests {
             decision,
             PolicyDecision::Allow { matched_rule } if matched_rule == format!("session_lease:{}", lease.lease_id)
         ));
+
+        // Even with the active 1-hour `workspace_commit` lease, touching `build.rs`, `Makefile`,
+        // `package.json`, or `.cargo/config.toml` escalates via R0b!
+        for poisoned in [
+            "build.rs",
+            "crates/foo/build.rs",
+            "Makefile",
+            "package.json",
+            ".cargo/config.toml",
+        ] {
+            let poisoned_ctx = PolicyContext {
+                principal: agent.clone(),
+                action: "workspace_commit".to_string(),
+                target_org_id: "acme".to_string(),
+                target_resource: "/Users/dev/project".to_string(),
+                metadata: json!({ "paths": [poisoned] }),
+            };
+            let esc = kernel.evaluate(&poisoned_ctx).await.unwrap();
+            let esc_id = match esc {
+                PolicyDecision::Ask { escalation_id, .. } => escalation_id,
+                other => panic!("Expected R0b Ask for {}, got {:?}", poisoned, other),
+            };
+            // Explicit one-shot approval of that sensitive path allows the commit once
+            kernel.approve_escalation(&esc_id, 0, "dev-lead").await.unwrap();
+            let approved = kernel.evaluate(&poisoned_ctx).await.unwrap();
+            assert!(matches!(approved, PolicyDecision::Allow { .. }));
+        }
     }
 }

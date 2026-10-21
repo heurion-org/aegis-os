@@ -42,7 +42,7 @@ pub struct CoWWorkspace {
 const RACY_WINDOW: std::time::Duration = std::time::Duration::from_secs(2);
 
 /// A host mutation computed during Phase 1 of `workspace_commit` and applied in Phase 2.
-enum StagedCommitAction {
+pub enum StagedCommitAction {
     CloneFromShadow {
         rel: String,
         shadow_path: PathBuf,
@@ -105,7 +105,7 @@ impl CoWWorkspace {
     }
 
     /// Applies the actions staged by Phase 1 of a commit to the host tree and the baseline.
-    async fn apply_staged_actions(
+    pub async fn apply_staged_actions(
         &self,
         staged_actions: Vec<StagedCommitAction>,
     ) -> anyhow::Result<Vec<String>> {
@@ -168,11 +168,11 @@ impl CoWWorkspace {
     /// Aborts a commit whose Phase 1 found a conflict. Normally nothing has touched the host yet;
     /// under the `prevalidate` ablation the actions staged so far are applied first, modelling a
     /// commit that writes as it goes and leaves a half-applied batch behind.
-    async fn fail_commit(
+    async fn fail_commit<T>(
         &self,
         staged_actions: Vec<StagedCommitAction>,
         err: anyhow::Error,
-    ) -> anyhow::Result<Vec<String>> {
+    ) -> anyhow::Result<T> {
         if aos_core::ablated("prevalidate") {
             let _ = self.apply_staged_actions(staged_actions).await;
         }
@@ -416,11 +416,23 @@ impl CoWWorkspace {
     /// Blocking implementation of [`Self::cow_clone_file`]. Directory-level callers use it directly
     /// so a whole tree is cloned on one thread instead of hopping to the blocking pool per file.
     pub fn cow_clone_file_blocking(src: &Path, dst: &Path) -> anyhow::Result<()> {
-        if dst.exists() {
-            let _ = std::fs::remove_file(dst);
-        }
+        Self::cow_clone_file_inner(src, dst, false, &mut true)
+    }
+
+    fn cow_clone_file_inner(
+        src: &Path,
+        dst: &Path,
+        dst_is_fresh: bool,
+        allow_reflink: &mut bool,
+    ) -> anyhow::Result<()> {
+        #[cfg(not(target_os = "linux"))]
+        let _ = allow_reflink;
+
         #[cfg(target_os = "macos")]
         {
+            if !dst_is_fresh && dst.exists() {
+                let _ = std::fs::remove_file(dst);
+            }
             use std::ffi::CString;
             use std::os::unix::ffi::OsStrExt;
             if let (Ok(c_src), Ok(c_dst)) = (
@@ -437,79 +449,82 @@ impl CoWWorkspace {
         #[cfg(target_os = "linux")]
         {
             use std::collections::HashSet;
-            use std::os::unix::fs::MetadataExt;
+            use std::os::unix::fs::{MetadataExt, OpenOptionsExt};
             use std::os::unix::io::AsRawFd;
             use std::sync::{LazyLock, Mutex};
             // Linux `FICLONE` ioctl request code (`_IOW(0x94, 9, int)` = 0x40049409)
             const FICLONE: libc::c_ulong = 0x40049409;
-            // Source/destination device pairs on which reflink cloning is known to be unavailable
-            // (`EOPNOTSUPP` on ext4/tmpfs, `EXDEV` across filesystems). Remembering them avoids
-            // paying a failed open/truncate/ioctl round-trip for every file before falling back to
-            // a plain copy, which made non-reflink filesystems up to 3x slower than `cp -R`.
             static NO_REFLINK: LazyLock<Mutex<HashSet<(u64, u64)>>> =
                 LazyLock::new(|| Mutex::new(HashSet::new()));
 
-            let dev_pair = match (std::fs::metadata(src), dst.parent().map(std::fs::metadata)) {
-                (Ok(s), Some(Ok(d))) => Some((s.dev(), d.dev())),
-                _ => None,
-            };
-            let known_unavailable = dev_pair
-                .map(|p| NO_REFLINK.lock().map(|g| g.contains(&p)).unwrap_or(false))
-                .unwrap_or(false);
+            let mut src_file = std::fs::File::open(src)?;
+            let meta = src_file.metadata()?;
+            let mut dst_file = std::fs::OpenOptions::new()
+                .write(true)
+                .create(true)
+                .truncate(true)
+                .mode(meta.mode())
+                .open(dst)?;
+            if !dst_is_fresh {
+                let _ = dst_file.set_permissions(meta.permissions());
+            }
 
-            if !known_unavailable {
-                if let Ok(src_file) = std::fs::File::open(src) {
-                    if let Ok(dst_file) = std::fs::OpenOptions::new()
-                        .write(true)
-                        .create(true)
-                        .truncate(true)
-                        .open(dst)
-                    {
-                        if let Ok(meta) = src_file.metadata() {
-                            let _ = dst_file.set_permissions(meta.permissions());
+            if *allow_reflink {
+                let known_unavailable = NO_REFLINK
+                    .lock()
+                    .map(|g| !g.is_empty() && dst_file.metadata().map(|d| g.contains(&(meta.dev(), d.dev()))).unwrap_or(false))
+                    .unwrap_or(false);
+                if known_unavailable {
+                    *allow_reflink = false;
+                } else {
+                    let rc = unsafe {
+                        libc::ioctl(dst_file.as_raw_fd(), FICLONE, src_file.as_raw_fd())
+                    };
+                    if rc == 0 {
+                        if let Ok(m) = meta.modified() {
+                            let _ = dst_file.set_modified(m);
                         }
-                        let rc = unsafe {
-                            libc::ioctl(dst_file.as_raw_fd(), FICLONE, src_file.as_raw_fd())
-                        };
-                        if rc == 0 {
-                            // Unlike APFS `clonefile`, a fresh `FICLONE` target gets mtime = now.
-                            // Carry the source's mtime over so unchanged files keep an identical
-                            // (size, mtime) fingerprint and `diff` can skip reading them.
-                            if let Ok(m) = src_file.metadata().and_then(|m| m.modified()) {
-                                let _ = dst_file.set_modified(m);
-                            }
-                            return Ok(());
-                        }
-                        let errno = std::io::Error::last_os_error().raw_os_error();
-                        if matches!(
-                            errno,
-                            Some(libc::EOPNOTSUPP) | Some(libc::EXDEV) | Some(libc::ENOTTY)
-                        ) {
-                            if let (Some(pair), Ok(mut guard)) = (dev_pair, NO_REFLINK.lock()) {
-                                if guard.insert(pair) {
-                                    eprintln!(
-                                        "[aos-vfs] WARNING: reflink (FICLONE) unavailable between {} and {} \
-                                         (errno {:?}); falling back to full file copies. Place the runtime \
-                                         directory on btrfs/XFS(reflink) to restore copy-on-write cloning.",
-                                        src.display(),
-                                        dst.display(),
-                                        errno
-                                    );
-                                }
+                        return Ok(());
+                    }
+                    let errno = std::io::Error::last_os_error().raw_os_error();
+                    if matches!(
+                        errno,
+                        Some(libc::EOPNOTSUPP) | Some(libc::EXDEV) | Some(libc::ENOTTY)
+                    ) {
+                        *allow_reflink = false;
+                        if let (Ok(dmeta), Ok(mut guard)) = (dst_file.metadata(), NO_REFLINK.lock())
+                        {
+                            if guard.insert((meta.dev(), dmeta.dev())) {
+                                eprintln!(
+                                    "[aos-vfs] WARNING: reflink (FICLONE) unavailable between {} and {} \
+                                     (errno {:?}); falling back to full file copies. Place the runtime \
+                                     directory on btrfs/XFS(reflink) to restore copy-on-write cloning.",
+                                    src.display(),
+                                    dst.display(),
+                                    errno
+                                );
                             }
                         }
                     }
                 }
             }
-        }
-        std::fs::copy(src, dst)?;
-        // Plain copies get mtime = now; keep the source's so unchanged files stay fingerprint-equal.
-        if let Ok(m) = std::fs::metadata(src).and_then(|m| m.modified()) {
-            if let Ok(f) = std::fs::OpenOptions::new().write(true).open(dst) {
-                let _ = f.set_modified(m);
+
+            std::io::copy(&mut src_file, &mut dst_file)?;
+            if let Ok(m) = meta.modified() {
+                let _ = dst_file.set_modified(m);
             }
+            return Ok(());
         }
-        Ok(())
+        #[cfg(not(target_os = "linux"))]
+        {
+            std::fs::copy(src, dst)?;
+            if let Ok(m) = std::fs::metadata(src).and_then(|m| m.modified()) {
+                if let Ok(f) = std::fs::OpenOptions::new().write(true).open(dst) {
+                    let _ = f.set_modified(m);
+                }
+            }
+            Ok(())
+        }
     }
 
     fn is_ignored_dir_name(name: &str) -> bool {
@@ -593,6 +608,7 @@ impl CoWWorkspace {
         }
 
         std::fs::create_dir_all(dst)?;
+        let mut allow_reflink = true;
         let mut stack = vec![(src.to_path_buf(), dst.to_path_buf())];
         while let Some((cur_src, cur_dst)) = stack.pop() {
             for entry in std::fs::read_dir(&cur_src)? {
@@ -618,10 +634,14 @@ impl CoWWorkspace {
                             }
                         }
                     }
-                    std::fs::create_dir_all(&entry_dst)?;
+                    if let Err(e) = std::fs::create_dir(&entry_dst) {
+                        if e.kind() != std::io::ErrorKind::AlreadyExists {
+                            return Err(e.into());
+                        }
+                    }
                     stack.push((entry_src, entry_dst));
                 } else if ft.is_file() {
-                    Self::cow_clone_file_blocking(&entry_src, &entry_dst)?;
+                    Self::cow_clone_file_inner(&entry_src, &entry_dst, true, &mut allow_reflink)?;
                 }
             }
         }
@@ -860,6 +880,178 @@ impl CoWWorkspace {
         }
         Ok(result)
     }
+    /// Phase 1 of two-phase commit: rebases untouched host files, validates all Added/Modified/Deleted
+    /// files against concurrent host modifications via LCS Diff3 3-Way Merge, and returns the staged
+    /// commit batch without modifying any file in `host_source_root`.
+    /// Also stages any `WriteMerged` content into `shadow_root` so an optional pre-commit verification
+    /// command (`verify_cmd`, e.g., `cargo check --offline`) can validate the merged shadow tree before
+    /// Phase 2 (`apply_staged_actions`) touches the host repository.
+    pub async fn stage_commit(
+        &self,
+        filter_paths: Option<Vec<String>>,
+        overwrite_binaries: bool,
+    ) -> anyhow::Result<Vec<StagedCommitAction>> {
+        // First auto-rebase onto the current host tree so any files modified by peers that this
+        // Agent did NOT touch (including regenerated binary artifacts) are fast-forwarded automatically.
+        let _ = self.refresh_from_host().await?;
+
+        // Compute diff relative to this Agent's own `baseline_root` so we only touch files this Agent actually changed!
+        let base_files: BTreeMap<String, PathBuf> = Self::collect_files(&self.baseline_root)
+            .await?
+            .into_iter()
+            .collect();
+        let shadow_files: BTreeMap<String, PathBuf> = Self::collect_files(&self.shadow_root)
+            .await?
+            .into_iter()
+            .collect();
+
+        let mut staged_actions = Vec::new();
+
+        // Phase 1: Validate all Added & Modified files and compute 3-Way Merges before mutating any host file
+        for (rel, shadow_path) in &shadow_files {
+            if let Some(ref allow_list) = filter_paths {
+                if !allow_list.iter().any(|p| p == rel) {
+                    continue;
+                }
+            }
+
+            // The agent never touched this file (same fingerprint as its baseline copy).
+            if let Some(base_path) = base_files.get(rel) {
+                if Self::same_fingerprint(shadow_path, base_path) {
+                    continue;
+                }
+            }
+            let shadow_bytes = tokio::fs::read(shadow_path).await?;
+            let host_dst = self.host_source_root.join(rel);
+
+            match base_files.get(rel) {
+                None => {
+                    if host_dst.exists() {
+                        let host_bytes = tokio::fs::read(&host_dst).await?;
+                        if Self::sha256_bytes(&host_bytes) != Self::sha256_bytes(&shadow_bytes) {
+                            let is_binary = std::str::from_utf8(&host_bytes).is_err()
+                                || std::str::from_utf8(&shadow_bytes).is_err();
+                            if is_binary && overwrite_binaries {
+                                staged_actions.push(StagedCommitAction::CloneFromShadow {
+                                    rel: rel.clone(),
+                                    shadow_path: shadow_path.clone(),
+                                });
+                                continue;
+                            }
+                            return self
+                                .fail_commit(
+                                    staged_actions,
+                                    anyhow::anyhow!(
+                                        "3-Way Merge Conflict on newly added file '{}': file was also independently created on host{}",
+                                        rel,
+                                        if is_binary {
+                                            " (pass `overwrite_binaries: true` to overwrite binary artifact, or `paths` to commit source files first)"
+                                        } else {
+                                            ""
+                                        }
+                                    ),
+                                )
+                                .await;
+                        }
+                    }
+                    staged_actions.push(StagedCommitAction::CloneFromShadow {
+                        rel: rel.clone(),
+                        shadow_path: shadow_path.clone(),
+                    });
+                }
+                Some(existing_base_path) => {
+                    let base_bytes = tokio::fs::read(existing_base_path).await?;
+                    if Self::sha256_bytes(&base_bytes) == Self::sha256_bytes(&shadow_bytes) {
+                        continue;
+                    }
+
+                    if host_dst.exists() {
+                        let host_bytes = tokio::fs::read(&host_dst).await?;
+                        if Self::sha256_bytes(&host_bytes) != Self::sha256_bytes(&base_bytes)
+                            && Self::sha256_bytes(&host_bytes) != Self::sha256_bytes(&shadow_bytes)
+                            && !aos_core::ablated("merge")
+                        {
+                            match (
+                                std::str::from_utf8(&base_bytes),
+                                std::str::from_utf8(&host_bytes),
+                                std::str::from_utf8(&shadow_bytes),
+                            ) {
+                                (Ok(base_str), Ok(their_str), Ok(our_str)) => {
+                                    match Self::three_way_merge_lines(base_str, their_str, our_str) {
+                                        Ok(merged_str) => {
+                                            staged_actions.push(StagedCommitAction::WriteMerged {
+                                                rel: rel.clone(),
+                                                shadow_path: shadow_path.clone(),
+                                                merged_content: merged_str,
+                                            });
+                                            continue;
+                                        }
+                                        Err(conflict_err) => {
+                                            return self
+                                                .fail_commit(
+                                                    staged_actions,
+                                                    anyhow::anyhow!("Conflict on '{}': {}", rel, conflict_err),
+                                                )
+                                                .await;
+                                        }
+                                    }
+                                }
+                                _ => {
+                                    if overwrite_binaries {
+                                        staged_actions.push(StagedCommitAction::CloneFromShadow {
+                                            rel: rel.clone(),
+                                            shadow_path: shadow_path.clone(),
+                                        });
+                                        continue;
+                                    }
+                                    return self
+                                        .fail_commit(
+                                            staged_actions,
+                                            anyhow::anyhow!(
+                                                "Binary file concurrent modification conflict on '{}': modified in both host and shadow workspace (pass `overwrite_binaries: true` to overwrite with shadow binary, or `paths` to commit specific source files first)",
+                                                rel
+                                            ),
+                                        )
+                                        .await;
+                                }
+                            }
+                        }
+                    }
+
+                    staged_actions.push(StagedCommitAction::CloneFromShadow {
+                        rel: rel.clone(),
+                        shadow_path: shadow_path.clone(),
+                    });
+                }
+            }
+        }
+
+        for (rel, _) in &base_files {
+            if !shadow_files.contains_key(rel) {
+                if let Some(ref allow_list) = filter_paths {
+                    if !allow_list.iter().any(|p| p == rel) {
+                        continue;
+                    }
+                }
+                staged_actions.push(StagedCommitAction::DeleteFile { rel: rel.clone() });
+            }
+        }
+
+        // Write any Phase-1 merged contents into `shadow_path` so pre-commit verification commands see the merged code.
+        for action in &staged_actions {
+            if let StagedCommitAction::WriteMerged {
+                shadow_path,
+                merged_content,
+                ..
+            } = action
+            {
+                tokio::fs::write(shadow_path, merged_content).await?;
+                Self::touch_mtime(shadow_path);
+            }
+        }
+
+        Ok(staged_actions)
+    }
 }
 
 #[async_trait]
@@ -1011,152 +1203,7 @@ impl TransactionalWorkspace for CoWWorkspace {
         filter_paths: Option<Vec<String>>,
         overwrite_binaries: bool,
     ) -> anyhow::Result<Vec<String>> {
-        // First auto-rebase onto the current host tree so any files modified by peers that this
-        // Agent did NOT touch (including regenerated binary artifacts) are fast-forwarded automatically.
-        let _ = self.refresh_from_host().await?;
-
-        // Compute diff relative to this Agent's own `baseline_root` so we only touch files this Agent actually changed!
-        let base_files: BTreeMap<String, PathBuf> = Self::collect_files(&self.baseline_root)
-            .await?
-            .into_iter()
-            .collect();
-        let shadow_files: BTreeMap<String, PathBuf> = Self::collect_files(&self.shadow_root)
-            .await?
-            .into_iter()
-            .collect();
-
-        let mut staged_actions = Vec::new();
-
-        // Phase 1: Validate all Added & Modified files and compute 3-Way Merges before mutating any host file
-        for (rel, shadow_path) in &shadow_files {
-            if let Some(ref allow_list) = filter_paths {
-                if !allow_list.iter().any(|p| p == rel) {
-                    continue;
-                }
-            }
-
-            // The agent never touched this file (same fingerprint as its baseline copy).
-            if let Some(base_path) = base_files.get(rel) {
-                if Self::same_fingerprint(shadow_path, base_path) {
-                    continue;
-                }
-            }
-            let shadow_bytes = tokio::fs::read(shadow_path).await?;
-            let host_dst = self.host_source_root.join(rel);
-
-            match base_files.get(rel) {
-                None => {
-                    if host_dst.exists() {
-                        let host_bytes = tokio::fs::read(&host_dst).await?;
-                        if Self::sha256_bytes(&host_bytes) != Self::sha256_bytes(&shadow_bytes) {
-                            let is_binary = std::str::from_utf8(&host_bytes).is_err()
-                                || std::str::from_utf8(&shadow_bytes).is_err();
-                            if is_binary && overwrite_binaries {
-                                staged_actions.push(StagedCommitAction::CloneFromShadow {
-                                    rel: rel.clone(),
-                                    shadow_path: shadow_path.clone(),
-                                });
-                                continue;
-                            }
-                            return self
-                                .fail_commit(
-                                    staged_actions,
-                                    anyhow::anyhow!(
-                                        "3-Way Merge Conflict on newly added file '{}': file was also independently created on host{}",
-                                        rel,
-                                        if is_binary {
-                                            " (pass `overwrite_binaries: true` to overwrite binary artifact, or `paths` to commit source files first)"
-                                        } else {
-                                            ""
-                                        }
-                                    ),
-                                )
-                                .await;
-                        }
-                    }
-                    staged_actions.push(StagedCommitAction::CloneFromShadow {
-                        rel: rel.clone(),
-                        shadow_path: shadow_path.clone(),
-                    });
-                }
-                Some(existing_base_path) => {
-                    let base_bytes = tokio::fs::read(existing_base_path).await?;
-                    if Self::sha256_bytes(&base_bytes) == Self::sha256_bytes(&shadow_bytes) {
-                        continue;
-                    }
-
-                    if host_dst.exists() {
-                        let host_bytes = tokio::fs::read(&host_dst).await?;
-                        if Self::sha256_bytes(&host_bytes) != Self::sha256_bytes(&base_bytes)
-                            && Self::sha256_bytes(&host_bytes) != Self::sha256_bytes(&shadow_bytes)
-                            && !aos_core::ablated("merge")
-                        {
-                            match (
-                                std::str::from_utf8(&base_bytes),
-                                std::str::from_utf8(&host_bytes),
-                                std::str::from_utf8(&shadow_bytes),
-                            ) {
-                                (Ok(base_str), Ok(their_str), Ok(our_str)) => {
-                                    match Self::three_way_merge_lines(base_str, their_str, our_str) {
-                                        Ok(merged_str) => {
-                                            staged_actions.push(StagedCommitAction::WriteMerged {
-                                                rel: rel.clone(),
-                                                shadow_path: shadow_path.clone(),
-                                                merged_content: merged_str,
-                                            });
-                                            continue;
-                                        }
-                                        Err(conflict_err) => {
-                                            return self
-                                                .fail_commit(
-                                                    staged_actions,
-                                                    anyhow::anyhow!("Conflict on '{}': {}", rel, conflict_err),
-                                                )
-                                                .await;
-                                        }
-                                    }
-                                }
-                                _ => {
-                                    if overwrite_binaries {
-                                        staged_actions.push(StagedCommitAction::CloneFromShadow {
-                                            rel: rel.clone(),
-                                            shadow_path: shadow_path.clone(),
-                                        });
-                                        continue;
-                                    }
-                                    return self
-                                        .fail_commit(
-                                            staged_actions,
-                                            anyhow::anyhow!(
-                                                "Binary file concurrent modification conflict on '{}': modified in both host and shadow workspace (pass `overwrite_binaries: true` to overwrite with shadow binary, or `paths` to commit specific source files first)",
-                                                rel
-                                            ),
-                                        )
-                                        .await;
-                                }
-                            }
-                        }
-                    }
-
-                    staged_actions.push(StagedCommitAction::CloneFromShadow {
-                        rel: rel.clone(),
-                        shadow_path: shadow_path.clone(),
-                    });
-                }
-            }
-        }
-
-        for (rel, _) in &base_files {
-            if !shadow_files.contains_key(rel) {
-                if let Some(ref allow_list) = filter_paths {
-                    if !allow_list.iter().any(|p| p == rel) {
-                        continue;
-                    }
-                }
-                staged_actions.push(StagedCommitAction::DeleteFile { rel: rel.clone() });
-            }
-        }
-
+        let staged_actions = self.stage_commit(filter_paths, overwrite_binaries).await?;
         // Phase 2: All conflicts cleared; apply staged actions atomically across the commit batch
         self.apply_staged_actions(staged_actions).await
     }

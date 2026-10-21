@@ -133,6 +133,51 @@ impl AegisEgressGateway {
         out
     }
 
+    /// Normalizes an HTTP request target (`origin-form` `/repos/acme/pulls` or proxy `absolute-form`
+    /// `http://api.github.com/repos/acme/pulls?page=1`) into a canonical URL path starting with `/`,
+    /// resolving `.` and `..` traversal segments (including percent-encoded `%2e` / `%2f`).
+    pub fn normalize_request_path(raw_target: &str) -> String {
+        let mut s = raw_target.trim();
+        if let Some(rest) = s
+            .strip_prefix("http://")
+            .or_else(|| s.strip_prefix("https://"))
+        {
+            s = match rest.find('/') {
+                Some(idx) => &rest[idx..],
+                None => "/",
+            };
+        }
+        if let Some(q) = s.find(['?', '#']) {
+            s = &s[..q];
+        }
+        // Decode percent-encoded dots and slashes (`%2e`, `%2f`) to prevent traversal bypasses.
+        let decoded = s
+            .replace("%2e", ".")
+            .replace("%2E", ".")
+            .replace("%2f", "/")
+            .replace("%2F", "/");
+        let trailing_slash = decoded.len() > 1 && decoded.ends_with('/');
+        let mut segments: Vec<&str> = Vec::new();
+        for seg in decoded.split('/') {
+            match seg {
+                "" | "." => {}
+                ".." => {
+                    segments.pop();
+                }
+                other => segments.push(other),
+            }
+        }
+        if segments.is_empty() {
+            "/".to_string()
+        } else {
+            let mut out = format!("/{}", segments.join("/"));
+            if trailing_slash {
+                out.push('/');
+            }
+            out
+        }
+    }
+
     pub async fn inspect_and_inject(
         &self,
         identity: &AgentIdentity,
@@ -142,6 +187,7 @@ impl AegisEgressGateway {
         let mut secrets_injected = Vec::new();
         let vault = self.vault.read().await;
         let scopes = self.scopes.read().await;
+        let normalized_path = Self::normalize_request_path(&req.path);
 
         // 1. First inspect all headers for `$AOS_SECRET_*` placeholders and enforce per-secret domain + method/path bindings
         // Sort by descending placeholder length so `$AOS_SECRET_GH_SCOPED` is matched before `$AOS_SECRET_GH`.
@@ -154,45 +200,46 @@ impl AegisEgressGateway {
                     continue;
                 }
                 if header_val.contains(&secret_entry.placeholder) {
-                    if !aos_core::ablated("secret_binding")
-                        && !secret_entry
+                    if !aos_core::ablated("secret_binding") {
+                        if !secret_entry
                             .allowed_domains
                             .iter()
                             .any(|d| d.eq_ignore_ascii_case(&req.target_domain))
-                    {
-                        return Ok(EgressVerdict::BlockedSecretExfiltration {
-                            placeholder: secret_entry.placeholder.clone(),
-                            unauthorized_domain: req.target_domain.clone(),
-                        });
-                    }
-                    if let Some(scope) = scopes.get(vault_key) {
-                        if !scope.allowed_methods.is_empty()
-                            && !scope
-                                .allowed_methods
-                                .iter()
-                                .any(|m| m.eq_ignore_ascii_case(&req.method))
                         {
                             return Ok(EgressVerdict::BlockedSecretExfiltration {
                                 placeholder: secret_entry.placeholder.clone(),
-                                unauthorized_domain: format!(
-                                    "{} (disallowed method {})",
-                                    req.target_domain, req.method
-                                ),
+                                unauthorized_domain: req.target_domain.clone(),
                             });
                         }
-                        if !scope.allowed_path_prefixes.is_empty()
-                            && !scope
-                                .allowed_path_prefixes
-                                .iter()
-                                .any(|p| req.path.starts_with(p))
-                        {
-                            return Ok(EgressVerdict::BlockedSecretExfiltration {
-                                placeholder: secret_entry.placeholder.clone(),
-                                unauthorized_domain: format!(
-                                    "{} (disallowed path {})",
-                                    req.target_domain, req.path
-                                ),
-                            });
+                        if let Some(scope) = scopes.get(vault_key) {
+                            if !scope.allowed_methods.is_empty()
+                                && !scope
+                                    .allowed_methods
+                                    .iter()
+                                    .any(|m| m.eq_ignore_ascii_case(&req.method))
+                            {
+                                return Ok(EgressVerdict::BlockedSecretExfiltration {
+                                    placeholder: secret_entry.placeholder.clone(),
+                                    unauthorized_domain: format!(
+                                        "{} (disallowed method {})",
+                                        req.target_domain, req.method
+                                    ),
+                                });
+                            }
+                            if !scope.allowed_path_prefixes.is_empty()
+                                && !scope
+                                    .allowed_path_prefixes
+                                    .iter()
+                                    .any(|p| normalized_path.starts_with(p))
+                            {
+                                return Ok(EgressVerdict::BlockedSecretExfiltration {
+                                    placeholder: secret_entry.placeholder.clone(),
+                                    unauthorized_domain: format!(
+                                        "{} (disallowed path {})",
+                                        req.target_domain, normalized_path
+                                    ),
+                                });
+                            }
                         }
                     }
                     *header_val = header_val
@@ -272,7 +319,8 @@ impl AegisEgressGateway {
                     };
                     let parts: Vec<&str> = request_line.split_whitespace().collect();
                     let method = parts.first().copied().unwrap_or("GET").to_string();
-                    let path = parts.get(1).copied().unwrap_or("/").to_string();
+                    let raw_target = parts.get(1).copied().unwrap_or("/");
+                    let path = Self::normalize_request_path(raw_target);
 
                     let mut headers = HashMap::new();
                     while let Ok(Some(line)) = reader.next_line().await {
@@ -299,8 +347,13 @@ impl AegisEgressGateway {
                     };
                     let target_domain = headers
                         .get("Host")
+                        .or_else(|| headers.get("host"))
                         .cloned()
-                        .unwrap_or_else(|| "localhost".to_string());
+                        .unwrap_or_else(|| "localhost".to_string())
+                        .split(':')
+                        .next()
+                        .unwrap_or("localhost")
+                        .to_string();
                     let spec = OutboundRequestSpec {
                         target_domain,
                         method,
@@ -477,13 +530,69 @@ mod tests {
                     target_domain: "api.github.com".to_string(),
                     method: "POST".to_string(),
                     path: "/gists".to_string(),
-                    headers: scoped_headers,
+                    headers: scoped_headers.clone(),
                 },
             )
             .await
             .unwrap();
         assert!(matches!(
             blocked_gist,
+            EgressVerdict::BlockedSecretExfiltration { .. }
+        ));
+
+        // Proxy absolute-form URL (`http://api.github.com/repos/acme/issues`) is normalized and allowed
+        let ok_abs = gw
+            .inspect_and_inject(
+                &agent,
+                &OutboundRequestSpec {
+                    target_domain: "api.github.com".to_string(),
+                    method: "GET".to_string(),
+                    path: "http://api.github.com/repos/acme/issues?state=open".to_string(),
+                    headers: scoped_headers.clone(),
+                },
+            )
+            .await
+            .unwrap();
+        assert!(matches!(ok_abs, EgressVerdict::AllowedAndSanitized { .. }));
+
+        // Path traversal attempt (`/repos/acme/../../gists` and `%2e%2e`) is normalized and blocked
+        for traversal in [
+            "/repos/acme/../../gists",
+            "http://api.github.com/repos/acme/%2e%2e/%2e%2e/gists",
+        ] {
+            let blocked_trav = gw
+                .inspect_and_inject(
+                    &agent,
+                    &OutboundRequestSpec {
+                        target_domain: "api.github.com".to_string(),
+                        method: "POST".to_string(),
+                        path: traversal.to_string(),
+                        headers: scoped_headers.clone(),
+                    },
+                )
+                .await
+                .unwrap();
+            assert!(matches!(
+                blocked_trav,
+                EgressVerdict::BlockedSecretExfiltration { .. }
+            ));
+        }
+
+        // Disallowed HTTP method (`DELETE /repos/acme/issues`) is blocked
+        let blocked_method = gw
+            .inspect_and_inject(
+                &agent,
+                &OutboundRequestSpec {
+                    target_domain: "api.github.com".to_string(),
+                    method: "DELETE".to_string(),
+                    path: "/repos/acme/issues/1".to_string(),
+                    headers: scoped_headers,
+                },
+            )
+            .await
+            .unwrap();
+        assert!(matches!(
+            blocked_method,
             EgressVerdict::BlockedSecretExfiltration { .. }
         ));
     }
