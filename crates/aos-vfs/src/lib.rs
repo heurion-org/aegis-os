@@ -537,6 +537,7 @@ impl CoWWorkspace {
         )
     }
 
+    #[cfg(target_os = "macos")]
     fn contains_ignored_subdir(dir: &Path, max_depth: usize) -> bool {
         if max_depth == 0 {
             return false;

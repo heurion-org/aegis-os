@@ -331,7 +331,17 @@ impl AegisRuntimeKernel {
     ) -> anyhow::Result<Arc<AgentEnvironment>> {
         let key = Self::agent_key(&identity.org_id, &identity.agent_id);
         if let Some(existing) = self.agents.read().await.get(&key) {
-            return Ok(existing.clone());
+            if existing.workspace.shadow_root().join(".initialized").exists()
+                || (existing.workspace.shadow_root().exists()
+                    && existing
+                        .workspace
+                        .shadow_root()
+                        .parent()
+                        .map_or(false, |p| p.join(".initialized").exists())
+                    && existing.workspace.host_source_root() == host_project_source.as_ref())
+            {
+                return Ok(existing.clone());
+            }
         }
 
         let agent_root = self
@@ -511,22 +521,26 @@ impl AegisRuntimeKernel {
         if matches!(tool_name, "ipc_send" | "ipc_request") {
             if let Some(raw_to) = args.get("to_agent").and_then(|v| v.as_str()) {
                 let cleaned = raw_to.strip_prefix("agent:").unwrap_or(raw_to);
+                let all_peers = self.ipc.list_all_peers().await.unwrap_or_default();
+                let caller_is_workstation_peer = all_peers.iter().any(|p| {
+                    p.org_id == identity.org_id
+                        && p.agent_id == identity.agent_id
+                        && p.pid.is_some()
+                });
+                let is_verified_workstation_pair = |org: &str, agent: &str| -> bool {
+                    caller_is_workstation_peer
+                        && all_peers
+                            .iter()
+                            .any(|p| p.org_id == org && p.agent_id == agent && p.pid.is_some())
+                };
                 if let Some((org_part, agent_part)) = cleaned.split_once('/') {
-                    let all_peers = self.ipc.list_all_peers().await.unwrap_or_default();
-                    if all_peers
-                        .iter()
-                        .any(|p| p.org_id == org_part && p.agent_id == agent_part)
-                    {
-                        target_org = org_part.to_string();
-                        resolved_cross_org_peer =
-                            Some((org_part.to_string(), agent_part.to_string()));
+                    target_org = org_part.to_string();
+                    resolved_cross_org_peer =
+                        Some((org_part.to_string(), agent_part.to_string()));
+                    if is_verified_workstation_pair(org_part, agent_part) {
                         if let Some(obj) = audit_metadata.as_object_mut() {
                             obj.insert("workstation_peer_verified".to_string(), json!(true));
                         }
-                    } else {
-                        target_org = org_part.to_string();
-                        resolved_cross_org_peer =
-                            Some((org_part.to_string(), agent_part.to_string()));
                     }
                 } else if args.get("target_org_id").is_none() {
                     // If not found in current org, auto-resolve unique peer ID from global peer list!
@@ -536,13 +550,12 @@ impl AegisRuntimeKernel {
                         .await
                         .unwrap_or_default();
                     if !same_org_peers.iter().any(|p| p.agent_id == cleaned) {
-                        let all_peers = self.ipc.list_all_peers().await.unwrap_or_default();
                         let matches: Vec<_> = all_peers
-                            .into_iter()
-                            .filter(|p| p.online && p.agent_id == cleaned)
+                            .iter()
+                            .filter(|p| p.online && p.agent_id == cleaned && p.pid.is_some())
                             .collect();
-                        if matches.len() == 1 {
-                            let matched = &matches[0];
+                        if caller_is_workstation_peer && matches.len() == 1 {
+                            let matched = matches[0];
                             target_org = matched.org_id.clone();
                             resolved_cross_org_peer =
                                 Some((matched.org_id.clone(), matched.agent_id.clone()));
@@ -552,11 +565,7 @@ impl AegisRuntimeKernel {
                         }
                     }
                 } else if args.get("scope").and_then(|v| v.as_str()) == Some("global") {
-                    let all_peers = self.ipc.list_all_peers().await.unwrap_or_default();
-                    if all_peers
-                        .iter()
-                        .any(|p| p.org_id == target_org && p.agent_id == cleaned)
-                    {
+                    if is_verified_workstation_pair(&target_org, cleaned) {
                         resolved_cross_org_peer =
                             Some((target_org.clone(), cleaned.to_string()));
                         if let Some(obj) = audit_metadata.as_object_mut() {
@@ -2244,15 +2253,43 @@ impl AegisRuntimeKernel {
                 let ws_path = default_workspace.clone();
                 tokio::spawn(async move {
                     use tokio::io::AsyncReadExt;
-                    let mut buf = vec![0u8; 65536];
-                    let Ok(n) = stream.read(&mut buf).await else {
-                        return;
+                    let mut buf = Vec::with_capacity(8192);
+                    let mut chunk = [0u8; 8192];
+                    let header_end = loop {
+                        if let Some(pos) = buf.windows(4).position(|w| w == b"\r\n\r\n") {
+                            break pos + 4;
+                        }
+                        let Ok(n) = stream.read(&mut chunk).await else {
+                            return;
+                        };
+                        if n == 0 || buf.len() > 4 * 1024 * 1024 {
+                            return;
+                        }
+                        buf.extend_from_slice(&chunk[..n]);
                     };
-                    if n == 0 {
-                        return;
+                    let head = String::from_utf8_lossy(&buf[..header_end - 4]).to_string();
+                    let content_length: usize = head
+                        .lines()
+                        .find_map(|l| {
+                            let (k, v) = l.split_once(':')?;
+                            if k.trim().eq_ignore_ascii_case("content-length") {
+                                v.trim().parse::<usize>().ok()
+                            } else {
+                                None
+                            }
+                        })
+                        .unwrap_or(0);
+                    while buf.len() < header_end + content_length {
+                        let Ok(n) = stream.read(&mut chunk).await else {
+                            break;
+                        };
+                        if n == 0 {
+                            break;
+                        }
+                        buf.extend_from_slice(&chunk[..n]);
                     }
-                    let raw_req = String::from_utf8_lossy(&buf[..n]).to_string();
-                    let (head, body_str) = raw_req.split_once("\r\n\r\n").unwrap_or((&raw_req, ""));
+                    let body_end = (header_end + content_length).min(buf.len());
+                    let body_str = String::from_utf8_lossy(&buf[header_end..body_end]).to_string();
                     let mut head_lines = head.lines();
                     let req_line = head_lines.next().unwrap_or("");
                     let parts: Vec<&str> = req_line.split_whitespace().collect();

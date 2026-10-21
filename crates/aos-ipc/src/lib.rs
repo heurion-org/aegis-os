@@ -468,6 +468,50 @@ impl IpcBus for AegisIpcBus {
 
         Self::validate_attachments(&envelope.org_id, &envelope.from_agent, &envelope.attachments)?;
 
+        if !aos_core::ablated("tenant_gate")
+            && !matches!(envelope.kind, IpcKind::TaskResponse { .. })
+        {
+            let target_agent = envelope
+                .to_target
+                .strip_prefix("agent:")
+                .unwrap_or(&envelope.to_target);
+            let peers = self.peers.read().await;
+            if let Some((sender_org, sender_agent)) = envelope.from_agent.split_once('/') {
+                if sender_org != envelope.org_id {
+                    let sender_verified = peers
+                        .get(sender_org)
+                        .and_then(|m| m.get(sender_agent))
+                        .map_or(false, |p| p.pid.is_some());
+                    let target_verified = peers
+                        .get(&envelope.org_id)
+                        .and_then(|m| m.get(target_agent))
+                        .map_or(false, |p| p.pid.is_some());
+                    if !(sender_verified && target_verified) {
+                        bail!(
+                            "Cross-organization IPC delivery denied by broker tenant guard: '{}' -> '{}/{}'",
+                            envelope.from_agent,
+                            envelope.org_id,
+                            target_agent
+                        );
+                    }
+                }
+            } else {
+                let in_target_org = peers
+                    .get(&envelope.org_id)
+                    .map_or(false, |m| m.contains_key(&envelope.from_agent));
+                let in_other_org = peers.iter().any(|(org, m)| {
+                    org != &envelope.org_id && m.contains_key(&envelope.from_agent)
+                });
+                if !in_target_org && in_other_org {
+                    bail!(
+                        "Cross-organization sender spoofing denied by broker tenant guard: '{}' does not belong to '{}'",
+                        envelope.from_agent,
+                        envelope.org_id
+                    );
+                }
+            }
+        }
+
         match &envelope.kind {
             IpcKind::TopicBroadcast { topic } => {
                 let subscribers: Vec<String> = {
@@ -1107,6 +1151,59 @@ mod tests {
         let worker = AgentIdentity::new("repo-backend", "claude-work", "Backend Worker");
         bus.register_peer(&planner, vec!["*".to_string()]).await.unwrap();
         bus.register_peer(&worker, vec!["*".to_string()]).await.unwrap();
+        let my_pid = std::process::id();
+        bus.update_peer_metadata(
+            &planner,
+            Some("agy".to_string()),
+            Some(my_pid),
+            None,
+            Some("/work/frontend".to_string()),
+        )
+        .await
+        .unwrap();
+        bus.update_peer_metadata(
+            &worker,
+            Some("claude".to_string()),
+            Some(my_pid),
+            None,
+            Some("/work/backend".to_string()),
+        )
+        .await
+        .unwrap();
+
+        // Verify that an unverified multi-tenant peer (pid == None) cannot send cross-org IPC or spoof sender org
+        let unverified = AgentIdentity::new("tenant-untrusted", "mallory", "Untrusted Tenant");
+        bus.register_peer(&unverified, vec!["*".to_string()]).await.unwrap();
+        let spoof_attempt = bus
+            .send(IpcEnvelope {
+                msg_id: String::new(),
+                org_id: "repo-backend".to_string(),
+                from_agent: "tenant-untrusted/mallory".to_string(),
+                to_target: "claude-work".to_string(),
+                kind: IpcKind::DirectMessage,
+                subject: "Unauthorized cross-tenant injection".to_string(),
+                payload: json!({}),
+                attachments: vec![],
+                status: MessageDeliveryStatus::Unread,
+                created_at_ms: 0,
+            })
+            .await;
+        assert!(spoof_attempt.is_err(), "Unverified tenant must be blocked by broker tenant guard");
+        let bare_spoof = bus
+            .send(IpcEnvelope {
+                msg_id: String::new(),
+                org_id: "repo-backend".to_string(),
+                from_agent: "mallory".to_string(),
+                to_target: "claude-work".to_string(),
+                kind: IpcKind::DirectMessage,
+                subject: "Bare sender spoofing".to_string(),
+                payload: json!({}),
+                attachments: vec![],
+                status: MessageDeliveryStatus::Unread,
+                created_at_ms: 0,
+            })
+            .await;
+        assert!(bare_spoof.is_err(), "Bare sender spoofing across orgs must be blocked");
 
         let peer = bus
             .update_agent_card(

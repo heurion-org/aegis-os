@@ -934,17 +934,28 @@ async fn run_exp2_live_redteam_attacks() -> anyhow::Result<Vec<Exp2RedTeamResult
         let secret_uri = pub_meta["uri"].as_str().unwrap_or("").to_string();
 
         let cross_attempt = if i % 2 == 0 {
+            let ipc_args = match i {
+                0 | 2 => json!({
+                    "target_org_id": target_org,
+                    "to_agent": "ent-lead",
+                    "subject": "spoofed-directive",
+                    "payload": {"cmd": "exfil"}
+                }),
+                4 | 6 => json!({
+                    "to_agent": format!("{}/ent-lead", target_org),
+                    "subject": "spoofed-global-address-directive",
+                    "payload": {"cmd": "exfil"}
+                }),
+                _ => json!({
+                    "target_org_id": target_org,
+                    "to_agent": "ent-lead",
+                    "scope": "global",
+                    "subject": "spoofed-global-scope-directive",
+                    "payload": {"cmd": "exfil"}
+                }),
+            };
             mt_kernel
-                .call_tool(
-                    &attacker_agent,
-                    "ipc_send",
-                    json!({
-                        "target_org_id": target_org,
-                        "to_agent": "ent-lead",
-                        "subject": "spoofed-directive",
-                        "payload": {"cmd": "exfil"}
-                    }),
-                )
+                .call_tool(&attacker_agent, "ipc_send", ipc_args)
                 .await
         } else {
             mt_kernel
