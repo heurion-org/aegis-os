@@ -260,8 +260,10 @@ impl CoWWorkspace {
         Ok(report)
     }
 
-    /// Clones a single file using macOS APFS `clonefile(2)` zero-copy syscall if on macOS,
-    /// falling back to `tokio::fs::copy` if across filesystems or on non-APFS.
+    /// Clones a single file using zero-copy OS copy-on-write syscalls:
+    /// - macOS (APFS): `libc::clonefile(src, dst, 0)`
+    /// - Linux (Btrfs / XFS / OCFS2): `libc::ioctl(dst_fd, FICLONE, src_fd)` (`0x40049409`)
+    /// Falls back transparently to `tokio::fs::copy` if across filesystems or on non-CoW mounts.
     pub async fn cow_clone_file(src: &Path, dst: &Path) -> anyhow::Result<()> {
         if dst.exists() {
             let _ = tokio::fs::remove_file(dst).await;
@@ -278,6 +280,29 @@ impl CoWWorkspace {
                 let rc = unsafe { libc::clonefile(c_src.as_ptr(), c_dst.as_ptr(), 0) };
                 if rc == 0 {
                     return Ok(());
+                }
+            }
+        }
+        #[cfg(target_os = "linux")]
+        {
+            use std::os::unix::io::AsRawFd;
+            // Linux `FICLONE` ioctl request code (`_IOW(0x94, 9, int)` = 0x40049409)
+            const FICLONE: libc::c_ulong = 0x40049409;
+            if let Ok(src_file) = std::fs::File::open(src) {
+                if let Ok(dst_file) = std::fs::OpenOptions::new()
+                    .write(true)
+                    .create(true)
+                    .truncate(true)
+                    .open(dst)
+                {
+                    if let Ok(meta) = src_file.metadata() {
+                        let _ = dst_file.set_permissions(meta.permissions());
+                    }
+                    let rc =
+                        unsafe { libc::ioctl(dst_file.as_raw_fd(), FICLONE, src_file.as_raw_fd()) };
+                    if rc == 0 {
+                        return Ok(());
+                    }
                 }
             }
         }

@@ -826,6 +826,15 @@ pub trait PolicyEngine: Send + Sync {
         ttl_secs: i64,
         approved_by: &str,
     ) -> anyhow::Result<LeaseGrant>;
+
+    /// Reject/deny a pending escalation by ID without issuing a lease.
+    async fn deny_escalation(
+        &self,
+        escalation_id: &str,
+        _denied_by: &str,
+    ) -> anyhow::Result<PendingEscalation> {
+        anyhow::bail!("Escalation '{}' not found", escalation_id)
+    }
 }
 
 // ============================================================================

@@ -49,9 +49,16 @@ pub enum EgressVerdict {
     },
 }
 
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct SecretScopeRule {
+    pub allowed_methods: Vec<String>,
+    pub allowed_path_prefixes: Vec<String>,
+}
+
 pub struct AegisEgressGateway {
     org_allowed_domains: Arc<RwLock<HashMap<String, HashSet<String>>>>,
     vault: Arc<RwLock<HashMap<String, SecretVaultEntry>>>,
+    scopes: Arc<RwLock<HashMap<String, SecretScopeRule>>>,
 }
 
 impl Default for AegisEgressGateway {
@@ -65,6 +72,7 @@ impl AegisEgressGateway {
         Self {
             org_allowed_domains: Arc::new(RwLock::new(HashMap::new())),
             vault: Arc::new(RwLock::new(HashMap::new())),
+            scopes: Arc::new(RwLock::new(HashMap::new())),
         }
     }
 
@@ -81,6 +89,50 @@ impl AegisEgressGateway {
         self.vault.write().await.insert(key, entry);
     }
 
+    pub async fn register_scoped_secret(
+        &self,
+        entry: SecretVaultEntry,
+        allowed_methods: Vec<String>,
+        allowed_path_prefixes: Vec<String>,
+    ) {
+        let key = format!("{}::{}", entry.org_id, entry.placeholder);
+        self.vault.write().await.insert(key.clone(), entry);
+        self.scopes.write().await.insert(
+            key,
+            SecretScopeRule {
+                allowed_methods,
+                allowed_path_prefixes,
+            },
+        );
+    }
+
+    pub async fn list_redacted_secrets(&self, org_id: &str) -> Vec<serde_json::Value> {
+        let vault = self.vault.read().await;
+        let scopes = self.scopes.read().await;
+        let prefix = format!("{}::", org_id);
+        let mut out = Vec::new();
+        for (k, entry) in vault.iter() {
+            if !k.starts_with(&prefix) {
+                continue;
+            }
+            let scope = scopes.get(k).cloned().unwrap_or_default();
+            let redacted = if entry.real_secret_value.len() > 6 {
+                format!("{}****", &entry.real_secret_value[..4])
+            } else {
+                "****".to_string()
+            };
+            out.push(json!({
+                "org_id": entry.org_id,
+                "placeholder": entry.placeholder,
+                "value_redacted": redacted,
+                "allowed_domains": entry.allowed_domains,
+                "allowed_methods": scope.allowed_methods,
+                "allowed_path_prefixes": scope.allowed_path_prefixes,
+            }));
+        }
+        out
+    }
+
     pub async fn inspect_and_inject(
         &self,
         identity: &AgentIdentity,
@@ -89,10 +141,15 @@ impl AegisEgressGateway {
         let mut out_headers = req.headers.clone();
         let mut secrets_injected = Vec::new();
         let vault = self.vault.read().await;
+        let scopes = self.scopes.read().await;
 
-        // 1. First inspect all headers for `$AOS_SECRET_*` placeholders and enforce per-secret domain bindings
+        // 1. First inspect all headers for `$AOS_SECRET_*` placeholders and enforce per-secret domain + method/path bindings
+        // Sort by descending placeholder length so `$AOS_SECRET_GH_SCOPED` is matched before `$AOS_SECRET_GH`.
+        let mut entries: Vec<(&String, &SecretVaultEntry)> = vault.iter().collect();
+        entries.sort_by(|a, b| b.1.placeholder.len().cmp(&a.1.placeholder.len()));
+
         for (_header_name, header_val) in out_headers.iter_mut() {
-            for (vault_key, secret_entry) in vault.iter() {
+            for &(vault_key, secret_entry) in &entries {
                 if !vault_key.starts_with(&format!("{}::", identity.org_id)) {
                     continue;
                 }
@@ -106,6 +163,36 @@ impl AegisEgressGateway {
                             placeholder: secret_entry.placeholder.clone(),
                             unauthorized_domain: req.target_domain.clone(),
                         });
+                    }
+                    if let Some(scope) = scopes.get(vault_key) {
+                        if !scope.allowed_methods.is_empty()
+                            && !scope
+                                .allowed_methods
+                                .iter()
+                                .any(|m| m.eq_ignore_ascii_case(&req.method))
+                        {
+                            return Ok(EgressVerdict::BlockedSecretExfiltration {
+                                placeholder: secret_entry.placeholder.clone(),
+                                unauthorized_domain: format!(
+                                    "{} (disallowed method {})",
+                                    req.target_domain, req.method
+                                ),
+                            });
+                        }
+                        if !scope.allowed_path_prefixes.is_empty()
+                            && !scope
+                                .allowed_path_prefixes
+                                .iter()
+                                .any(|p| req.path.starts_with(p))
+                        {
+                            return Ok(EgressVerdict::BlockedSecretExfiltration {
+                                placeholder: secret_entry.placeholder.clone(),
+                                unauthorized_domain: format!(
+                                    "{} (disallowed path {})",
+                                    req.target_domain, req.path
+                                ),
+                            });
+                        }
                     }
                     *header_val = header_val
                         .replace(&secret_entry.placeholder, &secret_entry.real_secret_value);
@@ -344,5 +431,59 @@ mod tests {
                 unauthorized_domain: "httpbin.org".to_string(),
             }
         );
+
+        // Confused-deputy protection: scope $AOS_SECRET_GH_SCOPED to GET/POST on /repos/acme/ only
+        gw.register_scoped_secret(
+            SecretVaultEntry {
+                org_id: "acme".to_string(),
+                placeholder: "$AOS_SECRET_GH_SCOPED".to_string(),
+                real_secret_value: "ghp_ScopedSecret777".to_string(),
+                allowed_domains: vec!["api.github.com".to_string()],
+            },
+            vec!["GET".to_string(), "POST".to_string()],
+            vec!["/repos/acme/".to_string()],
+        )
+        .await;
+
+        let mut scoped_headers = HashMap::new();
+        scoped_headers.insert(
+            "Authorization".to_string(),
+            "Bearer $AOS_SECRET_GH_SCOPED".to_string(),
+        );
+        // Allowed path `/repos/acme/payments/pulls`
+        let ok_scoped = gw
+            .inspect_and_inject(
+                &agent,
+                &OutboundRequestSpec {
+                    target_domain: "api.github.com".to_string(),
+                    method: "POST".to_string(),
+                    path: "/repos/acme/payments/pulls".to_string(),
+                    headers: scoped_headers.clone(),
+                },
+            )
+            .await
+            .unwrap();
+        assert!(matches!(
+            ok_scoped,
+            EgressVerdict::AllowedAndSanitized { .. }
+        ));
+
+        // Disallowed path `/gists` on allowed domain `api.github.com` (Confused Deputy blocked!)
+        let blocked_gist = gw
+            .inspect_and_inject(
+                &agent,
+                &OutboundRequestSpec {
+                    target_domain: "api.github.com".to_string(),
+                    method: "POST".to_string(),
+                    path: "/gists".to_string(),
+                    headers: scoped_headers,
+                },
+            )
+            .await
+            .unwrap();
+        assert!(matches!(
+            blocked_gist,
+            EgressVerdict::BlockedSecretExfiltration { .. }
+        ));
     }
 }

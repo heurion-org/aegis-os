@@ -13,7 +13,7 @@ use aos_core::{
     OrgSharedStorage, PolicyContext, PolicyDecision, PolicyEngine, ResourceLimits, SandboxConfig,
     SandboxDriver, SandboxInstance, TransactionalWorkspace,
 };
-use aos_egress::AegisEgressGateway;
+use aos_egress::{AegisEgressGateway, SecretVaultEntry};
 use aos_ipc::AegisIpcBus;
 use aos_policy::AegisPolicyKernel;
 use aos_recorder::AegisFlightRecorder;
@@ -29,6 +29,9 @@ use std::sync::Arc;
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::sync::RwLock;
 use uuid::Uuid;
+
+pub mod paas;
+use paas::PaasControlPlane;
 
 pub struct AgentEnvironment {
     pub identity: AgentIdentity,
@@ -51,6 +54,7 @@ pub struct AegisRuntimeKernel {
     pub org_storage: Arc<dyn OrgSharedStorage>,
     pub egress: Arc<AegisEgressGateway>,
     pub recorder: Arc<dyn FlightRecorder>,
+    pub paas: Arc<PaasControlPlane>,
     agents: Arc<RwLock<HashMap<String, Arc<AgentEnvironment>>>>,
     mounted_mcp_servers: Arc<RwLock<Vec<MountedMcpServer>>>,
 }
@@ -69,6 +73,7 @@ impl AegisRuntimeKernel {
         let org_storage = Arc::new(OrgCasAndKvStore::new(root.join("orgs")).await?);
         let audit_path = root.join("audit").join("flight_recorder.jsonl");
         let recorder = Arc::new(AegisFlightRecorder::new(Some(audit_path)));
+        let paas = Arc::new(PaasControlPlane::new(&root));
 
         Ok(Self {
             runtime_data_root: root,
@@ -77,9 +82,23 @@ impl AegisRuntimeKernel {
             org_storage,
             egress: Arc::new(AegisEgressGateway::new()),
             recorder,
+            paas,
             agents: Arc::new(RwLock::new(HashMap::new())),
             mounted_mcp_servers: Arc::new(RwLock::new(Vec::new())),
         })
+    }
+
+    pub async fn get_agent_environment(
+        &self,
+        identity: &AgentIdentity,
+    ) -> anyhow::Result<Arc<AgentEnvironment>> {
+        let key = Self::agent_key(&identity.org_id, &identity.agent_id);
+        self.agents
+            .read()
+            .await
+            .get(&key)
+            .cloned()
+            .with_context(|| format!("Agent environment '{}' is not initialized", key))
     }
 
     fn agent_key(org_id: &str, agent_id: &str) -> String {
@@ -807,6 +826,32 @@ impl AegisRuntimeKernel {
                 }))
             }
 
+            "workspace_export_pr" => {
+                let branch_name = args
+                    .get("branch_name")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("");
+                let commit_title = args
+                    .get("commit_title")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("");
+                let workspace_id = args.get("workspace_id").and_then(|v| v.as_str());
+                let overwrite_binaries = args
+                    .get("overwrite_binaries")
+                    .and_then(|v| v.as_bool())
+                    .unwrap_or(false);
+                self.paas
+                    .export_workspace_pr(
+                        self,
+                        identity,
+                        workspace_id,
+                        branch_name,
+                        commit_title,
+                        overwrite_binaries,
+                    )
+                    .await
+            }
+
             // ----------------------------------------------------------------
             // 2. Sandboxed Command Execution Tools (Zero-Prompt in Sandbox)
             // ----------------------------------------------------------------
@@ -1426,6 +1471,19 @@ impl AegisRuntimeKernel {
                                 "type": "boolean",
                                 "description": "If true, allow your shadow copy of concurrently modified binary artifacts (e.g. PDFs) to overwrite the host copy."
                             }
+                        }
+                    }
+                },
+                {
+                    "name": "workspace_export_pr",
+                    "description": "[Lease-Gated] Merge your CoW shadow workspace into the repository via 4-Tier LCS Diff3, create a Git branch, commit changes, and export a unified Git patch and GitHub Pull Request payload.",
+                    "inputSchema": {
+                        "type": "object",
+                        "properties": {
+                            "workspace_id": { "type": "string" },
+                            "branch_name": { "type": "string" },
+                            "commit_title": { "type": "string" },
+                            "overwrite_binaries": { "type": "boolean" }
                         }
                     }
                 },
@@ -2208,23 +2266,68 @@ impl AegisRuntimeKernel {
                         }
                     }
 
-                    let org_id = headers
+                    let mut org_id = headers
                         .get("x-aegis-org")
                         .cloned()
                         .unwrap_or_else(|| "default-org".to_string());
-                    let agent_id = headers
+                    let mut agent_id = headers
                         .get("x-aegis-agent")
                         .cloned()
                         .unwrap_or_else(|| "http-agent".to_string());
-                    let role = headers
+                    let mut role = headers
                         .get("x-aegis-role")
                         .cloned()
                         .unwrap_or_else(|| "Remote MCP Agent".to_string());
+                    let mut bound_ws_path = ws_path.clone();
 
-                    let (status_line, resp_body) = if method == "GET" && full_target.starts_with("/health") {
+                    // Optional Bearer API Key / X-Aegis-Api-Key Authentication (`ak_live_*`)
+                    let raw_auth = headers
+                        .get("authorization")
+                        .or_else(|| headers.get("x-aegis-api-key"))
+                        .cloned();
+                    let mut auth_failed = false;
+                    if let Some(ref token_hdr) = raw_auth {
+                        if let Some(key_rec) = k.paas.authenticate_token(token_hdr).await {
+                            org_id = key_rec.org_id;
+                            agent_id = key_rec.agent_id;
+                            role = key_rec.role;
+                            if let Some(ref ws_id) = key_rec.workspace_id {
+                                if let Some(ws_rec) = k.paas.get_workspace(&org_id, ws_id).await {
+                                    bound_ws_path = ws_rec.host_repo_path;
+                                }
+                            }
+                        } else {
+                            auth_failed = true;
+                        }
+                    } else if std::env::var("AOS_REQUIRE_API_KEY").as_deref() == Ok("1")
+                        && (full_target.starts_with("/mcp")
+                            || full_target.starts_with("/v1/mcp")
+                            || full_target.starts_with("/a2a")
+                            || full_target.starts_with("/v1/a2a"))
+                    {
+                        auth_failed = true;
+                    }
+
+                    let mut content_type = "application/json";
+                    let (status_line, resp_body) = if auth_failed {
+                        (
+                            "HTTP/1.1 401 Unauthorized",
+                            json!({
+                                "error": "Invalid or missing Aegis Cloud API key (expected `Authorization: Bearer ak_live_...`)"
+                            })
+                            .to_string(),
+                        )
+                    } else if method == "GET"
+                        && (full_target == "/"
+                            || full_target.starts_with("/dashboard")
+                            || full_target.starts_with("/ui"))
+                    {
+                        content_type = "text/html; charset=utf-8";
+                        ("HTTP/1.1 200 OK", paas::DASHBOARD_HTML.to_string())
+                    } else if method == "GET" && full_target.starts_with("/health") {
                         (
                             "HTTP/1.1 200 OK",
-                            json!({ "status": "ok", "service": "aegis-os-daemon", "version": "0.2.0" }).to_string(),
+                            json!({ "status": "ok", "service": "aegis-os-paas-daemon", "version": "0.3.0" }).to_string(),
                         )
                     } else if method == "GET"
                         && (full_target.starts_with("/.well-known/agent.json")
@@ -2247,13 +2350,14 @@ impl AegisRuntimeKernel {
                                 "name": "aegis-os-workstation-gateway",
                                 "description": "Aegis OS Policy-Governed Multi-Agent A2A & MCP Gateway",
                                 "url": format!("{}/a2a", base_url),
-                                "version": "0.2.0",
+                                "version": "0.3.0",
                                 "protocolVersion": "0.2.0",
                                 "capabilities": {
                                     "streaming": true,
                                     "pushNotifications": true,
                                     "stateTransitionHistory": true,
-                                    "aegisPolicyKernel": true
+                                    "aegisPolicyKernel": true,
+                                    "aegisCloudPaas": true
                                 },
                                 "defaultInputModes": ["text/plain", "application/json", "application/octet-stream"],
                                 "defaultOutputModes": ["text/plain", "application/json", "application/octet-stream"],
@@ -2263,31 +2367,236 @@ impl AegisRuntimeKernel {
                             .to_string(),
                         )
                     } else if method == "GET" && full_target.starts_with("/api/status") {
-                        let peers = k.ipc.list_peers(&org_id).await.unwrap_or_default();
+                        let query_org = if full_target.contains("org_id=*") {
+                            "*".to_string()
+                        } else {
+                            org_id.clone()
+                        };
+                        let peers = if query_org == "*" {
+                            k.ipc.list_all_peers().await.unwrap_or_default()
+                        } else {
+                            k.ipc.list_peers(&query_org).await.unwrap_or_default()
+                        };
                         let global_peers = k.ipc.list_all_peers().await.unwrap_or_default();
                         let tasks = k.ipc.list_tasks(None, None).await.unwrap_or_default();
-                        let escalations = k.policy.list_escalations(&org_id).await.unwrap_or_default();
-                        let leases = k.policy.list_leases(&org_id, None).await.unwrap_or_default();
+                        let escalations = k.policy.list_escalations(&query_org).await.unwrap_or_default();
+                        let leases = k.policy.list_leases(&query_org, None).await.unwrap_or_default();
+                        let workspaces = k.paas.list_workspaces(Some(&query_org)).await;
+                        let api_keys = k.paas.list_api_keys(Some(&query_org)).await;
+                        let secrets = if query_org == "*" {
+                            let mut all_sec = k.egress.list_redacted_secrets("aegis-os").await;
+                            all_sec.extend(k.egress.list_redacted_secrets("acme").await);
+                            all_sec.extend(k.egress.list_redacted_secrets("default-org").await);
+                            all_sec
+                        } else {
+                            k.egress.list_redacted_secrets(&query_org).await
+                        };
                         (
                             "HTTP/1.1 200 OK",
                             json!({
-                                "org_id": org_id,
+                                "org_id": query_org,
                                 "peers": peers,
                                 "global_peers": global_peers,
                                 "a2a_tasks": tasks,
                                 "pending_escalations": escalations,
-                                "active_leases": leases
+                                "active_leases": leases,
+                                "workspaces": workspaces,
+                                "api_keys": api_keys,
+                                "secrets": secrets
                             })
                             .to_string(),
                         )
+                    } else if method == "POST" && full_target.starts_with("/v1/tenants/keys") {
+                        let payload: Value = serde_json::from_str(body_str.trim()).unwrap_or_else(|_| json!({}));
+                        let k_org = payload.get("org_id").and_then(|v| v.as_str()).unwrap_or(&org_id);
+                        let k_agent = payload.get("agent_id").and_then(|v| v.as_str()).unwrap_or("cloud-coder-1");
+                        let k_role = payload.get("role").and_then(|v| v.as_str()).unwrap_or("Aegis Cloud Agent");
+                        let k_ws = payload.get("workspace_id").and_then(|v| v.as_str()).map(|s| s.to_string());
+                        let k_label = payload.get("label").and_then(|v| v.as_str()).unwrap_or("PaaS API Key");
+                        match k.paas.issue_api_key(k_org, k_agent, k_role, k_ws, k_label).await {
+                            Ok((raw_key, record)) => (
+                                "HTTP/1.1 200 OK",
+                                json!({
+                                    "status": "issued",
+                                    "api_key": raw_key,
+                                    "record": record
+                                })
+                                .to_string(),
+                            ),
+                            Err(e) => (
+                                "HTTP/1.1 500 Internal Server Error",
+                                json!({ "error": e.to_string() }).to_string(),
+                            ),
+                        }
+                    } else if method == "GET" && full_target.starts_with("/v1/tenants/keys") {
+                        let keys = k.paas.list_api_keys(None).await;
+                        ("HTTP/1.1 200 OK", json!({ "api_keys": keys }).to_string())
+                    } else if method == "POST" && full_target == "/v1/workspaces" {
+                        let payload: Value = serde_json::from_str(body_str.trim()).unwrap_or_else(|_| json!({}));
+                        let w_org = payload.get("org_id").and_then(|v| v.as_str()).unwrap_or(&org_id);
+                        let w_id = payload.get("workspace_id").and_then(|v| v.as_str()).unwrap_or("");
+                        let w_src = payload
+                            .get("source_url")
+                            .or_else(|| payload.get("git_url"))
+                            .and_then(|v| v.as_str())
+                            .unwrap_or_else(|| ws_path.to_str().unwrap_or("."));
+                        let w_branch = payload.get("branch").and_then(|v| v.as_str()).unwrap_or("main");
+                        let w_agents: Vec<String> = payload
+                            .get("agents")
+                            .and_then(|v| serde_json::from_value(v.clone()).ok())
+                            .unwrap_or_else(|| vec!["cloud-coder-1".to_string()]);
+                        match k
+                            .paas
+                            .provision_workspace(&k, w_org, w_id, w_src, w_branch, w_agents)
+                            .await
+                        {
+                            Ok(rec) => (
+                                "HTTP/1.1 200 OK",
+                                json!({
+                                    "status": "provisioned",
+                                    "workspace": rec,
+                                    "mcp_endpoint": format!("http://{}/v1/mcp", local_addr),
+                                    "a2a_endpoint": format!("http://{}/v1/a2a", local_addr),
+                                    "dashboard_url": format!("http://{}/dashboard", local_addr)
+                                })
+                                .to_string(),
+                            ),
+                            Err(e) => (
+                                "HTTP/1.1 500 Internal Server Error",
+                                json!({ "error": e.to_string() }).to_string(),
+                            ),
+                        }
+                    } else if method == "GET" && full_target == "/v1/workspaces" {
+                        let list = k.paas.list_workspaces(None).await;
+                        ("HTTP/1.1 200 OK", json!({ "workspaces": list }).to_string())
+                    } else if method == "POST" && full_target.starts_with("/v1/workspaces/pr") {
+                        let payload: Value = serde_json::from_str(body_str.trim()).unwrap_or_else(|_| json!({}));
+                        let p_org = payload.get("org_id").and_then(|v| v.as_str()).unwrap_or(&org_id);
+                        let p_agent = payload.get("agent_id").and_then(|v| v.as_str()).unwrap_or(&agent_id);
+                        let p_ws = payload.get("workspace_id").and_then(|v| v.as_str());
+                        let p_branch = payload.get("branch_name").and_then(|v| v.as_str()).unwrap_or("");
+                        let p_title = payload.get("commit_title").and_then(|v| v.as_str()).unwrap_or("");
+                        let overwrite_bin = payload
+                            .get("overwrite_binaries")
+                            .and_then(|v| v.as_bool())
+                            .unwrap_or(false);
+                        let id = AgentIdentity::new(p_org, p_agent, "Aegis Cloud Agent");
+                        match k
+                            .paas
+                            .export_workspace_pr(&k, &id, p_ws, p_branch, p_title, overwrite_bin)
+                            .await
+                        {
+                            Ok(val) => ("HTTP/1.1 200 OK", val.to_string()),
+                            Err(e) => (
+                                "HTTP/1.1 500 Internal Server Error",
+                                json!({ "error": e.to_string() }).to_string(),
+                            ),
+                        }
+                    } else if method == "POST" && full_target.starts_with("/v1/vault/secrets") {
+                        let payload: Value = serde_json::from_str(body_str.trim()).unwrap_or_else(|_| json!({}));
+                        let s_org = payload.get("org_id").and_then(|v| v.as_str()).unwrap_or(&org_id).to_string();
+                        let placeholder = payload
+                            .get("placeholder")
+                            .and_then(|v| v.as_str())
+                            .unwrap_or("$AOS_SECRET_DEFAULT")
+                            .to_string();
+                        let value = payload
+                            .get("value")
+                            .and_then(|v| v.as_str())
+                            .unwrap_or("")
+                            .to_string();
+                        let allowed_domains: Vec<String> = payload
+                            .get("allowed_domains")
+                            .and_then(|v| serde_json::from_value(v.clone()).ok())
+                            .unwrap_or_default();
+                        let allowed_methods: Vec<String> = payload
+                            .get("allowed_methods")
+                            .and_then(|v| serde_json::from_value(v.clone()).ok())
+                            .unwrap_or_default();
+                        let allowed_path_prefixes: Vec<String> = payload
+                            .get("allowed_path_prefixes")
+                            .and_then(|v| serde_json::from_value(v.clone()).ok())
+                            .unwrap_or_default();
+                        k.egress
+                            .allow_domains(&s_org, allowed_domains.clone())
+                            .await;
+                        k.egress
+                            .register_scoped_secret(
+                                SecretVaultEntry {
+                                    org_id: s_org.clone(),
+                                    placeholder: placeholder.clone(),
+                                    real_secret_value: value,
+                                    allowed_domains: allowed_domains.clone(),
+                                },
+                                allowed_methods,
+                                allowed_path_prefixes,
+                            )
+                            .await;
+                        (
+                            "HTTP/1.1 200 OK",
+                            json!({
+                                "status": "secret_registered",
+                                "org_id": s_org,
+                                "placeholder": placeholder,
+                                "allowed_domains": allowed_domains
+                            })
+                            .to_string(),
+                        )
+                    } else if method == "GET" && full_target.starts_with("/v1/vault/secrets") {
+                        let list = k.egress.list_redacted_secrets(&org_id).await;
+                        ("HTTP/1.1 200 OK", json!({ "secrets": list }).to_string())
+                    } else if method == "POST" && full_target.starts_with("/v1/approvals/decide") {
+                        let payload: Value = serde_json::from_str(body_str.trim()).unwrap_or_else(|_| json!({}));
+                        let esc_id = payload
+                            .get("escalation_id")
+                            .and_then(|v| v.as_str())
+                            .unwrap_or("");
+                        let decision = payload
+                            .get("decision")
+                            .and_then(|v| v.as_str())
+                            .unwrap_or("approve");
+                        let ttl_secs = payload
+                            .get("ttl_secs")
+                            .and_then(|v| v.as_i64())
+                            .unwrap_or(0);
+                        let actor = payload
+                            .get("approved_by")
+                            .and_then(|v| v.as_str())
+                            .unwrap_or("mission-control-dashboard");
+                        if decision.eq_ignore_ascii_case("deny") || decision.eq_ignore_ascii_case("reject") {
+                            match k.policy.deny_escalation(esc_id, actor).await {
+                                Ok(esc) => (
+                                    "HTTP/1.1 200 OK",
+                                    json!({ "status": "denied", "escalation": esc }).to_string(),
+                                ),
+                                Err(e) => (
+                                    "HTTP/1.1 404 Not Found",
+                                    json!({ "error": e.to_string() }).to_string(),
+                                ),
+                            }
+                        } else {
+                            match k.policy.approve_escalation(esc_id, ttl_secs, actor).await {
+                                Ok(lease) => (
+                                    "HTTP/1.1 200 OK",
+                                    json!({ "status": "approved", "lease": lease }).to_string(),
+                                ),
+                                Err(e) => (
+                                    "HTTP/1.1 404 Not Found",
+                                    json!({ "error": e.to_string() }).to_string(),
+                                ),
+                            }
+                        }
                     } else if method == "POST"
-                        && (full_target.starts_with("/mcp") || full_target.starts_with("/a2a"))
+                        && (full_target.starts_with("/mcp")
+                            || full_target.starts_with("/v1/mcp")
+                            || full_target.starts_with("/a2a")
+                            || full_target.starts_with("/v1/a2a"))
                     {
                         let identity = AgentIdentity::new(org_id, agent_id, role);
                         let _ = k
                             .ensure_agent_environment(
                                 identity.clone(),
-                                &ws_path,
+                                &bound_ws_path,
                                 IsolationTier::NativeOsSandbox,
                                 vec!["*".to_string()],
                             )
@@ -2310,7 +2619,7 @@ impl AegisRuntimeKernel {
                     };
 
                     let http_resp = format!(
-                        "{status_line}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{resp_body}",
+                        "{status_line}\r\nContent-Type: {content_type}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{resp_body}",
                         resp_body.len()
                     );
                     let _ = stream.write_all(http_resp.as_bytes()).await;
@@ -2550,5 +2859,194 @@ mod tests {
         assert!(send_str.contains("200 OK"));
         assert!(send_str.contains("\"state\":\"submitted\""));
         assert!(send_str.contains("ctx-http-a2a"));
+    }
+
+    #[tokio::test]
+    async fn test_paas_api_key_auth_cloud_workspace_pr_and_dashboard_approval() {
+        let temp = tempfile::tempdir().unwrap();
+        let source_repo = temp.path().join("source_repo");
+        let runtime_root = temp.path().join("aegis_runtime");
+        tokio::fs::create_dir_all(&source_repo).await.unwrap();
+        tokio::fs::write(source_repo.join("lib.rs"), "pub fn compute() -> i32 { 10 }\n")
+            .await
+            .unwrap();
+
+        let kernel = Arc::new(AegisRuntimeKernel::new(&runtime_root).await.unwrap());
+        let addr = kernel
+            .clone()
+            .start_http_daemon("127.0.0.1:0", source_repo.clone())
+            .await
+            .unwrap();
+
+        async fn http_call(
+            addr: std::net::SocketAddr,
+            method: &str,
+            path: &str,
+            auth: Option<&str>,
+            body: Option<Value>,
+        ) -> (String, Value) {
+            let mut stream = tokio::net::TcpStream::connect(addr).await.unwrap();
+            let body_str = body.map(|b| b.to_string()).unwrap_or_default();
+            let auth_hdr = auth
+                .map(|a| format!("Authorization: Bearer {}\r\n", a))
+                .unwrap_or_default();
+            let req = format!(
+                "{} {} HTTP/1.1\r\nHost: {}\r\n{}Content-Length: {}\r\n\r\n{}",
+                method,
+                path,
+                addr,
+                auth_hdr,
+                body_str.len(),
+                body_str
+            );
+            stream.write_all(req.as_bytes()).await.unwrap();
+            let mut buf = Vec::new();
+            tokio::io::AsyncReadExt::read_to_end(&mut stream, &mut buf)
+                .await
+                .unwrap();
+            let raw = String::from_utf8_lossy(&buf).to_string();
+            let (head, b) = raw.split_once("\r\n\r\n").unwrap_or((&raw, "{}"));
+            let parsed = serde_json::from_str::<Value>(b).unwrap_or_else(|_| json!({ "html": b }));
+            (head.to_string(), parsed)
+        }
+
+        // 1. Verify Embedded Web Mission Control Dashboard (`GET /dashboard`)
+        let (dash_head, dash_body) = http_call(addr, "GET", "/dashboard", None, None).await;
+        assert!(dash_head.contains("200 OK"));
+        assert!(dash_head.contains("text/html"));
+        assert!(dash_body["html"]
+            .as_str()
+            .unwrap()
+            .contains("Aegis Cloud PaaS — Mission Control"));
+
+        // 2. Provision a Cloud Workspace (`POST /v1/workspaces`) with 2 parallel CoW agent branches
+        let (ws_head, ws_resp) = http_call(
+            addr,
+            "POST",
+            "/v1/workspaces",
+            None,
+            Some(json!({
+                "org_id": "acme-cloud",
+                "workspace_id": "ws-billing",
+                "source_url": source_repo.to_string_lossy(),
+                "branch": "main",
+                "agents": ["coder-alpha", "reviewer-beta"]
+            })),
+        )
+        .await;
+        assert!(ws_head.contains("200 OK"));
+        assert_eq!(ws_resp["status"], "provisioned");
+
+        // 3. Mint a scoped `ak_live_*` API key (`POST /v1/tenants/keys`) bound to `ws-billing`
+        let (_, key_resp) = http_call(
+            addr,
+            "POST",
+            "/v1/tenants/keys",
+            None,
+            Some(json!({
+                "org_id": "acme-cloud",
+                "agent_id": "coder-alpha",
+                "workspace_id": "ws-billing",
+                "label": "CI Cloud Key"
+            })),
+        )
+        .await;
+        let api_key = key_resp["api_key"].as_str().unwrap().to_string();
+        assert!(api_key.starts_with("ak_live_"));
+
+        // 4. Reject forged API key with `401 Unauthorized`
+        let (bad_head, _) = http_call(
+            addr,
+            "POST",
+            "/v1/mcp",
+            Some("ak_live_forged_invalid_token"),
+            Some(json!({ "jsonrpc": "2.0", "id": 1, "method": "initialize" })),
+        )
+        .await;
+        assert!(bad_head.contains("401 Unauthorized"));
+
+        // 5. Modify `lib.rs` in `coder-alpha`'s CoW shadow workspace via authenticated `POST /v1/mcp`
+        let (edit_head, _) = http_call(
+            addr,
+            "POST",
+            "/v1/mcp",
+            Some(&api_key),
+            Some(json!({
+                "jsonrpc": "2.0",
+                "id": 2,
+                "method": "tools/call",
+                "params": {
+                    "name": "fs_edit",
+                    "arguments": {
+                        "path": "lib.rs",
+                        "target": "pub fn compute() -> i32 { 10 }",
+                        "replacement": "pub fn compute() -> i32 { 42 }"
+                    }
+                }
+            })),
+        )
+        .await;
+        assert!(edit_head.contains("200 OK"));
+
+        // 6. Trigger `workspace_commit` -> hits HITL approval gate -> approve via `/v1/approvals/decide`
+        let (_, commit_ask) = http_call(
+            addr,
+            "POST",
+            "/v1/mcp",
+            Some(&api_key),
+            Some(json!({
+                "jsonrpc": "2.0",
+                "id": 3,
+                "method": "tools/call",
+                "params": {
+                    "name": "workspace_commit",
+                    "arguments": {}
+                }
+            })),
+        )
+        .await;
+        let ask_text = commit_ask["result"]["content"][0]["text"].as_str().unwrap();
+        let ask_json: Value = serde_json::from_str(ask_text).unwrap();
+        assert_eq!(ask_json["status"], "approval_required");
+        let esc_id = ask_json["escalation_id"].as_str().unwrap();
+
+        let (app_head, app_resp) = http_call(
+            addr,
+            "POST",
+            "/v1/approvals/decide",
+            None,
+            Some(json!({
+                "escalation_id": esc_id,
+                "decision": "approve",
+                "ttl_secs": 3600
+            })),
+        )
+        .await;
+        assert!(app_head.contains("200 OK"));
+        assert_eq!(app_resp["status"], "approved");
+
+        // 7. Export Git branch, commit SHA, unified patch, and GitHub PR payload (`POST /v1/workspaces/pr`)
+        let (pr_head, pr_resp) = http_call(
+            addr,
+            "POST",
+            "/v1/workspaces/pr",
+            Some(&api_key),
+            Some(json!({
+                "org_id": "acme-cloud",
+                "workspace_id": "ws-billing",
+                "agent_id": "coder-alpha",
+                "branch_name": "aegis/coder-alpha/fix-compute",
+                "commit_title": "feat(billing): update compute() return value to 42"
+            })),
+        )
+        .await;
+        assert!(pr_head.contains("200 OK"));
+        assert_eq!(pr_resp["status"], "pr_bundle_exported");
+        assert_eq!(pr_resp["git_branch"], "aegis/coder-alpha/fix-compute");
+        assert!(!pr_resp["git_commit_sha"].as_str().unwrap().is_empty());
+        assert!(pr_resp["unified_patch"]
+            .as_str()
+            .unwrap()
+            .contains("+pub fn compute() -> i32 { 42 }"));
     }
 }

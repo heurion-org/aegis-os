@@ -402,8 +402,8 @@ impl PolicyEngine for AegisPolicyKernel {
         Ok(leases
             .iter()
             .filter(|l| {
-                l.org_id == org_id
-                    && l.expires_at_ms > now_ms
+                (org_id == "*" || l.org_id == org_id)
+                    && (l.expires_at_ms > now_ms || l.expires_at_ms == -1)
                     && agent_id.map_or(true, |a| l.agent_id == "*" || l.agent_id == a)
             })
             .cloned()
@@ -415,7 +415,7 @@ impl PolicyEngine for AegisPolicyKernel {
         let esc = self.escalations.read().await;
         Ok(esc
             .iter()
-            .filter(|e| e.org_id == org_id)
+            .filter(|e| org_id == "*" || e.org_id == org_id)
             .cloned()
             .collect())
     }
@@ -454,6 +454,25 @@ impl PolicyEngine for AegisPolicyKernel {
         self.leases.write().await.push(lease.clone());
         self.flush_to_disk().await?;
         Ok(lease)
+    }
+
+    async fn deny_escalation(
+        &self,
+        escalation_id: &str,
+        _denied_by: &str,
+    ) -> anyhow::Result<PendingEscalation> {
+        self.reload_from_disk().await;
+        let target = {
+            let mut list = self.escalations.write().await;
+            let item = list
+                .iter_mut()
+                .find(|e| e.escalation_id == escalation_id)
+                .with_context(|| format!("Escalation '{}' not found", escalation_id))?;
+            item.status = EscalationStatus::Denied;
+            item.clone()
+        };
+        self.flush_to_disk().await?;
+        Ok(target)
     }
 }
 

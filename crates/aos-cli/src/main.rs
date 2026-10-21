@@ -495,9 +495,14 @@ async fn main() -> anyhow::Result<()> {
                 .start_http_daemon(&listen, workspace.clone())
                 .await?;
             println!("=========================================================================");
-            println!("  Aegis OS Runtime Daemon (v0.2.0) Started");
-            println!("  MCP Streamable HTTP: http://{}/mcp", daemon_addr);
-            println!("  Status API:          http://{}/api/status", daemon_addr);
+            println!("  Aegis Cloud PaaS & Runtime Daemon (v0.3.0) Started");
+            println!("  Web Mission Control: http://{}/dashboard", daemon_addr);
+            println!("  MCP Streamable HTTP: http://{}/v1/mcp (or /mcp)", daemon_addr);
+            println!("  Google A2A Hub:      http://{}/v1/a2a (Card: /.well-known/agent.json)", daemon_addr);
+            println!("  PaaS Workspaces API: http://{}/v1/workspaces", daemon_addr);
+            println!("  Tenant API Keys:     http://{}/v1/tenants/keys", daemon_addr);
+            println!("  Secret Vault API:    http://{}/v1/vault/secrets", daemon_addr);
+            println!("  HITL Approvals API:  http://{}/v1/approvals/decide", daemon_addr);
             println!("  Zero-Trust Egress:   http://{}", egress_addr);
             println!("=========================================================================");
             tokio::signal::ctrl_c().await?;
