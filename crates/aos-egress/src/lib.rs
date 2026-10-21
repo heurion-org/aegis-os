@@ -12,7 +12,7 @@ use serde_json::json;
 use std::collections::{HashMap, HashSet};
 use std::net::SocketAddr;
 use std::sync::Arc;
-use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader};
 use tokio::net::TcpListener;
 use tokio::sync::RwLock;
 
@@ -178,10 +178,71 @@ impl AegisEgressGateway {
         }
     }
 
+    /// Scans outbound URL query strings and HTTP request bodies for credential exfiltration:
+    /// 1. Raw `$AOS_SECRET_*` placeholders or registered vault secret values leaked into query/body.
+    /// 2. High-confidence secret/key signatures (PEM private keys, AWS `AKIA*` keys, GitHub `ghp_*` /
+    ///    `github_pat_*` tokens, API `sk-*` keys, Slack `xoxb-*` tokens).
+    pub fn inspect_payload_dlp(
+        text: &str,
+        entries: &[(&String, &SecretVaultEntry)],
+        org_id: &str,
+    ) -> Option<String> {
+        if text.is_empty() {
+            return None;
+        }
+        if text.contains("$AOS_SECRET_") {
+            return Some("$AOS_SECRET_* (outbound DLP)".to_string());
+        }
+        let org_prefix = format!("{}::", org_id);
+        for &(vault_key, secret_entry) in entries {
+            if vault_key.starts_with(&org_prefix)
+                && !secret_entry.real_secret_value.is_empty()
+                && text.contains(&secret_entry.real_secret_value)
+            {
+                return Some(format!("{} (outbound DLP)", secret_entry.placeholder));
+            }
+        }
+        if text.contains("-----BEGIN ") && text.contains("PRIVATE KEY-----") {
+            return Some("DLP:PEM_PRIVATE_KEY".to_string());
+        }
+        if let Some(idx) = text.find("AKIA") {
+            let tail = &text[idx + 4..];
+            let alnum_len = tail
+                .chars()
+                .take_while(|c| c.is_ascii_uppercase() || c.is_ascii_digit())
+                .count();
+            if alnum_len >= 12 {
+                return Some("DLP:AWS_ACCESS_KEY".to_string());
+            }
+        }
+        for prefix in ["ghp_", "github_pat_", "sk-ant-", "sk-proj-", "sk-live-", "xoxb-"] {
+            if let Some(idx) = text.find(prefix) {
+                let tail = &text[idx + prefix.len()..];
+                let token_len = tail
+                    .chars()
+                    .take_while(|c| c.is_ascii_alphanumeric() || *c == '_' || *c == '-')
+                    .count();
+                if token_len >= 8 {
+                    return Some(format!("DLP:TOKEN_{}", prefix.trim_end_matches(['_', '-'])));
+                }
+            }
+        }
+        None
+    }
+
     pub async fn inspect_and_inject(
         &self,
         identity: &AgentIdentity,
         req: &OutboundRequestSpec,
+    ) -> anyhow::Result<EgressVerdict> {
+        self.inspect_and_inject_with_body(identity, req, None).await
+    }
+
+    pub async fn inspect_and_inject_with_body(
+        &self,
+        identity: &AgentIdentity,
+        req: &OutboundRequestSpec,
+        body: Option<&str>,
     ) -> anyhow::Result<EgressVerdict> {
         let mut out_headers = req.headers.clone();
         let mut secrets_injected = Vec::new();
@@ -193,6 +254,24 @@ impl AegisEgressGateway {
         // Sort by descending placeholder length so `$AOS_SECRET_GH_SCOPED` is matched before `$AOS_SECRET_GH`.
         let mut entries: Vec<(&String, &SecretVaultEntry)> = vault.iter().collect();
         entries.sort_by(|a, b| b.1.placeholder.len().cmp(&a.1.placeholder.len()));
+
+        // 1b. Outbound L7 DLP inspection on URL query string and HTTP request body (prevents exfiltrating
+        // secrets or private keys inside the body/query of an allowlisted endpoint such as POST /repos/acme/app/issues).
+        if !aos_core::ablated("secret_binding") {
+            let query_part = req.path.split_once('?').map(|(_, q)| q).unwrap_or("");
+            if let Some(dlp_hit) =
+                Self::inspect_payload_dlp(query_part, &entries, &identity.org_id)
+                    .or_else(|| body.and_then(|b| Self::inspect_payload_dlp(b, &entries, &identity.org_id)))
+            {
+                return Ok(EgressVerdict::BlockedSecretExfiltration {
+                    placeholder: dlp_hit,
+                    unauthorized_domain: format!(
+                        "{} (outbound DLP policy violation on {})",
+                        req.target_domain, normalized_path
+                    ),
+                });
+            }
+        }
 
         for (_header_name, header_val) in out_headers.iter_mut() {
             for &(vault_key, secret_entry) in &entries {
@@ -312,23 +391,44 @@ impl AegisEgressGateway {
                 let bound_id = pinned_identity.clone();
                 tokio::spawn(async move {
                     let (read_half, mut write_half) = stream.split();
-                    let mut reader = BufReader::new(read_half).lines();
+                    let mut reader = BufReader::new(read_half);
 
-                    let Ok(Some(request_line)) = reader.next_line().await else {
+                    let mut request_line = String::new();
+                    let Ok(n) = reader.read_line(&mut request_line).await else {
                         return;
                     };
+                    if n == 0 {
+                        return;
+                    }
                     let parts: Vec<&str> = request_line.split_whitespace().collect();
                     let method = parts.first().copied().unwrap_or("GET").to_string();
-                    let raw_target = parts.get(1).copied().unwrap_or("/");
-                    let path = Self::normalize_request_path(raw_target);
+                    let raw_target = parts.get(1).copied().unwrap_or("/").to_string();
 
                     let mut headers = HashMap::new();
-                    while let Ok(Some(line)) = reader.next_line().await {
-                        if line.trim().is_empty() {
+                    let mut content_length: usize = 0;
+                    loop {
+                        let mut line = String::new();
+                        let Ok(read_n) = reader.read_line(&mut line).await else {
+                            break;
+                        };
+                        if read_n == 0 || line.trim().is_empty() {
                             break;
                         }
                         if let Some((k, v)) = line.split_once(':') {
-                            headers.insert(k.trim().to_string(), v.trim().to_string());
+                            let key = k.trim().to_string();
+                            let val = v.trim().to_string();
+                            if key.eq_ignore_ascii_case("content-length") {
+                                content_length = val.parse::<usize>().unwrap_or(0).min(65536);
+                            }
+                            headers.insert(key, val);
+                        }
+                    }
+
+                    let mut req_body = String::new();
+                    if content_length > 0 {
+                        let mut buf = vec![0u8; content_length];
+                        if reader.read_exact(&mut buf).await.is_ok() {
+                            req_body = String::from_utf8_lossy(&buf).into_owned();
                         }
                     }
 
@@ -357,11 +457,19 @@ impl AegisEgressGateway {
                     let spec = OutboundRequestSpec {
                         target_domain,
                         method,
-                        path,
+                        path: raw_target,
                         headers,
                     };
 
-                    let (status_line, body) = match gw_conn.inspect_and_inject(&identity, &spec).await {
+                    let body_opt = if req_body.is_empty() {
+                        None
+                    } else {
+                        Some(req_body.as_str())
+                    };
+                    let (status_line, body) = match gw_conn
+                        .inspect_and_inject_with_body(&identity, &spec, body_opt)
+                        .await
+                    {
                         Ok(EgressVerdict::AllowedAndSanitized { secrets_injected, .. }) => (
                             "HTTP/1.1 200 OK",
                             json!({
@@ -586,13 +694,52 @@ mod tests {
                     target_domain: "api.github.com".to_string(),
                     method: "DELETE".to_string(),
                     path: "/repos/acme/issues/1".to_string(),
-                    headers: scoped_headers,
+                    headers: scoped_headers.clone(),
                 },
             )
             .await
             .unwrap();
         assert!(matches!(
             blocked_method,
+            EgressVerdict::BlockedSecretExfiltration { .. }
+        ));
+
+        // Outbound L7 DLP: exfiltrating a PEM private key or AWS key inside the body of an allowlisted
+        // endpoint (`POST /repos/acme/issues`) is blocked!
+        let blocked_body_dlp = gw
+            .inspect_and_inject_with_body(
+                &agent,
+                &OutboundRequestSpec {
+                    target_domain: "api.github.com".to_string(),
+                    method: "POST".to_string(),
+                    path: "/repos/acme/issues".to_string(),
+                    headers: scoped_headers.clone(),
+                },
+                Some(r#"{"title":"bug","body":"-----BEGIN OPENSSH PRIVATE KEY----- b3BlbnNzaC1rZXktdjE= -----END OPENSSH PRIVATE KEY-----"}"#),
+            )
+            .await
+            .unwrap();
+        assert!(matches!(
+            blocked_body_dlp,
+            EgressVerdict::BlockedSecretExfiltration { .. }
+        ));
+
+        // Outbound L7 DLP: exfiltrating a secret placeholder or AWS key in URL query string on allowlisted path is blocked!
+        let blocked_query_dlp = gw
+            .inspect_and_inject_with_body(
+                &agent,
+                &OutboundRequestSpec {
+                    target_domain: "api.github.com".to_string(),
+                    method: "GET".to_string(),
+                    path: "/repos/acme/issues?leak=AKIAIOSFODNN7EXAMPLE".to_string(),
+                    headers: scoped_headers,
+                },
+                None,
+            )
+            .await
+            .unwrap();
+        assert!(matches!(
+            blocked_query_dlp,
             EgressVerdict::BlockedSecretExfiltration { .. }
         ));
     }

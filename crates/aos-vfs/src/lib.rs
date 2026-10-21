@@ -552,7 +552,7 @@ impl CoWWorkspace {
         )
     }
 
-    #[cfg(target_os = "macos")]
+    #[cfg(any(target_os = "macos", target_os = "linux"))]
     fn contains_ignored_subdir(dir: &Path, max_depth: usize) -> bool {
         if max_depth == 0 {
             return false;
@@ -576,9 +576,134 @@ impl CoWWorkspace {
         false
     }
 
-    /// Clones an entire directory tree using macOS APFS directory-level `clonefile(2)` in a single
-    /// atomic kernel metadata operation (O(1) time & zero disk blocks) while automatically skipping
-    /// heavy build/VCS directories (`.git`, `target`, `node_modules`, `.aegis_os`, `.gemini`).
+    #[cfg(target_os = "linux")]
+    fn btrfs_ioctl_on_parent(parent: &Path, name: &str, req: libc::c_ulong, src_fd: i64) -> bool {
+        use std::os::unix::io::AsRawFd;
+        #[repr(C)]
+        struct BtrfsIoctlVolArgsV2 {
+            fd: i64,
+            transid: u64,
+            flags: u64,
+            unused: [u64; 4],
+            name: [u8; 4040],
+        }
+        let name_bytes = name.as_bytes();
+        if name_bytes.is_empty() || name_bytes.len() > 4039 {
+            return false;
+        }
+        let Ok(parent_file) = std::fs::File::open(parent) else {
+            return false;
+        };
+        let mut args = BtrfsIoctlVolArgsV2 {
+            fd: src_fd,
+            transid: 0,
+            flags: 0,
+            unused: [0; 4],
+            name: [0u8; 4040],
+        };
+        args.name[..name_bytes.len()].copy_from_slice(name_bytes);
+        unsafe { libc::ioctl(parent_file.as_raw_fd(), req, &args as *const _) == 0 }
+    }
+
+    #[cfg(target_os = "linux")]
+    fn btrfs_subvol_supported(parent: &Path) -> bool {
+        use std::os::unix::fs::MetadataExt;
+        use std::sync::{LazyLock, Mutex};
+        const BTRFS_IOC_SUBVOL_CREATE_V2: libc::c_ulong = 0x50009418;
+        const BTRFS_IOC_SNAP_DESTROY: libc::c_ulong = 0x5000940f;
+        static SUBVOL_CAP: LazyLock<Mutex<HashMap<u64, bool>>> =
+            LazyLock::new(|| Mutex::new(HashMap::new()));
+
+        let Ok(meta) = std::fs::metadata(parent) else {
+            return false;
+        };
+        let dev = meta.dev();
+        if let Ok(guard) = SUBVOL_CAP.lock() {
+            if let Some(&cap) = guard.get(&dev) {
+                return cap;
+            }
+        }
+        let probe_name = format!(".aegis_btrfs_probe_{}", std::process::id());
+        let probe_path = parent.join(&probe_name);
+        let created = Self::btrfs_ioctl_on_parent(parent, &probe_name, BTRFS_IOC_SUBVOL_CREATE_V2, 0);
+        let supported = if created {
+            if std::fs::remove_dir(&probe_path).is_ok() {
+                true
+            } else {
+                let _ = Self::btrfs_ioctl_on_parent(parent, &probe_name, BTRFS_IOC_SNAP_DESTROY, 0);
+                false
+            }
+        } else {
+            false
+        };
+        if let Ok(mut guard) = SUBVOL_CAP.lock() {
+            guard.insert(dev, supported);
+        }
+        supported
+    }
+
+    #[cfg(target_os = "linux")]
+    fn try_btrfs_subvol_snapshot(src: &Path, dst: &Path) -> bool {
+        use std::os::unix::fs::MetadataExt;
+        use std::os::unix::io::AsRawFd;
+        // On Linux Btrfs, every subvolume root has inode number BTRFS_FIRST_FREE_OBJECTID (256).
+        const BTRFS_FIRST_FREE_OBJECTID: u64 = 256;
+        const BTRFS_IOC_SNAP_CREATE_V2: libc::c_ulong = 0x50009417;
+
+        let Ok(src_meta) = std::fs::metadata(src) else {
+            return false;
+        };
+        if src_meta.ino() != BTRFS_FIRST_FREE_OBJECTID {
+            return false;
+        }
+        let (Some(parent), Some(name)) = (dst.parent(), dst.file_name().and_then(|n| n.to_str()))
+        else {
+            return false;
+        };
+        if !Self::btrfs_subvol_supported(parent) {
+            return false;
+        }
+        let Ok(src_file) = std::fs::File::open(src) else {
+            return false;
+        };
+        Self::btrfs_ioctl_on_parent(
+            parent,
+            name,
+            BTRFS_IOC_SNAP_CREATE_V2,
+            src_file.as_raw_fd() as i64,
+        )
+    }
+
+    #[cfg(target_os = "linux")]
+    fn try_btrfs_subvol_create(dst: &Path) -> bool {
+        const BTRFS_IOC_SUBVOL_CREATE_V2: libc::c_ulong = 0x50009418;
+        let (Some(parent), Some(name)) = (dst.parent(), dst.file_name().and_then(|n| n.to_str()))
+        else {
+            return false;
+        };
+        if !Self::btrfs_subvol_supported(parent) {
+            return false;
+        }
+        Self::btrfs_ioctl_on_parent(parent, name, BTRFS_IOC_SUBVOL_CREATE_V2, 0)
+    }
+
+    /// Creates a directory, preferring a Btrfs subvolume on Linux Btrfs mounts (when unprivileged
+    /// subvolume deletion is supported) so subsequent `cow_sync_dir` snapshots run in O(1) via
+    /// `BTRFS_IOC_SNAP_CREATE_V2`, and falling back to `std::fs::create_dir_all` everywhere else.
+    pub fn init_dir(dst: &Path) -> std::io::Result<()> {
+        if let Some(parent) = dst.parent() {
+            std::fs::create_dir_all(parent)?;
+        }
+        #[cfg(target_os = "linux")]
+        if !dst.exists() && Self::try_btrfs_subvol_create(dst) {
+            return Ok(());
+        }
+        std::fs::create_dir_all(dst)
+    }
+
+    /// Clones an entire directory tree using macOS APFS directory-level `clonefile(2)` or Linux Btrfs
+    /// `BTRFS_IOC_SNAP_CREATE_V2` in a single atomic kernel metadata operation (O(1) time & zero disk
+    /// blocks) while automatically skipping heavy build/VCS directories (`.git`, `target`, `node_modules`).
     pub async fn cow_sync_dir(src: &Path, dst: &Path) -> anyhow::Result<()> {
         let (src, dst) = (src.to_path_buf(), dst.to_path_buf());
         tokio::task::spawn_blocking(move || Self::cow_sync_dir_blocking(&src, &dst)).await?
@@ -607,6 +732,19 @@ impl CoWWorkspace {
             }
         }
 
+        #[cfg(target_os = "linux")]
+        if std::env::var_os("AOS_BTRFS_SUBVOL").is_some() {
+            if !Self::contains_ignored_subdir(src, 1) && Self::try_btrfs_subvol_snapshot(src, dst) {
+                return Ok(());
+            }
+            if !Self::try_btrfs_subvol_create(dst) {
+                std::fs::create_dir_all(dst)?;
+            }
+        } else {
+            std::fs::create_dir_all(dst)?;
+        }
+
+        #[cfg(not(target_os = "linux"))]
         std::fs::create_dir_all(dst)?;
         let mut allow_reflink = true;
         let mut stack = vec![(src.to_path_buf(), dst.to_path_buf())];

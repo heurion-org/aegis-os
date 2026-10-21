@@ -22,6 +22,8 @@ import tempfile
 ABLATIONS = [
     ("none", "full system (control)"),
     ("kernel_sandbox", "no OS kernel sandbox (Seatbelt / bwrap)"),
+    ("cred_mask", "no credential-directory masking"),
+    ("net_isolation", "no network / egress proxy confinement"),
     ("commit_guard", "no commit-time poisoning guard"),
     ("tenant_gate", "no cross-tenant policy gate"),
     ("secret_binding", "no per-secret domain binding"),

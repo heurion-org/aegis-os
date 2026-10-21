@@ -50,6 +50,7 @@ def mcp_call(base_url: str, token: str, tool_name: str, arguments: dict) -> dict
 def main():
     port = 17088
     base_url = f"http://127.0.0.1:{port}"
+    ssh_base = ["ssh", "-F", "/Users/huizhao/.lima/aegis-linux/ssh.config", "lima-aegis-linux"]
     setup_cmd = """set -e
 pkill -f "aegis-os.*17088" || true
 rm -rf /mnt/btrfs/remote_hybrid_test
@@ -62,7 +63,7 @@ printf 'pub fn alpha() -> i32 { 1 }\\npub fn beta() -> i32 { 2 }\\n' > src/lib.r
 git add . && git commit -qm "init"
 """
     subprocess.run(
-        ["limactl", "shell", "--workdir", "/", "aegis-linux", "bash"],
+        [*ssh_base, "bash"],
         input=setup_cmd,
         text=True,
         check=True,
@@ -70,12 +71,10 @@ git add . && git commit -qm "init"
 
     daemon_proc = subprocess.Popen(
         [
-            "limactl",
-            "shell",
-            "--workdir",
-            "/",
-            "aegis-linux",
-            "/mnt/btrfs/aegis-target/release/aegis-os",
+            *ssh_base,
+            "-L",
+            f"127.0.0.1:{port}:127.0.0.1:{port}",
+            "/mnt/btrfs/aegis-os/target/release/aegis-os",
             "--runtime-dir",
             "/mnt/btrfs/remote_hybrid_test/rt",
             "--workspace",
@@ -220,13 +219,25 @@ git add . && git commit -qm "init"
         # Verify host file on Linux btrfs contains BOTH edits
         host_lib = f"{pr['host_root']}/src/lib.rs"
         merged_file = subprocess.run(
-            ["limactl", "shell", "--workdir", "/", "aegis-linux", "cat", host_lib],
+            [*ssh_base, f"cat '{host_lib}'"],
             capture_output=True,
             text=True,
             check=True,
         ).stdout
         assert "100" in merged_file and "200" in merged_file, merged_file
         print("[5/5] Verified merged file on Linux btrfs contains both concurrent edits!")
+
+        # Measure 50 cross-OS HTTP/JSON-RPC `POST /v1/mcp` (`fs_read`) round-trips from macOS to Linux daemon
+        lat_ms = []
+        for _ in range(50):
+            t0 = time.perf_counter()
+            mcp_call(base_url, key_a, "fs_read", {"path": "src/lib.rs"})
+            lat_ms.append((time.perf_counter() - t0) * 1000.0)
+        lat_ms.sort()
+        mean_ms = sum(lat_ms) / len(lat_ms)
+        p50_ms = lat_ms[len(lat_ms) // 2]
+        p99_ms = lat_ms[int(len(lat_ms) * 0.99)]
+        print(f"[Latency] Cross-OS macOS->Linux `POST /v1/mcp` (`fs_read`, N=50): Mean={mean_ms:.2f} ms, P50={p50_ms:.2f} ms, P99={p99_ms:.2f} ms")
     finally:
         daemon_proc.terminate()
         try:
@@ -234,7 +245,7 @@ git add . && git commit -qm "init"
         except Exception:
             daemon_proc.kill()
         subprocess.run(
-            ["limactl", "shell", "--workdir", "/", "aegis-linux", "pkill", "-f", "aegis-os.*17088"],
+            [*ssh_base, "pkill -f 'aegis-os.*17088' || true"],
             capture_output=True,
         )
 

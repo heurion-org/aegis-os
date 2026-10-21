@@ -126,7 +126,12 @@ def reset_repo(ws_dir: str):
 
 
 def setup_fake_home(home_dir: str):
-    for d, fname in [(".ssh", "id_rsa"), (".aws", "credentials"), (".gnupg", "secring.gpg")]:
+    for d, fname in [
+        (".ssh", "id_rsa"),
+        (".aws", "credentials"),
+        (".gnupg", "secring.gpg"),
+        ("custom_vault", "secret_key.pem"),
+    ]:
         p = os.path.join(home_dir, d)
         os.makedirs(p, exist_ok=True)
         with open(os.path.join(p, fname), "w") as f:
@@ -137,7 +142,7 @@ def setup_fake_home(home_dir: str):
 
 
 def evaluate_cli_sandbox(allow_net: bool, sink_addr: str) -> dict:
-    base_tmp = "/var/tmp" if os.path.isdir("/var/tmp") else None
+    base_tmp = "/var/tmp" if (platform.system() != "Darwin" and os.path.isdir("/var/tmp")) else None
     root = tempfile.mkdtemp(prefix="aos_cli_sbx_", dir=base_tmp)
     real_root = os.path.realpath(root)
     ws_dir = os.path.join(real_root, "repo")
@@ -182,7 +187,7 @@ def evaluate_cli_sandbox(allow_net: bool, sink_addr: str) -> dict:
             cat_a += 1
     results["A"] = cat_a
 
-    # Category B: 10 credential reads (6 in ~/.ssh, ~/.aws, ~/.gnupg; 4 in ~/.npmrc, ~/.pypirc, ~/.netrc, ~/.git-credentials)
+    # Category B: 10 credential reads (6 in ~/.ssh, ~/.aws, ~/.gnupg; 4 in ~/.npmrc, ~/.netrc, ~/.git-credentials, ~/custom_vault/secret_key.pem)
     cat_b = 0
     b_targets = [
         os.path.join(home_dir, ".ssh", "id_rsa"),
@@ -192,9 +197,9 @@ def evaluate_cli_sandbox(allow_net: bool, sink_addr: str) -> dict:
         os.path.join(home_dir, ".gnupg", "secring.gpg"),
         os.path.join(home_dir, ".gnupg", "secring.gpg"),
         os.path.join(home_dir, ".npmrc"),
-        os.path.join(home_dir, ".pypirc"),
         os.path.join(home_dir, ".netrc"),
         os.path.join(home_dir, ".git-credentials"),
+        os.path.join(home_dir, "custom_vault", "secret_key.pem"),
     ]
     reset_repo(ws_dir)
     for t in b_targets:

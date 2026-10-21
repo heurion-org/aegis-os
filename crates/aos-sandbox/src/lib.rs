@@ -72,21 +72,50 @@ impl NativeOsSandboxInstance {
         let home = Self::canonical_or_orig(&self.config.agent_home_dir);
         let pub_dir = Self::canonical_or_orig(&self.config.org_agent_pub_dir);
 
-        let net_rules = if let Some(ref proxy_str) = self.config.egress_proxy_addr {
-            let port_pattern = proxy_str
-                .rsplit_once(':')
-                .map(|(_, port)| port.trim_end_matches('/'))
-                .filter(|p| p.chars().all(|c| c.is_ascii_digit()) && !p.is_empty())
-                .unwrap_or("*");
-            format!(
-                r#"
+        let net_rules = if !aos_core::ablated("net_isolation") {
+            if let Some(ref proxy_str) = self.config.egress_proxy_addr {
+                let port_pattern = proxy_str
+                    .rsplit_once(':')
+                    .map(|(_, port)| port.trim_end_matches('/'))
+                    .filter(|p| p.chars().all(|c| c.is_ascii_digit()) && !p.is_empty())
+                    .unwrap_or("*");
+                format!(
+                    r#"
 (deny network-outbound)
 (allow network-outbound
     (remote ip "localhost:{port_pattern}")
 )"#
-            )
+                )
+            } else {
+                String::new()
+            }
         } else {
             String::new()
+        };
+
+        let cred_rules = if !aos_core::ablated("cred_mask") {
+            r#"
+(deny file-read*
+    (regex #".*/\.ssh(/.*)?$")
+    (regex #".*/\.aws(/.*)?$")
+    (regex #".*/\.gnupg(/.*)?$")
+    (regex #".*/\.kube(/.*)?$")
+    (regex #".*/\.docker(/.*)?$")
+    (regex #".*/\.config/gh(/.*)?$")
+    (regex #".*/\.config/gcloud(/.*)?$")
+    (regex #".*/\.azure(/.*)?$")
+    (regex #".*/\.npmrc$")
+    (regex #".*/\.pypirc$")
+    (regex #".*/\.netrc$")
+    (regex #".*/\.git-credentials$")
+    (regex #".*/\.vault-token$")
+    (regex #".*/\.cargo/credentials(\.toml)?$")
+    (regex #".*/(custom_vault|\.secrets)(/.*)?$")
+    (regex #".*/Library/Keychains(/.*)?$")
+    (literal "/etc/shadow")
+)"#
+        } else {
+            ""
         };
 
         format!(
@@ -103,18 +132,7 @@ impl NativeOsSandboxInstance {
     (literal "/dev/random")
     (literal "/dev/urandom")
     (literal "/dev/tty")
-)
-(deny file-read*
-    (regex #".*/\.ssh(/.*)?$")
-    (regex #".*/\.aws(/.*)?$")
-    (regex #".*/\.gnupg(/.*)?$")
-    (regex #".*/\.kube(/.*)?$")
-    (regex #".*/\.config/gh(/.*)?$")
-    (regex #".*/\.npmrc$")
-    (regex #".*/\.pypirc$")
-    (regex #".*/Library/Keychains(/.*)?$")
-    (literal "/etc/shadow")
-){net_rules}
+){cred_rules}{net_rules}
 "#
         )
     }
@@ -192,6 +210,43 @@ impl NativeOsSandboxInstance {
         }
     }
 
+    /// Safe read-only compiler/toolchain subdirectories re-exposed after masking a host `$HOME` with `--tmpfs`.
+    /// Note that `.cargo/credentials.toml` and `.cargo/credentials` are intentionally excluded.
+    const SAFE_TOOLCHAIN_SUBDIRS: &'static [&'static str] = &[
+        ".rustup",
+        ".cargo/bin",
+        ".cargo/registry",
+        ".cargo/git",
+        ".local/bin",
+        ".local/lib",
+        ".local/share",
+    ];
+
+    fn candidate_homes() -> Vec<PathBuf> {
+        let mut homes: Vec<PathBuf> = Vec::new();
+        if let Ok(h) = std::env::var("HOME") {
+            homes.push(PathBuf::from(h));
+        }
+        homes.push(PathBuf::from("/root"));
+        if let Ok(rd) = std::fs::read_dir("/home") {
+            homes.extend(rd.flatten().map(|e| e.path()).filter(|p| p.is_dir()));
+        }
+        if let Ok(extra) = std::env::var("AOS_EXTRA_CREDENTIAL_HOMES") {
+            homes.extend(extra.split(':').filter(|s| !s.is_empty()).map(PathBuf::from));
+        }
+        let mut seen = std::collections::BTreeSet::new();
+        homes
+            .into_iter()
+            .filter(|h| {
+                h.is_dir()
+                    && h != Path::new("/")
+                    && !h.starts_with("/tmp")
+                    && !h.starts_with("/private/tmp")
+                    && seen.insert(h.clone())
+            })
+            .collect()
+    }
+
     /// Generates Linux `bwrap` (Bubblewrap) namespace confinement flags.
     pub fn generate_linux_bwrap_args(&self) -> Vec<String> {
         let mut args = vec![
@@ -205,6 +260,36 @@ impl NativeOsSandboxInstance {
             // `/tmp` (the default runtime dir is `/tmp/aegis-os-runtime`).
             "--tmpfs".to_string(),
             "/tmp".to_string(),
+        ];
+
+        // Default-Deny Host Home Protection on Linux: mount `--tmpfs` over every candidate host home
+        // directory (`$HOME`, `/root`, `/home/*`, `AOS_EXTRA_CREDENTIAL_HOMES`) *before* mounting the
+        // agent's CoW workspace and safe read-only compiler toolchains. This hides all known and unknown
+        // credential files in `$HOME` (even at arbitrary custom paths like `~/custom_vault/secret.pem`)
+        // while preserving access to `.rustup` and `.cargo/{bin,registry,git}`.
+        let homes = Self::candidate_homes();
+        if !aos_core::ablated("cred_mask") {
+            let cur_exe = std::env::current_exe().ok();
+            for home in &homes {
+                let home_str = home.to_string_lossy().into_owned();
+                args.extend(["--tmpfs".to_string(), home_str]);
+                for sub in Self::SAFE_TOOLCHAIN_SUBDIRS {
+                    let p = home.join(sub);
+                    if p.is_dir() {
+                        let p_str = p.to_string_lossy().into_owned();
+                        args.extend(["--ro-bind".to_string(), p_str.clone(), p_str]);
+                    }
+                }
+                if let Some(ref exe) = cur_exe {
+                    if exe.starts_with(home) && exe.is_file() {
+                        let exe_str = exe.to_string_lossy().into_owned();
+                        args.extend(["--ro-bind".to_string(), exe_str.clone(), exe_str]);
+                    }
+                }
+            }
+        }
+
+        args.extend([
             "--bind".to_string(),
             self.config.workspace_dir.to_string_lossy().to_string(),
             self.config.workspace_dir.to_string_lossy().to_string(),
@@ -217,16 +302,22 @@ impl NativeOsSandboxInstance {
             "--bind".to_string(),
             self.config.org_agent_pub_dir.to_string_lossy().to_string(),
             self.config.org_agent_pub_dir.to_string_lossy().to_string(),
-        ];
-        for (path, is_file) in Self::credential_mask_targets() {
-            if is_file {
-                // Files cannot be hidden with a tmpfs; shadow them with an empty read-only file.
-                args.extend(["--ro-bind".to_string(), "/dev/null".to_string(), path]);
-            } else {
-                args.extend(["--tmpfs".to_string(), path]);
+        ]);
+        if !aos_core::ablated("cred_mask") {
+            for (path, is_file) in Self::credential_mask_targets() {
+                let p_ref = Path::new(&path);
+                if homes.iter().any(|h| p_ref.starts_with(h)) {
+                    // Already wiped by the whole-home `--tmpfs` mount above.
+                    continue;
+                }
+                if is_file {
+                    args.extend(["--ro-bind".to_string(), "/dev/null".to_string(), path]);
+                } else {
+                    args.extend(["--tmpfs".to_string(), path]);
+                }
             }
         }
-        if self.config.egress_proxy_addr.is_none() {
+        if self.config.egress_proxy_addr.is_none() || aos_core::ablated("net_isolation") {
             args.push("--share-net".to_string());
         }
         args
@@ -294,16 +385,18 @@ impl SandboxInstance for NativeOsSandboxInstance {
             c.args(self.generate_linux_bwrap_args()).arg("--");
             // `--unshare-net` also cuts the sandbox off from its own proxy; relay through the
             // Unix-socket bridge so it can reach exactly that proxy and nothing else.
-            if let Some(proxy) = self.config.egress_proxy_addr.as_deref() {
-                if let Some((guard, exe)) = self.start_egress_bridge(proxy) {
-                    c.arg(exe)
-                        .arg("egress-shim")
-                        .arg("--listen")
-                        .arg(bridge::proxy_host_port(proxy))
-                        .arg("--unix")
-                        .arg(&guard.sock)
-                        .arg("--");
-                    egress_bridge = Some(guard);
+            if !aos_core::ablated("net_isolation") {
+                if let Some(proxy) = self.config.egress_proxy_addr.as_deref() {
+                    if let Some((guard, exe)) = self.start_egress_bridge(proxy) {
+                        c.arg(exe)
+                            .arg("egress-shim")
+                            .arg("--listen")
+                            .arg(bridge::proxy_host_port(proxy))
+                            .arg("--unix")
+                            .arg(&guard.sock)
+                            .arg("--");
+                        egress_bridge = Some(guard);
+                    }
                 }
             }
             c.arg(&spec.command).args(&spec.args);

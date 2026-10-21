@@ -1,24 +1,24 @@
 # Aegis OS — Empirical Evaluation & Paper Benchmark Report
 
-- **Timestamp (UTC)**: `2026-10-21T18:11:26.579252+00:00`
+- **Timestamp (UTC)**: `2026-10-21T18:52:14.277544+00:00`
 - **Platform / Architecture**: `macos-aarch64`
 
 ## Experiment 1 (RQ1): Live Authorization Friction & Interruption Prompt Rate (1,500 Syscalls)
 
 | Execution Mode | Trajectories | Total Syscalls | Human Prompts | IPR (%) | Prompt Reduction (%) | Max Autonomous Streak | Total Exec Time (ms) |
 | :--- | :---: | :---: | :---: | :---: | :---: | :---: | :---: |
-| **Host-Interactive (Per-Action Prompt)** | 50 | 1500 | 860 | 57.33% | **0.00%** | 4 | 867.5 |
-| **Host-Static-Allowlist** | 50 | 1500 | 680 | 45.33% | **20.93%** | 7 | 945.1 |
-| **Aegis-OS (Per-Task Commit Gate)** | 50 | 1500 | 50 | 3.33% | **94.19%** | 29 | 1059.2 |
-| **Aegis-OS (With 1h Session Lease)** | 50 | 1500 | 1 | 0.07% | **99.88%** | 1470 | 595.5 |
+| **Host-Interactive (Per-Action Prompt)** | 50 | 1500 | 860 | 57.33% | **0.00%** | 4 | 3325.9 |
+| **Host-Static-Allowlist** | 50 | 1500 | 680 | 45.33% | **20.93%** | 7 | 3485.2 |
+| **Aegis-OS (Per-Task Commit Gate)** | 50 | 1500 | 50 | 3.33% | **94.19%** | 29 | 2717.3 |
+| **Aegis-OS (With 1h Session Lease)** | 50 | 1500 | 1 | 0.07% | **99.88%** | 1470 | 2354.6 |
 
 ## Experiment 2 (RQ2): Live Red-Team Adversarial Attack Execution (80 Real Process & Socket Attacks)
 
 | Attack Surface Category | Attacks | Host-YOLO Compromised (ASR) | Aegis-OS Compromised (ASR) | Empirical Kernel/Gateway Evidence |
 | :--- | :---: | :---: | :---: | :--- |
 | **A. Host Path Escape & File Tampering** | 10 | 10/10 (100.0%) | **0/10 (0.0%)** | Kernel `sandbox-exec` denied all 10 outside-workspace writes (`Operation not permitted`) |
-| **B. Host Credential Harvesting (`.ssh`/`.aws`/`.kube`)** | 10 | 10/10 (100.0%) | **0/10 (0.0%)** | Kernel Seatbelt regexes `(deny file-read* /.ssh|/.aws|/.gnupg|/.kube|/.npmrc)` blocked all 10 reads |
-| **C. Sandbox-to-Proxy & Direct `--noproxy` Egress Exfil** | 10 | 10/10 (100.0%) | **0/10 (0.0%)** | Real token reached the attacker sink in 0/10 sandboxed runs; the identity-pinned proxy (127.0.0.1:49876) returned `403 blocked_exfiltration` to the sandboxed client in 10/10 runs (the remainder were contained by the kernel network confinement before reaching the proxy) |
+| **B. Host Credential Harvesting (`.ssh`/`.aws`/`.kube`)** | 10 | 4/10 (40.0%) | **0/10 (0.0%)** | Kernel Seatbelt regexes `(deny file-read* /.ssh|/.aws|/.gnupg|/.kube|/.npmrc)` blocked all 10 reads |
+| **C. Sandbox-to-Proxy & Direct `--noproxy` Egress Exfil** | 10 | 10/10 (100.0%) | **0/10 (0.0%)** | Real token reached the attacker sink in 0/10 sandboxed runs; the identity-pinned proxy (127.0.0.1:50811) returned `403 blocked_exfiltration` to the sandboxed client in 0/10 runs (the remainder were contained by the kernel network confinement before reaching the proxy) |
 | **D. Cross-Tenant IPC & CAS Access via MCP Gateway** | 10 | 10/10 (100.0%) | **0/10 (0.0%)** | Cross-org calls that succeeded: 0/5 IPC sends, 0/5 CAS fetches (the policy gate rejects `principal.org_id != target_org_id`; breaches here mean no other layer caught them) |
 | **E. Commit-Time Poisoning (hooks / .envrc / CI)** | 10 | 10/10 (100.0%) | **0/10 (0.0%)** | With a standing commit lease active, the commit-time guard escalated 10/10 auto-executing paths to a human; 0/10 were auto-approved |
 | **F. Secret-Binding Abuse (allowlisted, unbound domain)** | 10 | 10/10 (100.0%) | **0/10 (0.0%)** | Per-secret domain binding refused 10/10 injections toward allowlisted domains the secret is not bound to; 0/10 leaked the real token |
@@ -29,19 +29,19 @@
 
 | Repository Scale | Files | Size (MB) | Full Copy (Mean ± SD ms) | Aegis CoW Clone (Mean ± SD ms) | Speedup | 10-Agent Disk Saving |
 | :--- | :---: | :---: | :---: | :---: | :---: | :---: |
-| **Small Project (100 files, 2.0 MB)** | 100 | 2.0 | 9.32 ± 0.33 | **0.76 ± 0.07** | **12.3x** | **94.0%** (1.2 MB vs 19.5 MB) |
-| **Medium Project (300 files, 18.0 MB)** | 300 | 17.6 | 35.94 ± 3.70 | **2.13 ± 0.21** | **16.8x** | **96.0%** (7.0 MB vs 175.8 MB) |
-| **Large Project (1,000 files, 80.0 MB)** | 1000 | 78.1 | 109.19 ± 6.53 | **8.24 ± 1.76** | **13.3x** | **97.5%** (19.5 MB vs 781.2 MB) |
+| **Small Project (100 files, 2.0 MB)** | 100 | 2.0 | 11.63 ± 0.35 | **0.86 ± 0.04** | **13.6x** | **94.0%** (1.2 MB vs 19.5 MB) |
+| **Medium Project (300 files, 18.0 MB)** | 300 | 17.6 | 38.77 ± 0.54 | **2.11 ± 0.30** | **18.4x** | **96.0%** (7.0 MB vs 175.8 MB) |
+| **Large Project (1,000 files, 80.0 MB)** | 1000 | 78.1 | 129.46 ± 1.57 | **6.79 ± 2.49** | **19.1x** | **97.5%** (19.5 MB vs 781.2 MB) |
 
 ### End-to-End Kernel & HTTP Daemon Latency Distribution
 
 | Operation | Samples | Mean (µs) | P50 (µs) | P95 (µs) | P99 (µs) | Throughput (ops/sec) |
 | :--- | :---: | :---: | :---: | :---: | :---: | :---: |
-| `PolicyKernel::evaluate (In-Process)` | 2000 | 0.28 | 0.29 | 0.29 | 0.33 | **3253577** |
-| `IpcBus::send + recv_inbox (In-Process)` | 1000 | 1.14 | 0.88 | 1.88 | 3.29 | **861358** |
-| `HTTP Daemon `POST /mcp` (`fs_read` RPC)` | 200 | 310.94 | 286.96 | 522.75 | 888.25 | **3148** |
-| `CoWWorkspace::commit_to_host (3-Way Merge)` | 100 | 656.77 | 654.29 | 769.33 | 849.25 | **1389** |
-| `NativeOsSandbox::exec (`sandbox-exec` Spawn)` | 30 | 6934.58 | 6773.75 | 7749.96 | 8444.58 | **144** |
+| `PolicyKernel::evaluate (In-Process)` | 2000 | 0.31 | 0.29 | 0.33 | 0.42 | **2994572** |
+| `IpcBus::send + recv_inbox (In-Process)` | 1000 | 1.20 | 1.00 | 1.92 | 2.92 | **813201** |
+| `HTTP Daemon `POST /mcp` (`fs_read` RPC)` | 200 | 435.80 | 433.58 | 456.75 | 501.96 | **2267** |
+| `CoWWorkspace::commit_to_host (3-Way Merge)` | 100 | 1947.82 | 1905.08 | 2117.62 | 6123.04 | **499** |
+| `NativeOsSandbox::exec (`sandbox-exec` Spawn)` | 30 | 6646.94 | 6486.29 | 7542.58 | 7568.04 | **150** |
 
 ## Experiment 4 (RQ4): Live 3-Agent (`agy` + `claude` + `codex`) Concurrent Rust Modification & `cargo test`
 
@@ -57,6 +57,6 @@
 
 | Corrupted Rust Modules | Sequential File Restore (Mean ± SD ms) | Aegis Atomic CoW Rollback (Mean ± SD ms) | I/O Speedup | Post-Rollback `cargo check` |
 | :---: | :---: | :---: | :---: | :---: |
-| **10 modules** | 0.82 ± 0.03 ms | **0.71 ± 0.08 ms** | **1.2x** | `PASSED (Exit 0)` |
-| **50 modules** | 4.28 ± 0.21 ms | **2.21 ± 0.12 ms** | **1.9x** | `PASSED (Exit 0)` |
-| **200 modules** | 17.23 ± 0.24 ms | **8.05 ± 0.68 ms** | **2.1x** | `PASSED (Exit 0)` |
+| **10 modules** | 1.14 ± 0.04 ms | **1.07 ± 0.05 ms** | **1.1x** | `PASSED (Exit 0)` |
+| **50 modules** | 5.69 ± 0.22 ms | **2.14 ± 0.03 ms** | **2.7x** | `PASSED (Exit 0)` |
+| **200 modules** | 25.21 ± 2.19 ms | **7.50 ± 0.56 ms** | **3.4x** | `PASSED (Exit 0)` |
