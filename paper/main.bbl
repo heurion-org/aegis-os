@@ -39,19 +39,21 @@ Manuel Costa, Boris K{\"o}pf, Aashish Kolluri, Andrew Paverd, Mark Russinovich,
 \bibitem{cutler2024cedar}
 Joseph~W. Cutler, Craig Disselkoen, Aaron Eline, Shaobo He, Kyle Headley,
   Michael Hicks, Kesha Hietala, Eleftherios Ioannidis, John Kastner, Anwar
-  Mamat, Darin McAdams, Matt McCutchen, Neha Rungta, Emina Torlak, and Andrew
-  Wells.
+  Mamat, Darin McAdams, Matt McCutchen, Neha Rungta, Emina Torlak, and
+  Andrew~M. Wells.
 \newblock {Cedar}: A new language for expressive, fast, safe, and analyzable
   authorization.
 \newblock {\em Proceedings of the ACM on Programming Languages},
-  8(OOPSLA1):670--697, 2024.
+  8(OOPSLA1):118:1--118:28, 2024.
 
 \bibitem{debenedetti2025camel}
 Edoardo Debenedetti, Ilia Shumailov, Tianqi Fan, Jamie Hayes, Nicholas Carlini,
   Daniel Fabian, Christoph Kern, Chongyang Shi, Andreas Terzis, and Florian
   Tram{\`e}r.
 \newblock Defeating prompt injections by design.
-\newblock {\em arXiv preprint arXiv:2503.18813}, 2025.
+\newblock In {\em IEEE Conference on Secure and Trustworthy Machine Learning
+  (SaTML)}, 2026.
+\newblock arXiv:2503.18813.
 
 \bibitem{debenedetti2024agentdojo}
 Edoardo Debenedetti, Jie Zhang, Mislav Balunovi{\'c}, Luca Beurer-Kellner, Marc
@@ -69,10 +71,11 @@ Adrienne~Porter Felt, Elizabeth Ha, Serge Egelman, Ariel Haney, Erika Chin, and
   Security (SOUPS)}, pages 1--14. ACM, 2012.
 
 \bibitem{google2025a2a}
-{Google}.
-\newblock {Agent2Agent} ({A2A}) protocol: An open protocol for interoperability
-  between autonomous {AI} agents.
-\newblock \url{https://google.github.io/A2A}, 2025.
+{Google and the Linux Foundation A2A Project}.
+\newblock {Agent2Agent} ({A2A}) protocol specification.
+\newblock \url{https://a2a-protocol.org}, 2025.
+\newblock Originally released by Google in April 2025; now hosted by the Linux
+  Foundation.
 
 \bibitem{greshake2023not}
 Kai Greshake, Sahar Abdelnabi, Shailesh Mishra, Christoph Endres, Thorsten
@@ -133,7 +136,7 @@ Donald~E. Porter, Owen~S. Hofmann, Christopher~J. Rossbach, Alexander Benn, and
 
 \bibitem{rodeh2013btrfs}
 Ohad Rodeh, Josef Bacik, and Chris Mason.
-\newblock {BTRFS}: The {Linux} b-tree filesystem.
+\newblock {BTRFS}: The {Linux} {B}-tree filesystem.
 \newblock {\em ACM Transactions on Storage (TOS)}, 9(3):9:1--9:32, 2013.
 
 \bibitem{ruan2024toolemu}
