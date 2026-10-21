@@ -18,7 +18,7 @@ Aegis OS: A Transactional Multi-Tenant Operating System Runtime for Eliminating 
 Hui Zhao (huizhao@heurion.org)
 
 [Comments]
-16 pages, 3 TikZ figures, 11 tables. Open-source Rust implementation and reproducible benchmark suite available at https://github.com/heurion-org/aegis-os
+17 pages, 3 TikZ figures, 12 tables. Open-source Rust implementation and reproducible benchmark suite available at https://github.com/heurion-org/aegis-os
 
 [Abstract (Plain Text for arXiv Web Form — 1893 characters, strictly under the 1,920-character limit)]
 Autonomous coding agents such as Google Antigravity (agy), Anthropic Claude Code (claude), and OpenAI Codex CLI (codex) execute multi-step software engineering workflows on developer workstations and cloud hosts. Existing agent execution environments face a Security-Autonomy Dilemma: operators must choose between per-action confirmation prompts, which interrupt workflows on 45%-57% of tool calls in our benchmark trajectories and induce severe authorization fatigue, or unconfined execution (--yolo / --dangerously-skip-permissions), which exposes host files, SSH/cloud credentials, and API tokens to prompt injection and hallucination risks. Furthermore, concurrent agents editing a shared working tree clobber one another's changes, while passing large artifacts inline through LLM context windows incurs high token overhead.
