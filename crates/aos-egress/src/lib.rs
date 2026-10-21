@@ -154,10 +154,11 @@ impl AegisEgressGateway {
                     continue;
                 }
                 if header_val.contains(&secret_entry.placeholder) {
-                    if !secret_entry
-                        .allowed_domains
-                        .iter()
-                        .any(|d| d.eq_ignore_ascii_case(&req.target_domain))
+                    if !aos_core::ablated("secret_binding")
+                        && !secret_entry
+                            .allowed_domains
+                            .iter()
+                            .any(|d| d.eq_ignore_ascii_case(&req.target_domain))
                     {
                         return Ok(EgressVerdict::BlockedSecretExfiltration {
                             placeholder: secret_entry.placeholder.clone(),

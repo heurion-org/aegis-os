@@ -864,3 +864,20 @@ pub trait FlightRecorder: Send + Sync {
         limit: usize,
     ) -> anyhow::Result<Vec<AuditEvent>>;
 }
+
+/// Returns true when the named safety component has been switched off for an ablation experiment.
+///
+/// Only functional in builds with the `ablation` cargo feature; otherwise a compile-time `false`.
+#[cfg(feature = "ablation")]
+pub fn ablated(component: &str) -> bool {
+    std::env::var("AOS_ABLATE")
+        .map(|v| v.split(',').any(|c| c.trim() == component))
+        .unwrap_or(false)
+}
+
+/// See the `ablation`-feature variant. Constant `false` in normal builds.
+#[cfg(not(feature = "ablation"))]
+#[inline(always)]
+pub const fn ablated(_component: &str) -> bool {
+    false
+}

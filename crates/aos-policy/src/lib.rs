@@ -167,7 +167,7 @@ impl PolicyEngine for AegisPolicyKernel {
         //    - Verified local workstation peer discovery & IPC (`workstation_peer_verified = true`) is allowed across directories/repos.
         //    - Cross-org CAS/KV reads among verified workstation peers escalate to `Ask` (or pass via an active session lease).
         //    - Unverified cross-tenant access is unconditionally Denied.
-        if ctx.principal.org_id != ctx.target_org_id {
+        if ctx.principal.org_id != ctx.target_org_id && !aos_core::ablated("tenant_gate") {
             let workstation_verified = ctx
                 .metadata
                 .get("workstation_peer_verified")
@@ -240,7 +240,7 @@ impl PolicyEngine for AegisPolicyKernel {
 
         // 2b. Commit-Time Poisoning Guard: Even if an active session lease exists, committing
         // modifications to git hooks or shell auto-execution files requires explicit human escalation.
-        if ctx.action == "workspace_commit" {
+        if ctx.action == "workspace_commit" && !aos_core::ablated("commit_guard") {
             if let Some(paths) = ctx.metadata.get("paths").and_then(|v| v.as_array()) {
                 for p in paths.iter().filter_map(|x| x.as_str()) {
                     if p.contains(".git/hooks")

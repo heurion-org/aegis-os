@@ -17,3 +17,10 @@ libc = "0.2"
 
 [dev-dependencies]
 tempfile.workspace = true
+
+[features]
+# TEST-ONLY. Lets the benchmark suite switch individual safety components off via `AOS_ABLATE`
+# (comma separated: kernel_sandbox, commit_guard, tenant_gate, secret_binding, merge, prevalidate)
+# to measure what each one contributes. Release builds must NOT enable it: without the feature
+# `ablated()` is a constant `false` and every ablation branch is compiled out.
+ablation = []

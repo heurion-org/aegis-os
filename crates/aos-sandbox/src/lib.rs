@@ -18,6 +18,22 @@ use std::time::{Duration, Instant};
 use tokio::process::Command;
 use uuid::Uuid;
 
+pub mod bridge;
+
+/// Host-side half of the Linux egress bridge for one `exec` call (see [`bridge`]). Dropping it
+/// stops the relay and removes the socket, including on timeout / early-return paths.
+struct EgressBridge {
+    handle: tokio::task::JoinHandle<()>,
+    token: String,
+    sock: PathBuf,
+}
+
+impl Drop for EgressBridge {
+    fn drop(&mut self) {
+        self.handle.abort();
+        let _ = std::fs::remove_file(&self.sock);
+    }
+}
 // ============================================================================
 // Tier 1: Native OS Sandbox Instance (macOS Seatbelt / Linux Bubblewrap)
 // ============================================================================
@@ -103,6 +119,79 @@ impl NativeOsSandboxInstance {
         )
     }
 
+    /// Credential directories hidden from Linux sandboxes (relative to each home directory).
+    const CRED_DIRS: &'static [&'static str] =
+        &[".ssh", ".aws", ".gnupg", ".kube", ".docker", ".config/gh"];
+    /// Credential files hidden from Linux sandboxes (relative to each home directory).
+    const CRED_FILES: &'static [&'static str] = &[".npmrc", ".pypirc", ".netrc", ".git-credentials"];
+
+    /// Credential locations to hide from a Linux sandbox, as `(path, is_file)` for every candidate
+    /// home: the invoking user's `$HOME`, `/root`, every `/home/*`, and any colon-separated roots in
+    /// `AOS_EXTRA_CREDENTIAL_HOMES`. Unlike Seatbelt, bwrap cannot deny reads by path pattern, so this
+    /// covers well-known locations only; credentials stored elsewhere are not protected.
+    fn credential_mask_targets() -> Vec<(String, bool)> {
+        let mut homes: Vec<PathBuf> = Vec::new();
+        if let Ok(h) = std::env::var("HOME") {
+            homes.push(PathBuf::from(h));
+        }
+        homes.push(PathBuf::from("/root"));
+        if let Ok(rd) = std::fs::read_dir("/home") {
+            homes.extend(rd.flatten().map(|e| e.path()).filter(|p| p.is_dir()));
+        }
+        if let Ok(extra) = std::env::var("AOS_EXTRA_CREDENTIAL_HOMES") {
+            homes.extend(extra.split(':').filter(|s| !s.is_empty()).map(PathBuf::from));
+        }
+        Self::credential_mask_targets_for(&homes)
+    }
+
+    /// Pure helper for [`Self::credential_mask_targets`]: only paths that exist are returned (bwrap
+    /// cannot create mount points on its read-only root), de-duplicated and in a stable order.
+    fn credential_mask_targets_for(homes: &[PathBuf]) -> Vec<(String, bool)> {
+        let mut seen = std::collections::BTreeSet::new();
+        let mut out = Vec::new();
+        for home in homes {
+            for sub in Self::CRED_DIRS {
+                let p = home.join(sub);
+                if p.is_dir() && seen.insert(p.clone()) {
+                    out.push((p.to_string_lossy().into_owned(), false));
+                }
+            }
+            for sub in Self::CRED_FILES {
+                let p = home.join(sub);
+                if p.is_file() && seen.insert(p.clone()) {
+                    out.push((p.to_string_lossy().into_owned(), true));
+                }
+            }
+        }
+        out
+    }
+
+    /// Starts the host half of the egress bridge when a proxy is bound and this binary can act as
+    /// the in-sandbox shim (`aegis-os egress-shim`). Returns `None` otherwise, in which case the
+    /// sandbox stays in an isolated network namespace with no route out (fail closed).
+    fn start_egress_bridge(&self, proxy_url: &str) -> Option<(EgressBridge, PathBuf)> {
+        let exe = std::env::current_exe().ok()?;
+        if !exe
+            .file_name()?
+            .to_string_lossy()
+            .starts_with("aegis-os")
+        {
+            return None;
+        }
+        let sock = self
+            .config
+            .agent_home_dir
+            .join(format!(".aos-egress-{}.sock", self.instance_id));
+        let token = bridge::new_token();
+        match bridge::spawn_host_bridge(&sock, bridge::proxy_host_port(proxy_url), token.clone()) {
+            Ok(handle) => Some((EgressBridge { handle, token, sock }, exe)),
+            Err(err) => {
+                eprintln!("[aos-sandbox] egress bridge unavailable, sandbox has no network path: {err}");
+                None
+            }
+        }
+    }
+
     /// Generates Linux `bwrap` (Bubblewrap) namespace confinement flags.
     pub fn generate_linux_bwrap_args(&self) -> Vec<String> {
         let mut args = vec![
@@ -111,6 +200,11 @@ impl NativeOsSandboxInstance {
             "--ro-bind".to_string(),
             "/".to_string(),
             "/".to_string(),
+            // The private `/tmp` must be mounted *before* the writable binds below: bwrap applies
+            // mounts in order, so a later `--tmpfs /tmp` would hide any workspace/home living under
+            // `/tmp` (the default runtime dir is `/tmp/aegis-os-runtime`).
+            "--tmpfs".to_string(),
+            "/tmp".to_string(),
             "--bind".to_string(),
             self.config.workspace_dir.to_string_lossy().to_string(),
             self.config.workspace_dir.to_string_lossy().to_string(),
@@ -123,16 +217,13 @@ impl NativeOsSandboxInstance {
             "--bind".to_string(),
             self.config.org_agent_pub_dir.to_string_lossy().to_string(),
             self.config.org_agent_pub_dir.to_string_lossy().to_string(),
-            "--tmpfs".to_string(),
-            "/tmp".to_string(),
         ];
-        if let Ok(host_home) = std::env::var("HOME") {
-            for cred_sub in [".ssh", ".aws", ".gnupg", ".kube"] {
-                let p = Path::new(&host_home).join(cred_sub);
-                if p.exists() {
-                    args.push("--tmpfs".to_string());
-                    args.push(p.to_string_lossy().to_string());
-                }
+        for (path, is_file) in Self::credential_mask_targets() {
+            if is_file {
+                // Files cannot be hidden with a tmpfs; shadow them with an empty read-only file.
+                args.extend(["--ro-bind".to_string(), "/dev/null".to_string(), path]);
+            } else {
+                args.extend(["--tmpfs".to_string(), path]);
             }
         }
         if self.config.egress_proxy_addr.is_none() {
@@ -178,11 +269,15 @@ impl SandboxInstance for NativeOsSandboxInstance {
             .clone()
             .unwrap_or_else(|| self.config.workspace_dir.clone());
 
-        let kernel_sandbox_disabled = std::env::var("AOS_DISABLE_KERNEL_SANDBOX")
-            .map(|v| v == "1" || v == "true")
-            .unwrap_or(false);
+        // Only ever true in `ablation` test builds. This used to be an unconditional
+        // `AOS_DISABLE_KERNEL_SANDBOX` environment switch, which let anything able to set the
+        // server's environment (for example a project-level MCP config) silently turn the
+        // kernel sandbox off.
+        let kernel_sandbox_disabled = aos_core::ablated("kernel_sandbox");
 
         let start = Instant::now();
+        // Kept alive until this call returns so the relay outlives the sandboxed command.
+        let mut egress_bridge: Option<EgressBridge> = None;
         let (mut cmd, profile_label) = if cfg!(target_os = "macos")
             && !kernel_sandbox_disabled
             && Path::new("/usr/bin/sandbox-exec").exists()
@@ -196,10 +291,22 @@ impl SandboxInstance for NativeOsSandboxInstance {
             && Path::new("/usr/bin/bwrap").exists()
         {
             let mut c = Command::new("/usr/bin/bwrap");
-            c.args(self.generate_linux_bwrap_args())
-                .arg("--")
-                .arg(&spec.command)
-                .args(&spec.args);
+            c.args(self.generate_linux_bwrap_args()).arg("--");
+            // `--unshare-net` also cuts the sandbox off from its own proxy; relay through the
+            // Unix-socket bridge so it can reach exactly that proxy and nothing else.
+            if let Some(proxy) = self.config.egress_proxy_addr.as_deref() {
+                if let Some((guard, exe)) = self.start_egress_bridge(proxy) {
+                    c.arg(exe)
+                        .arg("egress-shim")
+                        .arg("--listen")
+                        .arg(bridge::proxy_host_port(proxy))
+                        .arg("--unix")
+                        .arg(&guard.sock)
+                        .arg("--");
+                    egress_bridge = Some(guard);
+                }
+            }
+            c.arg(&spec.command).args(&spec.args);
             (c, "linux-bwrap-namespace-enforced".to_string())
         } else {
             let mut c = Command::new(&spec.command);
@@ -249,6 +356,10 @@ impl SandboxInstance for NativeOsSandboxInstance {
 
         for (k, v) in &spec.env {
             cmd.env(k, v);
+        }
+
+        if let Some(ref guard) = egress_bridge {
+            cmd.env(bridge::BRIDGE_TOKEN_ENV, &guard.token);
         }
 
         let child = cmd.spawn()?;
@@ -398,6 +509,58 @@ mod tests {
     use super::*;
     use aos_core::{AgentIdentity, ResourceLimits};
     use std::collections::HashMap;
+
+    #[test]
+    fn credential_masks_cover_dirs_files_and_dedupe() {
+        let tmp = tempfile::tempdir().unwrap();
+        let home = tmp.path().join("alice");
+        std::fs::create_dir_all(home.join(".ssh")).unwrap();
+        // Under an Aegis Seatbelt sandbox (e.g. `proc_exec`) reading any `.ssh` path is denied, so the
+        // directory we just created cannot even be stat'ed; the logic under test is then unobservable.
+        if !home.join(".ssh").is_dir() {
+            eprintln!("skipping: credential paths are unreadable in this sandboxed environment");
+            return;
+        }
+        std::fs::create_dir_all(home.join(".config/gh")).unwrap();
+        std::fs::write(home.join(".npmrc"), "token").unwrap();
+        std::fs::write(home.join(".pypirc"), "token").unwrap();
+        // `.aws` does not exist: bwrap cannot mask a missing path, so it must be skipped.
+
+        // Listing the same home twice must not produce duplicate mounts.
+        let targets = NativeOsSandboxInstance::credential_mask_targets_for(&[home.clone(), home.clone()]);
+        let as_str = |name: &str, is_file: bool| (home.join(name).to_string_lossy().into_owned(), is_file);
+        assert!(targets.contains(&as_str(".ssh", false)));
+        assert!(targets.contains(&as_str(".config/gh", false)));
+        assert!(targets.contains(&as_str(".npmrc", true)));
+        assert!(targets.contains(&as_str(".pypirc", true)));
+        assert!(!targets.contains(&as_str(".aws", false)));
+        assert_eq!(targets.len(), 4);
+    }
+
+    #[test]
+    fn bwrap_mounts_private_tmp_before_writable_binds() {
+        let tmp = tempfile::tempdir().unwrap();
+        let driver_cfg = SandboxConfig {
+            identity: AgentIdentity::new("acme", "coder-1", "Engineer"),
+            tier: IsolationTier::NativeOsSandbox,
+            limits: ResourceLimits::default(),
+            workspace_dir: tmp.path().join("ws"),
+            agent_home_dir: tmp.path().join("home"),
+            org_shared_ro_dir: tmp.path().join("ro"),
+            org_agent_pub_dir: tmp.path().join("pub"),
+            egress_proxy_addr: None,
+        };
+        let args = NativeOsSandboxInstance::new(driver_cfg).generate_linux_bwrap_args();
+        let tmpfs_pos = args.windows(2).position(|w| w == ["--tmpfs", "/tmp"]).unwrap();
+        let ws_pos = args
+            .iter()
+            .position(|a| a.ends_with("/ws"))
+            .expect("workspace bind present");
+        assert!(
+            tmpfs_pos < ws_pos,
+            "`--tmpfs /tmp` must precede the workspace bind or it hides workspaces under /tmp"
+        );
+    }
 
     #[tokio::test]
     async fn test_sandbox_isolated_env_and_pause_resume() {

@@ -37,6 +37,26 @@ pub struct CoWWorkspace {
     snapshots: Arc<RwLock<Vec<SnapshotMeta>>>,
 }
 
+/// Files whose mtime is within this window of the moment they were cloned are compared by content
+/// rather than by metadata (see `CoWWorkspace::same_fingerprint`).
+const RACY_WINDOW: std::time::Duration = std::time::Duration::from_secs(2);
+
+/// A host mutation computed during Phase 1 of `workspace_commit` and applied in Phase 2.
+enum StagedCommitAction {
+    CloneFromShadow {
+        rel: String,
+        shadow_path: PathBuf,
+    },
+    WriteMerged {
+        rel: String,
+        shadow_path: PathBuf,
+        merged_content: String,
+    },
+    DeleteFile {
+        rel: String,
+    },
+}
+
 impl CoWWorkspace {
     /// Initialize or resume a Copy-on-Write shadow workspace from `host_source_root` inside `runtime_workspace_base`.
     pub async fn init(
@@ -84,6 +104,81 @@ impl CoWWorkspace {
         Ok(ws)
     }
 
+    /// Applies the actions staged by Phase 1 of a commit to the host tree and the baseline.
+    async fn apply_staged_actions(
+        &self,
+        staged_actions: Vec<StagedCommitAction>,
+    ) -> anyhow::Result<Vec<String>> {
+        let mut committed = Vec::new();
+        for action in staged_actions {
+            match action {
+                StagedCommitAction::CloneFromShadow { rel, shadow_path } => {
+                    let host_dst = self.host_source_root.join(&rel);
+                    let base_path = self.baseline_root.join(&rel);
+                    if let Some(parent) = host_dst.parent() {
+                        tokio::fs::create_dir_all(parent).await?;
+                    }
+                    if let Some(parent) = base_path.parent() {
+                        tokio::fs::create_dir_all(parent).await?;
+                    }
+                    Self::cow_clone_file(&shadow_path, &host_dst).await?;
+                    // Ensure host file mtime is bumped to `now` even when APFS `clonefile(2)`
+                    // preserves the older shadow edit timestamp, so Cargo/build systems detect changes.
+                    if let Ok(f) = std::fs::OpenOptions::new().write(true).open(&host_dst) {
+                        let _ = f.set_modified(std::time::SystemTime::now());
+                    }
+                    Self::cow_clone_file(&shadow_path, &base_path).await?;
+                    committed.push(rel);
+                }
+                StagedCommitAction::WriteMerged {
+                    rel,
+                    shadow_path,
+                    merged_content,
+                } => {
+                    let host_dst = self.host_source_root.join(&rel);
+                    let base_path = self.baseline_root.join(&rel);
+                    if let Some(parent) = host_dst.parent() {
+                        tokio::fs::create_dir_all(parent).await?;
+                    }
+                    if let Some(parent) = base_path.parent() {
+                        tokio::fs::create_dir_all(parent).await?;
+                    }
+                    tokio::fs::write(&host_dst, &merged_content).await?;
+                    tokio::fs::write(&base_path, &merged_content).await?;
+                    tokio::fs::write(&shadow_path, &merged_content).await?;
+                    committed.push(rel);
+                }
+                StagedCommitAction::DeleteFile { rel } => {
+                    let host_dst = self.host_source_root.join(&rel);
+                    let base_path = self.baseline_root.join(&rel);
+                    if host_dst.exists() {
+                        tokio::fs::remove_file(&host_dst).await?;
+                    }
+                    if base_path.exists() {
+                        tokio::fs::remove_file(&base_path).await?;
+                    }
+                    committed.push(rel);
+                }
+            }
+        }
+
+        Ok(committed)
+    }
+
+    /// Aborts a commit whose Phase 1 found a conflict. Normally nothing has touched the host yet;
+    /// under the `prevalidate` ablation the actions staged so far are applied first, modelling a
+    /// commit that writes as it goes and leaves a half-applied batch behind.
+    async fn fail_commit(
+        &self,
+        staged_actions: Vec<StagedCommitAction>,
+        err: anyhow::Error,
+    ) -> anyhow::Result<Vec<String>> {
+        if aos_core::ablated("prevalidate") {
+            let _ = self.apply_staged_actions(staged_actions).await;
+        }
+        Err(err)
+    }
+
     async fn flush_snapshots(&self) -> anyhow::Result<()> {
         let list = self.snapshots.read().await.clone();
         let bytes = serde_json::to_vec_pretty(&list)?;
@@ -96,6 +191,46 @@ impl CoWWorkspace {
             tokio::fs::create_dir_all(parent).await?;
         }
         Self::cow_clone_file(src, dst).await
+    }
+
+    /// True when `a` and `clone_side` are provably unchanged copies of one another, judged from
+    /// metadata alone (no content is read).
+    ///
+    /// Clones preserve the source mtime (see `cow_clone_file`), so a file nobody has edited since
+    /// the copy was made keeps an identical size and mtime. `clone_side` must be the file that was
+    /// created *by* the clone (baseline, shadow or snapshot copy): its ctime is the moment of the
+    /// clone and cannot be set back by an ordinary write.
+    ///
+    /// Timestamps have a granularity (a kernel tick, or whole seconds on some filesystems), so an
+    /// edit that lands in the same tick as the original mtime would leave size and mtime unchanged.
+    /// Like git's "racily clean" rule, equality is therefore only trusted when the mtime predates
+    /// the clone by more than [`RACY_WINDOW`]; younger files are compared by content instead.
+    fn same_fingerprint(a: &Path, clone_side: &Path) -> bool {
+        let (Ok(x), Ok(y)) = (std::fs::metadata(a), std::fs::metadata(clone_side)) else {
+            return false;
+        };
+        if x.len() != y.len() {
+            return false;
+        }
+        let (Ok(m1), Ok(m2)) = (x.modified(), y.modified()) else {
+            return false;
+        };
+        if m1 != m2 {
+            return false;
+        }
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::MetadataExt;
+            let Ok(mtime) = m2.duration_since(std::time::UNIX_EPOCH) else {
+                return false;
+            };
+            let ctime = std::time::Duration::new(y.ctime().max(0) as u64, y.ctime_nsec() as u32);
+            mtime + RACY_WINDOW < ctime
+        }
+        #[cfg(not(unix))]
+        {
+            false
+        }
     }
 
     fn touch_mtime(path: &Path) {
@@ -117,6 +252,9 @@ impl CoWWorkspace {
             match base.get(rel) {
                 None => out.push(rel.clone()),
                 Some(bp) => {
+                    if Self::same_fingerprint(sp, bp) {
+                        continue;
+                    }
                     if tokio::fs::read(sp).await? != tokio::fs::read(bp).await? {
                         out.push(rel.clone());
                     }
@@ -149,6 +287,12 @@ impl CoWWorkspace {
         let mut report = RefreshReport::default();
 
         for (rel, host_path) in &host {
+            // Host unchanged since our baseline: nothing to rebase, and no need to read anything.
+            if let Some(base_path) = base.get(rel) {
+                if Self::same_fingerprint(host_path, base_path) {
+                    continue;
+                }
+            }
             let host_bytes = tokio::fs::read(host_path).await?;
             let shadow_dst = self.shadow_root.join(rel);
             let base_dst = self.baseline_root.join(rel);
@@ -285,28 +429,79 @@ impl CoWWorkspace {
         }
         #[cfg(target_os = "linux")]
         {
+            use std::collections::HashSet;
+            use std::os::unix::fs::MetadataExt;
             use std::os::unix::io::AsRawFd;
+            use std::sync::{LazyLock, Mutex};
             // Linux `FICLONE` ioctl request code (`_IOW(0x94, 9, int)` = 0x40049409)
             const FICLONE: libc::c_ulong = 0x40049409;
-            if let Ok(src_file) = std::fs::File::open(src) {
-                if let Ok(dst_file) = std::fs::OpenOptions::new()
-                    .write(true)
-                    .create(true)
-                    .truncate(true)
-                    .open(dst)
-                {
-                    if let Ok(meta) = src_file.metadata() {
-                        let _ = dst_file.set_permissions(meta.permissions());
-                    }
-                    let rc =
-                        unsafe { libc::ioctl(dst_file.as_raw_fd(), FICLONE, src_file.as_raw_fd()) };
-                    if rc == 0 {
-                        return Ok(());
+            // Source/destination device pairs on which reflink cloning is known to be unavailable
+            // (`EOPNOTSUPP` on ext4/tmpfs, `EXDEV` across filesystems). Remembering them avoids
+            // paying a failed open/truncate/ioctl round-trip for every file before falling back to
+            // a plain copy, which made non-reflink filesystems up to 3x slower than `cp -R`.
+            static NO_REFLINK: LazyLock<Mutex<HashSet<(u64, u64)>>> =
+                LazyLock::new(|| Mutex::new(HashSet::new()));
+
+            let dev_pair = match (std::fs::metadata(src), dst.parent().map(std::fs::metadata)) {
+                (Ok(s), Some(Ok(d))) => Some((s.dev(), d.dev())),
+                _ => None,
+            };
+            let known_unavailable = dev_pair
+                .map(|p| NO_REFLINK.lock().map(|g| g.contains(&p)).unwrap_or(false))
+                .unwrap_or(false);
+
+            if !known_unavailable {
+                if let Ok(src_file) = std::fs::File::open(src) {
+                    if let Ok(dst_file) = std::fs::OpenOptions::new()
+                        .write(true)
+                        .create(true)
+                        .truncate(true)
+                        .open(dst)
+                    {
+                        if let Ok(meta) = src_file.metadata() {
+                            let _ = dst_file.set_permissions(meta.permissions());
+                        }
+                        let rc = unsafe {
+                            libc::ioctl(dst_file.as_raw_fd(), FICLONE, src_file.as_raw_fd())
+                        };
+                        if rc == 0 {
+                            // Unlike APFS `clonefile`, a fresh `FICLONE` target gets mtime = now.
+                            // Carry the source's mtime over so unchanged files keep an identical
+                            // (size, mtime) fingerprint and `diff` can skip reading them.
+                            if let Ok(m) = src_file.metadata().and_then(|m| m.modified()) {
+                                let _ = dst_file.set_modified(m);
+                            }
+                            return Ok(());
+                        }
+                        let errno = std::io::Error::last_os_error().raw_os_error();
+                        if matches!(
+                            errno,
+                            Some(libc::EOPNOTSUPP) | Some(libc::EXDEV) | Some(libc::ENOTTY)
+                        ) {
+                            if let (Some(pair), Ok(mut guard)) = (dev_pair, NO_REFLINK.lock()) {
+                                if guard.insert(pair) {
+                                    eprintln!(
+                                        "[aos-vfs] WARNING: reflink (FICLONE) unavailable between {} and {} \
+                                         (errno {:?}); falling back to full file copies. Place the runtime \
+                                         directory on btrfs/XFS(reflink) to restore copy-on-write cloning.",
+                                        src.display(),
+                                        dst.display(),
+                                        errno
+                                    );
+                                }
+                            }
+                        }
                     }
                 }
             }
         }
         tokio::fs::copy(src, dst).await?;
+        // Plain copies get mtime = now; keep the source's so unchanged files stay fingerprint-equal.
+        if let Ok(m) = std::fs::metadata(src).and_then(|m| m.modified()) {
+            if let Ok(f) = std::fs::OpenOptions::new().write(true).open(dst) {
+                let _ = f.set_modified(m);
+            }
+        }
         Ok(())
     }
 
@@ -421,20 +616,28 @@ impl CoWWorkspace {
     }
 
     pub async fn collect_files(root: &Path) -> anyhow::Result<Vec<(String, PathBuf)>> {
+        // Walk the whole tree in one blocking task. Doing this with `tokio::fs` costs a thread-pool
+        // hop per directory entry (~60 us each), which dominated `diff`/`refresh`/`commit` on large
+        // trees even though the underlying syscalls take microseconds.
+        let root = root.to_path_buf();
+        tokio::task::spawn_blocking(move || Self::collect_files_blocking(&root)).await?
+    }
+
+    fn collect_files_blocking(root: &Path) -> anyhow::Result<Vec<(String, PathBuf)>> {
         let mut results = Vec::new();
         if !root.exists() {
             return Ok(results);
         }
         let mut stack = vec![root.to_path_buf()];
         while let Some(dir) = stack.pop() {
-            let mut rd = tokio::fs::read_dir(&dir).await?;
-            while let Some(entry) = rd.next_entry().await? {
+            for entry in std::fs::read_dir(&dir)? {
+                let entry = entry?;
                 let path = entry.path();
                 let name = entry.file_name().to_string_lossy().to_string();
                 if Self::is_ignored_dir_name(&name) {
                     continue;
                 }
-                let ft = entry.file_type().await?;
+                let ft = entry.file_type()?;
                 if ft.is_dir() {
                     stack.push(path);
                 } else if ft.is_file() {
@@ -701,17 +904,8 @@ impl TransactionalWorkspace for CoWWorkspace {
         let fast_meta_skip = current_files.len() > 500;
         for (rel, cur_path) in &current_files {
             if let Some(base_path) = base_files.get(rel) {
-                if fast_meta_skip {
-                    if let (Ok(cm), Ok(bm)) = (
-                        std::fs::metadata(cur_path),
-                        std::fs::metadata(base_path),
-                    ) {
-                        if cm.len() == bm.len()
-                            && cm.modified().ok() == bm.modified().ok()
-                        {
-                            continue;
-                        }
-                    }
+                if fast_meta_skip && Self::same_fingerprint(base_path, cur_path) {
+                    continue;
                 }
             }
             let cur_bytes = tokio::fs::read(cur_path).await?;
@@ -818,21 +1012,6 @@ impl TransactionalWorkspace for CoWWorkspace {
             .into_iter()
             .collect();
 
-        enum StagedCommitAction {
-            CloneFromShadow {
-                rel: String,
-                shadow_path: PathBuf,
-            },
-            WriteMerged {
-                rel: String,
-                shadow_path: PathBuf,
-                merged_content: String,
-            },
-            DeleteFile {
-                rel: String,
-            },
-        }
-
         let mut staged_actions = Vec::new();
 
         // Phase 1: Validate all Added & Modified files and compute 3-Way Merges before mutating any host file
@@ -843,6 +1022,12 @@ impl TransactionalWorkspace for CoWWorkspace {
                 }
             }
 
+            // The agent never touched this file (same fingerprint as its baseline copy).
+            if let Some(base_path) = base_files.get(rel) {
+                if Self::same_fingerprint(shadow_path, base_path) {
+                    continue;
+                }
+            }
             let shadow_bytes = tokio::fs::read(shadow_path).await?;
             let host_dst = self.host_source_root.join(rel);
 
@@ -860,15 +1045,20 @@ impl TransactionalWorkspace for CoWWorkspace {
                                 });
                                 continue;
                             }
-                            bail!(
-                                "3-Way Merge Conflict on newly added file '{}': file was also independently created on host{}",
-                                rel,
-                                if is_binary {
-                                    " (pass `overwrite_binaries: true` to overwrite binary artifact, or `paths` to commit source files first)"
-                                } else {
-                                    ""
-                                }
-                            );
+                            return self
+                                .fail_commit(
+                                    staged_actions,
+                                    anyhow::anyhow!(
+                                        "3-Way Merge Conflict on newly added file '{}': file was also independently created on host{}",
+                                        rel,
+                                        if is_binary {
+                                            " (pass `overwrite_binaries: true` to overwrite binary artifact, or `paths` to commit source files first)"
+                                        } else {
+                                            ""
+                                        }
+                                    ),
+                                )
+                                .await;
                         }
                     }
                     staged_actions.push(StagedCommitAction::CloneFromShadow {
@@ -886,6 +1076,7 @@ impl TransactionalWorkspace for CoWWorkspace {
                         let host_bytes = tokio::fs::read(&host_dst).await?;
                         if Self::sha256_bytes(&host_bytes) != Self::sha256_bytes(&base_bytes)
                             && Self::sha256_bytes(&host_bytes) != Self::sha256_bytes(&shadow_bytes)
+                            && !aos_core::ablated("merge")
                         {
                             match (
                                 std::str::from_utf8(&base_bytes),
@@ -903,7 +1094,12 @@ impl TransactionalWorkspace for CoWWorkspace {
                                             continue;
                                         }
                                         Err(conflict_err) => {
-                                            bail!("Conflict on '{}': {}", rel, conflict_err);
+                                            return self
+                                                .fail_commit(
+                                                    staged_actions,
+                                                    anyhow::anyhow!("Conflict on '{}': {}", rel, conflict_err),
+                                                )
+                                                .await;
                                         }
                                     }
                                 }
@@ -915,10 +1111,15 @@ impl TransactionalWorkspace for CoWWorkspace {
                                         });
                                         continue;
                                     }
-                                    bail!(
-                                        "Binary file concurrent modification conflict on '{}': modified in both host and shadow workspace (pass `overwrite_binaries: true` to overwrite with shadow binary, or `paths` to commit specific source files first)",
-                                        rel
-                                    );
+                                    return self
+                                        .fail_commit(
+                                            staged_actions,
+                                            anyhow::anyhow!(
+                                                "Binary file concurrent modification conflict on '{}': modified in both host and shadow workspace (pass `overwrite_binaries: true` to overwrite with shadow binary, or `paths` to commit specific source files first)",
+                                                rel
+                                            ),
+                                        )
+                                        .await;
                                 }
                             }
                         }
@@ -944,60 +1145,7 @@ impl TransactionalWorkspace for CoWWorkspace {
         }
 
         // Phase 2: All conflicts cleared; apply staged actions atomically across the commit batch
-        let mut committed = Vec::new();
-        for action in staged_actions {
-            match action {
-                StagedCommitAction::CloneFromShadow { rel, shadow_path } => {
-                    let host_dst = self.host_source_root.join(&rel);
-                    let base_path = self.baseline_root.join(&rel);
-                    if let Some(parent) = host_dst.parent() {
-                        tokio::fs::create_dir_all(parent).await?;
-                    }
-                    if let Some(parent) = base_path.parent() {
-                        tokio::fs::create_dir_all(parent).await?;
-                    }
-                    Self::cow_clone_file(&shadow_path, &host_dst).await?;
-                    // Ensure host file mtime is bumped to `now` even when APFS `clonefile(2)`
-                    // preserves the older shadow edit timestamp, so Cargo/build systems detect changes.
-                    if let Ok(f) = std::fs::OpenOptions::new().write(true).open(&host_dst) {
-                        let _ = f.set_modified(std::time::SystemTime::now());
-                    }
-                    Self::cow_clone_file(&shadow_path, &base_path).await?;
-                    committed.push(rel);
-                }
-                StagedCommitAction::WriteMerged {
-                    rel,
-                    shadow_path,
-                    merged_content,
-                } => {
-                    let host_dst = self.host_source_root.join(&rel);
-                    let base_path = self.baseline_root.join(&rel);
-                    if let Some(parent) = host_dst.parent() {
-                        tokio::fs::create_dir_all(parent).await?;
-                    }
-                    if let Some(parent) = base_path.parent() {
-                        tokio::fs::create_dir_all(parent).await?;
-                    }
-                    tokio::fs::write(&host_dst, &merged_content).await?;
-                    tokio::fs::write(&base_path, &merged_content).await?;
-                    tokio::fs::write(&shadow_path, &merged_content).await?;
-                    committed.push(rel);
-                }
-                StagedCommitAction::DeleteFile { rel } => {
-                    let host_dst = self.host_source_root.join(&rel);
-                    let base_path = self.baseline_root.join(&rel);
-                    if host_dst.exists() {
-                        tokio::fs::remove_file(&host_dst).await?;
-                    }
-                    if base_path.exists() {
-                        tokio::fs::remove_file(&base_path).await?;
-                    }
-                    committed.push(rel);
-                }
-            }
-        }
-
-        Ok(committed)
+        self.apply_staged_actions(staged_actions).await
     }
 }
 
@@ -1235,6 +1383,62 @@ impl OrgSharedStorage for OrgCasAndKvStore {
 mod tests {
     use super::*;
     use serde_json::json;
+
+    /// Backdates `path`'s mtime so that it counts as "old" for the racy-timestamp rule.
+    fn age(path: &Path, secs: u64) {
+        let f = std::fs::OpenOptions::new().write(true).open(path).unwrap();
+        f.set_modified(std::time::SystemTime::now() - std::time::Duration::from_secs(secs))
+            .unwrap();
+    }
+
+    /// The metadata fast path must skip genuinely unchanged files but never hide a real edit,
+    /// including an edit that keeps the file size identical.
+    #[tokio::test]
+    async fn test_fingerprint_fast_path_skips_unchanged_but_not_same_size_edits() {
+        let tmp = tempfile::tempdir().unwrap();
+        let host = tmp.path().join("host");
+        std::fs::create_dir_all(&host).unwrap();
+        for name in ["keep.txt", "edit.txt"] {
+            std::fs::write(host.join(name), "AAAA\n").unwrap();
+            age(&host.join(name), 3600);
+        }
+        let ws = CoWWorkspace::init(&host, tmp.path().join("rt")).await.unwrap();
+
+        // Untouched shadow file: same size + mtime as its baseline copy, and old enough to trust.
+        assert!(CoWWorkspace::same_fingerprint(
+            &ws.shadow_root.join("keep.txt"),
+            &ws.baseline_root.join("keep.txt"),
+        ));
+
+        // Same-length rewrite (the case a size-only check would miss).
+        std::fs::write(ws.shadow_root.join("edit.txt"), "BBBB\n").unwrap();
+        assert!(!CoWWorkspace::same_fingerprint(
+            &ws.shadow_root.join("edit.txt"),
+            &ws.baseline_root.join("edit.txt"),
+        ));
+
+        let changed = ws.changed_since_baseline().await.unwrap();
+        assert_eq!(changed, vec!["edit.txt".to_string()]);
+    }
+
+    /// A file modified within the racy window of its clone is compared by content, not metadata.
+    #[tokio::test]
+    async fn test_fingerprint_racy_young_files_fall_back_to_content() {
+        let tmp = tempfile::tempdir().unwrap();
+        let host = tmp.path().join("host");
+        std::fs::create_dir_all(&host).unwrap();
+        std::fs::write(host.join("young.txt"), "AAAA\n").unwrap(); // mtime = now
+        let ws = CoWWorkspace::init(&host, tmp.path().join("rt")).await.unwrap();
+        assert!(!CoWWorkspace::same_fingerprint(
+            &ws.shadow_root.join("young.txt"),
+            &ws.baseline_root.join("young.txt"),
+        ));
+        std::fs::write(ws.shadow_root.join("young.txt"), "BBBB\n").unwrap();
+        assert_eq!(
+            ws.changed_since_baseline().await.unwrap(),
+            vec!["young.txt".to_string()]
+        );
+    }
 
     #[tokio::test]
     async fn test_refresh_from_host_fast_forwards_merges_and_reports_conflicts() {

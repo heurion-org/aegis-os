@@ -129,6 +129,21 @@ enum Commands {
 
     /// Run a complete end-to-end simulation of heterogeneous Agents (`agy` + `claude` + `codex`) collaborating
     Demo,
+
+    /// [Internal] Linux in-sandbox egress shim: relays a loopback proxy port to the host egress
+    /// bridge over a Unix socket, then runs a command. Spawned by `aos-sandbox`, not for direct use.
+    #[command(hide = true)]
+    EgressShim {
+        /// Loopback `host:port` to listen on inside the sandbox network namespace
+        #[arg(long)]
+        listen: String,
+        /// Unix socket of the host-side egress bridge
+        #[arg(long)]
+        unix: PathBuf,
+        /// Command (and arguments) to run once the relay is listening
+        #[arg(trailing_var_arg = true, allow_hyphen_values = true, required = true)]
+        cmd: Vec<String>,
+    },
 }
 
 #[derive(Subcommand)]
@@ -252,6 +267,12 @@ fn resolve_identity(
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
     let mut cli = Cli::parse();
+    // The in-sandbox shim must not resolve identities or touch runtime state; it only relays a port
+    // and runs the user's command, then exits with that command's status.
+    if let Commands::EgressShim { listen, unix, cmd } = &cli.command {
+        let code = aos_sandbox::bridge::run_shim(listen, unix, cmd).await?;
+        std::process::exit(code);
+    }
     if cli.workspace == Path::new(".") {
         if let Ok(env_ws) = std::env::var("AOS_WORKSPACE") {
             if !env_ws.trim().is_empty() {
@@ -520,6 +541,8 @@ async fn main() -> anyhow::Result<()> {
         Commands::Demo => {
             run_end_to_end_multi_client_demo().await?;
         }
+
+        Commands::EgressShim { .. } => unreachable!("handled before identity resolution"),
     }
 
     Ok(())
