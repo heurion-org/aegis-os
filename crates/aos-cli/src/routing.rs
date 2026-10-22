@@ -180,10 +180,31 @@ const CREDENTIAL_MARKERS: &[&str] = &[
     "~/.aws",
     "/.gnupg",
     "/.kube",
+    "/.docker",
+    "/.azure",
+    "/.config/gcloud",
     "/Library/Keychains",
     "/.config/gh/hosts",
     "/.git-credentials",
     "/.netrc",
+    "/.npmrc",
+    "/.pypirc",
+    "/.vault-token",
+    "/.cargo/credentials",
+    "/custom_vault",
+    "/.secrets",
+    "/etc/shadow",
+    "/etc/sudoers",
+];
+
+const PROTECTED_CLIENT_CONFIG_MARKERS: &[&str] = &[
+    "/.gemini/config/hooks.json",
+    "/.gemini/config/mcp_config.json",
+    "/.gemini/antigravity-cli/settings.json",
+    "/.claude/settings.json",
+    "/.claude.json",
+    "/.codex/config.toml",
+    "/.agents/hooks.json",
 ];
 
 const GIT_HOST_SUBCOMMANDS: &[&str] = &[
@@ -340,21 +361,79 @@ pub fn canonicalize_lossy(p: &Path) -> PathBuf {
 /// Directory names inside a repo that native tools may still write (agent scratch / client state).
 const NATIVE_WRITE_ALLOWED_DIRS: &[&str] = &[".gemini", ".antigravity", "brain", "target", "node_modules"];
 
+/// Classify a native `read_file` / `view_file` / `Read` targeting `path`.
+pub fn classify_native_read(path: &Path, own_org_id: &str) -> Route {
+    if path.as_os_str().is_empty() {
+        return Route::Pass;
+    }
+    let raw = path.to_string_lossy();
+    let target = canonicalize_lossy(path);
+    let t = target.to_string_lossy();
+    if CREDENTIAL_MARKERS
+        .iter()
+        .any(|m| raw.contains(m) || t.contains(m))
+    {
+        return Route::Deny {
+            reason: "Blocked by Aegis OS Ring-0 policy: reading host credential stores (~/.ssh, ~/.aws, ~/.gnupg, ~/.kube, Keychains, custom_vault, ...) via native file tools is forbidden.".to_string(),
+        };
+    }
+    if let Some((_, after)) = t.split_once("/orgs/") {
+        if let Some(target_org) = after.split('/').next() {
+            if !target_org.is_empty() && !own_org_id.is_empty() && target_org != own_org_id {
+                return Route::Deny {
+                    reason: format!(
+                        "Blocked by Aegis OS Policy Rule R1 (Multi-Tenant Isolation): native read into foreign organization runtime directory (`{target_org}`) is forbidden."
+                    ),
+                };
+            }
+        }
+    }
+    Route::Pass
+}
+
 /// Classify a native `write_file` / `edit_file` targeting `path`.
 pub fn classify_native_write(path: &Path, repo_root: &Path) -> Route {
     if path.as_os_str().is_empty() {
         return Route::Pass;
     }
+    let raw = path.to_string_lossy();
     let target = canonicalize_lossy(path);
     let root = canonicalize_lossy(repo_root);
-
-    // Writes into any CoW shadow / runtime state are the agent's own business.
     let t = target.to_string_lossy();
-    if t.contains("/cow_workspace/") || t.contains("/upper_workspace/") {
+
+    if CREDENTIAL_MARKERS
+        .iter()
+        .any(|m| raw.contains(m) || t.contains(m))
+    {
+        return Route::Deny {
+            reason: "Blocked by Aegis OS Ring-0 policy: writing to host credential stores is forbidden.".to_string(),
+        };
+    }
+    if PROTECTED_CLIENT_CONFIG_MARKERS
+        .iter()
+        .any(|m| raw.contains(m) || t.contains(m))
+    {
+        return Route::Deny {
+            reason: "Blocked by Aegis OS Ring-0 policy: modifying client lifecycle hooks or permission configurations (`hooks.json`, `settings.json`, `mcp_config.json`) is forbidden.".to_string(),
+        };
+    }
+
+    // Writes into the agent's CoW shadow workspace or client brain/artifact scratch directory are allowed.
+    if t.contains("/cow_workspace/")
+        || t.contains("/upper_workspace/")
+        || t.contains("/.gemini/antigravity-cli/brain/")
+        || ((t.starts_with("/tmp/") || t.starts_with("/private/tmp/")) && !t.contains("/orgs/"))
+    {
         return Route::Pass;
     }
     let Ok(rel) = target.strip_prefix(&root) else {
-        return Route::Pass; // outside the repo: not ours to route
+        return Route::HostBoundary {
+            reason: format!(
+                "[Aegis OS Host File Write Approval]\n  • What this does: Modify `{}` outside your active repository (`{}`).\n  • Why confirmation is required: Target path lies outside the isolated CoW shadow workspace.",
+                target.display(),
+                root.display()
+            ),
+        };
     };
     if rel.as_os_str().is_empty() {
         return Route::Pass;
@@ -502,7 +581,15 @@ mod tests {
         assert_eq!(classify_native_write(Path::new("/tmp/scratch.txt"), root).kind(), "pass");
         assert_eq!(
             classify_native_write(&root.join("../outside.txt"), root).kind(),
-            "pass"
+            "host_boundary_ask"
+        );
+        assert_eq!(
+            classify_native_write(Path::new("/Users/alice/.ssh/authorized_keys"), root).kind(),
+            "deny_ring0"
+        );
+        assert_eq!(
+            classify_native_write(Path::new("/Users/alice/.gemini/config/hooks.json"), root).kind(),
+            "deny_ring0"
         );
         assert_eq!(classify_native_write(&root.join(".gemini/notes.md"), root).kind(), "pass");
         assert_eq!(classify_native_write(&root.join("target/x"), root).kind(), "pass");
@@ -510,6 +597,26 @@ mod tests {
             classify_native_write(
                 Path::new("/tmp/aegis-os-runtime/orgs/o/agents/a/cow_workspace/upper_workspace/src/a.rs"),
                 root
+            )
+            .kind(),
+            "pass"
+        );
+        assert_eq!(
+            classify_native_read(Path::new("/Users/alice/.ssh/id_rsa"), "acme").kind(),
+            "deny_ring0"
+        );
+        assert_eq!(
+            classify_native_read(
+                Path::new("/tmp/aegis-os-runtime/orgs/org-enterprise-0/cas/blob"),
+                "org-alpha"
+            )
+            .kind(),
+            "deny_ring0"
+        );
+        assert_eq!(
+            classify_native_read(
+                Path::new("/tmp/aegis-os-runtime/orgs/org-alpha/cas/blob"),
+                "org-alpha"
             )
             .kind(),
             "pass"

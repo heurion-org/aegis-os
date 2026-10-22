@@ -118,6 +118,30 @@ impl NativeOsSandboxInstance {
             ""
         };
 
+        let tenant_rules = if !aos_core::ablated("tenant_gate") {
+            if let Some(own_org_dir) = self.config.org_shared_ro_dir.parent() {
+                if let Some(orgs_root) = own_org_dir.parent() {
+                    if orgs_root.file_name().and_then(|n| n.to_str()) == Some("orgs") {
+                        let orgs_str = Self::canonical_or_orig(orgs_root);
+                        let own_str = Self::canonical_or_orig(own_org_dir);
+                        format!(
+                            r#"
+(deny file-read* (subpath "{orgs_str}"))
+(allow file-read* (subpath "{own_str}"))"#
+                        )
+                    } else {
+                        String::new()
+                    }
+                } else {
+                    String::new()
+                }
+            } else {
+                String::new()
+            }
+        } else {
+            String::new()
+        };
+
         format!(
             r#"(version 1)
 (allow default)
@@ -132,7 +156,7 @@ impl NativeOsSandboxInstance {
     (literal "/dev/random")
     (literal "/dev/urandom")
     (literal "/dev/tty")
-){cred_rules}{net_rules}
+){tenant_rules}{cred_rules}{net_rules}
 "#
         )
     }

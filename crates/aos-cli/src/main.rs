@@ -709,7 +709,7 @@ pub async fn install_global_clients(
                     ],
                     "PreToolUse": [
                         {
-                            "matcher": "call_mcp_tool|mcp_aegis-os_.*|write_file|edit_file|run_command",
+                            "matcher": "call_mcp_tool|mcp_aegis-os_.*|mcp__aegis-os__.*|write_file|edit_file|read_file|view_file|run_command|Write|Edit|MultiEdit|Read|Bash",
                             "hooks": [
                                 {
                                     "type": "command",
@@ -940,6 +940,27 @@ You are running inside the **Aegis OS Runtime (`aegis-os`)** with an isolated Co
                         arr.push(r);
                     }
                 }
+            }
+            let hooks = root
+                .as_object_mut()
+                .unwrap()
+                .entry("hooks")
+                .or_insert_with(|| json!({}));
+            if let Some(hobj) = hooks.as_object_mut() {
+                hobj.insert(
+                    "PreToolUse".to_string(),
+                    json!([
+                        {
+                            "matcher": "call_mcp_tool|mcp__aegis-os__.*|Write|Edit|MultiEdit|Read|Bash|write_file|edit_file|read_file|run_command",
+                            "hooks": [
+                                {
+                                    "type": "command",
+                                    "command": format!("\"{}\" --client claude --org auto --agent auto --runtime-dir \"{}\" agy-hook --event PreToolUse", bin_str, rt_str)
+                                }
+                            ]
+                        }
+                    ]),
+                );
             }
         },
         dry_run,
@@ -1573,9 +1594,37 @@ async fn handle_agy_hook(
 
             let routing_mode = routing::RoutingMode::from_env();
 
-            if matches!(tool_name, "write_file" | "edit_file") {
+            if matches!(tool_name, "read_file" | "view_file" | "Read") {
                 let target_path = tool_args
                     .get("Path")
+                    .or_else(|| tool_args.get("file_path"))
+                    .or_else(|| tool_args.get("AbsolutePath"))
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("");
+                let route =
+                    routing::classify_native_read(Path::new(target_path), &identity.org_id);
+                if !matches!(route, routing::Route::Pass) {
+                    coord::log_routing_decision(
+                        &cli.runtime_dir,
+                        &identity.agent_id,
+                        tool_name,
+                        &format!("{}:{}", routing_mode.as_str(), route.kind()),
+                        target_path,
+                    );
+                }
+                let out = route.to_hook_decision(routing_mode);
+                println!("{}", serde_json::to_string(&out)?);
+                return Ok(());
+            }
+
+            if matches!(
+                tool_name,
+                "write_file" | "edit_file" | "Write" | "Edit" | "MultiEdit"
+            ) {
+                let target_path = tool_args
+                    .get("Path")
+                    .or_else(|| tool_args.get("file_path"))
+                    .or_else(|| tool_args.get("TargetFile"))
                     .and_then(|v| v.as_str())
                     .unwrap_or("");
 
@@ -1635,9 +1684,10 @@ async fn handle_agy_hook(
                 return Ok(());
             }
 
-            if tool_name == "run_command" {
+            if matches!(tool_name, "run_command" | "Bash") {
                 let cmd_line = tool_args
                     .get("CommandLine")
+                    .or_else(|| tool_args.get("command"))
                     .and_then(|v| v.as_str())
                     .unwrap_or("");
 
@@ -1740,7 +1790,7 @@ async fn setup_agy_workspace(
             ],
             "PreToolUse": [
                 {
-                    "matcher": "call_mcp_tool|mcp_aegis-os_.*|write_file|edit_file|run_command",
+                    "matcher": "call_mcp_tool|mcp_aegis-os_.*|mcp__aegis-os__.*|write_file|edit_file|read_file|view_file|run_command|Write|Edit|MultiEdit|Read|Bash",
                     "hooks": [
                         {
                             "type": "command",
