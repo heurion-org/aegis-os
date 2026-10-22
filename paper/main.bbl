@@ -134,6 +134,11 @@ Donald~E. Porter, Owen~S. Hofmann, Christopher~J. Rossbach, Alexander Benn, and
 \newblock In {\em Proceedings of the ACM SIGOPS 22nd Symposium on Operating
   Systems Principles (SOSP)}, pages 161--176. ACM, 2009.
 
+\bibitem{rodeh2013btrfs}
+Ohad Rodeh, Josef Bacik, and Chris Mason.
+\newblock {BTRFS}: The {Linux} {B}-tree filesystem.
+\newblock {\em ACM Transactions on Storage (TOS)}, 9(3):9:1--9:32, 2013.
+
 \bibitem{ruan2024toolemu}
 Yangjun Ruan, Honghua Dong, Andrew Wang, Silviu Pitis, Yongchao Zhou, Jimmy Ba,
   Yann Dubois, Chris~J. Maddison, and Tatsunori Hashimoto.

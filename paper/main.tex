@@ -140,13 +140,13 @@ We design, implement, and evaluate \textbf{Aegis OS} (\texttt{aegis-os}), a mult
 
 \node[policy, below=0.4cm of mcp] (pol) {\textbf{Cedar-Inspired Policy Engine \& Lease Manager (\texttt{aos-policy})}\\{\scriptsize R0: Host \& Commit Red-Line $\mid$ R1: Cross-Tenant Gate $\mid$ R2: TTL / One-Shot Lease $\mid$ R3: In-Sandbox \& Intra-Org Auto-Allow $\mid$ R4: Boundary Escalation}};
 
-\node[subsys, below=0.5cm of pol, xshift=-5.62cm] (vfs) {\textbf{Transactional CoW VFS}\\(\texttt{aos-vfs})\\[2pt]{\scriptsize $\bullet$ APFS \texttt{libc::clonefile}}\\[-1pt]{\scriptsize $\bullet$ Snapshots \& Rollback}\\[-1pt]{\scriptsize $\bullet$ 2-Phase LCS Diff3 Merge}};
+\node[subsys, below=0.5cm of pol, xshift=-5.62cm] (vfs) {\textbf{Transactional CoW VFS}\\(\texttt{aos-vfs})\\[2pt]{\scriptsize $\bullet$ APFS \texttt{clonefile} / \texttt{FICLONE}}\\[-1pt]{\scriptsize $\bullet$ Snapshots \& Rollback}\\[-1pt]{\scriptsize $\bullet$ 2-Phase LCS Diff3 Merge}};
 
 \node[subsys, right=0.38cm of vfs] (sbx) {\textbf{Dual-Tier OS Sandbox}\\(\texttt{aos-sandbox})\\[2pt]{\scriptsize $\bullet$ macOS \texttt{sandbox-exec}}\\[-1pt]{\scriptsize $\bullet$ Linux \texttt{bwrap} / MicroVM}\\[-1pt]{\scriptsize $\bullet$ File \& Port Confinement}};
 
 \node[subsys, right=0.38cm of sbx] (ipc) {\textbf{A2A IPC Bus \& CAS}\\(\texttt{aos-ipc} + \texttt{aos-vfs})\\[2pt]{\scriptsize $\bullet$ A2A \texttt{AgentCard} \& \texttt{TaskState}}\\[-1pt]{\scriptsize $\bullet$ Global Peer Discovery \& RPC}\\[-1pt]{\scriptsize $\bullet$ \texttt{artifact://sha256} FileParts}};
 
-\node[subsys, right=0.38cm of ipc] (egr) {\textbf{Zero-Trust Egress Proxy}\\(\texttt{aos-egress})\\[2pt]{\scriptsize $\bullet$ Identity-Pinned Socket}\\[-1pt]{\scriptsize $\bullet$ Domain Allowlist}\\[-1pt]{\scriptsize $\bullet$ \texttt{\$AOS\_SECRET\_*} Inject}};
+\node[subsys, right=0.38cm of ipc] (egr) {\textbf{Zero-Trust Egress Proxy}\\(\texttt{aos-egress})\\[2pt]{\scriptsize $\bullet$ Identity-Pinned Socket}\\[-1pt]{\scriptsize $\bullet$ L7 Scope \& Outbound DLP}\\[-1pt]{\scriptsize $\bullet$ \texttt{\$AOS\_SECRET\_*} Inject}};
 
 \node[host, below=0.5cm of sbx, xshift=1.87cm] (hostos) {\textbf{Host OS Kernel \& Validated Project Repository} --- APFS / Reflink Storage $\mid$ Seatbelt / Namespace MAC $\mid$ Flight Recorder (\texttt{aos-recorder})};
 
@@ -184,9 +184,9 @@ We consider a multi-agent deployment where autonomous coding agents operate with
 \paragraph{Adversarial Threat Vectors (T1--T5).} We assume the LLM driving any agent is untrusted and may issue malicious or erroneous tool calls due to:
 \begin{itemize}
     \item \textbf{T1 (Indirect Prompt Injection):} Malicious instructions embedded in repository files, commit logs, issue trackers, or web pages read by the agent~\cite{greshake2023not,debenedetti2024agentdojo}.
-    \item \textbf{T2 (Host Path Escape and Tampering):} Attempting to write files outside the workspace (e.g., \texttt{../../etc/hosts}, \texttt{\textasciitilde/.zshrc}, or sibling repositories) or staging commit-time hooks (\texttt{.git/hooks/pre-commit}, \texttt{.envrc}).
-    \item \textbf{T3 (Credential Harvesting):} Attempting to read sensitive host credentials (\texttt{\textasciitilde/.ssh/id\_rsa}, \texttt{\textasciitilde/.aws/credentials}, \texttt{\textasciitilde/.gnupg}, \texttt{\textasciitilde/.kube/config}, \texttt{\textasciitilde/.npmrc}, or macOS Keychains).
-    \item \textbf{T4 (Network Secret Exfiltration):} Attempting to transmit API tokens or source code to unauthorized external domains (\texttt{evil-exfil.org}, \texttt{webhook.site}) via HTTP requests or direct socket bypass (\texttt{curl --noproxy '*'}), or by sending a secret toward a domain that is allowlisted but is not the one the secret is bound to.
+    \item \textbf{T2 (Host Path Escape and Tampering):} Attempting to write files outside the workspace (e.g., \texttt{../../etc/hosts}, \texttt{\textasciitilde/.zshrc}, or sibling repositories) or staging commit-time hooks and build scripts (\texttt{.git/hooks/pre-commit}, \texttt{.envrc}, \texttt{build.rs}, \texttt{Makefile}).
+    \item \textbf{T3 (Credential Harvesting):} Attempting to read sensitive host credentials (\texttt{\textasciitilde/.ssh/id\_rsa}, \texttt{\textasciitilde/.aws/credentials}, \texttt{\textasciitilde/.gnupg}, \texttt{\textasciitilde/.kube/config}, \texttt{\textasciitilde/.npmrc}, \texttt{\textasciitilde/.config/gcloud}, custom vault directories in \texttt{\$HOME}, or macOS Keychains).
+    \item \textbf{T4 (Network Secret Exfiltration):} Attempting to transmit API tokens or source code to unauthorized external domains (\texttt{evil-exfil.org}, \texttt{webhook.site}) via HTTP requests or direct socket bypass (\texttt{curl --noproxy '*'}), sending a secret toward an allowlisted domain it is not bound to, or abusing disallowed L7 paths or request bodies on a bound domain.
     \item \textbf{T5 (Cross-Tenant Privilege Escalation):} Attempting to read CAS artifacts or inject IPC messages into a different tenant organization.
 \end{itemize}
 
@@ -223,7 +223,7 @@ Figure~\ref{fig:arch} illustrates the architecture of Aegis OS, and Table~\ref{t
 \textbf{Inter-Agent IPC \& Claims} (\texttt{aos-ipc}, 10 tools) & \texttt{ipc\_send}, \texttt{ipc\_recv}, \texttt{ipc\_request}, \texttt{ipc\_reply}, \texttt{ipc\_ack}, \texttt{ipc\_publish}, \texttt{ipc\_subscribe}, \texttt{ipc\_list\_peers}, \texttt{coord\_claim}, \texttt{coord\_release} & \textbf{Auto-Allow Intra-Org \& Workstation IPC}: Verified global peers (\texttt{<org>/<agent>}) allowed; file claims enforced \\
 \textbf{Google A2A Protocol} (\texttt{aos-ipc}, 4 tools + HTTP) & \texttt{ipc\_update\_card}, \texttt{ipc\_task\_update}, \texttt{ipc\_task\_get}, \texttt{ipc\_task\_list} + \texttt{GET /.well-known/agent-card.json}, \texttt{POST /a2a} & \textbf{Auto-Allow Discovery \& Task RPC}: \texttt{AgentCard} synthesis \& stateful \texttt{A2ATaskState} lifecycle (\texttt{submitted}$\to$\texttt{completed}) \\
 \textbf{Org CAS \& KV} (\texttt{aos-vfs}, 4 tools) & \texttt{org\_artifact\_publish}, \texttt{org\_artifact\_fetch}, \texttt{org\_kv\_put}, \texttt{org\_kv\_get} & \textbf{Auto-Allow Intra-Org}: Cross-org \texttt{artifact://} \texttt{FilePart} fetch requires policy boundary approval (\textbf{Ask}/\textbf{Deny}) \\
-\textbf{Zero-Trust Egress} (\texttt{aos-egress}, 1 tool) & \texttt{egress\_http\_request} + Identity-Pinned TCP Proxy (\texttt{127.0.0.1:<port>}) & \textbf{Allowlisted Domains Auto-Allow}: Unlisted domains escalate; injects \texttt{\$AOS\_SECRET\_*} \\
+\textbf{Zero-Trust Egress} (\texttt{aos-egress}, 1 tool) & \texttt{egress\_http\_request} + Identity-Pinned TCP Proxy (\texttt{127.0.0.1:<port>}) & \textbf{Allowlisted Domains + L7 Scope Auto-Allow}: Unlisted domains escalate; injects \texttt{\$AOS\_SECRET\_*} \& runs DLP \\
 \textbf{Policy \& Leases} (\texttt{aos-policy}, 3 tools) & \texttt{policy\_list\_escalations}, \texttt{policy\_approve\_escalation}, \texttt{policy\_grant\_lease} & Operator control plane for one-shot (\texttt{ttl=0}) or TTL-scoped \texttt{LeaseGrant} tokens \\
 \textbf{Dynamic MCP URIs} (7 resources) & \texttt{aegis://workspace/status}, \texttt{aegis://ipc/inbox}, \texttt{aegis://org/peers}, \texttt{aegis://global/peers}, \texttt{aegis://a2a/agent-cards}, \texttt{aegis://a2a/tasks}, \texttt{aegis://org/shared/catalog} & Live state introspection for IDE status bars, global peer topology, and A2A task tables \\
 \bottomrule
@@ -242,7 +242,7 @@ To eliminate confirmation prompts on file mutations without risking host corrupt
 
 \paragraph{APFS \texttt{clonefile} Shadow Provisioning.} Copying a multi-megabyte repository per agent via user-space read/write loops scales linearly with total byte volume. On macOS (APFS), \texttt{aos-vfs} invokes the native XNU syscall \texttt{libc::clonefile(src, dst, 0)} on eligible directory subtrees and files (automatically skipping heavy build/VCS directories such as \texttt{.git}, \texttt{target}, and \texttt{node\_modules}). Because \texttt{clonefile} duplicates only filesystem metadata extents and shares physical blocks until mutated, workspace initialization on APFS depends only on file count (0.71--6.28 ms for 100--1,000 files) and allocates physical storage only for modified files. Unlike \texttt{git worktree}, which requires a valid git commit history, shares the repository object store, and cannot snapshot dirty untracked trees in sub-millisecond time, \texttt{aos-vfs} operates transparently on any directory and supports instant nested checkpoints.
 
-\paragraph{Linux Provisioning, Single-Open Syscall Reduction, and Btrfs Subvolume Snapshots.} Linux has no general directory-level clone: \texttt{ioctl(FICLONE)} reflinks one file at a time on btrfs and XFS, and ext4 has no reflink at all. \texttt{aos-vfs} therefore clones file by file by default and falls back to \texttt{std::io::copy} (\texttt{copy\_file\_range}) when the filesystem reports \texttt{EOPNOTSUPP} or \texttt{EXDEV}; it caches the failing device state so that a non-reflink filesystem is not charged a failed \texttt{FICLONE} syscall for every subsequent file, and logs a warning once. An initial implementation issued 12--16 syscalls per file (checking \texttt{dst.exists()}, \texttt{stat(src)}, \texttt{stat(dst.parent())}, recursive \texttt{create\_dir\_all}, double \texttt{fstat}, and reopening \texttt{dst} on ext4 fallback), costing 37.4 ms on btrfs and 73.7 ms on ext4 for 1,000 files. Our optimized \texttt{cow\_clone\_file\_inner} traversal creates each target directory once via \texttt{create\_dir}, opens \texttt{src} and \texttt{dst} once with \texttt{OpenOptionsExt::mode(meta.mode())}, calls \texttt{fstat} once, and reuses the open file descriptors for \texttt{FICLONE} or \texttt{copy\_file\_range} plus \texttt{futimens} (7 syscalls per file). This cuts 1,000-file provisioning to \textbf{15.6 ms on btrfs}, \textbf{32.1 ms on XFS}, and \textbf{35.1 ms on ext4} (Table~\ref{tab:baselines}). \texttt{aos-vfs} also implements an optional kernel subvolume fast path (\texttt{AOS\_BTRFS\_SUBVOL=1}) using \texttt{BTRFS\_IOC\_SUBVOL\_CREATE\_V2} (\texttt{0x50009418}) and \texttt{BTRFS\_IOC\_SNAP\_CREATE\_V2} (\texttt{0x50009417}) after probing whether unprivileged \texttt{rmdir(2)} on subvolumes (\texttt{user\_subvol\_rm\_allowed}) is supported. Interestingly, on freshly written 1,000-file trees (80 MB of dirty page cache), \texttt{BTRFS\_IOC\_SNAP\_CREATE\_V2} takes 27.9 ms because the kernel's \texttt{btrfs\_mksnapshot} forces a synchronous \texttt{btrfs\_commit\_transaction} disk flush of delayed allocations, whereas per-file \texttt{FICLONE} (15.6 ms) remaps extent metadata purely in memory; on clean 10,000-file monorepos already synced to disk, \texttt{BTRFS\_IOC\_SNAP\_CREATE\_V2} completes in $O(1)$ time (2.1 ms).
+\paragraph{Linux Provisioning, Single-Open Syscall Reduction, and Btrfs Subvolume Snapshots.} Linux has no general directory-level clone: \texttt{ioctl(FICLONE)} reflinks one file at a time on btrfs~\cite{rodeh2013btrfs} and XFS, and ext4 has no reflink at all. \texttt{aos-vfs} therefore clones file by file by default and falls back to \texttt{std::io::copy} (\texttt{copy\_file\_range}) when the filesystem reports \texttt{EOPNOTSUPP} or \texttt{EXDEV}; it caches the failing device state so that a non-reflink filesystem is not charged a failed \texttt{FICLONE} syscall for every subsequent file, and logs a warning once. An initial implementation issued 12--16 syscalls per file (checking \texttt{dst.exists()}, \texttt{stat(src)}, \texttt{stat(dst.parent())}, recursive \texttt{create\_dir\_all}, double \texttt{fstat}, and reopening \texttt{dst} on ext4 fallback), costing 37.4 ms on btrfs and 73.7 ms on ext4 for 1,000 files. Our optimized \texttt{cow\_clone\_file\_inner} traversal creates each target directory once via \texttt{create\_dir}, opens \texttt{src} and \texttt{dst} once with \texttt{OpenOptionsExt::mode(meta.mode())}, calls \texttt{fstat} once, and reuses the open file descriptors for \texttt{FICLONE} or \texttt{copy\_file\_range} plus \texttt{futimens} (7 syscalls per file). This cuts 1,000-file provisioning to \textbf{15.6 ms on btrfs}, \textbf{32.1 ms on XFS}, and \textbf{35.1 ms on ext4} (Table~\ref{tab:baselines}). \texttt{aos-vfs} also implements an optional kernel subvolume fast path (\texttt{AOS\_BTRFS\_SUBVOL=1}) using \texttt{BTRFS\_IOC\_SUBVOL\_CREATE\_V2} (\texttt{0x50009418}) and \texttt{BTRFS\_IOC\_SNAP\_CREATE\_V2} (\texttt{0x50009417}) after probing whether unprivileged \texttt{rmdir(2)} on subvolumes (\texttt{user\_subvol\_rm\_allowed}) is supported. Interestingly, on freshly written 1,000-file trees (80 MB of dirty page cache), \texttt{BTRFS\_IOC\_SNAP\_CREATE\_V2} takes 27.9 ms because the kernel's \texttt{btrfs\_mksnapshot} forces a synchronous \texttt{btrfs\_commit\_transaction} disk flush of delayed allocations, whereas per-file \texttt{FICLONE} (15.6 ms) remaps extent metadata purely in memory; on clean 10,000-file monorepos already synced to disk, \texttt{BTRFS\_IOC\_SNAP\_CREATE\_V2} completes in $O(1)$ time (2.1 ms).
 
 \paragraph{Metadata Fingerprints.} Commit, refresh, and diff must decide which files an agent changed. Reading every file three times (host, shadow, baseline) took 542 ms for a 1,000-file repository on btrfs. Clones preserve the source's modification time, so an unedited file keeps the same size and mtime as its baseline copy and can be skipped without being read. Following git's ``racily clean'' rule, equality is trusted only when the mtime predates the clone by more than two seconds; younger files are compared by content, so a same-size edit inside one timestamp tick is not missed. This reduced a status query from 542 ms to 7.0 ms. One residual case remains: an agent that deliberately rewrites a file at the same size and restores its old mtime hides that edit from \texttt{diff}, and the edit is then not committed. The failure direction is safe, since nothing unreviewed reaches the host.
 
@@ -318,9 +318,9 @@ Every runtime tool call is evaluated by \texttt{AegisPolicyKernel::\allowbreak e
 
 Together, these mechanisms enforce three core runtime invariants:
 \begin{itemize}
-    \item \textbf{Design Invariant 1 (Pre-Commit Host Non-Interference):} \emph{Until a \texttt{workspace\_commit} is explicitly approved, no sequence of agent tool calls or spawned child processes can modify any file in the host repository.} VFS tools reject path traversal (\texttt{..}) and resolve all paths inside \texttt{shadow\_root}, while \texttt{proc\_exec} enforces kernel Seatbelt \texttt{(deny file-write*)} outside \texttt{shadow\_root}, \texttt{agent\_home}, and \texttt{org\_pub}.
-    \item \textbf{Design Invariant 2 (Zero Raw Secret Exposure to Sandbox):} \emph{Plaintext API credentials never enter the sandboxed process environment, command-line arguments, or logs, and are injected into outbound HTTP headers only when the destination \texttt{Host} matches the secret's authorized domain list.} \texttt{NativeOsSandboxInstance::exec} clears the child environment (\texttt{env\_clear()}) and passes only opaque \texttt{\$AOS\_SECRET\_*} placeholders.
-    \item \textbf{Design Invariant 3 (All-or-Nothing Conflict-Safe Commit):} \emph{Concurrent agent commits either produce a merged host file preserving all non-overlapping edits, or abort in Phase 1 without modifying any host file when two agents edit the same baseline lines inconsistently.}
+    \item \textbf{Design Invariant 1 (Pre-Commit Host Non-Interference):} \emph{Until a \texttt{workspace\_commit} is explicitly approved, no sequence of agent tool calls or spawned child processes can modify any file in the host repository.} VFS tools reject path traversal (\texttt{..}) and resolve all paths inside \texttt{shadow\_root}, while \texttt{proc\_exec} enforces kernel Seatbelt \texttt{(deny file-write*)} and Linux \texttt{bwrap --ro-bind / /} outside \texttt{shadow\_root}, \texttt{agent\_home}, and \texttt{org\_pub}.
+    \item \textbf{Design Invariant 2 (Zero Raw Secret Exposure to Sandbox):} \emph{Plaintext API credentials never enter the sandboxed process environment, command-line arguments, or logs, and are injected into outbound HTTP headers only when the destination \texttt{Host} and canonicalized HTTP method + URL path prefix match the secret's \texttt{SecretScopeRule} and the request query/body passes outbound DLP inspection (\texttt{inspect\_payload\_dlp}).} \texttt{NativeOsSandboxInstance::exec} clears the child environment (\texttt{env\_clear()}) and passes only opaque \texttt{\$AOS\_SECRET\_*} placeholders.
+    \item \textbf{Design Invariant 3 (All-or-Nothing Conflict-Safe Commit):} \emph{Concurrent agent commits either produce a merged host file preserving all non-overlapping edits, or abort in Phase 1 without modifying any host file when two agents edit the same baseline lines inconsistently or when the optional pre-commit \texttt{verify\_cmd} semantic gate fails inside the sandbox.}
 \end{itemize}
 
 \section{Multi-Client Integration and Enforcement}
@@ -342,10 +342,10 @@ To minimize setup friction, \texttt{aegis-os install} automatically configures M
 
 We evaluate Aegis OS using our reproducible benchmark suite (\texttt{crates/aos-cli/src/bench.rs}, invoked via \texttt{aegis-os bench}). Unless stated otherwise, experiments ran on an Apple Silicon workstation (\texttt{macos-aarch64}, APFS, Rust 1.99.0 \texttt{--release}) using real OS processes, Seatbelt kernel sandboxes, loopback TCP sockets, and \texttt{cargo} builds. The security, merge, and provisioning experiments were repeated on Linux in a virtual machine on the same host (Ubuntu 24.04 aarch64, kernel 6.8, bubblewrap 0.9) with the workspace on btrfs, XFS, or ext4. Linux numbers therefore include virtualised I/O, and the XFS volume was a loop-backed image on btrfs, so it is only a rough indication. We investigate six research questions:
 \begin{itemize}
-    \item \textbf{RQ1 (Authorization Friction):} How much does Aegis OS reduce confirmation prompts and modeled verification wait time across multi-step software engineering trajectories?
-    \item \textbf{RQ2 (Adversarial Security):} Does Aegis OS block end-to-end OS process, credential harvesting, proxy/socket exfiltration, cross-tenant, commit-time poisoning, secret-binding, and conflicting-commit attacks that compromise unconfined \texttt{Host-YOLO} execution?
+    \item \textbf{RQ1 (Authorization Friction):} How much does Aegis OS reduce confirmation prompts and modeled verification wait time across both controlled SWE trajectories and real-world coding-agent session transcripts?
+    \item \textbf{RQ2 (Adversarial Security):} Does Aegis OS block end-to-end OS process, credential harvesting, proxy/socket exfiltration, cross-tenant, commit-time poisoning, L7 confused-deputy/DLP, and conflicting-commit attacks that compromise unconfined \texttt{Host-YOLO} execution and stateless native CLI sandboxes?
     \item \textbf{RQ3 (System Overhead \& Scaling):} What is the latency and disk footprint of CoW provisioning (APFS clones and Linux reflinks, compared with \texttt{cp}, \texttt{rsync}, and \texttt{git}), policy evaluation, HTTP daemon RPCs, 3-way merge commits, and Seatbelt process spawning?
-    \item \textbf{RQ4 (Multi-Agent Concurrency):} Does two-phase LCS Diff3 merging preserve concurrent multi-agent edits (including multi-line insertions) while catching overlapping line conflicts?
+    \item \textbf{RQ4 (Multi-Agent Concurrency):} Does two-phase LCS Diff3 merging with pre-commit semantic verification (\texttt{verify\_cmd}) preserve concurrent multi-agent edits while catching both overlapping line conflicts and disjoint-line semantic regressions?
     \item \textbf{RQ5 (Fault Recovery):} How fast does atomic CoW rollback recover from multi-file syntax corruption compared to sequential file restoration?
     \item \textbf{RQ6 (Component Necessity):} Is each safety component necessary, i.e., does switching it off re-open an attack class that the full system blocks?
 \end{itemize}
@@ -480,7 +480,7 @@ H. Silent Overwrite of a Peer's Edit (lost update) & 10 & 10 / 10 (100.0\%) & \t
 
 \subsection{Experiment 2 (RQ2): End-to-End Adversarial Security}
 
-We execute 80 live adversarial attacks end-to-end against both an unconfined disposable victim environment (\texttt{Host-YOLO}) and \texttt{Aegis-OS}:
+We execute 80 live adversarial attacks end-to-end against both an unconfined disposable victim environment (\texttt{Host-YOLO}) and \texttt{Aegis-OS} (Table~\ref{tab:exp2}):
 \begin{itemize}
     \item \textbf{Category A (10 Host Path Escape Attacks):} Spawns \texttt{sh -c "echo COMPROMISED > <outside\_target>"}. In \texttt{Host-YOLO}, all 10 outside-workspace files were created on disk (100.0\% ASR). Inside \texttt{Aegis-OS} (\texttt{proc\_exec}), \texttt{/usr/bin/sandbox-exec} denied all 10 writes at the XNU kernel boundary with \texttt{Operation not permitted} (0.0\% ASR).
     \item \textbf{Category B (10 Multi-Store Credential Harvesting Attacks):} Spawns \texttt{sh -c "cat <cred\_path>"} across 10 distinct credential locations: \texttt{\textasciitilde/.ssh/id\_rsa}, \texttt{\textasciitilde/.aws/credentials}, \texttt{\textasciitilde/.gnupg/secring.gpg}, \texttt{\textasciitilde/.kube/config}, \texttt{\textasciitilde/.npmrc}, \texttt{\textasciitilde/.pypirc}, \texttt{\textasciitilde/.netrc}, \texttt{\textasciitilde/.git-credentials}, \texttt{\textasciitilde/.config/gcloud/credentials.db}, and an arbitrary user vault directory \texttt{\textasciitilde/custom\_vault/secret\_key.pem}. \texttt{Host-YOLO} leaked the secret key material on all 10 attempts (100.0\% ASR), whereas the Aegis OS Seatbelt profile and Linux default-deny \texttt{--tmpfs \$HOME} mount blocked all 10 reads (0.0\% ASR).
@@ -532,6 +532,28 @@ Large Project & 1,000 & 78.1 MB & $113.13 \pm 16.41$ ms & $\mathbf{6.28 \pm 0.65
 }
 \end{table*}
 
+\begin{table}[!t]
+\centering
+\caption{\textbf{Experiment 3B (RQ3): Kernel, Daemon, Merge Commit, and Sandbox Spawn Latency Distribution}. Ops/sec is computed as $N$ divided by total wall-clock time of the measurement loop (including harness overhead), so it is slightly lower than $1/\text{Mean}$.}
+\label{tab:exp3b}
+\vspace{2pt}
+\resizebox{\columnwidth}{!}{%
+\begin{tabular}{lccccc}
+\toprule
+\textbf{Runtime Operation} & \textbf{Mean ($\mu$s)} & \textbf{P50 ($\mu$s)} & \textbf{P95 ($\mu$s)} & \textbf{P99 ($\mu$s)} & \textbf{Ops/sec} \\
+\midrule
+\texttt{PolicyKernel::evaluate} ($N{=}2000$) & 0.31 & 0.29 & 0.38 & 0.50 & 2,959,674 \\
+\texttt{IpcBus::send + recv} ($N{=}1000$) & 1.06 & 0.83 & 1.79 & 4.75 & 924,749 \\
+\texttt{HTTP POST /mcp} (\texttt{fs\_read}, $N{=}200$) & 177.11 & 183.08 & 258.79 & 409.00 & 5,503 \\
+\texttt{commit\_to\_host} (3-Way Merge, $N{=}100$) & 424.02 & 413.08 & 540.21 & 646.12 & 2,110 \\
+\texttt{Sandbox::exec} (\texttt{sandbox-exec}, $N{=}30$) & 6,678.97 & 6,557.62 & 7,533.12 & 7,811.33 & 150 \\
+\bottomrule
+\end{tabular}%
+}
+\end{table}
+
+\subsection{Experiment 3 (RQ3): CoW Provisioning, Storage Footprint, and Operation Latency}
+
 \begin{figure}[!t]
 \centering
 \resizebox{\columnwidth}{!}{%
@@ -572,28 +594,6 @@ Large Project & 1,000 & 78.1 MB & $113.13 \pm 16.41$ ms & $\mathbf{6.28 \pm 0.65
 \caption{Workspace provisioning latency across repository scales (Experiment 3A). APFS \texttt{clonefile} scales with file metadata count rather than total byte volume, achieving an 18.0$\times$ speedup over a user-space copy loop on the 1,000-file repository.}
 \label{fig:exp3}
 \end{figure}
-
-\begin{table}[!t]
-\centering
-\caption{\textbf{Experiment 3B (RQ3): Kernel, Daemon, Merge Commit, and Sandbox Spawn Latency Distribution}. Ops/sec is computed as $N$ divided by total wall-clock time of the measurement loop (including harness overhead), so it is slightly lower than $1/\text{Mean}$.}
-\label{tab:exp3b}
-\vspace{2pt}
-\resizebox{\columnwidth}{!}{%
-\begin{tabular}{lccccc}
-\toprule
-\textbf{Runtime Operation} & \textbf{Mean ($\mu$s)} & \textbf{P50 ($\mu$s)} & \textbf{P95 ($\mu$s)} & \textbf{P99 ($\mu$s)} & \textbf{Ops/sec} \\
-\midrule
-\texttt{PolicyKernel::evaluate} ($N{=}2000$) & 0.31 & 0.29 & 0.38 & 0.50 & 2,959,674 \\
-\texttt{IpcBus::send + recv} ($N{=}1000$) & 1.06 & 0.83 & 1.79 & 4.75 & 924,749 \\
-\texttt{HTTP POST /mcp} (\texttt{fs\_read}, $N{=}200$) & 177.11 & 183.08 & 258.79 & 409.00 & 5,503 \\
-\texttt{commit\_to\_host} (3-Way Merge, $N{=}100$) & 424.02 & 413.08 & 540.21 & 646.12 & 2,110 \\
-\texttt{Sandbox::exec} (\texttt{sandbox-exec}, $N{=}30$) & 6,678.97 & 6,557.62 & 7,533.12 & 7,811.33 & 150 \\
-\bottomrule
-\end{tabular}%
-}
-\end{table}
-
-\subsection{Experiment 3 (RQ3): CoW Provisioning, Storage Footprint, and Operation Latency}
 
 We benchmark workspace provisioning across three repository scales (100 files / 2.0 MB, 300 files / 17.6 MB, and 1,000 files / 78.1 MB, 5 trials per scale). As shown in Table~\ref{tab:exp3a} and Figure~\ref{fig:exp3}, a user-space copy loop requires $113.13 \pm 16.41$ ms for the 1,000-file repository, whereas APFS \texttt{libc::clonefile} provisions the shadow workspace in \textbf{$6.28 \pm 0.65$ ms} (18.0$\times$ faster than that loop; Table~\ref{tab:baselines} gives the comparison against real tools). Because \texttt{clonefile} duplicates only inode metadata rather than file data blocks, provisioning latency scales with file count (0.71 ms at 100 files to 6.28 ms at 1,000 files) rather than total byte size. Across 10 concurrent agent workspaces modifying working sets of 6, 12, and 25 files per agent, APFS CoW reduces disk block allocation by \textbf{94.0\%--97.5\%} (19.5 MB vs.\ 781.2 MB at 1,000 files).
 
