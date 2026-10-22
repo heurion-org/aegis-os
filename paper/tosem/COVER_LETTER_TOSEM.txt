@@ -1,0 +1,30 @@
+Dear Editor-in-Chief and Associate Editor of ACM TOSEM,
+
+Please find enclosed our manuscript entitled "Aegis OS: A Transactional Multi-Tenant Operating System Runtime for Eliminating Authorization Fatigue in Autonomous Coding Agents" for consideration as a Regular Research Article in ACM Transactions on Software Engineering and Methodology (TOSEM).
+
+1. Motivation and Relevance to ACM TOSEM
+Autonomous coding agents—such as Google Antigravity (agy), Anthropic Claude Code (claude), OpenAI Codex CLI (codex), SWE-agent, and OpenHands—increasingly execute long-horizon software engineering tasks across local developer workstations and cloud hosts. Yet existing agent execution substrates suffer from a severe Security-Autonomy Dilemma: developers must choose between per-action confirmation prompts, which interrupt 45%-57% of tool calls and induce severe authorization fatigue, or unconfined execution (--yolo / --dangerously-skip-permissions), which exposes host files, SSH/cloud credentials, and API tokens to indirect prompt injection and hallucinated corruption. Moreover, when multiple coding agents collaborate on a shared repository, concurrent in-place edits overwrite one another's changes, while inline artifact passing bloats LLM context windows.
+
+2. Summary of Technical Contributions and Empirical Evaluation
+We design, implement, and evaluate Aegis OS (aegis-os), an open-source, 9-crate transactional multi-tenant Agent Operating System Runtime written in Rust and exposed via the Model Context Protocol (MCP, 35 tools and 7 dynamic URI resources) and the Google Agent2Agent (A2A) protocol. Aegis OS shifts the authorization boundary from individual speculative tool calls to transactional workspace boundaries:
+  (i) Transactional Copy-on-Write VFS & Pre-Commit Semantic Verification (aos-vfs): Uses macOS APFS libc::clonefile (0.71-6.28 ms for 100-1,000 files; 16x faster than cp -cR and 20x faster than git worktree add) and a 7-syscall single-open Linux ioctl(FICLONE) reflink traversal (15.6 ms on btrfs, plus optional BTRFS_IOC_SNAP_CREATE_V2 subvolume snapshots), paired with a two-phase Longest Common Subsequence (LCS) Diff3 3-Way Merge Engine and an optional sandboxed pre-commit semantic verification gate (verify_cmd) that intercepts both overlapping syntactic line conflicts and disjoint-line semantic regressions before any host file is touched.
+  (ii) Dual-Tier Kernel Sandbox & L7 Capability-Scoped Egress Proxy with Outbound DLP (aos-sandbox, aos-egress): Enforces mandatory access control via macOS Seatbelt (/usr/bin/sandbox-exec) and Linux Bubblewrap (bwrap --unshare-all with a default-deny --tmpfs $HOME mount architecture and a token-authenticated Unix-socket egress bridge), paired with an identity-pinned HTTP proxy that enforces RFC 3986 path canonicalization, per-secret L7 HTTP method and URL path-prefix capability rules (SecretScopeRule), and outbound Data Loss Prevention (inspect_payload_dlp) scanning URL query strings and HTTP bodies for leaked secret placeholders, vault tokens, and PEM/AWS/GitHub keys.
+  (iii) Cedar-Inspired Policy Engine with Commit-Time Poisoning Guards (aos-policy): Implements a five-stage policy hierarchy with TTL/one-shot session leases and Rule R0b commit-time guards blocking silent lease commits to VCS/shell hooks (.git/hooks/*, .envrc), CI workflows (.github/workflows/*), and build-system entrypoints (build.rs, Makefile, package.json, .cargo/config.toml).
+  (iv) A2A-Compliant Inter-Agent IPC Bus & Reference-Based CAS (aos-ipc): Unifies MCP vertical tool mediation with horizontal Google A2A capability discovery (/.well-known/agent-card.json), stateful A2A Task lifecycles, zombie PID pruning, cooperative file claims (coord_claim), and Content-Addressable Storage (artifact://<org>/sha256:<hash>), reducing in-transit IPC token overhead by 99.85%.
+
+We evaluate Aegis OS across six Research Questions (RQ1-RQ6) on both macOS (Apple Silicon, APFS, Seatbelt) and Linux (Ubuntu 24.04, btrfs, XFS, ext4, Bubblewrap):
+  * Real-World & Controlled Authorization Friction (RQ1): Across 1,500 controlled tool calls (50 trajectories) and 28,087 real tool calls from 52 production coding-agent session transcripts, we uncover a key structural property of real coding agents—39.0% of shell calls use compound pipelines (&&, |) or inline interpreter scripts (python3 -c) that defeat static prefix allowlists (28.54% prompt rate)—and show that Aegis OS reduces confirmation prompts by 94.19%-99.88% (controlled) and 90.7%-97.9% (real sessions, lowering aggregate IPR to 1.12%).
+  * End-to-End Red-Team Security & CLI Sandbox Comparison (RQ2): Across 80 live attacks in eight categories, Aegis OS lowers the Attack Success Rate (ASR) from 100.0% (Host-YOLO) and 85.0% / 60.0% (stateless native CLI sandboxes) to 0.0% on both macOS and Linux.
+  * Component Necessity Ablation (RQ6): A complete 9-row single-component ablation matrix across all 80 attacks demonstrates that switching off any safety component re-opens the exact attack category it guards.
+
+3. Open-Source Replication Package and Originality Declaration
+The complete Rust source code (9 crates), 46 automated unit/integration tests, anonymized real-trace corpus (28,087 tool calls), and reproducible evaluation scripts are publicly available at https://github.com/heurion-org/aegis-os. This manuscript is original, has not been published previously, and is not under consideration for publication elsewhere (a preprint is archived on arXiv).
+
+Thank you very much for your time and consideration.
+
+Sincerely,
+
+Hui Zhao
+Heurion Research
+Email: huizhao@heurion.org
+GitHub / Replication Package: https://github.com/heurion-org/aegis-os
