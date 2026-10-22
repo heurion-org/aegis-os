@@ -25,6 +25,6 @@ Thank you very much for your time and consideration.
 Sincerely,
 
 Hui Zhao
-Heurion Research
+Heurion Research, Rotterdam, Netherlands
 Email: huizhao@heurion.org
 GitHub / Replication Package: https://github.com/heurion-org/aegis-os

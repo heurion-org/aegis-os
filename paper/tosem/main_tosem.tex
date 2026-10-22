@@ -43,10 +43,11 @@
 \email{huizhao@heurion.org}
 \affiliation{%
   \institution{Heurion Research}
+  \city{Rotterdam}
   \country{Netherlands}
 }
 
-\authorsaddresses{Author's address: Hui Zhao, Heurion Research, Netherlands; email: \texttt{huizhao@heurion.org}.}
+\authorsaddresses{Author's address: Hui Zhao, Heurion Research, Rotterdam, Netherlands; email: \texttt{huizhao@heurion.org}.}
 
 \begin{abstract}
 Autonomous coding agents such as Google Antigravity (\texttt{agy}), Anthropic Claude Code (\texttt{claude}), and OpenAI Codex CLI (\texttt{codex}) execute multi-step software engineering workflows on developer workstations and cloud hosts. Existing agent execution environments face a \emph{Security--Autonomy Dilemma}: operators must choose between per-action confirmation prompts, which interrupt workflows on 45\%--57\% of tool calls in our benchmark trajectories and induce severe authorization fatigue, or unconfined execution (\texttt{--yolo} / \texttt{--dangerously-skip-permissions}), which exposes host files, SSH/cloud credentials, and API tokens to prompt injection and hallucination risks. Furthermore, concurrent agents editing a shared working tree clobber one another's changes, while passing large artifacts inline through LLM context windows incurs high token overhead.
