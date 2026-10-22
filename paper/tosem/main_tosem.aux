@@ -1,0 +1,194 @@
+\relax 
+\providecommand\hyper@newdestlabel[2]{}
+\providecommand\HyperFirstAtBeginDocument{\AtBeginDocument}
+\HyperFirstAtBeginDocument{\ifx\hyper@anchor\@undefined
+\global\let\oldcontentsline\contentsline
+\gdef\contentsline#1#2#3#4{\oldcontentsline{#1}{#2}{#3}}
+\global\let\oldnewlabel\newlabel
+\gdef\newlabel#1#2{\newlabelxx{#1}#2}
+\gdef\newlabelxx#1#2#3#4#5#6{\oldnewlabel{#1}{{#2}{#3}}}
+\AtEndDocument{\ifx\hyper@anchor\@undefined
+\let\contentsline\oldcontentsline
+\let\newlabel\oldnewlabel
+\fi}
+\fi}
+\global\let\hyper@last\relax 
+\gdef\HyperFirstAtBeginDocument#1{#1}
+\providecommand*\HyPL@Entry[1]{}
+\HyPL@Entry{0<</S/D>>}
+\@writefile{toc}{\contentsline {section}{Abstract}{1}{section*.1}\protected@file@percent }
+\citation{yang2024sweagent}
+\citation{wang2025openhands}
+\citation{jimenez2024swebench,anthropic2024mcp}
+\citation{felt2012android,akhawe2013alice}
+\citation{greshake2023not,debenedetti2024agentdojo,zhan2024injecagent}
+\citation{wu2023autogen,hong2024metagpt}
+\citation{jimenez2024swebench,wang2025openhands}
+\citation{mei2024aios}
+\citation{porter2009txos,nightingale2005speculator}
+\citation{kim2013mbox,wright2004unionfs}
+\@writefile{toc}{\contentsline {section}{\numberline {1}Introduction}{2}{section.1}\protected@file@percent }
+\@writefile{toc}{\contentsline {subsection}{\numberline {1.1}The Security--Autonomy Dilemma}{2}{subsection.1.1}\protected@file@percent }
+\citation{khanna2007formal}
+\@writefile{lot}{\contentsline {table}{\numberline {1}{\ignorespaces \textbf  {Comparison of Agent Execution Substrates} across isolation mechanisms, authorization friction, workspace storage, and multi-agent coordination primitives.\relax }}{3}{table.caption.2}\protected@file@percent }
+\providecommand*\caption@xref[2]{\@setref\relax\@undefined{#1}}
+\newlabel{tab:substrates}{{1}{3}{\textbf {Comparison of Agent Execution Substrates} across isolation mechanisms, authorization friction, workspace storage, and multi-agent coordination primitives.\relax }{table.caption.2}{}}
+\@writefile{toc}{\contentsline {subsection}{\numberline {1.2}Key Insight: Transaction-Boundary Security}{3}{subsection.1.2}\protected@file@percent }
+\@writefile{toc}{\contentsline {subsection}{\numberline {1.3}Contributions}{3}{subsection.1.3}\protected@file@percent }
+\citation{google2025a2a}
+\citation{cutler2024cedar}
+\@writefile{lof}{\contentsline {figure}{\numberline {1}{\ignorespaces Architecture of the Aegis OS Runtime (\texttt  {aegis-os}). Coding agents connect via MCP (\texttt  {stdio} or HTTP daemon) as distinct principals within a tenant organization. The policy engine auto-allows in-sandbox CoW mutations, confined process executions, and intra-organization IPC/CAS operations with zero prompts, while guarding host commits and network egress.\relax }}{4}{figure.caption.3}\protected@file@percent }
+\newlabel{fig:arch}{{1}{4}{Architecture of the Aegis OS Runtime (\texttt {aegis-os}). Coding agents connect via MCP (\texttt {stdio} or HTTP daemon) as distinct principals within a tenant organization. The policy engine auto-allows in-sandbox CoW mutations, confined process executions, and intra-organization IPC/CAS operations with zero prompts, while guarding host commits and network egress.\relax }{figure.caption.3}{}}
+\@writefile{toc}{\contentsline {section}{\numberline {2}Threat Model and Evaluation Metrics}{4}{section.2}\protected@file@percent }
+\newlabel{sec:threat}{{2}{4}{Threat Model and Evaluation Metrics}{section.2}{}}
+\@writefile{toc}{\contentsline {subsection}{\numberline {2.1}System and Adversary Model}{4}{subsection.2.1}\protected@file@percent }
+\@writefile{toc}{\contentsline {paragraph}{Trusted Computing Base and Enforcement Assumption.}{4}{section*.4}\protected@file@percent }
+\citation{greshake2023not,debenedetti2024agentdojo}
+\@writefile{toc}{\contentsline {paragraph}{Adversarial Threat Vectors (T1--T5).}{5}{section*.5}\protected@file@percent }
+\@writefile{toc}{\contentsline {paragraph}{Non-Adversarial Concurrency and Reliability Hazards (H1--H2).}{5}{section*.6}\protected@file@percent }
+\@writefile{toc}{\contentsline {subsection}{\numberline {2.2}Evaluation Metrics}{5}{subsection.2.2}\protected@file@percent }
+\@writefile{toc}{\contentsline {section}{\numberline {3}Aegis OS Runtime Architecture}{5}{section.3}\protected@file@percent }
+\newlabel{sec:arch}{{3}{5}{Aegis OS Runtime Architecture}{section.3}{}}
+\citation{rodeh2013btrfs}
+\@writefile{lot}{\contentsline {table}{\numberline {2}{\ignorespaces \textbf  {Aegis OS MCP Tool, Dynamic URI Resource, and Google A2A Interface} (35 MCP Tools and 7 Dynamic URI Resources implemented in \texttt  {aos-mcp-gateway}).\relax }}{6}{table.caption.7}\protected@file@percent }
+\newlabel{tab:syscalls}{{2}{6}{\textbf {Aegis OS MCP Tool, Dynamic URI Resource, and Google A2A Interface} (35 MCP Tools and 7 Dynamic URI Resources implemented in \texttt {aos-mcp-gateway}).\relax }{table.caption.7}{}}
+\@writefile{toc}{\contentsline {subsection}{\numberline {3.1}Transactional CoW Virtual Filesystem and Two-Phase LCS Diff3 Merge (\texttt  {aos-vfs})}{6}{subsection.3.1}\protected@file@percent }
+\newlabel{sec:vfs}{{3.1}{6}{Transactional CoW Virtual Filesystem and Two-Phase LCS Diff3 Merge (\texttt {aos-vfs})}{subsection.3.1}{}}
+\@writefile{toc}{\contentsline {paragraph}{APFS \texttt  {clonefile} Shadow Provisioning.}{6}{section*.8}\protected@file@percent }
+\@writefile{toc}{\contentsline {paragraph}{Linux Provisioning, Single-Open Syscall Reduction, and Btrfs Subvolume Snapshots.}{6}{section*.9}\protected@file@percent }
+\citation{khanna2007formal}
+\@writefile{toc}{\contentsline {paragraph}{Metadata Fingerprints.}{7}{section*.10}\protected@file@percent }
+\@writefile{toc}{\contentsline {paragraph}{Time-Travel Snapshots, Rollback, and Build-Cache Preservation.}{7}{section*.11}\protected@file@percent }
+\@writefile{toc}{\contentsline {paragraph}{Two-Phase LCS Diff3 3-Way Merge Engine.}{7}{section*.12}\protected@file@percent }
+\@writefile{toc}{\contentsline {subsection}{\numberline {3.2}Dual-Tier OS Sandbox and Zero-Trust Egress Proxy (\texttt  {aos-sandbox}, \texttt  {aos-egress})}{8}{subsection.3.2}\protected@file@percent }
+\newlabel{sec:sandbox}{{3.2}{8}{Dual-Tier OS Sandbox and Zero-Trust Egress Proxy (\texttt {aos-sandbox}, \texttt {aos-egress})}{subsection.3.2}{}}
+\citation{agache2020firecracker}
+\citation{anthropic2024mcp}
+\citation{google2025a2a}
+\@writefile{toc}{\contentsline {paragraph}{Identity-Pinned Egress Proxy with L7 Capability-Scoped Secret Injection and Outbound DLP.}{9}{section*.13}\protected@file@percent }
+\@writefile{toc}{\contentsline {subsection}{\numberline {3.3}A2A-Compliant Inter-Agent IPC Bus, Global Peer Discovery, and Reference-Based CAS (\texttt  {aos-ipc})}{9}{subsection.3.3}\protected@file@percent }
+\newlabel{sec:ipc}{{3.3}{9}{A2A-Compliant Inter-Agent IPC Bus, Global Peer Discovery, and Reference-Based CAS (\texttt {aos-ipc})}{subsection.3.3}{}}
+\citation{cutler2024cedar}
+\@writefile{toc}{\contentsline {subsection}{\numberline {3.4}Cedar-Inspired Policy Engine and Runtime Design Invariants (\texttt  {aos-policy})}{10}{subsection.3.4}\protected@file@percent }
+\newlabel{sec:policy}{{3.4}{10}{Cedar-Inspired Policy Engine and Runtime Design Invariants (\texttt {aos-policy})}{subsection.3.4}{}}
+\@writefile{toc}{\contentsline {section}{\numberline {4}Multi-Client Integration and Enforcement}{11}{section.4}\protected@file@percent }
+\newlabel{sec:integration}{{4}{11}{Multi-Client Integration and Enforcement}{section.4}{}}
+\@writefile{lot}{\contentsline {table}{\numberline {3}{\ignorespaces \textbf  {Experiment 1 (RQ1): Authorization Friction, Interruption Prompt Rate (IPR), and Modeled Human Wait Time} across 50 deterministic multi-step trajectories spanning 5 SWE task templates (1,500 tool calls executed on \texttt  {AegisRuntimeKernel}, including 50 real \texttt  {workspace\_commit} operations in every mode; human verification modeled at 5.0 s/prompt).\relax }}{12}{table.caption.14}\protected@file@percent }
+\newlabel{tab:exp1}{{3}{12}{\textbf {Experiment 1 (RQ1): Authorization Friction, Interruption Prompt Rate (IPR), and Modeled Human Wait Time} across 50 deterministic multi-step trajectories spanning 5 SWE task templates (1,500 tool calls executed on \texttt {AegisRuntimeKernel}, including 50 real \texttt {workspace\_commit} operations in every mode; human verification modeled at 5.0 s/prompt).\relax }{table.caption.14}{}}
+\@writefile{toc}{\contentsline {section}{\numberline {5}Empirical Evaluation}{12}{section.5}\protected@file@percent }
+\newlabel{sec:eval}{{5}{12}{Empirical Evaluation}{section.5}{}}
+\@writefile{toc}{\contentsline {subsection}{\numberline {5.1}Experiment 1 (RQ1): Authorization Friction and Autonomous Continuity}{12}{subsection.5.1}\protected@file@percent }
+\@writefile{lof}{\contentsline {figure}{\numberline {2}{\ignorespaces Interruption Prompt Rate (IPR) across both 50 controlled trajectories (1,500 calls, Experiment 1) and 52 real coding-agent session logs (28,087 calls, Experiment 1B). Aegis OS reduces confirmation prompts by 94.2\%--99.9\% on controlled trajectories and by 90.7\%--97.9\% on real session traces.\relax }}{13}{figure.caption.15}\protected@file@percent }
+\newlabel{fig:exp1}{{2}{13}{Interruption Prompt Rate (IPR) across both 50 controlled trajectories (1,500 calls, Experiment 1) and 52 real coding-agent session logs (28,087 calls, Experiment 1B). Aegis OS reduces confirmation prompts by 94.2\%--99.9\% on controlled trajectories and by 90.7\%--97.9\% on real session traces.\relax }{figure.caption.15}{}}
+\@writefile{lot}{\contentsline {table}{\numberline {4}{\ignorespaces \textbf  {Experiment 1B (RQ1): Real-World Coding-Agent Session Trace Evaluation} across \textbf  {Corpus A} (52 real production coding-agent session transcripts totaling 57,923 conversation steps and 28,087 tool calls: 13,098 read/coord, 11,070 shell commands of which 4,318 [39.0\%] are compound pipelines \texttt  {\&\&}/\texttt  {|} or inline scripts \texttt  {python3 -c}, and 3,836 file edits/writes) and \textbf  {Corpus B} (5 live Aegis OS dogfooding sessions totaling 3,962 steps and 2,040 tool calls, including 68 \texttt  {workspace\_commit} and 15 ground-truth \texttt  {policy\_approve\_escalation} events), evaluated via \texttt  {scripts/e6\_real\_traces.py}.\relax }}{13}{table.caption.16}\protected@file@percent }
+\newlabel{tab:exp1b}{{4}{13}{\textbf {Experiment 1B (RQ1): Real-World Coding-Agent Session Trace Evaluation} across \textbf {Corpus A} (52 real production coding-agent session transcripts totaling 57,923 conversation steps and 28,087 tool calls: 13,098 read/coord, 11,070 shell commands of which 4,318 [39.0\%] are compound pipelines \texttt {\&\&}/\texttt {|} or inline scripts \texttt {python3 -c}, and 3,836 file edits/writes) and \textbf {Corpus B} (5 live Aegis OS dogfooding sessions totaling 3,962 steps and 2,040 tool calls, including 68 \texttt {workspace\_commit} and 15 ground-truth \texttt {policy\_approve\_escalation} events), evaluated via \texttt {scripts/e6\_real\_traces.py}.\relax }{table.caption.16}{}}
+\@writefile{lot}{\contentsline {table}{\numberline {5}{\ignorespaces \textbf  {Experiment 2 (RQ2): End-to-End Red-Team Adversarial Attack Evaluation} across 80 live process, socket, proxy, gateway, policy, and commit attacks in eight categories, executed against an unconfined \texttt  {Host-YOLO} target environment versus \texttt  {Aegis-OS} (identical counts on macOS and Linux). The \texttt  {Host-YOLO} column is 100\% by construction, since every attack is designed to succeed against an unconfined process; the informative column is \texttt  {Aegis-OS}.\relax }}{14}{table.caption.18}\protected@file@percent }
+\newlabel{tab:exp2}{{5}{14}{\textbf {Experiment 2 (RQ2): End-to-End Red-Team Adversarial Attack Evaluation} across 80 live process, socket, proxy, gateway, policy, and commit attacks in eight categories, executed against an unconfined \texttt {Host-YOLO} target environment versus \texttt {Aegis-OS} (identical counts on macOS and Linux). The \texttt {Host-YOLO} column is 100\% by construction, since every attack is designed to succeed against an unconfined process; the informative column is \texttt {Aegis-OS}.\relax }{table.caption.18}{}}
+\@writefile{toc}{\contentsline {paragraph}{Real-World Coding-Agent Session Trace Evaluation (Experiment 1B).}{14}{section*.17}\protected@file@percent }
+\@writefile{toc}{\contentsline {subsection}{\numberline {5.2}Experiment 2 (RQ2): End-to-End Adversarial Security}{14}{subsection.5.2}\protected@file@percent }
+\@writefile{lot}{\contentsline {table}{\numberline {6}{\ignorespaces \textbf  {Experiment 2B (RQ2): Comparison with Stateless Native CLI Sandboxes} across all 80 attacks in Categories A--H, executed on both macOS (\texttt  {sandbox-exec}) and Linux (\texttt  {bwrap}) via \texttt  {scripts/e5\_cli\_sandboxes.py} (identical counts on both OSes). \texttt  {CLI-Sandbox (WS-Write)} mounts the live host repository read-write, carves out \texttt  {.git} as read-only, and blocks \texttt  {\textasciitilde /.ssh}, \texttt  {\textasciitilde /.aws}, and \texttt  {\textasciitilde /.gnupg}.\relax }}{16}{table.caption.19}\protected@file@percent }
+\newlabel{tab:clisandboxes}{{6}{16}{\textbf {Experiment 2B (RQ2): Comparison with Stateless Native CLI Sandboxes} across all 80 attacks in Categories A--H, executed on both macOS (\texttt {sandbox-exec}) and Linux (\texttt {bwrap}) via \texttt {scripts/e5\_cli\_sandboxes.py} (identical counts on both OSes). \texttt {CLI-Sandbox (WS-Write)} mounts the live host repository read-write, carves out \texttt {.git} as read-only, and blocks \texttt {\textasciitilde /.ssh}, \texttt {\textasciitilde /.aws}, and \texttt {\textasciitilde /.gnupg}.\relax }{table.caption.19}{}}
+\@writefile{lot}{\contentsline {table}{\numberline {7}{\ignorespaces \textbf  {Experiment 3A (RQ3): Multi-Trial APFS Copy-on-Write Workspace Provisioning Latency and Storage Efficiency} across 10 concurrent agents modifying realistic per-task working sets (6, 12, and 25 files per agent; 5 trials per scale, Mean $\pm $ StdDev). The baseline is a user-space read/write loop, not a system copy tool; Table\nonbreakingspace \ref  {tab:baselines} compares against real tools.\relax }}{16}{table.caption.21}\protected@file@percent }
+\newlabel{tab:exp3a}{{7}{16}{\textbf {Experiment 3A (RQ3): Multi-Trial APFS Copy-on-Write Workspace Provisioning Latency and Storage Efficiency} across 10 concurrent agents modifying realistic per-task working sets (6, 12, and 25 files per agent; 5 trials per scale, Mean $\pm $ StdDev). The baseline is a user-space read/write loop, not a system copy tool; Table~\ref {tab:baselines} compares against real tools.\relax }{table.caption.21}{}}
+\@writefile{toc}{\contentsline {paragraph}{Comparison with Stateless Native CLI Sandboxes (Experiment 2B).}{16}{section*.20}\protected@file@percent }
+\@writefile{lot}{\contentsline {table}{\numberline {8}{\ignorespaces \textbf  {Experiment 3B (RQ3): Kernel, Daemon, Merge Commit, and Sandbox Spawn Latency Distribution}. Ops/sec is computed as $N$ divided by total wall-clock time of the measurement loop (including harness overhead), so it is slightly lower than $1/\text  {Mean}$.\relax }}{17}{table.caption.22}\protected@file@percent }
+\newlabel{tab:exp3b}{{8}{17}{\textbf {Experiment 3B (RQ3): Kernel, Daemon, Merge Commit, and Sandbox Spawn Latency Distribution}. Ops/sec is computed as $N$ divided by total wall-clock time of the measurement loop (including harness overhead), so it is slightly lower than $1/\text {Mean}$.\relax }{table.caption.22}{}}
+\@writefile{lof}{\contentsline {figure}{\numberline {3}{\ignorespaces Workspace provisioning latency across repository scales (Experiment 3A). APFS \texttt  {clonefile} scales with file metadata count rather than total byte volume, achieving an 18.0$\times $ speedup over a user-space copy loop on the 1,000-file repository.\relax }}{17}{figure.caption.23}\protected@file@percent }
+\newlabel{fig:exp3}{{3}{17}{Workspace provisioning latency across repository scales (Experiment 3A). APFS \texttt {clonefile} scales with file metadata count rather than total byte volume, achieving an 18.0$\times $ speedup over a user-space copy loop on the 1,000-file repository.\relax }{figure.caption.23}{}}
+\@writefile{toc}{\contentsline {subsection}{\numberline {5.3}Experiment 3 (RQ3): CoW Provisioning, Storage Footprint, and Operation Latency}{17}{subsection.5.3}\protected@file@percent }
+\@writefile{toc}{\contentsline {paragraph}{Comparison with Real Tools and Cross-OS Remote Daemon Evaluation (Experiment 3C).}{17}{section*.25}\protected@file@percent }
+\@writefile{lot}{\contentsline {table}{\numberline {9}{\ignorespaces \textbf  {Experiment 3C (RQ3): Provisioning a 1,000-file, 78 MB Tree with Real Tools} (mean time in ms; 7 trials after a warm-up, methods interleaved; physical disk consumed in parentheses when above 1 MB). Plain copy tools receive the tree without \texttt  {.git}, which Aegis OS also skips; the git-based methods inherently need the repository. External commands include 0.3--2.6 ms of process start-up; the Aegis figure is an in-process call (macOS: Table\nonbreakingspace \ref  {tab:exp3a}; Linux: range over three runs of \texttt  {aegis-os bench}). $^\dagger $XFS is a loop-backed image on btrfs and its Aegis timings are very noisy. ext4 has no reflink.\relax }}{18}{table.caption.24}\protected@file@percent }
+\newlabel{tab:baselines}{{9}{18}{\textbf {Experiment 3C (RQ3): Provisioning a 1,000-file, 78 MB Tree with Real Tools} (mean time in ms; 7 trials after a warm-up, methods interleaved; physical disk consumed in parentheses when above 1 MB). Plain copy tools receive the tree without \texttt {.git}, which Aegis OS also skips; the git-based methods inherently need the repository. External commands include 0.3--2.6 ms of process start-up; the Aegis figure is an in-process call (macOS: Table~\ref {tab:exp3a}; Linux: range over three runs of \texttt {aegis-os bench}). $^\dagger $XFS is a loop-backed image on btrfs and its Aegis timings are very noisy. ext4 has no reflink.\relax }{table.caption.24}{}}
+\@writefile{lot}{\contentsline {table}{\numberline {10}{\ignorespaces \textbf  {Experiment 4 (RQ4): 3-Agent (\texttt  {agy} + \texttt  {claude} + \texttt  {codex}) Concurrent Rust Modification, Syntactic \& Semantic Conflict Detection, and \texttt  {cargo test} Verification}.\relax }}{18}{table.caption.26}\protected@file@percent }
+\newlabel{tab:exp4}{{10}{18}{\textbf {Experiment 4 (RQ4): 3-Agent (\texttt {agy} + \texttt {claude} + \texttt {codex}) Concurrent Rust Modification, Syntactic \& Semantic Conflict Detection, and \texttt {cargo test} Verification}.\relax }{table.caption.26}{}}
+\@writefile{lot}{\contentsline {table}{\numberline {11}{\ignorespaces \textbf  {Experiment 5 (RQ5): Multi-File Corruption Recovery and \texttt  {cargo check} Verification} (5 trials/scale, Mean $\pm $ SD).\relax }}{18}{table.caption.27}\protected@file@percent }
+\newlabel{tab:exp5}{{11}{18}{\textbf {Experiment 5 (RQ5): Multi-File Corruption Recovery and \texttt {cargo check} Verification} (5 trials/scale, Mean $\pm $ SD).\relax }{table.caption.27}{}}
+\@writefile{toc}{\contentsline {subsection}{\numberline {5.4}Experiment 4 (RQ4): Multi-Agent Concurrent Rust Coding and Conflict Detection}{19}{subsection.5.4}\protected@file@percent }
+\@writefile{toc}{\contentsline {subsection}{\numberline {5.5}Experiment 5 (RQ5): Time-Travel Rollback and \texttt  {cargo check} Verification}{19}{subsection.5.5}\protected@file@percent }
+\@writefile{toc}{\contentsline {subsection}{\numberline {5.6}Experiment 6 (RQ6): Component Ablation}{19}{subsection.5.6}\protected@file@percent }
+\@writefile{lot}{\contentsline {table}{\numberline {12}{\ignorespaces \textbf  {Experiment 6 (RQ6): Component Ablation.} Attacks (out of 10 per category) that compromise Aegis OS when a single component is switched off in a test-only build (\texttt  {scripts/e5\_ablation.py}); identical on macOS and Linux. The first row is the full system.\relax }}{20}{table.caption.28}\protected@file@percent }
+\newlabel{tab:ablation}{{12}{20}{\textbf {Experiment 6 (RQ6): Component Ablation.} Attacks (out of 10 per category) that compromise Aegis OS when a single component is switched off in a test-only build (\texttt {scripts/e5\_ablation.py}); identical on macOS and Linux. The first row is the full system.\relax }{table.caption.28}{}}
+\@writefile{lot}{\contentsline {table}{\numberline {13}{\ignorespaces \textbf  {Cross-Platform Operating System Primitive Mapping and Implementation Status} in Aegis OS.\relax }}{20}{table.caption.29}\protected@file@percent }
+\newlabel{tab:crossplatform}{{13}{20}{\textbf {Cross-Platform Operating System Primitive Mapping and Implementation Status} in Aegis OS.\relax }{table.caption.29}{}}
+\@writefile{toc}{\contentsline {section}{\numberline {6}Discussion and Limitations}{20}{section.6}\protected@file@percent }
+\newlabel{sec:discussion}{{6}{20}{Discussion and Limitations}{section.6}{}}
+\@writefile{toc}{\contentsline {paragraph}{Cross-Platform Implementation Scope (macOS vs.\ Linux).}{20}{section*.30}\protected@file@percent }
+\@writefile{toc}{\contentsline {paragraph}{Scope and Validity of the Evaluation.}{21}{section*.31}\protected@file@percent }
+\@writefile{toc}{\contentsline {paragraph}{macOS Seatbelt Architecture and Escape Surface.}{21}{section*.32}\protected@file@percent }
+\@writefile{toc}{\contentsline {paragraph}{Session Leases and Commit-Time Poisoning.}{21}{section*.33}\protected@file@percent }
+\citation{apel2011semistructured}
+\citation{porter2009txos}
+\citation{nightingale2005speculator}
+\citation{kim2013mbox}
+\citation{wright2004unionfs}
+\citation{khanna2007formal,apel2011semistructured}
+\citation{cutler2024cedar}
+\@writefile{toc}{\contentsline {paragraph}{Confused Deputy on Allowlisted Egress Domains and HTTPS TLS Termination.}{22}{section*.34}\protected@file@percent }
+\@writefile{toc}{\contentsline {paragraph}{Syntactic 3-Way Merging vs.\ Pre-Commit Semantic Verification.}{22}{section*.35}\protected@file@percent }
+\@writefile{toc}{\contentsline {paragraph}{Local Workstation Enforcement vs.\ Cloud PaaS Sandbox Offloading.}{22}{section*.36}\protected@file@percent }
+\@writefile{toc}{\contentsline {section}{\numberline {7}Related Work}{22}{section.7}\protected@file@percent }
+\newlabel{sec:related}{{7}{22}{Related Work}{section.7}{}}
+\@writefile{toc}{\contentsline {paragraph}{Operating System Transactions and Speculative Execution.}{22}{section*.37}\protected@file@percent }
+\citation{felt2012android}
+\citation{akhawe2013alice}
+\citation{jimenez2024swebench}
+\citation{yang2024sweagent}
+\citation{wang2025openhands}
+\citation{ruan2024toolemu}
+\citation{debenedetti2024agentdojo}
+\citation{zhan2024injecagent}
+\citation{greshake2023not}
+\citation{wu2024secgpt}
+\citation{debenedetti2025camel}
+\citation{costa2025fides}
+\citation{mei2024aios}
+\citation{wu2023autogen}
+\citation{hong2024metagpt}
+\citation{anthropic2024mcp}
+\citation{google2025a2a}
+\citation{watson2010capsicum}
+\citation{agache2020firecracker}
+\bibstyle{ACM-Reference-Format}
+\bibdata{references}
+\bibcite{agache2020firecracker}{{1}{2020}{{Agache et~al\mbox  {.}}}{{}}}
+\@writefile{toc}{\contentsline {paragraph}{Authorization Fatigue in Usable Security.}{23}{section*.38}\protected@file@percent }
+\@writefile{toc}{\contentsline {paragraph}{LLM Agent Sandboxes and Prompt Injection Defenses.}{23}{section*.39}\protected@file@percent }
+\@writefile{toc}{\contentsline {paragraph}{Agent Operating Systems and Multi-Agent Frameworks.}{23}{section*.40}\protected@file@percent }
+\@writefile{toc}{\contentsline {section}{\numberline {8}Conclusion}{23}{section.8}\protected@file@percent }
+\newlabel{sec:conclusion}{{8}{23}{Conclusion}{section.8}{}}
+\@writefile{toc}{\contentsline {section}{References}{23}{section*.42}\protected@file@percent }
+\bibcite{akhawe2013alice}{{2}{2013}{{Akhawe and Felt}}{{}}}
+\bibcite{anthropic2024mcp}{{3}{2024}{{Anthropic}}{{}}}
+\bibcite{apel2011semistructured}{{4}{2011}{{Apel et~al\mbox  {.}}}{{}}}
+\bibcite{costa2025fides}{{5}{2025}{{Costa et~al\mbox  {.}}}{{}}}
+\bibcite{cutler2024cedar}{{6}{2024}{{Cutler et~al\mbox  {.}}}{{}}}
+\bibcite{debenedetti2025camel}{{7}{2025}{{Debenedetti et~al\mbox  {.}}}{{}}}
+\bibcite{debenedetti2024agentdojo}{{8}{2024}{{Debenedetti et~al\mbox  {.}}}{{}}}
+\bibcite{felt2012android}{{9}{2012}{{Felt et~al\mbox  {.}}}{{}}}
+\bibcite{google2025a2a}{{10}{2025}{{Google and the Linux Foundation A2A Project}}{{}}}
+\bibcite{greshake2023not}{{11}{2023}{{Greshake et~al\mbox  {.}}}{{}}}
+\bibcite{hong2024metagpt}{{12}{2024}{{Hong et~al\mbox  {.}}}{{}}}
+\bibcite{jimenez2024swebench}{{13}{2024}{{Jimenez et~al\mbox  {.}}}{{}}}
+\bibcite{khanna2007formal}{{14}{2007}{{Khanna et~al\mbox  {.}}}{{}}}
+\bibcite{kim2013mbox}{{15}{2013}{{Kim and Zeldovich}}{{}}}
+\bibcite{mei2024aios}{{16}{2025}{{Mei et~al\mbox  {.}}}{{}}}
+\bibcite{nightingale2005speculator}{{17}{2005}{{Nightingale et~al\mbox  {.}}}{{}}}
+\bibcite{porter2009txos}{{18}{2009}{{Porter et~al\mbox  {.}}}{{}}}
+\bibcite{rodeh2013btrfs}{{19}{2013}{{Rodeh et~al\mbox  {.}}}{{}}}
+\bibcite{ruan2024toolemu}{{20}{2024}{{Ruan et~al\mbox  {.}}}{{}}}
+\bibcite{wang2025openhands}{{21}{2025}{{Wang et~al\mbox  {.}}}{{}}}
+\bibcite{watson2010capsicum}{{22}{2010}{{Watson et~al\mbox  {.}}}{{}}}
+\bibcite{wright2004unionfs}{{23}{2006}{{Wright et~al\mbox  {.}}}{{}}}
+\bibcite{wu2023autogen}{{24}{2024}{{Wu et~al\mbox  {.}}}{{}}}
+\bibcite{wu2024secgpt}{{25}{2025}{{Wu et~al\mbox  {.}}}{{}}}
+\bibcite{yang2024sweagent}{{26}{2024}{{Yang et~al\mbox  {.}}}{{}}}
+\bibcite{zhan2024injecagent}{{27}{2024}{{Zhan et~al\mbox  {.}}}{{}}}
+\newlabel{tocindent-1}{0pt}
+\newlabel{tocindent0}{0pt}
+\newlabel{tocindent1}{6.95pt}
+\newlabel{tocindent2}{11.5pt}
+\newlabel{tocindent3}{0pt}
+\@writefile{toc}{\contentsline {section}{\numberline {A}Reproducibility and Artifact Guide}{25}{appendix.A}\protected@file@percent }
+\newlabel{sec:appendix}{{A}{25}{Reproducibility and Artifact Guide}{appendix.A}{}}
+\newlabel{TotPages}{{25}{25}{}{page.25}{}}
+\gdef \@abspage@last{25}

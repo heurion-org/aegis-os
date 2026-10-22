@@ -47,7 +47,8 @@
 \newblock \showarticletitle{{Firecracker}: Lightweight Virtualization for
   Serverless Applications}. In \bibinfo{booktitle}{\emph{17th USENIX Symposium
   on Networked Systems Design and Implementation (NSDI 20)}}.
-  \bibinfo{publisher}{USENIX Association}, \bibinfo{pages}{419--434}.
+  \bibinfo{publisher}{USENIX Association}, \bibinfo{address}{Santa Clara, CA,
+  USA}, \bibinfo{pages}{419--434}.
 \newblock
 
 
@@ -58,7 +59,8 @@
 \newblock \showarticletitle{Alice in {Warningland}: A Large-Scale Field Study
   of Browser Security Warning Effectiveness}. In \bibinfo{booktitle}{\emph{22nd
   USENIX Security Symposium (USENIX Security 13)}}. \bibinfo{publisher}{USENIX
-  Association}, \bibinfo{pages}{257--272}.
+  Association}, \bibinfo{address}{Washington, DC, USA},
+  \bibinfo{pages}{257--272}.
 \newblock
 
 
@@ -81,8 +83,8 @@
 \newblock \showarticletitle{Semistructured Merge: Rethinking Merge in Revision
   Control Systems}. In \bibinfo{booktitle}{\emph{Proceedings of the 19th ACM
   SIGSOFT Symposium and the 13th European Conference on Foundations of Software
-  Engineering (ESEC/FSE)}}. \bibinfo{publisher}{ACM},
-  \bibinfo{pages}{190--200}.
+  Engineering (ESEC/FSE)}}. \bibinfo{publisher}{ACM}, \bibinfo{address}{Szeged,
+  Hungary}, \bibinfo{pages}{190--200}.
 \newblock
 
 
@@ -96,9 +98,14 @@
   \bibinfo{year}{2025}\natexlab{}.
 \newblock \showarticletitle{Securing {AI} Agents with Information-Flow
   Control}.
-\newblock \bibinfo{journal}{\emph{arXiv preprint arXiv:2505.23643}}
-  (\bibinfo{year}{2025}).
+\newblock \bibinfo{journal}{\emph{arXiv preprint}}
+  \bibinfo{volume}{arXiv:2505.23643} (\bibinfo{year}{2025}),
+  \bibinfo{numpages}{29}~pages.
 \newblock
+\urldef\tempurl%
+\url{https://arxiv.org/abs/2505.23643}
+\showURL{%
+\tempurl}
 
 
 \bibitem[Cutler et~al\mbox{.}(2024)]%
@@ -116,27 +123,30 @@
 \newblock \bibinfo{journal}{\emph{Proceedings of the ACM on Programming
   Languages}} \bibinfo{volume}{8}, \bibinfo{number}{OOPSLA1}, Article
   \bibinfo{articleno}{118} (\bibinfo{year}{2024}),
-  \bibinfo{numpages}{118:1--118:28}~pages.
+  \bibinfo{numpages}{28}~pages.
 \newblock
 \urldef\tempurl%
 \url{https://doi.org/10.1145/3649835}
 \showDOI{\tempurl}
 
 
-\bibitem[Debenedetti et~al\mbox{.}(2026)]%
+\bibitem[Debenedetti et~al\mbox{.}(2025)]%
         {debenedetti2025camel}
 \bibfield{author}{\bibinfo{person}{Edoardo Debenedetti}, \bibinfo{person}{Ilia
   Shumailov}, \bibinfo{person}{Tianqi Fan}, \bibinfo{person}{Jamie Hayes},
   \bibinfo{person}{Nicholas Carlini}, \bibinfo{person}{Daniel Fabian},
   \bibinfo{person}{Christoph Kern}, \bibinfo{person}{Chongyang Shi},
   \bibinfo{person}{Andreas Terzis}, {and} \bibinfo{person}{Florian
-  Tram{\`e}r}.} \bibinfo{year}{2026}\natexlab{}.
-\newblock \showarticletitle{Defeating Prompt Injections by Design}. In
-  \bibinfo{booktitle}{\emph{IEEE Conference on Secure and Trustworthy Machine
-  Learning (SaTML)}}.
+  Tram{\`e}r}.} \bibinfo{year}{2025}\natexlab{}.
+\newblock \showarticletitle{Defeating Prompt Injections by Design}.
+\newblock \bibinfo{journal}{\emph{arXiv preprint}}
+  \bibinfo{volume}{arXiv:2503.18813} (\bibinfo{year}{2025}),
+  \bibinfo{numpages}{26}~pages.
 \newblock
-\newblock
-\shownote{arXiv:2503.18813}.
+\urldef\tempurl%
+\url{https://arxiv.org/abs/2503.18813}
+\showURL{%
+\tempurl}
 
 
 \bibitem[Debenedetti et~al\mbox{.}(2024)]%
@@ -149,6 +159,8 @@
   Prompt Injection Attacks and Defenses for {LLM} Agents}. In
   \bibinfo{booktitle}{\emph{Advances in Neural Information Processing Systems
   (NeurIPS) Datasets and Benchmarks Track}}, Vol.~\bibinfo{volume}{37}.
+  \bibinfo{publisher}{Curran Associates, Inc.}, \bibinfo{address}{Vancouver,
+  BC, Canada}, \bibinfo{pages}{92895--92935}.
 \newblock
 
 
@@ -161,8 +173,8 @@
 \newblock \showarticletitle{{Android} Permissions: User Attention,
   Comprehension, and Behavior}. In \bibinfo{booktitle}{\emph{Proceedings of the
   Eighth Symposium on Usable Privacy and Security (SOUPS)}}.
-  \bibinfo{publisher}{ACM}, Article \bibinfo{articleno}{3},
-  \bibinfo{numpages}{14}~pages.
+  \bibinfo{publisher}{ACM}, \bibinfo{address}{Washington, DC, USA}, Article
+  \bibinfo{articleno}{3}, \bibinfo{numpages}{14}~pages.
 \newblock
 
 
@@ -187,7 +199,8 @@
 \newblock \showarticletitle{Not What You've Signed Up For: Compromising
   Real-World {LLM}-Integrated Applications with Indirect Prompt Injection}. In
   \bibinfo{booktitle}{\emph{Proceedings of the 16th ACM Workshop on Artificial
-  Intelligence and Security (AISec)}}. \bibinfo{pages}{79--90}.
+  Intelligence and Security (AISec)}}. \bibinfo{publisher}{ACM},
+  \bibinfo{address}{Copenhagen, Denmark}, \bibinfo{pages}{79--90}.
 \newblock
 \urldef\tempurl%
 \url{https://doi.org/10.1145/3605764.3623985}
@@ -207,6 +220,8 @@
 \newblock \showarticletitle{{MetaGPT}: Meta Programming for A Multi-Agent
   Collaborative Framework}. In \bibinfo{booktitle}{\emph{Twelfth International
   Conference on Learning Representations (ICLR)}}.
+  \bibinfo{publisher}{OpenReview.net}, \bibinfo{address}{Vienna, Austria},
+  \bibinfo{numpages}{29}~pages.
 \newblock
 
 
@@ -219,6 +234,8 @@
 \newblock \showarticletitle{{SWE-bench}: Can Language Models Resolve Real-World
   {GitHub} Issues?}. In \bibinfo{booktitle}{\emph{Twelfth International
   Conference on Learning Representations (ICLR)}}.
+  \bibinfo{publisher}{OpenReview.net}, \bibinfo{address}{Vienna, Austria},
+  \bibinfo{numpages}{31}~pages.
 \newblock
 \urldef\tempurl%
 \url{https://openreview.net/forum?id=VTF8yNQM66}
@@ -234,7 +251,8 @@
 \newblock \showarticletitle{A Formal Investigation of {Diff3}}. In
   \bibinfo{booktitle}{\emph{27th International Conference on Foundations of
   Software Technology and Theoretical Computer Science (FSTTCS)}}.
-  \bibinfo{publisher}{Springer}, \bibinfo{pages}{485--496}.
+  \bibinfo{publisher}{Springer}, \bibinfo{address}{New Delhi, India},
+  \bibinfo{pages}{485--496}.
 \newblock
 
 
@@ -245,7 +263,7 @@
 \newblock \showarticletitle{Practical and Effective Sandboxing for Non-root
   Users}. In \bibinfo{booktitle}{\emph{2013 USENIX Annual Technical Conference
   (USENIX ATC 13)}}. \bibinfo{publisher}{USENIX Association},
-  \bibinfo{pages}{139--144}.
+  \bibinfo{address}{San Jose, CA, USA}, \bibinfo{pages}{139--144}.
 \newblock
 
 
@@ -258,7 +276,9 @@
   \bibinfo{person}{Yingqiang Ge}, {and} \bibinfo{person}{Yongfeng Zhang}.}
   \bibinfo{year}{2025}\natexlab{}.
 \newblock \showarticletitle{{AIOS}: {LLM} Agent Operating System}. In
-  \bibinfo{booktitle}{\emph{Conference on Language Modeling (COLM)}}.
+  \bibinfo{booktitle}{\emph{Second Conference on Language Modeling (COLM)}}.
+  \bibinfo{publisher}{OpenReview.net}, \bibinfo{address}{Montreal, QC, Canada},
+  \bibinfo{numpages}{24}~pages.
 \newblock
 \newblock
 \shownote{arXiv:2403.16971}.
@@ -272,7 +292,7 @@
 \newblock \showarticletitle{Speculative Execution in a Distributed File
   System}. In \bibinfo{booktitle}{\emph{Proceedings of the ACM SIGOPS 20th
   Symposium on Operating Systems Principles (SOSP)}}. \bibinfo{publisher}{ACM},
-  \bibinfo{pages}{191--205}.
+  \bibinfo{address}{Brighton, United Kingdom}, \bibinfo{pages}{191--205}.
 \newblock
 
 
@@ -285,7 +305,7 @@
 \newblock \showarticletitle{Operating System Transactions}. In
   \bibinfo{booktitle}{\emph{Proceedings of the ACM SIGOPS 22nd Symposium on
   Operating Systems Principles (SOSP)}}. \bibinfo{publisher}{ACM},
-  \bibinfo{pages}{161--176}.
+  \bibinfo{address}{Big Sky, MT, USA}, \bibinfo{pages}{161--176}.
 \newblock
 
 
@@ -296,7 +316,7 @@
 \newblock \showarticletitle{{BTRFS}: The {Linux} {B}-Tree Filesystem}.
 \newblock \bibinfo{journal}{\emph{ACM Transactions on Storage (TOS)}}
   \bibinfo{volume}{9}, \bibinfo{number}{3}, Article \bibinfo{articleno}{9}
-  (\bibinfo{year}{2013}), \bibinfo{numpages}{9:1--9:32}~pages.
+  (\bibinfo{year}{2013}), \bibinfo{numpages}{32}~pages.
 \newblock
 \urldef\tempurl%
 \url{https://doi.org/10.1145/2501620.2501623}
@@ -313,6 +333,8 @@
 \newblock \showarticletitle{Identifying the Risks of {LM} Agents with an
   {LM}-Emulated Sandbox}. In \bibinfo{booktitle}{\emph{Twelfth International
   Conference on Learning Representations (ICLR)}}.
+  \bibinfo{publisher}{OpenReview.net}, \bibinfo{address}{Vienna, Austria},
+  \bibinfo{numpages}{32}~pages.
 \newblock
 \urldef\tempurl%
 \url{https://openreview.net/forum?id=GEcwtMk1uA}
@@ -338,6 +360,8 @@
 \newblock \showarticletitle{{OpenHands}: An Open Platform for {AI} Software
   Developers as Generalist Agents}. In \bibinfo{booktitle}{\emph{Thirteenth
   International Conference on Learning Representations (ICLR)}}.
+  \bibinfo{publisher}{OpenReview.net}, \bibinfo{address}{Singapore},
+  \bibinfo{numpages}{34}~pages.
 \newblock
 \urldef\tempurl%
 \url{https://openreview.net/forum?id=OJd3ayDDoF}
@@ -352,7 +376,8 @@
   \bibinfo{person}{Kris Kennaway}.} \bibinfo{year}{2010}\natexlab{}.
 \newblock \showarticletitle{{Capsicum}: Practical Capabilities for {UNIX}}. In
   \bibinfo{booktitle}{\emph{19th USENIX Security Symposium (USENIX Security
-  10)}}. \bibinfo{publisher}{USENIX Association}, \bibinfo{pages}{29--46}.
+  10)}}. \bibinfo{publisher}{USENIX Association}, \bibinfo{address}{Washington,
+  DC, USA}, \bibinfo{pages}{29--46}.
 \newblock
 
 
@@ -385,7 +410,8 @@
   \bibinfo{year}{2024}\natexlab{}.
 \newblock \showarticletitle{{AutoGen}: Enabling Next-Gen {LLM} Applications via
   Multi-Agent Conversation}. In \bibinfo{booktitle}{\emph{First Conference on
-  Language Modeling (COLM)}}.
+  Language Modeling (COLM)}}. \bibinfo{publisher}{OpenReview.net},
+  \bibinfo{address}{Philadelphia, PA, USA}, \bibinfo{numpages}{43}~pages.
 \newblock
 
 
@@ -396,8 +422,14 @@
   {and} \bibinfo{person}{Umar Iqbal}.} \bibinfo{year}{2025}\natexlab{}.
 \newblock \showarticletitle{{IsolateGPT}: An Execution Isolation Architecture
   for {LLM}-Based Agentic Systems}. In \bibinfo{booktitle}{\emph{Network and
-  Distributed System Security Symposium (NDSS)}}.
+  Distributed System Security Symposium (NDSS)}}. \bibinfo{publisher}{Internet
+  Society}, \bibinfo{address}{San Diego, CA, USA},
+  \bibinfo{numpages}{18}~pages.
 \newblock
+\urldef\tempurl%
+\url{https://arxiv.org/abs/2403.04960}
+\showURL{%
+\tempurl}
 
 
 \bibitem[Yang et~al\mbox{.}(2024)]%
@@ -409,6 +441,8 @@
 \newblock \showarticletitle{{SWE-agent}: Agent-Computer Interfaces Enable
   Automated Software Engineering}. In \bibinfo{booktitle}{\emph{Advances in
   Neural Information Processing Systems (NeurIPS)}}, Vol.~\bibinfo{volume}{37}.
+  \bibinfo{publisher}{Curran Associates, Inc.}, \bibinfo{address}{Vancouver,
+  BC, Canada}, \bibinfo{pages}{50528--50652}.
 \newblock
 
 
@@ -421,7 +455,8 @@
   Injections in Tool-Integrated Large Language Model Agents}. In
   \bibinfo{booktitle}{\emph{Findings of the Association for Computational
   Linguistics: ACL 2024}}. \bibinfo{publisher}{Association for Computational
-  Linguistics}, \bibinfo{pages}{10471--10506}.
+  Linguistics}, \bibinfo{address}{Bangkok, Thailand},
+  \bibinfo{pages}{10471--10506}.
 \newblock
 
 
