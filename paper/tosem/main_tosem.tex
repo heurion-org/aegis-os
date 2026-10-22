@@ -193,6 +193,7 @@ We design, implement, and evaluate \textbf{Aegis OS} (\texttt{aegis-os}), a mult
 \end{tikzpicture}%
 }
 \caption{Architecture of the Aegis OS Runtime (\texttt{aegis-os}). Coding agents connect via MCP (\texttt{stdio} or HTTP daemon) as distinct principals within a tenant organization. The policy engine auto-allows in-sandbox CoW mutations, confined process executions, and intra-organization IPC/CAS operations with zero prompts, while guarding host commits and network egress.}
+\Description{System architecture diagram of Aegis OS showing three coding agents (Google Antigravity, Claude Code, and OpenAI Codex) connecting through the Aegis MCP and A2A Runtime Gateway and Cedar-Inspired Policy Engine to four core subsystems: Transactional CoW VFS, Dual-Tier OS Sandbox, A2A IPC Bus and CAS, and Zero-Trust Egress Proxy.}
 \label{fig:arch}
 \end{figure}
 
@@ -442,6 +443,7 @@ Host-Static-Allowlist (Read/Status Allow) & 50 & 1,500 & 680 & 45.33\% & 20.93\%
 \end{tikzpicture}%
 }
 \caption{Interruption Prompt Rate (IPR) across both 50 controlled trajectories (1,500 calls, Experiment 1) and 52 real coding-agent session logs (28,087 calls, Experiment 1B). Aegis OS reduces confirmation prompts by 94.2\%--99.9\% on controlled trajectories and by 90.7\%--97.9\% on real session traces.}
+\Description{Paired bar chart comparing Interruption Prompt Rate (IPR) across four permission regimes for both 50 controlled trajectories and 52 real coding-agent sessions, showing reductions from 57.3\% and 53.3\% down to 0.07\% and 1.12\%.}
 \label{fig:exp1}
 \end{figure}
 
@@ -616,6 +618,7 @@ Large Project & 1,000 & 78.1 MB & $113.13 \pm 16.41$ ms & $\mathbf{6.28 \pm 0.65
 \end{tikzpicture}%
 }
 \caption{Workspace provisioning latency across repository scales (Experiment 3A). APFS \texttt{clonefile} scales with file metadata count rather than total byte volume, achieving an 18.0$\times$ speedup over a user-space copy loop on the 1,000-file repository.}
+\Description{Bar chart comparing workspace provisioning latency in milliseconds between a user-space copy loop and Aegis APFS CoW clonefile across 100, 300, and 1,000 files.}
 \label{fig:exp3}
 \end{figure}
 
@@ -786,7 +789,7 @@ We presented \textbf{Aegis OS}, a transactional, multi-tenant Agent Operating Sy
 \bibliography{references}
 \appendix
 
-\section{Appendix: Reproducibility and Artifact Guide}
+\section{Reproducibility and Artifact Guide}
 \label{sec:appendix}
 
 The open-source implementation of Aegis OS and the benchmark suite are available at \url{https://github.com/heurion-org/aegis-os}. All nine Rust crates (\texttt{aos-core}, \texttt{aos-policy}, \texttt{aos-vfs}, \texttt{aos-ipc}, \texttt{aos-sandbox}, \texttt{aos-egress}, \texttt{aos-recorder}, \texttt{aos-mcp-gateway}, and \texttt{aos-cli}) are self-contained in the workspace. To run all unit tests and reproduce all empirical experiments (\texttt{BENCHMARK\_REPORT.md} and \texttt{BENCHMARK\_REPORT.json}):
