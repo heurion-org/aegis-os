@@ -1424,317 +1424,1159 @@ impl PaasControlPlane {
     }
 }
 
-/// Minimalist, developer-focused Web Console served at `GET /dashboard`.
-/// Displays only high-signal core operational information:
-/// 1. Top Status & Commercial Plan / Metering Strip
-/// 2. Pending Boundary Approvals (with inline Code Diff viewer & 1-click lease approval)
-/// 3. Cloud CoW Workspaces (Scale-to-Zero Hibernate/Wake, Source Diff & Git PR export)
-/// 4. Scoped API Keys & 1-line `aegis-os cloud up` onboarding command
-pub const DASHBOARD_HTML: &str = r##"<!DOCTYPE html>
+/// Heurion Research — Nordic / Scandinavian Editorial Design System (v5) Web Console served at `GET /dashboard`.
+/// Displays high-signal operational telemetry and controls in the exact visual language of `https://heurion.org`:
+/// 1. Heurion Sticky Top Navigation (Original Brand Mark, Section Links, Plan Switcher, Bilingual ZH/EN Toggle, Polar.sh Checkout CTA)
+/// 2. Editorial Split Hero & Live L1 Aegis OS Architectural Plate (4-Column Tabular Serif Metrics + CoW/Diff3/AAP-1.0 Schematic)
+/// 3. 01 / Pending Boundary Approvals (AAP-1.0 Ed25519 Human-in-the-Loop Lease Gate & Inline Unified Diff Drawer)
+/// 4. 02 / Cloud CoW Workspaces & Scale-to-Zero (Warm Linen `#EFECE4` Section with Instant Btrfs CoW Fork, Wake/Hibernate & Git PR Export)
+/// 5. 03 / CLI Onboarding, Polar.sh Subscription Key Claim & Scoped API Keys
+pub const DASHBOARD_HTML: &str = r##"<!doctype html>
 <html lang="zh-CN">
 <head>
-  <meta charset="UTF-8" />
+  <meta charset="utf-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1.0" />
-  <title>Aegis Cloud — Developer Console</title>
+  <title>Aegis Cloud — Developer Console · Heurion Research</title>
+  <link rel="preconnect" href="https://fonts.googleapis.com">
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+  <link href="https://fonts.googleapis.com/css2?family=Inter:wght@300;400;500;600;700&family=JetBrains+Mono:wght@400;500&family=Newsreader:ital,opsz,wght@0,6..72,300;0,6..72,400;1,6..72,300;1,6..72,400&family=Noto+Serif+SC:wght@300;400;500&display=swap" rel="stylesheet">
   <style>
+    /* Heurion Research — Nordic / Scandinavian Editorial Design System (v5) */
     :root {
-      --bg: #090d16;
-      --surface: #111827;
-      --elevated: #1e293b;
-      --border: rgba(148, 163, 184, 0.16);
-      --text: #f8fafc;
-      --muted: #94a3b8;
-      --blue: #3b82f6;
-      --green: #10b981;
-      --amber: #f59e0b;
-      --red: #f43f5e;
-      --radius: 8px;
+      --bg-primary: #FAF8F4;
+      --bg-neutral: #EFECE4;
+      --bg-elevated: #FDFCF9;
+      --ink: #151C19;
+      --ink-secondary: #525B56;
+      --ink-muted: #848D88;
+      --accent: #233E33;
+      --heurion-mint: #00C472;
+      --accent-warm: #8F5638;
+      --accent-soft: #E3ECE7;
+      --warm-soft: rgba(143, 86, 56, 0.10);
+      --danger: #9E332E;
+      --danger-soft: rgba(158, 51, 46, 0.09);
+      --ink-light: #F4F1EA;
+      --border: #DFDAD0;
+      --border-strong: #151C19;
+
+      --serif: 'Newsreader', 'Noto Serif SC', 'Songti SC', 'STSong', Georgia, serif;
+      --sans: 'Inter', -apple-system, BlinkMacSystemFont, 'SF Pro Text', 'PingFang SC', 'Hiragino Sans GB', sans-serif;
+      --mono: 'JetBrains Mono', 'SF Mono', Menlo, Consolas, monospace;
     }
-    * { box-sizing: border-box; margin: 0; padding: 0; }
+
+    *, *::before, *::after {
+      box-sizing: border-box;
+      margin: 0;
+      padding: 0;
+    }
+
+    html {
+      scroll-behavior: smooth;
+      -webkit-font-smoothing: antialiased;
+      -moz-osx-font-smoothing: grayscale;
+    }
+
     body {
-      font-family: -apple-system, BlinkMacSystemFont, "Inter", "SF Pro Text", sans-serif;
-      background: var(--bg);
-      color: var(--text);
-      line-height: 1.5;
-      padding: 20px 28px 48px;
-      max-width: 1180px;
-      margin: 0 auto;
+      background-color: var(--bg-primary);
+      color: var(--ink);
+      font-family: var(--sans);
+      font-size: 0.92rem;
+      line-height: 1.65;
+      font-weight: 400;
     }
+
+    ::selection {
+      background: var(--accent-soft);
+      color: var(--accent);
+    }
+
+    a {
+      color: inherit;
+      text-decoration: none;
+      transition: color 0.2s ease, opacity 0.2s ease, border-color 0.2s ease, background-color 0.2s ease;
+    }
+
+    a:hover {
+      color: var(--accent);
+    }
+
     code, pre, .mono {
-      font-family: "JetBrains Mono", "SF Mono", ui-monospace, Menlo, monospace;
+      font-family: var(--mono);
     }
-    header {
-      display: flex;
-      justify-content: space-between;
-      align-items: center;
-      padding-bottom: 16px;
+
+    .container {
+      max-width: 1220px;
+      margin: 0 auto;
+      padding: 0 3.5rem;
+    }
+
+    /* Editorial Typography */
+    .label-caps {
+      font-family: var(--mono);
+      font-size: 0.68rem;
+      font-weight: 400;
+      letter-spacing: 0.14em;
+      text-transform: uppercase;
+      color: var(--ink-muted);
+    }
+
+    .heading-1 {
+      font-family: var(--serif);
+      font-size: clamp(2rem, 3vw, 2.75rem);
+      font-weight: 300;
+      line-height: 1.18;
+      letter-spacing: -0.02em;
+      color: var(--ink);
+    }
+
+    html[lang="zh-CN"] .heading-1 {
+      font-size: clamp(1.85rem, 2.5vw, 2.35rem);
+      line-height: 1.32;
+      letter-spacing: 0.01em;
+    }
+
+    .heading-1 em,
+    .heading-2 em {
+      font-style: italic;
+      font-weight: 400;
+      color: var(--accent);
+    }
+
+    html[lang="zh-CN"] .heading-1 em,
+    html[lang="zh-CN"] .heading-2 em {
+      font-style: normal;
+      border-bottom: 1px solid rgba(35, 62, 51, 0.35);
+      padding-bottom: 0.04em;
+    }
+
+    .heading-2 {
+      font-family: var(--serif);
+      font-size: clamp(1.38rem, 1.9vw, 1.75rem);
+      font-weight: 300;
+      line-height: 1.28;
+      letter-spacing: -0.012em;
+      color: var(--ink);
+    }
+
+    .heading-3 {
+      font-family: var(--serif);
+      font-size: 1.08rem;
+      font-weight: 400;
+      line-height: 1.38;
+      color: var(--ink);
+    }
+
+    .text-muted {
+      font-size: 0.86rem;
+      line-height: 1.65;
+      color: var(--ink-secondary);
+    }
+
+    /* Top Navigation with Original Heurion Logo */
+    .nav {
+      position: sticky;
+      top: 0;
+      z-index: 50;
+      background: rgba(250, 248, 244, 0.92);
+      backdrop-filter: blur(12px);
+      -webkit-backdrop-filter: blur(12px);
       border-bottom: 1px solid var(--border);
-      margin-bottom: 20px;
-      gap: 12px;
+    }
+
+    .nav-inner {
+      max-width: 1220px;
+      margin: 0 auto;
+      padding: 1.1rem 3.5rem;
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      gap: 1.5rem;
       flex-wrap: wrap;
     }
-    .brand { display: flex; align-items: center; gap: 10px; }
-    .brand h1 { font-size: 16px; font-weight: 700; }
-    .pill {
+
+    .brand-group {
+      display: flex;
+      align-items: center;
+      gap: 0.85rem;
+    }
+
+    .brand {
       display: inline-flex;
       align-items: center;
-      padding: 2px 8px;
-      border-radius: 999px;
-      font-size: 11px;
-      font-weight: 600;
-      background: rgba(59, 130, 246, 0.15);
-      color: #60a5fa;
-      border: 1px solid rgba(59, 130, 246, 0.3);
+      gap: 0.65rem;
+      color: var(--ink);
     }
-    .pill.green { background: rgba(16, 185, 129, 0.14); color: #34d399; border-color: rgba(16, 185, 129, 0.3); }
-    .pill.amber { background: rgba(245, 158, 11, 0.14); color: #fbbf24; border-color: rgba(245, 158, 11, 0.35); }
-    .pill.muted { background: rgba(148, 163, 184, 0.12); color: var(--muted); border-color: var(--border); }
 
-    .stats-bar {
-      display: grid;
-      grid-template-columns: repeat(4, 1fr);
-      gap: 12px;
-      margin-bottom: 20px;
+    .brand-mark {
+      width: 24px;
+      height: 22px;
+      display: block;
+      flex-shrink: 0;
     }
-    .stat {
-      background: var(--surface);
-      border: 1px solid var(--border);
-      border-radius: var(--radius);
-      padding: 12px 14px;
-    }
-    .stat-label { font-size: 11px; color: var(--muted); }
-    .stat-val { font-size: 20px; font-weight: 700; margin-top: 2px; }
 
-    .section {
-      background: var(--surface);
-      border: 1px solid var(--border);
-      border-radius: var(--radius);
-      padding: 16px 18px;
-      margin-bottom: 16px;
+    .brand-mark .mark-bar { fill: var(--ink); }
+    .brand-mark .mark-accent { fill: var(--heurion-mint); }
+
+    .brand-word {
+      font-family: var(--sans);
+      font-size: 0.9rem;
+      font-weight: 700;
+      letter-spacing: 0.22em;
+      text-transform: uppercase;
+      color: var(--ink);
     }
-    .section-head {
+
+    .brand-sep {
+      color: var(--border);
+      font-weight: 300;
+    }
+
+    .brand-sub {
+      font-family: var(--mono);
+      font-size: 0.68rem;
+      letter-spacing: 0.14em;
+      text-transform: uppercase;
+      color: var(--accent);
+      padding: 0.18rem 0.52rem;
+      background: var(--accent-soft);
+      border: 1px solid rgba(35, 62, 51, 0.2);
+    }
+
+    .nav-links {
       display: flex;
-      justify-content: space-between;
       align-items: center;
-      margin-bottom: 12px;
-      gap: 10px;
+      gap: 1.85rem;
+    }
+
+    .nav-link {
+      font-size: 0.8rem;
+      letter-spacing: 0.02em;
+      color: var(--ink-secondary);
+    }
+
+    .nav-link:hover {
+      color: var(--accent);
+    }
+
+    .nav-right {
+      display: flex;
+      align-items: center;
+      gap: 0.65rem;
       flex-wrap: wrap;
     }
-    .section-title { font-size: 14px; font-weight: 600; display: flex; align-items: center; gap: 8px; }
+
+    /* Architectural Buttons & Inputs (Sharp 0px Radius, 1px Hairline) */
+    .btn, select, input {
+      font-family: var(--sans);
+      font-size: 0.78rem;
+      border-radius: 0;
+      border: 1px solid var(--border);
+      background: var(--bg-elevated);
+      color: var(--ink);
+      padding: 0.44rem 0.85rem;
+      line-height: 1.3;
+      transition: all 0.18s ease;
+    }
+
+    select, .mono-input {
+      font-family: var(--mono);
+      font-size: 0.72rem;
+      letter-spacing: 0.03em;
+    }
+
+    input:focus, select:focus {
+      outline: none;
+      border-color: var(--accent);
+      background: #FFFFFF;
+    }
 
     .btn {
       display: inline-flex;
       align-items: center;
-      gap: 5px;
-      padding: 6px 11px;
-      border-radius: 6px;
-      font-size: 12px;
-      font-weight: 600;
+      gap: 0.45rem;
       cursor: pointer;
-      border: 1px solid var(--border);
-      background: var(--elevated);
-      color: var(--text);
+      font-weight: 500;
+      letter-spacing: 0.02em;
     }
-    .btn:hover { filter: brightness(1.12); }
-    .btn-primary { background: var(--blue); border-color: transparent; color: #fff; }
-    .btn-success { background: var(--green); border-color: transparent; color: #fff; }
-    .btn-danger { background: rgba(244, 63, 94, 0.16); border-color: rgba(244, 63, 94, 0.35); color: #fda4af; }
 
-    .approval-row {
-      border: 1px solid rgba(245, 158, 11, 0.35);
-      border-left: 3px solid var(--amber);
-      background: rgba(30, 41, 59, 0.55);
-      border-radius: 6px;
-      padding: 12px 14px;
-      margin-bottom: 8px;
+    .btn:hover {
+      border-color: var(--accent);
+      color: var(--accent);
+      background: var(--bg-primary);
+    }
+
+    .btn-solid {
+      background: var(--accent);
+      color: var(--ink-light);
+      border-color: var(--accent);
+    }
+
+    .btn-solid:hover {
+      background: var(--ink);
+      border-color: var(--ink);
+      color: var(--ink-light);
+    }
+
+    .btn-mint {
+      background: var(--accent-soft);
+      color: var(--accent);
+      border-color: rgba(35, 62, 51, 0.32);
+    }
+
+    .btn-mint:hover {
+      background: var(--accent);
+      color: var(--ink-light);
+      border-color: var(--accent);
+    }
+
+    .btn-danger {
+      background: transparent;
+      color: var(--danger);
+      border-color: rgba(158, 51, 46, 0.35);
+    }
+
+    .btn-danger:hover {
+      background: var(--danger-soft);
+      color: var(--danger);
+      border-color: var(--danger);
+    }
+
+    .lang-btn {
+      background: transparent;
+      border: 1px solid var(--border);
+      padding: 0.34rem 0.62rem;
+      font-family: var(--mono);
+      font-size: 0.68rem;
+      letter-spacing: 0.08em;
+      color: var(--ink-secondary);
+      cursor: pointer;
+    }
+
+    .lang-btn:hover {
+      border-color: var(--accent);
+      color: var(--accent);
+    }
+
+    /* Tags & Status Badges */
+    .tag {
+      display: inline-flex;
+      align-items: center;
+      gap: 0.38rem;
+      padding: 0.16rem 0.55rem;
+      font-family: var(--mono);
+      font-size: 0.66rem;
+      letter-spacing: 0.08em;
+      text-transform: uppercase;
+      border: 1px solid var(--border);
+      background: var(--bg-primary);
+      color: var(--ink-secondary);
+    }
+
+    .tag-active {
+      background: var(--accent-soft);
+      color: var(--accent);
+      border-color: rgba(35, 62, 51, 0.28);
+    }
+
+    .tag-warm {
+      background: var(--warm-soft);
+      color: var(--accent-warm);
+      border-color: rgba(143, 86, 56, 0.32);
+    }
+
+    .dot-mint {
+      width: 6px;
+      height: 6px;
+      border-radius: 50%;
+      background: var(--heurion-mint);
+      display: inline-block;
+    }
+
+    .dot-warm {
+      width: 6px;
+      height: 6px;
+      border-radius: 50%;
+      background: var(--accent-warm);
+      display: inline-block;
+    }
+
+    /* Section 0: Editorial Console Hero & Telemetry Plate */
+    .sec-hero {
+      padding: 3.5rem 0 3.75rem;
+      background-color: var(--bg-primary);
+      background-image:
+        linear-gradient(102deg, rgba(250, 248, 244, 0.94) 0%, rgba(250, 248, 244, 0.86) 50%, rgba(239, 236, 228, 0.72) 100%),
+        url('https://images.unsplash.com/photo-1542273917363-3b1817f69a2d?auto=format&fit=crop&w=2000&q=80');
+      background-size: cover;
+      background-position: center 62%;
+      border-bottom: 1px solid var(--border);
+    }
+
+    .hero-grid {
+      display: grid;
+      grid-template-columns: 1.08fr 0.92fr;
+      gap: 3.5rem;
+      align-items: stretch;
+    }
+
+    .hero-left {
+      display: flex;
+      flex-direction: column;
+      justify-content: space-between;
+      gap: 2rem;
+    }
+
+    .hero-intro {
+      display: flex;
+      flex-direction: column;
+      gap: 1.1rem;
+    }
+
+    .telemetry-strip {
+      display: grid;
+      grid-template-columns: repeat(4, 1fr);
+      gap: 1.25rem;
+      padding: 1.35rem 0;
+      border-top: 1px solid rgba(21, 28, 25, 0.16);
+      border-bottom: 1px solid rgba(21, 28, 25, 0.16);
+    }
+
+    .stat-cell {
+      display: flex;
+      flex-direction: column;
+      gap: 0.25rem;
+    }
+
+    .stat-val {
+      font-family: var(--serif);
+      font-size: 1.65rem;
+      font-weight: 300;
+      color: var(--ink);
+      line-height: 1.1;
+      font-variant-numeric: tabular-nums;
+    }
+
+    .stat-lbl {
+      font-family: var(--mono);
+      font-size: 0.64rem;
+      color: var(--ink-muted);
+      letter-spacing: 0.08em;
+      text-transform: uppercase;
+    }
+
+    .hero-actions {
+      display: flex;
+      align-items: center;
+      gap: 0.85rem;
+      flex-wrap: wrap;
+    }
+
+    /* Nordic Architectural Plate (Right Column) */
+    .hero-art {
+      background: rgba(250, 248, 244, 0.90);
+      backdrop-filter: blur(14px);
+      -webkit-backdrop-filter: blur(14px);
+      border: 1px solid rgba(21, 28, 25, 0.16);
+      box-shadow: 0 20px 48px rgba(21, 28, 25, 0.06);
+      padding: 1.35rem 1.6rem;
+      display: flex;
+      flex-direction: column;
+      justify-content: space-between;
+      gap: 0.85rem;
+    }
+
+    .art-header, .art-caption {
       display: flex;
       justify-content: space-between;
       align-items: center;
-      gap: 14px;
-      flex-wrap: wrap;
+      font-family: var(--mono);
+      font-size: 0.64rem;
+      letter-spacing: 0.11em;
+      color: var(--ink-muted);
+      text-transform: uppercase;
     }
-    .actions { display: flex; gap: 6px; flex-wrap: wrap; }
 
-    table { width: 100%; border-collapse: collapse; font-size: 12.5px; }
-    th {
-      text-align: left;
-      padding: 8px 10px;
-      font-size: 11px;
-      color: var(--muted);
+    .art-header {
+      padding-bottom: 0.65rem;
       border-bottom: 1px solid var(--border);
     }
-    td {
-      padding: 9px 10px;
-      border-bottom: 1px solid rgba(148, 163, 184, 0.08);
-    }
-    tr:last-child td { border-bottom: none; }
 
-    .inline-form {
+    .art-caption {
+      padding-top: 0.65rem;
+      border-top: 1px solid var(--border);
+    }
+
+    .art-svg {
+      width: 100%;
+      height: 215px;
+      display: block;
+    }
+
+    /* Content Sections */
+    .sec-primary {
+      background: var(--bg-primary);
+      padding: 3.75rem 0;
+    }
+
+    .sec-linen {
+      background: var(--bg-neutral);
+      border-top: 1px solid var(--border);
+      border-bottom: 1px solid var(--border);
+      padding: 3.75rem 0;
+    }
+
+    .section-header {
       display: flex;
-      gap: 8px;
-      margin-bottom: 12px;
+      align-items: baseline;
+      justify-content: space-between;
+      gap: 1.5rem;
+      margin-bottom: 1.75rem;
+      padding-bottom: 0.9rem;
+      border-bottom: 1px solid var(--border);
       flex-wrap: wrap;
     }
-    input, select {
-      background: var(--bg);
-      border: 1px solid var(--border);
-      color: var(--text);
-      padding: 6px 10px;
-      border-radius: 6px;
-      font-size: 12px;
+
+    .section-title-group {
+      display: flex;
+      align-items: baseline;
+      gap: 1rem;
+      flex-wrap: wrap;
     }
-    pre.code {
-      background: #050811;
+
+    .section-num {
+      font-family: var(--serif);
+      font-size: 1.35rem;
+      color: var(--accent);
+    }
+
+    .editorial-card {
+      background: var(--bg-elevated);
       border: 1px solid var(--border);
-      border-radius: 6px;
-      padding: 10px 12px;
-      font-size: 11.5px;
+      padding: 1.65rem 1.85rem;
+    }
+
+    /* Approval Rows */
+    .approval-row {
+      background: var(--bg-elevated);
+      border: 1px solid var(--border);
+      border-left: 3px solid var(--accent-warm);
+      padding: 1.15rem 1.35rem;
+      margin-bottom: 0.75rem;
+      display: flex;
+      justify-content: space-between;
+      align-items: center;
+      gap: 1.25rem;
+      flex-wrap: wrap;
+    }
+
+    .approval-meta {
+      display: flex;
+      flex-direction: column;
+      gap: 0.35rem;
+    }
+
+    .actions {
+      display: flex;
+      align-items: center;
+      gap: 0.5rem;
+      flex-wrap: wrap;
+    }
+
+    /* Tables */
+    .table-wrap {
       overflow-x: auto;
-      color: #cbd5e1;
-      max-height: 360px;
     }
-    .empty { color: var(--muted); font-size: 12.5px; padding: 10px 0; }
-    #diff-drawer { display: none; margin-top: 12px; }
+
+    table {
+      width: 100%;
+      border-collapse: collapse;
+      font-size: 0.84rem;
+    }
+
+    th {
+      text-align: left;
+      padding: 0.75rem 0.9rem;
+      font-family: var(--mono);
+      font-size: 0.66rem;
+      font-weight: 400;
+      letter-spacing: 0.12em;
+      text-transform: uppercase;
+      color: var(--ink-muted);
+      border-bottom: 1px solid var(--border);
+    }
+
+    td {
+      padding: 0.95rem 0.9rem;
+      border-bottom: 1px solid var(--border);
+      vertical-align: middle;
+    }
+
+    tr:last-child td {
+      border-bottom: none;
+    }
+
+    .inline-bar {
+      display: flex;
+      align-items: center;
+      gap: 0.55rem;
+      flex-wrap: wrap;
+      margin-bottom: 1.25rem;
+      padding-bottom: 1.15rem;
+      border-bottom: 1px solid var(--border);
+    }
+
+    /* Code & Diff Viewer */
+    pre.code {
+      background: #151C19;
+      color: #F4F1EA;
+      border: 1px solid var(--border-strong);
+      padding: 1.1rem 1.35rem;
+      font-family: var(--mono);
+      font-size: 0.76rem;
+      line-height: 1.65;
+      overflow-x: auto;
+      max-height: 380px;
+    }
+
+    #diff-drawer {
+      display: none;
+      margin-top: 1.25rem;
+      padding-top: 1.15rem;
+      border-top: 1px solid var(--border);
+    }
+
+    .onboarding-grid {
+      display: grid;
+      grid-template-columns: 1.12fr 0.88fr;
+      gap: 1.75rem;
+      margin-bottom: 1.75rem;
+    }
+
+    .empty {
+      color: var(--ink-muted);
+      font-size: 0.84rem;
+      padding: 0.85rem 0;
+      font-style: italic;
+      font-family: var(--serif);
+    }
+
+    /* Footer */
+    .foot {
+      background: var(--bg-primary);
+      border-top: 1px solid var(--border);
+      padding: 2.15rem 0;
+    }
+
+    .foot-bar {
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      gap: 1.5rem;
+      flex-wrap: wrap;
+    }
+
+    .foot-right {
+      display: flex;
+      flex-wrap: wrap;
+      align-items: center;
+      gap: 1.5rem;
+      font-size: 0.76rem;
+      color: var(--ink-muted);
+    }
+
+    .foot-link {
+      font-family: var(--mono);
+      font-size: 0.68rem;
+      letter-spacing: 0.08em;
+      text-transform: uppercase;
+      color: var(--ink-secondary);
+    }
+
     #toast {
       position: fixed;
-      bottom: 20px;
-      right: 24px;
-      background: var(--elevated);
-      border: 1px solid var(--blue);
-      padding: 9px 14px;
-      border-radius: 6px;
-      font-size: 12px;
+      bottom: 24px;
+      right: 28px;
+      z-index: 100;
+      background: var(--ink);
+      color: var(--ink-light);
+      border-left: 3px solid var(--heurion-mint);
+      padding: 0.7rem 1.15rem;
+      font-family: var(--mono);
+      font-size: 0.74rem;
+      letter-spacing: 0.03em;
+      box-shadow: 0 16px 36px rgba(21, 28, 25, 0.18);
       display: none;
+    }
+
+    @media (max-width: 991px) {
+      .container, .nav-inner { padding-left: 1.5rem; padding-right: 1.5rem; }
+      .hero-grid, .onboarding-grid { grid-template-columns: 1fr; }
+      .telemetry-strip { grid-template-columns: repeat(2, 1fr); }
+      .nav-links { display: none; }
     }
   </style>
 </head>
 <body>
-  <header>
-    <div class="brand">
-      <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="#3b82f6" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M12 22s8-4 8-10V5l-8-3-8 3v7c0 6 8 10 8 10z"/><path d="M9 12l2 2 4-4"/></svg>
-      <h1>Aegis Cloud</h1>
-      <span class="pill" id="plan-badge">Pro Plan · $29/mo</span>
-      <span class="pill green">Zero-Local-Load CoW Runtime</span>
-    </div>
-    <div class="actions">
-      <select id="plan-select" onchange="changePlan(this.value)">
-        <option value="community">Community (Free · 2 Agents)</option>
-        <option value="pro" selected>Pro ($29/mo · 8 Agents)</option>
-        <option value="team">Team ($79/seat · 32 Agents)</option>
-        <option value="enterprise">Enterprise (VPC · 256 Agents)</option>
-      </select>
-      <button class="btn" onclick="simulateEscalation()">+ 模拟审批</button>
-      <button class="btn" onclick="refresh(true)">刷新</button>
+
+  <!-- Top Navigation with Original Heurion Brand Mark -->
+  <header class="nav" role="banner">
+    <div class="nav-inner">
+      <div class="brand-group">
+        <a class="brand" href="https://heurion.org/" aria-label="Heurion Research">
+          <svg class="brand-mark" viewBox="-2 6 96 88" aria-hidden="true">
+            <rect class="mark-bar" x="0" y="10" width="18" height="80" rx="9"/>
+            <rect class="mark-bar" x="62" y="30" width="18" height="60" rx="9"/>
+            <rect class="mark-accent" x="14" y="42" width="52" height="18" rx="9"/>
+            <circle class="mark-accent" cx="80" cy="20" r="11"/>
+          </svg>
+          <span class="brand-word">HEURION</span>
+        </a>
+        <span class="brand-sep">/</span>
+        <span class="brand-sub" id="plan-badge">AEGIS CLOUD · PRO</span>
+      </div>
+
+      <nav class="nav-links" aria-label="Console Sections">
+        <a href="#sec-approvals" class="nav-link" data-i18n="nav_approvals">01 / 边界审批</a>
+        <a href="#sec-workspaces" class="nav-link" data-i18n="nav_workspaces">02 / 写时复制工作区</a>
+        <a href="#sec-onboarding" class="nav-link" data-i18n="nav_onboarding">03 / 接入与密钥</a>
+        <a href="https://heurion.org/" class="nav-link" data-i18n="nav_home">Heurion 主站 ↗</a>
+        <a href="https://github.com/heurion-org/aegis-os" target="_blank" rel="noopener" class="nav-link">GitHub ↗</a>
+      </nav>
+
+      <div class="nav-right">
+        <select id="plan-select" onchange="changePlan(this.value)" aria-label="Select Tier">
+          <option value="community">COMMUNITY · FREE (2 AGENTS)</option>
+          <option value="pro" selected>PRO · $29/MO (8 AGENTS)</option>
+          <option value="team">TEAM · $79/SEAT (32 AGENTS)</option>
+          <option value="enterprise">ENTERPRISE · VPC (256 AGENTS)</option>
+        </select>
+        <button class="lang-btn" id="langBtn" type="button" onclick="toggleLang()">EN</button>
+        <a class="btn btn-solid" id="polar-checkout-btn" href="https://buy.polar.sh/polar_cl_jCPpzbp4eOAyRbkDP4YzNIFVnYLddbvJZI5Fc27zL0x" target="_blank" rel="noopener" data-i18n="nav_subscribe">订阅 Pro ($29/mo) →</a>
+      </div>
     </div>
   </header>
 
-  <!-- Core Metrics Strip -->
-  <div class="stats-bar">
-    <div class="stat">
-      <div class="stat-label">待处理边界审批 (HITL)</div>
-      <div class="stat-val" id="st-pending" style="color:#fbbf24;">0</div>
-    </div>
-    <div class="stat">
-      <div class="stat-label">云工作区 (Active / Hibernated)</div>
-      <div class="stat-val" id="st-ws">0 / 0</div>
-    </div>
-    <div class="stat">
-      <div class="stat-label">云沙箱调用 / 执行耗时</div>
-      <div class="stat-val" id="st-usage">0 calls · 0ms</div>
-    </div>
-    <div class="stat">
-      <div class="stat-label">CoW 零拷贝节省磁盘</div>
-      <div class="stat-val" id="st-saved" style="color:#34d399;">0 KB</div>
-    </div>
-  </div>
+  <main>
+    <!-- Hero & Architectural Telemetry Plate -->
+    <section class="sec-hero">
+      <div class="container">
+        <div class="hero-grid">
+          <div class="hero-left">
+            <div class="hero-intro">
+              <p class="label-caps" data-i18n="hero_eyebrow">HEURION RESEARCH · L1 TRANSACTIONAL AGENT OS CLOUD</p>
+              <h1 class="heading-1" data-i18n-html="hero_title">为多智能体并发协作，<br>提供<em>零本地负载</em>的写时复制云底座。</h1>
+              <p class="text-muted" data-i18n="hero_desc">基于 64GB Btrfs FICLONE 写时复制影子树、Bubblewrap 内核沙箱与 AAP-1.0 Ed25519 人类签名租约，将重型编译测试 100% 卸载至云端。</p>
+            </div>
 
-  <!-- 1. Pending Boundary Approvals -->
-  <div class="section">
-    <div class="section-head">
-      <div class="section-title">
-        <span>1. 待处理边界审批 (Pending Approvals)</span>
-        <span class="pill amber" id="pending-pill">0</span>
-      </div>
-      <span style="font-size:11.5px; color:var(--muted);">绿区沙箱内读写与测试 100% 静默放行；仅落盘提交或未知外网在此审批</span>
-    </div>
-    <div id="approvals-box"></div>
-    <div id="diff-drawer">
-      <div style="display:flex; justify-content:space-between; align-items:center; margin-bottom:6px;">
-        <strong style="font-size:12px;" id="diff-title">源码 Diff 预览</strong>
-        <button class="btn" onclick="document.getElementById('diff-drawer').style.display='none'">收起</button>
-      </div>
-      <pre class="code mono" id="diff-content"></pre>
-    </div>
-  </div>
+            <div>
+              <div class="telemetry-strip">
+                <div class="stat-cell">
+                  <span class="stat-val" id="st-pending" style="color:var(--accent-warm);">0</span>
+                  <span class="stat-lbl" data-i18n="st_lbl_pending">待处理边界审批</span>
+                </div>
+                <div class="stat-cell">
+                  <span class="stat-val" id="st-ws">0 / 0</span>
+                  <span class="stat-lbl" data-i18n="st_lbl_ws">活跃 / 休眠工作区</span>
+                </div>
+                <div class="stat-cell">
+                  <span class="stat-val" id="st-usage">0 · 0ms</span>
+                  <span class="stat-lbl" data-i18n="st_lbl_usage">系统调用 / 沙箱耗时</span>
+                </div>
+                <div class="stat-cell">
+                  <span class="stat-val" id="st-saved" style="color:var(--accent);">0.0 KB</span>
+                  <span class="stat-lbl" data-i18n="st_lbl_saved">CoW 零拷贝节省</span>
+                </div>
+              </div>
 
-  <!-- 2. Cloud CoW Workspaces & Scale-to-Zero -->
-  <div class="section">
-    <div class="section-head">
-      <div class="section-title">2. 云端 CoW 工作区 (Workspaces &amp; Scale-to-Zero)</div>
-      <div class="inline-form" style="margin-bottom:0;">
-        <input id="ws-org" value="aegis-os" placeholder="org_id" style="width:110px;" />
-        <input id="ws-id" value="ws-core" placeholder="workspace_id" style="width:110px;" />
-        <input id="ws-src" value="." placeholder="Git URL or path" style="width:170px;" />
-        <input id="ws-agents" value="coder-alpha,reviewer-beta" placeholder="agents" style="width:180px;" />
-        <button class="btn btn-primary" onclick="provisionWorkspace()">+ 创建云工作区</button>
-      </div>
-    </div>
-    <table>
-      <thead>
-        <tr><th>组织 / 工作区</th><th>状态 (Scale-to-Zero)</th><th>CoW Agent 分支</th><th>操作</th></tr>
-      </thead>
-      <tbody id="ws-tbody"></tbody>
-    </table>
-  </div>
+              <div class="hero-actions" style="margin-top: 1.25rem;">
+                <button class="btn btn-solid" onclick="simulateEscalation()" data-i18n="btn_simulate">+ 模拟边界审批</button>
+                <button class="btn" onclick="refresh(true)" data-i18n="btn_refresh">同步遥测状态</button>
+                <a class="btn" href="#sec-onboarding" data-i18n="btn_cli_guide">CLI 一键接入指南 →</a>
+              </div>
+            </div>
+          </div>
 
-  <!-- 3. API Keys & One-Line CLI Onboarding -->
-  <div class="section">
-    <div class="section-head">
-      <div class="section-title">3. 开发者 CLI 一键上云 &amp; API Keys</div>
-      <div class="inline-form" style="margin-bottom:0;">
-        <input id="k-org" value="aegis-os" placeholder="org_id" style="width:110px;" />
-        <input id="k-agent" value="agy-agent" placeholder="agent_id" style="width:110px;" />
-        <input id="k-ws" value="ws-core" placeholder="workspace_id" style="width:110px;" />
-        <button class="btn btn-primary" onclick="mintKey()">+ 签发 API Key</button>
+          <!-- Nordic L1 Kernel Schematic Plate -->
+          <div class="hero-art" aria-hidden="true">
+            <div class="art-header">
+              <span data-i18n="art_top_l">L1 · AEGIS OS CLOUD KERNEL</span>
+              <span data-i18n="art_top_r">BTRFS FICLONE × AAP-1.0</span>
+            </div>
+            <svg class="art-svg" viewBox="0 0 460 210" fill="none" xmlns="http://www.w3.org/2000/svg">
+              <circle cx="230" cy="105" r="92" stroke="#DCD6CA" stroke-width="1" stroke-dasharray="2 4"/>
+              <line x1="230" y1="8" x2="230" y2="202" stroke="#E5E0D5" stroke-width="1"/>
+
+              <!-- Left: Btrfs CoW Fork -->
+              <rect x="16" y="72" width="102" height="66" fill="#F2EFE9" stroke="#233E33" stroke-width="1"/>
+              <text x="67" y="96" text-anchor="middle" fill="#151C19" font-family="JetBrains Mono, monospace" font-size="8.5" font-weight="500">BTRFS COW FORK</text>
+              <text x="67" y="112" text-anchor="middle" fill="#525B56" font-family="JetBrains Mono, monospace" font-size="7.5">0.42ms FICLONE</text>
+              <text x="67" y="126" text-anchor="middle" fill="#233E33" font-family="JetBrains Mono, monospace" font-size="7.2">Scale-to-Zero</text>
+
+              <!-- Fork Lines -->
+              <path d="M118 105 L140 105 L152 52 L166 52" stroke="#848D88" stroke-width="1"/>
+              <line x1="118" y1="105" x2="166" y2="105" stroke="#233E33" stroke-width="1.2"/>
+              <path d="M118 105 L140 105 L152 158 L166 158" stroke="#848D88" stroke-width="1"/>
+
+              <!-- Center: 3 Concurrent Agent Sandboxes -->
+              <rect x="166" y="36" width="128" height="32" fill="#FDFCF9" stroke="#C8C1B4" stroke-width="1"/>
+              <text x="230" y="55" text-anchor="middle" fill="#525B56" font-family="JetBrains Mono, monospace" font-size="7.8">Shadow A · agy-agent</text>
+
+              <rect x="166" y="89" width="128" height="32" fill="#E3ECE7" stroke="#233E33" stroke-width="1"/>
+              <circle cx="180" cy="105" r="3" fill="#00C472"/>
+              <text x="236" y="108" text-anchor="middle" fill="#151C19" font-family="JetBrains Mono, monospace" font-size="7.8" font-weight="500">Shadow B · claude-code</text>
+
+              <rect x="166" y="142" width="128" height="32" fill="#FDFCF9" stroke="#C8C1B4" stroke-width="1"/>
+              <text x="230" y="161" text-anchor="middle" fill="#525B56" font-family="JetBrains Mono, monospace" font-size="7.8">Shadow C · codex-cli</text>
+
+              <!-- Merge Lines -->
+              <path d="M294 52 L308 52 L320 105 L342 105" stroke="#848D88" stroke-width="1"/>
+              <line x1="294" y1="105" x2="342" y2="105" stroke="#233E33" stroke-width="1.2"/>
+              <path d="M294 158 L308 158 L320 105 L342 105" stroke="#848D88" stroke-width="1"/>
+
+              <!-- Right: 4-Tier LCS Diff3 + Ed25519 Lease Gate -->
+              <rect x="342" y="72" width="102" height="66" fill="#233E33"/>
+              <circle cx="358" cy="88" r="3.5" fill="#00C472"/>
+              <text x="398" y="92" text-anchor="middle" fill="#FAF8F4" font-family="JetBrains Mono, monospace" font-size="8.2" font-weight="500">LCS DIFF3 MERGE</text>
+              <text x="393" y="109" text-anchor="middle" fill="#E3ECE7" font-family="JetBrains Mono, monospace" font-size="7.4">Ed25519 Lease</text>
+              <text x="393" y="125" text-anchor="middle" fill="#00C472" font-family="JetBrains Mono, monospace" font-size="7.4">0% Silent Overwrite</text>
+            </svg>
+            <div class="art-caption">
+              <span id="node-health-lbl">NODE: HEURION.ORG · 64GB RAM</span>
+              <span>SANDBOX: BUBBLEWRAP / SEATBELT</span>
+            </div>
+          </div>
+        </div>
+      </div>
+    </section>
+
+    <!-- Section 01: Pending Boundary Approvals (AAP-1.0 HITL) -->
+    <section class="sec-primary" id="sec-approvals">
+      <div class="container">
+        <div class="section-header">
+          <div class="section-title-group">
+            <span class="section-num">01</span>
+            <h2 class="heading-2" data-i18n-html="sec1_title">边界治理与人类签名租约 <em>(Pending Approvals)</em></h2>
+            <span class="tag tag-warm"><span class="dot-warm"></span><span id="pending-pill">0</span> PENDING</span>
+          </div>
+          <p class="label-caps" data-i18n="sec1_label">01 / AAP-1.0 ED25519 LEASE GATE</p>
+        </div>
+
+        <div class="editorial-card">
+          <div style="display:flex; justify-content:space-between; align-items:center; gap:1rem; margin-bottom:1rem; flex-wrap:wrap;">
+            <p class="text-muted" data-i18n="sec1_note">绿区沙箱内读写、编译与单元测试 100% 静默放行；仅在向宿主仓库归并落盘 (workspace_commit) 或访问未授权外网时触发边界拦截。</p>
+            <button class="btn" onclick="simulateEscalation()" data-i18n="btn_simulate_inline">+ 生成测试审批单</button>
+          </div>
+
+          <div id="approvals-box"></div>
+
+          <div id="diff-drawer">
+            <div style="display:flex; justify-content:space-between; align-items:center; margin-bottom:0.65rem;">
+              <span class="label-caps" id="diff-title" style="color:var(--ink);">UNIFIED DIFF PREVIEW</span>
+              <button class="btn" onclick="document.getElementById('diff-drawer').style.display='none'" data-i18n="btn_close">收起预览</button>
+            </div>
+            <pre class="code" id="diff-content"></pre>
+          </div>
+        </div>
+      </div>
+    </section>
+
+    <!-- Section 02: Cloud CoW Workspaces & Scale-to-Zero (Warm Linen #EFECE4) -->
+    <section class="sec-linen" id="sec-workspaces">
+      <div class="container">
+        <div class="section-header">
+          <div class="section-title-group">
+            <span class="section-num">02</span>
+            <h2 class="heading-2" data-i18n-html="sec2_title">写时复制云端工作区 <em>(CoW Workspaces &amp; Scale-to-Zero)</em></h2>
+          </div>
+          <p class="label-caps" data-i18n="sec2_label">02 / BTRFS FICLONE SHADOW TREES</p>
+        </div>
+
+        <div class="editorial-card">
+          <div class="inline-bar">
+            <span class="label-caps" style="margin-right:0.35rem;" data-i18n="ws_form_lbl">派生新工作区:</span>
+            <input class="mono-input" id="ws-org" value="aegis-os" placeholder="org_id" style="width:125px;" />
+            <input class="mono-input" id="ws-id" value="ws-core" placeholder="workspace_id" style="width:125px;" />
+            <input class="mono-input" id="ws-src" value="." placeholder="Git URL or path" style="width:190px;" />
+            <input class="mono-input" id="ws-agents" value="coder-alpha,reviewer-beta" placeholder="agents (comma-separated)" style="width:220px;" />
+            <button class="btn btn-solid" onclick="provisionWorkspace()" data-i18n="btn_provision">+ 派生 CoW 工作区</button>
+          </div>
+
+          <div class="table-wrap">
+            <table>
+              <thead>
+                <tr>
+                  <th data-i18n="th_ws_name">组织 / 工作区 (分支)</th>
+                  <th data-i18n="th_ws_state">运行状态 (Scale-to-Zero)</th>
+                  <th data-i18n="th_ws_agents">并发 CoW 智能体分支</th>
+                  <th data-i18n="th_ws_ops">工作区操作</th>
+                </tr>
+              </thead>
+              <tbody id="ws-tbody"></tbody>
+            </table>
+          </div>
+        </div>
+      </div>
+    </section>
+
+    <!-- Section 03: CLI Onboarding, Polar.sh Claim & Scoped API Keys -->
+    <section class="sec-primary" id="sec-onboarding">
+      <div class="container">
+        <div class="section-header">
+          <div class="section-title-group">
+            <span class="section-num">03</span>
+            <h2 class="heading-2" data-i18n-html="sec3_title">开发者接入、订阅领卡与 <em>API 密钥</em></h2>
+          </div>
+          <p class="label-caps" data-i18n="sec3_label">03 / CLI ONBOARDING &amp; POLAR.SH BILLING</p>
+        </div>
+
+        <div class="onboarding-grid">
+          <!-- Left: 1-Line CLI Quickstart -->
+          <div class="editorial-card">
+            <div style="display:flex; justify-content:space-between; align-items:center; margin-bottom:0.85rem;">
+              <span class="label-caps" style="color:var(--ink);" data-i18n="cli_card_title">CLI 一键上云命令 (ZERO-LOCAL-LOAD)</span>
+              <button class="btn" onclick="copyCliSnippet()" data-i18n="btn_copy">复制命令</button>
+            </div>
+            <pre class="code" id="cli-snippet"></pre>
+          </div>
+
+          <!-- Right: Polar.sh Subscription Key Claim & Manual Key Minting -->
+          <div class="editorial-card" style="display:flex; flex-direction:column; justify-content:space-between; gap:1.35rem;">
+            <div>
+              <span class="label-caps" style="color:var(--accent);" data-i18n="claim_card_title">POLAR.SH 订阅自动领卡</span>
+              <p class="text-muted" style="margin: 0.45rem 0 0.85rem;" data-i18n="claim_card_desc">在 Polar.sh 完成 Pro / Team 订阅支付后，输入您的付款邮箱即可一键领取自动签发的专属 API Key：</p>
+              <div style="display:flex; gap:0.5rem; flex-wrap:wrap;">
+                <input class="mono-input" id="claim-email" type="email" placeholder="founder@company.com" style="flex:1; min-width:170px;" />
+                <button class="btn btn-mint" onclick="claimSubscriptionKey()" data-i18n="btn_claim">领取已购 Key →</button>
+              </div>
+            </div>
+
+            <div style="padding-top:1.15rem; border-top:1px solid var(--border);">
+              <span class="label-caps" style="color:var(--ink);" data-i18n="mint_card_title">手动签发作用域密钥 (SCOPED API KEY)</span>
+              <div style="display:flex; gap:0.5rem; flex-wrap:wrap; margin-top:0.65rem;">
+                <input class="mono-input" id="k-org" value="aegis-os" placeholder="org_id" style="width:105px;" />
+                <input class="mono-input" id="k-agent" value="agy-agent" placeholder="agent_id" style="width:110px;" />
+                <input class="mono-input" id="k-ws" value="ws-core" placeholder="workspace_id" style="width:105px;" />
+                <button class="btn btn-solid" onclick="mintKey()" data-i18n="btn_mint">+ 签发 Key</button>
+              </div>
+            </div>
+          </div>
+        </div>
+
+        <div class="editorial-card">
+          <div style="display:flex; justify-content:space-between; align-items:center; margin-bottom:0.75rem;">
+            <span class="label-caps" style="color:var(--ink);" data-i18n="keys_table_title">已签发 API 密钥与活跃租约列表</span>
+            <span class="tag tag-active"><span class="dot-mint"></span>SHA-256 VERIFIED</span>
+          </div>
+          <div class="table-wrap">
+            <table>
+              <thead>
+                <tr>
+                  <th data-i18n="th_k_prefix">密钥前缀 (Key Prefix)</th>
+                  <th data-i18n="th_k_id">绑定智能体身份 (Principal)</th>
+                  <th data-i18n="th_k_ws">绑定工作区 (Workspace)</th>
+                  <th data-i18n="th_k_leases">活跃 Ed25519 租约</th>
+                </tr>
+              </thead>
+              <tbody id="keys-tbody"></tbody>
+            </table>
+          </div>
+        </div>
+      </div>
+    </section>
+  </main>
+
+  <!-- Single-Row Minimal Heurion Footer -->
+  <footer class="foot" role="contentinfo">
+    <div class="container">
+      <div class="foot-bar">
+        <a class="brand" href="https://heurion.org/" aria-label="Heurion Research">
+          <svg class="brand-mark" viewBox="-2 6 96 88" aria-hidden="true">
+            <rect class="mark-bar" x="0" y="10" width="18" height="80" rx="9"/>
+            <rect class="mark-bar" x="62" y="30" width="18" height="60" rx="9"/>
+            <rect class="mark-accent" x="14" y="42" width="52" height="18" rx="9"/>
+            <circle class="mark-accent" cx="80" cy="20" r="11"/>
+          </svg>
+          <span class="brand-word">HEURION</span>
+        </a>
+        <div class="foot-right">
+          <span>© 2026 Heurion Research · Aegis Cloud PaaS v0.3.0 · MIT Licensed</span>
+          <a href="https://heurion.org/" class="foot-link">Heurion.org</a>
+          <a href="https://github.com/heurion-org/aegis-os" target="_blank" rel="noopener" class="foot-link">GitHub</a>
+          <a href="https://heurion.org/llms.txt" class="foot-link">LLMs.txt</a>
+        </div>
       </div>
     </div>
-    <pre class="code mono" id="cli-snippet" style="margin-bottom:10px;"></pre>
-    <table>
-      <thead>
-        <tr><th>Key 前缀</th><th>绑定身份</th><th>绑定工作区</th><th>生效租约数</th></tr>
-      </thead>
-      <tbody id="keys-tbody"></tbody>
-    </table>
-  </div>
+  </footer>
 
   <div id="toast"></div>
 
   <script>
     let latestKey = 'ak_live_...';
     let lastSig = '';
+    let currentLang = localStorage.getItem('heurion_lang') || 'zh';
+
+    const DICT = {
+      zh: {
+        nav_approvals: '01 / 边界审批',
+        nav_workspaces: '02 / 写时复制工作区',
+        nav_onboarding: '03 / 接入与密钥',
+        nav_home: 'Heurion 主站 ↗',
+        nav_subscribe: '订阅 Pro ($29/mo) →',
+        hero_eyebrow: 'HEURION RESEARCH · L1 事务级智能体云内核',
+        hero_title: '为多智能体并发协作，<br>提供<em>零本地负载</em>的写时复制云底座。',
+        hero_desc: '基于 64GB Btrfs FICLONE 写时复制影子树、Bubblewrap 内核沙箱与 AAP-1.0 Ed25519 人类签名租约，将重型编译测试 100% 卸载至云端。',
+        st_lbl_pending: '待处理边界审批',
+        st_lbl_ws: '活跃 / 休眠工作区',
+        st_lbl_usage: '系统调用 / 沙箱耗时',
+        st_lbl_saved: 'CoW 零拷贝节省',
+        btn_simulate: '+ 模拟边界审批',
+        btn_refresh: '同步遥测状态',
+        btn_cli_guide: 'CLI 一键接入指南 →',
+        art_top_l: 'L1 · AEGIS OS 云端内核架构',
+        art_top_r: 'BTRFS FICLONE × AAP-1.0',
+        sec1_title: '边界治理与人类签名租约 <em>(Pending Approvals)</em>',
+        sec1_label: '01 / AAP-1.0 ED25519 租约门控',
+        sec1_note: '绿区沙箱内读写、编译与单元测试 100% 静默放行；仅在向宿主仓库归并落盘 (workspace_commit) 或访问未授权外网时触发边界拦截。',
+        btn_simulate_inline: '+ 生成测试审批单',
+        btn_close: '收起预览',
+        sec2_title: '写时复制云端工作区 <em>(CoW Workspaces &amp; Scale-to-Zero)</em>',
+        sec2_label: '02 / BTRFS 零拷贝影子树',
+        ws_form_lbl: '派生新工作区:',
+        btn_provision: '+ 派生 CoW 工作区',
+        th_ws_name: '组织 / 工作区 (分支)',
+        th_ws_state: '运行状态 (Scale-to-Zero)',
+        th_ws_agents: '并发 CoW 智能体分支',
+        th_ws_ops: '工作区操作',
+        sec3_title: '开发者接入、订阅领卡与 <em>API 密钥</em>',
+        sec3_label: '03 / CLI 接入与 POLAR.SH 自动发卡',
+        cli_card_title: 'CLI 一键上云命令 (ZERO-LOCAL-LOAD)',
+        btn_copy: '复制命令',
+        claim_card_title: 'POLAR.SH 订阅自动领卡',
+        claim_card_desc: '在 Polar.sh 完成 Pro / Team 订阅支付后，输入您的付款邮箱即可一键领取自动签发的专属 API Key：',
+        btn_claim: '领取已购 Key →',
+        mint_card_title: '手动签发作用域密钥 (SCOPED API KEY)',
+        btn_mint: '+ 签发 Key',
+        keys_table_title: '已签发 API 密钥与活跃租约列表',
+        th_k_prefix: '密钥前缀 (Key Prefix)',
+        th_k_id: '绑定智能体身份 (Principal)',
+        th_k_ws: '绑定工作区 (Workspace)',
+        th_k_leases: '活跃 Ed25519 租约'
+      },
+      en: {
+        nav_approvals: '01 / Approvals',
+        nav_workspaces: '02 / CoW Workspaces',
+        nav_onboarding: '03 / CLI & API Keys',
+        nav_home: 'Heurion.org ↗',
+        nav_subscribe: 'Subscribe Pro ($29/mo) →',
+        hero_eyebrow: 'HEURION RESEARCH · L1 TRANSACTIONAL AGENT OS CLOUD',
+        hero_title: 'Zero-local-load <em>Copy-on-Write</em> cloud runtime for concurrent agents.',
+        hero_desc: 'Powered by 64GB Btrfs FICLONE shadow trees, Bubblewrap kernel sandboxes, and AAP-1.0 Ed25519 human-in-the-loop leases.',
+        st_lbl_pending: 'Pending HITL Approvals',
+        st_lbl_ws: 'Active / Hibernated WS',
+        st_lbl_usage: 'Syscalls / Sandbox Exec',
+        st_lbl_saved: 'Btrfs CoW Disk Saved',
+        btn_simulate: '+ Simulate Escalation',
+        btn_refresh: 'Sync Telemetry',
+        btn_cli_guide: 'CLI Quickstart →',
+        art_top_l: 'L1 · AEGIS OS CLOUD KERNEL',
+        art_top_r: 'BTRFS FICLONE × AAP-1.0',
+        sec1_title: 'Boundary Governance &amp; Human Leases <em>(Pending Approvals)</em>',
+        sec1_label: '01 / AAP-1.0 ED25519 LEASE GATE',
+        sec1_note: 'In-sandbox reads, edits, builds, and tests execute with zero prompts; only host commits (workspace_commit) or unallowlisted egress trigger human lease approval.',
+        btn_simulate_inline: '+ Simulate Approval',
+        btn_close: 'Close Preview',
+        sec2_title: 'Copy-on-Write Cloud Workspaces <em>(Scale-to-Zero)</em>',
+        sec2_label: '02 / BTRFS FICLONE SHADOW TREES',
+        ws_form_lbl: 'Fork Workspace:',
+        btn_provision: '+ Provision CoW Workspace',
+        th_ws_name: 'Organization / Workspace (Branch)',
+        th_ws_state: 'Lifecycle (Scale-to-Zero)',
+        th_ws_agents: 'Concurrent CoW Agent Branches',
+        th_ws_ops: 'Operations',
+        sec3_title: 'Developer CLI, Subscription Claim &amp; <em>Scoped API Keys</em>',
+        sec3_label: '03 / CLI ONBOARDING &amp; POLAR.SH BILLING',
+        cli_card_title: '1-LINE CLI CLOUD ONBOARDING (ZERO-LOCAL-LOAD)',
+        btn_copy: 'Copy Snippet',
+        claim_card_title: 'POLAR.SH SUBSCRIPTION KEY CLAIM',
+        claim_card_desc: 'After completing Pro / Team checkout on Polar.sh, enter your billing email below to claim your auto-minted API key:',
+        btn_claim: 'Claim API Key →',
+        mint_card_title: 'MINT SCOPED API KEY',
+        btn_mint: '+ Issue Key',
+        keys_table_title: 'ISSUED SCOPED API KEYS & ACTIVE LEASES',
+        th_k_prefix: 'Key Prefix',
+        th_k_id: 'Bound Principal',
+        th_k_ws: 'Bound Workspace',
+        th_k_leases: 'Active Ed25519 Leases'
+      }
+    };
+
+    function applyLang(lang) {
+      currentLang = lang;
+      localStorage.setItem('heurion_lang', lang);
+      document.documentElement.lang = lang === 'zh' ? 'zh-CN' : 'en';
+      const dict = DICT[lang] || DICT.zh;
+      document.querySelectorAll('[data-i18n]').forEach(el => {
+        const k = el.getAttribute('data-i18n');
+        if (dict[k]) el.textContent = dict[k];
+      });
+      document.querySelectorAll('[data-i18n-html]').forEach(el => {
+        const k = el.getAttribute('data-i18n-html');
+        if (dict[k]) el.innerHTML = dict[k];
+      });
+      const btn = document.getElementById('langBtn');
+      if (btn) btn.textContent = lang === 'zh' ? 'EN' : '中文';
+      updateCliSnippet();
+      refresh(true);
+    }
+
+    function toggleLang() {
+      applyLang(currentLang === 'zh' ? 'en' : 'zh');
+    }
 
     function toast(msg) {
       const el = document.getElementById('toast');
       el.textContent = msg;
       el.style.display = 'block';
       clearTimeout(window.__t);
-      window.__t = setTimeout(() => { el.style.display = 'none'; }, 3500);
+      window.__t = setTimeout(() => { el.style.display = 'none'; }, 3600);
     }
 
     function updateCliSnippet() {
       const origin = window.location.origin;
-      document.getElementById('cli-snippet').textContent =
-`# [CLI-First] 1. 在任意本地项目目录一键绑定云端沙箱 (0% 本地 CPU/内存占用):
+      if (currentLang === 'en') {
+        document.getElementById('cli-snippet').textContent =
+`# 1. Install Aegis OS CLI via Homebrew & subscribe / claim your Pro key:
+brew tap heurion-org/aegis-os && brew install aegis-os
+aegis-os cloud subscribe --email you@company.com --claim
+
+# 2. Bind any local repo to Heurion's 64GB Btrfs Cloud Runtime (0% local CPU/RAM):
 aegis-os cloud up --endpoint ${origin} --api-key ${latestKey}
 
-# [CLI-First] 2. 终端内直接查看云端 CoW 源码 Diff / 处理 HITL 审批 / 拉回改动 / 导出 PR:
+# 3. Inspect CoW diffs, approve boundary leases, pull changes, or export Git PRs:
 aegis-os cloud diff
 aegis-os cloud approvals && aegis-os cloud approve <escalation_id>
-aegis-os cloud pull
-aegis-os cloud pr
+aegis-os cloud pull && aegis-os cloud pr`;
+      } else {
+        document.getElementById('cli-snippet').textContent =
+`# 1. 通过 Homebrew 安装 Aegis OS 并一键订阅 / 领取 Pro 密钥:
+brew tap heurion-org/aegis-os && brew install aegis-os
+aegis-os cloud subscribe --email you@company.com --claim
 
-# [CLI-First] 3. 一键解绑切回本地免费模式 (云端工作区自动进入 Scale-to-Zero 休眠):
-aegis-os cloud down`;
+# 2. 在任意本地项目目录一键挂载 64GB Btrfs 云端沙箱 (0% 本地 CPU/内存占用):
+aegis-os cloud up --endpoint ${origin} --api-key ${latestKey}
+
+# 3. 终端内查看云端 CoW 源码 Diff / 审批人类租约 / 拉回改动 / 导出 PR:
+aegis-os cloud diff
+aegis-os cloud approvals && aegis-os cloud approve <escalation_id>
+aegis-os cloud pull && aegis-os cloud pr`;
+      }
+    }
+
+    function copyCliSnippet() {
+      const txt = document.getElementById('cli-snippet').textContent;
+      navigator.clipboard?.writeText(txt);
+      toast(currentLang === 'en' ? 'CLI snippet copied to clipboard' : 'CLI 接入命令已复制到剪贴板');
     }
 
     async function changePlan(plan) {
@@ -1743,7 +2585,29 @@ aegis-os cloud down`;
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ org_id: 'aegis-os', plan_tier: plan })
       });
-      toast(`已切换套餐至 ${plan.toUpperCase()}`);
+      toast(currentLang === 'en' ? `Switched tenant plan to ${plan.toUpperCase()}` : `已切换租户套餐至 ${plan.toUpperCase()}`);
+      refresh(true);
+    }
+
+    async function claimSubscriptionKey() {
+      const email = document.getElementById('claim-email').value.trim();
+      if (!email) {
+        toast(currentLang === 'en' ? 'Please enter your billing email' : '请输入您在 Polar.sh 付款时填写的邮箱');
+        return;
+      }
+      const res = await fetch('/v1/billing/claim', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ email })
+      });
+      const d = await res.json();
+      if (d.error) {
+        toast(currentLang === 'en' ? `Claim failed: ${d.error}` : `未查找到待领取密钥: ${d.error}`);
+        return;
+      }
+      latestKey = d.api_key;
+      updateCliSnippet();
+      toast(currentLang === 'en' ? `Claimed API Key: ${d.api_key}` : `成功领取订阅密钥: ${d.api_key}`);
       refresh(true);
     }
 
@@ -1759,7 +2623,7 @@ aegis-os cloud down`;
         })
       });
       const d = await res.json();
-      toast(`已生成测试审批单 ${d.escalation_id}`);
+      toast(currentLang === 'en' ? `Simulated escalation ${d.escalation_id}` : `已生成边界审批单 ${d.escalation_id}`);
       refresh(true);
     }
 
@@ -1769,7 +2633,9 @@ aegis-os cloud down`;
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ escalation_id: id, decision, ttl_secs: ttl })
       });
-      toast(decision === 'approve' ? `已批准 ${id}` : `已拒绝 ${id}`);
+      toast(decision === 'approve'
+        ? (currentLang === 'en' ? `Approved lease for ${id}` : `已批准并签发租约 ${id}`)
+        : (currentLang === 'en' ? `Rejected ${id}` : `已拒绝拦截 ${id}`));
       refresh(true);
     }
 
@@ -1778,7 +2644,8 @@ aegis-os cloud down`;
       if (wsId) q.set('workspace_id', wsId);
       const res = await fetch(`/v1/workspaces/diff?${q.toString()}`);
       const d = await res.json();
-      document.getElementById('diff-title').textContent = `源码 Diff (${orgId}/${agentId} · ${d.changes_count || 0} 文件变更)`;
+      document.getElementById('diff-title').textContent =
+        `UNIFIED SOURCE DIFF · ${orgId}/${agentId} (${d.changes_count || 0} FILES CHANGED)`;
       document.getElementById('diff-content').textContent =
         (d.unified_diff && d.unified_diff.trim())
           ? d.unified_diff
@@ -1797,8 +2664,8 @@ aegis-os cloud down`;
         body: JSON.stringify({ org_id, workspace_id, source_url, agents })
       });
       const d = await res.json();
-      if (d.error) { toast(`错误: ${d.error}`); return; }
-      toast(`已分叉云端 CoW 工作区 ${workspace_id}`);
+      if (d.error) { toast(`Error: ${d.error}`); return; }
+      toast(currentLang === 'en' ? `Provisioned CoW workspace ${workspace_id}` : `已派生云端写时复制工作区 ${workspace_id}`);
       refresh(true);
     }
 
@@ -1811,8 +2678,8 @@ aegis-os cloud down`;
       });
       const d = await res.json();
       toast(currentStatus === 'hibernated'
-        ? `工作区已瞬时唤醒 (${d.wake_latency_ms || 0}ms)`
-        : `工作区已进入 Scale-to-Zero 休眠 (0 内存占用)`);
+        ? (currentLang === 'en' ? `Woke workspace in ${d.wake_latency_ms || 0}ms` : `工作区已瞬时唤醒 (${d.wake_latency_ms || 0}ms)`)
+        : (currentLang === 'en' ? 'Workspace hibernated (Scale-to-Zero · 0 RAM)' : '工作区已进入 Scale-to-Zero 休眠 (0 内存占用)'));
       refresh(true);
     }
 
@@ -1823,12 +2690,14 @@ aegis-os cloud down`;
         body: JSON.stringify({ org_id: orgId, workspace_id: wsId, agent_id: agentId })
       });
       const d = await res.json();
-      document.getElementById('diff-title').textContent = `Git PR 补丁导出 (${d.git_branch || ''} @ ${d.git_commit_sha || ''})`;
+      document.getElementById('diff-title').textContent =
+        `GIT PR PATCH BUNDLE · ${d.git_branch || ''} @ ${d.git_commit_sha || ''}`;
       document.getElementById('diff-content').textContent =
         (d.unified_patch && d.unified_patch.trim())
           ? d.unified_patch
           : JSON.stringify(d.github_pr_payload || d, null, 2);
       document.getElementById('diff-drawer').style.display = 'block';
+      document.getElementById('sec-approvals').scrollIntoView({ behavior: 'smooth' });
       refresh(true);
     }
 
@@ -1844,7 +2713,7 @@ aegis-os cloud down`;
       const d = await res.json();
       latestKey = d.api_key;
       updateCliSnippet();
-      toast(`已签发 Key: ${d.api_key}`);
+      toast(currentLang === 'en' ? `Issued Key: ${d.api_key}` : `已签发密钥: ${d.api_key}`);
       refresh(true);
     }
 
@@ -1852,7 +2721,7 @@ aegis-os cloud down`;
       try {
         const res = await fetch('/v1/status?org_id=*');
         const data = await res.json();
-        const sig = JSON.stringify(data);
+        const sig = JSON.stringify(data) + ':' + currentLang;
         if (!force && sig === lastSig) return;
         lastSig = sig;
 
@@ -1873,65 +2742,80 @@ aegis-os cloud down`;
         });
         if (tenants[0]) {
           const tier = (tenants[0].plan_tier || 'pro').toUpperCase();
-          document.getElementById('plan-badge').textContent = `${tier} Plan · Max ${tenants[0].max_concurrent_agents} Agents`;
+          document.getElementById('plan-badge').textContent =
+            `AEGIS CLOUD · ${tier} (${tenants[0].max_concurrent_agents} AGENTS)`;
         }
 
         document.getElementById('st-pending').textContent = pending.length;
         document.getElementById('st-ws').textContent = `${activeWs} / ${hibWs}`;
-        document.getElementById('st-usage').textContent = `${totalCalls} calls · ${totalMs}ms`;
+        document.getElementById('st-usage').textContent = `${totalCalls} · ${totalMs}ms`;
         document.getElementById('st-saved').textContent = `${(savedBytes / 1024).toFixed(1)} KB`;
         document.getElementById('pending-pill').textContent = pending.length;
 
         const appBox = document.getElementById('approvals-box');
         if (pending.length === 0) {
-          appBox.innerHTML = `<div class="empty">当前无待审批请求（所有沙箱内操作均已自动放行）。</div>`;
+          appBox.innerHTML = `<div class="empty">${
+            currentLang === 'en'
+              ? 'No pending boundary escalations — all in-sandbox operations are executing with zero prompts.'
+              : '当前无待处理边界审批 — 所有绿区沙箱内读写与测试均处于零弹窗静默放行状态。'
+          }</div>`;
         } else {
           appBox.innerHTML = pending.map(e => `
             <div class="approval-row">
-              <div>
-                <div>
-                  <span class="pill amber">${e.action}</span>
-                  <code class="mono" style="margin-left:6px;">${e.org_id}/${e.agent_id}</code>
-                  <code class="mono" style="color:var(--muted); margin-left:6px;">(${e.escalation_id})</code>
+              <div class="approval-meta">
+                <div style="display:flex; align-items:center; gap:0.55rem; flex-wrap:wrap;">
+                  <span class="tag tag-warm"><span class="dot-warm"></span>${e.action}</span>
+                  <code class="mono" style="font-size:0.82rem; font-weight:500;">${e.org_id}/${e.agent_id}</code>
+                  <code class="mono" style="font-size:0.74rem; color:var(--ink-muted);">(${e.escalation_id})</code>
                 </div>
-                <div class="mono" style="font-size:12px; color:var(--muted); margin-top:4px;">${e.reason}</div>
+                <div class="mono" style="font-size:0.76rem; color:var(--ink-secondary);">${e.reason}</div>
               </div>
               <div class="actions">
-                <button class="btn" onclick="inspectDiff('${e.org_id}', '${e.agent_id}', '')">查看 Diff</button>
-                <button class="btn btn-success" onclick="decide('${e.escalation_id}', 'approve', 0)">批准 1 次</button>
-                <button class="btn btn-primary" onclick="decide('${e.escalation_id}', 'approve', 3600)">1h 租约</button>
-                <button class="btn btn-danger" onclick="decide('${e.escalation_id}', 'deny', 0)">拒绝</button>
+                <button class="btn" onclick="inspectDiff('${e.org_id}', '${e.agent_id}', '')">${currentLang === 'en' ? 'Inspect Diff' : '查看源码 Diff'}</button>
+                <button class="btn btn-mint" onclick="decide('${e.escalation_id}', 'approve', 0)">${currentLang === 'en' ? 'Approve Once' : '批准单次'}</button>
+                <button class="btn btn-solid" onclick="decide('${e.escalation_id}', 'approve', 3600)">${currentLang === 'en' ? '1h Lease' : '签发 1h 租约'}</button>
+                <button class="btn btn-danger" onclick="decide('${e.escalation_id}', 'deny', 0)">${currentLang === 'en' ? 'Deny' : '拒绝拦截'}</button>
               </div>
             </div>
           `).join('');
         }
 
         document.getElementById('ws-tbody').innerHTML = workspaces.length === 0
-          ? `<tr><td colspan="4" class="empty">暂无云工作区</td></tr>`
+          ? `<tr><td colspan="4" class="empty">${currentLang === 'en' ? 'No active cloud workspaces provisioned yet.' : '暂未派生云端写时复制工作区。'}</td></tr>`
           : workspaces.map(w => {
               const isHib = w.status === 'hibernated';
               const firstAgent = (w.agents && w.agents[0]) || 'cloud-coder-1';
               return `
                 <tr>
-                  <td><strong>${w.org_id}/${w.workspace_id}</strong> <code class="mono" style="color:var(--muted);">(${w.branch})</code></td>
-                  <td><span class="pill ${isHib ? 'muted' : 'green'}">${isHib ? 'HIBERNATED (0 RAM)' : 'ACTIVE'}</span></td>
-                  <td>${(w.agents || []).map(a => `<code class="mono" style="margin-right:6px;">${a}</code>`).join('')}</td>
-                  <td class="actions">
-                    <button class="btn" onclick="inspectDiff('${w.org_id}', '${firstAgent}', '${w.workspace_id}')">Diff</button>
-                    <button class="btn" onclick="toggleHibernate('${w.org_id}', '${w.workspace_id}', '${w.status || 'active'}')">${isHib ? '唤醒 (Wake)' : '休眠 (Scale-to-0)'}</button>
-                    <button class="btn btn-primary" onclick="exportPr('${w.org_id}', '${w.workspace_id}', '${firstAgent}')">导出 PR</button>
+                  <td>
+                    <strong style="font-weight:500;">${w.org_id}/${w.workspace_id}</strong>
+                    <code class="mono" style="font-size:0.74rem; color:var(--ink-muted); margin-left:0.4rem;">(${w.branch})</code>
+                  </td>
+                  <td>
+                    <span class="tag ${isHib ? '' : 'tag-active'}">
+                      ${isHib ? '' : '<span class="dot-mint"></span>'}
+                      ${isHib ? 'HIBERNATED · 0 RAM' : 'ACTIVE · BTRFS COW'}
+                    </span>
+                  </td>
+                  <td>${(w.agents || []).map(a => `<code class="mono" style="font-size:0.76rem; padding:0.12rem 0.45rem; border:1px solid var(--border); background:var(--bg-primary); margin-right:0.35rem;">${a}</code>`).join('')}</td>
+                  <td>
+                    <div class="actions">
+                      <button class="btn" onclick="inspectDiff('${w.org_id}', '${firstAgent}', '${w.workspace_id}')">Diff</button>
+                      <button class="btn" onclick="toggleHibernate('${w.org_id}', '${w.workspace_id}', '${w.status || 'active'}')">${isHib ? (currentLang === 'en' ? 'Wake' : '瞬时唤醒') : (currentLang === 'en' ? 'Hibernate' : '休眠 (Scale-to-0)')}</button>
+                      <button class="btn btn-solid" onclick="exportPr('${w.org_id}', '${w.workspace_id}', '${firstAgent}')">${currentLang === 'en' ? 'Export PR →' : '导出 PR →'}</button>
+                    </div>
                   </td>
                 </tr>`;
             }).join('');
 
         document.getElementById('keys-tbody').innerHTML = keys.length === 0
-          ? `<tr><td colspan="4" class="empty">暂未签发 API Key</td></tr>`
+          ? `<tr><td colspan="4" class="empty">${currentLang === 'en' ? 'No scoped API keys issued yet.' : '暂未签发 API 密钥。'}</td></tr>`
           : keys.map(k => `
               <tr>
-                <td><code class="mono">${k.key_prefix}</code></td>
-                <td><code class="mono">${k.org_id}/${k.agent_id}</code></td>
-                <td><code class="mono">${k.workspace_id || '*'}</code></td>
-                <td><span class="pill green">${leases.length} active</span></td>
+                <td><code class="mono" style="font-size:0.78rem;">${k.key_prefix}</code></td>
+                <td><code class="mono" style="font-size:0.78rem;">${k.org_id}/${k.agent_id}</code></td>
+                <td><code class="mono" style="font-size:0.78rem; color:var(--ink-secondary);">${k.workspace_id || '*'}</code></td>
+                <td><span class="tag tag-active"><span class="dot-mint"></span>${leases.length} ACTIVE</span></td>
               </tr>
             `).join('');
       } catch (e) {
@@ -1939,9 +2823,8 @@ aegis-os cloud down`;
       }
     }
 
-    updateCliSnippet();
-    refresh(true);
-    setInterval(() => refresh(false), 2000);
+    applyLang(currentLang);
+    setInterval(() => refresh(false), 2500);
   </script>
 </body>
 </html>
