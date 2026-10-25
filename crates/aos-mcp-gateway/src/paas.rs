@@ -2473,7 +2473,7 @@ pub const DASHBOARD_HTML: &str = r##"<!doctype html>
         </div>
 
         <div class="onboarding-grid">
-          <!-- Left Card: Free Plan (1-Line Install + Natural Language in AI Agent) -->
+          <!-- Left Card: Free Plan -->
           <div class="editorial-card">
             <div class="card-body">
               <div class="card-head">
@@ -2482,26 +2482,17 @@ pub const DASHBOARD_HTML: &str = r##"<!doctype html>
                   <h3 class="card-title" data-i18n="tier_free_title">$0 / 月 · 1 个云端工作区 · 1 个 Agent</h3>
                 </div>
               </div>
-              <p class="card-desc" data-i18n="tier_free_desc">只需在终端运行一次安装命令，自动把 Aegis OS 接入你的 AI Agent 客户端（Claude / Cursor / Codex / AGY 等），全程无需手动管理密钥：</p>
+              <p class="card-desc" data-i18n="tier_free_desc">一键安装并接入你的通用 AI Agent（Claude / Cursor / Codex / AGY 等），自动生成本机免费密钥，无需手动传参：</p>
 
               <div class="cmd-bar">
-                <span class="cmd-title" data-i18n="free_cmd_title">① 首次安装（在本地终端运行一次）：</span>
-                <button class="btn" onclick="copyFreeSnippet()" data-i18n="btn_copy_free">复制安装命令</button>
+                <span class="cmd-title" data-i18n="free_cmd_title">在终端运行（安装并启用免费云端沙箱）：</span>
+                <button class="btn" onclick="copyFreeSnippet()" data-i18n="btn_copy_free">复制命令</button>
               </div>
               <pre class="code" id="cli-snippet-free"></pre>
             </div>
-
-            <div class="sub-box">
-              <div style="font-size:0.8rem; font-weight:600; color:var(--ink); margin-bottom:0.45rem;" data-i18n="free_step3_title">② 安装后打开你的 AI Agent，直接用自然语言对它说：</div>
-              <div style="display:grid; gap:0.4rem; font-size:0.78rem; color:var(--ink-secondary);">
-                <div><code class="mono" style="color:var(--accent); font-weight:600;" data-i18n="prompt_free_1">「开启 Aegis 免费云端沙箱模式」</code> — <span data-i18n="cmd_diff_desc">本地进程自动绑定免费工作区（密钥不经过大模型）</span></div>
-                <div><code class="mono" style="color:var(--accent); font-weight:600;" data-i18n="prompt_free_2">「看看你在云端做了哪些改动」</code> — <span data-i18n="cmd_pull_desc">AI 自动调用 workspace_diff 展示所有变更对比</span></div>
-                <div><code class="mono" style="color:var(--accent); font-weight:600;" data-i18n="prompt_free_3">「确认没问题，把云端结果同步回本地」</code> — <span data-i18n="cmd_down_desc">AI 自动调用 workspace_commit 同步回你的电脑</span></div>
-              </div>
-            </div>
           </div>
 
-          <!-- Right Card: Pro Plan ($29/mo, Local Terminal Bind + Natural Language in AI Agent, Zero LLM Key Exposure) -->
+          <!-- Right Card: Pro Plan ($29/mo) -->
           <div class="editorial-card editorial-card-pro">
             <div class="card-body">
               <div class="card-head">
@@ -2512,22 +2503,13 @@ pub const DASHBOARD_HTML: &str = r##"<!doctype html>
                 <a class="btn btn-solid" href="https://buy.polar.sh/polar_cl_jCPpzbp4eOAyRbkDP4YzNIFVnYLddbvJZI5Fc27zL0x" target="_blank" rel="noopener" data-i18n="btn_buy_pro">① 立即订阅 Pro ($29/月) →</a>
               </div>
 
-              <p class="card-desc" data-i18n="tier_pro_desc">解锁最多 16 个云端工作区与 8 个 AI Agent 并行：密钥通过终端命令直接存入你本机（~/.aegis-os），由本地进程自动附加，绝不暴露给大模型：</p>
+              <p class="card-desc" data-i18n="tier_pro_desc">解锁最多 16 个云端工作区与 8 个 AI Agent 并行：付款后用邮箱在本机直接认领密钥并启用，密钥直存本机（不经过大模型）：</p>
 
               <div class="cmd-bar">
-                <span class="cmd-title" data-i18n="pro_cmd_title">② 付款后在终端运行一次（密钥直存本机，不经过 LLM）：</span>
-                <button class="btn" onclick="copyProSnippet()" data-i18n="btn_copy_pro">复制绑定命令</button>
+                <span class="cmd-title" data-i18n="pro_cmd_title">② 付款后在终端运行（绑定 Pro 密钥并启用）：</span>
+                <button class="btn" onclick="copyProSnippet()" data-i18n="btn_copy_pro">复制命令</button>
               </div>
               <pre class="code" id="cli-snippet-pro"></pre>
-            </div>
-
-            <div class="sub-box">
-              <div style="font-size:0.8rem; font-weight:600; color:var(--accent); margin-bottom:0.45rem;" data-i18n="claim_card_title">③ 绑定后打开你的 AI Agent，直接用自然语言对它说（无需传密钥）：</div>
-              <div style="display:grid; gap:0.4rem; font-size:0.78rem; color:var(--ink-secondary);">
-                <div><code class="mono" style="color:var(--accent); font-weight:600;" data-i18n="prompt_pro_1">「开启 Aegis Cloud Pro 云端沙箱模式」</code> — <span data-i18n="pro_desc_1">本地进程自动读取本机 Pro 凭证（LLM 零接触密钥）</span></div>
-                <div><code class="mono" style="color:var(--accent); font-weight:600;" data-i18n="prompt_pro_2">「派 3 个子 Agent 在云端并行做调研、跑分析、生成结果」</code> — <span data-i18n="pro_desc_2">最多 8 个 Agent 在 64GB 云端独立副本同时工作</span></div>
-                <div><code class="mono" style="color:var(--accent); font-weight:600;" data-i18n="prompt_pro_3">「看看云端的改动结果，确认没问题就同步回本地」</code> — <span data-i18n="pro_desc_3">AI 自动对比变更并同步回你的电脑</span></div>
-              </div>
             </div>
           </div>
         </div>
@@ -2592,29 +2574,15 @@ pub const DASHBOARD_HTML: &str = r##"<!doctype html>
         sec3_label: '安装一次插件 · 后续全部在你的 AI AGENT 对话框内完成',
         tier_free_tag: '免费版 · 无需注册或绑卡',
         tier_free_title: '$0 / 月 · 1 个云端工作区 · 1 个 Agent',
-        tier_free_desc: '只需在终端运行一次安装命令，自动把 Aegis OS 接入你的 AI Agent 客户端（Claude / Cursor / Codex / AGY 等），全程无需手动管理密钥：',
-        free_cmd_title: '① 首次安装（在本地终端运行一次）：',
-        btn_copy_free: '复制安装命令',
-        free_step3_title: '② 安装后打开你的 AI Agent，直接用自然语言对它说：',
-        prompt_free_1: '「开启 Aegis 免费云端沙箱模式」',
-        cmd_diff_desc: '本地进程自动绑定免费工作区（密钥不经过大模型）',
-        prompt_free_2: '「看看你在云端做了哪些改动」',
-        cmd_pull_desc: 'AI 自动调用 workspace_diff 展示所有变更对比',
-        prompt_free_3: '「确认没问题，把云端结果同步回本地」',
-        cmd_down_desc: 'AI 自动调用 workspace_commit 同步回你的电脑',
+        tier_free_desc: '一键安装并接入你的通用 AI Agent（Claude / Cursor / Codex / AGY 等），自动生成本机免费密钥，无需手动传参：',
+        free_cmd_title: '在终端运行（安装并启用免费云端沙箱）：',
+        btn_copy_free: '复制命令',
         tier_pro_tag: 'PRO 专业版 · 多 AGENT 并行',
         tier_pro_title: '$29 / 月 · 多个工作区 · 8 个 Agent 并行',
         btn_buy_pro: '① 立即订阅 Pro ($29/月) →',
-        tier_pro_desc: '解锁最多 16 个云端工作区与 8 个 AI Agent 并行：密钥通过终端命令直接存入你本机（~/.aegis-os），由本地进程自动附加，绝不暴露给大模型：',
-        pro_cmd_title: '② 付款后在终端运行一次（密钥直存本机，不经过 LLM）：',
-        btn_copy_pro: '复制绑定命令',
-        claim_card_title: '③ 绑定后打开你的 AI Agent，直接用自然语言对它说（无需传密钥）：',
-        prompt_pro_1: '「开启 Aegis Cloud Pro 云端沙箱模式」',
-        pro_desc_1: '本地进程自动读取本机 Pro 凭证（LLM 零接触密钥）',
-        prompt_pro_2: '「派 3 个子 Agent 在云端并行做调研、跑分析、生成结果」',
-        pro_desc_2: '最多 8 个 Agent 在 64GB 云端独立副本同时工作',
-        prompt_pro_3: '「看看云端的改动结果，确认没问题就同步回本地」',
-        pro_desc_3: 'AI 自动对比变更并同步回你的电脑'
+        tier_pro_desc: '解锁最多 16 个云端工作区与 8 个 AI Agent 并行：付款后用邮箱在本机直接认领密钥并启用，密钥直存本机（不经过大模型）：',
+        pro_cmd_title: '② 付款后在终端运行（绑定 Pro 密钥并启用）：',
+        btn_copy_pro: '复制命令'
       },
       en: {
         nav_home: 'Heurion.org ↗',
@@ -2643,29 +2611,15 @@ pub const DASHBOARD_HTML: &str = r##"<!doctype html>
         sec3_label: 'INSTALL ONCE · EVERYTHING ELSE HAPPENS IN YOUR AI AGENT CHAT',
         tier_free_tag: 'FREE PLAN · NO SIGNUP REQUIRED',
         tier_free_title: '$0 / mo · 1 Workspace · 1 Agent',
-        tier_free_desc: 'Run the 1-line installer once in terminal to wire Aegis OS into your AI Agent (Claude, Cursor, Codex, or AGY). Zero manual key management required:',
-        free_cmd_title: '① One-Time Install (run once in local terminal):',
-        btn_copy_free: 'Copy Install Command',
-        free_step3_title: '② Open your AI Agent and say in natural language:',
-        prompt_free_1: '"Enable Aegis free cloud sandbox mode"',
-        cmd_diff_desc: 'Local runtime auto-binds your free workspace (key never touches LLM)',
-        prompt_free_2: '"Show me the changes you made in the cloud"',
-        cmd_pull_desc: 'AI calls workspace_diff to display all file changes',
-        prompt_free_3: '"Looks good, sync the cloud results back to my workspace"',
-        cmd_down_desc: 'AI calls workspace_commit & syncs files back to your laptop',
+        tier_free_desc: 'Install once to connect your AI Agent (Claude, Cursor, Codex, or AGY) with an auto-provisioned local key — zero manual flags required:',
+        free_cmd_title: 'Run in terminal (install & enable free cloud sandbox):',
+        btn_copy_free: 'Copy Command',
         tier_pro_tag: 'PRO PLAN · PARALLEL AGENTS',
         tier_pro_title: '$29 / mo · Multi-Workspace · 8 Agents',
         btn_buy_pro: '① Subscribe to Pro ($29/mo) →',
-        tier_pro_desc: 'Unlock up to 16 cloud workspaces and 8 parallel AI Agents: bind your Pro subscription in local terminal so your API key stays in ~/.aegis-os and never enters the LLM context:',
-        pro_cmd_title: '② After payment, bind once in terminal (key stays local, never in LLM):',
-        btn_copy_pro: 'Copy Bind Command',
-        claim_card_title: '③ Open your AI Agent and say in natural language (no key needed):',
-        prompt_pro_1: '"Enable Aegis Cloud Pro sandbox mode"',
-        pro_desc_1: 'Local runtime uses your bound Pro key (zero LLM exposure)',
-        prompt_pro_2: '"Spawn 3 sub-agents in the cloud to research, analyze, and execute"',
-        pro_desc_2: 'Up to 8 Agents run in parallel in isolated 64GB cloud copies',
-        prompt_pro_3: '"Show me the cloud changes and sync the approved results"',
-        pro_desc_3: 'AI reviews the diff and syncs results back to your laptop'
+        tier_pro_desc: 'Unlock up to 16 cloud workspaces and 8 parallel AI Agents: claim your Pro key directly in terminal so it stays in ~/.aegis-os and never touches the LLM:',
+        pro_cmd_title: '② After payment, run in terminal (bind Pro key & enable):',
+        btn_copy_pro: 'Copy Command'
       }
     };
 
@@ -2705,23 +2659,25 @@ pub const DASHBOARD_HTML: &str = r##"<!doctype html>
       const proBox = document.getElementById('cli-snippet-pro');
       if (freeBox) {
         freeBox.textContent = currentLang === 'en'
-          ? `# 1. Install CLI & auto-configure Claude Code / Cursor / Codex / AGY
+          ? `# 1. Install & auto-configure your AI Agent (Claude / Cursor / Codex / AGY)
 curl -fsSL ${origin}/aegis-cloud/install.sh | sh
-# 2. Free plan requires no manual API key (auto-provisioned locally)`
-          : `# 1. 自动安装客户端并配置 Claude Code / Cursor / Codex / AGY
+# 2. Enable Free Cloud Sandbox in your project directory
+aegis-os cloud up`
+          : `# 1. 安装并自动接入你的 AI Agent（Claude / Cursor / Codex / AGY）
 curl -fsSL ${origin}/aegis-cloud/install.sh | sh
-# 2. 免费版无需手动配置密钥（本地进程会自动向云端申请并保存）`;
+# 2. 在当前目录启用免费云端沙箱（之后直接在 AI 对话框正常使用即可）
+aegis-os cloud up`;
       }
       if (proBox) {
         proBox.textContent = currentLang === 'en'
           ? `# 1. Install CLI if not already installed
 curl -fsSL ${origin}/aegis-cloud/install.sh | sh
-# 2. Bind Pro key locally in ~/.aegis-os (never exposed to LLM)
-aegis-os cloud subscribe --claim --email you@company.com`
+# 2. Claim Pro key locally (~/.aegis-os) & enable Cloud Sandbox
+aegis-os cloud subscribe --claim --email you@company.com && aegis-os cloud up`
           : `# 1. 若首次使用，先运行一行安装命令（已安装可跳过）
 curl -fsSL ${origin}/aegis-cloud/install.sh | sh
-# 2. 用付款邮箱在本机直接绑定 Pro 密钥（直存 ~/.aegis-os，不经过 LLM）
-aegis-os cloud subscribe --claim --email 你的付款邮箱`;
+# 2. 用付款邮箱在本机认领 Pro 密钥并启用云端沙箱（密钥不经过 LLM）
+aegis-os cloud subscribe --claim --email 你的付款邮箱 && aegis-os cloud up`;
       }
     }
 
