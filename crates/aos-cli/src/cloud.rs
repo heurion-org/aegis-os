@@ -91,15 +91,15 @@ pub enum CloudAction {
         title: Option<String>,
     },
 
-    /// Set or upgrade tenant subscription plan tier (`community`, `pro`, `team`, `enterprise`)
+    /// Set or upgrade tenant subscription plan tier (`community` Free 1 Agent, or `pro` $29/mo 8 Agents)
     Plan {
-        /// Target plan tier (`community`, `pro`, `team`, `enterprise`)
+        /// Target plan tier (`community` or `pro`)
         tier: String,
     },
 
-    /// Open or generate a Polar.sh / Lemon Squeezy subscription checkout URL, or `--claim` your activated `ak_live_*` key
+    /// Open or generate a Polar.sh subscription checkout URL, or `--claim` your activated `ak_live_*` key
     Subscribe {
-        /// Target subscription plan (`pro` $29/mo or `team` $79/mo)
+        /// Target subscription plan (`pro` $29/mo)
         #[arg(long, default_value = "pro")]
         plan: String,
         /// Subscriber email used during Polar.sh / Lemon Squeezy checkout

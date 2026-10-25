@@ -3496,9 +3496,9 @@ mod tests {
         .await;
         assert!(plan_head.contains("200 OK"));
         assert_eq!(plan_resp["monthly_price_usd"], 0);
-        assert_eq!(plan_resp["tenant"]["max_concurrent_agents"], 2);
+        assert_eq!(plan_resp["tenant"]["max_concurrent_agents"], 1);
 
-        // Requesting 3 agents on Community plan (max 2) must fail
+        // Requesting 3 agents on Community plan (max 1) must fail
         let (over_head, over_resp) = http_call(
             addr,
             "POST",
@@ -3513,7 +3513,7 @@ mod tests {
         )
         .await;
         assert!(over_head.contains("500 Internal Server Error"));
-        assert!(over_resp["error"].as_str().unwrap().contains("at most 2 concurrent cloud agents"));
+        assert!(over_resp["error"].as_str().unwrap().contains("at most 1 concurrent cloud agents"));
 
         // Upgrade tenant to Pro ($29/mo, max 8 agents)
         let (_, up_resp) = http_call(

@@ -49,7 +49,7 @@ impl PlanTier {
 
     pub fn max_concurrent_agents(&self) -> usize {
         match self {
-            Self::Community => 2,
+            Self::Community => 1,
             Self::Pro => 8,
             Self::Team => 32,
             Self::Enterprise => 256,
@@ -2108,26 +2108,21 @@ pub const DASHBOARD_HTML: &str = r##"<!doctype html>
           <span class="brand-word">HEURION</span>
         </a>
         <span class="brand-sep">/</span>
-        <span class="brand-sub" id="plan-badge">AEGIS CLOUD · PRO</span>
+        <span class="brand-sub">AEGIS CLOUD</span>
       </div>
 
       <nav class="nav-links" aria-label="Console Sections">
         <a href="#sec-approvals" class="nav-link" data-i18n="nav_approvals">01 / 待你确认</a>
         <a href="#sec-workspaces" class="nav-link" data-i18n="nav_workspaces">02 / 云端工作区</a>
-        <a href="#sec-onboarding" class="nav-link" data-i18n="nav_onboarding">03 / 接入与密钥</a>
+        <a href="#sec-onboarding" class="nav-link" data-i18n="nav_onboarding">03 / 方案与接入</a>
         <a href="https://heurion.org/" class="nav-link" data-i18n="nav_home">Heurion 主站 ↗</a>
         <a href="https://github.com/heurion-org/aegis-os" target="_blank" rel="noopener" class="nav-link">GitHub ↗</a>
       </nav>
 
       <div class="nav-right">
-        <select id="plan-select" onchange="changePlan(this.value)" aria-label="Select Tier">
-          <option value="community">免费版 · 2 个 AI 同时运行</option>
-          <option value="pro" selected>Pro 版 ($29/月) · 8 个 AI 同时运行</option>
-          <option value="team">团队版 ($79/月) · 32 个 AI 同时运行</option>
-          <option value="enterprise">企业版 · 256 个 AI 专属集群</option>
-        </select>
+        <span class="tag tag-active" id="plan-badge">当前方案：免费版 (1 个 AI)</span>
         <button class="lang-btn" id="langBtn" type="button" onclick="toggleLang()">EN</button>
-        <a class="btn btn-solid" id="polar-checkout-btn" href="https://buy.polar.sh/polar_cl_jCPpzbp4eOAyRbkDP4YzNIFVnYLddbvJZI5Fc27zL0x" target="_blank" rel="noopener" data-i18n="nav_subscribe">开通 Pro ($29/月) →</a>
+        <a class="btn btn-solid" href="#sec-onboarding" data-i18n="nav_subscribe">升级 Pro / 接入指南 →</a>
       </div>
     </div>
   </header>
@@ -2294,54 +2289,84 @@ pub const DASHBOARD_HTML: &str = r##"<!doctype html>
       </div>
     </section>
 
-    <!-- Section 03: CLI Onboarding, Polar.sh Claim & API Keys -->
+    <!-- Section 03: Plans, Clear 3-Step Subscription Flow & Terminal Onboarding -->
     <section class="sec-primary" id="sec-onboarding">
       <div class="container">
         <div class="section-header">
           <div class="section-title-group">
             <span class="section-num">03</span>
-            <h2 class="heading-2" data-i18n-html="sec3_title">30 秒接入指南与 <em>API 密钥</em></h2>
+            <h2 class="heading-2" data-i18n-html="sec3_title">方案对比、开通流程与 <em>30 秒终端接入</em></h2>
           </div>
-          <p class="label-caps" data-i18n="sec3_label">03 / 终端接入与会员密钥提取</p>
+          <p class="label-caps" data-i18n="sec3_label">03 / 免费版与 PRO 版说明</p>
         </div>
 
         <div class="onboarding-grid">
-          <!-- Left: 3-Step CLI Quickstart -->
-          <div class="editorial-card">
-            <div style="display:flex; justify-content:space-between; align-items:center; margin-bottom:0.85rem;">
-              <span style="font-size:0.82rem; font-weight:600; color:var(--ink);" data-i18n="cli_card_title">在你的电脑终端运行这 3 步即可连上云端：</span>
-              <button class="btn" onclick="copyCliSnippet()" data-i18n="btn_copy">复制命令</button>
-            </div>
-            <pre class="code" id="cli-snippet"></pre>
-          </div>
-
-          <!-- Right: Polar.sh Subscription Key Claim & Manual Key Minting -->
+          <!-- Left: Clear 2-Tier Comparison & 3-Step Subscription Explanation -->
           <div class="editorial-card" style="display:flex; flex-direction:column; justify-content:space-between; gap:1.35rem;">
             <div>
-              <span style="font-size:0.82rem; font-weight:600; color:var(--accent);" data-i18n="claim_card_title">已购买 Pro / Team 会员？输入邮箱领密钥</span>
-              <p class="text-muted" style="margin: 0.45rem 0 0.85rem; font-size:0.84rem;" data-i18n="claim_card_desc">在 Polar.sh 付款成功后，输入你付款时填的邮箱，直接提取系统为你生成的专属 API Key：</p>
-              <div style="display:flex; gap:0.5rem; flex-wrap:wrap;">
-                <input class="mono-input" id="claim-email" type="email" placeholder="你的付款邮箱 (如 you@company.com)" style="flex:1; min-width:170px;" />
-                <button class="btn btn-mint" onclick="claimSubscriptionKey()" data-i18n="btn_claim">提取我的 Key →</button>
+              <div style="display:flex; justify-content:space-between; align-items:baseline; padding-bottom:0.85rem; border-bottom:1px solid var(--border); margin-bottom:1rem;">
+                <div>
+                  <span class="tag" data-i18n="tier_free_tag">免费版 · FREE</span>
+                  <h3 style="font-family:var(--serif); font-size:1.25rem; font-weight:400; margin-top:0.35rem;" data-i18n="tier_free_title">$0 / 月 · 支持 1 个 AI 助手</h3>
+                </div>
+                <button class="btn" onclick="changePlan('community')" data-i18n="btn_use_free">切换为免费版</button>
               </div>
+              <p class="text-muted" style="font-size:0.84rem;" data-i18n="tier_free_desc">适合个人日常轻量开发：支持 1 个 AI 助手在独立临时副本中改代码与跑测试，合并回主项目前提供代码对比预览与人工确认保护。</p>
             </div>
 
             <div style="padding-top:1.15rem; border-top:1px solid var(--border);">
-              <span style="font-size:0.82rem; font-weight:600; color:var(--ink);" data-i18n="mint_card_title">手动生成新密钥</span>
-              <div style="display:flex; gap:0.5rem; flex-wrap:wrap; margin-top:0.65rem;">
-                <input class="mono-input" id="k-org" value="aegis-os" placeholder="团队名" style="width:105px;" />
-                <input class="mono-input" id="k-agent" value="agy-agent" placeholder="AI 助手名" style="width:110px;" />
-                <input class="mono-input" id="k-ws" value="ws-core" placeholder="工作区名" style="width:105px;" />
-                <button class="btn btn-solid" onclick="mintKey()" data-i18n="btn_mint">+ 生成密钥</button>
+              <div style="display:flex; justify-content:space-between; align-items:baseline; margin-bottom:0.65rem; flex-wrap:wrap; gap:0.5rem;">
+                <div>
+                  <span class="tag tag-active"><span class="dot-mint"></span><span data-i18n="tier_pro_tag">PRO 专业版 · 多 AI 并行</span></span>
+                  <h3 style="font-family:var(--serif); font-size:1.35rem; font-weight:400; margin-top:0.35rem;" data-i18n="tier_pro_title">$29 / 月 · 支持 8 个 AI 同时运行</h3>
+                </div>
+                <a class="btn btn-solid" href="https://buy.polar.sh/polar_cl_jCPpzbp4eOAyRbkDP4YzNIFVnYLddbvJZI5Fc27zL0x" target="_blank" rel="noopener" data-i18n="btn_buy_pro">① 在线开通 Pro ($29/月) →</a>
               </div>
+              <p class="text-muted" style="font-size:0.84rem; margin-bottom:0.85rem;" data-i18n="tier_pro_desc">适合重度编译测试与多 AI 协同：最多 8 个 AI 助手在 64GB 内存云主机上同时改代码、跑测试、做审查，本地电脑 0 内存占用，闲置自动休眠。</p>
+
+              <div style="background:var(--bg-primary); border:1px solid var(--border); padding:0.9rem 1.05rem; font-size:0.82rem; color:var(--ink-secondary); line-height:1.75;">
+                <div style="font-weight:600; color:var(--ink); margin-bottom:0.25rem;" data-i18n="flow_box_title">Pro 会员 3 步开通流程：</div>
+                <div data-i18n="flow_step_1">① 点击上方「在线开通 Pro ($29/月)」完成支付（请记住付款时填写的邮箱）；</div>
+                <div data-i18n="flow_step_2">② 在右侧输入框填入你的付款邮箱，点击「提取我的 Pro 密钥」即可拿到专属密钥；</div>
+                <div data-i18n="flow_step_3">③ 复制右侧自动填好密钥的终端命令，在项目文件夹里运行即可连上 64GB 云端沙箱。</div>
+              </div>
+            </div>
+          </div>
+
+          <!-- Right: Step 2 Email Claim + Step 3 CLI Commands -->
+          <div class="editorial-card" style="display:flex; flex-direction:column; justify-content:space-between; gap:1.25rem;">
+            <div>
+              <span style="font-size:0.84rem; font-weight:600; color:var(--accent);" data-i18n="claim_card_title">② 已完成付款？输入邮箱提取你的专属密钥</span>
+              <p class="text-muted" style="margin: 0.35rem 0 0.75rem; font-size:0.82rem;" data-i18n="claim_card_desc">完成在线订阅后，输入你付款时填写的邮箱，系统会自动发放你的专属 API 密钥并填入下方命令：</p>
+              <div style="display:flex; gap:0.5rem; flex-wrap:wrap;">
+                <input class="mono-input" id="claim-email" type="email" placeholder="你的付款邮箱 (如 you@company.com)" style="flex:1; min-width:170px;" />
+                <button class="btn btn-mint" onclick="claimSubscriptionKey()" data-i18n="btn_claim">② 提取我的 Pro 密钥 →</button>
+              </div>
+            </div>
+
+            <div style="padding-top:1rem; border-top:1px solid var(--border);">
+              <div style="display:flex; justify-content:space-between; align-items:center; margin-bottom:0.65rem;">
+                <span style="font-size:0.84rem; font-weight:600; color:var(--ink);" data-i18n="cli_card_title">③ 在你的电脑终端运行这 3 步即可连上云端：</span>
+                <button class="btn" onclick="copyCliSnippet()" data-i18n="btn_copy">复制命令</button>
+              </div>
+              <pre class="code" id="cli-snippet" style="max-height:240px;"></pre>
             </div>
           </div>
         </div>
 
         <div class="editorial-card">
-          <div style="display:flex; justify-content:space-between; align-items:center; margin-bottom:0.75rem;">
-            <span style="font-size:0.82rem; font-weight:600; color:var(--ink);" data-i18n="keys_table_title">已生成的 API 密钥列表</span>
-            <span class="tag tag-active"><span class="dot-mint"></span>已加密保护</span>
+          <div style="display:flex; justify-content:space-between; align-items:center; margin-bottom:0.85rem; flex-wrap:wrap; gap:0.75rem;">
+            <div>
+              <span style="font-size:0.82rem; font-weight:600; color:var(--ink);" data-i18n="keys_table_title">当前生效的 API 密钥列表</span>
+              <span class="tag tag-active" style="margin-left:0.5rem;"><span class="dot-mint"></span>已加密保护</span>
+            </div>
+            <div style="display:flex; gap:0.45rem; flex-wrap:wrap; align-items:center;">
+              <span style="font-size:0.78rem; color:var(--ink-secondary);" data-i18n="mint_card_title">手动生成测试密钥：</span>
+              <input class="mono-input" id="k-org" value="aegis-os" placeholder="团队名" style="width:95px;" />
+              <input class="mono-input" id="k-agent" value="agy-agent" placeholder="AI 助手名" style="width:105px;" />
+              <input class="mono-input" id="k-ws" value="ws-core" placeholder="工作区名" style="width:95px;" />
+              <button class="btn" onclick="mintKey()" data-i18n="btn_mint">+ 生成密钥</button>
+            </div>
           </div>
           <div class="table-wrap">
             <table>
@@ -2395,9 +2420,9 @@ pub const DASHBOARD_HTML: &str = r##"<!doctype html>
       zh: {
         nav_approvals: '01 / 待你确认',
         nav_workspaces: '02 / 云端工作区',
-        nav_onboarding: '03 / 接入与密钥',
+        nav_onboarding: '03 / 方案与接入',
         nav_home: 'Heurion 主站 ↗',
-        nav_subscribe: '开通 Pro ($29/月) →',
+        nav_subscribe: '升级 Pro / 接入指南 →',
         hero_eyebrow: 'HEURION · AEGIS CLOUD 云端 AI 编程工作台',
         hero_title: '让多个 AI 同时改代码，<br>电脑<em>不卡顿</em>，原项目<em>不怕改坏</em>。',
         hero_desc: '把吃内存的编译、测试和多 AI 并行改代码全部放到 64GB 云端服务器上跑。每个 AI 都在独立的临时副本里干活，互不干扰；改好后你先看代码对比，满意再一键同步回本地。',
@@ -2407,7 +2432,7 @@ pub const DASHBOARD_HTML: &str = r##"<!doctype html>
         st_lbl_saved: '为你节省的磁盘空间',
         btn_simulate: '+ 演示一次确认流程',
         btn_refresh: '刷新数据',
-        btn_cli_guide: '30 秒接入指南 →',
+        btn_cli_guide: '查看方案与 30 秒接入 →',
         art_top_l: '工作流程 — 先在独立副本试跑，满意后再合并',
         art_top_r: '64GB 云端服务器',
         svg_step1_t: '1. 秒建独立副本',
@@ -2434,16 +2459,28 @@ pub const DASHBOARD_HTML: &str = r##"<!doctype html>
         th_ws_state: '当前状态',
         th_ws_agents: '正在里面的 AI 助手',
         th_ws_ops: '操作',
-        sec3_title: '30 秒接入指南与 <em>API 密钥</em>',
-        sec3_label: '03 / 终端接入与会员密钥提取',
-        cli_card_title: '在你的电脑终端运行这 3 步即可连上云端：',
+        sec3_title: '方案对比、开通流程与 <em>30 秒终端接入</em>',
+        sec3_label: '03 / 免费版与 PRO 版说明',
+        tier_free_tag: '免费版 · FREE',
+        tier_free_title: '$0 / 月 · 支持 1 个 AI 助手',
+        btn_use_free: '切换为免费版',
+        tier_free_desc: '适合个人日常轻量开发：支持 1 个 AI 助手在独立临时副本中改代码与跑测试，合并回主项目前提供代码对比预览与人工确认保护。',
+        tier_pro_tag: 'PRO 专业版 · 多 AI 并行',
+        tier_pro_title: '$29 / 月 · 支持 8 个 AI 同时运行',
+        btn_buy_pro: '① 在线开通 Pro ($29/月) →',
+        tier_pro_desc: '适合重度编译测试与多 AI 协同：最多 8 个 AI 助手在 64GB 内存云主机上同时改代码、跑测试、做审查，本地电脑 0 内存占用，闲置自动休眠。',
+        flow_box_title: 'Pro 会员 3 步开通流程：',
+        flow_step_1: '① 点击上方「在线开通 Pro ($29/月)」完成支付（请记住付款时填写的邮箱）；',
+        flow_step_2: '② 在右侧输入框填入你的付款邮箱，点击「提取我的 Pro 密钥」即可拿到专属密钥；',
+        flow_step_3: '③ 复制右侧自动填好密钥的终端命令，在项目文件夹里运行即可连上 64GB 云端沙箱。',
+        claim_card_title: '② 已完成付款？输入邮箱提取你的专属密钥',
+        claim_card_desc: '完成在线订阅后，输入你付款时填写的邮箱，系统会自动发放你的专属 API 密钥并填入下方命令：',
+        btn_claim: '② 提取我的 Pro 密钥 →',
+        cli_card_title: '③ 在你的电脑终端运行这 3 步即可连上云端：',
         btn_copy: '复制命令',
-        claim_card_title: '已购买 Pro / Team 会员？输入邮箱领密钥',
-        claim_card_desc: '在 Polar.sh 付款成功后，输入你付款时填的邮箱，直接提取系统为你生成的专属 API Key：',
-        btn_claim: '提取我的 Key →',
-        mint_card_title: '手动生成新密钥',
+        mint_card_title: '手动生成测试密钥：',
         btn_mint: '+ 生成密钥',
-        keys_table_title: '已生成的 API 密钥列表',
+        keys_table_title: '当前生效的 API 密钥列表',
         th_k_prefix: '密钥前缀',
         th_k_id: '绑定的 AI 助手',
         th_k_ws: '所属工作区',
@@ -2452,9 +2489,9 @@ pub const DASHBOARD_HTML: &str = r##"<!doctype html>
       en: {
         nav_approvals: '01 / Approvals',
         nav_workspaces: '02 / Workspaces',
-        nav_onboarding: '03 / Quickstart & Keys',
+        nav_onboarding: '03 / Plans & Setup',
         nav_home: 'Heurion.org ↗',
-        nav_subscribe: 'Get Pro ($29/mo) →',
+        nav_subscribe: 'Plans & Setup →',
         hero_eyebrow: 'HEURION · AEGIS CLOUD AI CODING WORKSPACE',
         hero_title: 'Run multiple coding AIs in parallel —<br><em>zero local lag</em>, <em>zero risk</em> to your repo.',
         hero_desc: 'Offload heavy builds, test suites, and parallel AI edits to our 64GB cloud server. Each AI works in its own isolated copy — nothing touches your main project until you review the diff and approve.',
@@ -2464,7 +2501,7 @@ pub const DASHBOARD_HTML: &str = r##"<!doctype html>
         st_lbl_saved: 'Local Disk Space Saved',
         btn_simulate: '+ Try Demo Approval',
         btn_refresh: 'Refresh',
-        btn_cli_guide: '30-Second Setup →',
+        btn_cli_guide: 'Plans & 30-Second Setup →',
         art_top_l: 'HOW IT WORKS — TEST IN ISOLATED COPIES, MERGE WHEN READY',
         art_top_r: '64GB CLOUD SERVER',
         svg_step1_t: '1. Instant Copy',
@@ -2491,16 +2528,28 @@ pub const DASHBOARD_HTML: &str = r##"<!doctype html>
         th_ws_state: 'Status',
         th_ws_agents: 'Active AI Assistants',
         th_ws_ops: 'Actions',
-        sec3_title: '30-Second Setup &amp; <em>API Keys</em>',
-        sec3_label: '03 / TERMINAL SETUP &amp; SUBSCRIPTION KEYS',
-        cli_card_title: 'Run these 3 steps in your terminal to connect:',
+        sec3_title: 'Plans, Subscription Flow &amp; <em>30-Second Setup</em>',
+        sec3_label: '03 / FREE VS. PRO PLANS',
+        tier_free_tag: 'FREE PLAN',
+        tier_free_title: '$0 / month · 1 AI Assistant',
+        btn_use_free: 'Use Free Plan',
+        tier_free_desc: 'For everyday solo coding: run 1 AI assistant in an isolated copy with diff preview and human approval before merging back to your main project.',
+        tier_pro_tag: 'PRO PLAN · PARALLEL AI',
+        tier_pro_title: '$29 / month · Up to 8 Parallel AIs',
+        btn_buy_pro: '① Subscribe to Pro ($29/mo) →',
+        tier_pro_desc: 'For heavy builds and multi-AI workflows: run up to 8 AI assistants in parallel on our 64GB cloud server with 0% local CPU/RAM load and auto-sleep when idle.',
+        flow_box_title: 'How to activate Pro in 3 simple steps:',
+        flow_step_1: '① Click "Subscribe to Pro ($29/mo)" above and complete payment (remember your checkout email);',
+        flow_step_2: '② Enter your checkout email on the right and click "Claim My Pro Key" to get your API key;',
+        flow_step_3: '③ Copy the terminal commands on the right (pre-filled with your key) and run them in your project folder.',
+        claim_card_title: '② Already subscribed? Enter your email to claim your key',
+        claim_card_desc: 'After completing online payment, enter the email you used at checkout to retrieve your API key and auto-fill the commands below:',
+        btn_claim: '② Claim My Pro Key →',
+        cli_card_title: '③ Run these 3 steps in your terminal to connect:',
         btn_copy: 'Copy Commands',
-        claim_card_title: 'Already bought Pro / Team? Claim your key by email',
-        claim_card_desc: 'After paying on Polar.sh, enter the email you used at checkout to retrieve your API key:',
-        btn_claim: 'Claim My Key →',
-        mint_card_title: 'Or generate a key manually',
+        mint_card_title: 'Generate test key:',
         btn_mint: '+ Generate Key',
-        keys_table_title: 'Your API Keys',
+        keys_table_title: 'Active API Keys',
         th_k_prefix: 'Key Prefix',
         th_k_id: 'AI Assistant',
         th_k_ws: 'Workspace',
@@ -2589,7 +2638,7 @@ aegis-os cloud down    # 断开云端（云工作区自动休眠，不扣费）`
     async function claimSubscriptionKey() {
       const email = document.getElementById('claim-email').value.trim();
       if (!email) {
-        toast(currentLang === 'en' ? 'Please enter your checkout email' : '请输入你在 Polar.sh 付款时填写的邮箱');
+        toast(currentLang === 'en' ? 'Please enter the email you used at checkout' : '请输入你付款时填写的邮箱');
         return;
       }
       const res = await fetch('/v1/billing/claim', {
@@ -2740,11 +2789,12 @@ aegis-os cloud down    # 断开云端（云工作区自动休眠，不扣费）`
           savedBytes += (t.cow_saved_bytes || 0);
         });
         if (tenants[0]) {
-          const tier = (tenants[0].plan_tier || 'pro').toUpperCase();
-          document.getElementById('plan-badge').textContent =
-            currentLang === 'en'
-              ? `AEGIS CLOUD · ${tier} (${tenants[0].max_concurrent_agents} AI MAX)`
-              : `AEGIS CLOUD · ${tier} (支持 ${tenants[0].max_concurrent_agents} 个 AI 并行)`;
+          const rawTier = (tenants[0].plan_tier || 'pro').toLowerCase();
+          const isFree = rawTier === 'community' || rawTier === 'free';
+          const tierLabel = isFree
+            ? (currentLang === 'en' ? 'Current Plan: Free (1 AI)' : '当前方案：免费版 (1 个 AI)')
+            : (currentLang === 'en' ? `Current Plan: Pro (${tenants[0].max_concurrent_agents} AIs)` : `当前方案：Pro 版 (${tenants[0].max_concurrent_agents} 个 AI 并行)`);
+          document.getElementById('plan-badge').textContent = tierLabel;
         }
 
         document.getElementById('st-pending').textContent = pending.length;
