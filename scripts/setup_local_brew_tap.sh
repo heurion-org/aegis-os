@@ -62,6 +62,9 @@ class AegisOs < Formula
 end
 EOF
 
-echo "==> [4/4] Done! You can now run:"
+echo "==> [4/4] Trusting tap so Homebrew 5+ allows loading it..."
+brew trust aegis-os/tap || true
+
+echo "==> Done! You can now run:"
 echo "    brew install aegis-os"
 echo "    (or 'brew reinstall aegis-os' if already installed)"

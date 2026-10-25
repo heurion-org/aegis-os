@@ -135,7 +135,9 @@ To coding agents (`agy`, `claude`, `codex`), **Local Mode** and **Cloud Mode** e
 Users **never need to run `aegis-os` manually** after installation:
 
 ```bash
-# Install via Homebrew (post_install automatically wires AGY, Claude Code, and Codex CLI)
+# Install via Homebrew (automatically wires AGY, Claude Code, and Codex CLI in 2 seconds)
+brew tap heurion-org/aegis-os https://github.com/heurion-org/aegis-os.git
+brew trust heurion-org/aegis-os
 brew install aegis-os
 ```
 
