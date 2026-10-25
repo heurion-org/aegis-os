@@ -2239,16 +2239,13 @@ pub const DASHBOARD_HTML: &str = r##"<!doctype html>
       </div>
 
       <nav class="nav-links" aria-label="Console Sections">
-        <a href="#sec-onboarding" class="nav-link" data-i18n="nav_onboarding">01 / 方案与接入</a>
-        <a href="#sec-approvals" class="nav-link" data-i18n="nav_approvals">02 / 待你确认</a>
         <a href="https://heurion.org/" class="nav-link" data-i18n="nav_home">Heurion 主站 ↗</a>
         <a href="https://github.com/heurion-org/aegis-os" target="_blank" rel="noopener" class="nav-link">GitHub ↗</a>
       </nav>
 
       <div class="nav-right">
-        <span class="tag tag-active" id="plan-badge">当前方案：免费版 (1 个 AI)</span>
         <button class="lang-btn" id="langBtn" type="button" onclick="toggleLang()">EN</button>
-        <a class="btn btn-solid" href="#sec-onboarding" data-i18n="nav_subscribe">升级 Pro / 接入指南 →</a>
+        <a class="btn btn-solid" href="https://buy.polar.sh/polar_cl_jCPpzbp4eOAyRbkDP4YzNIFVnYLddbvJZI5Fc27zL0x" target="_blank" rel="noopener" data-i18n="nav_subscribe">立即订阅 Pro ($29/月) →</a>
       </div>
     </div>
   </header>
@@ -2260,53 +2257,43 @@ pub const DASHBOARD_HTML: &str = r##"<!doctype html>
         <div class="hero-grid">
           <div class="hero-left">
             <div class="hero-intro">
-              <p class="label-caps" data-i18n="hero_eyebrow">HEURION · AEGIS CLOUD 云端 AI 编程工作台</p>
-              <h1 class="heading-1" data-i18n-html="hero_title">让多个 AI 同时改代码，<br>电脑<em>不卡顿</em>，原项目<em>不怕改坏</em>。</h1>
-              <p class="text-muted" data-i18n="hero_desc">把吃内存的编译、测试和多 AI 并行改代码全部放到 64GB 云端服务器上跑。每个 AI 都在独立的临时副本里干活，互不干扰；改好后你先看代码对比，满意再一键同步回本地。</p>
+              <p class="label-caps" data-i18n="hero_eyebrow">HEURION · AEGIS CLOUD 云端 AI 编程沙箱</p>
+              <h1 class="heading-1" data-i18n-html="hero_title">让 AI 在云端改代码跑测试，<br>电脑<em>不卡顿</em>，原项目<em>不怕改坏</em>。</h1>
+              <p class="text-muted" data-i18n="hero_desc">把吃内存的编译、测试和多 AI 并行改代码全部放到 64GB 云端服务器上跑。AI 在独立的云端临时副本里干活，不碰你的原项目；改好后你先在终端用 cloud diff 看代码对比，满意再用 cloud pull 一键同步回电脑。</p>
             </div>
 
             <div>
-              <div class="telemetry-strip">
+              <div class="telemetry-strip" style="grid-template-columns: repeat(3, 1fr);">
                 <div class="stat-cell">
-                  <span class="stat-val" id="st-pending" style="color:var(--accent-warm);">0</span>
-                  <span class="stat-lbl" data-i18n="st_lbl_pending">待你确认的改动</span>
+                  <span class="stat-val" style="color:var(--accent);">64 GB</span>
+                  <span class="stat-lbl" data-i18n="st_lbl_ram">云端独占编译内存</span>
                 </div>
                 <div class="stat-cell">
-                  <span class="stat-val" id="st-ws">0 / 0</span>
-                  <span class="stat-lbl" data-i18n="st_lbl_ws">运行中 / 已休眠项目</span>
+                  <span class="stat-val">0%</span>
+                  <span class="stat-lbl" data-i18n="st_lbl_cpu">本地电脑 CPU / 内存占用</span>
                 </div>
                 <div class="stat-cell">
-                  <span class="stat-val" id="st-usage">0 · 0ms</span>
-                  <span class="stat-lbl" data-i18n="st_lbl_usage">已执行命令 / 云端耗时</span>
+                  <span class="stat-val" style="font-size:1.15rem; font-family:var(--mono);">diff → pull</span>
+                  <span class="stat-lbl" data-i18n="st_lbl_safe">先看对比，满意再同步回电脑</span>
                 </div>
-                <div class="stat-cell">
-                  <span class="stat-val" id="st-saved" style="color:var(--accent);">0.0 KB</span>
-                  <span class="stat-lbl" data-i18n="st_lbl_saved">为你节省的磁盘空间</span>
-                </div>
-              </div>
-
-              <div class="hero-actions" style="margin-top: 1.25rem;">
-                <button class="btn btn-solid" onclick="simulateEscalation()" data-i18n="btn_simulate">+ 演示一次确认流程</button>
-                <button class="btn" onclick="refresh(true)" data-i18n="btn_refresh">刷新数据</button>
-                <a class="btn" href="#sec-onboarding" data-i18n="btn_cli_guide">30 秒接入指南 →</a>
               </div>
             </div>
           </div>
 
-          <!-- Clear 3-Step Workflow Diagram Plate -->
+          <!-- Clear 3-Step E2E Workflow Diagram Plate -->
           <div class="hero-art" aria-hidden="true">
             <div class="art-header">
-              <span data-i18n="art_top_l">工作流程 — 先在独立副本试跑，满意后再合并</span>
+              <span data-i18n="art_top_l">端到端工作流 — 云端改代码跑测试，本地看对比再同步</span>
               <span data-i18n="art_top_r">64GB 云端服务器</span>
             </div>
             <svg class="art-svg" viewBox="0 0 460 210" fill="none" xmlns="http://www.w3.org/2000/svg">
               <circle cx="230" cy="105" r="92" stroke="#DCD6CA" stroke-width="1" stroke-dasharray="2 4"/>
               <line x1="230" y1="8" x2="230" y2="202" stroke="#E5E0D5" stroke-width="1"/>
 
-              <!-- Step 1: Instant Copy -->
+              <!-- Step 1: cloud up -->
               <rect x="14" y="70" width="104" height="70" fill="#F2EFE9" stroke="#233E33" stroke-width="1"/>
-              <text x="66" y="94" text-anchor="middle" fill="#151C19" font-family="Inter, PingFang SC, sans-serif" font-size="9.5" font-weight="600" data-i18n="svg_step1_t">1. 秒建独立副本</text>
-              <text x="66" y="112" text-anchor="middle" fill="#525B56" font-family="JetBrains Mono, PingFang SC, sans-serif" font-size="7.8" data-i18n="svg_step1_d">不碰你的原代码</text>
+              <text x="66" y="94" text-anchor="middle" fill="#151C19" font-family="Inter, PingFang SC, sans-serif" font-size="9.2" font-weight="600" data-i18n="svg_step1_t">1. cloud up 开启</text>
+              <text x="66" y="112" text-anchor="middle" fill="#525B56" font-family="JetBrains Mono, PingFang SC, sans-serif" font-size="7.8" data-i18n="svg_step1_d">秒建云端独立副本</text>
               <text x="66" y="128" text-anchor="middle" fill="#233E33" font-family="JetBrains Mono, PingFang SC, sans-serif" font-size="7.5" data-i18n="svg_step1_s">0% 本地内存占用</text>
 
               <!-- Fork Lines -->
@@ -2314,7 +2301,7 @@ pub const DASHBOARD_HTML: &str = r##"<!doctype html>
               <line x1="118" y1="105" x2="164" y2="105" stroke="#233E33" stroke-width="1.2"/>
               <path d="M118 105 L140 105 L152 158 L164 158" stroke="#848D88" stroke-width="1"/>
 
-              <!-- Step 2: 3 Parallel AI Assistants -->
+              <!-- Step 2: Cloud Sandbox Execution -->
               <rect x="164" y="35" width="132" height="34" fill="#FDFCF9" stroke="#C8C1B4" stroke-width="1"/>
               <text x="230" y="55" text-anchor="middle" fill="#525B56" font-family="Inter, PingFang SC, sans-serif" font-size="8.4" data-i18n="svg_ai1">AI 助手 A · 写新功能</text>
 
@@ -2330,58 +2317,62 @@ pub const DASHBOARD_HTML: &str = r##"<!doctype html>
               <line x1="296" y1="105" x2="342" y2="105" stroke="#233E33" stroke-width="1.2"/>
               <path d="M296 158 L308 158 L320 105 L342 105" stroke="#848D88" stroke-width="1"/>
 
-              <!-- Step 3: Review & Merge -->
+              <!-- Step 3: diff & pull -->
               <rect x="342" y="70" width="104" height="70" fill="#233E33"/>
               <circle cx="357" cy="88" r="3.5" fill="#00C472"/>
-              <text x="399" y="92" text-anchor="middle" fill="#FAF8F4" font-family="Inter, PingFang SC, sans-serif" font-size="9.2" font-weight="600" data-i18n="svg_step3_t">2. 你确认后合并</text>
+              <text x="399" y="92" text-anchor="middle" fill="#FAF8F4" font-family="Inter, PingFang SC, sans-serif" font-size="9.0" font-weight="600" data-i18n="svg_step3_t">2. diff &amp; pull</text>
               <text x="394" y="110" text-anchor="middle" fill="#E3ECE7" font-family="JetBrains Mono, PingFang SC, sans-serif" font-size="7.6" data-i18n="svg_step3_d">先看改动对比</text>
-              <text x="394" y="126" text-anchor="middle" fill="#00C472" font-family="JetBrains Mono, PingFang SC, sans-serif" font-size="7.6" data-i18n="svg_step3_s">绝不乱覆盖代码</text>
+              <text x="394" y="126" text-anchor="middle" fill="#00C472" font-family="JetBrains Mono, PingFang SC, sans-serif" font-size="7.6" data-i18n="svg_step3_s">满意再同步回电脑</text>
             </svg>
             <div class="art-caption">
               <span data-i18n="art_bot_l">云主机：HEURION.ORG (64GB 内存)</span>
-              <span data-i18n="art_bot_r">闲置自动休眠 · 用时秒级唤醒</span>
+              <span data-i18n="art_bot_r">cloud down 随时休眠 · 用时秒唤醒</span>
             </div>
           </div>
         </div>
       </div>
     </section>
 
-    <!-- Section 01: Two-Column Plans (Simple Free Setup on Left, Guided Pro Purchase on Right) -->
-    <section class="sec-linen" id="sec-onboarding">
+    <!-- Single Main Section: Free vs. Pro End-to-End Quickstart -->
+    <section class="sec-linen" id="sec-onboarding" style="border-bottom:none;">
       <div class="container">
         <div class="section-header">
           <div class="section-title-group">
-            <span class="section-num">01</span>
-            <h2 class="heading-2" data-i18n-html="sec3_title">选择方案与 <em>30 秒快速开始</em></h2>
+            <h2 class="heading-2" data-i18n-html="sec3_title">选择方案与 <em>30 秒完整使用流程</em></h2>
           </div>
-          <p class="label-caps" data-i18n="sec3_label">01 / 免费版直接用 · PRO 版在线开通</p>
+          <p class="label-caps" data-i18n="sec3_label">免费版开箱即用 · PRO 版支持多工作区与 8 个 AI 并行</p>
         </div>
 
         <div class="onboarding-grid" style="grid-template-columns: 1fr 1fr; align-items: stretch; margin-bottom: 0;">
-          <!-- Left Card: Free Plan (Simplest 2-Line Setup, Auto API Key) -->
-          <div class="editorial-card" style="display:flex; flex-direction:column; justify-content:space-between; gap:1.25rem;">
+          <!-- Left Card: Free Plan (Complete E2E Loop) -->
+          <div class="editorial-card" style="display:flex; flex-direction:column; justify-content:space-between; gap:1.15rem;">
             <div>
               <div style="display:flex; justify-content:space-between; align-items:flex-start; gap:0.75rem; padding-bottom:0.9rem; border-bottom:1px solid var(--border); margin-bottom:0.9rem;">
                 <div>
-                  <span class="tag" data-i18n="tier_free_tag">免费版 · 默认开启</span>
+                  <span class="tag" data-i18n="tier_free_tag">免费版 · 无需注册或绑卡</span>
                   <h3 style="font-family:var(--serif); font-size:1.35rem; font-weight:400; margin-top:0.4rem;" data-i18n="tier_free_title">$0 / 月 · 1 个云端工作区 · 1 个 AI</h3>
                 </div>
               </div>
-              <p class="text-muted" style="font-size:0.85rem; margin-bottom:1rem;" data-i18n="tier_free_desc">无需注册或绑卡，也不需要手动传 API 密钥（系统会自动为你生成并绑定唯一的免费云端工作区）。只需在终端运行以下 2 行命令即可开始：</p>
+              <p class="text-muted" style="font-size:0.85rem; margin-bottom:1rem;" data-i18n="tier_free_desc">无需传 --api-key 参数（系统自动生成密钥并绑定你唯一的免费云端工作区）。完整使用流程只需以下终端命令：</p>
 
               <div style="display:flex; justify-content:space-between; align-items:center; margin-bottom:0.55rem;">
-                <span style="font-size:0.82rem; font-weight:600; color:var(--ink);" data-i18n="free_cmd_title">免费版两步开启命令：</span>
-                <button class="btn" onclick="copyFreeSnippet()" data-i18n="btn_copy_free">复制免费版命令</button>
+                <span style="font-size:0.82rem; font-weight:600; color:var(--ink);" data-i18n="free_cmd_title">① 安装客户端 &amp; ② 开启云端沙箱：</span>
+                <button class="btn" onclick="copyFreeSnippet()" data-i18n="btn_copy_free">复制开启命令</button>
               </div>
-              <pre class="code" id="cli-snippet-free" style="max-height:220px;"></pre>
-            </div>
+              <pre class="code" id="cli-snippet-free" style="max-height:200px; margin-bottom:1rem;"></pre>
 
-            <div style="padding-top:0.9rem; border-top:1px solid var(--border); font-size:0.79rem; color:var(--ink-secondary); line-height:1.7;" data-i18n="free_footer_tip">
-              日常常用命令：运行 aegis-os cloud diff 查看云端代码改动 · 运行 aegis-os cloud pull 同步回电脑 · 运行 aegis-os cloud down 断开并休眠。
+              <div style="background:var(--bg-primary); border:1px solid var(--border); padding:0.85rem 1rem;">
+                <div style="font-size:0.8rem; font-weight:600; color:var(--ink); margin-bottom:0.45rem;" data-i18n="free_step3_title">③ AI 在云端改完代码后（日常 3 条命令）：</div>
+                <div style="display:grid; gap:0.35rem; font-size:0.78rem; color:var(--ink-secondary);">
+                  <div><code class="mono" style="color:var(--accent); font-weight:600;">aegis-os cloud diff</code> — <span data-i18n="cmd_diff_desc">查看 AI 在云端改了哪些代码</span></div>
+                  <div><code class="mono" style="color:var(--accent); font-weight:600;">aegis-os cloud pull</code> — <span data-i18n="cmd_pull_desc">确认无误后，把云端改动同步回你的电脑</span></div>
+                  <div><code class="mono" style="color:var(--accent); font-weight:600;">aegis-os cloud down</code> — <span data-i18n="cmd_down_desc">断开并休眠云端沙箱（下次 cloud up 秒唤醒）</span></div>
+                </div>
+              </div>
             </div>
           </div>
 
-          <!-- Right Card: Pro Plan ($29/mo, Guided 3-Step Purchase & Activation) -->
+          <!-- Right Card: Pro Plan ($29/mo, Guided 3-Step Purchase & Parallel Activation) -->
           <div class="editorial-card" style="display:flex; flex-direction:column; justify-content:space-between; gap:1.15rem; border-color:var(--accent);">
             <div>
               <div style="display:flex; justify-content:space-between; align-items:flex-start; gap:0.75rem; padding-bottom:0.9rem; border-bottom:1px solid var(--border); margin-bottom:0.9rem; flex-wrap:wrap;">
@@ -2392,57 +2383,30 @@ pub const DASHBOARD_HTML: &str = r##"<!doctype html>
                 <a class="btn btn-solid" href="https://buy.polar.sh/polar_cl_jCPpzbp4eOAyRbkDP4YzNIFVnYLddbvJZI5Fc27zL0x" target="_blank" rel="noopener" data-i18n="btn_buy_pro">① 立即订阅 Pro ($29/月) →</a>
               </div>
 
-              <p class="text-muted" style="font-size:0.85rem; margin-bottom:0.95rem;" data-i18n="tier_pro_desc">适合重度编译测试与多 AI 协同：支持创建多个云端工作区，最多 8 个 AI 助手在 64GB 内存云主机上同时改代码、跑测试、做审查，本地电脑 0 内存占用。</p>
+              <p class="text-muted" style="font-size:0.85rem; margin-bottom:0.95rem;" data-i18n="tier_pro_desc">解锁多项目工作区（最多 16 个）与多 AI 并行（最多 8 个 AI 助手在 64GB 内存云主机各自的独立副本里同时改代码、跑测试、做审查）。</p>
 
               <!-- Step 2: Claim Pro Key by Checkout Email -->
               <div style="background:var(--bg-primary); border:1px solid var(--border); padding:0.85rem 1rem; margin-bottom:0.95rem;">
-                <div style="font-size:0.82rem; font-weight:600; color:var(--accent); margin-bottom:0.35rem;" data-i18n="claim_card_title">② 完成订阅后：输入付款邮箱提取你的 Pro 专属密钥</div>
+                <div style="font-size:0.82rem; font-weight:600; color:var(--accent); margin-bottom:0.35rem;" data-i18n="claim_card_title">② 完成付款后：输入付款邮箱提取你的 Pro 专属密钥</div>
                 <div style="display:flex; gap:0.5rem; flex-wrap:wrap;">
                   <input class="mono-input" id="claim-email" type="email" placeholder="你付款时填写的邮箱 (如 you@company.com)" style="flex:1; min-width:170px; background:var(--bg-elevated);" />
-                  <button class="btn btn-mint" onclick="claimSubscriptionKey()" data-i18n="btn_claim">② 提取 Pro 密钥 →</button>
+                  <button class="btn btn-mint" onclick="claimSubscriptionKey()" data-i18n="btn_claim">提取 Pro 密钥 →</button>
                 </div>
               </div>
 
               <!-- Step 3: Pro Parallel Command -->
               <div>
                 <div style="display:flex; justify-content:space-between; align-items:center; margin-bottom:0.55rem;">
-                  <span style="font-size:0.82rem; font-weight:600; color:var(--ink);" data-i18n="pro_cmd_title">③ 在项目文件夹运行 Pro 多 AI 并行命令：</span>
+                  <span style="font-size:0.82rem; font-weight:600; color:var(--ink);" data-i18n="pro_cmd_title">③ 在项目文件夹启动多 AI 云端并行：</span>
                   <button class="btn" onclick="copyProSnippet()" data-i18n="btn_copy_pro">复制 Pro 命令</button>
                 </div>
                 <pre class="code" id="cli-snippet-pro" style="max-height:190px;"></pre>
               </div>
             </div>
-          </div>
-        </div>
-      </div>
-    </section>
 
-    <!-- Section 02: Pending Approvals -->
-    <section class="sec-primary" id="sec-approvals">
-      <div class="container">
-        <div class="section-header">
-          <div class="section-title-group">
-            <span class="section-num">02</span>
-            <h2 class="heading-2" data-i18n-html="sec1_title">待你确认的操作 <em>(Pending Approvals)</em></h2>
-            <span class="tag tag-warm"><span class="dot-warm"></span><span id="pending-pill">0</span></span>
-          </div>
-          <p class="label-caps" data-i18n="sec1_label">02 / 关键改动确认</p>
-        </div>
-
-        <div class="editorial-card">
-          <div style="display:flex; justify-content:space-between; align-items:center; gap:1rem; margin-bottom:1rem; flex-wrap:wrap;">
-            <p class="text-muted" data-i18n="sec1_note">AI 在云端沙箱里读文件、改代码、跑测试全部自动完成，不会频繁弹窗打扰你；只有当 AI 准备把最终修改写回主项目时，才会列在这里等你确认。</p>
-            <button class="btn" onclick="simulateEscalation()" data-i18n="btn_simulate_inline">+ 演示一条待确认请求</button>
-          </div>
-
-          <div id="approvals-box"></div>
-
-          <div id="diff-drawer">
-            <div style="display:flex; justify-content:space-between; align-items:center; margin-bottom:0.65rem;">
-              <span class="label-caps" id="diff-title" style="color:var(--ink);">代码改动对比 (DIFF)</span>
-              <button class="btn" onclick="document.getElementById('diff-drawer').style.display='none'" data-i18n="btn_close">收起预览</button>
+            <div style="padding-top:0.85rem; border-top:1px solid var(--border); font-size:0.78rem; color:var(--ink-secondary);" data-i18n="pro_footer_tip">
+              多 AI 并行时：可用 aegis-os cloud diff --agent &lt;名称&gt; 查看指定 AI 的改动，aegis-os cloud pull --agent &lt;名称&gt; 同步回电脑。
             </div>
-            <pre class="code" id="diff-content"></pre>
           </div>
         </div>
       </div>
@@ -2476,109 +2440,94 @@ pub const DASHBOARD_HTML: &str = r##"<!doctype html>
 
   <script>
     let latestKey = 'ak_live_...';
-    let lastSig = '';
     let currentLang = localStorage.getItem('heurion_lang') || 'zh';
 
     const DICT = {
       zh: {
-        nav_onboarding: '01 / 方案与接入',
-        nav_approvals: '02 / 待你确认',
         nav_home: 'Heurion 主站 ↗',
-        nav_subscribe: '升级 Pro / 接入指南 →',
-        hero_eyebrow: 'HEURION · AEGIS CLOUD 云端 AI 编程工作台',
-        hero_title: '让多个 AI 同时改代码，<br>电脑<em>不卡顿</em>，原项目<em>不怕改坏</em>。',
-        hero_desc: '把吃内存的编译、测试和多 AI 并行改代码全部放到 64GB 云端服务器上跑。每个 AI 都在独立的临时副本里干活，互不干扰；改好后你先看代码对比，满意再一键同步回本地。',
-        st_lbl_pending: '待你确认的改动',
-        st_lbl_ws: '运行中 / 已休眠项目',
-        st_lbl_usage: '已执行命令 / 云端耗时',
-        st_lbl_saved: '为你节省的磁盘空间',
-        btn_simulate: '+ 演示一次确认流程',
-        btn_refresh: '刷新数据',
-        btn_cli_guide: '查看方案与 30 秒接入 →',
-        art_top_l: '工作流程 — 先在独立副本试跑，满意后再合并',
+        nav_subscribe: '立即订阅 Pro ($29/月) →',
+        hero_eyebrow: 'HEURION · AEGIS CLOUD 云端 AI 编程沙箱',
+        hero_title: '让 AI 在云端改代码跑测试，<br>电脑<em>不卡顿</em>，原项目<em>不怕改坏</em>。',
+        hero_desc: '把吃内存的编译、测试和多 AI 并行改代码全部放到 64GB 云端服务器上跑。AI 在独立的云端临时副本里干活，不碰你的原项目；改好后你先在终端用 cloud diff 看代码对比，满意再用 cloud pull 一键同步回电脑。',
+        st_lbl_ram: '云端独占编译内存',
+        st_lbl_cpu: '本地电脑 CPU / 内存占用',
+        st_lbl_safe: '先看对比，满意再同步回电脑',
+        art_top_l: '端到端工作流 — 云端改代码跑测试，本地看对比再同步',
         art_top_r: '64GB 云端服务器',
-        svg_step1_t: '1. 秒建独立副本',
-        svg_step1_d: '不碰你的原代码',
+        svg_step1_t: '1. cloud up 开启',
+        svg_step1_d: '秒建云端独立副本',
         svg_step1_s: '0% 本地内存占用',
         svg_ai1: 'AI 助手 A · 写新功能',
         svg_ai2: 'AI 助手 B · 跑测试修 Bug',
         svg_ai3: 'AI 助手 C · 代码审查',
-        svg_step3_t: '2. 你确认后合并',
+        svg_step3_t: '2. diff & pull',
         svg_step3_d: '先看改动对比',
-        svg_step3_s: '绝不乱覆盖代码',
+        svg_step3_s: '满意再同步回电脑',
         art_bot_l: '云主机：HEURION.ORG (64GB 内存)',
-        art_bot_r: '闲置自动休眠 · 用时秒级唤醒',
-        sec3_title: '选择方案与 <em>30 秒快速开始</em>',
-        sec3_label: '01 / 免费版直接用 · PRO 版在线开通',
-        tier_free_tag: '免费版 · 默认开启',
+        art_bot_r: 'cloud down 随时休眠 · 用时秒唤醒',
+        sec3_title: '选择方案与 <em>30 秒完整使用流程</em>',
+        sec3_label: '免费版开箱即用 · PRO 版支持多工作区与 8 个 AI 并行',
+        tier_free_tag: '免费版 · 无需注册或绑卡',
         tier_free_title: '$0 / 月 · 1 个云端工作区 · 1 个 AI',
-        tier_free_desc: '无需注册或绑卡，也不需要手动传 API 密钥（系统会自动为你生成并绑定唯一的免费云端工作区）。只需在终端运行以下 2 行命令即可开始：',
-        free_cmd_title: '免费版两步开启命令：',
-        btn_copy_free: '复制免费版命令',
-        free_footer_tip: '日常常用命令：运行 aegis-os cloud diff 查看云端代码改动 · 运行 aegis-os cloud pull 同步回电脑 · 运行 aegis-os cloud down 断开并休眠。',
+        tier_free_desc: '无需传 --api-key 参数（系统自动生成密钥并绑定你唯一的免费云端工作区）。完整使用流程只需以下终端命令：',
+        free_cmd_title: '① 安装客户端 & ② 开启云端沙箱：',
+        btn_copy_free: '复制开启命令',
+        free_step3_title: '③ AI 在云端改完代码后（日常 3 条命令）：',
+        cmd_diff_desc: '查看 AI 在云端改了哪些代码',
+        cmd_pull_desc: '确认无误后，把云端改动同步回你的电脑',
+        cmd_down_desc: '断开并休眠云端沙箱（下次 cloud up 秒唤醒）',
         tier_pro_tag: 'PRO 专业版 · 多 AI 并行',
         tier_pro_title: '$29 / 月 · 多个工作区 · 8 个 AI 并行',
         btn_buy_pro: '① 立即订阅 Pro ($29/月) →',
-        tier_pro_desc: '适合重度编译测试与多 AI 协同：支持创建多个云端工作区，最多 8 个 AI 助手在 64GB 内存云主机上同时改代码、跑测试、做审查，本地电脑 0 内存占用。',
-        claim_card_title: '② 完成订阅后：输入付款邮箱提取你的 Pro 专属密钥',
-        btn_claim: '② 提取 Pro 密钥 →',
-        pro_cmd_title: '③ 在项目文件夹运行 Pro 多 AI 并行命令：',
+        tier_pro_desc: '解锁多项目工作区（最多 16 个）与多 AI 并行（最多 8 个 AI 助手在 64GB 内存云主机各自的独立副本里同时改代码、跑测试、做审查）。',
+        claim_card_title: '② 完成付款后：输入付款邮箱提取你的 Pro 专属密钥',
+        btn_claim: '提取 Pro 密钥 →',
+        pro_cmd_title: '③ 在项目文件夹启动多 AI 云端并行：',
         btn_copy_pro: '复制 Pro 命令',
-        sec1_title: '待你确认的操作 <em>(Pending Approvals)</em>',
-        sec1_label: '02 / 关键改动确认',
-        sec1_note: 'AI 在云端沙箱里读文件、改代码、跑测试全部自动完成，不会频繁弹窗打扰你；只有当 AI 准备把最终修改写回主项目时，才会列在这里等你确认。',
-        btn_simulate_inline: '+ 演示一条待确认请求',
-        btn_close: '收起预览'
+        pro_footer_tip: '多 AI 并行时：可用 aegis-os cloud diff --agent <名称> 查看指定 AI 的改动，aegis-os cloud pull --agent <名称> 同步回电脑。'
       },
       en: {
-        nav_onboarding: '01 / Plans & Setup',
-        nav_approvals: '02 / Approvals',
         nav_home: 'Heurion.org ↗',
-        nav_subscribe: 'Plans & Setup →',
-        hero_eyebrow: 'HEURION · AEGIS CLOUD AI CODING WORKSPACE',
-        hero_title: 'Run multiple coding AIs in parallel —<br><em>zero local lag</em>, <em>zero risk</em> to your repo.',
-        hero_desc: 'Offload heavy builds, test suites, and parallel AI edits to our 64GB cloud server. Each AI works in its own isolated copy — nothing touches your main project until you review the diff and approve.',
-        st_lbl_pending: 'Awaiting Your Approval',
-        st_lbl_ws: 'Active / Sleeping Projects',
-        st_lbl_usage: 'Commands Run / Cloud Time',
-        st_lbl_saved: 'Local Disk Space Saved',
-        btn_simulate: '+ Try Demo Approval',
-        btn_refresh: 'Refresh',
-        btn_cli_guide: 'Plans & 30-Second Setup →',
-        art_top_l: 'HOW IT WORKS — TEST IN ISOLATED COPIES, MERGE WHEN READY',
+        nav_subscribe: 'Subscribe to Pro ($29/mo) →',
+        hero_eyebrow: 'HEURION · AEGIS CLOUD AI CODING SANDBOX',
+        hero_title: 'Run coding AIs in the cloud —<br><em>zero local lag</em>, <em>zero risk</em> to your repo.',
+        hero_desc: 'Offload heavy builds, test suites, and parallel AI edits to our 64GB cloud server. Each AI works in its own isolated cloud copy — inspect changes with cloud diff and sync back to your laptop with cloud pull.',
+        st_lbl_ram: 'Dedicated Cloud RAM',
+        st_lbl_cpu: 'Local CPU / RAM Usage',
+        st_lbl_safe: 'Review diff first, then pull to laptop',
+        art_top_l: 'END-TO-END FLOW — EDIT & TEST IN CLOUD, DIFF & PULL LOCALLY',
         art_top_r: '64GB CLOUD SERVER',
-        svg_step1_t: '1. Instant Copy',
-        svg_step1_d: 'Main repo untouched',
+        svg_step1_t: '1. cloud up',
+        svg_step1_d: 'Instant cloud copy',
         svg_step1_s: '0% local CPU / RAM',
         svg_ai1: 'Agent A · New Feature',
         svg_ai2: 'Agent B · Run Tests & Fix',
         svg_ai3: 'Agent C · Code Review',
-        svg_step3_t: '2. Review & Merge',
+        svg_step3_t: '2. diff & pull',
         svg_step3_d: 'Inspect diff first',
-        svg_step3_s: 'Zero silent overwrites',
+        svg_step3_s: 'Pull when satisfied',
         art_bot_l: 'HOST: HEURION.ORG (64GB RAM)',
-        art_bot_r: 'AUTO-SLEEP WHEN IDLE · INSTANT WAKE',
-        sec3_title: 'Choose Your Plan &amp; <em>Start in 30 Seconds</em>',
-        sec3_label: '01 / FREE VS. PRO PLANS',
-        tier_free_tag: 'FREE PLAN · DEFAULT',
+        art_bot_r: 'CLOUD DOWN TO SLEEP · INSTANT WAKE',
+        sec3_title: 'Choose Your Plan &amp; <em>30-Second Workflow</em>',
+        sec3_label: 'FREE PLAN READY OUT OF THE BOX · PRO FOR MULTI-AI PARALLELISM',
+        tier_free_tag: 'FREE PLAN · NO SIGNUP REQUIRED',
         tier_free_title: '$0 / mo · 1 Workspace · 1 AI',
-        tier_free_desc: 'No credit card and no manual --api-key needed (automatically generated and bound to your single free workspace). Just run these 2 commands:',
-        free_cmd_title: 'Free Plan 2-Step Quickstart:',
-        btn_copy_free: 'Copy Free Commands',
-        free_footer_tip: 'Daily commands: aegis-os cloud diff (view changes) · aegis-os cloud pull (sync to laptop) · aegis-os cloud down (sleep).',
+        tier_free_desc: 'No manual --api-key needed (automatically generated and bound to your single free workspace). Full end-to-end terminal commands:',
+        free_cmd_title: '① Install CLI & ② Start Cloud Sandbox:',
+        btn_copy_free: 'Copy Commands',
+        free_step3_title: '③ After AI edits code in the cloud (3 daily commands):',
+        cmd_diff_desc: 'Inspect code changes made in the cloud sandbox',
+        cmd_pull_desc: 'Sync approved cloud changes back to your laptop',
+        cmd_down_desc: 'Disconnect & sleep sandbox (wakes instantly on next cloud up)',
         tier_pro_tag: 'PRO PLAN · PARALLEL AI',
         tier_pro_title: '$29 / mo · Multi-Workspace · 8 AIs',
         btn_buy_pro: '① Subscribe to Pro ($29/mo) →',
-        tier_pro_desc: 'For heavy builds and multi-AI workflows: create multiple workspaces and run up to 8 AI assistants in parallel on our 64GB cloud server.',
+        tier_pro_desc: 'Unlock up to 16 cloud workspaces and up to 8 parallel AI assistants working simultaneously in isolated copies on our 64GB cloud server.',
         claim_card_title: '② After payment: Enter your checkout email to claim your Pro API key',
-        btn_claim: '② Claim Pro Key →',
-        pro_cmd_title: '③ Run inside your project folder to launch up to 8 parallel AIs:',
+        btn_claim: 'Claim Pro Key →',
+        pro_cmd_title: '③ Launch parallel AIs inside your project folder:',
         btn_copy_pro: 'Copy Pro Commands',
-        sec1_title: 'Changes Awaiting Your Approval <em>(Pending Approvals)</em>',
-        sec1_label: '02 / SAFE MERGE CONFIRMATION',
-        sec1_note: 'Reading files, editing code, and running tests inside the cloud sandbox happen automatically without interrupting you. You only confirm when an AI wants to write final changes back to your main project.',
-        btn_simulate_inline: '+ Create Demo Request',
-        btn_close: 'Close Preview'
+        pro_footer_tip: 'With multiple AIs: run aegis-os cloud diff --agent <name> to review a specific AI, and aegis-os cloud pull --agent <name> to sync.'
       }
     };
 
@@ -2598,7 +2547,6 @@ pub const DASHBOARD_HTML: &str = r##"<!doctype html>
       const btn = document.getElementById('langBtn');
       if (btn) btn.textContent = lang === 'zh' ? 'EN' : '中文';
       updateCliSnippets();
-      refresh(true);
     }
 
     function toggleLang() {
@@ -2624,10 +2572,10 @@ curl -fsSL ${origin}/aegis-cloud/install.sh | sh
 
 # 2. Run inside your project folder (auto-generates key & binds 1 free workspace)
 cd /path/to/your/project && aegis-os cloud up`
-          : `# 1. 一行命令安装 Aegis OS（自动配置你的 AI 编程工具）
+          : `# 1. 一行命令安装客户端（自动配置你的 AI 编程工具）
 curl -fsSL ${origin}/aegis-cloud/install.sh | sh
 
-# 2. 进入你的项目文件夹，一键连上免费云端工作区（自动生成密钥，无需任何参数）
+# 2. 进入你的项目文件夹，一键开启免费云端沙箱（自动生成密钥，无需传参）
 cd 你的项目文件夹 && aegis-os cloud up`;
       }
       if (proBox) {
@@ -2675,196 +2623,10 @@ cd 你的项目文件夹 && aegis-os cloud up --api-key ${latestKey} --agents ag
       }
       latestKey = d.api_key;
       updateCliSnippets();
-      toast(currentLang === 'en' ? `Claimed Pro Key: ${d.api_key}` : `已提取 Pro 专属密钥并填入下方命令`);
-      refresh(true);
-    }
-
-    async function simulateEscalation() {
-      const res = await fetch('/v1/approvals/simulate', {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({
-          org_id: 'aegis-os',
-          agent_id: 'coder-alpha',
-          action: 'workspace_commit',
-          files: ['src/lib.rs']
-        })
-      });
-      const d = await res.json();
-      toast(currentLang === 'en' ? `Created demo request ${d.escalation_id}` : `已生成演示确认请求 ${d.escalation_id}`);
-      refresh(true);
-    }
-
-    async function decide(id, decision, ttl) {
-      await fetch('/v1/approvals/decide', {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ escalation_id: id, decision, ttl_secs: ttl })
-      });
-      toast(decision === 'approve'
-        ? (currentLang === 'en' ? `Approved ${id}` : `已同意合并 (${id})`)
-        : (currentLang === 'en' ? `Rejected ${id}` : `已拒绝该改动 (${id})`));
-      refresh(true);
-    }
-
-    async function inspectDiff(orgId, agentId, wsId) {
-      const q = new URLSearchParams({ org_id: orgId, agent_id: agentId });
-      if (wsId) q.set('workspace_id', wsId);
-      const res = await fetch(`/v1/workspaces/diff?${q.toString()}`);
-      const d = await res.json();
-      document.getElementById('diff-title').textContent =
-        currentLang === 'en'
-          ? `CODE DIFF · ${orgId}/${agentId} (${d.changes_count || 0} FILES CHANGED)`
-          : `代码改动对比 · ${orgId}/${agentId}（共 ${d.changes_count || 0} 个文件变更）`;
-      document.getElementById('diff-content').textContent =
-        (d.unified_diff && d.unified_diff.trim())
-          ? d.unified_diff
-          : JSON.stringify(d.changes || d, null, 2);
-      document.getElementById('diff-drawer').style.display = 'block';
-    }
-
-    async function provisionWorkspace() {
-      const org_id = document.getElementById('ws-org').value.trim() || 'aegis-os';
-      const workspace_id = document.getElementById('ws-id').value.trim() || 'ws-core';
-      const source_url = document.getElementById('ws-src').value.trim() || '.';
-      const agents = document.getElementById('ws-agents').value.split(',').map(s => s.trim()).filter(Boolean);
-      const res = await fetch('/v1/workspaces', {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ org_id, workspace_id, source_url, agents })
-      });
-      const d = await res.json();
-      if (d.error) { toast(`Error: ${d.error}`); return; }
-      toast(currentLang === 'en' ? `Created workspace ${workspace_id}` : `已创建云端工作区 ${workspace_id}`);
-      refresh(true);
-    }
-
-    async function toggleHibernate(orgId, wsId, currentStatus) {
-      const route = currentStatus === 'hibernated' ? '/v1/workspaces/wake' : '/v1/workspaces/hibernate';
-      const res = await fetch(route, {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ org_id: orgId, workspace_id: wsId })
-      });
-      const d = await res.json();
-      toast(currentStatus === 'hibernated'
-        ? (currentLang === 'en' ? `Woke workspace in ${d.wake_latency_ms || 0}ms` : `工作区已唤醒 (${d.wake_latency_ms || 0}ms)`)
-        : (currentLang === 'en' ? 'Workspace put to sleep (0 RAM used)' : '工作区已休眠（不占内存）'));
-      refresh(true);
-    }
-
-    async function deleteWorkspace(orgId, wsId) {
-      await fetch('/v1/workspaces/delete', {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ org_id: orgId, workspace_id: wsId })
-      });
-      toast(currentLang === 'en' ? `Deleted workspace ${wsId}` : `已删除工作区 ${wsId}`);
-      refresh(true);
-    }
-
-    async function exportPr(orgId, wsId, agentId) {
-      const res = await fetch('/v1/workspaces/pr', {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ org_id: orgId, workspace_id: wsId, agent_id: agentId })
-      });
-      const d = await res.json();
-      document.getElementById('diff-title').textContent =
-        `GIT PR 补丁 · ${d.git_branch || ''} @ ${d.git_commit_sha || ''}`;
-      document.getElementById('diff-content').textContent =
-        (d.unified_patch && d.unified_patch.trim())
-          ? d.unified_patch
-          : JSON.stringify(d.github_pr_payload || d, null, 2);
-      document.getElementById('diff-drawer').style.display = 'block';
-      document.getElementById('sec-approvals').scrollIntoView({ behavior: 'smooth' });
-      refresh(true);
-    }
-
-    async function refresh(force) {
-      try {
-        const res = await fetch('/v1/status?org_id=*');
-        const data = await res.json();
-        const sig = JSON.stringify(data) + ':' + currentLang;
-        if (!force && sig === lastSig) return;
-        lastSig = sig;
-
-        const pending = (data.pending_escalations || []).filter(e => e.status === 'pending');
-        const allWorkspaces = data.workspaces || [];
-        const tenants = data.tenants || [];
-
-        const primaryTenant = tenants.find(t => t.org_id === 'aegis-os') || tenants[0] || { plan_tier: 'community', max_concurrent_agents: 1 };
-        const rawTier = (primaryTenant.plan_tier || 'community').toLowerCase();
-        const isFree = rawTier === 'community' || rawTier === 'free';
-
-        // On Free Plan, only 1 cloud workspace is allowed/shown
-        const workspaces = isFree ? allWorkspaces.slice(0, 1) : allWorkspaces;
-        const activeWs = workspaces.filter(w => w.status !== 'hibernated').length;
-        const hibWs = workspaces.filter(w => w.status === 'hibernated').length;
-
-        const createBar = document.getElementById('ws-create-bar');
-        const limitBar = document.getElementById('ws-free-limit-bar');
-        if (createBar && limitBar) {
-          if (isFree && workspaces.length >= 1) {
-            createBar.style.display = 'none';
-            limitBar.style.display = 'flex';
-          } else {
-            createBar.style.display = 'flex';
-            limitBar.style.display = 'none';
-          }
-        }
-
-        let totalCalls = 0, totalMs = 0, savedBytes = 0;
-        tenants.forEach(t => {
-          totalCalls += (t.total_syscalls || 0);
-          totalMs += (t.sandbox_exec_ms || 0);
-          savedBytes += (t.cow_saved_bytes || 0);
-        });
-        const tierLabel = isFree
-          ? (currentLang === 'en' ? 'Current Plan: Free (1 Workspace · 1 AI)' : '当前方案：免费版 (1 个工作区 · 1 个 AI)')
-          : (currentLang === 'en' ? `Current Plan: Pro (${primaryTenant.max_concurrent_agents} AIs)` : `当前方案：Pro 版 (${primaryTenant.max_concurrent_agents} 个 AI 并行)`);
-        document.getElementById('plan-badge').textContent = tierLabel;
-
-        document.getElementById('st-pending').textContent = pending.length;
-        document.getElementById('st-ws').textContent = `${activeWs} / ${hibWs}`;
-        document.getElementById('st-usage').textContent = `${totalCalls} · ${totalMs}ms`;
-        document.getElementById('st-saved').textContent = `${(savedBytes / 1024).toFixed(1)} KB`;
-        document.getElementById('pending-pill').textContent = pending.length;
-
-        const appBox = document.getElementById('approvals-box');
-        if (pending.length === 0) {
-          appBox.innerHTML = `<div class="empty">${
-            currentLang === 'en'
-              ? 'No changes waiting for your confirmation — AI assistants are working smoothly in the cloud sandbox.'
-              : '目前没有需要你确认的操作 — AI 助手在云端沙箱里的日常改代码与跑测试会自动进行。'
-          }</div>`;
-        } else {
-          appBox.innerHTML = pending.map(e => `
-            <div class="approval-row">
-              <div class="approval-meta">
-                <div style="display:flex; align-items:center; gap:0.55rem; flex-wrap:wrap;">
-                  <span class="tag tag-warm"><span class="dot-warm"></span>${e.action === 'workspace_commit' ? (currentLang === 'en' ? 'Write to Main Project' : '写回主项目') : e.action}</span>
-                  <code class="mono" style="font-size:0.82rem; font-weight:500;">${e.org_id}/${e.agent_id}</code>
-                  <code class="mono" style="font-size:0.74rem; color:var(--ink-muted);">(${e.escalation_id})</code>
-                </div>
-                <div style="font-size:0.8rem; color:var(--ink-secondary);">${e.reason}</div>
-              </div>
-              <div class="actions">
-                <button class="btn" onclick="inspectDiff('${e.org_id}', '${e.agent_id}', '')">${currentLang === 'en' ? 'View Code Diff' : '查看代码改动'}</button>
-                <button class="btn btn-mint" onclick="decide('${e.escalation_id}', 'approve', 0)">${currentLang === 'en' ? 'Approve Once' : '同意本次'}</button>
-                <button class="btn btn-solid" onclick="decide('${e.escalation_id}', 'approve', 3600)">${currentLang === 'en' ? 'Auto-Approve 1h' : '1 小时内免确认'}</button>
-                <button class="btn btn-danger" onclick="decide('${e.escalation_id}', 'deny', 0)">${currentLang === 'en' ? 'Reject' : '拒绝'}</button>
-              </div>
-            </div>
-          `).join('');
-        }
-      } catch (e) {
-        console.error(e);
-      }
+      toast(currentLang === 'en' ? `Claimed Pro Key: ${d.api_key}` : `已提取 Pro 专属密钥并自动填入下方命令`);
     }
 
     applyLang(currentLang);
-    setInterval(() => refresh(false), 2500);
   </script>
 </body>
 </html>
