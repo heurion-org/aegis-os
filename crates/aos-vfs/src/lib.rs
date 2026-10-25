@@ -73,14 +73,27 @@ impl CoWWorkspace {
 
         tokio::fs::create_dir_all(&snapshots_root).await?;
 
-        let is_existing = init_marker.exists() && shadow_root.exists() && baseline_root.exists();
+        let has_legacy_populated = shadow_root.exists()
+            && baseline_root.exists()
+            && std::fs::read_dir(&shadow_root)
+                .map(|mut d| d.next().is_some())
+                .unwrap_or(false)
+            && std::fs::read_dir(&baseline_root)
+                .map(|mut d| d.next().is_some())
+                .unwrap_or(false);
+        let is_existing =
+            (init_marker.exists() && shadow_root.exists() && baseline_root.exists())
+                || has_legacy_populated;
         if !is_existing {
             tokio::fs::create_dir_all(&shadow_root).await?;
             tokio::fs::create_dir_all(&baseline_root).await?;
             Self::cow_sync_dir(&host_source_root, &shadow_root).await?;
             Self::cow_sync_dir(&shadow_root, &baseline_root).await?;
             tokio::fs::write(&init_marker, Utc::now().to_rfc3339()).await?;
+        } else if !init_marker.exists() {
+            let _ = tokio::fs::write(&init_marker, Utc::now().to_rfc3339()).await;
         }
+        Self::link_host_dependency_dirs(&host_source_root, &shadow_root);
 
         let mut loaded_snapshots = Vec::new();
         if let Ok(bytes) = tokio::fs::read(&snapshots_index_file).await {
@@ -401,7 +414,79 @@ impl CoWWorkspace {
                 }
             }
         }
+        Self::link_host_dependency_dirs(&self.host_source_root, &self.shadow_root);
         Ok(report)
+    }
+
+    /// Automatically links heavy read-only dependency directories (`node_modules`, `.venv`, `venv`)
+    /// from `host_root` into `shadow_root` (up to depth 3 for monorepo packages like `apps/*/node_modules`)
+    /// and cleans up any broken symlinks left behind by interrupted sandbox commands.
+    ///
+    /// Because the OS sandbox (`sandbox-exec` Seatbelt / `bwrap`) only grants write permissions to
+    /// `shadow_root` (`upper_workspace`) and resolves realpaths before checking write rules, symlinks
+    /// pointing to `host_root/node_modules` are automatically kernel-enforced read-only!
+    pub fn link_host_dependency_dirs(host_root: &Path, shadow_root: &Path) {
+        #[cfg(unix)]
+        {
+            const DEP_DIRS: &[&str] = &["node_modules", ".venv", "venv"];
+
+            // 1. Clean up any broken symlinks inside `shadow_root` (up to depth 3) so stale links
+            //    from timed-out `proc_exec` commands never poison the workspace.
+            let mut clean_stack = vec![(shadow_root.to_path_buf(), 0usize)];
+            while let Some((cur_dir, depth)) = clean_stack.pop() {
+                let Ok(rd) = std::fs::read_dir(&cur_dir) else {
+                    continue;
+                };
+                for entry in rd.flatten() {
+                    let path = entry.path();
+                    let Ok(ft) = entry.file_type() else {
+                        continue;
+                    };
+                    if ft.is_symlink() {
+                        if !path.exists() {
+                            let _ = std::fs::remove_file(&path);
+                        }
+                        continue;
+                    }
+                    let name = entry.file_name().to_string_lossy().to_string();
+                    if depth < 3 && ft.is_dir() && !Self::is_ignored_dir_name(&name) {
+                        clean_stack.push((path, depth + 1));
+                    }
+                }
+            }
+
+            // 2. Link existing host dependency directories (`node_modules`, `.venv`, `venv`) into `shadow_root`.
+            let mut link_stack = vec![(host_root.to_path_buf(), shadow_root.to_path_buf(), 0usize)];
+            while let Some((h_dir, s_dir, depth)) = link_stack.pop() {
+                let Ok(rd) = std::fs::read_dir(&h_dir) else {
+                    continue;
+                };
+                for entry in rd.flatten() {
+                    let name = entry.file_name().to_string_lossy().to_string();
+                    let h_path = entry.path();
+                    let s_path = s_dir.join(&name);
+
+                    if DEP_DIRS.contains(&name.as_str()) {
+                        if h_path.exists() && std::fs::symlink_metadata(&s_path).is_err() {
+                            let _ = std::fs::create_dir_all(&s_dir);
+                            let _ = std::os::unix::fs::symlink(&h_path, &s_path);
+                        }
+                        continue;
+                    }
+
+                    if depth < 2
+                        && !Self::is_ignored_dir_name(&name)
+                        && entry.file_type().map(|ft| ft.is_dir()).unwrap_or(false)
+                    {
+                        link_stack.push((h_path, s_path, depth + 1));
+                    }
+                }
+            }
+        }
+        #[cfg(not(unix))]
+        {
+            let _ = (host_root, shadow_root);
+        }
     }
 
     /// Clones a single file using zero-copy OS copy-on-write syscalls:
@@ -566,8 +651,14 @@ impl CoWWorkspace {
             if Self::is_ignored_dir_name(&name_str) {
                 return true;
             }
+            let Ok(ft) = entry.file_type() else {
+                continue;
+            };
+            if ft.is_symlink() {
+                return true;
+            }
             if max_depth > 1
-                && entry.file_type().map(|ft| ft.is_dir()).unwrap_or(false)
+                && ft.is_dir()
                 && Self::contains_ignored_subdir(&entry.path(), max_depth - 1)
             {
                 return true;
@@ -710,15 +801,19 @@ impl CoWWorkspace {
     }
 
     fn cow_sync_dir_blocking(src: &Path, dst: &Path) -> anyhow::Result<()> {
-        if dst.exists() {
-            std::fs::remove_dir_all(dst)?;
+        if let Ok(meta) = std::fs::symlink_metadata(dst) {
+            if meta.file_type().is_symlink() || meta.file_type().is_file() {
+                let _ = std::fs::remove_file(dst);
+            } else if meta.file_type().is_dir() {
+                std::fs::remove_dir_all(dst)?;
+            }
         }
         if let Some(parent) = dst.parent() {
             std::fs::create_dir_all(parent)?;
         }
 
         #[cfg(target_os = "macos")]
-        if !Self::contains_ignored_subdir(src, 1) {
+        if !Self::contains_ignored_subdir(src, 4) {
             use std::ffi::CString;
             use std::os::unix::ffi::OsStrExt;
             if let (Ok(c_src), Ok(c_dst)) = (
@@ -734,7 +829,7 @@ impl CoWWorkspace {
 
         #[cfg(target_os = "linux")]
         if std::env::var_os("AOS_BTRFS_SUBVOL").is_some() {
-            if !Self::contains_ignored_subdir(src, 1) && Self::try_btrfs_subvol_snapshot(src, dst) {
+            if !Self::contains_ignored_subdir(src, 4) && Self::try_btrfs_subvol_snapshot(src, dst) {
                 return Ok(());
             }
             if !Self::try_btrfs_subvol_create(dst) {
@@ -749,18 +844,25 @@ impl CoWWorkspace {
         let mut allow_reflink = true;
         let mut stack = vec![(src.to_path_buf(), dst.to_path_buf())];
         while let Some((cur_src, cur_dst)) = stack.pop() {
-            for entry in std::fs::read_dir(&cur_src)? {
-                let entry = entry?;
+            let Ok(rd) = std::fs::read_dir(&cur_src) else {
+                continue;
+            };
+            for entry in rd.flatten() {
                 let name = entry.file_name().to_string_lossy().to_string();
                 if Self::is_ignored_dir_name(&name) {
                     continue;
                 }
                 let entry_src = entry.path();
                 let entry_dst = cur_dst.join(&name);
-                let ft = entry.file_type()?;
+                let Ok(ft) = entry.file_type() else {
+                    continue;
+                };
+                if ft.is_symlink() {
+                    continue;
+                }
                 if ft.is_dir() {
                     #[cfg(target_os = "macos")]
-                    if !Self::contains_ignored_subdir(&entry_src, 1) {
+                    if !Self::contains_ignored_subdir(&entry_src, 4) {
                         use std::ffi::CString;
                         use std::os::unix::ffi::OsStrExt;
                         if let (Ok(c_src), Ok(c_dst)) = (
@@ -801,14 +903,21 @@ impl CoWWorkspace {
         }
         let mut stack = vec![root.to_path_buf()];
         while let Some(dir) = stack.pop() {
-            for entry in std::fs::read_dir(&dir)? {
-                let entry = entry?;
+            let Ok(rd) = std::fs::read_dir(&dir) else {
+                continue;
+            };
+            for entry in rd.flatten() {
                 let path = entry.path();
                 let name = entry.file_name().to_string_lossy().to_string();
                 if Self::is_ignored_dir_name(&name) {
                     continue;
                 }
-                let ft = entry.file_type()?;
+                let Ok(ft) = entry.file_type() else {
+                    continue;
+                };
+                if ft.is_symlink() {
+                    continue;
+                }
                 if ft.is_dir() {
                     stack.push(path);
                 } else if ft.is_file() {
@@ -1321,6 +1430,7 @@ impl TransactionalWorkspace for CoWWorkspace {
             bail!("Snapshot '{}' does not exist", snapshot_id);
         }
         Self::cow_sync_dir(&snap_dir, &self.shadow_root).await?;
+        Self::link_host_dependency_dirs(&self.host_source_root, &self.shadow_root);
         Ok(())
     }
 
@@ -1905,5 +2015,66 @@ mod tests {
             tokio::fs::read(host_dir.join("main.pdf")).await.unwrap(),
             vec![0xffu8, 0xd8, 0x00, 0x04]
         );
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn test_host_dependency_symlinks_and_broken_symlink_recovery() {
+        let temp = tempfile::tempdir().unwrap();
+        let host_dir = temp.path().join("host_monorepo");
+        tokio::fs::create_dir_all(host_dir.join("node_modules/tsx"))
+            .await
+            .unwrap();
+        tokio::fs::write(host_dir.join("node_modules/tsx/index.js"), "module.exports = 1;\n")
+            .await
+            .unwrap();
+        tokio::fs::create_dir_all(host_dir.join("apps/platform/node_modules/pkg"))
+            .await
+            .unwrap();
+        tokio::fs::write(
+            host_dir.join("apps/platform/node_modules/pkg/index.js"),
+            "module.exports = 2;\n",
+        )
+        .await
+        .unwrap();
+        tokio::fs::write(host_dir.join("apps/platform/main.ts"), "console.log('ok');\n")
+            .await
+            .unwrap();
+
+        let cow_dir = temp.path().join("cow_ws");
+        let ws = CoWWorkspace::init(&host_dir, &cow_dir).await.unwrap();
+
+        // Both root `node_modules` and `apps/platform/node_modules` should be auto-symlinked in shadow_root
+        let root_nm = ws.shadow_root().join("node_modules");
+        let sub_nm = ws.shadow_root().join("apps/platform/node_modules");
+        assert!(
+            std::fs::symlink_metadata(&root_nm)
+                .unwrap()
+                .file_type()
+                .is_symlink()
+        );
+        assert!(
+            std::fs::symlink_metadata(&sub_nm)
+                .unwrap()
+                .file_type()
+                .is_symlink()
+        );
+        assert!(root_nm.join("tsx/index.js").exists());
+        assert!(sub_nm.join("pkg/index.js").exists());
+
+        // `diff` and `create_snapshot` must completely ignore `node_modules` symlinks
+        assert!(ws.diff(None).await.unwrap().is_empty());
+        let snap = ws.create_snapshot("with-symlinks").await.unwrap();
+        assert_eq!(snap.file_count, 1);
+
+        // Simulate a timed-out `proc_exec` leaving a broken symlink in `upper_workspace`
+        let broken_link = ws.shadow_root().join("stale_link");
+        std::os::unix::fs::symlink("/nonexistent/target/path", &broken_link).unwrap();
+        assert!(std::fs::symlink_metadata(&broken_link).is_ok());
+
+        // Re-initializing or refreshing automatically cleans up the broken symlink without error
+        let ws_reopened = CoWWorkspace::init(&host_dir, &cow_dir).await.unwrap();
+        assert!(std::fs::symlink_metadata(&broken_link).is_err());
+        assert!(ws_reopened.diff(None).await.unwrap().is_empty());
     }
 }

@@ -1704,14 +1704,31 @@ pub async fn serve_unified_stdio(
 
         // Local Community Mode execution path
         if method == "tools/call" || method == "resources/read" {
-            let _ = kernel
+            if let Err(err) = kernel
                 .ensure_agent_environment(
                     identity.clone(),
                     &active_workspace,
                     aos_core::IsolationTier::NativeOsSandbox,
                     vec!["*".to_string()],
                 )
-                .await?;
+                .await
+            {
+                let err_resp = json!({
+                    "jsonrpc": "2.0",
+                    "id": id,
+                    "result": {
+                        "isError": true,
+                        "content": [{
+                            "type": "text",
+                            "text": format!("Aegis OS Environment Initialization Error: {}", err)
+                        }]
+                    }
+                });
+                let out_line = format!("{}\n", serde_json::to_string(&err_resp)?);
+                stdout.write_all(out_line.as_bytes()).await?;
+                stdout.flush().await?;
+                continue;
+            }
             let _ = kernel
                 .ipc
                 .update_peer_metadata(
@@ -1724,7 +1741,20 @@ pub async fn serve_unified_stdio(
                 .await;
         }
 
-        let response = kernel.handle_jsonrpc_message(&identity, req).await?;
+        let response = match kernel.handle_jsonrpc_message(&identity, req).await {
+            Ok(resp) => resp,
+            Err(err) => json!({
+                "jsonrpc": "2.0",
+                "id": id,
+                "result": {
+                    "isError": true,
+                    "content": [{
+                        "type": "text",
+                        "text": format!("Aegis OS Kernel Error: {}", err)
+                    }]
+                }
+            }),
+        };
         let out_line = format!("{}\n", serde_json::to_string(&response)?);
         stdout.write_all(out_line.as_bytes()).await?;
         stdout.flush().await?;

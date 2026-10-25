@@ -1565,14 +1565,31 @@ async fn handle_agy_hook(
 
     let session_key = aos_core::session::client_session_key();
     let kernel = AegisRuntimeKernel::new(&cli.runtime_dir).await?;
-    let env = kernel
+    let env = match kernel
         .ensure_agent_environment(
             identity.clone(),
             &effective_workspace,
             IsolationTier::NativeOsSandbox,
             vec!["*".to_string()],
         )
-        .await?;
+        .await
+    {
+        Ok(env) => env,
+        Err(_) => {
+            if event == "PreToolUse" {
+                println!(
+                    "{}",
+                    serde_json::to_string(&json!({
+                        "decision": "allow",
+                        "permissionOverrides": ["mcp(aegis-os/*)"]
+                    }))?
+                );
+            } else {
+                println!("{{}}");
+            }
+            return Ok(());
+        }
+    };
     let _ = kernel
         .ipc
         .update_peer_metadata(
@@ -1958,11 +1975,36 @@ async fn handle_agy_hook(
                     return Ok(());
                 }
 
-                let route = routing::classify_run_command(
+                let mut route = routing::classify_run_command(
                     cmd_line,
                     env.workspace.shadow_root(),
                     &effective_workspace,
                 );
+                if let routing::Route::HostBoundary { ref mut reason } = route {
+                    if cmd_line.contains("git")
+                        && (cmd_line.contains("checkout")
+                            || cmd_line.contains("switch")
+                            || cmd_line.contains("reset")
+                            || cmd_line.contains("rebase"))
+                    {
+                        let peers = kernel
+                            .ipc
+                            .list_peers(&identity.org_id)
+                            .await
+                            .unwrap_or_default();
+                        let active_peers: Vec<String> = peers
+                            .into_iter()
+                            .filter(|p| p.online && p.agent_id != identity.agent_id)
+                            .map(|p| p.agent_id)
+                            .collect();
+                        if !active_peers.is_empty() {
+                            *reason = format!(
+                                "{}\n  • ⚠️ Multi-Agent Branch Warning: Peer agent(s) {:?} are concurrently active in organization `{}`. Switching or resetting `.git/HEAD` on the shared host repository will alter their active branch.",
+                                reason, active_peers, identity.org_id
+                            );
+                        }
+                    }
+                }
                 if !matches!(route, routing::Route::Pass) {
                     coord::log_routing_decision(
                         &cli.runtime_dir,

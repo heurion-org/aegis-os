@@ -64,8 +64,9 @@ pub struct AegisRuntimeKernel {
 
 impl AegisRuntimeKernel {
     pub async fn new(runtime_data_root: impl AsRef<Path>) -> anyhow::Result<Self> {
-        let root = runtime_data_root.as_ref().to_path_buf();
-        tokio::fs::create_dir_all(&root).await?;
+        let raw_root = runtime_data_root.as_ref().to_path_buf();
+        tokio::fs::create_dir_all(&raw_root).await?;
+        let root = std::fs::canonicalize(&raw_root).unwrap_or(raw_root);
 
         let policy = Arc::new(AegisPolicyKernel::with_state_file(Some(
             root.join("policy_state.json"),
@@ -924,8 +925,47 @@ impl AegisRuntimeKernel {
             // 2. Sandboxed Command Execution Tools (Zero-Prompt in Sandbox)
             // ----------------------------------------------------------------
             "proc_exec" => {
+                if let Some(poll_pid) = args.get("poll_pid").and_then(|v| v.as_u64()) {
+                    let pid = poll_pid as u32;
+                    let bg_dir = env.sandbox.config().agent_home_dir.join("bg_jobs");
+                    let out_path = bg_dir.join(format!("{}.stdout.log", pid));
+                    let err_path = bg_dir.join(format!("{}.stderr.log", pid));
+                    let exit_path = bg_dir.join(format!("{}.exit", pid));
+                    let stdout = tokio::fs::read_to_string(&out_path).await.unwrap_or_default();
+                    let stderr = tokio::fs::read_to_string(&err_path).await.unwrap_or_default();
+                    let recorded_exit = tokio::fs::read_to_string(&exit_path)
+                        .await
+                        .ok()
+                        .and_then(|s| s.trim().parse::<i32>().ok());
+                    #[cfg(unix)]
+                    let running = recorded_exit.is_none() && {
+                        extern "C" {
+                            fn kill(pid: i32, sig: i32) -> i32;
+                        }
+                        unsafe { kill(pid as i32, 0) == 0 }
+                    };
+                    #[cfg(not(unix))]
+                    let running = recorded_exit.is_none();
+                    let exit_code = if let Some(code) = recorded_exit {
+                        Some(code)
+                    } else if !running {
+                        Some(0)
+                    } else {
+                        None
+                    };
+                    return Ok(json!({
+                        "pid": pid,
+                        "running": running,
+                        "exit_code": exit_code,
+                        "stdout": stdout,
+                        "stderr": stderr,
+                        "sandbox_profile_used": "background-job-poll"
+                    }));
+                }
+
                 let command = args
                     .get("command")
+                    .or_else(|| args.get("cmd"))
                     .and_then(|v| v.as_str())
                     .context("Missing 'command'")?
                     .to_string();
@@ -933,16 +973,25 @@ impl AegisRuntimeKernel {
                     .get("args")
                     .and_then(|v| serde_json::from_value(v.clone()).ok())
                     .unwrap_or_default();
+                let cwd = args
+                    .get("cwd")
+                    .and_then(|v| v.as_str())
+                    .filter(|s| !s.is_empty())
+                    .map(|rel| env.workspace.shadow_root().join(rel.trim_start_matches('/')));
+                let background = args
+                    .get("background")
+                    .and_then(|v| v.as_bool())
+                    .unwrap_or(false);
 
                 let out = env
                     .sandbox
                     .exec(ExecSpec {
                         command,
                         args: cmd_args,
-                        cwd: None,
+                        cwd,
                         env: HashMap::new(),
                         timeout_ms: args.get("timeout_ms").and_then(|v| v.as_u64()),
-                        background: false,
+                        background,
                     })
                     .await?;
                 Ok(serde_json::to_value(out)?)
@@ -1614,15 +1663,17 @@ impl AegisRuntimeKernel {
                 },
                 {
                     "name": "proc_exec",
-                    "description": "[Zero-Prompt] PREFERRED over native shell tools (run_command/Bash): execute a command (e.g. `sh -c \"grep -rn foo crates | head\"`, `cargo test`) kernel-confined inside the Agent's OS sandbox. cwd = your CoW shadow workspace; host files are readable by absolute path; writes stay in the shadow until workspace_commit.",
+                    "description": "[Zero-Prompt] PREFERRED over native shell tools (run_command/Bash): execute a command (e.g. `sh -c \"grep -rn foo crates | head\"`, `cargo test`) kernel-confined inside the Agent's OS sandbox. cwd = your CoW shadow workspace (with host `node_modules`/`.venv` auto-linked read-only); writes stay in the shadow until workspace_commit. For long-running tasks (>2m, e.g. online LLM benchmarks), pass `background: true` and poll status/output with `poll_pid`.",
                     "inputSchema": {
                         "type": "object",
                         "properties": {
                             "command": { "type": "string" },
                             "args": { "type": "array", "items": { "type": "string" } },
-                            "timeout_ms": { "type": "integer" }
-                        },
-                        "required": ["command"]
+                            "cwd": { "type": "string" },
+                            "timeout_ms": { "type": "integer" },
+                            "background": { "type": "boolean" },
+                            "poll_pid": { "type": "integer" }
+                        }
                     }
                 },
                 {
@@ -2421,14 +2472,32 @@ impl AegisRuntimeKernel {
                         key,
                     );
                 }
-                let _ = self
+                if let Err(err) = self
                     .ensure_agent_environment(
                         identity.clone(),
                         &active_workspace,
                         IsolationTier::NativeOsSandbox,
                         vec!["*".to_string()],
                     )
-                    .await?;
+                    .await
+                {
+                    let id = req.get("id").cloned().unwrap_or(Value::Null);
+                    let err_resp = json!({
+                        "jsonrpc": "2.0",
+                        "id": id,
+                        "result": {
+                            "isError": true,
+                            "content": [{
+                                "type": "text",
+                                "text": format!("Aegis OS Environment Initialization Error: {}", err)
+                            }]
+                        }
+                    });
+                    let out_line = format!("{}\n", serde_json::to_string(&err_resp)?);
+                    stdout.write_all(out_line.as_bytes()).await?;
+                    stdout.flush().await?;
+                    continue;
+                }
                 let _ = self
                     .ipc
                     .update_peer_metadata(
@@ -2441,7 +2510,21 @@ impl AegisRuntimeKernel {
                     .await;
             }
 
-            let response = self.handle_jsonrpc_message(&identity, req).await?;
+            let id = req.get("id").cloned().unwrap_or(Value::Null);
+            let response = match self.handle_jsonrpc_message(&identity, req).await {
+                Ok(resp) => resp,
+                Err(err) => json!({
+                    "jsonrpc": "2.0",
+                    "id": id,
+                    "result": {
+                        "isError": true,
+                        "content": [{
+                            "type": "text",
+                            "text": format!("Aegis OS Kernel Error: {}", err)
+                        }]
+                    }
+                }),
+            };
             let out_line = format!("{}\n", serde_json::to_string(&response)?);
             stdout.write_all(out_line.as_bytes()).await?;
             stdout.flush().await?;
@@ -4078,5 +4161,62 @@ mod tests {
         )
         .await;
         assert!(revoked_head.contains("401 Unauthorized"));
+    }
+
+    #[tokio::test]
+    async fn test_proc_exec_background_job_and_poll_pid() {
+        let temp = tempfile::tempdir().unwrap();
+        let runtime_dir = temp.path().join("runtime");
+        let host_project = temp.path().join("host_project");
+        tokio::fs::create_dir_all(&host_project).await.unwrap();
+        tokio::fs::write(host_project.join("README.md"), "# Test\n")
+            .await
+            .unwrap();
+
+        let kernel = AegisRuntimeKernel::new(&runtime_dir).await.unwrap();
+        let agent = AgentIdentity::new("org-bg", "agent-bg", "Benchmark Runner");
+        kernel
+            .ensure_agent_environment(
+                agent.clone(),
+                &host_project,
+                IsolationTier::NativeOsSandbox,
+                vec!["*".to_string()],
+            )
+            .await
+            .unwrap();
+
+        let start_out = kernel
+            .call_tool(
+                &agent,
+                "proc_exec",
+                json!({
+                    "command": "sh",
+                    "args": ["-c", "echo 'benchmark_done_123'"],
+                    "background": true
+                }),
+            )
+            .await
+            .unwrap();
+        let pid = start_out["pid"].as_u64().expect("Expected background pid");
+        assert!(pid > 0);
+        assert!(start_out["exit_code"].is_null());
+
+        for _ in 0..20 {
+            let poll = kernel
+                .call_tool(&agent, "proc_exec", json!({ "poll_pid": pid }))
+                .await
+                .unwrap();
+            if poll["running"].as_bool() == Some(false)
+                && poll["stdout"]
+                    .as_str()
+                    .unwrap_or("")
+                    .contains("benchmark_done_123")
+            {
+                assert_eq!(poll["exit_code"], json!(0));
+                return;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        }
+        panic!("Background job did not complete within expected window");
     }
 }

@@ -127,6 +127,7 @@ impl NativeOsSandboxInstance {
                         format!(
                             r#"
 (deny file-read* (subpath "{orgs_str}"))
+(allow file-read-metadata (literal "{orgs_str}"))
 (allow file-read* (subpath "{own_str}"))"#
                         )
                     } else {
@@ -393,8 +394,12 @@ impl SandboxInstance for NativeOsSandboxInstance {
         let start = Instant::now();
         // Kept alive until this call returns so the relay outlives the sandboxed command.
         let mut egress_bridge: Option<EgressBridge> = None;
+        let nested_bg_inherited = spec.background
+            && std::env::var("AEGIS_ALLOW_NESTED_TEST_SANDBOX").as_deref() == Ok("1")
+            && std::env::var("AOS_SANDBOX_ID").is_ok();
         let (mut cmd, profile_label) = if cfg!(target_os = "macos")
             && !kernel_sandbox_disabled
+            && !nested_bg_inherited
             && Path::new("/usr/bin/sandbox-exec").exists()
         {
             let sbpl = self.generate_macos_seatbelt_profile();
@@ -454,11 +459,30 @@ impl SandboxInstance for NativeOsSandboxInstance {
             .stderr(Stdio::piped());
 
         // `HOME` is redirected to the agent home, which would hide the host Rust/cargo toolchain
-        // (registry cache, installed toolchains) and make `cargo build/test` fail inside `proc_exec`.
+        // (registry cache, installed toolchains) and Node/Python virtualenvs inside `proc_exec`.
         // Expose them read-only by path; Seatbelt still denies writes outside the CoW roots.
         let host_home = std::env::var("HOME").ok().map(PathBuf::from);
-        let mut path_val =
-            "/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin".to_string();
+        let mut path_entries: Vec<String> = Vec::new();
+        for rel_bin in [
+            work_dir.join("node_modules/.bin"),
+            self.config.workspace_dir.join("node_modules/.bin"),
+            work_dir.join(".venv/bin"),
+            self.config.workspace_dir.join(".venv/bin"),
+            work_dir.join("venv/bin"),
+            self.config.workspace_dir.join("venv/bin"),
+        ] {
+            if rel_bin.exists() {
+                path_entries.push(rel_bin.display().to_string());
+            }
+        }
+        if let Some(ref h) = host_home {
+            for user_bin in [".local/bin", ".bun/bin", ".volta/bin"] {
+                let p = h.join(user_bin);
+                if p.is_dir() {
+                    path_entries.push(p.display().to_string());
+                }
+            }
+        }
         for (var, default_sub) in [("CARGO_HOME", ".cargo"), ("RUSTUP_HOME", ".rustup")] {
             let candidate = std::env::var(var)
                 .ok()
@@ -466,12 +490,19 @@ impl SandboxInstance for NativeOsSandboxInstance {
                 .or_else(|| host_home.as_ref().map(|h| h.join(default_sub)));
             if let Some(p) = candidate.filter(|p| p.is_dir()) {
                 if var == "CARGO_HOME" && p.join("bin").is_dir() {
-                    path_val = format!("{}:{}", p.join("bin").display(), path_val);
+                    path_entries.push(p.join("bin").display().to_string());
                 }
                 cmd.env(var, p);
             }
         }
-        cmd.env("PATH", path_val);
+        path_entries.push("/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin".to_string());
+        let path_val = path_entries.join(":");
+        cmd.env("PATH", &path_val);
+
+        let ws_node_modules = self.config.workspace_dir.join("node_modules");
+        if ws_node_modules.exists() {
+            cmd.env("NODE_PATH", &ws_node_modules);
+        }
 
         if let Some(ref proxy) = self.config.egress_proxy_addr {
             cmd.env("HTTP_PROXY", proxy).env("HTTPS_PROXY", proxy);
@@ -485,11 +516,65 @@ impl SandboxInstance for NativeOsSandboxInstance {
             cmd.env(bridge::BRIDGE_TOKEN_ENV, &guard.token);
         }
 
+        if spec.background {
+            let bg_dir = self.config.agent_home_dir.join("bg_jobs");
+            std::fs::create_dir_all(&bg_dir)?;
+            let tag = uuid::Uuid::new_v4().to_string();
+            let tmp_out = bg_dir.join(format!("job-{}.stdout.log", tag));
+            let tmp_err = bg_dir.join(format!("job-{}.stderr.log", tag));
+            let out_file = std::fs::File::create(&tmp_out)?;
+            let err_file = std::fs::File::create(&tmp_err)?;
+            cmd.stdout(Stdio::from(out_file))
+                .stderr(Stdio::from(err_file))
+                .kill_on_drop(false);
+
+            let mut child = cmd.spawn()?;
+            let pid = child.id().unwrap_or(0);
+            let pid_out = bg_dir.join(format!("{}.stdout.log", pid));
+            let pid_err = bg_dir.join(format!("{}.stderr.log", pid));
+            let pid_exit = bg_dir.join(format!("{}.exit", pid));
+            let _ = std::fs::rename(&tmp_out, &pid_out);
+            let _ = std::fs::rename(&tmp_err, &pid_err);
+
+            tokio::spawn(async move {
+                if let Ok(status) = child.wait().await {
+                    let code = status.code().unwrap_or(-1);
+                    let _ = tokio::fs::write(&pid_exit, code.to_string()).await;
+                }
+            });
+
+            return Ok(ExecOutput {
+                pid,
+                exit_code: None,
+                stdout: serde_json::to_string_pretty(&serde_json::json!({
+                    "status": "running_in_background",
+                    "pid": pid,
+                    "stdout_log": pid_out.display().to_string(),
+                    "stderr_log": pid_err.display().to_string(),
+                    "poll_hint": format!("Call `proc_exec` with `{{\"poll_pid\": {}}}` to check status and read live stdout/stderr.", pid)
+                }))
+                .unwrap_or_default(),
+                stderr: String::new(),
+                duration_ms: start.elapsed().as_millis() as u64,
+                sandbox_profile_used: profile_label,
+            });
+        }
+
+        cmd.kill_on_drop(true);
         let child = cmd.spawn()?;
         let pid = child.id().unwrap_or(0);
 
         let timeout_dur = Duration::from_millis(spec.timeout_ms.unwrap_or(30_000));
-        let output = tokio::time::timeout(timeout_dur, child.wait_with_output()).await??;
+        let output = match tokio::time::timeout(timeout_dur, child.wait_with_output()).await {
+            Ok(res) => res?,
+            Err(_) => {
+                anyhow::bail!(
+                    "Command timed out after {}ms (pid {} terminated cleanly). For long-running tasks (>2m, such as online LLM benchmarks), pass `\"background\": true` to `proc_exec` and poll with `\"poll_pid\": <pid>`.",
+                    timeout_dur.as_millis(),
+                    pid
+                );
+            }
+        };
         let stderr_str = String::from_utf8_lossy(&output.stderr).to_string();
 
         // When `cargo test` is executed inside an outer `proc_exec` Seatbelt sandbox on macOS,
@@ -505,10 +590,7 @@ impl SandboxInstance for NativeOsSandboxInstance {
                 .args(&spec.args)
                 .current_dir(&work_dir)
                 .env_clear()
-                .env(
-                    "PATH",
-                    "/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin",
-                )
+                .env("PATH", &path_val)
                 .env("HOME", &self.config.agent_home_dir)
                 .env("TMPDIR", &self.config.agent_home_dir)
                 .env(
@@ -523,22 +605,20 @@ impl SandboxInstance for NativeOsSandboxInstance {
                 .env("AOS_ORG_SHARED_RO", &self.config.org_shared_ro_dir)
                 .env("AOS_ORG_AGENT_PUB", &self.config.org_agent_pub_dir)
                 .stdout(Stdio::piped())
-                .stderr(Stdio::piped());
-            let mut fb_path_val =
-                "/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin".to_string();
+                .stderr(Stdio::piped())
+                .kill_on_drop(true);
             for (var, default_sub) in [("CARGO_HOME", ".cargo"), ("RUSTUP_HOME", ".rustup")] {
                 let candidate = std::env::var(var)
                     .ok()
                     .map(PathBuf::from)
                     .or_else(|| host_home.as_ref().map(|h| h.join(default_sub)));
                 if let Some(p) = candidate.filter(|p| p.is_dir()) {
-                    if var == "CARGO_HOME" && p.join("bin").is_dir() {
-                        fb_path_val = format!("{}:{}", p.join("bin").display(), fb_path_val);
-                    }
                     fallback.env(var, p);
                 }
             }
-            fallback.env("PATH", fb_path_val);
+            if ws_node_modules.exists() {
+                fallback.env("NODE_PATH", &ws_node_modules);
+            }
             if let Some(ref proxy) = self.config.egress_proxy_addr {
                 fallback.env("HTTP_PROXY", proxy).env("HTTPS_PROXY", proxy);
             }
@@ -547,7 +627,16 @@ impl SandboxInstance for NativeOsSandboxInstance {
             }
             let fb_child = fallback.spawn()?;
             let fb_pid = fb_child.id().unwrap_or(0);
-            let fb_out = tokio::time::timeout(timeout_dur, fb_child.wait_with_output()).await??;
+            let fb_out = match tokio::time::timeout(timeout_dur, fb_child.wait_with_output()).await {
+                Ok(res) => res?,
+                Err(_) => {
+                    anyhow::bail!(
+                        "Command timed out after {}ms (pid {} terminated cleanly).",
+                        timeout_dur.as_millis(),
+                        fb_pid
+                    );
+                }
+            };
             return Ok(ExecOutput {
                 pid: fb_pid,
                 exit_code: fb_out.status.code(),
