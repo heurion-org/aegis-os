@@ -1906,18 +1906,14 @@ impl AegisRuntimeKernel {
                 },
                 {
                     "name": "runtime_configure_mode",
-                    "description": "[Zero-Prompt] Configure or switch the current workspace's Aegis OS execution mode directly from the Coding Agent (`mode`: `\"cloud\"` for Zero-Local-Load Cloud Sandbox with subscription, `\"local\"` for Free Local CoW Sandbox mode, or `\"status\"` to inspect current mode).",
+                    "description": "[Zero-Prompt] Configure or switch the current workspace's Aegis OS execution mode directly from the Coding Agent (`mode`: `\"cloud\"` for Zero-Local-Load Cloud Sandbox, `\"pro\"` for Pro Multi-Agent Cloud Sandbox, `\"local\"` for Free Local CoW Sandbox mode, or `\"status\"` to inspect current mode). Credentials are automatically loaded from local `~/.aegis-os/cloud_bindings.json` or auto-provisioned by the local runtime — NEVER ask the user to paste raw `ak_live_*` API keys into chat.",
                     "inputSchema": {
                         "type": "object",
                         "properties": {
                             "mode": {
                                 "type": "string",
-                                "enum": ["cloud", "local", "status"],
-                                "description": "Target execution mode (`\"cloud\"` to offload to Aegis Cloud Sandbox, `\"local\"` for free local CoW sandbox, `\"status\"` to inspect)."
-                            },
-                            "api_key": {
-                                "type": "string",
-                                "description": "Optional `ak_live_*` subscription API key for Cloud mode (if omitted, uses saved key or auto-mints a trial/dev key)."
+                                "enum": ["cloud", "pro", "local", "status"],
+                                "description": "Target execution mode (`\"cloud\"` or `\"pro\"` to offload to Aegis Cloud Sandbox, `\"local\"` for local CoW sandbox, `\"status\"` to inspect)."
                             },
                             "endpoint": {
                                 "type": "string",
@@ -2831,6 +2827,12 @@ impl AegisRuntimeKernel {
                     } else if method == "POST" && full_target == "/v1/workspaces" {
                         let payload: Value = serde_json::from_str(body_str.trim()).unwrap_or_else(|_| json!({}));
                         let w_org = payload.get("org_id").and_then(|v| v.as_str()).unwrap_or(&org_id);
+                        let auth_tier = k.paas.get_tenant_plan(&org_id).await;
+                        if auth_tier != paas::PlanTier::Community
+                            && k.paas.get_tenant_plan(w_org).await == paas::PlanTier::Community
+                        {
+                            let _ = k.paas.set_tenant_plan(w_org, auth_tier).await;
+                        }
                         let w_id = payload.get("workspace_id").and_then(|v| v.as_str()).unwrap_or("");
                         let w_src = payload
                             .get("source_url")

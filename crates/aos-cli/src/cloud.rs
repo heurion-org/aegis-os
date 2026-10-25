@@ -1097,7 +1097,7 @@ pub fn build_onboarding_prompt_if_needed(
          1. Whether they have an **Aegis Cloud Subscription** (or want to subscribe via `{}`) to enable **Cloud Sandbox Mode** (0% local CPU/RAM load; builds & tests offloaded to the remote Linux `btrfs` CoW sandbox).\n\
          2. Or if they do not have a subscription and want to start **Local Community Mode (Free)** (local Copy-on-Write shadow workspace + native OS kernel sandbox).\n\
          Once the user answers, immediately call the `aegis-os` MCP tool `runtime_configure_mode` with:\n\
-         - `{{ \"mode\": \"cloud\", \"api_key\": \"<optional ak_live_... key>\", \"endpoint\": \"<optional url>\" }}` for Cloud Mode, or\n\
+         - `{{ \"mode\": \"cloud\" }}` for Cloud Mode (credentials are loaded automatically from local `~/.aegis-os/cloud_bindings.json` or auto-provisioned by the local runtime; NEVER ask the user to paste raw API keys into chat), or\n\
          - `{{ \"mode\": \"local\" }}` for Local Mode.",
         canon.display(),
         aos_mcp_gateway::paas::PaasControlPlane::DEFAULT_POLAR_PRO_CHECKOUT_URL
@@ -1328,7 +1328,12 @@ pub async fn configure_workspace_mode_via_mcp(
         }
 
         _ => {
-            let active = resolve_active_cloud_binding(runtime_dir, &canon);
+            let mut active = resolve_active_cloud_binding(runtime_dir, &canon);
+            if let Some(ref mut b) = active {
+                if !b.api_key.is_empty() {
+                    b.api_key = format!("{}...[REDACTED_LOCAL_ONLY]", &b.api_key[..b.api_key.len().min(12)]);
+                }
+            }
             let configured = is_workspace_mode_configured(runtime_dir, &canon);
             Ok(json!({
                 "status": "ok",
