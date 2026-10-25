@@ -27,7 +27,7 @@ use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader};
 pub enum CloudAction {
     /// Authenticate with an Aegis Cloud PaaS endpoint and store `ak_live_*` credentials
     Login {
-        #[arg(long, default_value = "http://127.0.0.1:17080")]
+        #[arg(long, default_value = "https://heurion.org")]
         endpoint: String,
         #[arg(long)]
         api_key: Option<String>,
@@ -442,7 +442,7 @@ pub async fn handle_cloud_command(
         } => {
             let clean_ep = endpoint
                 .or_else(|| store.auth.as_ref().map(|a| a.endpoint.clone()))
-                .unwrap_or_else(|| "http://127.0.0.1:17080".to_string())
+                .unwrap_or_else(|| "https://heurion.org".to_string())
                 .trim()
                 .trim_end_matches('/')
                 .to_string();
@@ -725,7 +725,7 @@ pub async fn handle_cloud_command(
                 .as_ref()
                 .map(|b| b.endpoint.clone())
                 .or_else(|| store.auth.as_ref().map(|a| a.endpoint.clone()))
-                .unwrap_or_else(|| "http://127.0.0.1:17080".to_string());
+                .unwrap_or_else(|| "https://heurion.org".to_string());
             let key = active
                 .as_ref()
                 .map(|b| b.api_key.as_str())
@@ -734,7 +734,7 @@ pub async fn handle_cloud_command(
             let status = cloud_http_json(
                 "GET",
                 &ep,
-                &format!("/api/status?org_id={}", identity.org_id),
+                &format!("/v1/status?org_id={}", identity.org_id),
                 key,
                 &[],
                 None,
@@ -764,7 +764,7 @@ pub async fn handle_cloud_command(
                 .as_ref()
                 .map(|b| b.endpoint.clone())
                 .or_else(|| store.auth.as_ref().map(|a| a.endpoint.clone()))
-                .unwrap_or_else(|| "http://127.0.0.1:17080".to_string());
+                .unwrap_or_else(|| "https://heurion.org".to_string());
             let key = active
                 .as_ref()
                 .map(|b| b.api_key.as_str())
@@ -824,7 +824,7 @@ pub async fn handle_cloud_command(
                 .as_ref()
                 .map(|b| b.endpoint.clone())
                 .or_else(|| store.auth.as_ref().map(|a| a.endpoint.clone()))
-                .unwrap_or_else(|| "http://127.0.0.1:17080".to_string());
+                .unwrap_or_else(|| "https://heurion.org".to_string());
             let key = active
                 .as_ref()
                 .map(|b| b.api_key.as_str())
@@ -855,7 +855,7 @@ pub async fn handle_cloud_command(
             let ep = endpoint
                 .or_else(|| active.as_ref().map(|b| b.endpoint.clone()))
                 .or_else(|| store.auth.as_ref().map(|a| a.endpoint.clone()))
-                .unwrap_or_else(|| "http://127.0.0.1:17080".to_string())
+                .unwrap_or_else(|| "https://heurion.org".to_string())
                 .trim()
                 .trim_end_matches('/')
                 .to_string();
@@ -930,7 +930,7 @@ pub async fn handle_cloud_command(
                 .as_ref()
                 .map(|b| b.endpoint.clone())
                 .or_else(|| store.auth.as_ref().map(|a| a.endpoint.clone()))
-                .unwrap_or_else(|| "http://127.0.0.1:17080".to_string());
+                .unwrap_or_else(|| "https://heurion.org".to_string());
             let key = active
                 .as_ref()
                 .map(|b| b.api_key.as_str())
@@ -956,7 +956,7 @@ pub async fn handle_cloud_command(
                 let status = cloud_http_json(
                     "GET",
                     &ep,
-                    &format!("/api/status?org_id={}", identity.org_id),
+                    &format!("/v1/status?org_id={}", identity.org_id),
                     key,
                     &[],
                     None,
@@ -1016,7 +1016,7 @@ pub async fn handle_cloud_command(
                 .as_ref()
                 .map(|b| b.endpoint.clone())
                 .or_else(|| store.auth.as_ref().map(|a| a.endpoint.clone()))
-                .unwrap_or_else(|| "http://127.0.0.1:17080".to_string());
+                .unwrap_or_else(|| "https://heurion.org".to_string());
             let key = active
                 .as_ref()
                 .map(|b| b.api_key.as_str())
@@ -1025,7 +1025,7 @@ pub async fn handle_cloud_command(
             let remote_status = cloud_http_json(
                 "GET",
                 &ep,
-                &format!("/api/status?org_id={}", identity.org_id),
+                &format!("/v1/status?org_id={}", identity.org_id),
                 key,
                 &[],
                 None,
@@ -1128,7 +1128,7 @@ pub async fn configure_workspace_mode_via_mcp(
             if !found_entry {
                 store.bindings.push(CloudWorkspaceBinding {
                     local_workspace: canon_str.clone(),
-                    endpoint: "http://127.0.0.1:17080".to_string(),
+                    endpoint: "https://heurion.org".to_string(),
                     api_key: String::new(),
                     org_id: identity.org_id.clone(),
                     workspace_id: format!("ws-{}", identity.org_id),
@@ -1173,7 +1173,7 @@ pub async fn configure_workspace_mode_via_mcp(
                 .filter(|s| !s.trim().is_empty())
                 .map(|s| s.trim().trim_end_matches('/').to_string())
                 .or_else(|| store.auth.as_ref().map(|a| a.endpoint.clone()))
-                .unwrap_or_else(|| "http://127.0.0.1:17080".to_string());
+                .unwrap_or_else(|| "https://heurion.org".to_string());
 
             let ws_id = args
                 .get("workspace_id")

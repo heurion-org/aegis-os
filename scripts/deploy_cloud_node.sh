@@ -56,7 +56,7 @@ WorkingDirectory=${DATA_ROOT}
 Environment="AOS_REQUIRE_API_KEY=1"
 Environment="AOS_BILLING_WEBHOOK_SECRET=${POLAR_WEBHOOK_SECRET}"
 Environment="AOS_CHECKOUT_URL_PRO=https://buy.polar.sh/polar_cl_jCPpzbp4eOAyRbkDP4YzNIFVnYLddbvJZI5Fc27zL0x"
-ExecStart=/usr/local/bin/aegis-os --runtime-dir ${DATA_ROOT} --workspace ${DATA_ROOT}/default_workspace daemon --bind 0.0.0.0:${PORT}
+ExecStart=/usr/local/bin/aegis-os --runtime-dir ${DATA_ROOT} --workspace ${DATA_ROOT}/default_workspace daemon --listen 0.0.0.0:${PORT}
 Restart=always
 RestartSec=2
 LimitNOFILE=65535

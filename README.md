@@ -159,7 +159,7 @@ aegis-os cloud subscribe --plan pro --email you@example.com
 aegis-os cloud subscribe --claim --email you@example.com
 
 # Authenticate or bind current project to an Aegis Cloud Sandbox (0% local CPU/RAM load)
-aegis-os cloud login --endpoint http://127.0.0.1:17080
+aegis-os cloud login --endpoint https://heurion.org
 aegis-os cloud up
 
 # Inspect remote CoW unified code diff, pending HITL approvals, and tenant metering in terminal

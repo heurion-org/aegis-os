@@ -1850,7 +1850,7 @@ aegis-os cloud down`;
 
     async function refresh(force) {
       try {
-        const res = await fetch('/api/status?org_id=*');
+        const res = await fetch('/v1/status?org_id=*');
         const data = await res.json();
         const sig = JSON.stringify(data);
         if (!force && sig === lastSig) return;

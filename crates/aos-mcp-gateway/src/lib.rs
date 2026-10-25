@@ -1921,7 +1921,7 @@ impl AegisRuntimeKernel {
                             },
                             "endpoint": {
                                 "type": "string",
-                                "description": "Optional Aegis Cloud PaaS endpoint URL (defaults to `http://127.0.0.1:17080` or saved endpoint)."
+                                "description": "Optional Aegis Cloud PaaS endpoint URL (defaults to `https://heurion.org` or saved endpoint)."
                             },
                             "plan_tier": {
                                 "type": "string",
@@ -2629,7 +2629,10 @@ impl AegisRuntimeKernel {
                             })
                             .to_string(),
                         )
-                    } else if method == "GET" && full_target.starts_with("/api/status") {
+                    } else if method == "GET"
+                        && (full_target.starts_with("/api/status")
+                            || full_target.starts_with("/v1/status"))
+                    {
                         let query_org = if let Some((_, after)) = full_target.split_once("org_id=") {
                             let val = after.split('&').next().unwrap_or("*").trim();
                             if val.is_empty() { "*".to_string() } else { val.to_string() }
