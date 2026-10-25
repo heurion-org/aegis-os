@@ -32,7 +32,7 @@ pub enum PlanTier {
 
 impl Default for PlanTier {
     fn default() -> Self {
-        Self::Pro
+        Self::Community
     }
 }
 
@@ -43,7 +43,7 @@ impl PlanTier {
             "pro" => Self::Pro,
             "team" => Self::Team,
             "enterprise" | "ent" => Self::Enterprise,
-            _ => Self::Pro,
+            _ => Self::Community,
         }
     }
 
@@ -119,7 +119,7 @@ pub struct TenantUsageRecord {
     pub org_id: String,
     #[serde(default)]
     pub plan_tier: PlanTier,
-    #[serde(default = "default_pro_agents")]
+    #[serde(default = "default_free_agents")]
     pub max_concurrent_agents: usize,
     #[serde(default)]
     pub total_syscalls: u64,
@@ -133,8 +133,8 @@ pub struct TenantUsageRecord {
     pub updated_at_ms: i64,
 }
 
-fn default_pro_agents() -> usize {
-    8
+fn default_free_agents() -> usize {
+    1
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -394,8 +394,8 @@ impl PaasControlPlane {
             } else {
                 state.tenants.push(TenantUsageRecord {
                     org_id: org_id.to_string(),
-                    plan_tier: PlanTier::Pro,
-                    max_concurrent_agents: PlanTier::Pro.max_concurrent_agents(),
+                    plan_tier: PlanTier::Community,
+                    max_concurrent_agents: PlanTier::Community.max_concurrent_agents(),
                     total_syscalls: syscalls_delta,
                     sandbox_exec_ms: exec_ms_delta,
                     cow_saved_bytes: cow_saved_delta,
@@ -439,7 +439,7 @@ impl PaasControlPlane {
             .iter()
             .find(|t| t.org_id == org_id)
             .map(|t| t.plan_tier)
-            .unwrap_or(PlanTier::Pro)
+            .unwrap_or(PlanTier::Community)
     }
 
     /// Official Polar.sh hosted checkout link for Aegis Cloud Pro ($29/mo).
@@ -929,7 +929,7 @@ impl PaasControlPlane {
                 .iter()
                 .find(|t| t.org_id == org_id)
                 .map(|t| t.max_concurrent_agents)
-                .unwrap_or_else(|| PlanTier::Pro.max_concurrent_agents())
+                .unwrap_or_else(|| PlanTier::Community.max_concurrent_agents())
         };
         if agent_list.len() > max_agents {
             bail!(
@@ -2268,7 +2268,7 @@ pub const DASHBOARD_HTML: &str = r##"<!doctype html>
             <input class="mono-input" id="ws-org" value="aegis-os" placeholder="团队名称 (org)" style="width:130px;" />
             <input class="mono-input" id="ws-id" value="ws-core" placeholder="工作区名称" style="width:130px;" />
             <input class="mono-input" id="ws-src" value="." placeholder="Git 仓库地址或路径" style="width:190px;" />
-            <input class="mono-input" id="ws-agents" value="coder-alpha,reviewer-beta" placeholder="AI 助手名（逗号分隔）" style="width:220px;" />
+            <input class="mono-input" id="ws-agents" value="coder-alpha" placeholder="AI 助手名（Pro 可用逗号分隔多个）" style="width:220px;" />
             <button class="btn btn-solid" onclick="provisionWorkspace()" data-i18n="btn_provision">+ 创建云端工作区</button>
           </div>
 
@@ -2301,17 +2301,22 @@ pub const DASHBOARD_HTML: &str = r##"<!doctype html>
         </div>
 
         <div class="onboarding-grid">
-          <!-- Left: Clear 2-Tier Comparison & 3-Step Subscription Explanation -->
+          <!-- Left: Clear 2-Tier Comparison & Step-by-Step Setup Explanation -->
           <div class="editorial-card" style="display:flex; flex-direction:column; justify-content:space-between; gap:1.35rem;">
             <div>
-              <div style="display:flex; justify-content:space-between; align-items:baseline; padding-bottom:0.85rem; border-bottom:1px solid var(--border); margin-bottom:1rem;">
+              <div style="display:flex; justify-content:space-between; align-items:baseline; padding-bottom:0.85rem; border-bottom:1px solid var(--border); margin-bottom:0.85rem;">
                 <div>
-                  <span class="tag" data-i18n="tier_free_tag">免费版 · FREE</span>
+                  <span class="tag" data-i18n="tier_free_tag">免费版 · 默认开启</span>
                   <h3 style="font-family:var(--serif); font-size:1.25rem; font-weight:400; margin-top:0.35rem;" data-i18n="tier_free_title">$0 / 月 · 支持 1 个 AI 助手</h3>
                 </div>
-                <button class="btn" onclick="changePlan('community')" data-i18n="btn_use_free">切换为免费版</button>
+                <button class="btn" onclick="changePlan('community')" data-i18n="btn_use_free">使用免费版 (查看命令)</button>
               </div>
               <p class="text-muted" style="font-size:0.84rem;" data-i18n="tier_free_desc">适合个人日常轻量开发：支持 1 个 AI 助手在独立临时副本中改代码与跑测试，合并回主项目前提供代码对比预览与人工确认保护。</p>
+              <div style="background:var(--bg-primary); border:1px solid var(--border); padding:0.75rem 0.95rem; font-size:0.8rem; color:var(--ink-secondary); line-height:1.7; margin-top:0.65rem;">
+                <div style="font-weight:600; color:var(--ink); margin-bottom:0.2rem;" data-i18n="free_box_title">免费版设置方法（无需付款）：</div>
+                <div data-i18n="free_step_1">• 本地免费模式：安装后在项目文件夹运行 aegis-os init --workspace . 即可免费使用；</div>
+                <div data-i18n="free_step_2">• 云端免费体验 (限 1 个 AI)：在下方点「+ 生成密钥」，复制右侧免费版命令即可连上云主机。</div>
+              </div>
             </div>
 
             <div style="padding-top:1.15rem; border-top:1px solid var(--border);">
@@ -2333,7 +2338,7 @@ pub const DASHBOARD_HTML: &str = r##"<!doctype html>
             </div>
           </div>
 
-          <!-- Right: Step 2 Email Claim + Step 3 CLI Commands -->
+          <!-- Right: Step 2 Email Claim + Step 3 CLI Commands (with Free / Pro Command Switcher) -->
           <div class="editorial-card" style="display:flex; flex-direction:column; justify-content:space-between; gap:1.25rem;">
             <div>
               <span style="font-size:0.84rem; font-weight:600; color:var(--accent);" data-i18n="claim_card_title">② 已完成付款？输入邮箱提取你的专属密钥</span>
@@ -2345,11 +2350,15 @@ pub const DASHBOARD_HTML: &str = r##"<!doctype html>
             </div>
 
             <div style="padding-top:1rem; border-top:1px solid var(--border);">
-              <div style="display:flex; justify-content:space-between; align-items:center; margin-bottom:0.65rem;">
-                <span style="font-size:0.84rem; font-weight:600; color:var(--ink);" data-i18n="cli_card_title">③ 在你的电脑终端运行这 3 步即可连上云端：</span>
-                <button class="btn" onclick="copyCliSnippet()" data-i18n="btn_copy">复制命令</button>
+              <div style="display:flex; justify-content:space-between; align-items:center; margin-bottom:0.65rem; flex-wrap:wrap; gap:0.5rem;">
+                <span style="font-size:0.84rem; font-weight:600; color:var(--ink);" data-i18n="cli_card_title">③ 终端接入命令：</span>
+                <div style="display:flex; gap:0.35rem; align-items:center;">
+                  <button class="btn" id="tab-cli-free" onclick="setCliMode('free')" data-i18n="tab_cli_free">免费版命令</button>
+                  <button class="btn btn-mint" id="tab-cli-pro" onclick="setCliMode('pro')" data-i18n="tab_cli_pro">Pro 版命令</button>
+                  <button class="btn" onclick="copyCliSnippet()" data-i18n="btn_copy">复制命令</button>
+                </div>
               </div>
-              <pre class="code" id="cli-snippet" style="max-height:240px;"></pre>
+              <pre class="code" id="cli-snippet" style="max-height:260px;"></pre>
             </div>
           </div>
         </div>
@@ -2415,6 +2424,7 @@ pub const DASHBOARD_HTML: &str = r##"<!doctype html>
     let latestKey = 'ak_live_...';
     let lastSig = '';
     let currentLang = localStorage.getItem('heurion_lang') || 'zh';
+    let cliPlanMode = 'free';
 
     const DICT = {
       zh: {
@@ -2461,10 +2471,13 @@ pub const DASHBOARD_HTML: &str = r##"<!doctype html>
         th_ws_ops: '操作',
         sec3_title: '方案对比、开通流程与 <em>30 秒终端接入</em>',
         sec3_label: '03 / 免费版与 PRO 版说明',
-        tier_free_tag: '免费版 · FREE',
+        tier_free_tag: '免费版 · 默认开启',
         tier_free_title: '$0 / 月 · 支持 1 个 AI 助手',
-        btn_use_free: '切换为免费版',
+        btn_use_free: '使用免费版 (查看命令)',
         tier_free_desc: '适合个人日常轻量开发：支持 1 个 AI 助手在独立临时副本中改代码与跑测试，合并回主项目前提供代码对比预览与人工确认保护。',
+        free_box_title: '免费版设置方法（无需付款）：',
+        free_step_1: '• 本地免费模式：安装后在项目文件夹运行 aegis-os init --workspace . 即可免费使用；',
+        free_step_2: '• 云端免费体验 (限 1 个 AI)：在下方点「+ 生成密钥」，复制右侧免费版命令即可连上云主机。',
         tier_pro_tag: 'PRO 专业版 · 多 AI 并行',
         tier_pro_title: '$29 / 月 · 支持 8 个 AI 同时运行',
         btn_buy_pro: '① 在线开通 Pro ($29/月) →',
@@ -2476,7 +2489,9 @@ pub const DASHBOARD_HTML: &str = r##"<!doctype html>
         claim_card_title: '② 已完成付款？输入邮箱提取你的专属密钥',
         claim_card_desc: '完成在线订阅后，输入你付款时填写的邮箱，系统会自动发放你的专属 API 密钥并填入下方命令：',
         btn_claim: '② 提取我的 Pro 密钥 →',
-        cli_card_title: '③ 在你的电脑终端运行这 3 步即可连上云端：',
+        cli_card_title: '③ 终端接入命令：',
+        tab_cli_free: '免费版命令',
+        tab_cli_pro: 'Pro 版命令',
         btn_copy: '复制命令',
         mint_card_title: '手动生成测试密钥：',
         btn_mint: '+ 生成密钥',
@@ -2530,10 +2545,13 @@ pub const DASHBOARD_HTML: &str = r##"<!doctype html>
         th_ws_ops: 'Actions',
         sec3_title: 'Plans, Subscription Flow &amp; <em>30-Second Setup</em>',
         sec3_label: '03 / FREE VS. PRO PLANS',
-        tier_free_tag: 'FREE PLAN',
+        tier_free_tag: 'FREE PLAN · DEFAULT',
         tier_free_title: '$0 / month · 1 AI Assistant',
-        btn_use_free: 'Use Free Plan',
+        btn_use_free: 'Use Free Plan (View Commands)',
         tier_free_desc: 'For everyday solo coding: run 1 AI assistant in an isolated copy with diff preview and human approval before merging back to your main project.',
+        free_box_title: 'How to set up the Free Plan (no payment required):',
+        free_step_1: '• Local Free Mode: install via Homebrew and run aegis-os init --workspace . inside your project;',
+        free_step_2: '• Cloud Free Trial (1 AI): click "+ Generate Key" below and run the Free Plan commands on the right.',
         tier_pro_tag: 'PRO PLAN · PARALLEL AI',
         tier_pro_title: '$29 / month · Up to 8 Parallel AIs',
         btn_buy_pro: '① Subscribe to Pro ($29/mo) →',
@@ -2545,7 +2563,9 @@ pub const DASHBOARD_HTML: &str = r##"<!doctype html>
         claim_card_title: '② Already subscribed? Enter your email to claim your key',
         claim_card_desc: 'After completing online payment, enter the email you used at checkout to retrieve your API key and auto-fill the commands below:',
         btn_claim: '② Claim My Pro Key →',
-        cli_card_title: '③ Run these 3 steps in your terminal to connect:',
+        cli_card_title: '③ Terminal Setup Commands:',
+        tab_cli_free: 'Free Plan',
+        tab_cli_pro: 'Pro Plan',
         btn_copy: 'Copy Commands',
         mint_card_title: 'Generate test key:',
         btn_mint: '+ Generate Key',
@@ -2556,6 +2576,17 @@ pub const DASHBOARD_HTML: &str = r##"<!doctype html>
         th_k_leases: 'Auto-Approve Status'
       }
     };
+
+    function setCliMode(mode) {
+      cliPlanMode = mode;
+      const freeBtn = document.getElementById('tab-cli-free');
+      const proBtn = document.getElementById('tab-cli-pro');
+      if (freeBtn && proBtn) {
+        freeBtn.className = mode === 'free' ? 'btn btn-mint' : 'btn';
+        proBtn.className = mode === 'pro' ? 'btn btn-mint' : 'btn';
+      }
+      updateCliSnippet();
+    }
 
     function applyLang(lang) {
       currentLang = lang;
@@ -2572,7 +2603,7 @@ pub const DASHBOARD_HTML: &str = r##"<!doctype html>
       });
       const btn = document.getElementById('langBtn');
       if (btn) btn.textContent = lang === 'zh' ? 'EN' : '中文';
-      updateCliSnippet();
+      setCliMode(cliPlanMode);
       refresh(true);
     }
 
@@ -2590,14 +2621,38 @@ pub const DASHBOARD_HTML: &str = r##"<!doctype html>
 
     function updateCliSnippet() {
       const origin = window.location.origin;
+      if (cliPlanMode === 'free') {
+        if (currentLang === 'en') {
+          document.getElementById('cli-snippet').textContent =
+`# Option A: Local Free Mode (1 AI in isolated local copy, no API key needed)
+brew tap heurion-org/aegis-os && brew install aegis-os
+cd /path/to/your/project && aegis-os init --workspace .
+
+# Option B: Cloud Free Mode (1 AI on 64GB cloud server, 30s timeout)
+# Click "+ Generate Key" below first, then run:
+aegis-os cloud plan community
+aegis-os cloud up --endpoint ${origin} --api-key ${latestKey} --agents agy-agent`;
+        } else {
+          document.getElementById('cli-snippet').textContent =
+`# 方式 A：本地免费模式（完全免费，无需密钥，在你的电脑上隔离保护 1 个 AI）
+brew tap heurion-org/aegis-os && brew install aegis-os
+cd 你的项目文件夹 && aegis-os init --workspace .
+
+# 方式 B：云端免费体验（免费连上云主机跑 1 个 AI，单次命令限 30 秒）
+# 先在下方点「+ 生成密钥」，然后运行：
+aegis-os cloud plan community
+aegis-os cloud up --endpoint ${origin} --api-key ${latestKey} --agents agy-agent`;
+        }
+        return;
+      }
       if (currentLang === 'en') {
         document.getElementById('cli-snippet').textContent =
 `# Step 1: Install Aegis OS via Homebrew & claim your Pro key
 brew tap heurion-org/aegis-os && brew install aegis-os
 aegis-os cloud subscribe --email you@company.com --claim
 
-# Step 2: Run inside any project folder to offload AI builds & tests to the cloud
-aegis-os cloud up --endpoint ${origin} --api-key ${latestKey}
+# Step 2: Run inside any project folder to offload up to 8 AIs to the cloud
+aegis-os cloud up --endpoint ${origin} --api-key ${latestKey} --agents agy-agent,claude-code,codex-cli
 
 # Step 3: View AI code changes, pull them to your Mac, or switch back to local mode
 aegis-os cloud diff    # Preview code changes made in the cloud
@@ -2605,12 +2660,12 @@ aegis-os cloud pull    # Sync approved changes back to your laptop
 aegis-os cloud down    # Disconnect and return to local mode`;
       } else {
         document.getElementById('cli-snippet').textContent =
-`# 第 1 步：用 Homebrew 安装命令行工具，并领取你的 Pro 会员密钥
+`# 第 1 步：用 Homebrew 安装命令行工具，并凭付款邮箱领取 Pro 会员密钥
 brew tap heurion-org/aegis-os && brew install aegis-os
 aegis-os cloud subscribe --email 你的付款邮箱 --claim
 
-# 第 2 步：进入你的代码项目文件夹，一行命令连上 64GB 云端沙箱
-aegis-os cloud up --endpoint ${origin} --api-key ${latestKey}
+# 第 2 步：进入你的代码项目文件夹，一行命令启动多 AI 云端并行（最多 8 个 AI）
+aegis-os cloud up --endpoint ${origin} --api-key ${latestKey} --agents agy-agent,claude-code,codex-cli
 
 # 第 3 步：随时查看 AI 改了哪些代码、拉回本地电脑，或切回本地模式
 aegis-os cloud diff    # 查看云端 AI 修改的代码对比
@@ -2631,7 +2686,8 @@ aegis-os cloud down    # 断开云端（云工作区自动休眠，不扣费）`
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ org_id: 'aegis-os', plan_tier: plan })
       });
-      toast(currentLang === 'en' ? `Switched plan to ${plan.toUpperCase()}` : `已切换至 ${plan.toUpperCase()} 方案`);
+      setCliMode(plan === 'community' ? 'free' : 'pro');
+      toast(currentLang === 'en' ? `Switched plan to ${plan.toUpperCase()}` : `已切换至 ${plan === 'community' ? '免费版 (1 个 AI)' : 'Pro 版 (8 个 AI)'}`);
       refresh(true);
     }
 
@@ -2652,7 +2708,7 @@ aegis-os cloud down    # 断开云端（云工作区自动休眠，不扣费）`
         return;
       }
       latestKey = d.api_key;
-      updateCliSnippet();
+      setCliMode('pro');
       toast(currentLang === 'en' ? `Claimed API Key: ${d.api_key}` : `已提取专属密钥: ${d.api_key}`);
       refresh(true);
     }
@@ -2789,7 +2845,7 @@ aegis-os cloud down    # 断开云端（云工作区自动休眠，不扣费）`
           savedBytes += (t.cow_saved_bytes || 0);
         });
         if (tenants[0]) {
-          const rawTier = (tenants[0].plan_tier || 'pro').toLowerCase();
+          const rawTier = (tenants[0].plan_tier || 'community').toLowerCase();
           const isFree = rawTier === 'community' || rawTier === 'free';
           const tierLabel = isFree
             ? (currentLang === 'en' ? 'Current Plan: Free (1 AI)' : '当前方案：免费版 (1 个 AI)')

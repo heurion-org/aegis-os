@@ -41,8 +41,8 @@ pub enum CloudAction {
         api_key: Option<String>,
         #[arg(long)]
         workspace_id: Option<String>,
-        /// Comma-separated cloud agent branches to pre-fork
-        #[arg(long, default_value = "agy-agent,claude-code,codex-cli")]
+        /// Comma-separated cloud agent branches to pre-fork (Free plan allows 1; Pro allows up to 8)
+        #[arg(long, default_value = "agy-agent")]
         agents: String,
     },
 
@@ -1633,6 +1633,13 @@ mod tests {
         let endpoint = format!("http://{}", cloud_addr);
 
         let identity = AgentIdentity::new("my_local_project", "agy-agent", "Lead Agent");
+
+        // Upgrade tenant to Pro so 2 concurrent agents ("agy-agent,claude-code") are allowed on `ws-pro-1`
+        cloud_kernel
+            .paas
+            .set_tenant_plan("my_local_project", aos_mcp_gateway::paas::PlanTier::Pro)
+            .await
+            .unwrap();
 
         // 1. Run `aegis-os cloud up` -> binds local repo to Cloud Sandbox and uploads source files
         handle_cloud_command(
