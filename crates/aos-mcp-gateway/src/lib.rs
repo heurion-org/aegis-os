@@ -2685,12 +2685,92 @@ impl AegisRuntimeKernel {
                                 json!({
                                     "status": "plan_updated",
                                     "tenant": rec,
-                                    "monthly_price_usd": tier.monthly_price_usd()
+                                    "monthly_price_usd": tier.monthly_price_usd(),
+                                    "max_exec_timeout_ms": tier.max_exec_timeout_ms()
                                 })
                                 .to_string(),
                             ),
                             Err(e) => (
                                 "HTTP/1.1 500 Internal Server Error",
+                                json!({ "error": e.to_string() }).to_string(),
+                            ),
+                        }
+                    } else if full_target.starts_with("/v1/billing/checkout") {
+                        let payload: Value = serde_json::from_str(body_str.trim()).unwrap_or_else(|_| json!({}));
+                        let mut c_org = payload
+                            .get("org_id")
+                            .and_then(|v| v.as_str())
+                            .unwrap_or(&org_id)
+                            .to_string();
+                        let mut c_plan = payload
+                            .get("plan_tier")
+                            .or_else(|| payload.get("plan"))
+                            .and_then(|v| v.as_str())
+                            .unwrap_or("pro")
+                            .to_string();
+                        let mut c_email = payload
+                            .get("email")
+                            .or_else(|| payload.get("customer_email"))
+                            .and_then(|v| v.as_str())
+                            .map(|s| s.to_string());
+                        if let Some((_, qs)) = full_target.split_once('?') {
+                            for pair in qs.split('&') {
+                                if let Some((qk, qv)) = pair.split_once('=') {
+                                    match qk {
+                                        "org_id" if !qv.is_empty() => c_org = qv.to_string(),
+                                        "plan" | "plan_tier" if !qv.is_empty() => c_plan = qv.to_string(),
+                                        "email" | "customer_email" if !qv.is_empty() => {
+                                            c_email = Some(qv.to_string())
+                                        }
+                                        _ => {}
+                                    }
+                                }
+                            }
+                        }
+                        let tier = paas::PlanTier::from_str_lossy(&c_plan);
+                        let info = k.paas.build_checkout_info(&c_org, tier, c_email.as_deref());
+                        ("HTTP/1.1 200 OK", info.to_string())
+                    } else if method == "POST" && full_target.starts_with("/v1/billing/webhook") {
+                        let webhook_secret = headers
+                            .get("x-aegis-webhook-secret-override")
+                            .cloned()
+                            .or_else(|| std::env::var("AOS_BILLING_WEBHOOK_SECRET").ok())
+                            .unwrap_or_default();
+                        if !paas::PaasControlPlane::verify_webhook_signature(
+                            &webhook_secret,
+                            &headers,
+                            &body_str,
+                        ) {
+                            (
+                                "HTTP/1.1 401 Unauthorized",
+                                json!({
+                                    "error": "Invalid billing webhook HMAC-SHA256 signature"
+                                })
+                                .to_string(),
+                            )
+                        } else {
+                            let payload: Value =
+                                serde_json::from_str(body_str.trim()).unwrap_or_else(|_| json!({}));
+                            match k.paas.handle_billing_webhook(&k, &payload).await {
+                                Ok(val) => ("HTTP/1.1 200 OK", val.to_string()),
+                                Err(e) => (
+                                    "HTTP/1.1 500 Internal Server Error",
+                                    json!({ "error": e.to_string() }).to_string(),
+                                ),
+                            }
+                        }
+                    } else if method == "POST" && full_target.starts_with("/v1/billing/claim") {
+                        let payload: Value =
+                            serde_json::from_str(body_str.trim()).unwrap_or_else(|_| json!({}));
+                        let c_org = payload.get("org_id").and_then(|v| v.as_str());
+                        let c_email = payload
+                            .get("email")
+                            .or_else(|| payload.get("customer_email"))
+                            .and_then(|v| v.as_str());
+                        match k.paas.claim_subscription_key(c_org, c_email).await {
+                            Ok(val) => ("HTTP/1.1 200 OK", val.to_string()),
+                            Err(e) => (
+                                "HTTP/1.1 404 Not Found",
                                 json!({ "error": e.to_string() }).to_string(),
                             ),
                         }
@@ -3059,7 +3139,25 @@ impl AegisRuntimeKernel {
                             .await;
                         let call_started = std::time::Instant::now();
                         match serde_json::from_str::<Value>(body_str.trim()) {
-                            Ok(rpc_req) => match k.handle_jsonrpc_message(&identity, rpc_req).await {
+                            Ok(mut rpc_req) => {
+                                // Enforce per-tier `max_exec_timeout_ms` on remote `proc_exec` calls
+                                let tier = k.paas.get_tenant_plan(&org_id).await;
+                                let max_timeout = tier.max_exec_timeout_ms();
+                                if let Some(params) = rpc_req.get_mut("params") {
+                                    if params.get("name").and_then(|v| v.as_str()) == Some("proc_exec") {
+                                        if let Some(args) = params.get_mut("arguments").and_then(|v| v.as_object_mut()) {
+                                            let req_t = args
+                                                .get("timeout_ms")
+                                                .and_then(|v| v.as_u64())
+                                                .unwrap_or(max_timeout);
+                                            args.insert(
+                                                "timeout_ms".to_string(),
+                                                json!(req_t.min(max_timeout)),
+                                            );
+                                        }
+                                    }
+                                }
+                                match k.handle_jsonrpc_message(&identity, rpc_req).await {
                                 Ok(rpc_resp) => {
                                     let elapsed_ms = call_started.elapsed().as_millis() as u64;
                                     let _ = k
@@ -3072,7 +3170,8 @@ impl AegisRuntimeKernel {
                                     "HTTP/1.1 500 Internal Server Error",
                                     json!({ "error": e.to_string() }).to_string(),
                                 ),
-                            },
+                                }
+                            }
                             Err(e) => (
                                 "HTTP/1.1 400 Bad Request",
                                 json!({ "error": format!("Invalid JSON-RPC payload: {}", e) }).to_string(),
@@ -3731,5 +3830,211 @@ mod tests {
             .unwrap();
         assert_eq!(fixed_commit["status"], "committed_to_host");
         assert_eq!(fixed_commit["verification_passed"], true);
+    }
+
+    #[tokio::test]
+    async fn test_billing_webhook_polar_lemonsqueezy_and_plan_timeout_guardrails() {
+        let temp = tempfile::tempdir().unwrap();
+        let source_repo = temp.path().join("source_repo");
+        let runtime_root = temp.path().join("aegis_runtime");
+        tokio::fs::create_dir_all(&source_repo).await.unwrap();
+        tokio::fs::write(source_repo.join("lib.rs"), "pub fn ready() -> bool { true }\n")
+            .await
+            .unwrap();
+
+        let kernel = Arc::new(AegisRuntimeKernel::new(&runtime_root).await.unwrap());
+        let addr = kernel
+            .clone()
+            .start_http_daemon("127.0.0.1:0", source_repo.clone())
+            .await
+            .unwrap();
+
+        async fn http_req_with_headers(
+            addr: std::net::SocketAddr,
+            method: &str,
+            path: &str,
+            extra_headers: &[(&str, &str)],
+            body: Option<Value>,
+        ) -> (String, Value) {
+            let mut stream = tokio::net::TcpStream::connect(addr).await.unwrap();
+            let body_str = body.map(|b| b.to_string()).unwrap_or_default();
+            let mut hdrs = String::new();
+            for (k, v) in extra_headers {
+                hdrs.push_str(&format!("{}: {}\r\n", k, v));
+            }
+            let req = format!(
+                "{} {} HTTP/1.1\r\nHost: {}\r\n{}Content-Length: {}\r\n\r\n{}",
+                method,
+                path,
+                addr,
+                hdrs,
+                body_str.len(),
+                body_str
+            );
+            stream.write_all(req.as_bytes()).await.unwrap();
+            let mut buf = Vec::new();
+            tokio::io::AsyncReadExt::read_to_end(&mut stream, &mut buf)
+                .await
+                .unwrap();
+            let raw = String::from_utf8_lossy(&buf).to_string();
+            let (head, b) = raw.split_once("\r\n\r\n").unwrap_or((&raw, "{}"));
+            let parsed = serde_json::from_str::<Value>(b).unwrap_or_else(|_| json!({ "raw": b }));
+            (head.to_string(), parsed)
+        }
+
+        // 1. Verify `/v1/billing/checkout` returns Polar.sh & Lemon Squeezy URLs pre-populated with `org_id` and `email`
+        let (chk_head, chk_resp) = http_req_with_headers(
+            addr,
+            "GET",
+            "/v1/billing/checkout?org_id=polar-org&plan=team&email=founder@polar-org.dev",
+            &[],
+            None,
+        )
+        .await;
+        assert!(chk_head.contains("200 OK"));
+        assert_eq!(chk_resp["monthly_price_usd"], 79);
+        assert_eq!(chk_resp["max_concurrent_agents"], 32);
+        assert_eq!(chk_resp["max_exec_timeout_ms"], 600_000);
+        assert!(chk_resp["providers"]["polar_sh"]
+            .as_str()
+            .unwrap()
+            .contains("metadata[org_id]=polar-org"));
+        assert!(chk_resp["providers"]["lemonsqueezy"]
+            .as_str()
+            .unwrap()
+            .contains("checkout[custom][org_id]=polar-org"));
+
+        // 2. Verify HMAC-SHA256 webhook signature rejection on forged signature
+        let webhook_secret = "whsec_polar_test_secret_123";
+        let polar_activate = json!({
+            "type": "subscription.created",
+            "data": {
+                "id": "sub_polar_99",
+                "customer_email": "founder@polar-org.dev",
+                "metadata": {
+                    "org_id": "polar-org",
+                    "plan_tier": "team"
+                }
+            }
+        });
+        let (forged_head, _) = http_req_with_headers(
+            addr,
+            "POST",
+            "/v1/billing/webhook",
+            &[
+                ("X-Aegis-Webhook-Secret-Override", webhook_secret),
+                ("X-Polar-Signature", "sha256=deadbeef0000"),
+            ],
+            Some(polar_activate.clone()),
+        )
+        .await;
+        assert!(forged_head.contains("401 Unauthorized"));
+
+        // 3. Send valid HMAC-SHA256 signed Polar.sh `subscription.created` webhook -> auto-upgrades tenant & mints `ak_live_*` key
+        let body_str = polar_activate.to_string();
+        let valid_sig = paas::PaasControlPlane::hmac_sha256_hex(
+            webhook_secret.as_bytes(),
+            body_str.as_bytes(),
+        );
+        let (wh_head, wh_resp) = http_req_with_headers(
+            addr,
+            "POST",
+            "/v1/billing/webhook",
+            &[
+                ("X-Aegis-Webhook-Secret-Override", webhook_secret),
+                ("X-Polar-Signature", &format!("sha256={}", valid_sig)),
+            ],
+            Some(polar_activate),
+        )
+        .await;
+        assert!(wh_head.contains("200 OK"));
+        assert_eq!(wh_resp["status"], "subscription_activated");
+        assert_eq!(wh_resp["provider"], "polar");
+        assert_eq!(wh_resp["plan_tier"], "team");
+        assert_eq!(wh_resp["max_concurrent_agents"], 32);
+
+        // 4. Subscriber claims their newly minted `ak_live_*` key via `POST /v1/billing/claim`
+        let (claim_head, claim_resp) = http_req_with_headers(
+            addr,
+            "POST",
+            "/v1/billing/claim",
+            &[],
+            Some(json!({ "email": "founder@polar-org.dev" })),
+        )
+        .await;
+        assert!(claim_head.contains("200 OK"));
+        assert_eq!(claim_resp["status"], "subscription_claimed");
+        let claimed_key = claim_resp["api_key"].as_str().unwrap().to_string();
+        assert!(claimed_key.starts_with("ak_live_"));
+
+        // Second claim attempt for the same key is rejected (one-time claim security)
+        let (reclaim_head, _) = http_req_with_headers(
+            addr,
+            "POST",
+            "/v1/billing/claim",
+            &[],
+            Some(json!({ "email": "founder@polar-org.dev" })),
+        )
+        .await;
+        assert!(reclaim_head.contains("404 Not Found"));
+
+        // 5. Provision an active Cloud Workspace for `polar-org` using the claimed key
+        let (ws_head, _) = http_req_with_headers(
+            addr,
+            "POST",
+            "/v1/workspaces",
+            &[("Authorization", &format!("Bearer {}", claimed_key))],
+            Some(json!({
+                "org_id": "polar-org",
+                "workspace_id": "ws-polar-1",
+                "source_url": source_repo.to_string_lossy(),
+                "agents": ["agy-agent", "claude-code", "codex-cli"]
+            })),
+        )
+        .await;
+        assert!(ws_head.contains("200 OK"));
+
+        // 6. Send Lemon Squeezy `subscription_cancelled` webhook -> revokes subscription key, downgrades to Community, and hibernates workspace!
+        let ls_cancel = json!({
+            "meta": {
+                "event_name": "subscription_cancelled",
+                "custom_data": {
+                    "org_id": "polar-org"
+                }
+            },
+            "data": {
+                "id": "sub_polar_99"
+            }
+        });
+        let cancel_sig = paas::PaasControlPlane::hmac_sha256_hex(
+            webhook_secret.as_bytes(),
+            ls_cancel.to_string().as_bytes(),
+        );
+        let (can_head, can_resp) = http_req_with_headers(
+            addr,
+            "POST",
+            "/v1/billing/webhook",
+            &[
+                ("X-Aegis-Webhook-Secret-Override", webhook_secret),
+                ("X-Signature", &cancel_sig),
+            ],
+            Some(ls_cancel),
+        )
+        .await;
+        assert!(can_head.contains("200 OK"));
+        assert_eq!(can_resp["status"], "subscription_canceled");
+        assert_eq!(can_resp["downgraded_plan"], "community");
+        assert_eq!(can_resp["hibernated_workspaces"], json!(["ws-polar-1"]));
+
+        // Revoked subscription key is now rejected with `401 Unauthorized`
+        let (revoked_head, _) = http_req_with_headers(
+            addr,
+            "POST",
+            "/v1/mcp",
+            &[("Authorization", &format!("Bearer {}", claimed_key))],
+            Some(json!({ "jsonrpc": "2.0", "id": 1, "method": "initialize" })),
+        )
+        .await;
+        assert!(revoked_head.contains("401 Unauthorized"));
     }
 }

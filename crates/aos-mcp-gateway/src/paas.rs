@@ -2,9 +2,11 @@
 //!
 //! Provides:
 //! 1. Multi-Tenant API Key Authentication (`ak_live_*` Bearer tokens hashed with SHA-256)
-//! 2. Cloud Git Workspace Provisioning (`POST /v1/workspaces`) with instant CoW agent branches
-//! 3. Automated Git Branch & Pull Request Exporter (`POST /v1/workspaces/pr` / `workspace_export_pr`)
-//! 4. Embedded Single-Binary Web Mission Control & HITL Approval Console (`GET /dashboard`)
+//! 2. Commercial Plan Tiers (`Community`, `Pro`, `Team`, `Enterprise`) & Usage Metering
+//! 3. Cloud Git Workspace Provisioning (`POST /v1/workspaces`) with Scale-to-Zero (`Active` <-> `Hibernated`)
+//! 4. Bidirectional Source-Only Diff Sync (`POST /v1/workspaces/sync-up` & `POST /v1/workspaces/diff`)
+//! 5. Automated Git Branch & Pull Request Exporter (`POST /v1/workspaces/pr` / `workspace_export_pr`)
+//! 6. Minimalist Developer Web Console (`GET /dashboard`)
 
 use crate::AegisRuntimeKernel;
 use anyhow::{bail, Context};
@@ -18,6 +20,131 @@ use std::path::{Path, PathBuf};
 use std::process::Command;
 use tokio::sync::RwLock;
 use uuid::Uuid;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum PlanTier {
+    Community,
+    Pro,
+    Team,
+    Enterprise,
+}
+
+impl Default for PlanTier {
+    fn default() -> Self {
+        Self::Pro
+    }
+}
+
+impl PlanTier {
+    pub fn from_str_lossy(s: &str) -> Self {
+        match s.trim().to_ascii_lowercase().as_str() {
+            "community" | "free" => Self::Community,
+            "pro" => Self::Pro,
+            "team" => Self::Team,
+            "enterprise" | "ent" => Self::Enterprise,
+            _ => Self::Pro,
+        }
+    }
+
+    pub fn max_concurrent_agents(&self) -> usize {
+        match self {
+            Self::Community => 2,
+            Self::Pro => 8,
+            Self::Team => 32,
+            Self::Enterprise => 256,
+        }
+    }
+
+    pub fn monthly_price_usd(&self) -> u32 {
+        match self {
+            Self::Community => 0,
+            Self::Pro => 29,
+            Self::Team => 79,
+            Self::Enterprise => 499,
+        }
+    }
+
+    /// Maximum allowed per-command execution timeout (in milliseconds) on the shared Cloud Sandbox.
+    pub fn max_exec_timeout_ms(&self) -> u64 {
+        match self {
+            Self::Community => 30_000,
+            Self::Pro => 300_000,
+            Self::Team => 600_000,
+            Self::Enterprise => 1_800_000,
+        }
+    }
+
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            Self::Community => "community",
+            Self::Pro => "pro",
+            Self::Team => "team",
+            Self::Enterprise => "enterprise",
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct BillingSubscriptionRecord {
+    pub subscription_id: String,
+    pub provider: String,
+    pub org_id: String,
+    #[serde(default)]
+    pub customer_email: Option<String>,
+    pub plan_tier: PlanTier,
+    pub status: String,
+    #[serde(default)]
+    pub issued_key_id: Option<String>,
+    #[serde(default)]
+    pub claimable_api_key: Option<String>,
+    pub updated_at_ms: i64,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum WorkspaceLifecycleState {
+    Active,
+    Hibernated,
+}
+
+impl Default for WorkspaceLifecycleState {
+    fn default() -> Self {
+        Self::Active
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct TenantUsageRecord {
+    pub org_id: String,
+    #[serde(default)]
+    pub plan_tier: PlanTier,
+    #[serde(default = "default_pro_agents")]
+    pub max_concurrent_agents: usize,
+    #[serde(default)]
+    pub total_syscalls: u64,
+    #[serde(default)]
+    pub sandbox_exec_ms: u64,
+    #[serde(default)]
+    pub cow_saved_bytes: u64,
+    #[serde(default)]
+    pub wake_count: u64,
+    #[serde(default)]
+    pub updated_at_ms: i64,
+}
+
+fn default_pro_agents() -> usize {
+    8
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SourceFileEntry {
+    pub path: String,
+    #[serde(default)]
+    pub content: String,
+    #[serde(default)]
+    pub deleted: bool,
+}
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct TenantApiKeyRecord {
@@ -41,12 +168,26 @@ pub struct CloudWorkspaceRecord {
     pub host_repo_path: PathBuf,
     pub agents: Vec<String>,
     pub created_at_ms: i64,
+    #[serde(default)]
+    pub status: WorkspaceLifecycleState,
+    #[serde(default)]
+    pub last_active_ms: i64,
+    #[serde(default)]
+    pub hibernated_at_ms: Option<i64>,
+    #[serde(default)]
+    pub cow_saved_bytes: u64,
 }
 
 #[derive(Debug, Default, Clone, Serialize, Deserialize)]
 struct PersistedPaasState {
+    #[serde(default)]
     api_keys: Vec<TenantApiKeyRecord>,
+    #[serde(default)]
     workspaces: Vec<CloudWorkspaceRecord>,
+    #[serde(default)]
+    tenants: Vec<TenantUsageRecord>,
+    #[serde(default)]
+    subscriptions: Vec<BillingSubscriptionRecord>,
 }
 
 pub struct PaasControlPlane {
@@ -76,6 +217,96 @@ impl PaasControlPlane {
         hex::encode(hasher.finalize())
     }
 
+    /// Standard RFC 2104 HMAC-SHA256 in pure Rust (zero external crate dependencies).
+    pub fn hmac_sha256_hex(secret: &[u8], message: &[u8]) -> String {
+        const BLOCK_SIZE: usize = 64;
+        let mut key_block = [0u8; BLOCK_SIZE];
+        if secret.len() > BLOCK_SIZE {
+            let mut h = Sha256::new();
+            h.update(secret);
+            let digest = h.finalize();
+            key_block[..digest.len()].copy_from_slice(&digest);
+        } else {
+            key_block[..secret.len()].copy_from_slice(secret);
+        }
+
+        let mut ipad = [0x36u8; BLOCK_SIZE];
+        let mut opad = [0x5cu8; BLOCK_SIZE];
+        for i in 0..BLOCK_SIZE {
+            ipad[i] ^= key_block[i];
+            opad[i] ^= key_block[i];
+        }
+
+        let mut inner = Sha256::new();
+        inner.update(ipad);
+        inner.update(message);
+        let inner_hash = inner.finalize();
+
+        let mut outer = Sha256::new();
+        outer.update(opad);
+        outer.update(inner_hash);
+        hex::encode(outer.finalize())
+    }
+
+    /// Verify webhook HMAC-SHA256 signature from Polar.sh, Lemon Squeezy, or Stripe when
+    /// `secret` (`AOS_BILLING_WEBHOOK_SECRET`) is configured.
+    pub fn verify_webhook_signature(
+        secret: &str,
+        headers: &std::collections::HashMap<String, String>,
+        raw_body: &str,
+    ) -> bool {
+        let secret = secret.trim();
+        if secret.is_empty() {
+            return true;
+        }
+        let expected_hex = Self::hmac_sha256_hex(secret.as_bytes(), raw_body.as_bytes());
+
+        // 1. Lemon Squeezy (`x-signature: <hex>`) or Aegis/Polar hex header (`x-polar-signature`, `x-aegis-webhook-signature`)
+        for hdr_name in [
+            "x-signature",
+            "x-polar-signature",
+            "x-aegis-webhook-signature",
+            "webhook-signature",
+        ] {
+            if let Some(sig_val) = headers.get(hdr_name) {
+                let cleaned = sig_val
+                    .trim()
+                    .strip_prefix("sha256=")
+                    .or_else(|| sig_val.trim().strip_prefix("v1="))
+                    .unwrap_or(sig_val.trim());
+                if cleaned.eq_ignore_ascii_case(&expected_hex) {
+                    return true;
+                }
+            }
+        }
+
+        // 2. Stripe (`stripe-signature: t=1700000,v1=<hex>`)
+        if let Some(stripe_sig) = headers.get("stripe-signature") {
+            let mut ts = "";
+            let mut v1 = "";
+            for part in stripe_sig.split(',') {
+                if let Some(t) = part.trim().strip_prefix("t=") {
+                    ts = t;
+                } else if let Some(s) = part.trim().strip_prefix("v1=") {
+                    v1 = s;
+                }
+            }
+            if !ts.is_empty() && !v1.is_empty() {
+                let signed_payload = format!("{}.{}", ts, raw_body);
+                let stripe_expected =
+                    Self::hmac_sha256_hex(secret.as_bytes(), signed_payload.as_bytes());
+                if v1.eq_ignore_ascii_case(&stripe_expected) {
+                    return true;
+                }
+            }
+            if stripe_sig.trim().eq_ignore_ascii_case(&expected_hex) {
+                return true;
+            }
+        }
+
+        false
+    }
+
     async fn reload(&self) {
         if let Ok(bytes) = tokio::fs::read(&self.state_file).await {
             if let Ok(parsed) = serde_json::from_slice::<PersistedPaasState>(&bytes) {
@@ -92,6 +323,474 @@ impl PaasControlPlane {
         let bytes = serde_json::to_vec_pretty(&snapshot)?;
         tokio::fs::write(&self.state_file, bytes).await?;
         Ok(())
+    }
+
+    /// Estimate directory size in bytes for CoW savings accounting.
+    async fn estimate_dir_bytes(dir: &Path) -> u64 {
+        let Ok(files) = CoWWorkspace::collect_files(dir).await else {
+            return 0;
+        };
+        let mut total = 0u64;
+        for (_, full) in files {
+            if let Ok(meta) = tokio::fs::metadata(&full).await {
+                total = total.saturating_add(meta.len());
+            }
+        }
+        total
+    }
+
+    /// Configure or upgrade a tenant's commercial plan tier (`Community`, `Pro`, `Team`, `Enterprise`).
+    pub async fn set_tenant_plan(
+        &self,
+        org_id: &str,
+        plan_tier: PlanTier,
+    ) -> anyhow::Result<TenantUsageRecord> {
+        self.reload().await;
+        let now = Utc::now().timestamp_millis();
+        let rec = {
+            let mut state = self.state.write().await;
+            if let Some(existing) = state.tenants.iter_mut().find(|t| t.org_id == org_id) {
+                existing.plan_tier = plan_tier;
+                existing.max_concurrent_agents = plan_tier.max_concurrent_agents();
+                existing.updated_at_ms = now;
+                existing.clone()
+            } else {
+                let created = TenantUsageRecord {
+                    org_id: org_id.to_string(),
+                    plan_tier,
+                    max_concurrent_agents: plan_tier.max_concurrent_agents(),
+                    total_syscalls: 0,
+                    sandbox_exec_ms: 0,
+                    cow_saved_bytes: 0,
+                    wake_count: 0,
+                    updated_at_ms: now,
+                };
+                state.tenants.push(created.clone());
+                created
+            }
+        };
+        self.flush().await?;
+        Ok(rec)
+    }
+
+    /// Record MCP syscall, sandbox execution duration, and CoW storage savings for tenant billing/metering.
+    pub async fn record_usage(
+        &self,
+        org_id: &str,
+        workspace_id: Option<&str>,
+        syscalls_delta: u64,
+        exec_ms_delta: u64,
+        cow_saved_delta: u64,
+    ) -> anyhow::Result<()> {
+        self.reload().await;
+        let now = Utc::now().timestamp_millis();
+        {
+            let mut state = self.state.write().await;
+            if let Some(t) = state.tenants.iter_mut().find(|t| t.org_id == org_id) {
+                t.total_syscalls = t.total_syscalls.saturating_add(syscalls_delta);
+                t.sandbox_exec_ms = t.sandbox_exec_ms.saturating_add(exec_ms_delta);
+                t.cow_saved_bytes = t.cow_saved_bytes.saturating_add(cow_saved_delta);
+                t.updated_at_ms = now;
+            } else {
+                state.tenants.push(TenantUsageRecord {
+                    org_id: org_id.to_string(),
+                    plan_tier: PlanTier::Pro,
+                    max_concurrent_agents: PlanTier::Pro.max_concurrent_agents(),
+                    total_syscalls: syscalls_delta,
+                    sandbox_exec_ms: exec_ms_delta,
+                    cow_saved_bytes: cow_saved_delta,
+                    wake_count: 0,
+                    updated_at_ms: now,
+                });
+            }
+            if let Some(ws_id) = workspace_id {
+                if let Some(ws) = state
+                    .workspaces
+                    .iter_mut()
+                    .find(|w| w.org_id == org_id && w.workspace_id == ws_id)
+                {
+                    ws.last_active_ms = now;
+                    ws.status = WorkspaceLifecycleState::Active;
+                    ws.hibernated_at_ms = None;
+                }
+            }
+        }
+        self.flush().await
+    }
+
+    pub async fn list_tenants(&self, org_id: Option<&str>) -> Vec<TenantUsageRecord> {
+        self.reload().await;
+        self.state
+            .read()
+            .await
+            .tenants
+            .iter()
+            .filter(|t| org_id.map_or(true, |o| o == "*" || t.org_id == o))
+            .cloned()
+            .collect()
+    }
+
+    pub async fn get_tenant_plan(&self, org_id: &str) -> PlanTier {
+        self.reload().await;
+        self.state
+            .read()
+            .await
+            .tenants
+            .iter()
+            .find(|t| t.org_id == org_id)
+            .map(|t| t.plan_tier)
+            .unwrap_or(PlanTier::Pro)
+    }
+
+    /// Official Polar.sh hosted checkout link for Aegis Cloud Pro ($29/mo).
+    pub const DEFAULT_POLAR_PRO_CHECKOUT_URL: &'static str =
+        "https://buy.polar.sh/polar_cl_jCPpzbp4eOAyRbkDP4YzNIFVnYLddbvJZI5Fc27zL0x";
+
+    /// Generate hosted Merchant-of-Record (Polar.sh / Lemon Squeezy) checkout URLs pre-filled with `org_id` and `email`.
+    pub fn build_checkout_info(
+        &self,
+        org_id: &str,
+        plan_tier: PlanTier,
+        customer_email: Option<&str>,
+    ) -> Value {
+        let base_url = match plan_tier {
+            PlanTier::Team => std::env::var("AOS_CHECKOUT_URL_TEAM")
+                .unwrap_or_else(|_| Self::DEFAULT_POLAR_PRO_CHECKOUT_URL.to_string()),
+            PlanTier::Enterprise => std::env::var("AOS_CHECKOUT_URL_ENTERPRISE")
+                .unwrap_or_else(|_| Self::DEFAULT_POLAR_PRO_CHECKOUT_URL.to_string()),
+            _ => std::env::var("AOS_CHECKOUT_URL_PRO")
+                .unwrap_or_else(|_| Self::DEFAULT_POLAR_PRO_CHECKOUT_URL.to_string()),
+        };
+        let sep = if base_url.contains('?') { '&' } else { '?' };
+        let email_qs = customer_email
+            .filter(|e| !e.trim().is_empty())
+            .map(|e| format!("&customer_email={}", e.trim()))
+            .unwrap_or_default();
+        let checkout_url = format!(
+            "{}{}reference_id={}&metadata[org_id]={}&metadata[plan_tier]={}{}",
+            base_url,
+            sep,
+            org_id,
+            org_id,
+            plan_tier.as_str(),
+            email_qs
+        );
+
+        let ls_base = std::env::var("AOS_LEMONSQUEEZY_CHECKOUT_URL").unwrap_or_else(|_| {
+            format!(
+                "https://aegis-os.lemonsqueezy.com/checkout/buy/aegis-cloud-{}",
+                plan_tier.as_str()
+            )
+        });
+        let ls_url = format!(
+            "{}?checkout[custom][org_id]={}&checkout[custom][plan_tier]={}{}",
+            ls_base,
+            org_id,
+            plan_tier.as_str(),
+            customer_email
+                .filter(|e| !e.trim().is_empty())
+                .map(|e| format!("&checkout[email]={}", e.trim()))
+                .unwrap_or_default()
+        );
+
+        json!({
+            "org_id": org_id,
+            "plan_tier": plan_tier,
+            "monthly_price_usd": plan_tier.monthly_price_usd(),
+            "max_concurrent_agents": plan_tier.max_concurrent_agents(),
+            "max_exec_timeout_ms": plan_tier.max_exec_timeout_ms(),
+            "checkout_url": checkout_url,
+            "providers": {
+                "polar_sh": checkout_url,
+                "lemonsqueezy": ls_url
+            },
+            "next_step": "Complete checkout in browser; our `/v1/billing/webhook` automatically upgrades your tenant and mints an `ak_live_*` key. Then run `aegis-os cloud subscribe --claim` to activate locally."
+        })
+    }
+
+    /// Process a Polar.sh, Lemon Squeezy, or Stripe billing webhook payload:
+    /// - On subscription activation (`subscription.created`, `subscription.active`, `subscription_created`, `checkout.session.completed`):
+    ///   upgrades the tenant's `PlanTier`, mints a scoped `ak_live_*` API key, and stores a `BillingSubscriptionRecord`.
+    /// - On subscription cancellation (`subscription.canceled`, `subscription.revoked`, `subscription_cancelled`, `customer.subscription.deleted`):
+    ///   revokes the subscription API key, downgrades the tenant to `PlanTier::Community`, and hibernates active Cloud Workspaces.
+    pub async fn handle_billing_webhook(
+        &self,
+        kernel: &AegisRuntimeKernel,
+        payload: &Value,
+    ) -> anyhow::Result<Value> {
+        self.reload().await;
+
+        // Detect provider & event type across Polar.sh, Lemon Squeezy, and Stripe
+        let event_type = payload
+            .get("type")
+            .and_then(|v| v.as_str())
+            .or_else(|| {
+                payload
+                    .get("meta")
+                    .and_then(|m| m.get("event_name"))
+                    .and_then(|v| v.as_str())
+            })
+            .unwrap_or("subscription.created")
+            .to_lowercase();
+
+        let provider = if payload.get("meta").and_then(|m| m.get("event_name")).is_some() {
+            "lemonsqueezy"
+        } else if payload
+            .get("data")
+            .and_then(|d| d.get("object"))
+            .is_some()
+        {
+            "stripe"
+        } else {
+            "polar"
+        };
+
+        let data_node = payload
+            .get("data")
+            .and_then(|d| d.get("object"))
+            .or_else(|| payload.get("data"))
+            .unwrap_or(payload);
+
+        let metadata_node = data_node
+            .get("metadata")
+            .or_else(|| {
+                payload
+                    .get("meta")
+                    .and_then(|m| m.get("custom_data"))
+            })
+            .or_else(|| payload.get("metadata"));
+
+        let customer_email = data_node
+            .get("customer_email")
+            .or_else(|| data_node.get("user_email"))
+            .or_else(|| {
+                data_node
+                    .get("customer")
+                    .and_then(|c| c.get("email"))
+            })
+            .or_else(|| {
+                data_node
+                    .get("user")
+                    .and_then(|u| u.get("email"))
+            })
+            .or_else(|| {
+                data_node
+                    .get("attributes")
+                    .and_then(|a| a.get("user_email"))
+            })
+            .and_then(|v| v.as_str())
+            .map(|s| s.trim().to_lowercase());
+
+        let org_id = metadata_node
+            .and_then(|m| m.get("org_id"))
+            .and_then(|v| v.as_str())
+            .or_else(|| data_node.get("reference_id").and_then(|v| v.as_str()))
+            .or_else(|| data_node.get("client_reference_id").and_then(|v| v.as_str()))
+            .or_else(|| payload.get("org_id").and_then(|v| v.as_str()))
+            .map(|s| s.trim().to_string())
+            .filter(|s| !s.is_empty())
+            .unwrap_or_else(|| {
+                customer_email
+                    .as_deref()
+                    .and_then(|e| e.split('@').next())
+                    .map(|prefix| {
+                        prefix
+                            .chars()
+                            .map(|c| if c.is_ascii_alphanumeric() { c } else { '-' })
+                            .collect::<String>()
+                    })
+                    .filter(|s| !s.is_empty())
+                    .unwrap_or_else(|| "aegis-os".to_string())
+            });
+
+        let raw_plan = metadata_node
+            .and_then(|m| m.get("plan_tier").or_else(|| m.get("plan")))
+            .and_then(|v| v.as_str())
+            .or_else(|| {
+                data_node
+                    .get("product")
+                    .and_then(|p| p.get("name"))
+                    .and_then(|v| v.as_str())
+            })
+            .or_else(|| {
+                data_node
+                    .get("attributes")
+                    .and_then(|a| a.get("variant_name").or_else(|| a.get("product_name")))
+                    .and_then(|v| v.as_str())
+            })
+            .or_else(|| payload.get("plan_tier").and_then(|v| v.as_str()))
+            .unwrap_or("pro");
+
+        let plan_tier = if raw_plan.to_ascii_lowercase().contains("team") {
+            PlanTier::Team
+        } else if raw_plan.to_ascii_lowercase().contains("enterprise") {
+            PlanTier::Enterprise
+        } else if raw_plan.to_ascii_lowercase().contains("community")
+            || raw_plan.to_ascii_lowercase().contains("free")
+        {
+            PlanTier::Community
+        } else {
+            PlanTier::Pro
+        };
+
+        let sub_id = data_node
+            .get("id")
+            .and_then(|v| {
+                v.as_str()
+                    .map(|s| s.to_string())
+                    .or_else(|| v.as_i64().map(|n| n.to_string()))
+            })
+            .unwrap_or_else(|| format!("sub-{}", &Uuid::new_v4().to_string()[..8]));
+
+        let is_cancel = event_type.contains("cancel")
+            || event_type.contains("revok")
+            || event_type.contains("delet")
+            || event_type.contains("expir");
+
+        let now = Utc::now().timestamp_millis();
+
+        if is_cancel {
+            let mut revoked_keys = Vec::new();
+            let ws_ids_to_hibernate: Vec<String> = {
+                let mut state = self.state.write().await;
+                for sub in state.subscriptions.iter_mut() {
+                    if sub.org_id == org_id || sub.subscription_id == sub_id {
+                        sub.status = "canceled".to_string();
+                        sub.claimable_api_key = None;
+                        sub.updated_at_ms = now;
+                        if let Some(ref kid) = sub.issued_key_id {
+                            revoked_keys.push(kid.clone());
+                        }
+                    }
+                }
+                if !revoked_keys.is_empty() {
+                    state.api_keys.retain(|k| !revoked_keys.contains(&k.key_id));
+                }
+                state
+                    .workspaces
+                    .iter()
+                    .filter(|w| w.org_id == org_id && w.status == WorkspaceLifecycleState::Active)
+                    .map(|w| w.workspace_id.clone())
+                    .collect()
+            };
+            self.flush().await?;
+
+            let tenant = self.set_tenant_plan(&org_id, PlanTier::Community).await?;
+            let mut hibernated = Vec::new();
+            for ws_id in ws_ids_to_hibernate {
+                if self.hibernate_workspace(kernel, &org_id, &ws_id).await.is_ok() {
+                    hibernated.push(ws_id);
+                }
+            }
+
+            return Ok(json!({
+                "status": "subscription_canceled",
+                "provider": provider,
+                "event_type": event_type,
+                "subscription_id": sub_id,
+                "org_id": org_id,
+                "downgraded_plan": tenant.plan_tier,
+                "revoked_key_ids": revoked_keys,
+                "hibernated_workspaces": hibernated
+            }));
+        }
+
+        // Subscription activated / renewed -> Upgrade tenant plan & mint scoped `ak_live_*` key
+        let tenant = self.set_tenant_plan(&org_id, plan_tier).await?;
+        let label = format!(
+            "{} {} Subscription ({})",
+            provider.to_uppercase(),
+            plan_tier.as_str().to_uppercase(),
+            sub_id
+        );
+        let (raw_key, key_rec) = self
+            .issue_api_key(
+                &org_id,
+                "agy-agent",
+                "Aegis Cloud Subscriber",
+                None,
+                &label,
+            )
+            .await?;
+
+        let sub_record = BillingSubscriptionRecord {
+            subscription_id: sub_id.clone(),
+            provider: provider.to_string(),
+            org_id: org_id.clone(),
+            customer_email: customer_email.clone(),
+            plan_tier,
+            status: "active".to_string(),
+            issued_key_id: Some(key_rec.key_id.clone()),
+            claimable_api_key: Some(raw_key.clone()),
+            updated_at_ms: now,
+        };
+
+        {
+            let mut state = self.state.write().await;
+            state
+                .subscriptions
+                .retain(|s| !(s.org_id == org_id && s.subscription_id == sub_id));
+            state.subscriptions.push(sub_record);
+        }
+        self.flush().await?;
+
+        Ok(json!({
+            "status": "subscription_activated",
+            "provider": provider,
+            "event_type": event_type,
+            "subscription_id": sub_id,
+            "org_id": org_id,
+            "customer_email": customer_email,
+            "plan_tier": tenant.plan_tier,
+            "max_concurrent_agents": tenant.max_concurrent_agents,
+            "max_exec_timeout_ms": plan_tier.max_exec_timeout_ms(),
+            "api_key": raw_key,
+            "key_id": key_rec.key_id
+        }))
+    }
+
+    /// Claim the newly minted `ak_live_*` API key for an active subscription by `org_id` or `customer_email`.
+    pub async fn claim_subscription_key(
+        &self,
+        org_id: Option<&str>,
+        customer_email: Option<&str>,
+    ) -> anyhow::Result<Value> {
+        self.reload().await;
+        let email_norm = customer_email
+            .map(|e| e.trim().to_lowercase())
+            .filter(|e| !e.is_empty());
+        let org_norm = org_id.map(|o| o.trim()).filter(|o| !o.is_empty());
+
+        let mut state = self.state.write().await;
+        let sub = state
+            .subscriptions
+            .iter_mut()
+            .rev()
+            .find(|s| {
+                s.status == "active"
+                    && (email_norm
+                        .as_ref()
+                        .map_or(false, |em| s.customer_email.as_ref() == Some(em))
+                        || org_norm.map_or(false, |og| s.org_id == og))
+            })
+            .context("No active subscription found for the given org_id or email")?;
+
+        let claimed_key = sub
+            .claimable_api_key
+            .take()
+            .context("Subscription API key has already been claimed (use `aegis-os cloud keys --create` to mint an additional key)")?;
+        let out = json!({
+            "status": "subscription_claimed",
+            "subscription_id": sub.subscription_id,
+            "provider": sub.provider,
+            "org_id": sub.org_id,
+            "customer_email": sub.customer_email,
+            "plan_tier": sub.plan_tier,
+            "api_key": claimed_key
+        });
+        drop(state);
+        self.flush().await?;
+        Ok(out)
     }
 
     /// Issue a new scoped `ak_live_*` API key for a tenant organization and agent principal.
@@ -199,7 +898,7 @@ impl PaasControlPlane {
     }
 
     /// Provision a Cloud Workspace from a local directory or remote Git URL, initialize a Git baseline,
-    /// and spawn isolated Copy-on-Write shadow workspaces for each requested agent.
+    /// enforce tenant plan concurrency limits, and spawn isolated CoW shadow workspaces.
     pub async fn provision_workspace(
         &self,
         kernel: &AegisRuntimeKernel,
@@ -215,6 +914,32 @@ impl PaasControlPlane {
         } else {
             workspace_id.trim().to_string()
         };
+
+        let agent_list = if agents.is_empty() {
+            vec!["cloud-coder-1".to_string()]
+        } else {
+            agents
+        };
+
+        // Check tenant plan limit
+        let max_agents = {
+            let state = self.state.read().await;
+            state
+                .tenants
+                .iter()
+                .find(|t| t.org_id == org_id)
+                .map(|t| t.max_concurrent_agents)
+                .unwrap_or_else(|| PlanTier::Pro.max_concurrent_agents())
+        };
+        if agent_list.len() > max_agents {
+            bail!(
+                "Tenant '{}' plan allows at most {} concurrent cloud agents (requested {})",
+                org_id,
+                max_agents,
+                agent_list.len()
+            );
+        }
+
         let host_repo = self.workspaces_root.join(org_id).join(&ws_id).join("host_repo");
         if host_repo.exists() {
             let _ = tokio::fs::remove_dir_all(&host_repo).await;
@@ -282,12 +1007,6 @@ impl PaasControlPlane {
                 .output();
         }
 
-        let agent_list = if agents.is_empty() {
-            vec!["cloud-coder-1".to_string()]
-        } else {
-            agents
-        };
-
         for agent_id in &agent_list {
             let identity = AgentIdentity::new(org_id, agent_id.clone(), "Aegis Cloud Agent");
             kernel
@@ -300,6 +1019,10 @@ impl PaasControlPlane {
                 .await?;
         }
 
+        let repo_bytes = Self::estimate_dir_bytes(&host_repo).await.max(4096);
+        let cow_saved = repo_bytes.saturating_mul(agent_list.len() as u64);
+        let now = Utc::now().timestamp_millis();
+
         let record = CloudWorkspaceRecord {
             workspace_id: ws_id.clone(),
             org_id: org_id.to_string(),
@@ -307,7 +1030,11 @@ impl PaasControlPlane {
             branch: branch.to_string(),
             host_repo_path: host_repo,
             agents: agent_list,
-            created_at_ms: Utc::now().timestamp_millis(),
+            created_at_ms: now,
+            status: WorkspaceLifecycleState::Active,
+            last_active_ms: now,
+            hibernated_at_ms: None,
+            cow_saved_bytes: cow_saved,
         };
 
         {
@@ -318,7 +1045,272 @@ impl PaasControlPlane {
             state.workspaces.push(record.clone());
         }
         self.flush().await?;
+        let _ = self
+            .record_usage(org_id, Some(&ws_id), 1, 0, cow_saved)
+            .await;
         Ok(record)
+    }
+
+    /// Transition a Cloud Workspace into Scale-to-Zero (`Hibernated`), releasing in-memory sandbox
+    /// handles while preserving zero-copy CoW shadow directories on disk for instant wake-up.
+    pub async fn hibernate_workspace(
+        &self,
+        kernel: &AegisRuntimeKernel,
+        org_id: &str,
+        workspace_id: &str,
+    ) -> anyhow::Result<CloudWorkspaceRecord> {
+        self.reload().await;
+        let now = Utc::now().timestamp_millis();
+        let record = {
+            let mut state = self.state.write().await;
+            let ws = state
+                .workspaces
+                .iter_mut()
+                .find(|w| (org_id == "*" || w.org_id == org_id) && w.workspace_id == workspace_id)
+                .with_context(|| {
+                    format!(
+                        "Cloud workspace '{}/{}' not found",
+                        org_id, workspace_id
+                    )
+                })?;
+            ws.status = WorkspaceLifecycleState::Hibernated;
+            ws.hibernated_at_ms = Some(now);
+            ws.clone()
+        };
+        kernel
+            .evict_agent_environments(&record.org_id, &record.agents)
+            .await;
+        self.flush().await?;
+        Ok(record)
+    }
+
+    /// Wake a `Hibernated` Cloud Workspace back to `Active` in milliseconds by re-attaching CoW directories.
+    pub async fn wake_workspace_if_needed(
+        &self,
+        kernel: &AegisRuntimeKernel,
+        org_id: &str,
+        workspace_id: &str,
+    ) -> anyhow::Result<(CloudWorkspaceRecord, u64)> {
+        self.reload().await;
+        let started = std::time::Instant::now();
+        let now = Utc::now().timestamp_millis();
+        let (record, was_hibernated) = {
+            let mut state = self.state.write().await;
+            let ws = state
+                .workspaces
+                .iter_mut()
+                .find(|w| (org_id == "*" || w.org_id == org_id) && w.workspace_id == workspace_id)
+                .with_context(|| {
+                    format!(
+                        "Cloud workspace '{}/{}' not found",
+                        org_id, workspace_id
+                    )
+                })?;
+            let was_hib = ws.status == WorkspaceLifecycleState::Hibernated;
+            ws.status = WorkspaceLifecycleState::Active;
+            ws.last_active_ms = now;
+            ws.hibernated_at_ms = None;
+            let cloned = ws.clone();
+            if was_hib {
+                if let Some(t) = state.tenants.iter_mut().find(|t| t.org_id == cloned.org_id) {
+                    t.wake_count = t.wake_count.saturating_add(1);
+                    t.updated_at_ms = now;
+                }
+            }
+            (cloned, was_hib)
+        };
+
+        for agent_id in &record.agents {
+            let identity = AgentIdentity::new(&record.org_id, agent_id.clone(), "Aegis Cloud Agent");
+            kernel
+                .ensure_agent_environment(
+                    identity,
+                    &record.host_repo_path,
+                    IsolationTier::NativeOsSandbox,
+                    vec!["*".to_string()],
+                )
+                .await?;
+        }
+        if was_hibernated {
+            self.flush().await?;
+        }
+        let wake_ms = started.elapsed().as_millis() as u64;
+        Ok((record, wake_ms))
+    }
+
+    /// Upload a source-only bundle from the developer's local workstation into the Cloud Workspace's
+    /// baseline repository and auto-rebase all active CoW agent branches.
+    pub async fn sync_up_source_bundle(
+        &self,
+        kernel: &AegisRuntimeKernel,
+        org_id: &str,
+        workspace_id: &str,
+        files: Vec<SourceFileEntry>,
+    ) -> anyhow::Result<Value> {
+        let (ws, _) = self
+            .wake_workspace_if_needed(kernel, org_id, workspace_id)
+            .await?;
+        let mut updated_paths = Vec::new();
+        let mut deleted_paths = Vec::new();
+
+        for entry in files {
+            let clean = entry.path.trim_start_matches('/').to_string();
+            if clean.is_empty()
+                || clean.contains("..")
+                || clean.starts_with(".git/")
+                || clean == ".git"
+            {
+                continue;
+            }
+            let dest = ws.host_repo_path.join(&clean);
+            if entry.deleted {
+                if dest.exists() {
+                    let _ = tokio::fs::remove_file(&dest).await;
+                    deleted_paths.push(clean);
+                }
+            } else {
+                if let Some(parent) = dest.parent() {
+                    tokio::fs::create_dir_all(parent).await?;
+                }
+                tokio::fs::write(&dest, entry.content.as_bytes()).await?;
+                updated_paths.push(clean);
+            }
+        }
+
+        // Propagate updated host baseline into every agent's CoW shadow workspace
+        let mut rebased_agents = Vec::new();
+        for agent_id in &ws.agents {
+            let id = AgentIdentity::new(&ws.org_id, agent_id.clone(), "Aegis Cloud Agent");
+            if let Ok(report) = kernel.refresh_agent_workspace(&id).await {
+                rebased_agents.push(json!({
+                    "agent_id": agent_id,
+                    "updates": report.total_updates(),
+                    "conflicts": report.conflicts
+                }));
+            }
+        }
+
+        let _ = self
+            .record_usage(&ws.org_id, Some(&ws.workspace_id), 1, 0, 0)
+            .await;
+
+        Ok(json!({
+            "status": "synced_up",
+            "org_id": ws.org_id,
+            "workspace_id": ws.workspace_id,
+            "updated_files_count": updated_paths.len(),
+            "deleted_files_count": deleted_paths.len(),
+            "updated_files": updated_paths,
+            "deleted_files": deleted_paths,
+            "rebased_agents": rebased_agents
+        }))
+    }
+
+    /// Inspect an Agent's uncommitted CoW shadow workspace changes (or host repo changes) and export
+    /// a unified source diff + verified text-only `changed_source_files` for safe `aegis-os cloud pull`.
+    pub async fn inspect_agent_diff(
+        &self,
+        kernel: &AegisRuntimeKernel,
+        org_id: &str,
+        agent_id: &str,
+        workspace_id: Option<&str>,
+    ) -> anyhow::Result<Value> {
+        let mut target_host_repo = None;
+        if let Some(ws_id) = workspace_id {
+            if let Ok((ws, _)) = self.wake_workspace_if_needed(kernel, org_id, ws_id).await {
+                target_host_repo = Some(ws.host_repo_path);
+            }
+        } else {
+            let list = self.list_workspaces(Some(org_id)).await;
+            if let Some(first) = list.first() {
+                target_host_repo = Some(first.host_repo_path.clone());
+            }
+        }
+
+        let identity = AgentIdentity::new(org_id, agent_id, "Aegis Cloud Agent");
+        if let Some(ref host_repo) = target_host_repo {
+            let _ = kernel
+                .ensure_agent_environment(
+                    identity.clone(),
+                    host_repo,
+                    IsolationTier::NativeOsSandbox,
+                    vec!["*".to_string()],
+                )
+                .await;
+        }
+
+        let env = kernel.get_agent_environment(&identity).await?;
+        let _ = env.workspace.refresh_from_host().await;
+        let diffs = env.workspace.diff(None).await?;
+
+        let shadow_root = env.workspace.shadow_root();
+        let host_root = env.workspace.host_source_root();
+
+        let mut unified_diff = String::new();
+        let mut changed_source_files: Vec<SourceFileEntry> = Vec::new();
+        let mut skipped_binaries: Vec<String> = Vec::new();
+
+        for d in &diffs {
+            let rel = d.relative_path.trim_start_matches('/').to_string();
+            let shadow_file = shadow_root.join(&rel);
+            let host_file = host_root.join(&rel);
+
+            let change_tag = format!("{:?}", d.change_type).to_lowercase();
+            if change_tag.contains("deleted") || !shadow_file.exists() {
+                let old_text = tokio::fs::read_to_string(&host_file).await.unwrap_or_default();
+                unified_diff.push_str(&format!("--- a/{rel}\n+++ /dev/null\n"));
+                for line in old_text.lines().take(80) {
+                    unified_diff.push_str(&format!("-{line}\n"));
+                }
+                changed_source_files.push(SourceFileEntry {
+                    path: rel,
+                    content: String::new(),
+                    deleted: true,
+                });
+                continue;
+            }
+
+            let raw_bytes = tokio::fs::read(&shadow_file).await.unwrap_or_default();
+            // Reject binary files (containing NUL bytes) from source-only sync
+            if raw_bytes.iter().take(8000).any(|&b| b == 0) {
+                skipped_binaries.push(rel);
+                continue;
+            }
+            let Ok(new_text) = String::from_utf8(raw_bytes) else {
+                skipped_binaries.push(rel);
+                continue;
+            };
+            let old_text = tokio::fs::read_to_string(&host_file).await.unwrap_or_default();
+
+            unified_diff.push_str(&format!("--- a/{rel}\n+++ b/{rel}\n"));
+            for line in old_text.lines().take(60) {
+                if !new_text.lines().any(|nl| nl == line) {
+                    unified_diff.push_str(&format!("-{line}\n"));
+                }
+            }
+            for line in new_text.lines().take(120) {
+                if !old_text.lines().any(|ol| ol == line) {
+                    unified_diff.push_str(&format!("+{line}\n"));
+                }
+            }
+
+            changed_source_files.push(SourceFileEntry {
+                path: rel,
+                content: new_text,
+                deleted: false,
+            });
+        }
+
+        Ok(json!({
+            "org_id": org_id,
+            "agent_id": agent_id,
+            "workspace_id": workspace_id.unwrap_or("default"),
+            "changes_count": diffs.len(),
+            "changes": diffs,
+            "unified_diff": unified_diff,
+            "changed_source_files": changed_source_files,
+            "skipped_binaries": skipped_binaries
+        }))
     }
 
     /// Merge an Agent's CoW Shadow Workspace into the Cloud Workspace's Git repository,
@@ -401,6 +1393,10 @@ impl PaasControlPlane {
             .map(|o| String::from_utf8_lossy(&o.stdout).to_string())
             .unwrap_or_default();
 
+        let _ = self
+            .record_usage(&identity.org_id, workspace_id, 1, 0, 0)
+            .await;
+
         Ok(json!({
             "status": "pr_bundle_exported",
             "org_id": identity.org_id,
@@ -428,1072 +1424,327 @@ impl PaasControlPlane {
     }
 }
 
-/// Embedded single-binary Web Mission Control & HITL Approval Console served at `GET /dashboard`.
-pub const DASHBOARD_HTML: &str = r#"<!DOCTYPE html>
+/// Minimalist, developer-focused Web Console served at `GET /dashboard`.
+/// Displays only high-signal core operational information:
+/// 1. Top Status & Commercial Plan / Metering Strip
+/// 2. Pending Boundary Approvals (with inline Code Diff viewer & 1-click lease approval)
+/// 3. Cloud CoW Workspaces (Scale-to-Zero Hibernate/Wake, Source Diff & Git PR export)
+/// 4. Scoped API Keys & 1-line `aegis-os cloud up` onboarding command
+pub const DASHBOARD_HTML: &str = r##"<!DOCTYPE html>
 <html lang="zh-CN">
 <head>
   <meta charset="UTF-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1.0" />
-  <title>Aegis Cloud PaaS — Mission Control & HITL Approval Center</title>
+  <title>Aegis Cloud — Developer Console</title>
   <style>
     :root {
-      --bg-base: #070a12;
-      --bg-sidebar: #0b101d;
-      --bg-surface: #111827;
-      --bg-elevated: #172033;
-      --bg-input: #090d16;
-      --border: rgba(148, 163, 184, 0.14);
-      --border-strong: rgba(148, 163, 184, 0.26);
-      --text-primary: #f8fafc;
-      --text-secondary: #cbd5e1;
-      --text-muted: #64748b;
-      --accent: #3b82f6;
-      --accent-glow: rgba(59, 130, 246, 0.18);
-      --emerald: #10b981;
-      --emerald-bg: rgba(16, 185, 129, 0.12);
+      --bg: #090d16;
+      --surface: #111827;
+      --elevated: #1e293b;
+      --border: rgba(148, 163, 184, 0.16);
+      --text: #f8fafc;
+      --muted: #94a3b8;
+      --blue: #3b82f6;
+      --green: #10b981;
       --amber: #f59e0b;
-      --amber-bg: rgba(245, 158, 11, 0.12);
-      --rose: #f43f5e;
-      --rose-bg: rgba(244, 63, 94, 0.12);
-      --violet: #8b5cf6;
-      --violet-bg: rgba(139, 92, 246, 0.12);
-      --radius-sm: 6px;
-      --radius-md: 10px;
-      --radius-lg: 14px;
+      --red: #f43f5e;
+      --radius: 8px;
     }
     * { box-sizing: border-box; margin: 0; padding: 0; }
     body {
-      font-family: -apple-system, BlinkMacSystemFont, "Inter", "SF Pro Text", "PingFang SC", sans-serif;
-      background: var(--bg-base);
-      color: var(--text-primary);
-      display: flex;
-      min-height: 100vh;
-      overflow-x: hidden;
-      -webkit-font-smoothing: antialiased;
+      font-family: -apple-system, BlinkMacSystemFont, "Inter", "SF Pro Text", sans-serif;
+      background: var(--bg);
+      color: var(--text);
+      line-height: 1.5;
+      padding: 20px 28px 48px;
+      max-width: 1180px;
+      margin: 0 auto;
     }
     code, pre, .mono {
       font-family: "JetBrains Mono", "SF Mono", ui-monospace, Menlo, monospace;
     }
-    .svg-icon {
-      width: 16px;
-      height: 16px;
-      stroke: currentColor;
-      stroke-width: 1.85;
-      stroke-linecap: round;
-      stroke-linejoin: round;
-      fill: none;
-      flex-shrink: 0;
-    }
-    .svg-icon-sm {
-      width: 14px;
-      height: 14px;
-      stroke: currentColor;
-      stroke-width: 1.9;
-      stroke-linecap: round;
-      stroke-linejoin: round;
-      fill: none;
-      flex-shrink: 0;
-    }
-    .svg-icon-lg {
-      width: 28px;
-      height: 28px;
-      stroke: currentColor;
-      stroke-width: 1.65;
-      stroke-linecap: round;
-      stroke-linejoin: round;
-      fill: none;
-      flex-shrink: 0;
-    }
-
-    /* Left Sidebar Navigation */
-    .sidebar {
-      width: 256px;
-      background: var(--bg-sidebar);
-      border-right: 1px solid var(--border);
+    header {
       display: flex;
-      flex-direction: column;
-      position: fixed;
-      top: 0;
-      bottom: 0;
-      left: 0;
-      z-index: 20;
-      padding: 20px 14px;
-    }
-    .brand {
-      display: flex;
-      align-items: center;
-      gap: 11px;
-      padding: 4px 10px 18px;
-      border-bottom: 1px solid var(--border);
-      margin-bottom: 16px;
-    }
-    .brand-logo {
-      width: 34px;
-      height: 34px;
-      border-radius: 9px;
-      background: linear-gradient(135deg, #2563eb 0%, #7c3aed 100%);
-      display: flex;
-      align-items: center;
-      justify-content: center;
-      color: #fff;
-      box-shadow: 0 4px 14px rgba(59, 130, 246, 0.35);
-      flex-shrink: 0;
-    }
-    .brand-title { font-size: 15px; font-weight: 700; letter-spacing: -0.01em; }
-    .brand-sub { font-size: 11px; color: var(--text-muted); margin-top: 1px; }
-
-    .nav-section-label {
-      font-size: 10px;
-      font-weight: 700;
-      text-transform: uppercase;
-      letter-spacing: 0.08em;
-      color: var(--text-muted);
-      padding: 10px 12px 6px;
-    }
-    .nav-item {
-      display: flex;
-      align-items: center;
       justify-content: space-between;
-      padding: 10px 12px;
-      border-radius: var(--radius-sm);
-      color: var(--text-secondary);
-      font-size: 13px;
-      font-weight: 500;
-      cursor: pointer;
-      transition: all 0.15s ease;
-      margin-bottom: 4px;
-      border: 1px solid transparent;
-    }
-    .nav-item:hover {
-      background: rgba(255, 255, 255, 0.04);
-      color: var(--text-primary);
-    }
-    .nav-item.active {
-      background: var(--accent-glow);
-      color: #60a5fa;
-      border-color: rgba(59, 130, 246, 0.3);
-      font-weight: 600;
-    }
-    .nav-left { display: flex; align-items: center; gap: 10px; }
-    .nav-pill {
-      font-size: 11px;
-      font-weight: 700;
-      padding: 1px 7px;
-      border-radius: 999px;
-      background: rgba(255, 255, 255, 0.08);
-      color: var(--text-secondary);
-    }
-    .nav-pill.urgent {
-      background: var(--amber-bg);
-      color: #fbbf24;
-      border: 1px solid rgba(245, 158, 11, 0.35);
-    }
-
-    .sidebar-footer {
-      margin-top: auto;
-      padding: 12px;
-      background: rgba(17, 24, 39, 0.75);
-      border: 1px solid var(--border);
-      border-radius: var(--radius-md);
-      font-size: 12px;
-    }
-    .status-dot {
-      width: 8px;
-      height: 8px;
-      border-radius: 50%;
-      background: var(--emerald);
-      display: inline-block;
-      box-shadow: 0 0 8px var(--emerald);
-      margin-right: 6px;
-    }
-
-    /* Main Content Area */
-    .main {
-      margin-left: 256px;
-      flex: 1;
-      display: flex;
-      flex-direction: column;
-      min-width: 0;
-    }
-    .topbar {
-      height: 62px;
-      padding: 0 32px;
+      align-items: center;
+      padding-bottom: 16px;
       border-bottom: 1px solid var(--border);
-      display: flex;
-      align-items: center;
-      justify-content: space-between;
-      background: rgba(11, 16, 29, 0.8);
-      backdrop-filter: blur(10px);
-      position: sticky;
-      top: 0;
-      z-index: 10;
-    }
-    .topbar-left { display: flex; align-items: center; gap: 12px; }
-    .topbar-title { font-size: 16px; font-weight: 600; }
-    .topbar-right { display: flex; align-items: center; gap: 10px; }
-
-    .content {
-      padding: 26px 32px 48px;
-      max-width: 1360px;
-      width: 100%;
-    }
-
-    /* Workflow Stepper Banner */
-    .workflow-banner {
-      display: grid;
-      grid-template-columns: repeat(3, 1fr);
-      gap: 14px;
-      margin-bottom: 24px;
-    }
-    .step-card {
-      background: linear-gradient(180deg, rgba(23, 32, 51, 0.7) 0%, rgba(17, 24, 39, 0.9) 100%);
-      border: 1px solid var(--border);
-      border-radius: var(--radius-md);
-      padding: 14px 16px;
-      display: flex;
-      gap: 12px;
-      align-items: flex-start;
-    }
-    .step-num {
-      width: 30px;
-      height: 30px;
-      border-radius: 8px;
-      background: rgba(59, 130, 246, 0.14);
-      border: 1px solid rgba(59, 130, 246, 0.35);
-      color: #60a5fa;
-      display: flex;
-      align-items: center;
-      justify-content: center;
-      flex-shrink: 0;
-      margin-top: 1px;
-    }
-    .step-title { font-size: 13px; font-weight: 600; color: var(--text-primary); }
-    .step-desc { font-size: 12px; color: var(--text-muted); margin-top: 3px; line-height: 1.45; }
-
-    /* KPI Strip */
-    .kpi-grid {
-      display: grid;
-      grid-template-columns: repeat(4, 1fr);
-      gap: 14px;
-      margin-bottom: 24px;
-    }
-    .kpi-card {
-      background: var(--bg-surface);
-      border: 1px solid var(--border);
-      border-radius: var(--radius-md);
-      padding: 16px 18px;
-      cursor: pointer;
-      transition: border-color 0.15s, transform 0.15s;
-    }
-    .kpi-card:hover { border-color: var(--border-strong); transform: translateY(-1px); }
-    .kpi-top { display: flex; justify-content: space-between; align-items: center; font-size: 12px; color: var(--text-muted); }
-    .kpi-val { font-size: 28px; font-weight: 700; margin-top: 6px; letter-spacing: -0.02em; }
-    .kpi-sub { font-size: 11px; color: var(--text-muted); margin-top: 4px; }
-
-    /* Cards & Sections */
-    .card {
-      background: var(--bg-surface);
-      border: 1px solid var(--border);
-      border-radius: var(--radius-lg);
-      padding: 20px 22px;
       margin-bottom: 20px;
-    }
-    .card-header {
-      display: flex;
-      justify-content: space-between;
-      align-items: flex-start;
-      margin-bottom: 16px;
       gap: 12px;
+      flex-wrap: wrap;
     }
-    .card-title { font-size: 15px; font-weight: 600; display: flex; align-items: center; gap: 8px; }
-    .card-subtitle { font-size: 12px; color: var(--text-muted); margin-top: 3px; }
-
-    .split-2 {
-      display: grid;
-      grid-template-columns: 1fr 1fr;
-      gap: 20px;
-    }
-
-    /* Badges */
-    .badge {
+    .brand { display: flex; align-items: center; gap: 10px; }
+    .brand h1 { font-size: 16px; font-weight: 700; }
+    .pill {
       display: inline-flex;
       align-items: center;
-      gap: 5px;
-      padding: 2px 9px;
+      padding: 2px 8px;
       border-radius: 999px;
       font-size: 11px;
       font-weight: 600;
-      border: 1px solid transparent;
+      background: rgba(59, 130, 246, 0.15);
+      color: #60a5fa;
+      border: 1px solid rgba(59, 130, 246, 0.3);
     }
-    .badge-blue { background: rgba(59, 130, 246, 0.14); color: #60a5fa; border-color: rgba(59, 130, 246, 0.3); }
-    .badge-green { background: var(--emerald-bg); color: #34d399; border-color: rgba(16, 185, 129, 0.3); }
-    .badge-amber { background: var(--amber-bg); color: #fbbf24; border-color: rgba(245, 158, 11, 0.35); }
-    .badge-red { background: var(--rose-bg); color: #fb7185; border-color: rgba(244, 63, 94, 0.3); }
-    .badge-purple { background: var(--violet-bg); color: #c4b5fd; border-color: rgba(139, 92, 246, 0.3); }
+    .pill.green { background: rgba(16, 185, 129, 0.14); color: #34d399; border-color: rgba(16, 185, 129, 0.3); }
+    .pill.amber { background: rgba(245, 158, 11, 0.14); color: #fbbf24; border-color: rgba(245, 158, 11, 0.35); }
+    .pill.muted { background: rgba(148, 163, 184, 0.12); color: var(--muted); border-color: var(--border); }
 
-    /* Approval Decision Card */
-    .approval-item {
-      background: var(--bg-elevated);
-      border: 1px solid rgba(245, 158, 11, 0.35);
-      border-left: 4px solid var(--amber);
-      border-radius: var(--radius-md);
+    .stats-bar {
+      display: grid;
+      grid-template-columns: repeat(4, 1fr);
+      gap: 12px;
+      margin-bottom: 20px;
+    }
+    .stat {
+      background: var(--surface);
+      border: 1px solid var(--border);
+      border-radius: var(--radius);
+      padding: 12px 14px;
+    }
+    .stat-label { font-size: 11px; color: var(--muted); }
+    .stat-val { font-size: 20px; font-weight: 700; margin-top: 2px; }
+
+    .section {
+      background: var(--surface);
+      border: 1px solid var(--border);
+      border-radius: var(--radius);
       padding: 16px 18px;
-      margin-bottom: 12px;
+      margin-bottom: 16px;
+    }
+    .section-head {
       display: flex;
       justify-content: space-between;
       align-items: center;
-      gap: 20px;
-    }
-    .approval-meta {
-      display: flex;
-      align-items: center;
-      gap: 8px;
-      margin-bottom: 6px;
+      margin-bottom: 12px;
+      gap: 10px;
       flex-wrap: wrap;
     }
-    .approval-reason {
-      font-size: 13px;
-      color: var(--text-primary);
-      background: rgba(7, 10, 18, 0.55);
-      border: 1px solid var(--border);
-      padding: 8px 12px;
-      border-radius: var(--radius-sm);
-      margin-top: 6px;
-    }
-    .approval-actions {
-      display: flex;
-      gap: 8px;
-      flex-shrink: 0;
-      flex-wrap: wrap;
-    }
+    .section-title { font-size: 14px; font-weight: 600; display: flex; align-items: center; gap: 8px; }
 
-    /* Buttons & Inputs */
     .btn {
       display: inline-flex;
       align-items: center;
-      gap: 6px;
-      padding: 8px 13px;
-      border-radius: var(--radius-sm);
+      gap: 5px;
+      padding: 6px 11px;
+      border-radius: 6px;
       font-size: 12px;
       font-weight: 600;
       cursor: pointer;
-      border: 1px solid transparent;
-      color: #fff;
-      transition: all 0.14s ease;
-      white-space: nowrap;
-    }
-    .btn:hover { filter: brightness(1.1); }
-    .btn:active { transform: scale(0.99); }
-    .btn-primary { background: var(--accent); box-shadow: 0 2px 8px rgba(59, 130, 246, 0.3); }
-    .btn-success { background: var(--emerald); }
-    .btn-danger { background: rgba(244, 63, 94, 0.16); color: #fda4af; border-color: rgba(244, 63, 94, 0.35); }
-    .btn-ghost {
-      background: rgba(255, 255, 255, 0.05);
-      color: var(--text-secondary);
-      border-color: var(--border);
-    }
-    .btn-ghost:hover { background: rgba(255, 255, 255, 0.09); color: var(--text-primary); }
-
-    .form-grid {
-      display: grid;
-      grid-template-columns: repeat(auto-fit, minmax(200px, 1fr));
-      gap: 12px;
-      margin-bottom: 14px;
-    }
-    .field label {
-      display: block;
-      font-size: 11px;
-      font-weight: 600;
-      color: var(--text-secondary);
-      margin-bottom: 5px;
-    }
-    .field input, .field select {
-      width: 100%;
-      background: var(--bg-input);
       border: 1px solid var(--border);
-      color: var(--text-primary);
-      padding: 8px 11px;
-      border-radius: var(--radius-sm);
-      font-size: 12px;
-      outline: none;
-      transition: border-color 0.15s;
+      background: var(--elevated);
+      color: var(--text);
     }
-    .field input:focus { border-color: var(--accent); }
+    .btn:hover { filter: brightness(1.12); }
+    .btn-primary { background: var(--blue); border-color: transparent; color: #fff; }
+    .btn-success { background: var(--green); border-color: transparent; color: #fff; }
+    .btn-danger { background: rgba(244, 63, 94, 0.16); border-color: rgba(244, 63, 94, 0.35); color: #fda4af; }
 
-    /* Clean Tables */
-    .table-wrap { overflow-x: auto; }
-    table { width: 100%; border-collapse: collapse; font-size: 12.5px; }
-    th {
-      text-align: left;
-      padding: 10px 12px;
-      font-size: 11px;
-      font-weight: 600;
-      color: var(--text-muted);
-      text-transform: uppercase;
-      letter-spacing: 0.04em;
-      border-bottom: 1px solid var(--border);
-    }
-    td {
-      padding: 11px 12px;
-      border-bottom: 1px solid rgba(148, 163, 184, 0.08);
-      color: var(--text-secondary);
-      vertical-align: middle;
-    }
-    tr:last-child td { border-bottom: none; }
-
-    /* Empty State */
-    .empty-state {
-      text-align: center;
-      padding: 28px 20px;
-      background: rgba(9, 13, 22, 0.45);
-      border: 1px dashed var(--border);
-      border-radius: var(--radius-md);
-      color: var(--text-muted);
-      font-size: 13px;
-      display: flex;
-      flex-direction: column;
-      align-items: center;
-      gap: 6px;
-    }
-    .empty-state strong { color: var(--text-secondary); display: block; }
-
-    /* Tabs */
-    .view-section { display: none; }
-    .view-section.active { display: block; }
-
-    /* Code Snippet Box */
-    .code-block {
-      background: #050811;
-      border: 1px solid var(--border);
-      border-radius: var(--radius-md);
-      padding: 14px 16px;
-      font-size: 12px;
-      color: #e2e8f0;
-      overflow-x: auto;
-      line-height: 1.55;
-      position: relative;
-    }
-
-    /* Slide-over Modal for PR Patch Preview */
-    .modal-backdrop {
-      position: fixed;
-      inset: 0;
-      background: rgba(0, 0, 0, 0.7);
-      backdrop-filter: blur(4px);
-      display: none;
-      align-items: center;
-      justify-content: center;
-      z-index: 100;
-      padding: 24px;
-    }
-    .modal {
-      background: var(--bg-surface);
-      border: 1px solid var(--border-strong);
-      border-radius: var(--radius-lg);
-      max-width: 820px;
-      width: 100%;
-      max-height: 85vh;
-      display: flex;
-      flex-direction: column;
-      box-shadow: 0 24px 48px rgba(0, 0, 0, 0.6);
-    }
-    .modal-header {
-      padding: 16px 20px;
-      border-bottom: 1px solid var(--border);
+    .approval-row {
+      border: 1px solid rgba(245, 158, 11, 0.35);
+      border-left: 3px solid var(--amber);
+      background: rgba(30, 41, 59, 0.55);
+      border-radius: 6px;
+      padding: 12px 14px;
+      margin-bottom: 8px;
       display: flex;
       justify-content: space-between;
       align-items: center;
+      gap: 14px;
+      flex-wrap: wrap;
     }
-    .modal-body {
-      padding: 18px 20px;
-      overflow-y: auto;
-      font-size: 12.5px;
-    }
+    .actions { display: flex; gap: 6px; flex-wrap: wrap; }
 
+    table { width: 100%; border-collapse: collapse; font-size: 12.5px; }
+    th {
+      text-align: left;
+      padding: 8px 10px;
+      font-size: 11px;
+      color: var(--muted);
+      border-bottom: 1px solid var(--border);
+    }
+    td {
+      padding: 9px 10px;
+      border-bottom: 1px solid rgba(148, 163, 184, 0.08);
+    }
+    tr:last-child td { border-bottom: none; }
+
+    .inline-form {
+      display: flex;
+      gap: 8px;
+      margin-bottom: 12px;
+      flex-wrap: wrap;
+    }
+    input, select {
+      background: var(--bg);
+      border: 1px solid var(--border);
+      color: var(--text);
+      padding: 6px 10px;
+      border-radius: 6px;
+      font-size: 12px;
+    }
+    pre.code {
+      background: #050811;
+      border: 1px solid var(--border);
+      border-radius: 6px;
+      padding: 10px 12px;
+      font-size: 11.5px;
+      overflow-x: auto;
+      color: #cbd5e1;
+      max-height: 360px;
+    }
+    .empty { color: var(--muted); font-size: 12.5px; padding: 10px 0; }
+    #diff-drawer { display: none; margin-top: 12px; }
     #toast {
       position: fixed;
-      bottom: 24px;
-      right: 28px;
-      background: #1e293b;
-      border: 1px solid rgba(59, 130, 246, 0.5);
-      color: var(--text-primary);
-      padding: 12px 16px;
-      border-radius: var(--radius-md);
-      font-size: 12.5px;
+      bottom: 20px;
+      right: 24px;
+      background: var(--elevated);
+      border: 1px solid var(--blue);
+      padding: 9px 14px;
+      border-radius: 6px;
+      font-size: 12px;
       display: none;
-      align-items: center;
-      gap: 8px;
-      box-shadow: 0 12px 28px rgba(0, 0, 0, 0.55);
-      z-index: 200;
     }
   </style>
 </head>
 <body>
-  <!-- Sidebar -->
-  <aside class="sidebar">
+  <header>
     <div class="brand">
-      <div class="brand-logo">
-        <svg class="svg-icon" viewBox="0 0 24 24" style="width:19px;height:19px;">
-          <path d="M12 22s8-4 8-10V5l-8-3-8 3v7c0 6 8 10 8 10z"/>
-          <path d="M9 12l2 2 4-4"/>
-        </svg>
-      </div>
-      <div>
-        <div class="brand-title">Aegis Cloud PaaS</div>
-        <div class="brand-sub">Transactional Agent OS v0.3</div>
-      </div>
+      <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="#3b82f6" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M12 22s8-4 8-10V5l-8-3-8 3v7c0 6 8 10 8 10z"/><path d="M9 12l2 2 4-4"/></svg>
+      <h1>Aegis Cloud</h1>
+      <span class="pill" id="plan-badge">Pro Plan · $29/mo</span>
+      <span class="pill green">Zero-Local-Load CoW Runtime</span>
     </div>
-
-    <div class="nav-section-label">Operations</div>
-    <div class="nav-item active" id="nav-overview" onclick="switchView('overview')">
-      <span class="nav-left">
-        <svg class="svg-icon" viewBox="0 0 24 24">
-          <path d="M12 22s8-4 8-10V5l-8-3-8 3v7c0 6 8 10 8 10z"/>
-          <path d="M9 12l2 2 4-4"/>
-        </svg>
-        <span>审批与协作总览</span>
-      </span>
-      <span class="nav-pill urgent" id="nav-badge-pending">0</span>
+    <div class="actions">
+      <select id="plan-select" onchange="changePlan(this.value)">
+        <option value="community">Community (Free · 2 Agents)</option>
+        <option value="pro" selected>Pro ($29/mo · 8 Agents)</option>
+        <option value="team">Team ($79/seat · 32 Agents)</option>
+        <option value="enterprise">Enterprise (VPC · 256 Agents)</option>
+      </select>
+      <button class="btn" onclick="simulateEscalation()">+ 模拟审批</button>
+      <button class="btn" onclick="refresh(true)">刷新</button>
     </div>
-    <div class="nav-item" id="nav-workspaces" onclick="switchView('workspaces')">
-      <span class="nav-left">
-        <svg class="svg-icon" viewBox="0 0 24 24">
-          <line x1="6" y1="3" x2="6" y2="15"/>
-          <circle cx="18" cy="6" r="3"/>
-          <circle cx="6" cy="18" r="3"/>
-          <path d="M18 9a9 9 0 0 1-9 9"/>
-        </svg>
-        <span>CoW 工作区 &amp; PR</span>
-      </span>
-      <span class="nav-pill" id="nav-badge-ws">0</span>
+  </header>
+
+  <!-- Core Metrics Strip -->
+  <div class="stats-bar">
+    <div class="stat">
+      <div class="stat-label">待处理边界审批 (HITL)</div>
+      <div class="stat-val" id="st-pending" style="color:#fbbf24;">0</div>
     </div>
-    <div class="nav-item" id="nav-security" onclick="switchView('security')">
-      <span class="nav-left">
-        <svg class="svg-icon" viewBox="0 0 24 24">
-          <rect x="3" y="11" width="18" height="11" rx="2" ry="2"/>
-          <path d="M7 11V7a5 5 0 0 1 10 0v4"/>
-          <circle cx="12" cy="16" r="1"/>
-        </svg>
-        <span>密钥金库 &amp; 租约</span>
-      </span>
-      <span class="nav-pill" id="nav-badge-sec">0</span>
+    <div class="stat">
+      <div class="stat-label">云工作区 (Active / Hibernated)</div>
+      <div class="stat-val" id="st-ws">0 / 0</div>
     </div>
-
-    <div class="nav-section-label" style="margin-top: 8px;">Developers</div>
-    <div class="nav-item" id="nav-connect" onclick="switchView('connect')">
-      <span class="nav-left">
-        <svg class="svg-icon" viewBox="0 0 24 24">
-          <polyline points="4 17 10 11 4 5"/>
-          <line x1="12" y1="19" x2="20" y2="19"/>
-        </svg>
-        <span>接入 Agent &amp; API Key</span>
-      </span>
-      <span class="nav-pill" id="nav-badge-keys">0</span>
+    <div class="stat">
+      <div class="stat-label">云沙箱调用 / 执行耗时</div>
+      <div class="stat-val" id="st-usage">0 calls · 0ms</div>
     </div>
-
-    <div class="sidebar-footer">
-      <div style="display:flex; align-items:center; justify-content:space-between; margin-bottom:4px;">
-        <span><span class="status-dot"></span>Runtime Online</span>
-        <code class="mono" style="font-size:10px; color:#94a3b8;">MCP+A2A</code>
-      </div>
-      <div style="color: var(--text-muted); font-size: 11px;">
-        CoW Engine: <strong style="color:var(--text-secondary);">APFS / FICLONE</strong>
-      </div>
+    <div class="stat">
+      <div class="stat-label">CoW 零拷贝节省磁盘</div>
+      <div class="stat-val" id="st-saved" style="color:#34d399;">0 KB</div>
     </div>
-  </aside>
-
-  <!-- Main Area -->
-  <div class="main">
-    <header class="topbar">
-      <div class="topbar-left">
-        <div class="topbar-title" id="topbar-heading">审批与实时协作总览 (Approvals &amp; Live Radar)</div>
-      </div>
-      <div class="topbar-right">
-        <button class="btn btn-ghost" onclick="simulateEscalation()" title="模拟一次 Agent 提交代码的审批请求，立即体验审批闭环">
-          <svg class="svg-icon-sm" viewBox="0 0 24 24">
-            <polygon points="13 2 3 14 12 14 11 22 21 10 12 10 13 2"/>
-          </svg>
-          <span>模拟 Agent 越界审批请求</span>
-        </button>
-        <button class="btn btn-ghost" onclick="refreshDashboard(true)">
-          <svg class="svg-icon-sm" viewBox="0 0 24 24">
-            <polyline points="23 4 23 10 17 10"/>
-            <polyline points="1 20 1 14 7 14"/>
-            <path d="M3.51 9a9 9 0 0 1 14.85-3.36L23 10M1 14l4.64 4.36A9 9 0 0 0 20.49 15"/>
-          </svg>
-          <span>立即刷新</span>
-        </button>
-      </div>
-    </header>
-
-    <main class="content">
-      <!-- ================================================================ -->
-      <!-- VIEW 1: OVERVIEW & HITL APPROVALS                                -->
-      <!-- ================================================================ -->
-      <section class="view-section active" id="view-overview">
-        <!-- 3-Step Mental Model Banner -->
-        <div class="workflow-banner">
-          <div class="step-card">
-            <div class="step-num">
-              <svg class="svg-icon" viewBox="0 0 24 24">
-                <circle cx="12" cy="18" r="3"/>
-                <circle cx="6" cy="6" r="3"/>
-                <circle cx="18" cy="6" r="3"/>
-                <path d="M18 9v1a2 2 0 0 1-2 2H8a2 2 0 0 1-2-2V9"/>
-                <line x1="12" y1="12" x2="12" y2="15"/>
-              </svg>
-            </div>
-            <div>
-              <div class="step-title">01 · 毫秒级 CoW 影子分叉 (&lt;10ms)</div>
-              <div class="step-desc">本地 IDE (<code>agy</code>/<code>claude</code>/<code>codex</code>) 或云端 Agent 自动运行在独立 CoW 分支，零磁盘冗余。</div>
-            </div>
-          </div>
-          <div class="step-card">
-            <div class="step-num">
-              <svg class="svg-icon" viewBox="0 0 24 24">
-                <path d="M12 22s8-4 8-10V5l-8-3-8 3v7c0 6 8 10 8 10z"/>
-                <path d="M9 12l2 2 4-4"/>
-              </svg>
-            </div>
-            <div>
-              <div class="step-title">02 · 绿区 100% 自动放行 (0 弹窗)</div>
-              <div class="step-desc">沙箱内读写文件、跑 <code>cargo test</code>、A2A 任务协同及允许域名的 <code>$AOS_SECRET_*</code> 注入全部静默放行。</div>
-            </div>
-          </div>
-          <div class="step-card">
-            <div class="step-num">
-              <svg class="svg-icon" viewBox="0 0 24 24">
-                <circle cx="18" cy="18" r="3"/>
-                <circle cx="6" cy="6" r="3"/>
-                <path d="M13 6h3a2 2 0 0 1 2 2v7"/>
-                <line x1="6" y1="9" x2="6" y2="21"/>
-              </svg>
-            </div>
-            <div>
-              <div class="step-title">03 · 边界提交审批 &amp; 自动三路合并</div>
-              <div class="step-desc">仅当 Agent 调用 <code>workspace_commit</code> 落盘或访问未知外网时，在此处一键批准单次或 1 小时租约。</div>
-            </div>
-          </div>
-        </div>
-
-        <!-- KPI Strip (Clickable to jump to views) -->
-        <div class="kpi-grid">
-          <div class="kpi-card" onclick="switchView('overview')">
-            <div class="kpi-top"><span>待处理边界审批 (HITL)</span><span class="badge badge-amber">Action</span></div>
-            <div class="kpi-val" id="kpi-pending" style="color: #fbbf24;">0</div>
-            <div class="kpi-sub">拦截的宿主落盘或敏感越界请求</div>
-          </div>
-          <div class="kpi-card" onclick="switchView('security')">
-            <div class="kpi-top"><span>生效中的会话租约 (Leases)</span><span class="badge badge-green">Auto-Pass</span></div>
-            <div class="kpi-val" id="kpi-leases" style="color: #34d399;">0</div>
-            <div class="kpi-sub">租约期内同作用域提交免重复弹窗</div>
-          </div>
-          <div class="kpi-card" onclick="switchView('overview')">
-            <div class="kpi-top"><span>在线协同 Agent (Global Peers)</span><span class="badge badge-blue">Live</span></div>
-            <div class="kpi-val" id="kpi-peers" style="color: #60a5fa;">0</div>
-            <div class="kpi-sub">跨终端 / 跨仓库实时心跳存活</div>
-          </div>
-          <div class="kpi-card" onclick="switchView('workspaces')">
-            <div class="kpi-top"><span>云端工作区 &amp; A2A 任务</span><span class="badge badge-purple">PaaS</span></div>
-            <div class="kpi-val" id="kpi-ws-tasks">0 / 0</div>
-            <div class="kpi-sub">托管 CoW 仓库与 Google A2A 状态机</div>
-          </div>
-        </div>
-
-        <!-- Section 1: Pending HITL Approvals -->
-        <div class="card">
-          <div class="card-header">
-            <div>
-              <div class="card-title">
-                <svg class="svg-icon" viewBox="0 0 24 24" style="color:#fbbf24;">
-                  <path d="M18 8A6 6 0 0 0 6 8c0 7-3 9-3 9h18s-3-2-3-9"/>
-                  <path d="M13.73 21a2 2 0 0 1-3.46 0"/>
-                </svg>
-                <span>待处理人工审批队列 (Pending Boundary Escalations)</span>
-                <span class="badge badge-amber" id="pending-count-pill">0 待审批</span>
-              </div>
-              <div class="card-subtitle">当 Agent 触发策略引擎 R0b (Hook/CI 修改) 或 R4 (未授权 <code>workspace_commit</code> / 外网请求) 时在此挂起等待决策</div>
-            </div>
-            <button class="btn btn-ghost" onclick="simulateEscalation()">
-              <svg class="svg-icon-sm" viewBox="0 0 24 24">
-                <circle cx="12" cy="12" r="10"/>
-                <line x1="12" y1="8" x2="12" y2="16"/>
-                <line x1="8" y1="12" x2="16" y2="12"/>
-              </svg>
-              <span>生成测试审批单</span>
-            </button>
-          </div>
-          <div id="approvals-container"></div>
-        </div>
-
-        <!-- Section 2: Live Peers + A2A Tasks Split -->
-        <div class="split-2">
-          <div class="card">
-            <div class="card-header">
-              <div>
-                <div class="card-title">
-                  <svg class="svg-icon" viewBox="0 0 24 24" style="color:#34d399;">
-                    <circle cx="12" cy="12" r="2"/>
-                    <path d="M16.24 7.76a6 6 0 0 1 0 8.49m-8.48-.01a6 6 0 0 1 0-8.49m11.31-2.82a10 10 0 0 1 0 14.14m-14.14 0a10 10 0 0 1 0-14.14"/>
-                  </svg>
-                  <span>在线 Agent 协作雷达 (Global Peer Registry)</span>
-                </div>
-                <div class="card-subtitle">自动检测本地与云端活跃 Agent、文件锁 (<code>coord_claim</code>) 与 A2A 技能卡</div>
-              </div>
-            </div>
-            <div class="table-wrap">
-              <table>
-                <thead>
-                  <tr><th>Agent Principal</th><th>角色与客户端</th><th>声明文件锁 / A2A Skills</th></tr>
-                </thead>
-                <tbody id="peers-tbody"></tbody>
-              </table>
-            </div>
-          </div>
-
-          <div class="card">
-            <div class="card-header">
-              <div>
-                <div class="card-title">
-                  <svg class="svg-icon" viewBox="0 0 24 24" style="color:#c4b5fd;">
-                    <polyline points="22 12 18 12 15 21 9 3 6 12 2 12"/>
-                  </svg>
-                  <span>Google A2A 任务状态流 (Stateful Tasks)</span>
-                </div>
-                <div class="card-subtitle">跨 Agent 委派任务 (<code>submitted → working → completed</code>)</div>
-              </div>
-            </div>
-            <div class="table-wrap">
-              <table>
-                <thead>
-                  <tr><th>Task ID</th><th>状态</th><th>委派路径 &amp; 主题</th></tr>
-                </thead>
-                <tbody id="tasks-tbody"></tbody>
-              </table>
-            </div>
-          </div>
-        </div>
-      </section>
-
-      <!-- ================================================================ -->
-      <!-- VIEW 2: COW WORKSPACES & GIT-TO-PR PIPELINE                      -->
-      <!-- ================================================================ -->
-      <section class="view-section" id="view-workspaces">
-        <div class="card">
-          <div class="card-header">
-            <div>
-              <div class="card-title">
-                <svg class="svg-icon" viewBox="0 0 24 24" style="color:#60a5fa;">
-                  <line x1="6" y1="3" x2="6" y2="15"/>
-                  <circle cx="18" cy="6" r="3"/>
-                  <circle cx="6" cy="18" r="3"/>
-                  <path d="M18 9a9 9 0 0 1-9 9"/>
-                </svg>
-                <span>创建云端 CoW 工作区 (Provision Cloud Workspace)</span>
-              </div>
-              <div class="card-subtitle">从 GitHub 仓库或本地目录克隆基准仓，并为多个 Agent 瞬间分叉独立的零拷贝 CoW 影子分支</div>
-            </div>
-          </div>
-          <div class="form-grid">
-            <div class="field">
-              <label>租户组织 (Organization ID)</label>
-              <input id="ws-org" value="aegis-os" placeholder="例如 acme" />
-            </div>
-            <div class="field">
-              <label>工作区标识 (Workspace ID)</label>
-              <input id="ws-id" value="ws-core" placeholder="例如 ws-payments" />
-            </div>
-            <div class="field">
-              <label>Git 仓库 URL 或本地路径 (Source)</label>
-              <input id="ws-src" value="." placeholder="https://github.com/org/repo.git 或 ." />
-            </div>
-            <div class="field">
-              <label>并发 Agent 列表 (逗号分隔)</label>
-              <input id="ws-agents" value="coder-alpha,reviewer-beta" placeholder="coder-1,tester-1" />
-            </div>
-          </div>
-          <button class="btn btn-primary" onclick="provisionWorkspace()">
-            <svg class="svg-icon-sm" viewBox="0 0 24 24">
-              <polygon points="12 2 2 7 12 12 22 7 12 2"/>
-              <polyline points="2 17 12 22 22 17"/>
-              <polyline points="2 12 12 17 22 12"/>
-            </svg>
-            <span>立即分叉 CoW 工作区 (&lt;10ms)</span>
-          </button>
-        </div>
-
-        <div class="card">
-          <div class="card-header">
-            <div>
-              <div class="card-title">
-                <svg class="svg-icon" viewBox="0 0 24 24" style="color:#60a5fa;">
-                  <path d="M22 19a2 2 0 0 1-2 2H4a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h5l2 3h9a2 2 0 0 1 2 2z"/>
-                </svg>
-                <span>已托管的 CoW 工作区列表 (Managed Workspaces)</span>
-              </div>
-              <div class="card-subtitle">点击「合并并导出 Git PR 补丁」即可运行 4-Tier LCS Diff3 合并并查看生成的 Git 分支与 Unified Patch</div>
-            </div>
-          </div>
-          <div class="table-wrap">
-            <table>
-              <thead>
-                <tr><th>组织 / 工作区 ID</th><th>基准源 (Branch)</th><th>已挂载 CoW Agent 分支</th><th>操作 (Git-to-PR)</th></tr>
-              </thead>
-              <tbody id="workspaces-tbody"></tbody>
-            </table>
-          </div>
-        </div>
-      </section>
-
-      <!-- ================================================================ -->
-      <!-- VIEW 3: ZERO-TRUST SECRET VAULT & ACTIVE LEASES                  -->
-      <!-- ================================================================ -->
-      <section class="view-section" id="view-security">
-        <div class="split-2">
-          <div class="card">
-            <div class="card-header">
-              <div>
-                <div class="card-title">
-                  <svg class="svg-icon" viewBox="0 0 24 24" style="color:#34d399;">
-                    <rect x="3" y="11" width="18" height="11" rx="2" ry="2"/>
-                    <path d="M7 11V7a5 5 0 0 1 10 0v4"/>
-                  </svg>
-                  <span>零信任边界密钥金库 (Boundary Secret Vault)</span>
-                </div>
-                <div class="card-subtitle">Agent 沙箱内仅持有 <code>$AOS_SECRET_*</code> 占位符；真实 Token 仅在匹配域名 + 路径前缀时由出口代理注入</div>
-              </div>
-            </div>
-            <div class="form-grid">
-              <div class="field">
-                <label>组织 (Org ID)</label>
-                <input id="sec-org" value="aegis-os" />
-              </div>
-              <div class="field">
-                <label>占位符名称 (Placeholder)</label>
-                <input id="sec-name" value="$AOS_SECRET_GITHUB" />
-              </div>
-              <div class="field">
-                <label>真实密钥值 (仅加密存储于网关边界)</label>
-                <input id="sec-val" type="password" placeholder="ghp_xxxxxxxxxxxx" />
-              </div>
-              <div class="field">
-                <label>允许注入的目标域名 (Allowed Domains)</label>
-                <input id="sec-dom" value="api.github.com" />
-              </div>
-              <div class="field">
-                <label>允许的 URL 路径前缀 (防 Confused Deputy)</label>
-                <input id="sec-path" value="/repos/" placeholder="/repos/my-org/" />
-              </div>
-            </div>
-            <button class="btn btn-success" onclick="registerSecret()" style="margin-bottom: 18px;">
-              <svg class="svg-icon-sm" viewBox="0 0 24 24">
-                <path d="M12 22s8-4 8-10V5l-8-3-8 3v7c0 6 8 10 8 10z"/>
-              </svg>
-              <span>绑定密钥至出口代理边界</span>
-            </button>
-
-            <div class="table-wrap">
-              <table>
-                <thead>
-                  <tr><th>占位符</th><th>脱敏预览</th><th>白名单域名与路径前缀</th></tr>
-                </thead>
-                <tbody id="secrets-tbody"></tbody>
-              </table>
-            </div>
-          </div>
-
-          <div class="card">
-            <div class="card-header">
-              <div>
-                <div class="card-title">
-                  <svg class="svg-icon" viewBox="0 0 24 24" style="color:#60a5fa;">
-                    <circle cx="12" cy="12" r="10"/>
-                    <polyline points="12 6 12 12 16 14"/>
-                  </svg>
-                  <span>生效中的会话租约 (Active Session Leases)</span>
-                </div>
-                <div class="card-subtitle">通过审批签发的临时通行证 (<code>LeaseGrant</code>)，到期自动失效</div>
-              </div>
-            </div>
-            <div class="table-wrap">
-              <table>
-                <thead>
-                  <tr><th>Lease ID</th><th>授权主体 (Principal)</th><th>允许动作 (Scope)</th><th>有效期状态</th></tr>
-                </thead>
-                <tbody id="leases-tbody"></tbody>
-              </table>
-            </div>
-          </div>
-        </div>
-      </section>
-
-      <!-- ================================================================ -->
-      <!-- VIEW 4: CONNECT AGENT & TENANT API KEYS                          -->
-      <!-- ================================================================ -->
-      <section class="view-section" id="view-connect">
-        <div class="split-2">
-          <div class="card">
-            <div class="card-header">
-              <div>
-                <div class="card-title">
-                  <svg class="svg-icon" viewBox="0 0 24 24" style="color:#60a5fa;">
-                    <path d="M21 2l-2 2m-7.61 7.61a5.5 5.5 0 1 1-7.778 7.778 5.5 5.5 0 0 1 7.777-7.777zm0 0L15.5 7.5m0 0l3 3L22 7l-3-3m-3.5 3.5L19 4"/>
-                  </svg>
-                  <span>签发多租户 API Key (<code>ak_live_*</code>)</span>
-                </div>
-                <div class="card-subtitle">每个 API Key 绑定唯一租户组织、Agent 身份与可选云端工作区，防止请求头伪造</div>
-              </div>
-            </div>
-            <div class="form-grid">
-              <div class="field">
-                <label>租户组织 (Org ID)</label>
-                <input id="key-org" value="aegis-os" />
-              </div>
-              <div class="field">
-                <label>绑定 Agent 身份 (Agent ID)</label>
-                <input id="key-agent" value="cloud-coder-1" />
-              </div>
-              <div class="field">
-                <label>绑定工作区 (Workspace ID, 可选)</label>
-                <input id="key-ws" value="ws-core" />
-              </div>
-              <div class="field">
-                <label>用途备注 (Label)</label>
-                <input id="key-label" value="Production Agent Swarm" />
-              </div>
-            </div>
-            <button class="btn btn-primary" onclick="mintApiKey()">
-              <svg class="svg-icon-sm" viewBox="0 0 24 24">
-                <line x1="12" y1="5" x2="12" y2="19"/>
-                <line x1="5" y1="12" x2="19" y2="12"/>
-              </svg>
-              <span>生成 Scoped API Key</span>
-            </button>
-
-            <div id="minted-key-banner" style="display:none; margin-top:14px; padding:12px 14px; background:var(--emerald-bg); border:1px solid rgba(16,185,129,0.4); border-radius:var(--radius-md); font-size:12.5px;"></div>
-
-            <div class="table-wrap" style="margin-top: 18px;">
-              <table>
-                <thead>
-                  <tr><th>Key ID / 前缀</th><th>绑定身份 (Org/Agent)</th><th>工作区</th><th>备注</th></tr>
-                </thead>
-                <tbody id="keys-tbody"></tbody>
-              </table>
-            </div>
-          </div>
-
-          <div class="card">
-            <div class="card-header">
-              <div>
-                <div class="card-title">
-                  <svg class="svg-icon" viewBox="0 0 24 24" style="color:#34d399;">
-                    <polyline points="16 18 22 12 16 6"/>
-                    <polyline points="8 6 2 12 8 18"/>
-                  </svg>
-                  <span>30 秒接入指南 (Quick Connect Snippets)</span>
-                </div>
-                <div class="card-subtitle">签发 API Key 后，直接复制以下配置到 Claude / OpenAI / LangGraph 或终端即可调用</div>
-              </div>
-            </div>
-            <div style="margin-bottom: 12px; font-size: 12px; font-weight: 600; color: var(--text-secondary);">
-              1. Claude / OpenAI / Cursor Remote MCP 配置 (<code>mcp_config.json</code>)
-            </div>
-            <pre class="code-block" id="snippet-mcp"></pre>
-
-            <div style="margin: 16px 0 10px; font-size: 12px; font-weight: 600; color: var(--text-secondary);">
-              2. 直接通过 HTTP 调用沙箱工具或委派 Google A2A 任务 (<code>curl</code>)
-            </div>
-            <pre class="code-block" id="snippet-curl"></pre>
-          </div>
-        </div>
-      </section>
-    </main>
   </div>
 
-  <!-- PR Patch Inspector Modal -->
-  <div class="modal-backdrop" id="pr-modal" onclick="if(event.target===this) closePrModal()">
-    <div class="modal">
-      <div class="modal-header">
-        <div>
-          <strong style="font-size:14px;" id="modal-title">Git Branch &amp; Pull Request Patch</strong>
-          <div style="font-size:11px; color:var(--text-muted);" id="modal-sub"></div>
-        </div>
-        <button class="btn btn-ghost" onclick="closePrModal()">
-          <svg class="svg-icon-sm" viewBox="0 0 24 24">
-            <line x1="18" y1="6" x2="6" y2="18"/>
-            <line x1="6" y1="6" x2="18" y2="18"/>
-          </svg>
-          <span>关闭</span>
-        </button>
+  <!-- 1. Pending Boundary Approvals -->
+  <div class="section">
+    <div class="section-head">
+      <div class="section-title">
+        <span>1. 待处理边界审批 (Pending Approvals)</span>
+        <span class="pill amber" id="pending-pill">0</span>
       </div>
-      <div class="modal-body">
-        <pre class="code-block" id="modal-patch" style="max-height: 55vh;"></pre>
+      <span style="font-size:11.5px; color:var(--muted);">绿区沙箱内读写与测试 100% 静默放行；仅落盘提交或未知外网在此审批</span>
+    </div>
+    <div id="approvals-box"></div>
+    <div id="diff-drawer">
+      <div style="display:flex; justify-content:space-between; align-items:center; margin-bottom:6px;">
+        <strong style="font-size:12px;" id="diff-title">源码 Diff 预览</strong>
+        <button class="btn" onclick="document.getElementById('diff-drawer').style.display='none'">收起</button>
+      </div>
+      <pre class="code mono" id="diff-content"></pre>
+    </div>
+  </div>
+
+  <!-- 2. Cloud CoW Workspaces & Scale-to-Zero -->
+  <div class="section">
+    <div class="section-head">
+      <div class="section-title">2. 云端 CoW 工作区 (Workspaces &amp; Scale-to-Zero)</div>
+      <div class="inline-form" style="margin-bottom:0;">
+        <input id="ws-org" value="aegis-os" placeholder="org_id" style="width:110px;" />
+        <input id="ws-id" value="ws-core" placeholder="workspace_id" style="width:110px;" />
+        <input id="ws-src" value="." placeholder="Git URL or path" style="width:170px;" />
+        <input id="ws-agents" value="coder-alpha,reviewer-beta" placeholder="agents" style="width:180px;" />
+        <button class="btn btn-primary" onclick="provisionWorkspace()">+ 创建云工作区</button>
       </div>
     </div>
+    <table>
+      <thead>
+        <tr><th>组织 / 工作区</th><th>状态 (Scale-to-Zero)</th><th>CoW Agent 分支</th><th>操作</th></tr>
+      </thead>
+      <tbody id="ws-tbody"></tbody>
+    </table>
+  </div>
+
+  <!-- 3. API Keys & One-Line CLI Onboarding -->
+  <div class="section">
+    <div class="section-head">
+      <div class="section-title">3. 开发者 CLI 一键上云 &amp; API Keys</div>
+      <div class="inline-form" style="margin-bottom:0;">
+        <input id="k-org" value="aegis-os" placeholder="org_id" style="width:110px;" />
+        <input id="k-agent" value="agy-agent" placeholder="agent_id" style="width:110px;" />
+        <input id="k-ws" value="ws-core" placeholder="workspace_id" style="width:110px;" />
+        <button class="btn btn-primary" onclick="mintKey()">+ 签发 API Key</button>
+      </div>
+    </div>
+    <pre class="code mono" id="cli-snippet" style="margin-bottom:10px;"></pre>
+    <table>
+      <thead>
+        <tr><th>Key 前缀</th><th>绑定身份</th><th>绑定工作区</th><th>生效租约数</th></tr>
+      </thead>
+      <tbody id="keys-tbody"></tbody>
+    </table>
   </div>
 
   <div id="toast"></div>
 
   <script>
-    const SVG_ICONS = {
-      check: '<svg class="svg-icon-sm" viewBox="0 0 24 24"><polyline points="20 6 9 17 4 12"/></svg>',
-      clock: '<svg class="svg-icon-sm" viewBox="0 0 24 24"><circle cx="12" cy="12" r="10"/><polyline points="12 6 12 12 16 14"/></svg>',
-      shield: '<svg class="svg-icon-sm" viewBox="0 0 24 24"><path d="M12 22s8-4 8-10V5l-8-3-8 3v7c0 6 8 10 8 10z"/><path d="M9 12l2 2 4-4"/></svg>',
-      close: '<svg class="svg-icon-sm" viewBox="0 0 24 24"><line x1="18" y1="6" x2="6" y2="18"/><line x1="6" y1="6" x2="18" y2="18"/></svg>',
-      gitPr: '<svg class="svg-icon-sm" viewBox="0 0 24 24"><circle cx="18" cy="18" r="3"/><circle cx="6" cy="6" r="3"/><path d="M13 6h3a2 2 0 0 1 2 2v7"/><line x1="6" y1="9" x2="6" y2="21"/></svg>',
-      emptyShield: '<svg class="svg-icon-lg" viewBox="0 0 24 24" style="color:#34d399;"><path d="M12 22s8-4 8-10V5l-8-3-8 3v7c0 6 8 10 8 10z"/><path d="M9 12l2 2 4-4"/></svg>'
-    };
+    let latestKey = 'ak_live_...';
+    let lastSig = '';
 
-    let currentView = 'overview';
-    let lastSignature = '';
-    let latestMintedKey = 'ak_live_replace_with_your_key';
-
-    function switchView(view) {
-      currentView = view;
-      ['overview', 'workspaces', 'security', 'connect'].forEach(v => {
-        document.getElementById(`view-${v}`).classList.toggle('active', v === view);
-        document.getElementById(`nav-${v}`).classList.toggle('active', v === view);
-      });
-      const titles = {
-        overview: '审批与实时协作总览 (Approvals & Live Radar)',
-        workspaces: 'CoW 影子工作区与 Git-to-PR 流水线 (Workspaces & PRs)',
-        security: '零信任边界密钥金库与活跃租约 (Secret Vault & Leases)',
-        connect: '接入外部 Agent 与多租户 API Key (Connect & API Keys)'
-      };
-      document.getElementById('topbar-heading').textContent = titles[view] || '';
-      updateSnippets();
-    }
-
-    function showToast(msg, iconKey = 'check') {
+    function toast(msg) {
       const el = document.getElementById('toast');
-      el.innerHTML = `${SVG_ICONS[iconKey] || SVG_ICONS.check}<span>${msg}</span>`;
-      el.style.display = 'inline-flex';
-      clearTimeout(window.__toastTimer);
-      window.__toastTimer = setTimeout(() => { el.style.display = 'none'; }, 4200);
+      el.textContent = msg;
+      el.style.display = 'block';
+      clearTimeout(window.__t);
+      window.__t = setTimeout(() => { el.style.display = 'none'; }, 3500);
     }
 
-    function updateSnippets() {
+    function updateCliSnippet() {
       const origin = window.location.origin;
-      document.getElementById('snippet-mcp').textContent = JSON.stringify({
-        mcpServers: {
-          "aegis-cloud": {
-            url: `${origin}/v1/mcp`,
-            headers: {
-              Authorization: `Bearer ${latestMintedKey}`
-            }
-          }
-        }
-      }, null, 2);
+      document.getElementById('cli-snippet').textContent =
+`# [CLI-First] 1. 在任意本地项目目录一键绑定云端沙箱 (0% 本地 CPU/内存占用):
+aegis-os cloud up --endpoint ${origin} --api-key ${latestKey}
 
-      document.getElementById('snippet-curl').textContent =
-`# 调用云端 CoW 沙箱执行 cargo test (0 弹窗)
-curl -X POST ${origin}/v1/mcp \\
-  -H "Authorization: Bearer ${latestMintedKey}" \\
-  -H "Content-Type: application/json" \\
-  -d '{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"workspace_status","arguments":{}}}'
+# [CLI-First] 2. 终端内直接查看云端 CoW 源码 Diff / 处理 HITL 审批 / 拉回改动 / 导出 PR:
+aegis-os cloud diff
+aegis-os cloud approvals && aegis-os cloud approve <escalation_id>
+aegis-os cloud pull
+aegis-os cloud pr
 
-# 查询 Google A2A AgentCard 拓扑
-curl ${origin}/.well-known/agent.json`;
+# [CLI-First] 3. 一键解绑切回本地免费模式 (云端工作区自动进入 Scale-to-Zero 休眠):
+aegis-os cloud down`;
+    }
+
+    async function changePlan(plan) {
+      await fetch('/v1/tenants/plan', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ org_id: 'aegis-os', plan_tier: plan })
+      });
+      toast(`已切换套餐至 ${plan.toUpperCase()}`);
+      refresh(true);
     }
 
     async function simulateEscalation() {
@@ -1504,49 +1755,35 @@ curl ${origin}/.well-known/agent.json`;
           org_id: 'aegis-os',
           agent_id: 'coder-alpha',
           action: 'workspace_commit',
-          files: ['src/payment_engine.rs', 'tests/idempotency_test.rs']
+          files: ['src/lib.rs']
         })
       });
-      const data = await res.json();
-      switchView('overview');
-      showToast(`已生成测试审批单 ${data.escalation_id} — 请在下方队列点击按钮体验审批`, 'shield');
-      refreshDashboard(true);
+      const d = await res.json();
+      toast(`已生成测试审批单 ${d.escalation_id}`);
+      refresh(true);
     }
 
-    async function decideApproval(escalationId, decision, ttlSecs) {
-      const res = await fetch('/v1/approvals/decide', {
+    async function decide(id, decision, ttl) {
+      await fetch('/v1/approvals/decide', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ escalation_id: escalationId, decision, ttl_secs: ttlSecs })
+        body: JSON.stringify({ escalation_id: id, decision, ttl_secs: ttl })
       });
-      const data = await res.json();
-      if (decision === 'approve') {
-        const label = ttlSecs <= 0 ? '单次放行 (One-Shot)' : `${ttlSecs / 60} 分钟会话租约`;
-        showToast(`已批准 ${escalationId} -> 签发 ${label} (${data.lease?.lease_id || ''})`, 'check');
-      } else {
-        showToast(`已拒绝越界请求 ${escalationId}`, 'close');
-      }
-      refreshDashboard(true);
+      toast(decision === 'approve' ? `已批准 ${id}` : `已拒绝 ${id}`);
+      refresh(true);
     }
 
-    async function mintApiKey() {
-      const org_id = document.getElementById('key-org').value.trim() || 'aegis-os';
-      const agent_id = document.getElementById('key-agent').value.trim() || 'cloud-coder-1';
-      const workspace_id = document.getElementById('key-ws').value.trim() || null;
-      const label = document.getElementById('key-label').value.trim() || 'PaaS Client Key';
-      const res = await fetch('/v1/tenants/keys', {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ org_id, agent_id, workspace_id, label })
-      });
-      const data = await res.json();
-      latestMintedKey = data.api_key;
-      const banner = document.getElementById('minted-key-banner');
-      banner.style.display = 'block';
-      banner.innerHTML = `<div style="display:flex;align-items:center;gap:6px;margin-bottom:4px;">${SVG_ICONS.check}<strong>已生成 API Key（请立即复制保存，右侧接入代码已自动填入该 Key）：</strong></div><code class="mono" style="font-size:13px; color:#fff; user-select:all;">${data.api_key}</code>`;
-      updateSnippets();
-      showToast(`已为 ${org_id}/${agent_id} 签发 API Key`, 'check');
-      refreshDashboard(true);
+    async function inspectDiff(orgId, agentId, wsId) {
+      const q = new URLSearchParams({ org_id: orgId, agent_id: agentId });
+      if (wsId) q.set('workspace_id', wsId);
+      const res = await fetch(`/v1/workspaces/diff?${q.toString()}`);
+      const d = await res.json();
+      document.getElementById('diff-title').textContent = `源码 Diff (${orgId}/${agentId} · ${d.changes_count || 0} 文件变更)`;
+      document.getElementById('diff-content').textContent =
+        (d.unified_diff && d.unified_diff.trim())
+          ? d.unified_diff
+          : JSON.stringify(d.changes || d, null, 2);
+      document.getElementById('diff-drawer').style.display = 'block';
     }
 
     async function provisionWorkspace() {
@@ -1559,246 +1796,167 @@ curl ${origin}/.well-known/agent.json`;
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ org_id, workspace_id, source_url, agents })
       });
-      const data = await res.json();
-      showToast(`工作区 ${data.workspace?.workspace_id || workspace_id} 创建成功（已挂载 ${agents.length} 个 CoW 分支）`, 'check');
-      refreshDashboard(true);
+      const d = await res.json();
+      if (d.error) { toast(`错误: ${d.error}`); return; }
+      toast(`已分叉云端 CoW 工作区 ${workspace_id}`);
+      refresh(true);
     }
 
-    async function exportWorkspacePr(orgId, wsId, agentId) {
+    async function toggleHibernate(orgId, wsId, currentStatus) {
+      const route = currentStatus === 'hibernated' ? '/v1/workspaces/wake' : '/v1/workspaces/hibernate';
+      const res = await fetch(route, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ org_id: orgId, workspace_id: wsId })
+      });
+      const d = await res.json();
+      toast(currentStatus === 'hibernated'
+        ? `工作区已瞬时唤醒 (${d.wake_latency_ms || 0}ms)`
+        : `工作区已进入 Scale-to-Zero 休眠 (0 内存占用)`);
+      refresh(true);
+    }
+
+    async function exportPr(orgId, wsId, agentId) {
       const res = await fetch('/v1/workspaces/pr', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({
-          org_id: orgId,
-          workspace_id: wsId,
-          agent_id: agentId,
-          branch_name: `aegis/${agentId}/${wsId}`,
-          commit_title: `feat(${wsId}): automated 4-tier CoW merge from ${agentId}`
-        })
+        body: JSON.stringify({ org_id: orgId, workspace_id: wsId, agent_id: agentId })
       });
-      const data = await res.json();
-      document.getElementById('modal-title').textContent = `PR Branch: ${data.git_branch || 'aegis/main'}`;
-      document.getElementById('modal-sub').textContent = `Commit SHA: ${data.git_commit_sha || 'HEAD'} · Agent: ${orgId}/${agentId}`;
-      document.getElementById('modal-patch').textContent =
-        (data.unified_patch && data.unified_patch.trim())
-          ? data.unified_patch
-          : JSON.stringify(data.github_pr_payload || data, null, 2);
-      document.getElementById('pr-modal').style.display = 'flex';
-      refreshDashboard(true);
+      const d = await res.json();
+      document.getElementById('diff-title').textContent = `Git PR 补丁导出 (${d.git_branch || ''} @ ${d.git_commit_sha || ''})`;
+      document.getElementById('diff-content').textContent =
+        (d.unified_patch && d.unified_patch.trim())
+          ? d.unified_patch
+          : JSON.stringify(d.github_pr_payload || d, null, 2);
+      document.getElementById('diff-drawer').style.display = 'block';
+      refresh(true);
     }
 
-    function closePrModal() {
-      document.getElementById('pr-modal').style.display = 'none';
-    }
-
-    async function registerSecret() {
-      const org_id = document.getElementById('sec-org').value.trim() || 'aegis-os';
-      const placeholder = document.getElementById('sec-name').value.trim() || '$AOS_SECRET_GITHUB';
-      const value = document.getElementById('sec-val').value || 'ghp_live_secret_token_demo';
-      const allowed_domains = document.getElementById('sec-dom').value.split(',').map(s => s.trim()).filter(Boolean);
-      const pathPrefix = document.getElementById('sec-path').value.trim();
-      const allowed_path_prefixes = pathPrefix ? [pathPrefix] : [];
-      await fetch('/v1/vault/secrets', {
+    async function mintKey() {
+      const org_id = document.getElementById('k-org').value.trim() || 'aegis-os';
+      const agent_id = document.getElementById('k-agent').value.trim() || 'agy-agent';
+      const workspace_id = document.getElementById('k-ws').value.trim() || null;
+      const res = await fetch('/v1/tenants/keys', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ org_id, placeholder, value, allowed_domains, allowed_path_prefixes })
+        body: JSON.stringify({ org_id, agent_id, workspace_id, label: 'CLI Cloud Key' })
       });
-      document.getElementById('sec-val').value = '';
-      showToast(`已绑定 ${placeholder} 至域名 ${allowed_domains.join(', ')}`, 'shield');
-      refreshDashboard(true);
+      const d = await res.json();
+      latestKey = d.api_key;
+      updateCliSnippet();
+      toast(`已签发 Key: ${d.api_key}`);
+      refresh(true);
     }
 
-    function formatRemainingLease(expiresAtMs) {
-      if (expiresAtMs === -1) return '单次有效 (One-Shot)';
-      const diffSec = Math.max(0, Math.floor((expiresAtMs - Date.now()) / 1000));
-      const mins = Math.floor(diffSec / 60);
-      const secs = diffSec % 60;
-      return `剩余 ${mins}分${secs}秒`;
-    }
-
-    async function refreshDashboard(force) {
+    async function refresh(force) {
       try {
         const res = await fetch('/api/status?org_id=*');
         const data = await res.json();
         const sig = JSON.stringify(data);
-        if (!force && sig === lastSignature) return;
-        lastSignature = sig;
+        if (!force && sig === lastSig) return;
+        lastSig = sig;
 
         const pending = (data.pending_escalations || []).filter(e => e.status === 'pending');
-        const leases = data.active_leases || [];
-        const onlinePeers = (data.global_peers || []).filter(p => p.online);
         const workspaces = data.workspaces || [];
-        const tasks = data.a2a_tasks || [];
-        const secrets = data.secrets || [];
+        const leases = data.active_leases || [];
         const keys = data.api_keys || [];
+        const tenants = data.tenants || [];
 
-        // Sidebar & KPI counters
-        document.getElementById('nav-badge-pending').textContent = pending.length;
-        document.getElementById('nav-badge-ws').textContent = workspaces.length;
-        document.getElementById('nav-badge-sec').textContent = secrets.length + leases.length;
-        document.getElementById('nav-badge-keys').textContent = keys.length;
+        const activeWs = workspaces.filter(w => w.status !== 'hibernated').length;
+        const hibWs = workspaces.filter(w => w.status === 'hibernated').length;
 
-        document.getElementById('kpi-pending').textContent = pending.length;
-        document.getElementById('kpi-leases').textContent = leases.length;
-        document.getElementById('kpi-peers').textContent = onlinePeers.length;
-        document.getElementById('kpi-ws-tasks').textContent = `${workspaces.length} / ${tasks.length}`;
-        document.getElementById('pending-count-pill').textContent = `${pending.length} 待审批`;
+        let totalCalls = 0, totalMs = 0, savedBytes = 0;
+        tenants.forEach(t => {
+          totalCalls += (t.total_syscalls || 0);
+          totalMs += (t.sandbox_exec_ms || 0);
+          savedBytes += (t.cow_saved_bytes || 0);
+        });
+        if (tenants[0]) {
+          const tier = (tenants[0].plan_tier || 'pro').toUpperCase();
+          document.getElementById('plan-badge').textContent = `${tier} Plan · Max ${tenants[0].max_concurrent_agents} Agents`;
+        }
 
-        // 1. Render Pending HITL Approvals
-        const appContainer = document.getElementById('approvals-container');
+        document.getElementById('st-pending').textContent = pending.length;
+        document.getElementById('st-ws').textContent = `${activeWs} / ${hibWs}`;
+        document.getElementById('st-usage').textContent = `${totalCalls} calls · ${totalMs}ms`;
+        document.getElementById('st-saved').textContent = `${(savedBytes / 1024).toFixed(1)} KB`;
+        document.getElementById('pending-pill').textContent = pending.length;
+
+        const appBox = document.getElementById('approvals-box');
         if (pending.length === 0) {
-          appContainer.innerHTML = `
-            <div class="empty-state">
-              ${SVG_ICONS.emptyShield}
-              <strong>当前没有阻塞中的越界请求</strong>
-              <div>所有沙箱内的文件读写、编译测试与同组织 A2A 通信均已由策略引擎自动放行。</div>
-              <div>想要测试审批流？点击右上角 <a href="javascript:void(0)" onclick="simulateEscalation()" style="color:#60a5fa;">「模拟 Agent 越界审批请求」</a> 即可体验一键批租约。</div>
-            </div>`;
+          appBox.innerHTML = `<div class="empty">当前无待审批请求（所有沙箱内操作均已自动放行）。</div>`;
         } else {
-          appContainer.innerHTML = pending.map(e => `
-            <div class="approval-item">
-              <div style="min-width:0; flex:1;">
-                <div class="approval-meta">
-                  <span class="badge badge-amber">待审批 · ${e.action}</span>
-                  <code class="mono">${e.escalation_id}</code>
-                  <span style="font-size:13px; font-weight:600; color:var(--text-primary);">
-                    Principal: <code>${e.org_id}/${e.agent_id}</code>
-                  </span>
+          appBox.innerHTML = pending.map(e => `
+            <div class="approval-row">
+              <div>
+                <div>
+                  <span class="pill amber">${e.action}</span>
+                  <code class="mono" style="margin-left:6px;">${e.org_id}/${e.agent_id}</code>
+                  <code class="mono" style="color:var(--muted); margin-left:6px;">(${e.escalation_id})</code>
                 </div>
-                <div class="approval-reason mono">${e.reason}</div>
+                <div class="mono" style="font-size:12px; color:var(--muted); margin-top:4px;">${e.reason}</div>
               </div>
-              <div class="approval-actions">
-                <button class="btn btn-success" onclick="decideApproval('${e.escalation_id}', 'approve', 0)">
-                  ${SVG_ICONS.check}<span>仅批准本次 (ttl=0)</span>
-                </button>
-                <button class="btn btn-primary" onclick="decideApproval('${e.escalation_id}', 'approve', 900)">
-                  ${SVG_ICONS.clock}<span>授权 15 分钟租约</span>
-                </button>
-                <button class="btn btn-primary" onclick="decideApproval('${e.escalation_id}', 'approve', 3600)">
-                  ${SVG_ICONS.shield}<span>授权 1 小时租约</span>
-                </button>
-                <button class="btn btn-danger" onclick="decideApproval('${e.escalation_id}', 'deny', 0)">
-                  ${SVG_ICONS.close}<span>拒绝</span>
-                </button>
+              <div class="actions">
+                <button class="btn" onclick="inspectDiff('${e.org_id}', '${e.agent_id}', '')">查看 Diff</button>
+                <button class="btn btn-success" onclick="decide('${e.escalation_id}', 'approve', 0)">批准 1 次</button>
+                <button class="btn btn-primary" onclick="decide('${e.escalation_id}', 'approve', 3600)">1h 租约</button>
+                <button class="btn btn-danger" onclick="decide('${e.escalation_id}', 'deny', 0)">拒绝</button>
               </div>
             </div>
           `).join('');
         }
 
-        // 2. Render Online Peers
-        document.getElementById('peers-tbody').innerHTML = onlinePeers.length === 0
-          ? `<tr><td colspan="3" style="color:var(--text-muted); text-align:center; padding:22px;">暂无在线 Agent</td></tr>`
-          : onlinePeers.map(p => `
-              <tr>
-                <td>
-                  <div style="font-weight:600; color:var(--text-primary);">${p.org_id}/${p.agent_id}</div>
-                  <div style="font-size:11px; color:var(--text-muted);">${p.workspace_root || 'CoW Shadow Workspace'}</div>
-                </td>
-                <td>
-                  <span class="badge badge-green">ONLINE</span>
-                  <span style="font-size:12px; margin-left:4px;">${p.client || p.role}</span>
-                </td>
-                <td>
-                  ${(p.skills || []).map(s => `<span class="badge badge-blue" style="margin:2px;">${s.id}</span>`).join('') || `<span style="color:var(--text-muted);">${p.summary || 'No active file claims'}</span>`}
-                </td>
-              </tr>
-            `).join('');
-
-        // 3. Render A2A Tasks
-        document.getElementById('tasks-tbody').innerHTML = tasks.length === 0
-          ? `<tr><td colspan="3" style="color:var(--text-muted); text-align:center; padding:22px;">暂无 A2A 委派任务</td></tr>`
-          : tasks.slice(0, 12).map(t => {
-              const badgeCls = t.state === 'completed' ? 'badge-green' : (t.state === 'input-required' ? 'badge-amber' : 'badge-purple');
+        document.getElementById('ws-tbody').innerHTML = workspaces.length === 0
+          ? `<tr><td colspan="4" class="empty">暂无云工作区</td></tr>`
+          : workspaces.map(w => {
+              const isHib = w.status === 'hibernated';
+              const firstAgent = (w.agents && w.agents[0]) || 'cloud-coder-1';
               return `
                 <tr>
-                  <td><code class="mono">${t.id}</code></td>
-                  <td><span class="badge ${badgeCls}">${t.state}</span></td>
-                  <td>
-                    <div style="color:var(--text-primary); font-weight:500;">${t.subject}</div>
-                    <div style="font-size:11px; color:var(--text-muted);">${t.from_agent} &rarr; ${t.to_agent}</div>
+                  <td><strong>${w.org_id}/${w.workspace_id}</strong> <code class="mono" style="color:var(--muted);">(${w.branch})</code></td>
+                  <td><span class="pill ${isHib ? 'muted' : 'green'}">${isHib ? 'HIBERNATED (0 RAM)' : 'ACTIVE'}</span></td>
+                  <td>${(w.agents || []).map(a => `<code class="mono" style="margin-right:6px;">${a}</code>`).join('')}</td>
+                  <td class="actions">
+                    <button class="btn" onclick="inspectDiff('${w.org_id}', '${firstAgent}', '${w.workspace_id}')">Diff</button>
+                    <button class="btn" onclick="toggleHibernate('${w.org_id}', '${w.workspace_id}', '${w.status || 'active'}')">${isHib ? '唤醒 (Wake)' : '休眠 (Scale-to-0)'}</button>
+                    <button class="btn btn-primary" onclick="exportPr('${w.org_id}', '${w.workspace_id}', '${firstAgent}')">导出 PR</button>
                   </td>
                 </tr>`;
             }).join('');
 
-        // 4. Render Cloud Workspaces
-        document.getElementById('workspaces-tbody').innerHTML = workspaces.length === 0
-          ? `<tr><td colspan="4" style="color:var(--text-muted); text-align:center; padding:24px;">尚未创建云端工作区 — 在上方填写表单即可一键分叉 CoW 仓库</td></tr>`
-          : workspaces.map(w => `
-              <tr>
-                <td>
-                  <strong style="color:var(--text-primary);">${w.org_id} / ${w.workspace_id}</strong>
-                </td>
-                <td><code class="mono">${w.source_url}</code> <span class="badge badge-blue">${w.branch}</span></td>
-                <td>${(w.agents || []).map(a => `<span class="badge badge-purple" style="margin-right:4px;">${a}</span>`).join('')}</td>
-                <td>
-                  <button class="btn btn-primary" onclick="exportWorkspacePr('${w.org_id}', '${w.workspace_id}', '${(w.agents && w.agents[0]) || 'cloud-coder-1'}')">
-                    ${SVG_ICONS.gitPr}<span>合并并导出 Git PR 补丁</span>
-                  </button>
-                </td>
-              </tr>
-            `).join('');
-
-        // 5. Render Secrets
-        document.getElementById('secrets-tbody').innerHTML = secrets.length === 0
-          ? `<tr><td colspan="3" style="color:var(--text-muted); text-align:center; padding:20px;">暂未绑定边界密钥</td></tr>`
-          : secrets.map(s => `
-              <tr>
-                <td><code class="mono" style="color:#34d399;">${s.placeholder}</code></td>
-                <td><code class="mono">${s.value_redacted}</code></td>
-                <td>
-                  ${(s.allowed_domains || []).map(d => `<span class="badge badge-blue">${d}</span>`).join(' ')}
-                  ${(s.allowed_path_prefixes || []).map(p => `<code class="mono" style="margin-left:4px;">${p}*</code>`).join(' ')}
-                </td>
-              </tr>
-            `).join('');
-
-        // 6. Render Active Leases
-        document.getElementById('leases-tbody').innerHTML = leases.length === 0
-          ? `<tr><td colspan="4" style="color:var(--text-muted); text-align:center; padding:20px;">暂无生效中的会话租约</td></tr>`
-          : leases.map(l => `
-              <tr>
-                <td><code class="mono">${l.lease_id}</code></td>
-                <td><strong>${l.org_id}/${l.agent_id}</strong></td>
-                <td><code class="mono">${l.action_pattern}</code></td>
-                <td><span class="badge badge-green">${formatRemainingLease(l.expires_at_ms)}</span></td>
-              </tr>
-            `).join('');
-
-        // 7. Render API Keys
         document.getElementById('keys-tbody').innerHTML = keys.length === 0
-          ? `<tr><td colspan="4" style="color:var(--text-muted); text-align:center; padding:20px;">暂未签发租户 API Key</td></tr>`
+          ? `<tr><td colspan="4" class="empty">暂未签发 API Key</td></tr>`
           : keys.map(k => `
               <tr>
                 <td><code class="mono">${k.key_prefix}</code></td>
-                <td><strong>${k.org_id}/${k.agent_id}</strong></td>
+                <td><code class="mono">${k.org_id}/${k.agent_id}</code></td>
                 <td><code class="mono">${k.workspace_id || '*'}</code></td>
-                <td>${k.label}</td>
+                <td><span class="pill green">${leases.length} active</span></td>
               </tr>
             `).join('');
-      } catch (err) {
-        console.error('Dashboard poll error:', err);
+      } catch (e) {
+        console.error(e);
       }
     }
 
-    updateSnippets();
-    refreshDashboard(true);
-    setInterval(() => refreshDashboard(false), 2000);
+    updateCliSnippet();
+    refresh(true);
+    setInterval(() => refresh(false), 2000);
   </script>
 </body>
 </html>
-"#;
+"##;
 
 /// Serves the Mission Control HTML, hot-reloading from `crates/aos-mcp-gateway/src/paas.rs` if present on disk.
 pub fn render_dashboard_html(workspace_root: &Path) -> String {
     let live_paas_rs = workspace_root.join("crates/aos-mcp-gateway/src/paas.rs");
     if let Ok(raw) = std::fs::read_to_string(&live_paas_rs) {
-        if let Some(start_idx) = raw.find("pub const DASHBOARD_HTML: &str = r#\"") {
-            let html_start = start_idx + "pub const DASHBOARD_HTML: &str = r#\"".len();
-            if let Some(end_rel) = raw[html_start..].find("\"#;") {
+        if let Some(start_idx) = raw.find("pub const DASHBOARD_HTML: &str = r##\"") {
+            let html_start = start_idx + "pub const DASHBOARD_HTML: &str = r##\"".len();
+            if let Some(end_rel) = raw[html_start..].find("\"##;") {
                 return raw[html_start..html_start + end_rel].to_string();
             }
         }
     }
     DASHBOARD_HTML.to_string()
 }
-

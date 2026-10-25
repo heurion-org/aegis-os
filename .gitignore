@@ -1,5 +1,6 @@
 # Rust build artifacts
 /target/
+/dist/
 
 # LaTeX build intermediates
 paper/*.aux
