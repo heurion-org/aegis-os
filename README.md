@@ -97,45 +97,99 @@ Autonomous coding agents such as **Google Antigravity (`agy`)**, **Anthropic Cla
 | **Google A2A Protocol** (`aos-ipc`, 4 tools + HTTP) | `ipc_update_card`, `ipc_task_update`, `ipc_task_get`, `ipc_task_list` + `GET /.well-known/agent.json`, `POST /a2a`, `POST /v1/a2a` | **Auto-Allow Discovery & Task Lifecycle**: Dynamic `AgentCard` & stateful `A2ATask` RPC |
 | **Org CAS & KV** (`aos-vfs`, 4 tools) | `org_artifact_publish`, `org_artifact_fetch`, `org_kv_put`, `org_kv_get` | **Auto-Allow Intra-Org**: Cross-org `artifact://` `FilePart` fetch gated by Rule R1 |
 | **Zero-Trust Egress** (`aos-egress`, 1 tool) | `egress_http_request` + Pinned TCP Proxy (`127.0.0.1:<port>`) | **Allowlisted Domains + Path Prefixes Auto-Allow**: Injects `$AOS_SECRET_*` at boundary; blocks exfil (`403`) |
-| **Policy & Leases** (`aos-policy`, 3 tools) | `policy_list_escalations`, `policy_approve_escalation`, `policy_grant_lease` | Operator control plane for one-shot (`ttl=0`) or TTL-scoped session leases |
-| **Cloud PaaS Control Plane** (`aos-mcp-gateway`) | `GET /dashboard`, `GET /api/status`, `POST /v1/workspaces`, `POST /v1/workspaces/pr`, `POST /v1/tenants/keys`, `POST /v1/vault/secrets`, `POST /v1/approvals/decide`, `POST /v1/approvals/simulate` | Multi-tenant cloud workspace provisioning, Git-to-PR export, `ak_live_*` auth, and Web HITL console |
+| **Policy, Leases & Mode Switch** (`aos-policy` + `aos-cli`, 4 tools) | `policy_list_escalations`, `policy_approve_escalation`, `policy_grant_lease`, `runtime_configure_mode` | Operator control plane for one-shot (`ttl=0`) or TTL-scoped session leases, plus live agent-driven switching between Local Community Mode and Cloud Sandbox Mode |
+| **Cloud PaaS Control Plane** (`aos-mcp-gateway`) | `GET /dashboard`, `GET /api/status`, `POST /v1/workspaces`, `POST /v1/workspaces/sync-up`, `POST /v1/workspaces/diff`, `POST /v1/workspaces/hibernate`, `POST /v1/workspaces/wake`, `POST /v1/workspaces/pr`, `POST /v1/tenants/plan`, `POST /v1/tenants/keys`, `POST /v1/vault/secrets`, `POST /v1/approvals/decide` | Multi-tenant cloud workspace provisioning, Scale-to-Zero hibernation (`<10ms` wake), source-only sync, Git-to-PR export, `ak_live_*` auth, and minimalist developer console |
 | **Dynamic MCP URIs** (7 resources) | `aegis://workspace/status`, `aegis://ipc/inbox`, `aegis://org/peers`, `aegis://global/peers`, `aegis://a2a/agent-cards`, `aegis://a2a/tasks`, `aegis://org/shared/catalog` | Live introspection for IDE status bars, global peer topology, and A2A task tables |
+
+---
+
+## Local Community Mode (Free) vs. Aegis Cloud Mode (Subscription)
+
+To coding agents (`agy`, `claude`, `codex`), **Local Mode** and **Cloud Mode** expose the **exact same 25+ MCP tools and transactional CoW semantics (100% behavioral isomorphism)**. Under the hood, they provide two distinct execution tiers:
+
+| Dimension | Local Community Mode (Free / Open-Core) | Aegis Cloud Sandbox Mode (`Pro` / `Team` / `Enterprise`) | Developer Value of Cloud Mode |
+| :--- | :--- | :--- | :--- |
+| **1. Local CPU, Memory & Battery Load** | **Runs on Local Machine**: Compilers (`cargo build`, `npm build`), test suites, and parallel agent sandboxes consume local CPU, RAM, and battery. | **0% Local CPU/RAM Load**: Local machine runs only a `<5 MB` `mcp-stdio` transparent proxy (`serve_unified_stdio`); all heavy builds and tests execute on remote Linux cloud nodes. | Keep your MacBook completely silent and cool while driving 8–32 concurrent coding agents on heavy Rust/C++/TypeScript builds. |
+| **2. Isolation Boundary & Supply-Chain Safety** | **Local OS Process Sandbox** (macOS `Seatbelt` / Linux `bwrap`): Masks `~/.ssh`, `~/.aws`, etc., and blocks direct host repo writes, but shares the host OS kernel and local network stack. | **Physical VM Isolation + Source-Only Diff Return**: Untrusted code and dependency scripts (`build.rs`, `postinstall`) execute inside remote Linux `bwrap` namespaces; binary artifacts (`NUL` bytes) are stripped at the boundary so **only verified text-only source diffs return to your laptop**. | Eliminates the risk of poisoned packages or hallucinated scripts attacking your local kernel, probing your LAN, or polluting local binaries. |
+| **3. Multi-Agent Concurrency & CoW Engine** | Bounded by laptop RAM and disk space (typically **1–2 concurrent local agents**). | Backed by Linux **`btrfs` `FICLONE` block-level zero-copy** with elastic concurrency quotas (`Community`: 2, `Pro`: 8, `Team`: 32, `Enterprise`: 256 concurrent cloud agents) sharing pre-warmed build caches. | Launch large multi-agent swarms (parallel refactoring, test generation, bug fixing) with instant `<15ms` CoW branching. |
+| **4. Scale-to-Zero Hibernation & Cross-Device Resume** | Ephemeral local state (`/tmp/aegis-os-runtime`); uncommitted shadow state is tied to a single machine. | **`Active <-> Hibernated` Scale-to-Zero Lifecycle**: Automatically releases in-memory kernel handles when idle (0 compute billing) while persisting CoW upper layers on `btrfs`; wakes automatically in **`<10ms`** on the next MCP call. | Close your laptop lid anytime with zero idle compute cost, and resume uncommitted CoW transactions seamlessly from another machine. |
+| **5. Team Collaboration & Direct Git PR Export** | IPC bus, cooperative file claims (`coord_claim`), and CAS artifacts are scoped to windows on a single workstation. | **Shared Cloud Organization & Git-to-PR Pipeline**: Multiple developers' agents collaborate over a shared cloud A2A/IPC bus and centralized Secret Vault (`$AOS_SECRET_*`), and export 3-way merged branches directly as GitHub/GitLab Pull Requests (`aegis-os cloud pr`). | Enables team-wide multi-agent collaboration and headless CI/CD agents that open verified PRs directly from the cloud. |
+| **6. Quotas, Metering & Remote HITL Approvals** | Local terminal/IDE approvals only; no usage metering. | Built-in `TenantUsageRecord` metering (`total_syscalls`, `sandbox_exec_ms`, `cow_saved_bytes`), `ak_live_*` key management, and remote CLI/Web HITL approval console (`aegis-os cloud approvals` / `GET /dashboard`). | Full cost/usage visibility for solo Pro developers and centralized audit/lease governance for engineering teams. |
 
 ---
 
 ## Quick Start
 
-### 1. Local Workstation Setup (`agy`, `claude`, and `codex`)
+### 1. Zero-CLI Onboarding (`brew install` → Directly Launch `agy` / `claude` / `codex`)
+
+Users **never need to run `aegis-os` manually** after installation:
 
 ```bash
-# 1. Build & globally configure AGY (MCP + lifecycle hooks), Claude Code, and Codex CLI
-cargo run --release --bin aegis-os -- install
-
-# 2. Start the background daemon & open the Web Mission Control Console
-cargo run --release --bin aegis-os -- up
-# -> Web Mission Control & HITL Approval UI: http://127.0.0.1:7080/dashboard
-# -> Terminal TUI Mission Control:           cargo run --release --bin aegis-os -- top
+# Install via Homebrew (post_install automatically wires AGY, Claude Code, and Codex CLI)
+brew install aegis-os
 ```
 
-### 2. Cloud PaaS API & Multi-Agent Git-to-PR Workflow
+1. **Open your coding agent directly** (`agy`, `claude`, or `codex`) in any project directory.
+2. **Automatic First-Run Subscription Check**: On first launch in a project, Aegis OS's `PreInvocation` hook instructs the coding agent to ask whether you have an **Aegis Cloud Subscription**:
+   - **With Subscription (Cloud Mode)**: The agent calls the `runtime_configure_mode(mode="cloud")` MCP tool, provisions your remote Linux `btrfs` CoW workspace, uploads clean source files, and **hot-switches the live IDE session to Zero-Local-Load Cloud Mode** without restarting. Whenever `workspace_commit` succeeds on the cloud sandbox, verified text-only source changes are automatically synced back to your local repo.
+   - **Without Subscription (Local Mode)**: The agent calls `runtime_configure_mode(mode="local")` and runs immediately in **Free Local Community Mode** using your local CoW shadow workspace and native OS sandbox.
+3. **Switch Anytime in Natural Language**: Simply tell your agent *"Switch to Cloud mode"* or *"Switch back to Local mode"* at any point in a conversation.
+
+### 2. CLI-First Cloud Control (`aegis-os cloud`)
+
+For developers who prefer explicit terminal control, 100% of Cloud PaaS operations are available as first-class CLI subcommands:
 
 ```bash
-# 1. Provision a Cloud Workspace with 2 parallel CoW agent branches (<10ms)
-curl -X POST http://127.0.0.1:7080/v1/workspaces \
-  -H "Content-Type: application/json" \
-  -d '{"org_id":"acme","workspace_id":"ws-payments","source_url":".","agents":["coder-alpha","reviewer-beta"]}'
+# Authenticate or bind current project to an Aegis Cloud Sandbox (0% local CPU/RAM load)
+aegis-os cloud login --endpoint http://127.0.0.1:17080
+aegis-os cloud up
 
-# 2. Mint a scoped tenant API key (ak_live_*) bound to coder-alpha
-curl -X POST http://127.0.0.1:7080/v1/tenants/keys \
-  -H "Content-Type: application/json" \
-  -d '{"org_id":"acme","agent_id":"coder-alpha","workspace_id":"ws-payments","label":"CI Swarm"}'
+# Inspect remote CoW unified code diff, pending HITL approvals, and tenant metering in terminal
+aegis-os cloud diff
+aegis-os cloud approvals
+aegis-os cloud approve <escalation_id> --grant-lease
+aegis-os cloud status
 
-# 3. Reconcile CoW edits via 4-Tier LCS Diff3 and export a Git branch + Unified Diff Patch
-curl -X POST http://127.0.0.1:7080/v1/workspaces/pr \
-  -H "Authorization: Bearer ak_live_<your_key>" \
-  -H "Content-Type: application/json" \
-  -d '{"org_id":"acme","workspace_id":"ws-payments","agent_id":"coder-alpha","branch_name":"aegis/coder-alpha/feat"}'
+# Sync source-only files, export a GitHub PR bundle, or trigger Scale-to-Zero hibernation
+aegis-os cloud push
+aegis-os cloud pull
+aegis-os cloud pr --branch aegis/feat-1
+aegis-os cloud hibernate
+aegis-os cloud wake
+
+# Unbind and return to Free Local Community Mode (automatically hibernates cloud workspace)
+aegis-os cloud down
 ```
+
+---
+
+## AAP-1.0 Application Ecosystem (`aegis-os app` & Progressive MCP Proxy)
+
+**Aegis OS** includes native support for the **Aegis Application Protocol (`AAP-1.0`)**, a 3-tier ecosystem (`first_party`, `verified`, `community`) with user-bound grant tokens (`aegis_at_<app_id>.*`), RFC 8628 Device Code passwordless binding, automatic SOP skill installation (`/.well-known/aegis-skills/`), and Policy Kernel lease-gated tool governance:
+
+```bash
+# 1. Browse or search the 3-tier AAP-1.0 application catalog (pre-registered with First-Party Heurion 2.0)
+aegis-os app list
+aegis-os app search heurion
+aegis-os app info heurion
+
+# 2. Install an AAP-1.0 application (fetches /.well-known/aegis-app.json & installs declared SKILL.md files)
+aegis-os app install heurion --url http://127.0.0.1:8787
+
+# 3. Bind your user account via RFC 8628 Device Code Flow or direct token exchange
+aegis-os app login heurion --device-code
+aegis-os app login heurion --token aegis_at_heurion.<grant_id>.<secret>
+
+# 4. Mount into Agent session or invoke remote MCP tools with automatic identity & lease header injection
+aegis-os app mount heurion
+aegis-os app call heurion doc_list --args '{}'
+aegis-os app logout heurion
+```
+
+Coding and research agents (`agy`, `claude`, `codex`) also have built-in progressive MCP tools:
+- `app_catalog_search`: Search `first_party`, `verified`, and `community` applications.
+- `app_mount_session`: Mount an application (e.g. `heurion`) into the current Agent session and inspect its `zero_prompt` vs `lease_gated` capabilities.
+- `app_call_tool`: Invoke any remote MCP tool over `POST /api/aegis/mcp` with automatic `Authorization: Bearer aegis_at_...`, `X-Aegis-Agent-Id`, `X-Aegis-Session-Id`, and Policy Kernel `X-Aegis-Lease-Token` injection.
 
 ---
 

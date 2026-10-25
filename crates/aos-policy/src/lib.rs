@@ -335,7 +335,8 @@ impl PolicyEngine for AegisPolicyKernel {
             "ipc_register_peer" | "ipc_list_peers" | "ipc_send" | "ipc_request" | "ipc_reply"
             | "ipc_recv" | "ipc_ack" | "ipc_publish" | "ipc_subscribe" | "egress_http_request"
             | "coord_claim" | "coord_release" | "ipc_update_card" | "ipc_task_update"
-            | "ipc_task_get" | "ipc_task_list" => {
+            | "ipc_task_get" | "ipc_task_list" | "app_catalog_search" | "app_mount_session"
+            | "app_call_tool" => {
                 Ok(PolicyDecision::Allow {
                     matched_rule: "aegis:default:intra_org_ipc_auto_allow".to_string(),
                 })

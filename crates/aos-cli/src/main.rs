@@ -11,6 +11,7 @@
 //! - Cross-Agent IPC across `agy`, `claude`, and `codex` within the same project!
 
 mod bench;
+mod cloud;
 mod coord;
 mod routing;
 
@@ -109,6 +110,18 @@ enum Commands {
         action: IpcAction,
     },
 
+    /// Manage Aegis Cloud Sandbox bindings (`up`/`down`), source-only sync (`push`/`pull`), and Scale-to-Zero
+    Cloud {
+        #[command(subcommand)]
+        action: cloud::CloudAction,
+    },
+
+    /// Discover, install, authenticate (`aegis_at_<app_id>.*`), and invoke AAP-1.0 Ecosystem Applications (e.g. `heurion` Heurion 2.0)
+    App {
+        #[command(subcommand)]
+        action: AppAction,
+    },
+
     /// Start the persistent Aegis OS HTTP MCP Daemon & Egress Proxy Server
     Daemon {
         #[arg(long, default_value = "127.0.0.1:7080")]
@@ -198,6 +211,99 @@ enum IpcAction {
         subject: String,
         #[arg(long)]
         message: String,
+    },
+}
+
+#[derive(Subcommand)]
+enum AppAction {
+    /// List all AAP-1.0 applications in the 3-tier ecosystem catalog and their installation/login status
+    List {
+        /// Optional trust tier filter (`first_party`, `verified`, `community`)
+        #[arg(long)]
+        tier: Option<String>,
+        /// Optional category filter (`medical`, `clinical-research`, `biostatistics`, etc.)
+        #[arg(long)]
+        category: Option<String>,
+    },
+
+    /// Search the AAP-1.0 application catalog by keyword
+    Search {
+        /// Search keyword (e.g. `heurion`, `medical`, `biostatistics`)
+        query: Option<String>,
+    },
+
+    /// Inspect the AAP-1.0 manifest (`/.well-known/aegis-app.json`), capabilities, skills, and auth status of an app
+    Info {
+        /// Application ID (e.g. `heurion`)
+        app_id: String,
+    },
+
+    /// Install an AAP-1.0 application by ID or endpoint URL and sync its declared SOP skills into `.agents/skills/`
+    Install {
+        /// Application ID (e.g. `heurion`) or base endpoint URL
+        app_id_or_url: String,
+        /// Optional endpoint URL override (e.g. `http://127.0.0.1:8787`)
+        #[arg(long)]
+        url: Option<String>,
+    },
+
+    /// Authenticate and bind a user-scoped `aegis_at_<app_id>.*` token via RFC 8628 Device Code, direct token, or credentials
+    Login {
+        /// Application ID (e.g. `heurion`)
+        app_id: String,
+        /// Optional endpoint URL override
+        #[arg(long)]
+        url: Option<String>,
+        /// Direct `aegis_at_<app_id>.*` token or web session token to exchange
+        #[arg(long)]
+        token: Option<String>,
+        /// Username for credential exchange
+        #[arg(long)]
+        username: Option<String>,
+        /// Password for credential exchange
+        #[arg(long)]
+        password: Option<String>,
+        /// Use RFC 8628 Device Code Flow (`POST /api/aegis/auth/device`)
+        #[arg(long, default_value_t = false)]
+        device_code: bool,
+        /// Seconds to poll for Device Code approval (0 = return code immediately without blocking)
+        #[arg(long, default_value_t = 60)]
+        wait_secs: u64,
+        /// Comma-separated scopes (e.g. `projects:read,projects:write,biostats:run,artifacts:publish`)
+        #[arg(long, default_value = "")]
+        scopes: String,
+    },
+
+    /// Revoke and remove the stored `aegis_at_<app_id>.*` credential for an application
+    Logout {
+        /// Application ID (e.g. `heurion`)
+        app_id: String,
+    },
+
+    /// Mount an AAP-1.0 application into the current Agent session (`app_mount_session`)
+    Mount {
+        /// Application ID (e.g. `heurion`)
+        app_id: String,
+        /// Optional endpoint URL override
+        #[arg(long)]
+        url: Option<String>,
+    },
+
+    /// Invoke an MCP tool on an AAP-1.0 application over `POST /api/aegis/mcp` (`app_call_tool`)
+    Call {
+        /// Application ID (e.g. `heurion`)
+        app_id: String,
+        /// Remote MCP tool name (e.g. `heurion_system_overview`, `heurion_list_projects`, `heurion_run_biostats`)
+        tool_name: String,
+        /// JSON arguments string (e.g. `'{"project_id":"prj-1"}'`)
+        #[arg(long, default_value = "{}")]
+        args: String,
+        /// Optional endpoint URL override
+        #[arg(long)]
+        url: Option<String>,
+        /// Optional explicit lease token for `lease_gated` tools
+        #[arg(long)]
+        lease_token: Option<String>,
     },
 }
 
@@ -322,7 +428,6 @@ async fn main() -> anyhow::Result<()> {
         }
 
         Commands::McpStdio => {
-            let kernel = AegisRuntimeKernel::new(&cli.runtime_dir).await?;
             let auto_org = cli.org == "auto" || cli.org.is_empty();
             let auto_agent_client = if cli.agent == "auto"
                 || cli.agent.is_empty()
@@ -334,9 +439,124 @@ async fn main() -> anyhow::Result<()> {
             } else {
                 None
             };
-            kernel
-                .serve_stdio_lazy(identity, workspace, auto_org, auto_agent_client)
-                .await?;
+            cloud::serve_unified_stdio(
+                cli.runtime_dir,
+                workspace,
+                identity,
+                auto_org,
+                auto_agent_client,
+            )
+            .await?;
+        }
+
+        Commands::Cloud { action } => {
+            cloud::handle_cloud_command(action, &identity, &workspace, &cli.runtime_dir).await?;
+        }
+
+        Commands::App { action } => {
+            let kernel = AegisRuntimeKernel::new(&cli.runtime_dir).await?;
+            match action {
+                AppAction::List { tier, category } => {
+                    let res = kernel
+                        .app_store
+                        .search_catalog(None, category.as_deref(), tier.as_deref())
+                        .await;
+                    println!("{}", serde_json::to_string_pretty(&res)?);
+                }
+                AppAction::Search { query } => {
+                    let res = kernel
+                        .app_store
+                        .search_catalog(query.as_deref(), None, None)
+                        .await;
+                    println!("{}", serde_json::to_string_pretty(&res)?);
+                }
+                AppAction::Info { app_id } => {
+                    let res = kernel.app_store.get_app_info(&app_id).await?;
+                    println!("{}", serde_json::to_string_pretty(&res)?);
+                }
+                AppAction::Install { app_id_or_url, url } => {
+                    let res = kernel
+                        .app_store
+                        .install_app(&app_id_or_url, url.as_deref(), Some(&workspace))
+                        .await?;
+                    println!("{}", serde_json::to_string_pretty(&res)?);
+                }
+                AppAction::Login {
+                    app_id,
+                    url,
+                    token,
+                    username,
+                    password,
+                    device_code,
+                    wait_secs,
+                    scopes,
+                } => {
+                    let scope_vec: Vec<String> = scopes
+                        .split(',')
+                        .map(|s| s.trim().to_string())
+                        .filter(|s| !s.is_empty())
+                        .collect();
+                    let res = if device_code || (token.is_none() && username.is_none()) {
+                        kernel
+                            .app_store
+                            .login_app_device_code(
+                                &app_id,
+                                url.as_deref(),
+                                scope_vec,
+                                wait_secs,
+                                token.as_deref(),
+                            )
+                            .await?
+                    } else {
+                        kernel
+                            .app_store
+                            .login_app(
+                                &app_id,
+                                url.as_deref(),
+                                token.as_deref(),
+                                username.as_deref(),
+                                password.as_deref(),
+                                scope_vec,
+                            )
+                            .await?
+                    };
+                    println!("{}", serde_json::to_string_pretty(&res)?);
+                }
+                AppAction::Logout { app_id } => {
+                    let res = kernel.app_store.logout_app(&app_id).await?;
+                    println!("{}", serde_json::to_string_pretty(&res)?);
+                }
+                AppAction::Mount { app_id, url } => {
+                    let res = kernel
+                        .app_store
+                        .mount_session(&identity, &app_id, url.as_deref())
+                        .await?;
+                    println!("{}", serde_json::to_string_pretty(&res)?);
+                }
+                AppAction::Call {
+                    app_id,
+                    tool_name,
+                    args,
+                    url,
+                    lease_token,
+                } => {
+                    let parsed_args: Value = serde_json::from_str(&args)
+                        .unwrap_or_else(|_| json!({}));
+                    let res = kernel
+                        .app_store
+                        .call_app_tool(
+                            &kernel,
+                            &identity,
+                            &app_id,
+                            &tool_name,
+                            parsed_args,
+                            url.as_deref(),
+                            lease_token.as_deref(),
+                        )
+                        .await?;
+                    println!("{}", serde_json::to_string_pretty(&res)?);
+                }
+            }
         }
 
         Commands::AgyHook { ref event, strict_cow } => {
@@ -654,6 +874,7 @@ pub async fn install_global_clients(
         "org_artifact_fetch",
         "org_kv_put",
         "org_kv_get",
+        "runtime_configure_mode",
     ];
 
     merge_json_file(
@@ -764,6 +985,7 @@ pub async fn install_global_clients(
         "mcp(aegis-os/ipc_ack)",
         "mcp(aegis-os/ipc_subscribe)",
         "mcp(aegis-os/ipc_publish)",
+        "mcp(aegis-os/runtime_configure_mode)",
     ];
     const AGY_MCP_ASK_RULES: &[&str] = &[
         "mcp(aegis-os/policy_approve_escalation)",
@@ -830,6 +1052,7 @@ You are running inside the **Aegis OS Runtime (`aegis-os`)** with an isolated Co
 | Claim / release files when collaborating | `coord_claim`, `coord_release` | Uncoordinated overlapping edits |
 | Multi-agent messaging & task handoff | `ipc_list_peers`, `ipc_send`, `ipc_request`, `ipc_reply`, `ipc_recv`, `ipc_ack` | Manual user relay |
 | Land shadow changes onto host repo | `workspace_diff` -> `workspace_commit` | Direct host mutation |
+| Switch Cloud vs. Local execution mode | `runtime_configure_mode` (`mode: "cloud" \| "local"`) | Manual CLI configuration |
 <!-- AEGIS-OS-RUNTIME-END -->
 "#;
 
@@ -1391,7 +1614,7 @@ async fn handle_agy_hook(
                 .filter(|p| p.online && !(p.org_id == identity.org_id && p.agent_id == identity.agent_id))
                 .map(|p| p.address())
                 .collect();
-            let msg = format!(
+            let mut msg = format!(
                 "[Aegis OS Runtime Active] Principal: `{}/{}` | CoW Shadow: `{}` | Same-Org Peers: {:?} | Global Peers: {:?} | Unread IPC: {} | Shadow Rebase Updates: {} (Conflicts: {}).",
                 identity.org_id,
                 identity.agent_id,
@@ -1402,6 +1625,13 @@ async fn handle_agy_hook(
                 refresh.total_updates(),
                 refresh.conflicts.len()
             );
+            if let Some(onboarding) = cloud::build_onboarding_prompt_if_needed(
+                &cli.runtime_dir,
+                &effective_workspace,
+                conv_tag,
+            ) {
+                msg = format!("{}\n\n{}", msg, onboarding);
+            }
             let out = json!({
                 "injectSteps": [
                     {
@@ -1418,7 +1648,22 @@ async fn handle_agy_hook(
                 println!("{{}}");
                 return Ok(());
             }
-            let out = coord::handle_pre_invocation(&cli.runtime_dir, &kernel, &identity).await;
+            let mut out = coord::handle_pre_invocation(&cli.runtime_dir, &kernel, &identity).await;
+            if let Some(onboarding) = cloud::build_onboarding_prompt_if_needed(
+                &cli.runtime_dir,
+                &effective_workspace,
+                conv_tag,
+            ) {
+                if let Some(steps) = out.get_mut("injectSteps").and_then(|v| v.as_array_mut()) {
+                    steps.push(json!({ "systemMessage": onboarding }));
+                } else {
+                    out = json!({
+                        "injectSteps": [
+                            { "systemMessage": onboarding }
+                        ]
+                    });
+                }
+            }
             println!("{}", serde_json::to_string(&out)?);
         }
 

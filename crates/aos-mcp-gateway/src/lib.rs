@@ -30,7 +30,9 @@ use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::sync::RwLock;
 use uuid::Uuid;
 
+pub mod app_store;
 pub mod paas;
+use app_store::AppStoreRegistry;
 use paas::PaasControlPlane;
 
 pub struct AgentEnvironment {
@@ -55,6 +57,7 @@ pub struct AegisRuntimeKernel {
     pub egress: Arc<AegisEgressGateway>,
     pub recorder: Arc<dyn FlightRecorder>,
     pub paas: Arc<PaasControlPlane>,
+    pub app_store: Arc<AppStoreRegistry>,
     agents: Arc<RwLock<HashMap<String, Arc<AgentEnvironment>>>>,
     mounted_mcp_servers: Arc<RwLock<Vec<MountedMcpServer>>>,
 }
@@ -74,6 +77,7 @@ impl AegisRuntimeKernel {
         let audit_path = root.join("audit").join("flight_recorder.jsonl");
         let recorder = Arc::new(AegisFlightRecorder::new(Some(audit_path)));
         let paas = Arc::new(PaasControlPlane::new(&root));
+        let app_store = Arc::new(AppStoreRegistry::new(&root));
 
         Ok(Self {
             runtime_data_root: root,
@@ -83,6 +87,7 @@ impl AegisRuntimeKernel {
             egress: Arc::new(AegisEgressGateway::new()),
             recorder,
             paas,
+            app_store,
             agents: Arc::new(RwLock::new(HashMap::new())),
             mounted_mcp_servers: Arc::new(RwLock::new(Vec::new())),
         })
@@ -422,6 +427,20 @@ impl AegisRuntimeKernel {
             return Ok(aos_core::RefreshReport::default());
         };
         env.workspace.refresh_from_host().await
+    }
+
+    /// Evicts in-memory sandbox handles for the specified agents when a Cloud Workspace transitions
+    /// to Scale-to-Zero (`Hibernated`), while preserving CoW shadow directories on disk.
+    pub async fn evict_agent_environments(&self, org_id: &str, agents: &[String]) -> usize {
+        let mut guard = self.agents.write().await;
+        let mut evicted = 0;
+        for agent_id in agents {
+            let key = Self::agent_key(org_id, agent_id);
+            if guard.remove(&key).is_some() {
+                evicted += 1;
+            }
+        }
+        evicted
     }
 
     async fn authorize_and_audit(
@@ -1416,6 +1435,55 @@ impl AegisRuntimeKernel {
                 Ok(serde_json::to_value(srv)?)
             }
 
+            // ----------------------------------------------------------------
+            // 6. AAP-1.0 Application Ecosystem & Progressive MCP Proxy Tools
+            // ----------------------------------------------------------------
+            "app_catalog_search" => {
+                let query = args.get("query").and_then(|v| v.as_str());
+                let category = args.get("category").and_then(|v| v.as_str());
+                let trust_tier = args.get("trust_tier").and_then(|v| v.as_str());
+                Ok(self.app_store.search_catalog(query, category, trust_tier).await)
+            }
+
+            "app_mount_session" => {
+                let app_id = args
+                    .get("app_id")
+                    .and_then(|v| v.as_str())
+                    .context("Missing 'app_id' (e.g. 'heurion')")?;
+                let endpoint = args.get("endpoint").and_then(|v| v.as_str());
+                self.app_store.mount_session(identity, app_id, endpoint).await
+            }
+
+            "app_call_tool" => {
+                let app_id = args
+                    .get("app_id")
+                    .and_then(|v| v.as_str())
+                    .context("Missing 'app_id' (e.g. 'heurion')")?;
+                let remote_tool = args
+                    .get("tool_name")
+                    .or_else(|| args.get("tool"))
+                    .and_then(|v| v.as_str())
+                    .context("Missing 'tool_name'")?;
+                let tool_args = args
+                    .get("arguments")
+                    .or_else(|| args.get("args"))
+                    .cloned()
+                    .unwrap_or_else(|| json!({}));
+                let endpoint = args.get("endpoint").and_then(|v| v.as_str());
+                let lease_token = args.get("lease_token").and_then(|v| v.as_str());
+                self.app_store
+                    .call_app_tool(
+                        self,
+                        identity,
+                        app_id,
+                        remote_tool,
+                        tool_args,
+                        endpoint,
+                        lease_token,
+                    )
+                    .await
+            }
+
             other => bail!("Unknown Aegis OS MCP tool '{}'", other),
         }
     }
@@ -1835,6 +1903,102 @@ impl AegisRuntimeKernel {
                         },
                         "required": ["action_pattern"]
                     }
+                },
+                {
+                    "name": "runtime_configure_mode",
+                    "description": "[Zero-Prompt] Configure or switch the current workspace's Aegis OS execution mode directly from the Coding Agent (`mode`: `\"cloud\"` for Zero-Local-Load Cloud Sandbox with subscription, `\"local\"` for Free Local CoW Sandbox mode, or `\"status\"` to inspect current mode).",
+                    "inputSchema": {
+                        "type": "object",
+                        "properties": {
+                            "mode": {
+                                "type": "string",
+                                "enum": ["cloud", "local", "status"],
+                                "description": "Target execution mode (`\"cloud\"` to offload to Aegis Cloud Sandbox, `\"local\"` for free local CoW sandbox, `\"status\"` to inspect)."
+                            },
+                            "api_key": {
+                                "type": "string",
+                                "description": "Optional `ak_live_*` subscription API key for Cloud mode (if omitted, uses saved key or auto-mints a trial/dev key)."
+                            },
+                            "endpoint": {
+                                "type": "string",
+                                "description": "Optional Aegis Cloud PaaS endpoint URL (defaults to `http://127.0.0.1:17080` or saved endpoint)."
+                            },
+                            "plan_tier": {
+                                "type": "string",
+                                "description": "Optional subscription tier (`pro`, `team`, `enterprise`, `community`)."
+                            }
+                        },
+                        "required": ["mode"]
+                    }
+                },
+                {
+                    "name": "app_catalog_search",
+                    "description": "[Zero-Prompt] Search the Aegis Application Protocol (AAP-1.0) 3-tier ecosystem catalog (`first_party` e.g. `heurion` Heurion 2.0, `verified`, `community`) and inspect installed & user-authenticated applications.",
+                    "inputSchema": {
+                        "type": "object",
+                        "properties": {
+                            "query": {
+                                "type": "string",
+                                "description": "Optional keyword filter (e.g. `heurion`, `medical`, `biostatistics`, `clinical`)."
+                            },
+                            "category": {
+                                "type": "string",
+                                "description": "Optional category filter (`first-party`, `medical`, `clinical-research`, `biostatistics`, `verified`)."
+                            },
+                            "trust_tier": {
+                                "type": "string",
+                                "enum": ["first_party", "verified", "community"]
+                            }
+                        }
+                    }
+                },
+                {
+                    "name": "app_mount_session",
+                    "description": "[Zero-Prompt] Mount an AAP-1.0 application (e.g. `heurion` for Heurion 2.0 Clinical & Biomedical Research) into the current Agent session and inspect its `zero_prompt` vs `lease_gated` MCP tools, bound user account, and recommended SOP skills.",
+                    "inputSchema": {
+                        "type": "object",
+                        "properties": {
+                            "app_id": {
+                                "type": "string",
+                                "description": "AAP-1.0 application identifier (e.g. `heurion`)."
+                            },
+                            "endpoint": {
+                                "type": "string",
+                                "description": "Optional endpoint URL override (defaults to installed endpoint or `http://127.0.0.1:8787`)."
+                            }
+                        },
+                        "required": ["app_id"]
+                    }
+                },
+                {
+                    "name": "app_call_tool",
+                    "description": "[AAP-1.0 Proxy] Invoke an MCP tool on an AAP-1.0 application (e.g. `heurion`) over `POST /api/aegis/mcp` with automatic injection of `Authorization: Bearer aegis_at_<app_id>.*`, `X-Aegis-Agent-Id`, `X-Aegis-Session-Id`, and Policy Kernel `X-Aegis-Lease-Token` for `lease_gated` tools.",
+                    "inputSchema": {
+                        "type": "object",
+                        "properties": {
+                            "app_id": {
+                                "type": "string",
+                                "description": "AAP-1.0 application identifier (e.g. `heurion`)."
+                            },
+                            "tool_name": {
+                                "type": "string",
+                                "description": "Remote MCP tool name on the target app (e.g. `heurion_run_biostats`, `heurion_list_projects`, `heurion_publish_artifact`)."
+                            },
+                            "arguments": {
+                                "type": "object",
+                                "description": "JSON arguments object for the remote MCP tool."
+                            },
+                            "endpoint": {
+                                "type": "string",
+                                "description": "Optional endpoint URL override."
+                            },
+                            "lease_token": {
+                                "type": "string",
+                                "description": "Optional explicit lease token override for `lease_gated` tools."
+                            }
+                        },
+                        "required": ["app_id", "tool_name"]
+                    }
                 }
             ]
         })
@@ -1881,7 +2045,8 @@ impl AegisRuntimeKernel {
                         { "uri": "aegis://global/peers", "name": "Global Workstation Peers Across All Repositories" },
                         { "uri": "aegis://a2a/agent-cards", "name": "Google A2A Agent Cards Across Workstation" },
                         { "uri": "aegis://a2a/tasks", "name": "Google A2A Stateful Tasks" },
-                        { "uri": "aegis://org/shared/catalog", "name": "Organization CAS Artifact Catalog" }
+                        { "uri": "aegis://org/shared/catalog", "name": "Organization CAS Artifact Catalog" },
+                        { "uri": "aegis://apps/catalog", "name": "AAP-1.0 Application Ecosystem Catalog & Installed Apps" }
                     ]
                 }
             }),
@@ -1906,6 +2071,9 @@ impl AegisRuntimeKernel {
                     "aegis://org/shared/catalog" | "agentos://org/shared/catalog" => {
                         let arts = self.org_storage.list_artifacts(&identity.org_id).await?;
                         json!({ "artifacts": arts })
+                    }
+                    "aegis://apps/catalog" => {
+                        self.app_store.search_catalog(None, None, None).await
                     }
                     _ => json!({ "error": "Unknown resource URI" }),
                 };
@@ -2106,7 +2274,7 @@ impl AegisRuntimeKernel {
         Ok(response)
     }
 
-    fn extract_workspace_from_init_params(params: &Value) -> Option<PathBuf> {
+    pub fn extract_workspace_from_init_params(params: &Value) -> Option<PathBuf> {
         let raw_uri = params
             .get("rootUri")
             .and_then(|v| v.as_str())
@@ -2136,7 +2304,7 @@ impl AegisRuntimeKernel {
         }
     }
 
-    fn resolve_workspace_fallback(&self, current_ws: &Path) -> PathBuf {
+    pub fn resolve_workspace_fallback(&self, current_ws: &Path) -> PathBuf {
         if let Ok(env_ws) = std::env::var("AOS_WORKSPACE") {
             let p = PathBuf::from(env_ws.trim());
             if p.exists() {
@@ -2363,6 +2531,7 @@ impl AegisRuntimeKernel {
                         .get("x-aegis-role")
                         .cloned()
                         .unwrap_or_else(|| "Remote MCP Agent".to_string());
+                    let mut bound_ws_id = headers.get("x-aegis-workspace").cloned();
                     let mut bound_ws_path = ws_path.clone();
 
                     // Optional Bearer API Key / X-Aegis-Api-Key Authentication (`ak_live_*`)
@@ -2374,15 +2543,24 @@ impl AegisRuntimeKernel {
                     if let Some(ref token_hdr) = raw_auth {
                         if let Some(key_rec) = k.paas.authenticate_token(token_hdr).await {
                             org_id = key_rec.org_id;
-                            agent_id = key_rec.agent_id;
-                            role = key_rec.role;
+                            if !headers.contains_key("x-aegis-agent") {
+                                agent_id = key_rec.agent_id;
+                            }
+                            if !headers.contains_key("x-aegis-role") {
+                                role = key_rec.role;
+                            }
                             if let Some(ref ws_id) = key_rec.workspace_id {
+                                bound_ws_id = Some(ws_id.clone());
                                 if let Some(ws_rec) = k.paas.get_workspace(&org_id, ws_id).await {
                                     bound_ws_path = ws_rec.host_repo_path;
                                 }
                             }
                         } else {
                             auth_failed = true;
+                        }
+                    } else if let Some(ref ws_id) = bound_ws_id {
+                        if let Some(ws_rec) = k.paas.get_workspace(&org_id, ws_id).await {
+                            bound_ws_path = ws_rec.host_repo_path;
                         }
                     } else if std::env::var("AOS_REQUIRE_API_KEY").as_deref() == Ok("1")
                         && (full_target.starts_with("/mcp")
@@ -2452,7 +2630,10 @@ impl AegisRuntimeKernel {
                             .to_string(),
                         )
                     } else if method == "GET" && full_target.starts_with("/api/status") {
-                        let query_org = if full_target.contains("org_id=*") {
+                        let query_org = if let Some((_, after)) = full_target.split_once("org_id=") {
+                            let val = after.split('&').next().unwrap_or("*").trim();
+                            if val.is_empty() { "*".to_string() } else { val.to_string() }
+                        } else if org_id == "default-org" {
                             "*".to_string()
                         } else {
                             org_id.clone()
@@ -2468,6 +2649,7 @@ impl AegisRuntimeKernel {
                         let leases = k.policy.list_leases(&query_org, None).await.unwrap_or_default();
                         let workspaces = k.paas.list_workspaces(Some(&query_org)).await;
                         let api_keys = k.paas.list_api_keys(Some(&query_org)).await;
+                        let tenants = k.paas.list_tenants(Some(&query_org)).await;
                         let secrets = if query_org == "*" {
                             let mut all_sec = k.egress.list_redacted_secrets("aegis-os").await;
                             all_sec.extend(k.egress.list_redacted_secrets("acme").await);
@@ -2487,10 +2669,31 @@ impl AegisRuntimeKernel {
                                 "active_leases": leases,
                                 "workspaces": workspaces,
                                 "api_keys": api_keys,
+                                "tenants": tenants,
                                 "secrets": secrets
                             })
                             .to_string(),
                         )
+                    } else if method == "POST" && full_target.starts_with("/v1/tenants/plan") {
+                        let payload: Value = serde_json::from_str(body_str.trim()).unwrap_or_else(|_| json!({}));
+                        let t_org = payload.get("org_id").and_then(|v| v.as_str()).unwrap_or(&org_id);
+                        let raw_tier = payload.get("plan_tier").and_then(|v| v.as_str()).unwrap_or("pro");
+                        let tier = paas::PlanTier::from_str_lossy(raw_tier);
+                        match k.paas.set_tenant_plan(t_org, tier).await {
+                            Ok(rec) => (
+                                "HTTP/1.1 200 OK",
+                                json!({
+                                    "status": "plan_updated",
+                                    "tenant": rec,
+                                    "monthly_price_usd": tier.monthly_price_usd()
+                                })
+                                .to_string(),
+                            ),
+                            Err(e) => (
+                                "HTTP/1.1 500 Internal Server Error",
+                                json!({ "error": e.to_string() }).to_string(),
+                            ),
+                        }
                     } else if method == "POST" && full_target.starts_with("/v1/tenants/keys") {
                         let payload: Value = serde_json::from_str(body_str.trim()).unwrap_or_else(|_| json!({}));
                         let k_org = payload.get("org_id").and_then(|v| v.as_str()).unwrap_or(&org_id);
@@ -2554,6 +2757,103 @@ impl AegisRuntimeKernel {
                     } else if method == "GET" && full_target == "/v1/workspaces" {
                         let list = k.paas.list_workspaces(None).await;
                         ("HTTP/1.1 200 OK", json!({ "workspaces": list }).to_string())
+                    } else if method == "POST" && full_target.starts_with("/v1/workspaces/hibernate") {
+                        let payload: Value = serde_json::from_str(body_str.trim()).unwrap_or_else(|_| json!({}));
+                        let w_org = payload.get("org_id").and_then(|v| v.as_str()).unwrap_or(&org_id);
+                        let w_id = payload.get("workspace_id").and_then(|v| v.as_str()).unwrap_or("ws-core");
+                        match k.paas.hibernate_workspace(&k, w_org, w_id).await {
+                            Ok(rec) => (
+                                "HTTP/1.1 200 OK",
+                                json!({
+                                    "status": "hibernated",
+                                    "scale_to_zero": true,
+                                    "workspace": rec
+                                })
+                                .to_string(),
+                            ),
+                            Err(e) => (
+                                "HTTP/1.1 404 Not Found",
+                                json!({ "error": e.to_string() }).to_string(),
+                            ),
+                        }
+                    } else if method == "POST" && full_target.starts_with("/v1/workspaces/wake") {
+                        let payload: Value = serde_json::from_str(body_str.trim()).unwrap_or_else(|_| json!({}));
+                        let w_org = payload.get("org_id").and_then(|v| v.as_str()).unwrap_or(&org_id);
+                        let w_id = payload.get("workspace_id").and_then(|v| v.as_str()).unwrap_or("ws-core");
+                        match k.paas.wake_workspace_if_needed(&k, w_org, w_id).await {
+                            Ok((rec, wake_ms)) => (
+                                "HTTP/1.1 200 OK",
+                                json!({
+                                    "status": "active",
+                                    "wake_latency_ms": wake_ms,
+                                    "workspace": rec
+                                })
+                                .to_string(),
+                            ),
+                            Err(e) => (
+                                "HTTP/1.1 404 Not Found",
+                                json!({ "error": e.to_string() }).to_string(),
+                            ),
+                        }
+                    } else if method == "POST" && full_target.starts_with("/v1/workspaces/sync-up") {
+                        let payload: Value = serde_json::from_str(body_str.trim()).unwrap_or_else(|_| json!({}));
+                        let w_org = payload.get("org_id").and_then(|v| v.as_str()).unwrap_or(&org_id);
+                        let w_id = payload
+                            .get("workspace_id")
+                            .and_then(|v| v.as_str())
+                            .or(bound_ws_id.as_deref())
+                            .unwrap_or("ws-core");
+                        let files: Vec<paas::SourceFileEntry> = payload
+                            .get("files")
+                            .and_then(|v| serde_json::from_value(v.clone()).ok())
+                            .unwrap_or_default();
+                        match k.paas.sync_up_source_bundle(&k, w_org, w_id, files).await {
+                            Ok(val) => ("HTTP/1.1 200 OK", val.to_string()),
+                            Err(e) => (
+                                "HTTP/1.1 500 Internal Server Error",
+                                json!({ "error": e.to_string() }).to_string(),
+                            ),
+                        }
+                    } else if full_target.starts_with("/v1/workspaces/diff") {
+                        let payload: Value = serde_json::from_str(body_str.trim()).unwrap_or_else(|_| json!({}));
+                        let mut query_org = payload
+                            .get("org_id")
+                            .and_then(|v| v.as_str())
+                            .unwrap_or(&org_id)
+                            .to_string();
+                        let mut query_agent = payload
+                            .get("agent_id")
+                            .and_then(|v| v.as_str())
+                            .unwrap_or(&agent_id)
+                            .to_string();
+                        let mut query_ws = payload
+                            .get("workspace_id")
+                            .and_then(|v| v.as_str())
+                            .map(|s| s.to_string())
+                            .or_else(|| bound_ws_id.clone());
+                        if let Some((_, qs)) = full_target.split_once('?') {
+                            for pair in qs.split('&') {
+                                if let Some((qk, qv)) = pair.split_once('=') {
+                                    match qk {
+                                        "org_id" if !qv.is_empty() => query_org = qv.to_string(),
+                                        "agent_id" if !qv.is_empty() => query_agent = qv.to_string(),
+                                        "workspace_id" if !qv.is_empty() => query_ws = Some(qv.to_string()),
+                                        _ => {}
+                                    }
+                                }
+                            }
+                        }
+                        match k
+                            .paas
+                            .inspect_agent_diff(&k, &query_org, &query_agent, query_ws.as_deref())
+                            .await
+                        {
+                            Ok(val) => ("HTTP/1.1 200 OK", val.to_string()),
+                            Err(e) => (
+                                "HTTP/1.1 500 Internal Server Error",
+                                json!({ "error": e.to_string() }).to_string(),
+                            ),
+                        }
                     } else if method == "POST" && full_target.starts_with("/v1/workspaces/pr") {
                         let payload: Value = serde_json::from_str(body_str.trim()).unwrap_or_else(|_| json!({}));
                         let p_org = payload.get("org_id").and_then(|v| v.as_str()).unwrap_or(&org_id);
@@ -2745,7 +3045,10 @@ impl AegisRuntimeKernel {
                             || full_target.starts_with("/a2a")
                             || full_target.starts_with("/v1/a2a"))
                     {
-                        let identity = AgentIdentity::new(org_id, agent_id, role);
+                        if let Some(ref ws_id) = bound_ws_id {
+                            let _ = k.paas.wake_workspace_if_needed(&k, &org_id, ws_id).await;
+                        }
+                        let identity = AgentIdentity::new(org_id.clone(), agent_id, role);
                         let _ = k
                             .ensure_agent_environment(
                                 identity.clone(),
@@ -2754,9 +3057,17 @@ impl AegisRuntimeKernel {
                                 vec!["*".to_string()],
                             )
                             .await;
+                        let call_started = std::time::Instant::now();
                         match serde_json::from_str::<Value>(body_str.trim()) {
                             Ok(rpc_req) => match k.handle_jsonrpc_message(&identity, rpc_req).await {
-                                Ok(rpc_resp) => ("HTTP/1.1 200 OK", rpc_resp.to_string()),
+                                Ok(rpc_resp) => {
+                                    let elapsed_ms = call_started.elapsed().as_millis() as u64;
+                                    let _ = k
+                                        .paas
+                                        .record_usage(&org_id, bound_ws_id.as_deref(), 1, elapsed_ms, 0)
+                                        .await;
+                                    ("HTTP/1.1 200 OK", rpc_resp.to_string())
+                                }
                                 Err(e) => (
                                     "HTTP/1.1 500 Internal Server Error",
                                     json!({ "error": e.to_string() }).to_string(),
@@ -3063,14 +3374,56 @@ mod tests {
             (head.to_string(), parsed)
         }
 
-        // 1. Verify Embedded Web Mission Control Dashboard (`GET /dashboard`) and simulation endpoint (`POST /v1/approvals/simulate`)
+        // 1. Verify Embedded Minimalist Web Console (`GET /dashboard`) and simulation endpoint (`POST /v1/approvals/simulate`)
         let (dash_head, dash_body) = http_call(addr, "GET", "/dashboard", None, None).await;
         assert!(dash_head.contains("200 OK"));
         assert!(dash_head.contains("text/html"));
         let html_str = dash_body["html"].as_str().unwrap();
-        assert!(html_str.contains("Aegis Cloud PaaS — Mission Control"));
+        assert!(html_str.contains("Aegis Cloud — Developer Console"));
         assert!(html_str.contains("<svg"));
         assert!(!html_str.chars().any(|c| ('\u{1F300}'..='\u{1FAFF}').contains(&c)));
+
+        // 1b. Verify Commercial Plan Tier (`POST /v1/tenants/plan`) & Concurrency Quota Enforcement
+        let (plan_head, plan_resp) = http_call(
+            addr,
+            "POST",
+            "/v1/tenants/plan",
+            None,
+            Some(json!({ "org_id": "acme-cloud", "plan_tier": "community" })),
+        )
+        .await;
+        assert!(plan_head.contains("200 OK"));
+        assert_eq!(plan_resp["monthly_price_usd"], 0);
+        assert_eq!(plan_resp["tenant"]["max_concurrent_agents"], 2);
+
+        // Requesting 3 agents on Community plan (max 2) must fail
+        let (over_head, over_resp) = http_call(
+            addr,
+            "POST",
+            "/v1/workspaces",
+            None,
+            Some(json!({
+                "org_id": "acme-cloud",
+                "workspace_id": "ws-over-quota",
+                "source_url": source_repo.to_string_lossy(),
+                "agents": ["a1", "a2", "a3"]
+            })),
+        )
+        .await;
+        assert!(over_head.contains("500 Internal Server Error"));
+        assert!(over_resp["error"].as_str().unwrap().contains("at most 2 concurrent cloud agents"));
+
+        // Upgrade tenant to Pro ($29/mo, max 8 agents)
+        let (_, up_resp) = http_call(
+            addr,
+            "POST",
+            "/v1/tenants/plan",
+            None,
+            Some(json!({ "org_id": "acme-cloud", "plan_tier": "pro" })),
+        )
+        .await;
+        assert_eq!(up_resp["monthly_price_usd"], 29);
+        assert_eq!(up_resp["tenant"]["max_concurrent_agents"], 8);
 
         let (sim_head, sim_resp) = http_call(
             addr,
@@ -3161,6 +3514,40 @@ mod tests {
         )
         .await;
         assert!(edit_head.contains("200 OK"));
+
+        // 5b. Verify Scale-to-Zero Hibernation (`POST /v1/workspaces/hibernate`) & Instant Wake (`POST /v1/workspaces/wake`)
+        let (hib_head, hib_resp) = http_call(
+            addr,
+            "POST",
+            "/v1/workspaces/hibernate",
+            Some(&api_key),
+            Some(json!({ "org_id": "acme-cloud", "workspace_id": "ws-billing" })),
+        )
+        .await;
+        assert!(hib_head.contains("200 OK"));
+        assert_eq!(hib_resp["status"], "hibernated");
+        assert_eq!(hib_resp["scale_to_zero"], true);
+
+        // Verify source-only diff inspection (`GET /v1/workspaces/diff`) automatically wakes the hibernated workspace
+        // and returns `unified_diff` + `changed_source_files` while preserving the uncommitted CoW edit!
+        let (diff_head, diff_resp) = http_call(
+            addr,
+            "GET",
+            "/v1/workspaces/diff?org_id=acme-cloud&agent_id=coder-alpha&workspace_id=ws-billing",
+            Some(&api_key),
+            None,
+        )
+        .await;
+        assert!(diff_head.contains("200 OK"));
+        assert_eq!(diff_resp["changes_count"], 1);
+        assert!(diff_resp["unified_diff"]
+            .as_str()
+            .unwrap()
+            .contains("+pub fn compute() -> i32 { 42 }"));
+        assert_eq!(
+            diff_resp["changed_source_files"][0]["path"].as_str().unwrap(),
+            "lib.rs"
+        );
 
         // 6. Trigger `workspace_commit` -> hits HITL approval gate -> approve via `/v1/approvals/decide`
         let (_, commit_ask) = http_call(
