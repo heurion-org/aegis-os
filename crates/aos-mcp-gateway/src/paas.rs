@@ -2239,9 +2239,8 @@ pub const DASHBOARD_HTML: &str = r##"<!doctype html>
       </div>
 
       <nav class="nav-links" aria-label="Console Sections">
-        <a href="#sec-approvals" class="nav-link" data-i18n="nav_approvals">01 / 待你确认</a>
-        <a href="#sec-workspaces" class="nav-link" data-i18n="nav_workspaces">02 / 云端工作区</a>
-        <a href="#sec-onboarding" class="nav-link" data-i18n="nav_onboarding">03 / 方案与接入</a>
+        <a href="#sec-onboarding" class="nav-link" data-i18n="nav_onboarding">01 / 方案与接入</a>
+        <a href="#sec-approvals" class="nav-link" data-i18n="nav_approvals">02 / 待你确认</a>
         <a href="https://heurion.org/" class="nav-link" data-i18n="nav_home">Heurion 主站 ↗</a>
         <a href="https://github.com/heurion-org/aegis-os" target="_blank" rel="noopener" class="nav-link">GitHub ↗</a>
       </nav>
@@ -2347,89 +2346,15 @@ pub const DASHBOARD_HTML: &str = r##"<!doctype html>
       </div>
     </section>
 
-    <!-- Section 01: Pending Approvals -->
-    <section class="sec-primary" id="sec-approvals">
+    <!-- Section 01: Two-Column Plans (Simple Free Setup on Left, Guided Pro Purchase on Right) -->
+    <section class="sec-linen" id="sec-onboarding">
       <div class="container">
         <div class="section-header">
           <div class="section-title-group">
             <span class="section-num">01</span>
-            <h2 class="heading-2" data-i18n-html="sec1_title">待你确认的操作 <em>(Pending Approvals)</em></h2>
-            <span class="tag tag-warm"><span class="dot-warm"></span><span id="pending-pill">0</span></span>
-          </div>
-          <p class="label-caps" data-i18n="sec1_label">01 / 关键改动确认</p>
-        </div>
-
-        <div class="editorial-card">
-          <div style="display:flex; justify-content:space-between; align-items:center; gap:1rem; margin-bottom:1rem; flex-wrap:wrap;">
-            <p class="text-muted" data-i18n="sec1_note">AI 在云端沙箱里读文件、改代码、跑测试全部自动完成，不会频繁弹窗打扰你；只有当 AI 准备把最终修改写回主项目时，才会列在这里等你确认。</p>
-            <button class="btn" onclick="simulateEscalation()" data-i18n="btn_simulate_inline">+ 演示一条待确认请求</button>
-          </div>
-
-          <div id="approvals-box"></div>
-
-          <div id="diff-drawer">
-            <div style="display:flex; justify-content:space-between; align-items:center; margin-bottom:0.65rem;">
-              <span class="label-caps" id="diff-title" style="color:var(--ink);">代码改动对比 (DIFF)</span>
-              <button class="btn" onclick="document.getElementById('diff-drawer').style.display='none'" data-i18n="btn_close">收起预览</button>
-            </div>
-            <pre class="code" id="diff-content"></pre>
-          </div>
-        </div>
-      </div>
-    </section>
-
-    <!-- Section 02: Cloud Workspaces (Warm Linen #EFECE4) -->
-    <section class="sec-linen" id="sec-workspaces">
-      <div class="container">
-        <div class="section-header">
-          <div class="section-title-group">
-            <span class="section-num">02</span>
-            <h2 class="heading-2" data-i18n-html="sec2_title">云端项目工作区 <em>(Cloud Workspaces)</em></h2>
-          </div>
-          <p class="label-caps" data-i18n="sec2_label">02 / 免费版限 1 个工作区 · PRO 支持多个工作区</p>
-        </div>
-
-        <div class="editorial-card">
-          <div class="inline-bar" id="ws-create-bar">
-            <span style="font-size:0.8rem; color:var(--ink-secondary); margin-right:0.35rem;" data-i18n="ws_form_lbl">新建云工作区：</span>
-            <input class="mono-input" id="ws-org" value="aegis-os" placeholder="团队名称 (org)" style="width:130px;" />
-            <input class="mono-input" id="ws-id" value="ws-core" placeholder="工作区名称" style="width:130px;" />
-            <input class="mono-input" id="ws-src" value="." placeholder="Git 仓库地址或路径" style="width:190px;" />
-            <input class="mono-input" id="ws-agents" value="agy-agent" placeholder="AI 助手名（Pro 可用逗号分隔多个）" style="width:220px;" />
-            <button class="btn btn-solid" onclick="provisionWorkspace()" data-i18n="btn_provision">+ 创建云端工作区</button>
-          </div>
-
-          <div class="inline-bar" id="ws-free-limit-bar" style="display:none; justify-content:space-between; background:var(--bg-primary); padding:0.85rem 1.1rem; border:1px solid var(--border); margin-bottom:1.15rem;">
-            <span style="font-size:0.82rem; color:var(--ink-secondary);" data-i18n="ws_free_limit_msg">当前免费版已包含 1 个云端工作区（1 个 AI 助手）。如需同时创建多个项目工作区并运行最多 8 个 AI，请升级 Pro 专业版。</span>
-            <a class="btn btn-solid" href="#sec-onboarding" data-i18n="ws_free_upgrade_btn">升级 Pro 解锁多工作区 →</a>
-          </div>
-
-          <div class="table-wrap">
-            <table>
-              <thead>
-                <tr>
-                  <th data-i18n="th_ws_name">项目 / 工作区</th>
-                  <th data-i18n="th_ws_state">当前状态</th>
-                  <th data-i18n="th_ws_agents">正在里面的 AI 助手</th>
-                  <th data-i18n="th_ws_ops">操作</th>
-                </tr>
-              </thead>
-              <tbody id="ws-tbody"></tbody>
-            </table>
-          </div>
-        </div>
-      </div>
-    </section>
-
-    <!-- Section 03: Two-Column Plans (Simple Free Setup on Left, Guided Pro Purchase on Right) -->
-    <section class="sec-primary" id="sec-onboarding">
-      <div class="container">
-        <div class="section-header">
-          <div class="section-title-group">
-            <span class="section-num">03</span>
             <h2 class="heading-2" data-i18n-html="sec3_title">选择方案与 <em>30 秒快速开始</em></h2>
           </div>
-          <p class="label-caps" data-i18n="sec3_label">03 / 免费版直接用 · PRO 版在线开通</p>
+          <p class="label-caps" data-i18n="sec3_label">01 / 免费版直接用 · PRO 版在线开通</p>
         </div>
 
         <div class="onboarding-grid" style="grid-template-columns: 1fr 1fr; align-items: stretch; margin-bottom: 0;">
@@ -2491,6 +2416,37 @@ pub const DASHBOARD_HTML: &str = r##"<!doctype html>
         </div>
       </div>
     </section>
+
+    <!-- Section 02: Pending Approvals -->
+    <section class="sec-primary" id="sec-approvals">
+      <div class="container">
+        <div class="section-header">
+          <div class="section-title-group">
+            <span class="section-num">02</span>
+            <h2 class="heading-2" data-i18n-html="sec1_title">待你确认的操作 <em>(Pending Approvals)</em></h2>
+            <span class="tag tag-warm"><span class="dot-warm"></span><span id="pending-pill">0</span></span>
+          </div>
+          <p class="label-caps" data-i18n="sec1_label">02 / 关键改动确认</p>
+        </div>
+
+        <div class="editorial-card">
+          <div style="display:flex; justify-content:space-between; align-items:center; gap:1rem; margin-bottom:1rem; flex-wrap:wrap;">
+            <p class="text-muted" data-i18n="sec1_note">AI 在云端沙箱里读文件、改代码、跑测试全部自动完成，不会频繁弹窗打扰你；只有当 AI 准备把最终修改写回主项目时，才会列在这里等你确认。</p>
+            <button class="btn" onclick="simulateEscalation()" data-i18n="btn_simulate_inline">+ 演示一条待确认请求</button>
+          </div>
+
+          <div id="approvals-box"></div>
+
+          <div id="diff-drawer">
+            <div style="display:flex; justify-content:space-between; align-items:center; margin-bottom:0.65rem;">
+              <span class="label-caps" id="diff-title" style="color:var(--ink);">代码改动对比 (DIFF)</span>
+              <button class="btn" onclick="document.getElementById('diff-drawer').style.display='none'" data-i18n="btn_close">收起预览</button>
+            </div>
+            <pre class="code" id="diff-content"></pre>
+          </div>
+        </div>
+      </div>
+    </section>
   </main>
 
   <!-- Single-Row Minimal Heurion Footer -->
@@ -2525,9 +2481,8 @@ pub const DASHBOARD_HTML: &str = r##"<!doctype html>
 
     const DICT = {
       zh: {
-        nav_approvals: '01 / 待你确认',
-        nav_workspaces: '02 / 云端工作区',
-        nav_onboarding: '03 / 方案与接入',
+        nav_onboarding: '01 / 方案与接入',
+        nav_approvals: '02 / 待你确认',
         nav_home: 'Heurion 主站 ↗',
         nav_subscribe: '升级 Pro / 接入指南 →',
         hero_eyebrow: 'HEURION · AEGIS CLOUD 云端 AI 编程工作台',
@@ -2553,23 +2508,8 @@ pub const DASHBOARD_HTML: &str = r##"<!doctype html>
         svg_step3_s: '绝不乱覆盖代码',
         art_bot_l: '云主机：HEURION.ORG (64GB 内存)',
         art_bot_r: '闲置自动休眠 · 用时秒级唤醒',
-        sec1_title: '待你确认的操作 <em>(Pending Approvals)</em>',
-        sec1_label: '01 / 关键改动确认',
-        sec1_note: 'AI 在云端沙箱里读文件、改代码、跑测试全部自动完成，不会频繁弹窗打扰你；只有当 AI 准备把最终修改写回主项目时，才会列在这里等你确认。',
-        btn_simulate_inline: '+ 演示一条待确认请求',
-        btn_close: '收起预览',
-        sec2_title: '云端项目工作区 <em>(Cloud Workspaces)</em>',
-        sec2_label: '02 / 免费版限 1 个工作区 · PRO 支持多个工作区',
-        ws_form_lbl: '新建云工作区：',
-        btn_provision: '+ 创建云端工作区',
-        ws_free_limit_msg: '当前免费版已包含 1 个云端工作区（1 个 AI 助手）。如需创建多个项目工作区并同时运行最多 8 个 AI，请升级 Pro 专业版。',
-        ws_free_upgrade_btn: '升级 Pro 解锁多工作区 →',
-        th_ws_name: '项目 / 工作区',
-        th_ws_state: '当前状态',
-        th_ws_agents: '正在里面的 AI 助手',
-        th_ws_ops: '操作',
         sec3_title: '选择方案与 <em>30 秒快速开始</em>',
-        sec3_label: '03 / 免费版直接用 · PRO 版在线开通',
+        sec3_label: '01 / 免费版直接用 · PRO 版在线开通',
         tier_free_tag: '免费版 · 默认开启',
         tier_free_title: '$0 / 月 · 1 个云端工作区 · 1 个 AI',
         tier_free_desc: '无需注册或绑卡，也不需要手动传 API 密钥（系统会自动为你生成并绑定唯一的免费云端工作区）。只需在终端运行以下 2 行命令即可开始：',
@@ -2583,12 +2523,16 @@ pub const DASHBOARD_HTML: &str = r##"<!doctype html>
         claim_card_title: '② 完成订阅后：输入付款邮箱提取你的 Pro 专属密钥',
         btn_claim: '② 提取 Pro 密钥 →',
         pro_cmd_title: '③ 在项目文件夹运行 Pro 多 AI 并行命令：',
-        btn_copy_pro: '复制 Pro 命令'
+        btn_copy_pro: '复制 Pro 命令',
+        sec1_title: '待你确认的操作 <em>(Pending Approvals)</em>',
+        sec1_label: '02 / 关键改动确认',
+        sec1_note: 'AI 在云端沙箱里读文件、改代码、跑测试全部自动完成，不会频繁弹窗打扰你；只有当 AI 准备把最终修改写回主项目时，才会列在这里等你确认。',
+        btn_simulate_inline: '+ 演示一条待确认请求',
+        btn_close: '收起预览'
       },
       en: {
-        nav_approvals: '01 / Approvals',
-        nav_workspaces: '02 / Workspaces',
-        nav_onboarding: '03 / Plans & Setup',
+        nav_onboarding: '01 / Plans & Setup',
+        nav_approvals: '02 / Approvals',
         nav_home: 'Heurion.org ↗',
         nav_subscribe: 'Plans & Setup →',
         hero_eyebrow: 'HEURION · AEGIS CLOUD AI CODING WORKSPACE',
@@ -2614,23 +2558,8 @@ pub const DASHBOARD_HTML: &str = r##"<!doctype html>
         svg_step3_s: 'Zero silent overwrites',
         art_bot_l: 'HOST: HEURION.ORG (64GB RAM)',
         art_bot_r: 'AUTO-SLEEP WHEN IDLE · INSTANT WAKE',
-        sec1_title: 'Changes Awaiting Your Approval <em>(Pending Approvals)</em>',
-        sec1_label: '01 / SAFE MERGE CONFIRMATION',
-        sec1_note: 'Reading files, editing code, and running tests inside the cloud sandbox happen automatically without interrupting you. You only confirm when an AI wants to write final changes back to your main project.',
-        btn_simulate_inline: '+ Create Demo Request',
-        btn_close: 'Close Preview',
-        sec2_title: 'Cloud Project Workspaces <em>(Cloud Workspaces)</em>',
-        sec2_label: '02 / FREE: 1 WORKSPACE · PRO: MULTIPLE WORKSPACES',
-        ws_form_lbl: 'New Workspace:',
-        btn_provision: '+ Create Workspace',
-        ws_free_limit_msg: 'Free Plan includes 1 cloud workspace (1 AI assistant). Upgrade to Pro to create multiple workspaces and run up to 8 AIs in parallel.',
-        ws_free_upgrade_btn: 'Upgrade to Pro →',
-        th_ws_name: 'Project / Workspace',
-        th_ws_state: 'Status',
-        th_ws_agents: 'Active AI Assistants',
-        th_ws_ops: 'Actions',
         sec3_title: 'Choose Your Plan &amp; <em>Start in 30 Seconds</em>',
-        sec3_label: '03 / FREE VS. PRO PLANS',
+        sec3_label: '01 / FREE VS. PRO PLANS',
         tier_free_tag: 'FREE PLAN · DEFAULT',
         tier_free_title: '$0 / mo · 1 Workspace · 1 AI',
         tier_free_desc: 'No credit card and no manual --api-key needed (automatically generated and bound to your single free workspace). Just run these 2 commands:',
@@ -2644,7 +2573,12 @@ pub const DASHBOARD_HTML: &str = r##"<!doctype html>
         claim_card_title: '② After payment: Enter your checkout email to claim your Pro API key',
         btn_claim: '② Claim Pro Key →',
         pro_cmd_title: '③ Run inside your project folder to launch up to 8 parallel AIs:',
-        btn_copy_pro: 'Copy Pro Commands'
+        btn_copy_pro: 'Copy Pro Commands',
+        sec1_title: 'Changes Awaiting Your Approval <em>(Pending Approvals)</em>',
+        sec1_label: '02 / SAFE MERGE CONFIRMATION',
+        sec1_note: 'Reading files, editing code, and running tests inside the cloud sandbox happen automatically without interrupting you. You only confirm when an AI wants to write final changes back to your main project.',
+        btn_simulate_inline: '+ Create Demo Request',
+        btn_close: 'Close Preview'
       }
     };
 
@@ -2924,35 +2858,6 @@ cd 你的项目文件夹 && aegis-os cloud up --api-key ${latestKey} --agents ag
             </div>
           `).join('');
         }
-
-        document.getElementById('ws-tbody').innerHTML = workspaces.length === 0
-          ? `<tr><td colspan="4" class="empty">${currentLang === 'en' ? 'No cloud workspaces yet. Run "aegis-os cloud up --endpoint https://heurion.org" in your project folder to start.' : '还没有创建云端工作区，在你的项目文件夹运行下方免费版命令或点击上方「+ 创建云端工作区」即可开始。'}</td></tr>`
-          : workspaces.map(w => {
-              const isHib = w.status === 'hibernated';
-              const firstAgent = (w.agents && w.agents[0]) || 'agy-agent';
-              return `
-                <tr>
-                  <td>
-                    <strong style="font-weight:500;">${w.org_id}/${w.workspace_id}</strong>
-                    <code class="mono" style="font-size:0.74rem; color:var(--ink-muted); margin-left:0.4rem;">(${w.branch})</code>
-                  </td>
-                  <td>
-                    <span class="tag ${isHib ? '' : 'tag-active'}">
-                      ${isHib ? '' : '<span class="dot-mint"></span>'}
-                      ${isHib ? (currentLang === 'en' ? 'SLEEPING · 0 RAM' : '已休眠 · 不占内存') : (currentLang === 'en' ? 'RUNNING' : '运行中')}
-                    </span>
-                  </td>
-                  <td>${(w.agents || []).map(a => `<code class="mono" style="font-size:0.76rem; padding:0.12rem 0.45rem; border:1px solid var(--border); background:var(--bg-primary); margin-right:0.35rem;">${a}</code>`).join('')}</td>
-                  <td>
-                    <div class="actions">
-                      <button class="btn" onclick="inspectDiff('${w.org_id}', '${firstAgent}', '${w.workspace_id}')">${currentLang === 'en' ? 'View Diff' : '查看改动'}</button>
-                      <button class="btn" onclick="toggleHibernate('${w.org_id}', '${w.workspace_id}', '${w.status || 'active'}')">${isHib ? (currentLang === 'en' ? 'Wake Up' : '唤醒') : (currentLang === 'en' ? 'Put to Sleep' : '休眠省内存')}</button>
-                      <button class="btn btn-solid" onclick="exportPr('${w.org_id}', '${w.workspace_id}', '${firstAgent}')">${currentLang === 'en' ? 'Export PR →' : '生成 PR 补丁 →'}</button>
-                      <button class="btn btn-danger" onclick="deleteWorkspace('${w.org_id}', '${w.workspace_id}')">${currentLang === 'en' ? 'Delete' : '删除'}</button>
-                    </div>
-                  </td>
-                </tr>`;
-            }).join('');
       } catch (e) {
         console.error(e);
       }
