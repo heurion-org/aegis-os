@@ -2388,15 +2388,15 @@ pub const DASHBOARD_HTML: &str = r##"<!doctype html>
         <div class="hero-grid">
           <div class="hero-left">
             <div class="hero-intro">
-              <p class="label-caps" data-i18n="hero_eyebrow">HEURION · AEGIS CLOUD 云端 AI 编程沙箱</p>
-              <h1 class="heading-1" data-i18n-html="hero_title">让 AI 在云端改代码跑测试，<br>电脑<em>不卡顿</em>，原项目<em>不怕改坏</em>。</h1>
-              <p class="text-muted" data-i18n="hero_desc">只需一行命令安装插件，你的 AI 编程工具（Claude Code / Cursor / Codex / AGY）就会自动接入 64GB 云端沙箱。你无需记任何终端命令，只需像平时一样在对话框里用自然语言对 AI 说话——AI 会自动在云端独立副本里改代码、跑测试、看对比，确认无误后自动同步回你的本地项目。</p>
+              <p class="label-caps" data-i18n="hero_eyebrow">HEURION · AEGIS CLOUD 通用 AI AGENT 云端沙箱</p>
+              <h1 class="heading-1" data-i18n-html="hero_title">让你的 AI Agent 在云端放手执行任务，<br>本地电脑<em>零负担</em>，原工作区<em>不怕改坏</em>。</h1>
+              <p class="text-muted" data-i18n="hero_desc">只需一行命令安装插件，你的通用 AI Agent（Claude / Cursor / Codex / AGY 等）就会自动接入 64GB 云端沙箱。无需记任何终端命令，像平时一样在对话框里用自然语言交代任务——无论是调研分析、文档处理、自动化执行还是软件构建，AI 都会在云端独立副本里安全运行，确认无误后再同步回你的电脑。</p>
             </div>
 
             <div class="telemetry-strip">
               <div class="stat-cell">
                 <span class="stat-val" style="color:var(--accent);">64 GB</span>
-                <span class="stat-lbl" data-i18n="st_lbl_ram">云端独占编译内存</span>
+                <span class="stat-lbl" data-i18n="st_lbl_ram">云端独占运行内存</span>
               </div>
               <div class="stat-cell">
                 <span class="stat-val">0%</span>
@@ -2404,7 +2404,7 @@ pub const DASHBOARD_HTML: &str = r##"<!doctype html>
               </div>
               <div class="stat-cell">
                 <span class="stat-val stat-val-mono" data-i18n="st_val_safe">自然语言驱动</span>
-                <span class="stat-lbl" data-i18n="st_lbl_safe">直接对 AI 说话，无需手敲命令</span>
+                <span class="stat-lbl" data-i18n="st_lbl_safe">直接对 AI Agent 说话，无需敲命令</span>
               </div>
             </div>
           </div>
@@ -2412,18 +2412,18 @@ pub const DASHBOARD_HTML: &str = r##"<!doctype html>
           <!-- Clear 3-Step E2E Workflow Diagram Plate -->
           <div class="hero-art" aria-hidden="true">
             <div class="art-header">
-              <span data-i18n="art_top_l">CODING AGENT 自动调用工作流</span>
+              <span data-i18n="art_top_l">AI AGENT 自动调用工作流</span>
               <span data-i18n="art_top_r">64GB 云端主机</span>
             </div>
             <svg class="art-svg" viewBox="0 0 460 210" fill="none" xmlns="http://www.w3.org/2000/svg">
               <circle cx="230" cy="105" r="92" stroke="#DCD6CA" stroke-width="1" stroke-dasharray="2 4"/>
               <line x1="230" y1="8" x2="230" y2="202" stroke="#E5E0D5" stroke-width="1"/>
 
-              <!-- Step 1: Chat in Coding Agent -->
+              <!-- Step 1: Chat in AI Agent -->
               <rect x="14" y="70" width="104" height="70" fill="#F2EFE9" stroke="#233E33" stroke-width="1"/>
-              <text x="66" y="94" text-anchor="middle" fill="#151C19" font-family="Inter, PingFang SC, sans-serif" font-size="9.0" font-weight="600" data-i18n="svg_step1_t">1. 在 AI 对话框提问</text>
+              <text x="66" y="94" text-anchor="middle" fill="#151C19" font-family="Inter, PingFang SC, sans-serif" font-size="9.0" font-weight="600" data-i18n="svg_step1_t">1. 在对话框交代任务</text>
               <text x="66" y="112" text-anchor="middle" fill="#525B56" font-family="JetBrains Mono, PingFang SC, sans-serif" font-size="7.6" data-i18n="svg_step1_d">AI 自动同步云端副本</text>
-              <text x="66" y="128" text-anchor="middle" fill="#233E33" font-family="JetBrains Mono, PingFang SC, sans-serif" font-size="7.5" data-i18n="svg_step1_s">0% 本地内存占用</text>
+              <text x="66" y="128" text-anchor="middle" fill="#233E33" font-family="JetBrains Mono, PingFang SC, sans-serif" font-size="7.5" data-i18n="svg_step1_s">0% 本地资源占用</text>
 
               <!-- Fork Lines -->
               <path d="M118 105 L140 105 L152 52 L164 52" stroke="#848D88" stroke-width="1"/>
@@ -2432,14 +2432,14 @@ pub const DASHBOARD_HTML: &str = r##"<!doctype html>
 
               <!-- Step 2: Cloud Sandbox Execution -->
               <rect x="164" y="35" width="132" height="34" fill="#FDFCF9" stroke="#C8C1B4" stroke-width="1"/>
-              <text x="230" y="55" text-anchor="middle" fill="#525B56" font-family="Inter, PingFang SC, sans-serif" font-size="8.4" data-i18n="svg_ai1">AI 助手 A · 写新功能</text>
+              <text x="230" y="55" text-anchor="middle" fill="#525B56" font-family="Inter, PingFang SC, sans-serif" font-size="8.4" data-i18n="svg_ai1">Agent A · 调研与分析</text>
 
               <rect x="164" y="88" width="132" height="34" fill="#E3ECE7" stroke="#233E33" stroke-width="1"/>
               <circle cx="178" cy="105" r="3" fill="#00C472"/>
-              <text x="236" y="108" text-anchor="middle" fill="#151C19" font-family="Inter, PingFang SC, sans-serif" font-size="8.4" font-weight="600" data-i18n="svg_ai2">AI 助手 B · 跑测试修 Bug</text>
+              <text x="236" y="108" text-anchor="middle" fill="#151C19" font-family="Inter, PingFang SC, sans-serif" font-size="8.4" font-weight="600" data-i18n="svg_ai2">Agent B · 执行与处理</text>
 
               <rect x="164" y="141" width="132" height="34" fill="#FDFCF9" stroke="#C8C1B4" stroke-width="1"/>
-              <text x="230" y="161" text-anchor="middle" fill="#525B56" font-family="Inter, PingFang SC, sans-serif" font-size="8.4" data-i18n="svg_ai3">AI 助手 C · 代码审查</text>
+              <text x="230" y="161" text-anchor="middle" fill="#525B56" font-family="Inter, PingFang SC, sans-serif" font-size="8.4" data-i18n="svg_ai3">Agent C · 复核与校验</text>
 
               <!-- Merge Lines -->
               <path d="M296 52 L308 52 L320 105 L342 105" stroke="#848D88" stroke-width="1"/>
@@ -2450,11 +2450,11 @@ pub const DASHBOARD_HTML: &str = r##"<!doctype html>
               <rect x="342" y="70" width="104" height="70" fill="#233E33"/>
               <circle cx="357" cy="88" r="3.5" fill="#00C472"/>
               <text x="399" y="92" text-anchor="middle" fill="#FAF8F4" font-family="Inter, PingFang SC, sans-serif" font-size="8.8" font-weight="600" data-i18n="svg_step3_t">2. 对话确认即合并</text>
-              <text x="394" y="110" text-anchor="middle" fill="#E3ECE7" font-family="JetBrains Mono, PingFang SC, sans-serif" font-size="7.5" data-i18n="svg_step3_d">AI 自动看对比 (diff)</text>
+              <text x="394" y="110" text-anchor="middle" fill="#E3ECE7" font-family="JetBrains Mono, PingFang SC, sans-serif" font-size="7.5" data-i18n="svg_step3_d">AI 自动看变更对比</text>
               <text x="394" y="126" text-anchor="middle" fill="#00C472" font-family="JetBrains Mono, PingFang SC, sans-serif" font-size="7.5" data-i18n="svg_step3_s">自动同步回你的电脑</text>
             </svg>
             <div class="art-caption">
-              <span data-i18n="art_bot_l">支持 CLAUDE CODE · CURSOR · CODEX · AGY</span>
+              <span data-i18n="art_bot_l">支持 CLAUDE · CURSOR · CODEX · AGY 等通用 AGENT</span>
               <span data-i18n="art_bot_r">全程由 AI 自动调用 MCP</span>
             </div>
           </div>
@@ -2469,20 +2469,20 @@ pub const DASHBOARD_HTML: &str = r##"<!doctype html>
           <div class="section-title-group">
             <h2 class="heading-2" data-i18n-html="sec3_title">选择方案与 <em>30 秒完整使用流程</em></h2>
           </div>
-          <p class="label-caps" data-i18n="sec3_label">安装一次插件 · 后续全部在你的 AI 编程工具对话框内完成</p>
+          <p class="label-caps" data-i18n="sec3_label">安装一次插件 · 后续全部在你的 AI AGENT 对话框内完成</p>
         </div>
 
         <div class="onboarding-grid">
-          <!-- Left Card: Free Plan (1-Line Install + Natural Language in Coding Agent) -->
+          <!-- Left Card: Free Plan (1-Line Install + Natural Language in AI Agent) -->
           <div class="editorial-card">
             <div class="card-body">
               <div class="card-head">
                 <div>
                   <span class="tag" data-i18n="tier_free_tag">免费版 · 无需注册或绑卡</span>
-                  <h3 class="card-title" data-i18n="tier_free_title">$0 / 月 · 1 个云端工作区 · 1 个 AI</h3>
+                  <h3 class="card-title" data-i18n="tier_free_title">$0 / 月 · 1 个云端工作区 · 1 个 Agent</h3>
                 </div>
               </div>
-              <p class="card-desc" data-i18n="tier_free_desc">只需在终端运行一次安装命令，自动把 Aegis OS 接入你的 AI 编程工具（Claude Code / Cursor / Codex / AGY），全程无需手动管理密钥：</p>
+              <p class="card-desc" data-i18n="tier_free_desc">只需在终端运行一次安装命令，自动把 Aegis OS 接入你的 AI Agent 客户端（Claude / Cursor / Codex / AGY 等），全程无需手动管理密钥：</p>
 
               <div class="cmd-bar">
                 <span class="cmd-title" data-i18n="free_cmd_title">① 首次安装（在本地终端运行一次）：</span>
@@ -2492,27 +2492,27 @@ pub const DASHBOARD_HTML: &str = r##"<!doctype html>
             </div>
 
             <div class="sub-box">
-              <div style="font-size:0.8rem; font-weight:600; color:var(--ink); margin-bottom:0.45rem;" data-i18n="free_step3_title">② 安装后打开你的 AI 编程工具，直接用自然语言对 AI 说：</div>
+              <div style="font-size:0.8rem; font-weight:600; color:var(--ink); margin-bottom:0.45rem;" data-i18n="free_step3_title">② 安装后打开你的 AI Agent，直接用自然语言对它说：</div>
               <div style="display:grid; gap:0.4rem; font-size:0.78rem; color:var(--ink-secondary);">
                 <div><code class="mono" style="color:var(--accent); font-weight:600;" data-i18n="prompt_free_1">「开启 Aegis 免费云端沙箱模式」</code> — <span data-i18n="cmd_diff_desc">本地进程自动绑定免费工作区（密钥不经过大模型）</span></div>
-                <div><code class="mono" style="color:var(--accent); font-weight:600;" data-i18n="prompt_free_2">「看看你在云端改了哪些代码」</code> — <span data-i18n="cmd_pull_desc">AI 自动调用 workspace_diff 给你展示改动对比</span></div>
-                <div><code class="mono" style="color:var(--accent); font-weight:600;" data-i18n="prompt_free_3">「确认没问题，把云端改动合并回本地」</code> — <span data-i18n="cmd_down_desc">AI 自动调用 workspace_commit 同步回你的电脑</span></div>
+                <div><code class="mono" style="color:var(--accent); font-weight:600;" data-i18n="prompt_free_2">「看看你在云端做了哪些改动」</code> — <span data-i18n="cmd_pull_desc">AI 自动调用 workspace_diff 展示所有变更对比</span></div>
+                <div><code class="mono" style="color:var(--accent); font-weight:600;" data-i18n="prompt_free_3">「确认没问题，把云端结果同步回本地」</code> — <span data-i18n="cmd_down_desc">AI 自动调用 workspace_commit 同步回你的电脑</span></div>
               </div>
             </div>
           </div>
 
-          <!-- Right Card: Pro Plan ($29/mo, Local Terminal Bind + Natural Language in Coding Agent, Zero LLM Key Exposure) -->
+          <!-- Right Card: Pro Plan ($29/mo, Local Terminal Bind + Natural Language in AI Agent, Zero LLM Key Exposure) -->
           <div class="editorial-card editorial-card-pro">
             <div class="card-body">
               <div class="card-head">
                 <div>
-                  <span class="tag tag-active"><span class="dot-mint"></span><span data-i18n="tier_pro_tag">PRO 专业版 · 多 AI 并行</span></span>
-                  <h3 class="card-title" data-i18n="tier_pro_title">$29 / 月 · 多个工作区 · 8 个 AI 并行</h3>
+                  <span class="tag tag-active"><span class="dot-mint"></span><span data-i18n="tier_pro_tag">PRO 专业版 · 多 AGENT 并行</span></span>
+                  <h3 class="card-title" data-i18n="tier_pro_title">$29 / 月 · 多个工作区 · 8 个 Agent 并行</h3>
                 </div>
                 <a class="btn btn-solid" href="https://buy.polar.sh/polar_cl_jCPpzbp4eOAyRbkDP4YzNIFVnYLddbvJZI5Fc27zL0x" target="_blank" rel="noopener" data-i18n="btn_buy_pro">① 立即订阅 Pro ($29/月) →</a>
               </div>
 
-              <p class="card-desc" data-i18n="tier_pro_desc">解锁最多 16 个云端工作区与 8 个 AI 并行：密钥通过终端命令直接存入你本机（~/.aegis-os），由本地进程自动附加，绝不暴露给大模型：</p>
+              <p class="card-desc" data-i18n="tier_pro_desc">解锁最多 16 个云端工作区与 8 个 AI Agent 并行：密钥通过终端命令直接存入你本机（~/.aegis-os），由本地进程自动附加，绝不暴露给大模型：</p>
 
               <div class="cmd-bar">
                 <span class="cmd-title" data-i18n="pro_cmd_title">② 付款后在终端运行一次（密钥直存本机，不经过 LLM）：</span>
@@ -2522,11 +2522,11 @@ pub const DASHBOARD_HTML: &str = r##"<!doctype html>
             </div>
 
             <div class="sub-box">
-              <div style="font-size:0.8rem; font-weight:600; color:var(--accent); margin-bottom:0.45rem;" data-i18n="claim_card_title">③ 绑定后打开你的 AI 编程工具，直接用自然语言对 AI 说（无需传密钥）：</div>
+              <div style="font-size:0.8rem; font-weight:600; color:var(--accent); margin-bottom:0.45rem;" data-i18n="claim_card_title">③ 绑定后打开你的 AI Agent，直接用自然语言对它说（无需传密钥）：</div>
               <div style="display:grid; gap:0.4rem; font-size:0.78rem; color:var(--ink-secondary);">
                 <div><code class="mono" style="color:var(--accent); font-weight:600;" data-i18n="prompt_pro_1">「开启 Aegis Cloud Pro 云端沙箱模式」</code> — <span data-i18n="pro_desc_1">本地进程自动读取本机 Pro 凭证（LLM 零接触密钥）</span></div>
-                <div><code class="mono" style="color:var(--accent); font-weight:600;" data-i18n="prompt_pro_2">「派 3 个子 Agent 在云端并行写接口、跑测试、做审查」</code> — <span data-i18n="pro_desc_2">最多 8 个 AI 在 64GB 云端独立副本同时工作</span></div>
-                <div><code class="mono" style="color:var(--accent); font-weight:600;" data-i18n="prompt_pro_3">「看看云端改了哪些代码，确认没问题就合并回本地」</code> — <span data-i18n="pro_desc_3">AI 自动对比改动并同步回你的电脑</span></div>
+                <div><code class="mono" style="color:var(--accent); font-weight:600;" data-i18n="prompt_pro_2">「派 3 个子 Agent 在云端并行做调研、跑分析、生成结果」</code> — <span data-i18n="pro_desc_2">最多 8 个 Agent 在 64GB 云端独立副本同时工作</span></div>
+                <div><code class="mono" style="color:var(--accent); font-weight:600;" data-i18n="prompt_pro_3">「看看云端的改动结果，确认没问题就同步回本地」</code> — <span data-i18n="pro_desc_3">AI 自动对比变更并同步回你的电脑</span></div>
               </div>
             </div>
           </div>
@@ -2568,104 +2568,104 @@ pub const DASHBOARD_HTML: &str = r##"<!doctype html>
       zh: {
         nav_home: 'Heurion 主站 ↗',
         nav_subscribe: '立即订阅 Pro ($29/月) →',
-        hero_eyebrow: 'HEURION · AEGIS CLOUD 云端 AI 编程沙箱',
-        hero_title: '让 AI 在云端改代码跑测试，<br>电脑<em>不卡顿</em>，原项目<em>不怕改坏</em>。',
-        hero_desc: '只需一行命令安装插件，你的 AI 编程工具（Claude Code / Cursor / Codex / AGY）就会自动接入 64GB 云端沙箱。你无需记任何终端命令，只需像平时一样在对话框里用自然语言对 AI 说话——AI 会自动在云端独立副本里改代码、跑测试、看对比，确认无误后自动同步回你的本地项目。',
-        st_lbl_ram: '云端独占编译内存',
+        hero_eyebrow: 'HEURION · AEGIS CLOUD 通用 AI AGENT 云端沙箱',
+        hero_title: '让你的 AI Agent 在云端放手执行任务，<br>本地电脑<em>零负担</em>，原工作区<em>不怕改坏</em>。',
+        hero_desc: '只需一行命令安装插件，你的通用 AI Agent（Claude / Cursor / Codex / AGY 等）就会自动接入 64GB 云端沙箱。无需记任何终端命令，像平时一样在对话框里用自然语言交代任务——无论是调研分析、文档处理、自动化执行还是软件构建，AI 都会在云端独立副本里安全运行，确认无误后再同步回你的电脑。',
+        st_lbl_ram: '云端独占运行内存',
         st_lbl_cpu: '本地电脑 CPU / 内存占用',
         st_val_safe: '自然语言驱动',
-        st_lbl_safe: '直接对 AI 说话，无需手敲命令',
-        art_top_l: 'CODING AGENT 自动调用工作流',
+        st_lbl_safe: '直接对 AI Agent 说话，无需敲命令',
+        art_top_l: 'AI AGENT 自动调用工作流',
         art_top_r: '64GB 云端主机',
-        svg_step1_t: '1. 在 AI 对话框提问',
+        svg_step1_t: '1. 在对话框交代任务',
         svg_step1_d: 'AI 自动同步云端副本',
-        svg_step1_s: '0% 本地内存占用',
-        svg_ai1: 'AI 助手 A · 写新功能',
-        svg_ai2: 'AI 助手 B · 跑测试修 Bug',
-        svg_ai3: 'AI 助手 C · 代码审查',
+        svg_step1_s: '0% 本地资源占用',
+        svg_ai1: 'Agent A · 调研与分析',
+        svg_ai2: 'Agent B · 执行与处理',
+        svg_ai3: 'Agent C · 复核与校验',
         svg_step3_t: '2. 对话确认即合并',
-        svg_step3_d: 'AI 自动看对比 (diff)',
+        svg_step3_d: 'AI 自动看变更对比',
         svg_step3_s: '自动同步回你的电脑',
-        art_bot_l: '支持 CLAUDE CODE · CURSOR · CODEX · AGY',
+        art_bot_l: '支持 CLAUDE · CURSOR · CODEX · AGY 等通用 AGENT',
         art_bot_r: '全程由 AI 自动调用 MCP',
         sec3_title: '选择方案与 <em>30 秒完整使用流程</em>',
-        sec3_label: '安装一次插件 · 后续全部在你的 AI 编程工具对话框内完成',
+        sec3_label: '安装一次插件 · 后续全部在你的 AI AGENT 对话框内完成',
         tier_free_tag: '免费版 · 无需注册或绑卡',
-        tier_free_title: '$0 / 月 · 1 个云端工作区 · 1 个 AI',
-        tier_free_desc: '只需在终端运行一次安装命令，自动把 Aegis OS 接入你的 AI 编程工具（Claude Code / Cursor / Codex / AGY），全程无需手动管理密钥：',
+        tier_free_title: '$0 / 月 · 1 个云端工作区 · 1 个 Agent',
+        tier_free_desc: '只需在终端运行一次安装命令，自动把 Aegis OS 接入你的 AI Agent 客户端（Claude / Cursor / Codex / AGY 等），全程无需手动管理密钥：',
         free_cmd_title: '① 首次安装（在本地终端运行一次）：',
         btn_copy_free: '复制安装命令',
-        free_step3_title: '② 安装后打开你的 AI 编程工具，直接用自然语言对 AI 说：',
+        free_step3_title: '② 安装后打开你的 AI Agent，直接用自然语言对它说：',
         prompt_free_1: '「开启 Aegis 免费云端沙箱模式」',
         cmd_diff_desc: '本地进程自动绑定免费工作区（密钥不经过大模型）',
-        prompt_free_2: '「看看你在云端改了哪些代码」',
-        cmd_pull_desc: 'AI 自动调用 workspace_diff 给你展示改动对比',
-        prompt_free_3: '「确认没问题，把云端改动合并回本地」',
+        prompt_free_2: '「看看你在云端做了哪些改动」',
+        cmd_pull_desc: 'AI 自动调用 workspace_diff 展示所有变更对比',
+        prompt_free_3: '「确认没问题，把云端结果同步回本地」',
         cmd_down_desc: 'AI 自动调用 workspace_commit 同步回你的电脑',
-        tier_pro_tag: 'PRO 专业版 · 多 AI 并行',
-        tier_pro_title: '$29 / 月 · 多个工作区 · 8 个 AI 并行',
+        tier_pro_tag: 'PRO 专业版 · 多 AGENT 并行',
+        tier_pro_title: '$29 / 月 · 多个工作区 · 8 个 Agent 并行',
         btn_buy_pro: '① 立即订阅 Pro ($29/月) →',
-        tier_pro_desc: '解锁最多 16 个云端工作区与 8 个 AI 并行：密钥通过终端命令直接存入你本机（~/.aegis-os），由本地进程自动附加，绝不暴露给大模型：',
+        tier_pro_desc: '解锁最多 16 个云端工作区与 8 个 AI Agent 并行：密钥通过终端命令直接存入你本机（~/.aegis-os），由本地进程自动附加，绝不暴露给大模型：',
         pro_cmd_title: '② 付款后在终端运行一次（密钥直存本机，不经过 LLM）：',
         btn_copy_pro: '复制绑定命令',
-        claim_card_title: '③ 绑定后打开你的 AI 编程工具，直接用自然语言对 AI 说（无需传密钥）：',
+        claim_card_title: '③ 绑定后打开你的 AI Agent，直接用自然语言对它说（无需传密钥）：',
         prompt_pro_1: '「开启 Aegis Cloud Pro 云端沙箱模式」',
         pro_desc_1: '本地进程自动读取本机 Pro 凭证（LLM 零接触密钥）',
-        prompt_pro_2: '「派 3 个子 Agent 在云端并行写接口、跑测试、做审查」',
-        pro_desc_2: '最多 8 个 AI 在 64GB 云端独立副本同时工作',
-        prompt_pro_3: '「看看云端改了哪些代码，确认没问题就合并回本地」',
-        pro_desc_3: 'AI 自动对比改动并同步回你的电脑'
+        prompt_pro_2: '「派 3 个子 Agent 在云端并行做调研、跑分析、生成结果」',
+        pro_desc_2: '最多 8 个 Agent 在 64GB 云端独立副本同时工作',
+        prompt_pro_3: '「看看云端的改动结果，确认没问题就同步回本地」',
+        pro_desc_3: 'AI 自动对比变更并同步回你的电脑'
       },
       en: {
         nav_home: 'Heurion.org ↗',
         nav_subscribe: 'Subscribe to Pro ($29/mo) →',
-        hero_eyebrow: 'HEURION · AEGIS CLOUD AI CODING SANDBOX',
-        hero_title: 'Run coding AIs in the cloud —<br><em>zero local lag</em>, <em>zero risk</em> to your repo.',
-        hero_desc: 'Install once with a single command to connect Claude Code, Cursor, Codex, or AGY to our 64GB cloud sandbox. No terminal commands to memorize — just chat with your coding agent in natural language, and it automatically edits, tests, diffs, and syncs approved changes back to your laptop.',
+        hero_eyebrow: 'HEURION · AEGIS CLOUD AI AGENT SANDBOX',
+        hero_title: 'Run your AI Agents in the cloud —<br><em>zero local lag</em>, <em>zero risk</em> to your files.',
+        hero_desc: 'Install once with a single command to connect your AI Agent (Claude, Cursor, Codex, AGY, etc.) to our 64GB cloud sandbox. Just assign tasks in natural language — whether research, data analysis, automation, or software engineering, your agent runs safely in an isolated cloud copy and syncs approved results back to your machine.',
         st_lbl_ram: 'Dedicated Cloud RAM',
         st_lbl_cpu: 'Local CPU / RAM Usage',
         st_val_safe: 'Chat-Driven',
-        st_lbl_safe: 'Controlled directly via your Coding Agent',
-        art_top_l: 'CODING AGENT MCP WORKFLOW',
+        st_lbl_safe: 'Controlled directly via your AI Agent',
+        art_top_l: 'AI AGENT MCP WORKFLOW',
         art_top_r: '64GB CLOUD HOST',
-        svg_step1_t: '1. Ask Your AI in Chat',
+        svg_step1_t: '1. Assign Task in Chat',
         svg_step1_d: 'Auto-synced cloud copy',
         svg_step1_s: '0% local CPU / RAM',
-        svg_ai1: 'Agent A · New Feature',
-        svg_ai2: 'Agent B · Run Tests & Fix',
-        svg_ai3: 'Agent C · Code Review',
+        svg_ai1: 'Agent A · Research & Analyze',
+        svg_ai2: 'Agent B · Execute & Process',
+        svg_ai3: 'Agent C · Verify & Review',
         svg_step3_t: '2. Approve in Chat',
-        svg_step3_d: 'AI runs workspace_diff',
+        svg_step3_d: 'AI previews all changes',
         svg_step3_s: 'Auto-synced to laptop',
-        art_bot_l: 'WORKS WITH CLAUDE CODE · CURSOR · CODEX · AGY',
-        art_bot_r: '100% DRIVEN BY YOUR CODING AGENT',
+        art_bot_l: 'WORKS WITH CLAUDE · CURSOR · CODEX · AGY',
+        art_bot_r: '100% DRIVEN BY YOUR AI AGENT',
         sec3_title: 'Choose Your Plan &amp; <em>30-Second Setup</em>',
-        sec3_label: 'INSTALL ONCE · EVERYTHING ELSE HAPPENS IN YOUR CODING AGENT CHAT',
+        sec3_label: 'INSTALL ONCE · EVERYTHING ELSE HAPPENS IN YOUR AI AGENT CHAT',
         tier_free_tag: 'FREE PLAN · NO SIGNUP REQUIRED',
-        tier_free_title: '$0 / mo · 1 Workspace · 1 AI',
-        tier_free_desc: 'Run the 1-line installer once in terminal to wire Aegis OS into Claude Code, Cursor, Codex, or AGY. Zero manual key management required:',
+        tier_free_title: '$0 / mo · 1 Workspace · 1 Agent',
+        tier_free_desc: 'Run the 1-line installer once in terminal to wire Aegis OS into your AI Agent (Claude, Cursor, Codex, or AGY). Zero manual key management required:',
         free_cmd_title: '① One-Time Install (run once in local terminal):',
         btn_copy_free: 'Copy Install Command',
-        free_step3_title: '② Open your Coding Agent and say in natural language:',
+        free_step3_title: '② Open your AI Agent and say in natural language:',
         prompt_free_1: '"Enable Aegis free cloud sandbox mode"',
         cmd_diff_desc: 'Local runtime auto-binds your free workspace (key never touches LLM)',
-        prompt_free_2: '"Show me the diff of your cloud changes"',
-        cmd_pull_desc: 'AI calls workspace_diff to display all changes',
-        prompt_free_3: '"Looks good, commit the cloud changes back to my repo"',
+        prompt_free_2: '"Show me the changes you made in the cloud"',
+        cmd_pull_desc: 'AI calls workspace_diff to display all file changes',
+        prompt_free_3: '"Looks good, sync the cloud results back to my workspace"',
         cmd_down_desc: 'AI calls workspace_commit & syncs files back to your laptop',
-        tier_pro_tag: 'PRO PLAN · PARALLEL AI',
-        tier_pro_title: '$29 / mo · Multi-Workspace · 8 AIs',
+        tier_pro_tag: 'PRO PLAN · PARALLEL AGENTS',
+        tier_pro_title: '$29 / mo · Multi-Workspace · 8 Agents',
         btn_buy_pro: '① Subscribe to Pro ($29/mo) →',
-        tier_pro_desc: 'Unlock up to 16 cloud workspaces and 8 parallel AIs: bind your Pro subscription in local terminal so your API key stays in ~/.aegis-os and never enters the LLM context:',
+        tier_pro_desc: 'Unlock up to 16 cloud workspaces and 8 parallel AI Agents: bind your Pro subscription in local terminal so your API key stays in ~/.aegis-os and never enters the LLM context:',
         pro_cmd_title: '② After payment, bind once in terminal (key stays local, never in LLM):',
         btn_copy_pro: 'Copy Bind Command',
-        claim_card_title: '③ Open your Coding Agent and say in natural language (no key needed):',
+        claim_card_title: '③ Open your AI Agent and say in natural language (no key needed):',
         prompt_pro_1: '"Enable Aegis Cloud Pro sandbox mode"',
         pro_desc_1: 'Local runtime uses your bound Pro key (zero LLM exposure)',
-        prompt_pro_2: '"Spawn 3 sub-agents in the cloud to code, test, and review"',
-        pro_desc_2: 'Up to 8 AIs run in parallel in isolated 64GB cloud copies',
-        prompt_pro_3: '"Show me the cloud diff and commit the approved changes"',
-        pro_desc_3: 'AI reviews the diff and syncs changes back to your laptop'
+        prompt_pro_2: '"Spawn 3 sub-agents in the cloud to research, analyze, and execute"',
+        pro_desc_2: 'Up to 8 Agents run in parallel in isolated 64GB cloud copies',
+        prompt_pro_3: '"Show me the cloud changes and sync the approved results"',
+        pro_desc_3: 'AI reviews the diff and syncs results back to your laptop'
       }
     };
 

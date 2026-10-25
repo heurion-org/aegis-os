@@ -296,7 +296,8 @@ pub async fn cloud_http_json(
         return Ok(parsed);
     }
 
-    // Fallback to `curl` for `https://` TLS endpoints
+    // Fallback to `curl` for `https://` TLS endpoints (pipe JSON body via stdin `--data-binary @-`
+    // so large workspace sync bundles never hit OS `ARG_MAX` / `Argument list too long (os error 7)`).
     let mut cmd = std::process::Command::new("curl");
     cmd.args(["-sS", "-X", method, &full_url, "-H", "Content-Type: application/json"]);
     if let Some(k) = api_key {
@@ -307,21 +308,126 @@ pub async fn cloud_http_json(
     for (hk, hv) in extra_headers {
         cmd.args(["-H", &format!("{}: {}", hk, hv)]);
     }
-    if let Some(b) = body {
-        cmd.args(["-d", &serde_json::to_string(b)?]);
+    let body_bytes = if let Some(b) = body {
+        cmd.args(["--data-binary", "@-"]);
+        Some(serde_json::to_vec(b)?)
+    } else {
+        None
+    };
+    cmd.stdin(if body_bytes.is_some() {
+        std::process::Stdio::piped()
+    } else {
+        std::process::Stdio::null()
+    });
+    cmd.stdout(std::process::Stdio::piped());
+    cmd.stderr(std::process::Stdio::piped());
+
+    let mut child = cmd
+        .spawn()
+        .context("Failed to execute `curl` for HTTPS cloud endpoint")?;
+    if let Some(bytes) = body_bytes {
+        if let Some(mut stdin) = child.stdin.take() {
+            use std::io::Write;
+            stdin
+                .write_all(&bytes)
+                .context("Failed to write request body to `curl` stdin")?;
+        }
     }
-    let out = cmd.output().context("Failed to execute `curl` for HTTPS cloud endpoint")?;
+    let out = child
+        .wait_with_output()
+        .context("Failed waiting for `curl` HTTPS cloud response")?;
     if !out.status.success() {
         bail!(
             "Cloud HTTPS request failed: {}",
             String::from_utf8_lossy(&out.stderr)
         );
     }
-    let parsed: Value = serde_json::from_slice(&out.stdout)?;
+    let parsed: Value = serde_json::from_slice(&out.stdout).with_context(|| {
+        format!(
+            "Invalid JSON response from {}: {}",
+            full_url,
+            String::from_utf8_lossy(&out.stdout)
+                .chars()
+                .take(200)
+                .collect::<String>()
+        )
+    })?;
     Ok(parsed)
 }
 
-/// Collects text source files from `workspace` while excluding `.git`, `target`, `node_modules`,
+/// Uploads `files` to `/v1/workspaces/sync-up` in <=350 KB chunks so large workspaces never exceed
+/// reverse-proxy (e.g. Nginx default 1 MB `client_max_body_size`) HTTP body limits.
+pub async fn sync_up_files_chunked(
+    endpoint: &str,
+    api_key: &str,
+    org_id: &str,
+    ws_id: &str,
+    files: &[SourceFileEntry],
+) -> anyhow::Result<Value> {
+    if files.is_empty() {
+        return cloud_http_json(
+            "POST",
+            endpoint,
+            "/v1/workspaces/sync-up",
+            Some(api_key),
+            &[("X-Aegis-Org", org_id), ("X-Aegis-Workspace", ws_id)],
+            Some(&json!({
+                "org_id": org_id,
+                "workspace_id": ws_id,
+                "files": []
+            })),
+        )
+        .await;
+    }
+
+    const MAX_CHUNK_BYTES: usize = 350 * 1024;
+    let mut chunk: Vec<SourceFileEntry> = Vec::new();
+    let mut chunk_bytes: usize = 0;
+    let mut last_resp = json!({ "status": "synced_up" });
+
+    for entry in files {
+        let entry_bytes = entry.path.len() + entry.content.len() + 64;
+        if !chunk.is_empty() && chunk_bytes + entry_bytes > MAX_CHUNK_BYTES {
+            last_resp = cloud_http_json(
+                "POST",
+                endpoint,
+                "/v1/workspaces/sync-up",
+                Some(api_key),
+                &[("X-Aegis-Org", org_id), ("X-Aegis-Workspace", ws_id)],
+                Some(&json!({
+                    "org_id": org_id,
+                    "workspace_id": ws_id,
+                    "files": chunk
+                })),
+            )
+            .await?;
+            chunk.clear();
+            chunk_bytes = 0;
+        }
+        chunk_bytes += entry_bytes;
+        chunk.push(entry.clone());
+    }
+
+    if !chunk.is_empty() {
+        last_resp = cloud_http_json(
+            "POST",
+            endpoint,
+            "/v1/workspaces/sync-up",
+            Some(api_key),
+            &[("X-Aegis-Org", org_id), ("X-Aegis-Workspace", ws_id)],
+            Some(&json!({
+                "org_id": org_id,
+                "workspace_id": ws_id,
+                "files": chunk
+            })),
+        )
+        .await?;
+    }
+
+    Ok(last_resp)
+}
+
+/// Collects text source files from `workspace` while excluding `.git`, `target`, `dist`, `build`, `node_modules`,
 /// `.agents`, hidden runtime directories, and binary files.
 pub async fn collect_local_source_bundle(workspace: &Path) -> anyhow::Result<Vec<SourceFileEntry>> {
     let mut entries = Vec::new();
@@ -336,6 +442,12 @@ pub async fn collect_local_source_bundle(workspace: &Path) -> anyhow::Result<Vec
             let name = entry.file_name().to_string_lossy().to_string();
             if name == ".git"
                 || name == "target"
+                || name == "dist"
+                || name == "build"
+                || name == ".next"
+                || name == ".venv"
+                || name == "venv"
+                || name == "__pycache__"
                 || name == "node_modules"
                 || name == ".agents"
                 || name == ".agent"
@@ -507,20 +619,12 @@ pub async fn handle_cloud_command(
             // 3. Push local source-only files to initialize the Cloud Workspace baseline
             let files = collect_local_source_bundle(&canon).await?;
             let files_count = files.len();
-            let sync_resp = cloud_http_json(
-                "POST",
+            let sync_resp = sync_up_files_chunked(
                 &clean_ep,
-                "/v1/workspaces/sync-up",
-                Some(&resolved_key),
-                &[
-                    ("X-Aegis-Org", &identity.org_id),
-                    ("X-Aegis-Workspace", &ws_id),
-                ],
-                Some(&json!({
-                    "org_id": identity.org_id,
-                    "workspace_id": ws_id,
-                    "files": files
-                })),
+                &resolved_key,
+                &identity.org_id,
+                &ws_id,
+                &files,
             )
             .await?;
 
@@ -602,20 +706,12 @@ pub async fn handle_cloud_command(
                 "Current directory is not bound to Aegis Cloud (run `aegis-os cloud up` first)",
             )?;
             let files = collect_local_source_bundle(&canon).await?;
-            let resp = cloud_http_json(
-                "POST",
+            let resp = sync_up_files_chunked(
                 &binding.endpoint,
-                "/v1/workspaces/sync-up",
-                Some(&binding.api_key),
-                &[
-                    ("X-Aegis-Org", &binding.org_id),
-                    ("X-Aegis-Workspace", &binding.workspace_id),
-                ],
-                Some(&json!({
-                    "org_id": binding.org_id,
-                    "workspace_id": binding.workspace_id,
-                    "files": files
-                })),
+                &binding.api_key,
+                &binding.org_id,
+                &binding.workspace_id,
+                &files,
             )
             .await?;
             println!("{}", serde_json::to_string_pretty(&resp)?);
@@ -1282,20 +1378,12 @@ pub async fn configure_workspace_mode_via_mcp(
 
             let files = collect_local_source_bundle(&canon).await?;
             let files_count = files.len();
-            let sync_resp = cloud_http_json(
-                "POST",
+            let sync_resp = sync_up_files_chunked(
                 &clean_ep,
-                "/v1/workspaces/sync-up",
-                Some(&resolved_key),
-                &[
-                    ("X-Aegis-Org", &identity.org_id),
-                    ("X-Aegis-Workspace", &ws_id),
-                ],
-                Some(&json!({
-                    "org_id": identity.org_id,
-                    "workspace_id": ws_id,
-                    "files": files
-                })),
+                &resolved_key,
+                &identity.org_id,
+                &ws_id,
+                &files,
             )
             .await?;
 
