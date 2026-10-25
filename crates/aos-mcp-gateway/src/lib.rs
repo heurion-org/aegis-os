@@ -2574,6 +2574,26 @@ impl AegisRuntimeKernel {
                         auth_failed = true;
                     }
 
+                    if method == "GET" && full_target.starts_with("/releases/") {
+                        let name = full_target
+                            .trim_start_matches("/releases/")
+                            .split('?')
+                            .next()
+                            .unwrap_or("");
+                        if !name.is_empty() && !name.contains("..") && !name.contains('/') {
+                            let file_path = k.runtime_data_root.join("releases").join(name);
+                            if let Ok(bytes) = tokio::fs::read(&file_path).await {
+                                let hdr = format!(
+                                    "HTTP/1.1 200 OK\r\nContent-Type: application/octet-stream\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                                    bytes.len()
+                                );
+                                let _ = stream.write_all(hdr.as_bytes()).await;
+                                let _ = stream.write_all(&bytes).await;
+                                return;
+                            }
+                        }
+                    }
+
                     let mut content_type = "application/json";
                     let (status_line, resp_body) = if auth_failed {
                         (
@@ -2590,6 +2610,9 @@ impl AegisRuntimeKernel {
                     {
                         content_type = "text/html; charset=utf-8";
                         ("HTTP/1.1 200 OK", paas::render_dashboard_html(&bound_ws_path))
+                    } else if method == "GET" && full_target.starts_with("/install.sh") {
+                        content_type = "text/x-shellscript; charset=utf-8";
+                        ("HTTP/1.1 200 OK", paas::INSTALL_SH.to_string())
                     } else if method == "GET" && full_target.starts_with("/health") {
                         (
                             "HTTP/1.1 200 OK",
@@ -2857,6 +2880,17 @@ impl AegisRuntimeKernel {
                                 })
                                 .to_string(),
                             ),
+                            Err(e) => (
+                                "HTTP/1.1 404 Not Found",
+                                json!({ "error": e.to_string() }).to_string(),
+                            ),
+                        }
+                    } else if method == "POST" && full_target.starts_with("/v1/workspaces/delete") {
+                        let payload: Value = serde_json::from_str(body_str.trim()).unwrap_or_else(|_| json!({}));
+                        let w_org = payload.get("org_id").and_then(|v| v.as_str()).unwrap_or(&org_id);
+                        let w_id = payload.get("workspace_id").and_then(|v| v.as_str()).unwrap_or("ws-core");
+                        match k.paas.delete_workspace(&k, w_org, w_id).await {
+                            Ok(val) => ("HTTP/1.1 200 OK", val.to_string()),
                             Err(e) => (
                                 "HTTP/1.1 404 Not Found",
                                 json!({ "error": e.to_string() }).to_string(),

@@ -452,6 +452,10 @@ pub async fn handle_cloud_command(
                 .map(|s| s.trim().to_string())
                 .filter(|s| !s.is_empty())
                 .collect();
+            let primary_agent = agent_list
+                .first()
+                .cloned()
+                .unwrap_or_else(|| "agy-agent".to_string());
 
             // 1. Provision Cloud CoW Workspace on the remote node
             let prov_resp = cloud_http_json(
@@ -485,7 +489,7 @@ pub async fn handle_cloud_command(
                         &[],
                         Some(&json!({
                             "org_id": identity.org_id,
-                            "agent_id": identity.agent_id,
+                            "agent_id": primary_agent,
                             "role": identity.role,
                             "workspace_id": ws_id,
                             "label": format!("Cloud Binding for {}", canon_str)
@@ -526,7 +530,7 @@ pub async fn handle_cloud_command(
                 api_key: resolved_key.clone(),
                 org_id: identity.org_id.clone(),
                 workspace_id: ws_id.clone(),
-                default_agent_id: identity.agent_id.clone(),
+                default_agent_id: primary_agent,
                 enabled: true,
                 updated_at_ms: Utc::now().timestamp_millis(),
             };
@@ -546,7 +550,7 @@ pub async fn handle_cloud_command(
                     "synced_source_files": files_count,
                     "provision": prov_resp.get("status").cloned().unwrap_or(json!("ok")),
                     "sync_up": sync_resp.get("status").cloned().unwrap_or(json!("ok")),
-                    "dashboard_url": format!("{}/dashboard", clean_ep)
+                    "dashboard_url": format!("{}/aegis-cloud/dashboard", clean_ep)
                 }))?
             );
         }
@@ -621,7 +625,9 @@ pub async fn handle_cloud_command(
             let binding = resolve_active_cloud_binding(runtime_dir, &canon).context(
                 "Current directory is not bound to Aegis Cloud (run `aegis-os cloud up` first)",
             )?;
-            let target_agent = agent.unwrap_or_else(|| binding.default_agent_id.clone());
+            let target_agent = agent
+                .filter(|a| a != "auto" && !a.trim().is_empty())
+                .unwrap_or_else(|| binding.default_agent_id.clone());
             let resp = cloud_http_json(
                 "POST",
                 &binding.endpoint,
@@ -685,7 +691,9 @@ pub async fn handle_cloud_command(
             let binding = resolve_active_cloud_binding(runtime_dir, &canon).context(
                 "Current directory is not bound to Aegis Cloud (run `aegis-os cloud up` first)",
             )?;
-            let target_agent = agent.unwrap_or_else(|| binding.default_agent_id.clone());
+            let target_agent = agent
+                .filter(|a| a != "auto" && !a.trim().is_empty())
+                .unwrap_or_else(|| binding.default_agent_id.clone());
             let resp = cloud_http_json(
                 "POST",
                 &binding.endpoint,
@@ -1504,7 +1512,13 @@ pub async fn serve_unified_stdio(
                 Some("claude") => "claude-code".to_string(),
                 Some("codex") => "codex-cli".to_string(),
                 Some(_) => binding.default_agent_id.clone(),
-                None => identity.agent_id.clone(),
+                None => {
+                    if identity.agent_id == "auto" || identity.agent_id.is_empty() {
+                        binding.default_agent_id.clone()
+                    } else {
+                        identity.agent_id.clone()
+                    }
+                }
             };
             // If committing on Cloud Sandbox, pre-fetch pending source-only diff so we can apply it
             // to the local repository as soon as `workspace_commit` succeeds on the remote sandbox.
