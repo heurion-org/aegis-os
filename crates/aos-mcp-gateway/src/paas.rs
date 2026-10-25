@@ -2510,23 +2510,23 @@ pub const DASHBOARD_HTML: &str = r##"<!doctype html>
         <div class="hero-grid">
           <div class="hero-left">
             <div class="hero-intro">
-              <p class="label-caps" data-i18n="hero_eyebrow">HEURION · AEGIS CLOUD 通用 AI AGENT 云端沙箱</p>
-              <h1 class="heading-1" data-i18n-html="hero_title">让你的 AI Agent 在云端放手执行任务，<br>本地电脑<em>零负担</em>，原工作区<em>不怕改坏</em>。</h1>
-              <p class="text-muted" data-i18n="hero_desc">只需一行命令安装插件，你的通用 AI Agent（Claude / Cursor / Codex / AGY 等）就会自动接入 64GB 云端沙箱。无需记任何终端命令，像平时一样在对话框里用自然语言交代任务——无论是调研分析、文档处理、自动化执行还是软件构建，AI 都会在云端独立副本里安全运行，确认无误后再同步回你的电脑。</p>
+              <p class="label-caps" data-i18n="hero_eyebrow">HEURION · AEGIS OS 线上安全 AGENT 运行时</p>
+              <h1 class="heading-1" data-i18n-html="hero_title">给你的 AI Agent 接入安全的<em>线上 OS 运行时</em>，<br>本地<em>零负载</em>，原环境<em>零风险</em>。</h1>
+              <p class="text-muted" data-i18n="hero_desc">你的 AI Agent（Claude / Cursor / Codex / AGY）依然在你熟悉的本地界面交互，但它的底层文件读写、进程执行与多 Agent 协作被无缝挂载到 Aegis 64GB 线上 OS 运行时——具备写时复制（CoW）文件系统隔离、内核级沙箱与边界写回保护。</p>
             </div>
 
             <div class="telemetry-strip">
               <div class="stat-cell">
                 <span class="stat-val" style="color:var(--accent);">64 GB</span>
-                <span class="stat-lbl" data-i18n="st_lbl_ram">云端独占运行内存</span>
+                <span class="stat-lbl" data-i18n="st_lbl_ram">线上 Runtime 独占内存</span>
               </div>
               <div class="stat-cell">
                 <span class="stat-val">0%</span>
-                <span class="stat-lbl" data-i18n="st_lbl_cpu">本地电脑 CPU / 内存占用</span>
+                <span class="stat-lbl" data-i18n="st_lbl_cpu">本地主机执行负载</span>
               </div>
               <div class="stat-cell">
-                <span class="stat-val stat-val-mono" data-i18n="st_val_safe">自然语言驱动</span>
-                <span class="stat-lbl" data-i18n="st_lbl_safe">直接对 AI Agent 说话，无需敲命令</span>
+                <span class="stat-val stat-val-mono" data-i18n="st_val_safe">CoW + Sandbox</span>
+                <span class="stat-lbl" data-i18n="st_lbl_safe">OS 级隔离与边界写回保护</span>
               </div>
             </div>
           </div>
@@ -2534,44 +2534,44 @@ pub const DASHBOARD_HTML: &str = r##"<!doctype html>
           <!-- Clear 3-Stage Architectural Schematic Plate -->
           <div class="hero-art" aria-label="Aegis Cloud Workflow Schematic">
             <div class="art-header">
-              <span data-i18n="art_top_l">AI AGENT 自动调用工作流</span>
-              <span style="display:inline-flex;align-items:center;gap:0.35rem;"><span class="dot-mint"></span><span data-i18n="art_top_r">64GB 云端主机</span></span>
+              <span data-i18n="art_top_l">AEGIS OS 线上运行时架构</span>
+              <span style="display:inline-flex;align-items:center;gap:0.35rem;"><span class="dot-mint"></span><span data-i18n="art_top_r">64GB ONLINE RUNTIME</span></span>
             </div>
 
             <div class="arch-flow">
               <!-- Stage 01: Local AI Agent -->
               <div class="arch-stage">
                 <div class="arch-row-top">
-                  <span class="arch-step-id" data-i18n="svg_step1_t">01 / 本地 AI AGENT 对话框</span>
-                  <span class="arch-badge" data-i18n="svg_step1_s">0% 本地资源占用</span>
+                  <span class="arch-step-id" data-i18n="svg_step1_t">01 / 本地 AGENT 客户端</span>
+                  <span class="arch-badge" data-i18n="svg_step1_s">MCP 透明挂载</span>
                 </div>
-                <div class="arch-title" data-i18n="svg_step1_d">直接用自然语言交代任务（Claude · Cursor · Codex · AGY）</div>
+                <div class="arch-title" data-i18n="svg_step1_d">保持在你原本的客户端交互（Claude · Cursor · Codex · AGY）</div>
               </div>
 
               <!-- Connector 1 -->
               <div class="arch-conn">
                 <span>↓</span>
-                <span data-i18n="arch_conn_1">MCP 自动转发至云端（本机密钥自动附加，LLM 零接触）</span>
+                <span data-i18n="arch_conn_1">系统调用（文件 / 进程 / IPC）自动路由至线上 OS 运行时</span>
               </div>
 
               <!-- Stage 02: 64GB Cloud CoW Sandbox -->
               <div class="arch-stage arch-stage-cloud">
                 <div class="arch-row-top">
-                  <span class="arch-step-id"><span class="dot-mint"></span><span data-i18n="arch_stage2_t">02 / 64GB 云端隔离沙箱</span></span>
-                  <span class="arch-badge" data-i18n="arch_stage2_b">Copy-on-Write 独立副本</span>
+                  <span class="arch-step-id"><span class="dot-mint"></span><span data-i18n="arch_stage2_t">02 / AEGIS 线上安全 OS 运行时</span></span>
+                  <span class="arch-badge" data-i18n="arch_stage2_b">CoW 文件系统 · 内核沙箱</span>
                 </div>
                 <div class="arch-lanes">
                   <div class="arch-lane">
-                    <span class="arch-lane-id">AGENT 01</span>
-                    <span class="arch-lane-name" data-i18n="svg_ai1">调研与分析</span>
+                    <span class="arch-lane-id">RUNTIME 01</span>
+                    <span class="arch-lane-name" data-i18n="svg_ai1">CoW 隔离文件系统</span>
                   </div>
                   <div class="arch-lane">
-                    <span class="arch-lane-id">AGENT 02</span>
-                    <span class="arch-lane-name" data-i18n="svg_ai2">执行与处理</span>
+                    <span class="arch-lane-id">RUNTIME 02</span>
+                    <span class="arch-lane-name" data-i18n="svg_ai2">内核级进程沙箱</span>
                   </div>
                   <div class="arch-lane">
-                    <span class="arch-lane-id">AGENT 03</span>
-                    <span class="arch-lane-name" data-i18n="svg_ai3">复核与校验</span>
+                    <span class="arch-lane-id">RUNTIME 03</span>
+                    <span class="arch-lane-name" data-i18n="svg_ai3">多 Agent 并行与 IPC</span>
                   </div>
                 </div>
               </div>
@@ -2579,22 +2579,22 @@ pub const DASHBOARD_HTML: &str = r##"<!doctype html>
               <!-- Connector 2 -->
               <div class="arch-conn">
                 <span>↓</span>
-                <span data-i18n="arch_conn_2">workspace_diff 预览全部改动 · 确认无误后合并</span>
+                <span data-i18n="arch_conn_2">Policy Kernel 边界校验（workspace_diff 预览 · 确认后提交）</span>
               </div>
 
               <!-- Stage 03: Verified Sync -->
               <div class="arch-stage arch-stage-commit">
                 <div class="arch-row-top">
-                  <span class="arch-step-id"><span class="dot-mint"></span><span data-i18n="svg_step3_t">03 / 对话确认即合并</span></span>
-                  <span style="font-family:var(--mono);font-size:0.62rem;color:#E3ECE7;" data-i18n="svg_step3_d">安全写回保护</span>
+                  <span class="arch-step-id"><span class="dot-mint"></span><span data-i18n="svg_step3_t">03 / 边界受控同步回本机</span></span>
+                  <span style="font-family:var(--mono);font-size:0.62rem;color:#E3ECE7;" data-i18n="svg_step3_d">Policy Kernel 保护</span>
                 </div>
-                <div class="arch-title" data-i18n="svg_step3_s">仅将通过校验的结果自动同步回你的本地电脑</div>
+                <div class="arch-title" data-i18n="svg_step3_s">仅将通过校验的文件变更原子同步回你的本地工作区</div>
               </div>
             </div>
 
             <div class="art-caption">
               <span data-i18n="art_bot_l">CLAUDE · CURSOR · CODEX · AGY</span>
-              <span data-i18n="art_bot_r">100% MCP 自动路由</span>
+              <span data-i18n="art_bot_r">ONLINE AGENT OS &amp; RUNTIME</span>
             </div>
           </div>
         </div>
@@ -2606,9 +2606,9 @@ pub const DASHBOARD_HTML: &str = r##"<!doctype html>
       <div class="container">
         <div class="section-header">
           <div class="section-title-group">
-            <h2 class="heading-2" data-i18n-html="sec3_title">选择方案与 <em>30 秒完整使用流程</em></h2>
+            <h2 class="heading-2" data-i18n-html="sec3_title">挂载线上 Runtime · <em>30 秒极速接入</em></h2>
           </div>
-          <p class="label-caps" data-i18n="sec3_label">安装一次插件 · 后续全部在你的 AI AGENT 对话框内完成</p>
+          <p class="label-caps" data-i18n="sec3_label">一行命令把本地 AGENT 的底层执行环境挂载到 AEGIS 线上 OS 运行时</p>
         </div>
 
         <div class="onboarding-grid">
@@ -2618,13 +2618,13 @@ pub const DASHBOARD_HTML: &str = r##"<!doctype html>
               <div class="card-head">
                 <div>
                   <span class="tag" data-i18n="tier_free_tag">免费版 · 无需注册或绑卡</span>
-                  <h3 class="card-title" data-i18n="tier_free_title">$0 / 月 · 1 个云端工作区 · 1 个 Agent</h3>
+                  <h3 class="card-title" data-i18n="tier_free_title">$0 / 月 · 1 个线上 Runtime 工作区 · 1 个 Agent</h3>
                 </div>
               </div>
-              <p class="card-desc" data-i18n="tier_free_desc">一键安装并接入你的通用 AI Agent（Claude / Cursor / Codex / AGY 等），自动生成本机免费密钥，无需手动传参：</p>
+              <p class="card-desc" data-i18n="tier_free_desc">一键为你的本地 AI Agent（Claude / Cursor / Codex / AGY）挂载免费的线上安全 OS 运行时，自动生成本机凭证，无需手动传参：</p>
 
               <div class="cmd-bar">
-                <span class="cmd-title" data-i18n="free_cmd_title">在终端运行（安装并启用免费云端沙箱）：</span>
+                <span class="cmd-title" data-i18n="free_cmd_title">在终端运行（安装并挂载免费线上 Runtime）：</span>
                 <button class="btn" onclick="copyFreeSnippet()" data-i18n="btn_copy_free">复制命令</button>
               </div>
               <pre class="code" id="cli-snippet-free"></pre>
@@ -2636,16 +2636,16 @@ pub const DASHBOARD_HTML: &str = r##"<!doctype html>
             <div class="card-body">
               <div class="card-head">
                 <div>
-                  <span class="tag tag-active"><span class="dot-mint"></span><span data-i18n="tier_pro_tag">PRO 专业版 · 多 AGENT 并行</span></span>
-                  <h3 class="card-title" data-i18n="tier_pro_title">$29 / 月 · 多个工作区 · 8 个 Agent 并行</h3>
+                  <span class="tag tag-active"><span class="dot-mint"></span><span data-i18n="tier_pro_tag">PRO 专业版 · 多 AGENT 并行运行时</span></span>
+                  <h3 class="card-title" data-i18n="tier_pro_title">$29 / 月 · 16 个线上工作区 · 8 个 Agent 并行</h3>
                 </div>
                 <a class="btn btn-solid" href="https://buy.polar.sh/polar_cl_jCPpzbp4eOAyRbkDP4YzNIFVnYLddbvJZI5Fc27zL0x" target="_blank" rel="noopener" data-i18n="btn_buy_pro">① 立即订阅 Pro ($29/月) →</a>
               </div>
 
-              <p class="card-desc" data-i18n="tier_pro_desc">解锁最多 16 个云端工作区与 8 个 AI Agent 并行：付款后用邮箱在本机直接认领密钥并启用，密钥直存本机（不经过大模型）：</p>
+              <p class="card-desc" data-i18n="tier_pro_desc">解锁最多 16 个线上 OS 工作区与 8 个 Agent 并行运行时：付款后在本机直接认领凭证并挂载，密钥直存本机（不经过大模型）：</p>
 
               <div class="cmd-bar">
-                <span class="cmd-title" data-i18n="pro_cmd_title">② 付款后在终端运行（绑定 Pro 密钥并启用）：</span>
+                <span class="cmd-title" data-i18n="pro_cmd_title">② 付款后在终端运行（绑定 Pro 凭证并挂载）：</span>
                 <button class="btn" onclick="copyProSnippet()" data-i18n="btn_copy_pro">复制命令</button>
               </div>
               <pre class="code" id="cli-snippet-pro"></pre>
@@ -2689,83 +2689,83 @@ pub const DASHBOARD_HTML: &str = r##"<!doctype html>
       zh: {
         nav_home: 'Heurion 主站 ↗',
         nav_subscribe: '立即订阅 Pro ($29/月) →',
-        hero_eyebrow: 'HEURION · AEGIS CLOUD 通用 AI AGENT 云端沙箱',
-        hero_title: '让你的 AI Agent 在云端放手执行任务，<br>本地电脑<em>零负担</em>，原工作区<em>不怕改坏</em>。',
-        hero_desc: '只需一行命令安装插件，你的通用 AI Agent（Claude / Cursor / Codex / AGY 等）就会自动接入 64GB 云端沙箱。无需记任何终端命令，像平时一样在对话框里用自然语言交代任务——无论是调研分析、文档处理、自动化执行还是软件构建，AI 都会在云端独立副本里安全运行，确认无误后再同步回你的电脑。',
-        st_lbl_ram: '云端独占运行内存',
-        st_lbl_cpu: '本地电脑 CPU / 内存占用',
-        st_val_safe: '自然语言驱动',
-        st_lbl_safe: '直接对 AI Agent 说话，无需敲命令',
-        art_top_l: 'AI AGENT 自动调用工作流',
-        art_top_r: '64GB 云端主机',
-        svg_step1_t: '01 / 本地 AI AGENT 对话框',
-        svg_step1_d: '直接用自然语言交代任务（Claude · Cursor · Codex · AGY）',
-        svg_step1_s: '0% 本地资源占用',
-        arch_conn_1: 'MCP 自动转发至云端（本机密钥自动附加，LLM 零接触）',
-        arch_stage2_t: '02 / 64GB 云端隔离沙箱',
-        arch_stage2_b: 'Copy-on-Write 独立副本',
-        svg_ai1: '调研与分析',
-        svg_ai2: '执行与处理',
-        svg_ai3: '复核与校验',
-        arch_conn_2: 'workspace_diff 预览全部改动 · 确认无误后合并',
-        svg_step3_t: '03 / 对话确认即合并',
-        svg_step3_d: '安全写回保护',
-        svg_step3_s: '仅将通过校验的结果自动同步回你的本地电脑',
+        hero_eyebrow: 'HEURION · AEGIS OS 线上安全 AGENT 运行时',
+        hero_title: '给你的 AI Agent 接入安全的<em>线上 OS 运行时</em>，<br>本地<em>零负载</em>，原环境<em>零风险</em>。',
+        hero_desc: '你的 AI Agent（Claude / Cursor / Codex / AGY）依然在你熟悉的本地界面交互，但它的底层文件读写、进程执行与多 Agent 协作被无缝挂载到 Aegis 64GB 线上 OS 运行时——具备写时复制（CoW）文件系统隔离、内核级沙箱与边界写回保护。',
+        st_lbl_ram: '线上 Runtime 独占内存',
+        st_lbl_cpu: '本地主机执行负载',
+        st_val_safe: 'CoW + Sandbox',
+        st_lbl_safe: 'OS 级隔离与边界写回保护',
+        art_top_l: 'AEGIS OS 线上运行时架构',
+        art_top_r: '64GB ONLINE RUNTIME',
+        svg_step1_t: '01 / 本地 AGENT 客户端',
+        svg_step1_d: '保持在你原本的客户端交互（Claude · Cursor · Codex · AGY）',
+        svg_step1_s: 'MCP 透明挂载',
+        arch_conn_1: '系统调用（文件 / 进程 / IPC）自动路由至线上 OS 运行时',
+        arch_stage2_t: '02 / AEGIS 线上安全 OS 运行时',
+        arch_stage2_b: 'CoW 文件系统 · 内核沙箱',
+        svg_ai1: 'CoW 隔离文件系统',
+        svg_ai2: '内核级进程沙箱',
+        svg_ai3: '多 Agent 并行与 IPC',
+        arch_conn_2: 'Policy Kernel 边界校验（workspace_diff 预览 · 确认后提交）',
+        svg_step3_t: '03 / 边界受控同步回本机',
+        svg_step3_d: 'Policy Kernel 保护',
+        svg_step3_s: '仅将通过校验的文件变更原子同步回你的本地工作区',
         art_bot_l: 'CLAUDE · CURSOR · CODEX · AGY',
-        art_bot_r: '100% MCP 自动路由',
-        sec3_title: '选择方案与 <em>30 秒完整使用流程</em>',
-        sec3_label: '安装一次插件 · 后续全部在你的 AI AGENT 对话框内完成',
+        art_bot_r: 'ONLINE AGENT OS & RUNTIME',
+        sec3_title: '挂载线上 Runtime · <em>30 秒极速接入</em>',
+        sec3_label: '一行命令把本地 AGENT 的底层执行环境挂载到 AEGIS 线上 OS 运行时',
         tier_free_tag: '免费版 · 无需注册或绑卡',
-        tier_free_title: '$0 / 月 · 1 个云端工作区 · 1 个 Agent',
-        tier_free_desc: '一键安装并接入你的通用 AI Agent（Claude / Cursor / Codex / AGY 等），自动生成本机免费密钥，无需手动传参：',
-        free_cmd_title: '在终端运行（安装并启用免费云端沙箱）：',
+        tier_free_title: '$0 / 月 · 1 个线上 Runtime 工作区 · 1 个 Agent',
+        tier_free_desc: '一键为你的本地 AI Agent（Claude / Cursor / Codex / AGY）挂载免费的线上安全 OS 运行时，自动生成本机凭证，无需手动传参：',
+        free_cmd_title: '在终端运行（安装并挂载免费线上 Runtime）：',
         btn_copy_free: '复制命令',
-        tier_pro_tag: 'PRO 专业版 · 多 AGENT 并行',
-        tier_pro_title: '$29 / 月 · 多个工作区 · 8 个 Agent 并行',
+        tier_pro_tag: 'PRO 专业版 · 多 AGENT 并行运行时',
+        tier_pro_title: '$29 / 月 · 16 个线上工作区 · 8 个 Agent 并行',
         btn_buy_pro: '① 立即订阅 Pro ($29/月) →',
-        tier_pro_desc: '解锁最多 16 个云端工作区与 8 个 AI Agent 并行：付款后用邮箱在本机直接认领密钥并启用，密钥直存本机（不经过大模型）：',
-        pro_cmd_title: '② 付款后在终端运行（绑定 Pro 密钥并启用）：',
+        tier_pro_desc: '解锁最多 16 个线上 OS 工作区与 8 个 Agent 并行运行时：付款后在本机直接认领凭证并挂载，密钥直存本机（不经过大模型）：',
+        pro_cmd_title: '② 付款后在终端运行（绑定 Pro 凭证并挂载）：',
         btn_copy_pro: '复制命令'
       },
       en: {
         nav_home: 'Heurion.org ↗',
         nav_subscribe: 'Subscribe to Pro ($29/mo) →',
-        hero_eyebrow: 'HEURION · AEGIS CLOUD AI AGENT SANDBOX',
-        hero_title: 'Run your AI Agents in the cloud —<br><em>zero local lag</em>, <em>zero risk</em> to your files.',
-        hero_desc: 'Install once with a single command to connect your AI Agent (Claude, Cursor, Codex, AGY, etc.) to our 64GB cloud sandbox. Just assign tasks in natural language — whether research, data analysis, automation, or software engineering, your agent runs safely in an isolated cloud copy and syncs approved results back to your machine.',
-        st_lbl_ram: 'Dedicated Cloud RAM',
-        st_lbl_cpu: 'Local CPU / RAM Usage',
-        st_val_safe: 'Chat-Driven',
-        st_lbl_safe: 'Controlled directly via your AI Agent',
-        art_top_l: 'AI AGENT MCP WORKFLOW',
-        art_top_r: '64GB CLOUD HOST',
-        svg_step1_t: '01 / LOCAL AI AGENT CHAT',
-        svg_step1_d: 'Assign tasks in natural language (Claude · Cursor · Codex · AGY)',
-        svg_step1_s: '0% local CPU / RAM',
-        arch_conn_1: 'Auto-routed via MCP (local key attached, zero LLM exposure)',
-        arch_stage2_t: '02 / 64GB CLOUD SANDBOX',
-        arch_stage2_b: 'Isolated CoW Copies',
-        svg_ai1: 'Research & Analyze',
-        svg_ai2: 'Execute & Process',
-        svg_ai3: 'Verify & Review',
-        arch_conn_2: 'Preview workspace_diff · approve to merge',
-        svg_step3_t: '03 / VERIFIED SYNC TO LAPTOP',
-        svg_step3_d: 'Write-Back Guard',
-        svg_step3_s: 'Only approved results are synced back to your machine',
+        hero_eyebrow: 'HEURION · AEGIS OS — SECURE CLOUD RUNTIME FOR AI AGENTS',
+        hero_title: 'Give your AI Agents a secure <em>Cloud OS Runtime</em> —<br><em>zero local load</em>, <em>zero host risk</em>.',
+        hero_desc: 'Keep using your AI Agent (Claude, Cursor, Codex, AGY) in your favorite local client while mounting its filesystem, process execution, and multi-agent IPC onto the 64GB Aegis Online OS Runtime — complete with Copy-on-Write isolation, kernel sandboxing, and boundary write-back guards.',
+        st_lbl_ram: 'Dedicated Runtime RAM',
+        st_lbl_cpu: 'Local Host Execution Load',
+        st_val_safe: 'CoW + Sandbox',
+        st_lbl_safe: 'OS-Level Isolation & Boundary Guard',
+        art_top_l: 'AEGIS OS CLOUD RUNTIME ARCHITECTURE',
+        art_top_r: '64GB ONLINE RUNTIME',
+        svg_step1_t: '01 / LOCAL AGENT CLIENT',
+        svg_step1_d: 'Interact in your existing Agent UI (Claude · Cursor · Codex · AGY)',
+        svg_step1_s: 'Transparent MCP Mount',
+        arch_conn_1: 'Syscalls (FS / Exec / IPC) routed to online OS Runtime',
+        arch_stage2_t: '02 / AEGIS ONLINE OS RUNTIME',
+        arch_stage2_b: 'CoW VFS · Kernel Sandbox',
+        svg_ai1: 'CoW Shadow VFS',
+        svg_ai2: 'Kernel Sandbox Exec',
+        svg_ai3: 'Multi-Agent IPC Bus',
+        arch_conn_2: 'Policy Kernel boundary guard (workspace_diff -> commit)',
+        svg_step3_t: '03 / GATED COMMIT TO HOST',
+        svg_step3_d: 'Policy Kernel Guard',
+        svg_step3_s: 'Atomically syncs verified state changes back to your local host',
         art_bot_l: 'CLAUDE · CURSOR · CODEX · AGY',
-        art_bot_r: '100% MCP AUTO-ROUTED',
-        sec3_title: 'Choose Your Plan &amp; <em>30-Second Setup</em>',
-        sec3_label: 'INSTALL ONCE · EVERYTHING ELSE HAPPENS IN YOUR AI AGENT CHAT',
+        art_bot_r: 'ONLINE AGENT OS & RUNTIME',
+        sec3_title: 'Mount Your Cloud Runtime · <em>30-Second Setup</em>',
+        sec3_label: 'MOUNT YOUR LOCAL AGENT ONTO THE AEGIS ONLINE OS RUNTIME IN ONE COMMAND',
         tier_free_tag: 'FREE PLAN · NO SIGNUP REQUIRED',
-        tier_free_title: '$0 / mo · 1 Workspace · 1 Agent',
-        tier_free_desc: 'Install once to connect your AI Agent (Claude, Cursor, Codex, or AGY) with an auto-provisioned local key — zero manual flags required:',
-        free_cmd_title: 'Run in terminal (install & enable free cloud sandbox):',
+        tier_free_title: '$0 / mo · 1 Runtime Workspace · 1 Agent',
+        tier_free_desc: 'Mount a free online OS Runtime for your local AI Agent (Claude, Cursor, Codex, or AGY) with an auto-provisioned local key — zero manual flags:',
+        free_cmd_title: 'Run in terminal (install & mount free online Runtime):',
         btn_copy_free: 'Copy Command',
-        tier_pro_tag: 'PRO PLAN · PARALLEL AGENTS',
-        tier_pro_title: '$29 / mo · Multi-Workspace · 8 Agents',
+        tier_pro_tag: 'PRO PLAN · MULTI-AGENT RUNTIME',
+        tier_pro_title: '$29 / mo · 16 Workspaces · 8 Parallel Agents',
         btn_buy_pro: '① Subscribe to Pro ($29/mo) →',
-        tier_pro_desc: 'Unlock up to 16 cloud workspaces and 8 parallel AI Agents: claim your Pro key directly in terminal so it stays in ~/.aegis-os and never touches the LLM:',
-        pro_cmd_title: '② After payment, run in terminal (bind Pro key & enable):',
+        tier_pro_desc: 'Unlock up to 16 online OS workspaces and 8 parallel Agent runtimes: claim your Pro key directly in terminal so it stays in ~/.aegis-os and never touches the LLM:',
+        pro_cmd_title: '② After payment, run in terminal (bind Pro key & mount Runtime):',
         btn_copy_pro: 'Copy Command'
       }
     };
