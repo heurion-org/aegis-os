@@ -2305,20 +2305,23 @@ impl AegisRuntimeKernel {
     }
 
     pub fn resolve_workspace_fallback(&self, current_ws: &Path) -> PathBuf {
-        if let Ok(env_ws) = std::env::var("AOS_WORKSPACE") {
-            let p = PathBuf::from(env_ws.trim());
-            if p.exists() {
-                return std::fs::canonicalize(&p).unwrap_or(p);
-            }
-        }
         let s = current_ws.to_string_lossy();
-        let is_umbrella =
-            !current_ws.join(".git").exists() && !current_ws.join("Cargo.toml").exists();
+        let is_umbrella = !current_ws.join(".git").exists()
+            && !current_ws.join("Cargo.toml").exists()
+            && !current_ws.join("package.json").exists()
+            && !current_ws.join("pyproject.toml").exists()
+            && !current_ws.join("go.mod").exists();
         if s.ends_with("/.gemini/config")
             || s.ends_with("/.agents")
             || s.ends_with("/.agent")
             || is_umbrella
         {
+            if let Ok(env_ws) = std::env::var("AOS_WORKSPACE") {
+                let p = PathBuf::from(env_ws.trim());
+                if p.exists() {
+                    return std::fs::canonicalize(&p).unwrap_or(p);
+                }
+            }
             let saved_file = self.runtime_data_root.join("active_workspace.txt");
             if let Ok(saved) = std::fs::read_to_string(&saved_file) {
                 let p = PathBuf::from(saved.trim());

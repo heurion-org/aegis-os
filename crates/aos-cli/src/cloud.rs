@@ -469,6 +469,9 @@ pub async fn handle_cloud_command(
                 })),
             )
             .await?;
+            if let Some(err_msg) = prov_resp.get("error").and_then(|v| v.as_str()) {
+                bail!("Cloud workspace provisioning rejected: {}", err_msg);
+            }
 
             // 2. Obtain or mint a scoped `ak_live_*` key bound to this workspace
             let resolved_key = match api_key.or_else(|| store.auth.as_ref().map(|a| a.api_key.clone())) {
@@ -1239,6 +1242,18 @@ pub async fn configure_workspace_mode_via_mcp(
                 updated_at_ms: Utc::now().timestamp_millis(),
             });
 
+            let is_pro_request = mode == "pro"
+                || args
+                    .get("plan_tier")
+                    .and_then(|v| v.as_str())
+                    .map(|t| t.eq_ignore_ascii_case("pro"))
+                    .unwrap_or(false);
+            let requested_agents = if is_pro_request {
+                vec!["agy-agent".to_string(), "claude-code".to_string(), "codex-cli".to_string()]
+            } else {
+                vec![identity.agent_id.clone()]
+            };
+
             let prov_resp = cloud_http_json(
                 "POST",
                 &clean_ep,
@@ -1249,10 +1264,13 @@ pub async fn configure_workspace_mode_via_mcp(
                     "org_id": identity.org_id,
                     "workspace_id": ws_id,
                     "source_url": ".",
-                    "agents": [&identity.agent_id, "agy-agent", "claude-code", "codex-cli"]
+                    "agents": requested_agents
                 })),
             )
             .await?;
+            if let Some(err_msg) = prov_resp.get("error").and_then(|v| v.as_str()) {
+                bail!("Cloud workspace provisioning rejected: {}", err_msg);
+            }
 
             let files = collect_local_source_bundle(&canon).await?;
             let files_count = files.len();
@@ -1482,6 +1500,12 @@ pub async fn serve_unified_stdio(
         }
 
         if let Some(binding) = resolve_active_cloud_binding(&runtime_dir, &active_workspace) {
+            let cloud_agent_id = match auto_agent_client.as_deref() {
+                Some("claude") => "claude-code".to_string(),
+                Some("codex") => "codex-cli".to_string(),
+                Some(_) => binding.default_agent_id.clone(),
+                None => identity.agent_id.clone(),
+            };
             // If committing on Cloud Sandbox, pre-fetch pending source-only diff so we can apply it
             // to the local repository as soon as `workspace_commit` succeeds on the remote sandbox.
             let pre_commit_files: Vec<SourceFileEntry> =
@@ -1493,12 +1517,12 @@ pub async fn serve_unified_stdio(
                         Some(&binding.api_key),
                         &[
                             ("X-Aegis-Org", &binding.org_id),
-                            ("X-Aegis-Agent", &identity.agent_id),
+                            ("X-Aegis-Agent", &cloud_agent_id),
                             ("X-Aegis-Workspace", &binding.workspace_id),
                         ],
                         Some(&json!({
                             "org_id": binding.org_id,
-                            "agent_id": identity.agent_id,
+                            "agent_id": cloud_agent_id,
                             "workspace_id": binding.workspace_id
                         })),
                     )
@@ -1518,7 +1542,7 @@ pub async fn serve_unified_stdio(
                 Some(&binding.api_key),
                 &[
                     ("X-Aegis-Org", &binding.org_id),
-                    ("X-Aegis-Agent", &identity.agent_id),
+                    ("X-Aegis-Agent", &cloud_agent_id),
                     ("X-Aegis-Role", &identity.role),
                     ("X-Aegis-Workspace", &binding.workspace_id),
                 ],
