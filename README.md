@@ -108,6 +108,7 @@ Autonomous coding agents such as **Google Antigravity (`agy`)**, **Anthropic Cla
 | **Org CAS & KV** (`aos-vfs`, 4 tools)                                | `org_artifact_publish`, `org_artifact_fetch`, `org_kv_put`, `org_kv_get`                                                                                                                                                                                                                                              | **Auto-Allow Intra-Org**: Cross-org `artifact://` `FilePart` fetch gated by Rule R1                                                                                         |
 | **Zero-Trust Egress** (`aos-egress`, 1 tool)                         | `egress_http_request` + Pinned TCP Proxy (`127.0.0.1:<port>`)                                                                                                                                                                                                                                                         | **Allowlisted Domains + Path Prefixes Auto-Allow**: Injects `$AOS_SECRET_*` at boundary; blocks exfil (`403`)                                                               |
 | **Policy, Leases & Mode Switch** (`aos-policy` + `aos-cli`, 4 tools) | `policy_list_escalations`, `policy_approve_escalation`, `policy_grant_lease`, `runtime_configure_mode`                                                                                                                                                                                                                | Operator control plane for one-shot (`ttl=0`) or TTL-scoped session leases, plus live agent-driven switching between Local Community Mode and Cloud Sandbox Mode            |
+| **AAP-1.0 App Store & Proxy** (`aos-mcp-gateway`, 3 tools + CLI)     | `app_catalog_search`, `app_mount_session`, `app_call_tool` + `aegis-os app <list\|search\|info\|install\|login\|logout\|mount\|call>`                                                                                                                                                                                 | **3-Tier Ecosystem (`first_party`, `verified`, `community`)**: User-bound `aegis_at_*` tokens, RFC 8628 Device Code login, SOP skill installer, and lease-gated MCP proxy  |
 | **Cloud PaaS Control Plane** (`aos-mcp-gateway`)                     | `GET /dashboard`, `GET /api/status`, `POST /v1/workspaces`, `POST /v1/workspaces/sync-up`, `POST /v1/workspaces/diff`, `POST /v1/workspaces/hibernate`, `POST /v1/workspaces/wake`, `POST /v1/workspaces/pr`, `POST /v1/tenants/plan`, `POST /v1/tenants/keys`, `POST /v1/vault/secrets`, `POST /v1/approvals/decide` | Multi-tenant cloud workspace provisioning, Scale-to-Zero hibernation (`<10ms` wake), source-only sync, Git-to-PR export, `ak_live_*` auth, and minimalist developer console |
 | **Dynamic MCP URIs** (7 resources)                                   | `aegis://workspace/status`, `aegis://ipc/inbox`, `aegis://org/peers`, `aegis://global/peers`, `aegis://a2a/agent-cards`, `aegis://a2a/tasks`, `aegis://org/shared/catalog`                                                                                                                                            | Live introspection for IDE status bars, global peer topology, and A2A task tables                                                                                           |
 
@@ -179,6 +180,83 @@ aegis-os cloud wake
 aegis-os cloud down
 ```
 
+---
+
+## AAP-1.0 Application Ecosystem & User Workflow Guide (`aegis-os app`)
+
+**Aegis OS** includes native support for the **Aegis Application Protocol (`AAP-1.0`)** (full specification: [`docs/AEGIS_APPLICATION_PROTOCOL.md`](docs/AEGIS_APPLICATION_PROTOCOL.md)) — a unified 3-tier ecosystem (`first_party`, `verified`, `community`) with user-bound grant tokens (`aegis_at_<app_id>.*`), RFC 8628 Device Code passwordless terminal binding, automatic SOP skill installation (`/.well-known/aegis-skills/`), and Policy Kernel lease-gated tool governance.
+
+### End-to-End User Workflow (4 Stages)
+
+#### Stage 1: One-Time App Discovery, Installation & Account Binding
+Users install first-party or third-party `AAP-1.0` applications (such as **Heurion 2.0 / 知衡 2.0 `heurion`**) and bind their personal account once:
+
+```bash
+# 1. Browse or search the 3-tier AAP-1.0 application catalog (pre-registered with First-Party Heurion 2.0)
+aegis-os app list
+aegis-os app search heurion
+aegis-os app info heurion
+
+# 2. Install the application:
+#    - Fetches /.well-known/aegis-app.json
+#    - Automatically downloads declared SOP skills into .agents/skills/<skill_id>/SKILL.md
+aegis-os app install heurion --url http://127.0.0.1:8787
+
+# 3. Bind your user account (choose any of the 3 methods below):
+#    Method A (Recommended — RFC 8628 Passwordless Device Code Flow):
+#    Displays an 8-character code (e.g. HEUR-7K9P); enter it in the Web UI Account Center to bind!
+aegis-os app login heurion --device-code
+
+#    Method B (Direct Grant Token from Web UI):
+aegis-os app login heurion --token aegis_at_heurion.<grant_id>.<secret>
+
+#    Method C (Username & Password Exchange):
+aegis-os app login heurion --username dr_zhang --password 'YourPassword'
+```
+
+#### Stage 2: Daily Natural-Language Agent Workflow (Zero-Prompt & Progressive Disclosure)
+Once bound, users do **not** need to manually configure per-client tokens or load dozens of tool schemas upfront. Simply talk to any Aegis-OS-connected agent (`agy`, `claude`, `codex`, `hermes`) in natural language:
+
+1. **On-Demand Progressive Session Mounting (`app_mount_session`)**:
+   - When a task involves clinical cohorts, biostatistics, or manuscript drafting, the Agent reads the installed `.agents/skills/heurion-clinical-research/SKILL.md` SOP and calls `app_mount_session(app_id: "heurion")` to mount the application on demand without polluting the global context window.
+2. **Green-Zone `[Zero-Prompt]` Execution (`app_call_tool`)**:
+   - Over 95% of daily research operations execute with **zero confirmation prompts**. Aegis-OS automatically injects `Authorization: Bearer aegis_at_<app_id>.*`, `X-Aegis-Agent-Id`, and `X-Aegis-Session-Id` at the gateway boundary:
+     - **Downlink Data to CoW Sandbox**: Call `dataset_open` or `labs_open` to receive de-identified inline `csv_content` directly inside the Agent's isolated Aegis-OS Copy-on-Write (CoW) sandbox for Python (`lifelines`, `statsmodels`, `matplotlib`) execution.
+     - **Uplink Figures with Code Provenance**: Call `asset_upload(data_base64, code, dataset_ids)` from the CoW sandbox to upload publication-grade figures alongside their exact generating script and dataset lineage.
+     - **Multi-Agent Collaborative Editing & Turn-Level Undo**: Multiple agents can concurrently edit manuscripts via `doc_edit`; if any agent introduces an error, `doc_revert_turn` selectively rolls back only that agent's turn while preserving peer agents' edits.
+3. **Direct CLI Tool Invocation (Optional for Scripting)**:
+   ```bash
+   aegis-os app mount heurion
+   aegis-os app call heurion doc_list --args '{}'
+   ```
+
+#### Stage 3: Yellow-Zone `[Lease-Gated]` High-Sensitivity Approval Workflow
+When an agent attempts an irreversible or clinically sensitive action (e.g., `report_resolve` / `lab_resolve` to commit AI-extracted lab values into the permanent patient record, or `doc_manage(purge)` to permanently destroy a document):
+
+1. **Automatic Interception & Escalation**: The `AAP-1.0` gateway intercepts the call and returns `status: "approval_required"` with an `escalation_id` (e.g., `esc-heurion-...`) and `suggested_lease_scope`.
+2. **One-Click Human-in-the-Loop Approval (Web UI or Terminal)**:
+   - **Via Application Web UI**: Click **Approve (10-min Lease)** or **Reject** in the Account Center's pending escalations panel.
+   - **Via Aegis-OS CLI**:
+     ```bash
+     aegis-os policy approve <escalation_id>
+     ```
+3. **Cryptographic Lease Verification**: Once approved, subsequent retries within the lease TTL automatically carry `X-Aegis-Lease-Token` (verified via the bound node's Ed25519 public key or active server lease) and record the approving user's identity in the immutable audit trail.
+
+#### Stage 4: Credential Inspection & Instant Revocation
+- **Revoke from Terminal**:
+  ```bash
+  aegis-os app logout heurion
+  ```
+- **Revoke from Web UI**: Inspect all bound Aegis-OS nodes, their last active timestamp, and calling `X-Aegis-Agent-Id` in the Web Account Center. Revoking a single grant or triggering **Logout Everywhere** (`token_version` increment) invalidates the corresponding `aegis_at_<app_id>.*` tokens immediately across all agents.
+
+### Progressive MCP Tools Reference (`aos-mcp-gateway`)
+| MCP Tool | Permission Tier | Description |
+| :--- | :--- | :--- |
+| `app_catalog_search` | `[Zero-Prompt]` | Search `first_party`, `verified`, and `community` `AAP-1.0` applications and check local install/auth status. |
+| `app_mount_session` | `[Zero-Prompt]` | Mount an `AAP-1.0` application into the current Agent session and inspect its `zero_prompt` vs `lease_gated` tools and SOP skills. |
+| `app_call_tool` | `[Zero-Prompt]` / `[Lease-Gated]` | Invoke any remote MCP tool over `POST /api/aegis/mcp` with automatic `Bearer aegis_at_...`, `X-Aegis-Agent-Id`, `X-Aegis-Session-Id`, and `X-Aegis-Lease-Token` injection. |
+
+---
 
 ## Empirical Benchmark Suite (`aegis-os bench`)
 
@@ -213,8 +291,9 @@ cargo build --release -p aos-cli --features ablation && python3 scripts/e5_ablat
 - [`crates/aos-sandbox`](crates/aos-sandbox): Dual-tier OS sandbox driver (`NativeOsSandboxDriver` via macOS Seatbelt / Linux `bwrap`, and `MicroVmSandboxDriver`).
 - [`crates/aos-egress`](crates/aos-egress): Identity-pinned Zero-Trust TCP HTTP Egress Proxy with domain, HTTP method, and URL path-prefix boundary secret injection (`$AOS_SECRET_*`).
 - [`crates/aos-recorder`](crates/aos-recorder): Append-only JSONL flight recorder for syscalls and security telemetry.
-- [`crates/aos-mcp-gateway`](crates/aos-mcp-gateway): Unified MCP JSON-RPC & Google A2A server (`lib.rs`) and Cloud PaaS Control Plane & Embedded Vector Web Mission Control Console (`paas.rs`).
-- [`crates/aos-cli`](crates/aos-cli): Unified `aegis-os` binary (`up`, `down`, `status`, `install`, `doctor`, `top`, `daemon`, `agy-hook`, `workspace`, `policy`, `ipc`, `bench`, `demo`), MCP-first routing, and `PreInvocation` Live Collaboration Radar.
+- [`crates/aos-mcp-gateway`](crates/aos-mcp-gateway): Unified MCP JSON-RPC & Google A2A server (`lib.rs`), AAP-1.0 App Store & Progressive MCP Proxy (`app_store.rs`), and Cloud PaaS Control Plane & Embedded Vector Web Mission Control Console (`paas.rs`).
+- [`crates/aos-cli`](crates/aos-cli): Unified `aegis-os` binary (`up`, `down`, `status`, `install`, `doctor`, `top`, `daemon`, `agy-hook`, `workspace`, `policy`, `ipc`, `app`, `cloud`, `bench`, `demo`), MCP-first routing, and `PreInvocation` Live Collaboration Radar.
+- [`docs/AEGIS_APPLICATION_PROTOCOL.md`](docs/AEGIS_APPLICATION_PROTOCOL.md): Complete `AAP-1.0` Application Protocol specification (manifest schema, user-bound `aegis_at_*` grant tokens, RFC 8628 Device Code Flow, Ed25519 lease-gated governance, and CoW sandbox data bridge).
 - [`paper/`](paper): LaTeX preprint (`main.tex`, `references.bib`, `aegis_os_arxiv_preprint.pdf`) and automated arXiv submission packager (`build_arxiv.sh`, `arxiv_submission.tar.gz`).
 
 ---
