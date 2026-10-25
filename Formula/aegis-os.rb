@@ -8,7 +8,7 @@ class AegisOs < Formula
   on_macos do
     if Hardware::CPU.arm?
       url "https://github.com/heurion-org/aegis-os/releases/download/v0.3.0/aegis-os-v0.3.0-aarch64-apple-darwin.tar.gz"
-      sha256 "0000000000000000000000000000000000000000000000000000000000000000"
+      sha256 "21c169a876d1e8b9dc5950ed05016685b714d726d10556131023b263193d7b2f"
     else
       url "https://github.com/heurion-org/aegis-os/releases/download/v0.3.0/aegis-os-v0.3.0-x86_64-apple-darwin.tar.gz"
       sha256 "0000000000000000000000000000000000000000000000000000000000000000"

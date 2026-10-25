@@ -27,8 +27,9 @@ DIST_DIR="dist"
 mkdir -p "${DIST_DIR}"
 ARCHIVE="${DIST_DIR}/aegis-os-${VERSION}-${TRIPLE}.tar.gz"
 
+TARGET_DIR="${CARGO_TARGET_DIR:-target}"
 echo "[2/3] Packaging ${ARCHIVE}..."
-cp target/release/aegis-os "${DIST_DIR}/aegis-os"
+cp "${TARGET_DIR}/release/aegis-os" "${DIST_DIR}/aegis-os"
 chmod +x "${DIST_DIR}/aegis-os"
 tar -czf "${ARCHIVE}" -C "${DIST_DIR}" aegis-os -C .. README.md Formula/aegis-os.rb
 rm -f "${DIST_DIR}/aegis-os"
