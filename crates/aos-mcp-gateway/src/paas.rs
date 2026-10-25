@@ -1995,16 +1995,18 @@ pub const DASHBOARD_HTML: &str = r##"<!doctype html>
 
     /* Nordic Workflow Plate (Right Column) */
     .hero-art {
-      background: rgba(250, 248, 244, 0.92);
+      background-color: rgba(253, 252, 249, 0.95);
+      background-image: radial-gradient(rgba(21, 28, 25, 0.09) 1px, transparent 1px);
+      background-size: 16px 16px;
       backdrop-filter: blur(14px);
       -webkit-backdrop-filter: blur(14px);
-      border: 1px solid rgba(21, 28, 25, 0.16);
+      border: 1px solid rgba(21, 28, 25, 0.18);
       box-shadow: 0 20px 48px rgba(21, 28, 25, 0.06);
-      padding: 1.35rem 1.65rem;
+      padding: 1.25rem 1.5rem;
       display: flex;
       flex-direction: column;
       justify-content: space-between;
-      gap: 0.85rem;
+      gap: 0.75rem;
       min-width: 0;
     }
 
@@ -2015,27 +2017,144 @@ pub const DASHBOARD_HTML: &str = r##"<!doctype html>
       gap: 0.75rem;
       flex-wrap: wrap;
       font-family: var(--mono);
-      font-size: 0.68rem;
+      font-size: 0.66rem;
       letter-spacing: 0.08em;
       color: var(--ink-secondary);
     }
 
     .art-header {
-      padding-bottom: 0.65rem;
+      padding-bottom: 0.55rem;
       border-bottom: 1px solid var(--border);
     }
 
     .art-caption {
-      padding-top: 0.65rem;
+      padding-top: 0.55rem;
       border-top: 1px solid var(--border);
     }
 
-    .art-svg {
-      width: 100%;
-      height: auto;
-      max-height: 215px;
-      aspect-ratio: 460 / 210;
-      display: block;
+    .arch-flow {
+      display: flex;
+      flex-direction: column;
+      gap: 0.42rem;
+    }
+
+    .arch-stage {
+      background: var(--bg-elevated);
+      border: 1px solid var(--border);
+      padding: 0.68rem 0.9rem;
+      display: flex;
+      flex-direction: column;
+      gap: 0.3rem;
+    }
+
+    .arch-stage-cloud {
+      background: var(--accent-soft);
+      border-color: var(--accent);
+      padding: 0.72rem 0.9rem;
+      gap: 0.5rem;
+    }
+
+    .arch-stage-commit {
+      background: var(--accent);
+      border-color: var(--accent);
+      color: var(--ink-light);
+      padding: 0.68rem 0.9rem;
+      gap: 0.28rem;
+    }
+
+    .arch-row-top {
+      display: flex;
+      justify-content: space-between;
+      align-items: center;
+      gap: 0.5rem;
+      flex-wrap: wrap;
+    }
+
+    .arch-step-id {
+      font-family: var(--mono);
+      font-size: 0.64rem;
+      font-weight: 500;
+      letter-spacing: 0.08em;
+      text-transform: uppercase;
+      color: var(--accent);
+      display: inline-flex;
+      align-items: center;
+      gap: 0.38rem;
+    }
+
+    .arch-stage-commit .arch-step-id {
+      color: var(--heurion-mint);
+    }
+
+    .arch-badge {
+      font-family: var(--mono);
+      font-size: 0.62rem;
+      padding: 0.08rem 0.42rem;
+      border: 1px solid var(--border);
+      background: var(--bg-primary);
+      color: var(--ink-secondary);
+    }
+
+    .arch-stage-cloud .arch-badge {
+      border-color: rgba(35, 62, 51, 0.25);
+      background: rgba(253, 252, 249, 0.9);
+      color: var(--accent);
+    }
+
+    .arch-title {
+      font-size: 0.82rem;
+      font-weight: 600;
+      color: var(--ink);
+      line-height: 1.35;
+    }
+
+    .arch-stage-commit .arch-title {
+      color: var(--ink-light);
+      font-weight: 500;
+    }
+
+    .arch-lanes {
+      display: grid;
+      grid-template-columns: repeat(3, minmax(0, 1fr));
+      gap: 0.42rem;
+    }
+
+    .arch-lane {
+      background: var(--bg-elevated);
+      border: 1px solid rgba(35, 62, 51, 0.22);
+      padding: 0.4rem 0.52rem;
+      display: flex;
+      flex-direction: column;
+      gap: 0.1rem;
+      min-width: 0;
+    }
+
+    .arch-lane-id {
+      font-family: var(--mono);
+      font-size: 0.58rem;
+      color: var(--ink-muted);
+      letter-spacing: 0.05em;
+    }
+
+    .arch-lane-name {
+      font-size: 0.73rem;
+      font-weight: 600;
+      color: var(--ink);
+      white-space: nowrap;
+      overflow: hidden;
+      text-overflow: ellipsis;
+    }
+
+    .arch-conn {
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      gap: 0.4rem;
+      font-family: var(--mono);
+      font-size: 0.62rem;
+      color: var(--ink-secondary);
+      line-height: 1.1;
+      padding: 0.04rem 0;
     }
 
     /* Content Sections */
@@ -2306,6 +2425,9 @@ pub const DASHBOARD_HTML: &str = r##"<!doctype html>
       .hero-art {
         padding: 1rem 1.05rem;
       }
+      .arch-lanes {
+        grid-template-columns: minmax(0, 1fr);
+      }
       .editorial-card {
         padding: 1.2rem 1.05rem;
       }
@@ -2409,53 +2531,70 @@ pub const DASHBOARD_HTML: &str = r##"<!doctype html>
             </div>
           </div>
 
-          <!-- Clear 3-Step E2E Workflow Diagram Plate -->
-          <div class="hero-art" aria-hidden="true">
+          <!-- Clear 3-Stage Architectural Schematic Plate -->
+          <div class="hero-art" aria-label="Aegis Cloud Workflow Schematic">
             <div class="art-header">
               <span data-i18n="art_top_l">AI AGENT 自动调用工作流</span>
-              <span data-i18n="art_top_r">64GB 云端主机</span>
+              <span style="display:inline-flex;align-items:center;gap:0.35rem;"><span class="dot-mint"></span><span data-i18n="art_top_r">64GB 云端主机</span></span>
             </div>
-            <svg class="art-svg" viewBox="0 0 460 210" fill="none" xmlns="http://www.w3.org/2000/svg">
-              <circle cx="230" cy="105" r="92" stroke="#DCD6CA" stroke-width="1" stroke-dasharray="2 4"/>
-              <line x1="230" y1="8" x2="230" y2="202" stroke="#E5E0D5" stroke-width="1"/>
 
-              <!-- Step 1: Chat in AI Agent -->
-              <rect x="14" y="70" width="104" height="70" fill="#F2EFE9" stroke="#233E33" stroke-width="1"/>
-              <text x="66" y="94" text-anchor="middle" fill="#151C19" font-family="Inter, PingFang SC, sans-serif" font-size="9.0" font-weight="600" data-i18n="svg_step1_t">1. 在对话框交代任务</text>
-              <text x="66" y="112" text-anchor="middle" fill="#525B56" font-family="JetBrains Mono, PingFang SC, sans-serif" font-size="7.6" data-i18n="svg_step1_d">AI 自动同步云端副本</text>
-              <text x="66" y="128" text-anchor="middle" fill="#233E33" font-family="JetBrains Mono, PingFang SC, sans-serif" font-size="7.5" data-i18n="svg_step1_s">0% 本地资源占用</text>
+            <div class="arch-flow">
+              <!-- Stage 01: Local AI Agent -->
+              <div class="arch-stage">
+                <div class="arch-row-top">
+                  <span class="arch-step-id" data-i18n="svg_step1_t">01 / 本地 AI AGENT 对话框</span>
+                  <span class="arch-badge" data-i18n="svg_step1_s">0% 本地资源占用</span>
+                </div>
+                <div class="arch-title" data-i18n="svg_step1_d">直接用自然语言交代任务（Claude · Cursor · Codex · AGY）</div>
+              </div>
 
-              <!-- Fork Lines -->
-              <path d="M118 105 L140 105 L152 52 L164 52" stroke="#848D88" stroke-width="1"/>
-              <line x1="118" y1="105" x2="164" y2="105" stroke="#233E33" stroke-width="1.2"/>
-              <path d="M118 105 L140 105 L152 158 L164 158" stroke="#848D88" stroke-width="1"/>
+              <!-- Connector 1 -->
+              <div class="arch-conn">
+                <span>↓</span>
+                <span data-i18n="arch_conn_1">MCP 自动转发至云端（本机密钥自动附加，LLM 零接触）</span>
+              </div>
 
-              <!-- Step 2: Cloud Sandbox Execution -->
-              <rect x="164" y="35" width="132" height="34" fill="#FDFCF9" stroke="#C8C1B4" stroke-width="1"/>
-              <text x="230" y="55" text-anchor="middle" fill="#525B56" font-family="Inter, PingFang SC, sans-serif" font-size="8.4" data-i18n="svg_ai1">Agent A · 调研与分析</text>
+              <!-- Stage 02: 64GB Cloud CoW Sandbox -->
+              <div class="arch-stage arch-stage-cloud">
+                <div class="arch-row-top">
+                  <span class="arch-step-id"><span class="dot-mint"></span><span data-i18n="arch_stage2_t">02 / 64GB 云端隔离沙箱</span></span>
+                  <span class="arch-badge" data-i18n="arch_stage2_b">Copy-on-Write 独立副本</span>
+                </div>
+                <div class="arch-lanes">
+                  <div class="arch-lane">
+                    <span class="arch-lane-id">AGENT 01</span>
+                    <span class="arch-lane-name" data-i18n="svg_ai1">调研与分析</span>
+                  </div>
+                  <div class="arch-lane">
+                    <span class="arch-lane-id">AGENT 02</span>
+                    <span class="arch-lane-name" data-i18n="svg_ai2">执行与处理</span>
+                  </div>
+                  <div class="arch-lane">
+                    <span class="arch-lane-id">AGENT 03</span>
+                    <span class="arch-lane-name" data-i18n="svg_ai3">复核与校验</span>
+                  </div>
+                </div>
+              </div>
 
-              <rect x="164" y="88" width="132" height="34" fill="#E3ECE7" stroke="#233E33" stroke-width="1"/>
-              <circle cx="178" cy="105" r="3" fill="#00C472"/>
-              <text x="236" y="108" text-anchor="middle" fill="#151C19" font-family="Inter, PingFang SC, sans-serif" font-size="8.4" font-weight="600" data-i18n="svg_ai2">Agent B · 执行与处理</text>
+              <!-- Connector 2 -->
+              <div class="arch-conn">
+                <span>↓</span>
+                <span data-i18n="arch_conn_2">workspace_diff 预览全部改动 · 确认无误后合并</span>
+              </div>
 
-              <rect x="164" y="141" width="132" height="34" fill="#FDFCF9" stroke="#C8C1B4" stroke-width="1"/>
-              <text x="230" y="161" text-anchor="middle" fill="#525B56" font-family="Inter, PingFang SC, sans-serif" font-size="8.4" data-i18n="svg_ai3">Agent C · 复核与校验</text>
+              <!-- Stage 03: Verified Sync -->
+              <div class="arch-stage arch-stage-commit">
+                <div class="arch-row-top">
+                  <span class="arch-step-id"><span class="dot-mint"></span><span data-i18n="svg_step3_t">03 / 对话确认即合并</span></span>
+                  <span style="font-family:var(--mono);font-size:0.62rem;color:#E3ECE7;" data-i18n="svg_step3_d">安全写回保护</span>
+                </div>
+                <div class="arch-title" data-i18n="svg_step3_s">仅将通过校验的结果自动同步回你的本地电脑</div>
+              </div>
+            </div>
 
-              <!-- Merge Lines -->
-              <path d="M296 52 L308 52 L320 105 L342 105" stroke="#848D88" stroke-width="1"/>
-              <line x1="296" y1="105" x2="342" y2="105" stroke="#233E33" stroke-width="1.2"/>
-              <path d="M296 158 L308 158 L320 105 L342 105" stroke="#848D88" stroke-width="1"/>
-
-              <!-- Step 3: Approve in Chat -->
-              <rect x="342" y="70" width="104" height="70" fill="#233E33"/>
-              <circle cx="357" cy="88" r="3.5" fill="#00C472"/>
-              <text x="399" y="92" text-anchor="middle" fill="#FAF8F4" font-family="Inter, PingFang SC, sans-serif" font-size="8.8" font-weight="600" data-i18n="svg_step3_t">2. 对话确认即合并</text>
-              <text x="394" y="110" text-anchor="middle" fill="#E3ECE7" font-family="JetBrains Mono, PingFang SC, sans-serif" font-size="7.5" data-i18n="svg_step3_d">AI 自动看变更对比</text>
-              <text x="394" y="126" text-anchor="middle" fill="#00C472" font-family="JetBrains Mono, PingFang SC, sans-serif" font-size="7.5" data-i18n="svg_step3_s">自动同步回你的电脑</text>
-            </svg>
             <div class="art-caption">
-              <span data-i18n="art_bot_l">支持 CLAUDE · CURSOR · CODEX · AGY 等通用 AGENT</span>
-              <span data-i18n="art_bot_r">全程由 AI 自动调用 MCP</span>
+              <span data-i18n="art_bot_l">CLAUDE · CURSOR · CODEX · AGY</span>
+              <span data-i18n="art_bot_r">100% MCP 自动路由</span>
             </div>
           </div>
         </div>
@@ -2559,17 +2698,21 @@ pub const DASHBOARD_HTML: &str = r##"<!doctype html>
         st_lbl_safe: '直接对 AI Agent 说话，无需敲命令',
         art_top_l: 'AI AGENT 自动调用工作流',
         art_top_r: '64GB 云端主机',
-        svg_step1_t: '1. 在对话框交代任务',
-        svg_step1_d: 'AI 自动同步云端副本',
+        svg_step1_t: '01 / 本地 AI AGENT 对话框',
+        svg_step1_d: '直接用自然语言交代任务（Claude · Cursor · Codex · AGY）',
         svg_step1_s: '0% 本地资源占用',
-        svg_ai1: 'Agent A · 调研与分析',
-        svg_ai2: 'Agent B · 执行与处理',
-        svg_ai3: 'Agent C · 复核与校验',
-        svg_step3_t: '2. 对话确认即合并',
-        svg_step3_d: 'AI 自动看变更对比',
-        svg_step3_s: '自动同步回你的电脑',
-        art_bot_l: '支持 CLAUDE · CURSOR · CODEX · AGY 等通用 AGENT',
-        art_bot_r: '全程由 AI 自动调用 MCP',
+        arch_conn_1: 'MCP 自动转发至云端（本机密钥自动附加，LLM 零接触）',
+        arch_stage2_t: '02 / 64GB 云端隔离沙箱',
+        arch_stage2_b: 'Copy-on-Write 独立副本',
+        svg_ai1: '调研与分析',
+        svg_ai2: '执行与处理',
+        svg_ai3: '复核与校验',
+        arch_conn_2: 'workspace_diff 预览全部改动 · 确认无误后合并',
+        svg_step3_t: '03 / 对话确认即合并',
+        svg_step3_d: '安全写回保护',
+        svg_step3_s: '仅将通过校验的结果自动同步回你的本地电脑',
+        art_bot_l: 'CLAUDE · CURSOR · CODEX · AGY',
+        art_bot_r: '100% MCP 自动路由',
         sec3_title: '选择方案与 <em>30 秒完整使用流程</em>',
         sec3_label: '安装一次插件 · 后续全部在你的 AI AGENT 对话框内完成',
         tier_free_tag: '免费版 · 无需注册或绑卡',
@@ -2596,17 +2739,21 @@ pub const DASHBOARD_HTML: &str = r##"<!doctype html>
         st_lbl_safe: 'Controlled directly via your AI Agent',
         art_top_l: 'AI AGENT MCP WORKFLOW',
         art_top_r: '64GB CLOUD HOST',
-        svg_step1_t: '1. Assign Task in Chat',
-        svg_step1_d: 'Auto-synced cloud copy',
+        svg_step1_t: '01 / LOCAL AI AGENT CHAT',
+        svg_step1_d: 'Assign tasks in natural language (Claude · Cursor · Codex · AGY)',
         svg_step1_s: '0% local CPU / RAM',
-        svg_ai1: 'Agent A · Research & Analyze',
-        svg_ai2: 'Agent B · Execute & Process',
-        svg_ai3: 'Agent C · Verify & Review',
-        svg_step3_t: '2. Approve in Chat',
-        svg_step3_d: 'AI previews all changes',
-        svg_step3_s: 'Auto-synced to laptop',
-        art_bot_l: 'WORKS WITH CLAUDE · CURSOR · CODEX · AGY',
-        art_bot_r: '100% DRIVEN BY YOUR AI AGENT',
+        arch_conn_1: 'Auto-routed via MCP (local key attached, zero LLM exposure)',
+        arch_stage2_t: '02 / 64GB CLOUD SANDBOX',
+        arch_stage2_b: 'Isolated CoW Copies',
+        svg_ai1: 'Research & Analyze',
+        svg_ai2: 'Execute & Process',
+        svg_ai3: 'Verify & Review',
+        arch_conn_2: 'Preview workspace_diff · approve to merge',
+        svg_step3_t: '03 / VERIFIED SYNC TO LAPTOP',
+        svg_step3_d: 'Write-Back Guard',
+        svg_step3_s: 'Only approved results are synced back to your machine',
+        art_bot_l: 'CLAUDE · CURSOR · CODEX · AGY',
+        art_bot_r: '100% MCP AUTO-ROUTED',
         sec3_title: 'Choose Your Plan &amp; <em>30-Second Setup</em>',
         sec3_label: 'INSTALL ONCE · EVERYTHING ELSE HAPPENS IN YOUR AI AGENT CHAT',
         tier_free_tag: 'FREE PLAN · NO SIGNUP REQUIRED',
