@@ -1425,12 +1425,7 @@ impl PaasControlPlane {
 }
 
 /// Heurion Research — Nordic / Scandinavian Editorial Design System (v5) Web Console served at `GET /dashboard`.
-/// Displays high-signal operational telemetry and controls in the exact visual language of `https://heurion.org`:
-/// 1. Heurion Sticky Top Navigation (Original Brand Mark, Section Links, Plan Switcher, Bilingual ZH/EN Toggle, Polar.sh Checkout CTA)
-/// 2. Editorial Split Hero & Live L1 Aegis OS Architectural Plate (4-Column Tabular Serif Metrics + CoW/Diff3/AAP-1.0 Schematic)
-/// 3. 01 / Pending Boundary Approvals (AAP-1.0 Ed25519 Human-in-the-Loop Lease Gate & Inline Unified Diff Drawer)
-/// 4. 02 / Cloud CoW Workspaces & Scale-to-Zero (Warm Linen `#EFECE4` Section with Instant Btrfs CoW Fork, Wake/Hibernate & Git PR Export)
-/// 5. 03 / CLI Onboarding, Polar.sh Subscription Key Claim & Scoped API Keys
+/// Displays clear, human-friendly operational controls in the visual language of `https://heurion.org`.
 pub const DASHBOARD_HTML: &str = r##"<!doctype html>
 <html lang="zh-CN">
 <head>
@@ -1532,7 +1527,7 @@ pub const DASHBOARD_HTML: &str = r##"<!doctype html>
 
     html[lang="zh-CN"] .heading-1 {
       font-size: clamp(1.85rem, 2.5vw, 2.35rem);
-      line-height: 1.32;
+      line-height: 1.34;
       letter-spacing: 0.01em;
     }
 
@@ -1559,17 +1554,9 @@ pub const DASHBOARD_HTML: &str = r##"<!doctype html>
       color: var(--ink);
     }
 
-    .heading-3 {
-      font-family: var(--serif);
-      font-size: 1.08rem;
-      font-weight: 400;
-      line-height: 1.38;
-      color: var(--ink);
-    }
-
     .text-muted {
-      font-size: 0.86rem;
-      line-height: 1.65;
+      font-size: 0.9rem;
+      line-height: 1.7;
       color: var(--ink-secondary);
     }
 
@@ -1635,7 +1622,7 @@ pub const DASHBOARD_HTML: &str = r##"<!doctype html>
     .brand-sub {
       font-family: var(--mono);
       font-size: 0.68rem;
-      letter-spacing: 0.14em;
+      letter-spacing: 0.12em;
       text-transform: uppercase;
       color: var(--accent);
       padding: 0.18rem 0.52rem;
@@ -1650,7 +1637,7 @@ pub const DASHBOARD_HTML: &str = r##"<!doctype html>
     }
 
     .nav-link {
-      font-size: 0.8rem;
+      font-size: 0.82rem;
       letter-spacing: 0.02em;
       color: var(--ink-secondary);
     }
@@ -1669,20 +1656,20 @@ pub const DASHBOARD_HTML: &str = r##"<!doctype html>
     /* Architectural Buttons & Inputs (Sharp 0px Radius, 1px Hairline) */
     .btn, select, input {
       font-family: var(--sans);
-      font-size: 0.78rem;
+      font-size: 0.8rem;
       border-radius: 0;
       border: 1px solid var(--border);
       background: var(--bg-elevated);
       color: var(--ink);
-      padding: 0.44rem 0.85rem;
+      padding: 0.46rem 0.88rem;
       line-height: 1.3;
       transition: all 0.18s ease;
     }
 
     select, .mono-input {
       font-family: var(--mono);
-      font-size: 0.72rem;
-      letter-spacing: 0.03em;
+      font-size: 0.74rem;
+      letter-spacing: 0.02em;
     }
 
     input:focus, select:focus {
@@ -1745,7 +1732,7 @@ pub const DASHBOARD_HTML: &str = r##"<!doctype html>
     .lang-btn {
       background: transparent;
       border: 1px solid var(--border);
-      padding: 0.34rem 0.62rem;
+      padding: 0.36rem 0.65rem;
       font-family: var(--mono);
       font-size: 0.68rem;
       letter-spacing: 0.08em;
@@ -1765,9 +1752,8 @@ pub const DASHBOARD_HTML: &str = r##"<!doctype html>
       gap: 0.38rem;
       padding: 0.16rem 0.55rem;
       font-family: var(--mono);
-      font-size: 0.66rem;
-      letter-spacing: 0.08em;
-      text-transform: uppercase;
+      font-size: 0.68rem;
+      letter-spacing: 0.06em;
       border: 1px solid var(--border);
       background: var(--bg-primary);
       color: var(--ink-secondary);
@@ -1801,7 +1787,7 @@ pub const DASHBOARD_HTML: &str = r##"<!doctype html>
       display: inline-block;
     }
 
-    /* Section 0: Editorial Console Hero & Telemetry Plate */
+    /* Section 0: Editorial Console Hero & Workflow Plate */
     .sec-hero {
       padding: 3.5rem 0 3.75rem;
       background-color: var(--bg-primary);
@@ -1845,7 +1831,7 @@ pub const DASHBOARD_HTML: &str = r##"<!doctype html>
     .stat-cell {
       display: flex;
       flex-direction: column;
-      gap: 0.25rem;
+      gap: 0.28rem;
     }
 
     .stat-val {
@@ -1858,11 +1844,9 @@ pub const DASHBOARD_HTML: &str = r##"<!doctype html>
     }
 
     .stat-lbl {
-      font-family: var(--mono);
-      font-size: 0.64rem;
-      color: var(--ink-muted);
-      letter-spacing: 0.08em;
-      text-transform: uppercase;
+      font-size: 0.74rem;
+      color: var(--ink-secondary);
+      letter-spacing: 0.02em;
     }
 
     .hero-actions {
@@ -1872,7 +1856,7 @@ pub const DASHBOARD_HTML: &str = r##"<!doctype html>
       flex-wrap: wrap;
     }
 
-    /* Nordic Architectural Plate (Right Column) */
+    /* Nordic Workflow Plate (Right Column) */
     .hero-art {
       background: rgba(250, 248, 244, 0.90);
       backdrop-filter: blur(14px);
@@ -1891,10 +1875,9 @@ pub const DASHBOARD_HTML: &str = r##"<!doctype html>
       justify-content: space-between;
       align-items: center;
       font-family: var(--mono);
-      font-size: 0.64rem;
-      letter-spacing: 0.11em;
-      color: var(--ink-muted);
-      text-transform: uppercase;
+      font-size: 0.68rem;
+      letter-spacing: 0.08em;
+      color: var(--ink-secondary);
     }
 
     .art-header {
@@ -1991,18 +1974,15 @@ pub const DASHBOARD_HTML: &str = r##"<!doctype html>
     table {
       width: 100%;
       border-collapse: collapse;
-      font-size: 0.84rem;
+      font-size: 0.85rem;
     }
 
     th {
       text-align: left;
       padding: 0.75rem 0.9rem;
-      font-family: var(--mono);
-      font-size: 0.66rem;
-      font-weight: 400;
-      letter-spacing: 0.12em;
-      text-transform: uppercase;
-      color: var(--ink-muted);
+      font-size: 0.75rem;
+      font-weight: 500;
+      color: var(--ink-secondary);
       border-bottom: 1px solid var(--border);
     }
 
@@ -2034,7 +2014,7 @@ pub const DASHBOARD_HTML: &str = r##"<!doctype html>
       padding: 1.1rem 1.35rem;
       font-family: var(--mono);
       font-size: 0.76rem;
-      line-height: 1.65;
+      line-height: 1.68;
       overflow-x: auto;
       max-height: 380px;
     }
@@ -2055,10 +2035,8 @@ pub const DASHBOARD_HTML: &str = r##"<!doctype html>
 
     .empty {
       color: var(--ink-muted);
-      font-size: 0.84rem;
+      font-size: 0.86rem;
       padding: 0.85rem 0;
-      font-style: italic;
-      font-family: var(--serif);
     }
 
     /* Footer */
@@ -2081,15 +2059,14 @@ pub const DASHBOARD_HTML: &str = r##"<!doctype html>
       flex-wrap: wrap;
       align-items: center;
       gap: 1.5rem;
-      font-size: 0.76rem;
+      font-size: 0.78rem;
       color: var(--ink-muted);
     }
 
     .foot-link {
       font-family: var(--mono);
-      font-size: 0.68rem;
-      letter-spacing: 0.08em;
-      text-transform: uppercase;
+      font-size: 0.7rem;
+      letter-spacing: 0.06em;
       color: var(--ink-secondary);
     }
 
@@ -2102,9 +2079,7 @@ pub const DASHBOARD_HTML: &str = r##"<!doctype html>
       color: var(--ink-light);
       border-left: 3px solid var(--heurion-mint);
       padding: 0.7rem 1.15rem;
-      font-family: var(--mono);
-      font-size: 0.74rem;
-      letter-spacing: 0.03em;
+      font-size: 0.8rem;
       box-shadow: 0 16px 36px rgba(21, 28, 25, 0.18);
       display: none;
     }
@@ -2137,8 +2112,8 @@ pub const DASHBOARD_HTML: &str = r##"<!doctype html>
       </div>
 
       <nav class="nav-links" aria-label="Console Sections">
-        <a href="#sec-approvals" class="nav-link" data-i18n="nav_approvals">01 / 边界审批</a>
-        <a href="#sec-workspaces" class="nav-link" data-i18n="nav_workspaces">02 / 写时复制工作区</a>
+        <a href="#sec-approvals" class="nav-link" data-i18n="nav_approvals">01 / 待你确认</a>
+        <a href="#sec-workspaces" class="nav-link" data-i18n="nav_workspaces">02 / 云端工作区</a>
         <a href="#sec-onboarding" class="nav-link" data-i18n="nav_onboarding">03 / 接入与密钥</a>
         <a href="https://heurion.org/" class="nav-link" data-i18n="nav_home">Heurion 主站 ↗</a>
         <a href="https://github.com/heurion-org/aegis-os" target="_blank" rel="noopener" class="nav-link">GitHub ↗</a>
@@ -2146,133 +2121,133 @@ pub const DASHBOARD_HTML: &str = r##"<!doctype html>
 
       <div class="nav-right">
         <select id="plan-select" onchange="changePlan(this.value)" aria-label="Select Tier">
-          <option value="community">COMMUNITY · FREE (2 AGENTS)</option>
-          <option value="pro" selected>PRO · $29/MO (8 AGENTS)</option>
-          <option value="team">TEAM · $79/SEAT (32 AGENTS)</option>
-          <option value="enterprise">ENTERPRISE · VPC (256 AGENTS)</option>
+          <option value="community">免费版 · 2 个 AI 同时运行</option>
+          <option value="pro" selected>Pro 版 ($29/月) · 8 个 AI 同时运行</option>
+          <option value="team">团队版 ($79/月) · 32 个 AI 同时运行</option>
+          <option value="enterprise">企业版 · 256 个 AI 专属集群</option>
         </select>
         <button class="lang-btn" id="langBtn" type="button" onclick="toggleLang()">EN</button>
-        <a class="btn btn-solid" id="polar-checkout-btn" href="https://buy.polar.sh/polar_cl_jCPpzbp4eOAyRbkDP4YzNIFVnYLddbvJZI5Fc27zL0x" target="_blank" rel="noopener" data-i18n="nav_subscribe">订阅 Pro ($29/mo) →</a>
+        <a class="btn btn-solid" id="polar-checkout-btn" href="https://buy.polar.sh/polar_cl_jCPpzbp4eOAyRbkDP4YzNIFVnYLddbvJZI5Fc27zL0x" target="_blank" rel="noopener" data-i18n="nav_subscribe">开通 Pro ($29/月) →</a>
       </div>
     </div>
   </header>
 
   <main>
-    <!-- Hero & Architectural Telemetry Plate -->
+    <!-- Hero & Clear Visual Workflow Plate -->
     <section class="sec-hero">
       <div class="container">
         <div class="hero-grid">
           <div class="hero-left">
             <div class="hero-intro">
-              <p class="label-caps" data-i18n="hero_eyebrow">HEURION RESEARCH · L1 TRANSACTIONAL AGENT OS CLOUD</p>
-              <h1 class="heading-1" data-i18n-html="hero_title">为多智能体并发协作，<br>提供<em>零本地负载</em>的写时复制云底座。</h1>
-              <p class="text-muted" data-i18n="hero_desc">基于 64GB Btrfs FICLONE 写时复制影子树、Bubblewrap 内核沙箱与 AAP-1.0 Ed25519 人类签名租约，将重型编译测试 100% 卸载至云端。</p>
+              <p class="label-caps" data-i18n="hero_eyebrow">HEURION · AEGIS CLOUD 云端 AI 编程工作台</p>
+              <h1 class="heading-1" data-i18n-html="hero_title">让多个 AI 同时改代码，<br>电脑<em>不卡顿</em>，原项目<em>不怕改坏</em>。</h1>
+              <p class="text-muted" data-i18n="hero_desc">把吃内存的编译、测试和多 AI 并行改代码全部放到 64GB 云端服务器上跑。每个 AI 都在独立的临时副本里干活，互不干扰；改好后你先看代码对比，满意再一键同步回本地。</p>
             </div>
 
             <div>
               <div class="telemetry-strip">
                 <div class="stat-cell">
                   <span class="stat-val" id="st-pending" style="color:var(--accent-warm);">0</span>
-                  <span class="stat-lbl" data-i18n="st_lbl_pending">待处理边界审批</span>
+                  <span class="stat-lbl" data-i18n="st_lbl_pending">待你确认的改动</span>
                 </div>
                 <div class="stat-cell">
                   <span class="stat-val" id="st-ws">0 / 0</span>
-                  <span class="stat-lbl" data-i18n="st_lbl_ws">活跃 / 休眠工作区</span>
+                  <span class="stat-lbl" data-i18n="st_lbl_ws">运行中 / 已休眠项目</span>
                 </div>
                 <div class="stat-cell">
                   <span class="stat-val" id="st-usage">0 · 0ms</span>
-                  <span class="stat-lbl" data-i18n="st_lbl_usage">系统调用 / 沙箱耗时</span>
+                  <span class="stat-lbl" data-i18n="st_lbl_usage">已执行命令 / 云端耗时</span>
                 </div>
                 <div class="stat-cell">
                   <span class="stat-val" id="st-saved" style="color:var(--accent);">0.0 KB</span>
-                  <span class="stat-lbl" data-i18n="st_lbl_saved">CoW 零拷贝节省</span>
+                  <span class="stat-lbl" data-i18n="st_lbl_saved">为你节省的磁盘空间</span>
                 </div>
               </div>
 
               <div class="hero-actions" style="margin-top: 1.25rem;">
-                <button class="btn btn-solid" onclick="simulateEscalation()" data-i18n="btn_simulate">+ 模拟边界审批</button>
-                <button class="btn" onclick="refresh(true)" data-i18n="btn_refresh">同步遥测状态</button>
-                <a class="btn" href="#sec-onboarding" data-i18n="btn_cli_guide">CLI 一键接入指南 →</a>
+                <button class="btn btn-solid" onclick="simulateEscalation()" data-i18n="btn_simulate">+ 演示一次确认流程</button>
+                <button class="btn" onclick="refresh(true)" data-i18n="btn_refresh">刷新数据</button>
+                <a class="btn" href="#sec-onboarding" data-i18n="btn_cli_guide">30 秒接入指南 →</a>
               </div>
             </div>
           </div>
 
-          <!-- Nordic L1 Kernel Schematic Plate -->
+          <!-- Clear 3-Step Workflow Diagram Plate -->
           <div class="hero-art" aria-hidden="true">
             <div class="art-header">
-              <span data-i18n="art_top_l">L1 · AEGIS OS CLOUD KERNEL</span>
-              <span data-i18n="art_top_r">BTRFS FICLONE × AAP-1.0</span>
+              <span data-i18n="art_top_l">工作流程 — 先在独立副本试跑，满意后再合并</span>
+              <span data-i18n="art_top_r">64GB 云端服务器</span>
             </div>
             <svg class="art-svg" viewBox="0 0 460 210" fill="none" xmlns="http://www.w3.org/2000/svg">
               <circle cx="230" cy="105" r="92" stroke="#DCD6CA" stroke-width="1" stroke-dasharray="2 4"/>
               <line x1="230" y1="8" x2="230" y2="202" stroke="#E5E0D5" stroke-width="1"/>
 
-              <!-- Left: Btrfs CoW Fork -->
-              <rect x="16" y="72" width="102" height="66" fill="#F2EFE9" stroke="#233E33" stroke-width="1"/>
-              <text x="67" y="96" text-anchor="middle" fill="#151C19" font-family="JetBrains Mono, monospace" font-size="8.5" font-weight="500">BTRFS COW FORK</text>
-              <text x="67" y="112" text-anchor="middle" fill="#525B56" font-family="JetBrains Mono, monospace" font-size="7.5">0.42ms FICLONE</text>
-              <text x="67" y="126" text-anchor="middle" fill="#233E33" font-family="JetBrains Mono, monospace" font-size="7.2">Scale-to-Zero</text>
+              <!-- Step 1: Instant Copy -->
+              <rect x="14" y="70" width="104" height="70" fill="#F2EFE9" stroke="#233E33" stroke-width="1"/>
+              <text x="66" y="94" text-anchor="middle" fill="#151C19" font-family="Inter, PingFang SC, sans-serif" font-size="9.5" font-weight="600" data-i18n="svg_step1_t">1. 秒建独立副本</text>
+              <text x="66" y="112" text-anchor="middle" fill="#525B56" font-family="JetBrains Mono, PingFang SC, sans-serif" font-size="7.8" data-i18n="svg_step1_d">不碰你的原代码</text>
+              <text x="66" y="128" text-anchor="middle" fill="#233E33" font-family="JetBrains Mono, PingFang SC, sans-serif" font-size="7.5" data-i18n="svg_step1_s">0% 本地内存占用</text>
 
               <!-- Fork Lines -->
-              <path d="M118 105 L140 105 L152 52 L166 52" stroke="#848D88" stroke-width="1"/>
-              <line x1="118" y1="105" x2="166" y2="105" stroke="#233E33" stroke-width="1.2"/>
-              <path d="M118 105 L140 105 L152 158 L166 158" stroke="#848D88" stroke-width="1"/>
+              <path d="M118 105 L140 105 L152 52 L164 52" stroke="#848D88" stroke-width="1"/>
+              <line x1="118" y1="105" x2="164" y2="105" stroke="#233E33" stroke-width="1.2"/>
+              <path d="M118 105 L140 105 L152 158 L164 158" stroke="#848D88" stroke-width="1"/>
 
-              <!-- Center: 3 Concurrent Agent Sandboxes -->
-              <rect x="166" y="36" width="128" height="32" fill="#FDFCF9" stroke="#C8C1B4" stroke-width="1"/>
-              <text x="230" y="55" text-anchor="middle" fill="#525B56" font-family="JetBrains Mono, monospace" font-size="7.8">Shadow A · agy-agent</text>
+              <!-- Step 2: 3 Parallel AI Assistants -->
+              <rect x="164" y="35" width="132" height="34" fill="#FDFCF9" stroke="#C8C1B4" stroke-width="1"/>
+              <text x="230" y="55" text-anchor="middle" fill="#525B56" font-family="Inter, PingFang SC, sans-serif" font-size="8.4" data-i18n="svg_ai1">AI 助手 A · 写新功能</text>
 
-              <rect x="166" y="89" width="128" height="32" fill="#E3ECE7" stroke="#233E33" stroke-width="1"/>
-              <circle cx="180" cy="105" r="3" fill="#00C472"/>
-              <text x="236" y="108" text-anchor="middle" fill="#151C19" font-family="JetBrains Mono, monospace" font-size="7.8" font-weight="500">Shadow B · claude-code</text>
+              <rect x="164" y="88" width="132" height="34" fill="#E3ECE7" stroke="#233E33" stroke-width="1"/>
+              <circle cx="178" cy="105" r="3" fill="#00C472"/>
+              <text x="236" y="108" text-anchor="middle" fill="#151C19" font-family="Inter, PingFang SC, sans-serif" font-size="8.4" font-weight="600" data-i18n="svg_ai2">AI 助手 B · 跑测试修 Bug</text>
 
-              <rect x="166" y="142" width="128" height="32" fill="#FDFCF9" stroke="#C8C1B4" stroke-width="1"/>
-              <text x="230" y="161" text-anchor="middle" fill="#525B56" font-family="JetBrains Mono, monospace" font-size="7.8">Shadow C · codex-cli</text>
+              <rect x="164" y="141" width="132" height="34" fill="#FDFCF9" stroke="#C8C1B4" stroke-width="1"/>
+              <text x="230" y="161" text-anchor="middle" fill="#525B56" font-family="Inter, PingFang SC, sans-serif" font-size="8.4" data-i18n="svg_ai3">AI 助手 C · 代码审查</text>
 
               <!-- Merge Lines -->
-              <path d="M294 52 L308 52 L320 105 L342 105" stroke="#848D88" stroke-width="1"/>
-              <line x1="294" y1="105" x2="342" y2="105" stroke="#233E33" stroke-width="1.2"/>
-              <path d="M294 158 L308 158 L320 105 L342 105" stroke="#848D88" stroke-width="1"/>
+              <path d="M296 52 L308 52 L320 105 L342 105" stroke="#848D88" stroke-width="1"/>
+              <line x1="296" y1="105" x2="342" y2="105" stroke="#233E33" stroke-width="1.2"/>
+              <path d="M296 158 L308 158 L320 105 L342 105" stroke="#848D88" stroke-width="1"/>
 
-              <!-- Right: 4-Tier LCS Diff3 + Ed25519 Lease Gate -->
-              <rect x="342" y="72" width="102" height="66" fill="#233E33"/>
-              <circle cx="358" cy="88" r="3.5" fill="#00C472"/>
-              <text x="398" y="92" text-anchor="middle" fill="#FAF8F4" font-family="JetBrains Mono, monospace" font-size="8.2" font-weight="500">LCS DIFF3 MERGE</text>
-              <text x="393" y="109" text-anchor="middle" fill="#E3ECE7" font-family="JetBrains Mono, monospace" font-size="7.4">Ed25519 Lease</text>
-              <text x="393" y="125" text-anchor="middle" fill="#00C472" font-family="JetBrains Mono, monospace" font-size="7.4">0% Silent Overwrite</text>
+              <!-- Step 3: Review & Merge -->
+              <rect x="342" y="70" width="104" height="70" fill="#233E33"/>
+              <circle cx="357" cy="88" r="3.5" fill="#00C472"/>
+              <text x="399" y="92" text-anchor="middle" fill="#FAF8F4" font-family="Inter, PingFang SC, sans-serif" font-size="9.2" font-weight="600" data-i18n="svg_step3_t">2. 你确认后合并</text>
+              <text x="394" y="110" text-anchor="middle" fill="#E3ECE7" font-family="JetBrains Mono, PingFang SC, sans-serif" font-size="7.6" data-i18n="svg_step3_d">先看改动对比</text>
+              <text x="394" y="126" text-anchor="middle" fill="#00C472" font-family="JetBrains Mono, PingFang SC, sans-serif" font-size="7.6" data-i18n="svg_step3_s">绝不乱覆盖代码</text>
             </svg>
             <div class="art-caption">
-              <span id="node-health-lbl">NODE: HEURION.ORG · 64GB RAM</span>
-              <span>SANDBOX: BUBBLEWRAP / SEATBELT</span>
+              <span data-i18n="art_bot_l">云主机：HEURION.ORG (64GB 内存)</span>
+              <span data-i18n="art_bot_r">闲置自动休眠 · 用时秒级唤醒</span>
             </div>
           </div>
         </div>
       </div>
     </section>
 
-    <!-- Section 01: Pending Boundary Approvals (AAP-1.0 HITL) -->
+    <!-- Section 01: Pending Approvals -->
     <section class="sec-primary" id="sec-approvals">
       <div class="container">
         <div class="section-header">
           <div class="section-title-group">
             <span class="section-num">01</span>
-            <h2 class="heading-2" data-i18n-html="sec1_title">边界治理与人类签名租约 <em>(Pending Approvals)</em></h2>
-            <span class="tag tag-warm"><span class="dot-warm"></span><span id="pending-pill">0</span> PENDING</span>
+            <h2 class="heading-2" data-i18n-html="sec1_title">待你确认的操作 <em>(Pending Approvals)</em></h2>
+            <span class="tag tag-warm"><span class="dot-warm"></span><span id="pending-pill">0</span></span>
           </div>
-          <p class="label-caps" data-i18n="sec1_label">01 / AAP-1.0 ED25519 LEASE GATE</p>
+          <p class="label-caps" data-i18n="sec1_label">01 / 关键改动确认</p>
         </div>
 
         <div class="editorial-card">
           <div style="display:flex; justify-content:space-between; align-items:center; gap:1rem; margin-bottom:1rem; flex-wrap:wrap;">
-            <p class="text-muted" data-i18n="sec1_note">绿区沙箱内读写、编译与单元测试 100% 静默放行；仅在向宿主仓库归并落盘 (workspace_commit) 或访问未授权外网时触发边界拦截。</p>
-            <button class="btn" onclick="simulateEscalation()" data-i18n="btn_simulate_inline">+ 生成测试审批单</button>
+            <p class="text-muted" data-i18n="sec1_note">AI 在云端沙箱里读文件、改代码、跑测试全部自动完成，不会频繁弹窗打扰你；只有当 AI 准备把最终修改写回主项目时，才会列在这里等你确认。</p>
+            <button class="btn" onclick="simulateEscalation()" data-i18n="btn_simulate_inline">+ 演示一条待确认请求</button>
           </div>
 
           <div id="approvals-box"></div>
 
           <div id="diff-drawer">
             <div style="display:flex; justify-content:space-between; align-items:center; margin-bottom:0.65rem;">
-              <span class="label-caps" id="diff-title" style="color:var(--ink);">UNIFIED DIFF PREVIEW</span>
+              <span class="label-caps" id="diff-title" style="color:var(--ink);">代码改动对比 (DIFF)</span>
               <button class="btn" onclick="document.getElementById('diff-drawer').style.display='none'" data-i18n="btn_close">收起预览</button>
             </div>
             <pre class="code" id="diff-content"></pre>
@@ -2281,35 +2256,35 @@ pub const DASHBOARD_HTML: &str = r##"<!doctype html>
       </div>
     </section>
 
-    <!-- Section 02: Cloud CoW Workspaces & Scale-to-Zero (Warm Linen #EFECE4) -->
+    <!-- Section 02: Cloud Workspaces (Warm Linen #EFECE4) -->
     <section class="sec-linen" id="sec-workspaces">
       <div class="container">
         <div class="section-header">
           <div class="section-title-group">
             <span class="section-num">02</span>
-            <h2 class="heading-2" data-i18n-html="sec2_title">写时复制云端工作区 <em>(CoW Workspaces &amp; Scale-to-Zero)</em></h2>
+            <h2 class="heading-2" data-i18n-html="sec2_title">云端项目工作区 <em>(Cloud Workspaces)</em></h2>
           </div>
-          <p class="label-caps" data-i18n="sec2_label">02 / BTRFS FICLONE SHADOW TREES</p>
+          <p class="label-caps" data-i18n="sec2_label">02 / 多 AI 独立运行空间</p>
         </div>
 
         <div class="editorial-card">
           <div class="inline-bar">
-            <span class="label-caps" style="margin-right:0.35rem;" data-i18n="ws_form_lbl">派生新工作区:</span>
-            <input class="mono-input" id="ws-org" value="aegis-os" placeholder="org_id" style="width:125px;" />
-            <input class="mono-input" id="ws-id" value="ws-core" placeholder="workspace_id" style="width:125px;" />
-            <input class="mono-input" id="ws-src" value="." placeholder="Git URL or path" style="width:190px;" />
-            <input class="mono-input" id="ws-agents" value="coder-alpha,reviewer-beta" placeholder="agents (comma-separated)" style="width:220px;" />
-            <button class="btn btn-solid" onclick="provisionWorkspace()" data-i18n="btn_provision">+ 派生 CoW 工作区</button>
+            <span style="font-size:0.8rem; color:var(--ink-secondary); margin-right:0.35rem;" data-i18n="ws_form_lbl">新建云工作区：</span>
+            <input class="mono-input" id="ws-org" value="aegis-os" placeholder="团队名称 (org)" style="width:130px;" />
+            <input class="mono-input" id="ws-id" value="ws-core" placeholder="工作区名称" style="width:130px;" />
+            <input class="mono-input" id="ws-src" value="." placeholder="Git 仓库地址或路径" style="width:190px;" />
+            <input class="mono-input" id="ws-agents" value="coder-alpha,reviewer-beta" placeholder="AI 助手名（逗号分隔）" style="width:220px;" />
+            <button class="btn btn-solid" onclick="provisionWorkspace()" data-i18n="btn_provision">+ 创建云端工作区</button>
           </div>
 
           <div class="table-wrap">
             <table>
               <thead>
                 <tr>
-                  <th data-i18n="th_ws_name">组织 / 工作区 (分支)</th>
-                  <th data-i18n="th_ws_state">运行状态 (Scale-to-Zero)</th>
-                  <th data-i18n="th_ws_agents">并发 CoW 智能体分支</th>
-                  <th data-i18n="th_ws_ops">工作区操作</th>
+                  <th data-i18n="th_ws_name">项目 / 工作区</th>
+                  <th data-i18n="th_ws_state">当前状态</th>
+                  <th data-i18n="th_ws_agents">正在里面的 AI 助手</th>
+                  <th data-i18n="th_ws_ops">操作</th>
                 </tr>
               </thead>
               <tbody id="ws-tbody"></tbody>
@@ -2319,22 +2294,22 @@ pub const DASHBOARD_HTML: &str = r##"<!doctype html>
       </div>
     </section>
 
-    <!-- Section 03: CLI Onboarding, Polar.sh Claim & Scoped API Keys -->
+    <!-- Section 03: CLI Onboarding, Polar.sh Claim & API Keys -->
     <section class="sec-primary" id="sec-onboarding">
       <div class="container">
         <div class="section-header">
           <div class="section-title-group">
             <span class="section-num">03</span>
-            <h2 class="heading-2" data-i18n-html="sec3_title">开发者接入、订阅领卡与 <em>API 密钥</em></h2>
+            <h2 class="heading-2" data-i18n-html="sec3_title">30 秒接入指南与 <em>API 密钥</em></h2>
           </div>
-          <p class="label-caps" data-i18n="sec3_label">03 / CLI ONBOARDING &amp; POLAR.SH BILLING</p>
+          <p class="label-caps" data-i18n="sec3_label">03 / 终端接入与会员密钥提取</p>
         </div>
 
         <div class="onboarding-grid">
-          <!-- Left: 1-Line CLI Quickstart -->
+          <!-- Left: 3-Step CLI Quickstart -->
           <div class="editorial-card">
             <div style="display:flex; justify-content:space-between; align-items:center; margin-bottom:0.85rem;">
-              <span class="label-caps" style="color:var(--ink);" data-i18n="cli_card_title">CLI 一键上云命令 (ZERO-LOCAL-LOAD)</span>
+              <span style="font-size:0.82rem; font-weight:600; color:var(--ink);" data-i18n="cli_card_title">在你的电脑终端运行这 3 步即可连上云端：</span>
               <button class="btn" onclick="copyCliSnippet()" data-i18n="btn_copy">复制命令</button>
             </div>
             <pre class="code" id="cli-snippet"></pre>
@@ -2343,21 +2318,21 @@ pub const DASHBOARD_HTML: &str = r##"<!doctype html>
           <!-- Right: Polar.sh Subscription Key Claim & Manual Key Minting -->
           <div class="editorial-card" style="display:flex; flex-direction:column; justify-content:space-between; gap:1.35rem;">
             <div>
-              <span class="label-caps" style="color:var(--accent);" data-i18n="claim_card_title">POLAR.SH 订阅自动领卡</span>
-              <p class="text-muted" style="margin: 0.45rem 0 0.85rem;" data-i18n="claim_card_desc">在 Polar.sh 完成 Pro / Team 订阅支付后，输入您的付款邮箱即可一键领取自动签发的专属 API Key：</p>
+              <span style="font-size:0.82rem; font-weight:600; color:var(--accent);" data-i18n="claim_card_title">已购买 Pro / Team 会员？输入邮箱领密钥</span>
+              <p class="text-muted" style="margin: 0.45rem 0 0.85rem; font-size:0.84rem;" data-i18n="claim_card_desc">在 Polar.sh 付款成功后，输入你付款时填的邮箱，直接提取系统为你生成的专属 API Key：</p>
               <div style="display:flex; gap:0.5rem; flex-wrap:wrap;">
-                <input class="mono-input" id="claim-email" type="email" placeholder="founder@company.com" style="flex:1; min-width:170px;" />
-                <button class="btn btn-mint" onclick="claimSubscriptionKey()" data-i18n="btn_claim">领取已购 Key →</button>
+                <input class="mono-input" id="claim-email" type="email" placeholder="你的付款邮箱 (如 you@company.com)" style="flex:1; min-width:170px;" />
+                <button class="btn btn-mint" onclick="claimSubscriptionKey()" data-i18n="btn_claim">提取我的 Key →</button>
               </div>
             </div>
 
             <div style="padding-top:1.15rem; border-top:1px solid var(--border);">
-              <span class="label-caps" style="color:var(--ink);" data-i18n="mint_card_title">手动签发作用域密钥 (SCOPED API KEY)</span>
+              <span style="font-size:0.82rem; font-weight:600; color:var(--ink);" data-i18n="mint_card_title">手动生成新密钥</span>
               <div style="display:flex; gap:0.5rem; flex-wrap:wrap; margin-top:0.65rem;">
-                <input class="mono-input" id="k-org" value="aegis-os" placeholder="org_id" style="width:105px;" />
-                <input class="mono-input" id="k-agent" value="agy-agent" placeholder="agent_id" style="width:110px;" />
-                <input class="mono-input" id="k-ws" value="ws-core" placeholder="workspace_id" style="width:105px;" />
-                <button class="btn btn-solid" onclick="mintKey()" data-i18n="btn_mint">+ 签发 Key</button>
+                <input class="mono-input" id="k-org" value="aegis-os" placeholder="团队名" style="width:105px;" />
+                <input class="mono-input" id="k-agent" value="agy-agent" placeholder="AI 助手名" style="width:110px;" />
+                <input class="mono-input" id="k-ws" value="ws-core" placeholder="工作区名" style="width:105px;" />
+                <button class="btn btn-solid" onclick="mintKey()" data-i18n="btn_mint">+ 生成密钥</button>
               </div>
             </div>
           </div>
@@ -2365,17 +2340,17 @@ pub const DASHBOARD_HTML: &str = r##"<!doctype html>
 
         <div class="editorial-card">
           <div style="display:flex; justify-content:space-between; align-items:center; margin-bottom:0.75rem;">
-            <span class="label-caps" style="color:var(--ink);" data-i18n="keys_table_title">已签发 API 密钥与活跃租约列表</span>
-            <span class="tag tag-active"><span class="dot-mint"></span>SHA-256 VERIFIED</span>
+            <span style="font-size:0.82rem; font-weight:600; color:var(--ink);" data-i18n="keys_table_title">已生成的 API 密钥列表</span>
+            <span class="tag tag-active"><span class="dot-mint"></span>已加密保护</span>
           </div>
           <div class="table-wrap">
             <table>
               <thead>
                 <tr>
-                  <th data-i18n="th_k_prefix">密钥前缀 (Key Prefix)</th>
-                  <th data-i18n="th_k_id">绑定智能体身份 (Principal)</th>
-                  <th data-i18n="th_k_ws">绑定工作区 (Workspace)</th>
-                  <th data-i18n="th_k_leases">活跃 Ed25519 租约</th>
+                  <th data-i18n="th_k_prefix">密钥前缀</th>
+                  <th data-i18n="th_k_id">绑定的 AI 助手</th>
+                  <th data-i18n="th_k_ws">所属工作区</th>
+                  <th data-i18n="th_k_leases">免确认授权</th>
                 </tr>
               </thead>
               <tbody id="keys-tbody"></tbody>
@@ -2400,7 +2375,7 @@ pub const DASHBOARD_HTML: &str = r##"<!doctype html>
           <span class="brand-word">HEURION</span>
         </a>
         <div class="foot-right">
-          <span>© 2026 Heurion Research · Aegis Cloud PaaS v0.3.0 · MIT Licensed</span>
+          <span>© 2026 Heurion Research · Aegis Cloud v0.3.0 · MIT Licensed</span>
           <a href="https://heurion.org/" class="foot-link">Heurion.org</a>
           <a href="https://github.com/heurion-org/aegis-os" target="_blank" rel="noopener" class="foot-link">GitHub</a>
           <a href="https://heurion.org/llms.txt" class="foot-link">LLMs.txt</a>
@@ -2418,96 +2393,118 @@ pub const DASHBOARD_HTML: &str = r##"<!doctype html>
 
     const DICT = {
       zh: {
-        nav_approvals: '01 / 边界审批',
-        nav_workspaces: '02 / 写时复制工作区',
+        nav_approvals: '01 / 待你确认',
+        nav_workspaces: '02 / 云端工作区',
         nav_onboarding: '03 / 接入与密钥',
         nav_home: 'Heurion 主站 ↗',
-        nav_subscribe: '订阅 Pro ($29/mo) →',
-        hero_eyebrow: 'HEURION RESEARCH · L1 事务级智能体云内核',
-        hero_title: '为多智能体并发协作，<br>提供<em>零本地负载</em>的写时复制云底座。',
-        hero_desc: '基于 64GB Btrfs FICLONE 写时复制影子树、Bubblewrap 内核沙箱与 AAP-1.0 Ed25519 人类签名租约，将重型编译测试 100% 卸载至云端。',
-        st_lbl_pending: '待处理边界审批',
-        st_lbl_ws: '活跃 / 休眠工作区',
-        st_lbl_usage: '系统调用 / 沙箱耗时',
-        st_lbl_saved: 'CoW 零拷贝节省',
-        btn_simulate: '+ 模拟边界审批',
-        btn_refresh: '同步遥测状态',
-        btn_cli_guide: 'CLI 一键接入指南 →',
-        art_top_l: 'L1 · AEGIS OS 云端内核架构',
-        art_top_r: 'BTRFS FICLONE × AAP-1.0',
-        sec1_title: '边界治理与人类签名租约 <em>(Pending Approvals)</em>',
-        sec1_label: '01 / AAP-1.0 ED25519 租约门控',
-        sec1_note: '绿区沙箱内读写、编译与单元测试 100% 静默放行；仅在向宿主仓库归并落盘 (workspace_commit) 或访问未授权外网时触发边界拦截。',
-        btn_simulate_inline: '+ 生成测试审批单',
+        nav_subscribe: '开通 Pro ($29/月) →',
+        hero_eyebrow: 'HEURION · AEGIS CLOUD 云端 AI 编程工作台',
+        hero_title: '让多个 AI 同时改代码，<br>电脑<em>不卡顿</em>，原项目<em>不怕改坏</em>。',
+        hero_desc: '把吃内存的编译、测试和多 AI 并行改代码全部放到 64GB 云端服务器上跑。每个 AI 都在独立的临时副本里干活，互不干扰；改好后你先看代码对比，满意再一键同步回本地。',
+        st_lbl_pending: '待你确认的改动',
+        st_lbl_ws: '运行中 / 已休眠项目',
+        st_lbl_usage: '已执行命令 / 云端耗时',
+        st_lbl_saved: '为你节省的磁盘空间',
+        btn_simulate: '+ 演示一次确认流程',
+        btn_refresh: '刷新数据',
+        btn_cli_guide: '30 秒接入指南 →',
+        art_top_l: '工作流程 — 先在独立副本试跑，满意后再合并',
+        art_top_r: '64GB 云端服务器',
+        svg_step1_t: '1. 秒建独立副本',
+        svg_step1_d: '不碰你的原代码',
+        svg_step1_s: '0% 本地内存占用',
+        svg_ai1: 'AI 助手 A · 写新功能',
+        svg_ai2: 'AI 助手 B · 跑测试修 Bug',
+        svg_ai3: 'AI 助手 C · 代码审查',
+        svg_step3_t: '2. 你确认后合并',
+        svg_step3_d: '先看改动对比',
+        svg_step3_s: '绝不乱覆盖代码',
+        art_bot_l: '云主机：HEURION.ORG (64GB 内存)',
+        art_bot_r: '闲置自动休眠 · 用时秒级唤醒',
+        sec1_title: '待你确认的操作 <em>(Pending Approvals)</em>',
+        sec1_label: '01 / 关键改动确认',
+        sec1_note: 'AI 在云端沙箱里读文件、改代码、跑测试全部自动完成，不会频繁弹窗打扰你；只有当 AI 准备把最终修改写回主项目时，才会列在这里等你确认。',
+        btn_simulate_inline: '+ 演示一条待确认请求',
         btn_close: '收起预览',
-        sec2_title: '写时复制云端工作区 <em>(CoW Workspaces &amp; Scale-to-Zero)</em>',
-        sec2_label: '02 / BTRFS 零拷贝影子树',
-        ws_form_lbl: '派生新工作区:',
-        btn_provision: '+ 派生 CoW 工作区',
-        th_ws_name: '组织 / 工作区 (分支)',
-        th_ws_state: '运行状态 (Scale-to-Zero)',
-        th_ws_agents: '并发 CoW 智能体分支',
-        th_ws_ops: '工作区操作',
-        sec3_title: '开发者接入、订阅领卡与 <em>API 密钥</em>',
-        sec3_label: '03 / CLI 接入与 POLAR.SH 自动发卡',
-        cli_card_title: 'CLI 一键上云命令 (ZERO-LOCAL-LOAD)',
+        sec2_title: '云端项目工作区 <em>(Cloud Workspaces)</em>',
+        sec2_label: '02 / 多 AI 独立运行空间',
+        ws_form_lbl: '新建云工作区：',
+        btn_provision: '+ 创建云端工作区',
+        th_ws_name: '项目 / 工作区',
+        th_ws_state: '当前状态',
+        th_ws_agents: '正在里面的 AI 助手',
+        th_ws_ops: '操作',
+        sec3_title: '30 秒接入指南与 <em>API 密钥</em>',
+        sec3_label: '03 / 终端接入与会员密钥提取',
+        cli_card_title: '在你的电脑终端运行这 3 步即可连上云端：',
         btn_copy: '复制命令',
-        claim_card_title: 'POLAR.SH 订阅自动领卡',
-        claim_card_desc: '在 Polar.sh 完成 Pro / Team 订阅支付后，输入您的付款邮箱即可一键领取自动签发的专属 API Key：',
-        btn_claim: '领取已购 Key →',
-        mint_card_title: '手动签发作用域密钥 (SCOPED API KEY)',
-        btn_mint: '+ 签发 Key',
-        keys_table_title: '已签发 API 密钥与活跃租约列表',
-        th_k_prefix: '密钥前缀 (Key Prefix)',
-        th_k_id: '绑定智能体身份 (Principal)',
-        th_k_ws: '绑定工作区 (Workspace)',
-        th_k_leases: '活跃 Ed25519 租约'
+        claim_card_title: '已购买 Pro / Team 会员？输入邮箱领密钥',
+        claim_card_desc: '在 Polar.sh 付款成功后，输入你付款时填的邮箱，直接提取系统为你生成的专属 API Key：',
+        btn_claim: '提取我的 Key →',
+        mint_card_title: '手动生成新密钥',
+        btn_mint: '+ 生成密钥',
+        keys_table_title: '已生成的 API 密钥列表',
+        th_k_prefix: '密钥前缀',
+        th_k_id: '绑定的 AI 助手',
+        th_k_ws: '所属工作区',
+        th_k_leases: '免确认授权'
       },
       en: {
         nav_approvals: '01 / Approvals',
-        nav_workspaces: '02 / CoW Workspaces',
-        nav_onboarding: '03 / CLI & API Keys',
+        nav_workspaces: '02 / Workspaces',
+        nav_onboarding: '03 / Quickstart & Keys',
         nav_home: 'Heurion.org ↗',
-        nav_subscribe: 'Subscribe Pro ($29/mo) →',
-        hero_eyebrow: 'HEURION RESEARCH · L1 TRANSACTIONAL AGENT OS CLOUD',
-        hero_title: 'Zero-local-load <em>Copy-on-Write</em> cloud runtime for concurrent agents.',
-        hero_desc: 'Powered by 64GB Btrfs FICLONE shadow trees, Bubblewrap kernel sandboxes, and AAP-1.0 Ed25519 human-in-the-loop leases.',
-        st_lbl_pending: 'Pending HITL Approvals',
-        st_lbl_ws: 'Active / Hibernated WS',
-        st_lbl_usage: 'Syscalls / Sandbox Exec',
-        st_lbl_saved: 'Btrfs CoW Disk Saved',
-        btn_simulate: '+ Simulate Escalation',
-        btn_refresh: 'Sync Telemetry',
-        btn_cli_guide: 'CLI Quickstart →',
-        art_top_l: 'L1 · AEGIS OS CLOUD KERNEL',
-        art_top_r: 'BTRFS FICLONE × AAP-1.0',
-        sec1_title: 'Boundary Governance &amp; Human Leases <em>(Pending Approvals)</em>',
-        sec1_label: '01 / AAP-1.0 ED25519 LEASE GATE',
-        sec1_note: 'In-sandbox reads, edits, builds, and tests execute with zero prompts; only host commits (workspace_commit) or unallowlisted egress trigger human lease approval.',
-        btn_simulate_inline: '+ Simulate Approval',
+        nav_subscribe: 'Get Pro ($29/mo) →',
+        hero_eyebrow: 'HEURION · AEGIS CLOUD AI CODING WORKSPACE',
+        hero_title: 'Run multiple coding AIs in parallel —<br><em>zero local lag</em>, <em>zero risk</em> to your repo.',
+        hero_desc: 'Offload heavy builds, test suites, and parallel AI edits to our 64GB cloud server. Each AI works in its own isolated copy — nothing touches your main project until you review the diff and approve.',
+        st_lbl_pending: 'Awaiting Your Approval',
+        st_lbl_ws: 'Active / Sleeping Projects',
+        st_lbl_usage: 'Commands Run / Cloud Time',
+        st_lbl_saved: 'Local Disk Space Saved',
+        btn_simulate: '+ Try Demo Approval',
+        btn_refresh: 'Refresh',
+        btn_cli_guide: '30-Second Setup →',
+        art_top_l: 'HOW IT WORKS — TEST IN ISOLATED COPIES, MERGE WHEN READY',
+        art_top_r: '64GB CLOUD SERVER',
+        svg_step1_t: '1. Instant Copy',
+        svg_step1_d: 'Main repo untouched',
+        svg_step1_s: '0% local CPU / RAM',
+        svg_ai1: 'Agent A · New Feature',
+        svg_ai2: 'Agent B · Run Tests & Fix',
+        svg_ai3: 'Agent C · Code Review',
+        svg_step3_t: '2. Review & Merge',
+        svg_step3_d: 'Inspect diff first',
+        svg_step3_s: 'Zero silent overwrites',
+        art_bot_l: 'HOST: HEURION.ORG (64GB RAM)',
+        art_bot_r: 'AUTO-SLEEP WHEN IDLE · INSTANT WAKE',
+        sec1_title: 'Changes Awaiting Your Approval <em>(Pending Approvals)</em>',
+        sec1_label: '01 / SAFE MERGE CONFIRMATION',
+        sec1_note: 'Reading files, editing code, and running tests inside the cloud sandbox happen automatically without interrupting you. You only confirm when an AI wants to write final changes back to your main project.',
+        btn_simulate_inline: '+ Create Demo Request',
         btn_close: 'Close Preview',
-        sec2_title: 'Copy-on-Write Cloud Workspaces <em>(Scale-to-Zero)</em>',
-        sec2_label: '02 / BTRFS FICLONE SHADOW TREES',
-        ws_form_lbl: 'Fork Workspace:',
-        btn_provision: '+ Provision CoW Workspace',
-        th_ws_name: 'Organization / Workspace (Branch)',
-        th_ws_state: 'Lifecycle (Scale-to-Zero)',
-        th_ws_agents: 'Concurrent CoW Agent Branches',
-        th_ws_ops: 'Operations',
-        sec3_title: 'Developer CLI, Subscription Claim &amp; <em>Scoped API Keys</em>',
-        sec3_label: '03 / CLI ONBOARDING &amp; POLAR.SH BILLING',
-        cli_card_title: '1-LINE CLI CLOUD ONBOARDING (ZERO-LOCAL-LOAD)',
-        btn_copy: 'Copy Snippet',
-        claim_card_title: 'POLAR.SH SUBSCRIPTION KEY CLAIM',
-        claim_card_desc: 'After completing Pro / Team checkout on Polar.sh, enter your billing email below to claim your auto-minted API key:',
-        btn_claim: 'Claim API Key →',
-        mint_card_title: 'MINT SCOPED API KEY',
-        btn_mint: '+ Issue Key',
-        keys_table_title: 'ISSUED SCOPED API KEYS & ACTIVE LEASES',
+        sec2_title: 'Cloud Project Workspaces <em>(Cloud Workspaces)</em>',
+        sec2_label: '02 / ISOLATED AI SANDBOXES',
+        ws_form_lbl: 'New Workspace:',
+        btn_provision: '+ Create Workspace',
+        th_ws_name: 'Project / Workspace',
+        th_ws_state: 'Status',
+        th_ws_agents: 'Active AI Assistants',
+        th_ws_ops: 'Actions',
+        sec3_title: '30-Second Setup &amp; <em>API Keys</em>',
+        sec3_label: '03 / TERMINAL SETUP &amp; SUBSCRIPTION KEYS',
+        cli_card_title: 'Run these 3 steps in your terminal to connect:',
+        btn_copy: 'Copy Commands',
+        claim_card_title: 'Already bought Pro / Team? Claim your key by email',
+        claim_card_desc: 'After paying on Polar.sh, enter the email you used at checkout to retrieve your API key:',
+        btn_claim: 'Claim My Key →',
+        mint_card_title: 'Or generate a key manually',
+        btn_mint: '+ Generate Key',
+        keys_table_title: 'Your API Keys',
         th_k_prefix: 'Key Prefix',
-        th_k_id: 'Bound Principal',
-        th_k_ws: 'Bound Workspace',
-        th_k_leases: 'Active Ed25519 Leases'
+        th_k_id: 'AI Assistant',
+        th_k_ws: 'Workspace',
+        th_k_leases: 'Auto-Approve Status'
       }
     };
 
@@ -2546,37 +2543,37 @@ pub const DASHBOARD_HTML: &str = r##"<!doctype html>
       const origin = window.location.origin;
       if (currentLang === 'en') {
         document.getElementById('cli-snippet').textContent =
-`# 1. Install Aegis OS CLI via Homebrew & subscribe / claim your Pro key:
+`# Step 1: Install Aegis OS via Homebrew & claim your Pro key
 brew tap heurion-org/aegis-os && brew install aegis-os
 aegis-os cloud subscribe --email you@company.com --claim
 
-# 2. Bind any local repo to Heurion's 64GB Btrfs Cloud Runtime (0% local CPU/RAM):
+# Step 2: Run inside any project folder to offload AI builds & tests to the cloud
 aegis-os cloud up --endpoint ${origin} --api-key ${latestKey}
 
-# 3. Inspect CoW diffs, approve boundary leases, pull changes, or export Git PRs:
-aegis-os cloud diff
-aegis-os cloud approvals && aegis-os cloud approve <escalation_id>
-aegis-os cloud pull && aegis-os cloud pr`;
+# Step 3: View AI code changes, pull them to your Mac, or switch back to local mode
+aegis-os cloud diff    # Preview code changes made in the cloud
+aegis-os cloud pull    # Sync approved changes back to your laptop
+aegis-os cloud down    # Disconnect and return to local mode`;
       } else {
         document.getElementById('cli-snippet').textContent =
-`# 1. 通过 Homebrew 安装 Aegis OS 并一键订阅 / 领取 Pro 密钥:
+`# 第 1 步：用 Homebrew 安装命令行工具，并领取你的 Pro 会员密钥
 brew tap heurion-org/aegis-os && brew install aegis-os
-aegis-os cloud subscribe --email you@company.com --claim
+aegis-os cloud subscribe --email 你的付款邮箱 --claim
 
-# 2. 在任意本地项目目录一键挂载 64GB Btrfs 云端沙箱 (0% 本地 CPU/内存占用):
+# 第 2 步：进入你的代码项目文件夹，一行命令连上 64GB 云端沙箱
 aegis-os cloud up --endpoint ${origin} --api-key ${latestKey}
 
-# 3. 终端内查看云端 CoW 源码 Diff / 审批人类租约 / 拉回改动 / 导出 PR:
-aegis-os cloud diff
-aegis-os cloud approvals && aegis-os cloud approve <escalation_id>
-aegis-os cloud pull && aegis-os cloud pr`;
+# 第 3 步：随时查看 AI 改了哪些代码、拉回本地电脑，或切回本地模式
+aegis-os cloud diff    # 查看云端 AI 修改的代码对比
+aegis-os cloud pull    # 把满意的改动一键同步回本地电脑
+aegis-os cloud down    # 断开云端（云工作区自动休眠，不扣费）`;
       }
     }
 
     function copyCliSnippet() {
       const txt = document.getElementById('cli-snippet').textContent;
       navigator.clipboard?.writeText(txt);
-      toast(currentLang === 'en' ? 'CLI snippet copied to clipboard' : 'CLI 接入命令已复制到剪贴板');
+      toast(currentLang === 'en' ? 'Commands copied to clipboard' : '命令已复制到剪贴板');
     }
 
     async function changePlan(plan) {
@@ -2585,14 +2582,14 @@ aegis-os cloud pull && aegis-os cloud pr`;
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ org_id: 'aegis-os', plan_tier: plan })
       });
-      toast(currentLang === 'en' ? `Switched tenant plan to ${plan.toUpperCase()}` : `已切换租户套餐至 ${plan.toUpperCase()}`);
+      toast(currentLang === 'en' ? `Switched plan to ${plan.toUpperCase()}` : `已切换至 ${plan.toUpperCase()} 方案`);
       refresh(true);
     }
 
     async function claimSubscriptionKey() {
       const email = document.getElementById('claim-email').value.trim();
       if (!email) {
-        toast(currentLang === 'en' ? 'Please enter your billing email' : '请输入您在 Polar.sh 付款时填写的邮箱');
+        toast(currentLang === 'en' ? 'Please enter your checkout email' : '请输入你在 Polar.sh 付款时填写的邮箱');
         return;
       }
       const res = await fetch('/v1/billing/claim', {
@@ -2602,12 +2599,12 @@ aegis-os cloud pull && aegis-os cloud pr`;
       });
       const d = await res.json();
       if (d.error) {
-        toast(currentLang === 'en' ? `Claim failed: ${d.error}` : `未查找到待领取密钥: ${d.error}`);
+        toast(currentLang === 'en' ? `Not found: ${d.error}` : `暂未查到该邮箱的待领密钥: ${d.error}`);
         return;
       }
       latestKey = d.api_key;
       updateCliSnippet();
-      toast(currentLang === 'en' ? `Claimed API Key: ${d.api_key}` : `成功领取订阅密钥: ${d.api_key}`);
+      toast(currentLang === 'en' ? `Claimed API Key: ${d.api_key}` : `已提取专属密钥: ${d.api_key}`);
       refresh(true);
     }
 
@@ -2623,7 +2620,7 @@ aegis-os cloud pull && aegis-os cloud pr`;
         })
       });
       const d = await res.json();
-      toast(currentLang === 'en' ? `Simulated escalation ${d.escalation_id}` : `已生成边界审批单 ${d.escalation_id}`);
+      toast(currentLang === 'en' ? `Created demo request ${d.escalation_id}` : `已生成演示确认请求 ${d.escalation_id}`);
       refresh(true);
     }
 
@@ -2634,8 +2631,8 @@ aegis-os cloud pull && aegis-os cloud pr`;
         body: JSON.stringify({ escalation_id: id, decision, ttl_secs: ttl })
       });
       toast(decision === 'approve'
-        ? (currentLang === 'en' ? `Approved lease for ${id}` : `已批准并签发租约 ${id}`)
-        : (currentLang === 'en' ? `Rejected ${id}` : `已拒绝拦截 ${id}`));
+        ? (currentLang === 'en' ? `Approved ${id}` : `已同意合并 (${id})`)
+        : (currentLang === 'en' ? `Rejected ${id}` : `已拒绝该改动 (${id})`));
       refresh(true);
     }
 
@@ -2645,7 +2642,9 @@ aegis-os cloud pull && aegis-os cloud pr`;
       const res = await fetch(`/v1/workspaces/diff?${q.toString()}`);
       const d = await res.json();
       document.getElementById('diff-title').textContent =
-        `UNIFIED SOURCE DIFF · ${orgId}/${agentId} (${d.changes_count || 0} FILES CHANGED)`;
+        currentLang === 'en'
+          ? `CODE DIFF · ${orgId}/${agentId} (${d.changes_count || 0} FILES CHANGED)`
+          : `代码改动对比 · ${orgId}/${agentId}（共 ${d.changes_count || 0} 个文件变更）`;
       document.getElementById('diff-content').textContent =
         (d.unified_diff && d.unified_diff.trim())
           ? d.unified_diff
@@ -2665,7 +2664,7 @@ aegis-os cloud pull && aegis-os cloud pr`;
       });
       const d = await res.json();
       if (d.error) { toast(`Error: ${d.error}`); return; }
-      toast(currentLang === 'en' ? `Provisioned CoW workspace ${workspace_id}` : `已派生云端写时复制工作区 ${workspace_id}`);
+      toast(currentLang === 'en' ? `Created workspace ${workspace_id}` : `已创建云端工作区 ${workspace_id}`);
       refresh(true);
     }
 
@@ -2678,8 +2677,8 @@ aegis-os cloud pull && aegis-os cloud pr`;
       });
       const d = await res.json();
       toast(currentStatus === 'hibernated'
-        ? (currentLang === 'en' ? `Woke workspace in ${d.wake_latency_ms || 0}ms` : `工作区已瞬时唤醒 (${d.wake_latency_ms || 0}ms)`)
-        : (currentLang === 'en' ? 'Workspace hibernated (Scale-to-Zero · 0 RAM)' : '工作区已进入 Scale-to-Zero 休眠 (0 内存占用)'));
+        ? (currentLang === 'en' ? `Woke workspace in ${d.wake_latency_ms || 0}ms` : `工作区已唤醒 (${d.wake_latency_ms || 0}ms)`)
+        : (currentLang === 'en' ? 'Workspace put to sleep (0 RAM used)' : '工作区已休眠（不占内存）'));
       refresh(true);
     }
 
@@ -2691,7 +2690,7 @@ aegis-os cloud pull && aegis-os cloud pr`;
       });
       const d = await res.json();
       document.getElementById('diff-title').textContent =
-        `GIT PR PATCH BUNDLE · ${d.git_branch || ''} @ ${d.git_commit_sha || ''}`;
+        `GIT PR 补丁 · ${d.git_branch || ''} @ ${d.git_commit_sha || ''}`;
       document.getElementById('diff-content').textContent =
         (d.unified_patch && d.unified_patch.trim())
           ? d.unified_patch
@@ -2713,7 +2712,7 @@ aegis-os cloud pull && aegis-os cloud pr`;
       const d = await res.json();
       latestKey = d.api_key;
       updateCliSnippet();
-      toast(currentLang === 'en' ? `Issued Key: ${d.api_key}` : `已签发密钥: ${d.api_key}`);
+      toast(currentLang === 'en' ? `Generated Key: ${d.api_key}` : `已生成新密钥: ${d.api_key}`);
       refresh(true);
     }
 
@@ -2743,7 +2742,9 @@ aegis-os cloud pull && aegis-os cloud pr`;
         if (tenants[0]) {
           const tier = (tenants[0].plan_tier || 'pro').toUpperCase();
           document.getElementById('plan-badge').textContent =
-            `AEGIS CLOUD · ${tier} (${tenants[0].max_concurrent_agents} AGENTS)`;
+            currentLang === 'en'
+              ? `AEGIS CLOUD · ${tier} (${tenants[0].max_concurrent_agents} AI MAX)`
+              : `AEGIS CLOUD · ${tier} (支持 ${tenants[0].max_concurrent_agents} 个 AI 并行)`;
         }
 
         document.getElementById('st-pending').textContent = pending.length;
@@ -2756,32 +2757,32 @@ aegis-os cloud pull && aegis-os cloud pr`;
         if (pending.length === 0) {
           appBox.innerHTML = `<div class="empty">${
             currentLang === 'en'
-              ? 'No pending boundary escalations — all in-sandbox operations are executing with zero prompts.'
-              : '当前无待处理边界审批 — 所有绿区沙箱内读写与测试均处于零弹窗静默放行状态。'
+              ? 'No changes waiting for your confirmation — AI assistants are working smoothly in the cloud sandbox.'
+              : '目前没有需要你确认的操作 — AI 助手在云端沙箱里的日常改代码与跑测试会自动进行。'
           }</div>`;
         } else {
           appBox.innerHTML = pending.map(e => `
             <div class="approval-row">
               <div class="approval-meta">
                 <div style="display:flex; align-items:center; gap:0.55rem; flex-wrap:wrap;">
-                  <span class="tag tag-warm"><span class="dot-warm"></span>${e.action}</span>
+                  <span class="tag tag-warm"><span class="dot-warm"></span>${e.action === 'workspace_commit' ? (currentLang === 'en' ? 'Write to Main Project' : '写回主项目') : e.action}</span>
                   <code class="mono" style="font-size:0.82rem; font-weight:500;">${e.org_id}/${e.agent_id}</code>
                   <code class="mono" style="font-size:0.74rem; color:var(--ink-muted);">(${e.escalation_id})</code>
                 </div>
-                <div class="mono" style="font-size:0.76rem; color:var(--ink-secondary);">${e.reason}</div>
+                <div style="font-size:0.8rem; color:var(--ink-secondary);">${e.reason}</div>
               </div>
               <div class="actions">
-                <button class="btn" onclick="inspectDiff('${e.org_id}', '${e.agent_id}', '')">${currentLang === 'en' ? 'Inspect Diff' : '查看源码 Diff'}</button>
-                <button class="btn btn-mint" onclick="decide('${e.escalation_id}', 'approve', 0)">${currentLang === 'en' ? 'Approve Once' : '批准单次'}</button>
-                <button class="btn btn-solid" onclick="decide('${e.escalation_id}', 'approve', 3600)">${currentLang === 'en' ? '1h Lease' : '签发 1h 租约'}</button>
-                <button class="btn btn-danger" onclick="decide('${e.escalation_id}', 'deny', 0)">${currentLang === 'en' ? 'Deny' : '拒绝拦截'}</button>
+                <button class="btn" onclick="inspectDiff('${e.org_id}', '${e.agent_id}', '')">${currentLang === 'en' ? 'View Code Diff' : '查看代码改动'}</button>
+                <button class="btn btn-mint" onclick="decide('${e.escalation_id}', 'approve', 0)">${currentLang === 'en' ? 'Approve Once' : '同意本次'}</button>
+                <button class="btn btn-solid" onclick="decide('${e.escalation_id}', 'approve', 3600)">${currentLang === 'en' ? 'Auto-Approve 1h' : '1 小时内免确认'}</button>
+                <button class="btn btn-danger" onclick="decide('${e.escalation_id}', 'deny', 0)">${currentLang === 'en' ? 'Reject' : '拒绝'}</button>
               </div>
             </div>
           `).join('');
         }
 
         document.getElementById('ws-tbody').innerHTML = workspaces.length === 0
-          ? `<tr><td colspan="4" class="empty">${currentLang === 'en' ? 'No active cloud workspaces provisioned yet.' : '暂未派生云端写时复制工作区。'}</td></tr>`
+          ? `<tr><td colspan="4" class="empty">${currentLang === 'en' ? 'No cloud workspaces yet. Click "+ Create Workspace" above to start.' : '还没有创建云端工作区，点击上方「+ 创建云端工作区」即可开始。'}</td></tr>`
           : workspaces.map(w => {
               const isHib = w.status === 'hibernated';
               const firstAgent = (w.agents && w.agents[0]) || 'cloud-coder-1';
@@ -2794,28 +2795,28 @@ aegis-os cloud pull && aegis-os cloud pr`;
                   <td>
                     <span class="tag ${isHib ? '' : 'tag-active'}">
                       ${isHib ? '' : '<span class="dot-mint"></span>'}
-                      ${isHib ? 'HIBERNATED · 0 RAM' : 'ACTIVE · BTRFS COW'}
+                      ${isHib ? (currentLang === 'en' ? 'SLEEPING · 0 RAM' : '已休眠 · 不占内存') : (currentLang === 'en' ? 'RUNNING' : '运行中')}
                     </span>
                   </td>
                   <td>${(w.agents || []).map(a => `<code class="mono" style="font-size:0.76rem; padding:0.12rem 0.45rem; border:1px solid var(--border); background:var(--bg-primary); margin-right:0.35rem;">${a}</code>`).join('')}</td>
                   <td>
                     <div class="actions">
-                      <button class="btn" onclick="inspectDiff('${w.org_id}', '${firstAgent}', '${w.workspace_id}')">Diff</button>
-                      <button class="btn" onclick="toggleHibernate('${w.org_id}', '${w.workspace_id}', '${w.status || 'active'}')">${isHib ? (currentLang === 'en' ? 'Wake' : '瞬时唤醒') : (currentLang === 'en' ? 'Hibernate' : '休眠 (Scale-to-0)')}</button>
-                      <button class="btn btn-solid" onclick="exportPr('${w.org_id}', '${w.workspace_id}', '${firstAgent}')">${currentLang === 'en' ? 'Export PR →' : '导出 PR →'}</button>
+                      <button class="btn" onclick="inspectDiff('${w.org_id}', '${firstAgent}', '${w.workspace_id}')">${currentLang === 'en' ? 'View Diff' : '查看改动'}</button>
+                      <button class="btn" onclick="toggleHibernate('${w.org_id}', '${w.workspace_id}', '${w.status || 'active'}')">${isHib ? (currentLang === 'en' ? 'Wake Up' : '唤醒') : (currentLang === 'en' ? 'Put to Sleep' : '休眠省内存')}</button>
+                      <button class="btn btn-solid" onclick="exportPr('${w.org_id}', '${w.workspace_id}', '${firstAgent}')">${currentLang === 'en' ? 'Export PR →' : '生成 PR 补丁 →'}</button>
                     </div>
                   </td>
                 </tr>`;
             }).join('');
 
         document.getElementById('keys-tbody').innerHTML = keys.length === 0
-          ? `<tr><td colspan="4" class="empty">${currentLang === 'en' ? 'No scoped API keys issued yet.' : '暂未签发 API 密钥。'}</td></tr>`
+          ? `<tr><td colspan="4" class="empty">${currentLang === 'en' ? 'No API keys generated yet.' : '还没有生成 API 密钥。'}</td></tr>`
           : keys.map(k => `
               <tr>
                 <td><code class="mono" style="font-size:0.78rem;">${k.key_prefix}</code></td>
                 <td><code class="mono" style="font-size:0.78rem;">${k.org_id}/${k.agent_id}</code></td>
                 <td><code class="mono" style="font-size:0.78rem; color:var(--ink-secondary);">${k.workspace_id || '*'}</code></td>
-                <td><span class="tag tag-active"><span class="dot-mint"></span>${leases.length} ACTIVE</span></td>
+                <td><span class="tag ${leases.length > 0 ? 'tag-active' : ''}">${leases.length > 0 ? '<span class="dot-mint"></span>' : ''}${leases.length > 0 ? (currentLang === 'en' ? `${leases.length} Auto-Approve Active` : `${leases.length} 项免确认生效中`) : (currentLang === 'en' ? 'Ask Before Merge' : '合并前询问我')}</span></td>
               </tr>
             `).join('');
       } catch (e) {
