@@ -1597,6 +1597,7 @@ pub const DASHBOARD_HTML: &str = r##"<!doctype html>
       scroll-behavior: smooth;
       -webkit-font-smoothing: antialiased;
       -moz-osx-font-smoothing: grayscale;
+      overflow-x: hidden;
     }
 
     body {
@@ -1606,6 +1607,8 @@ pub const DASHBOARD_HTML: &str = r##"<!doctype html>
       font-size: 0.92rem;
       line-height: 1.65;
       font-weight: 400;
+      overflow-x: hidden;
+      width: 100%;
     }
 
     ::selection {
@@ -1928,8 +1931,8 @@ pub const DASHBOARD_HTML: &str = r##"<!doctype html>
 
     .hero-grid {
       display: grid;
-      grid-template-columns: 1.08fr 0.92fr;
-      gap: 3.5rem;
+      grid-template-columns: minmax(0, 1fr) minmax(0, 1fr);
+      gap: 2rem;
       align-items: stretch;
     }
 
@@ -1937,20 +1940,21 @@ pub const DASHBOARD_HTML: &str = r##"<!doctype html>
       display: flex;
       flex-direction: column;
       justify-content: space-between;
-      gap: 2rem;
+      gap: 1.75rem;
+      min-width: 0;
     }
 
     .hero-intro {
       display: flex;
       flex-direction: column;
-      gap: 1.1rem;
+      gap: 1rem;
     }
 
     .telemetry-strip {
       display: grid;
-      grid-template-columns: repeat(4, 1fr);
+      grid-template-columns: repeat(3, minmax(0, 1fr));
       gap: 1.25rem;
-      padding: 1.35rem 0;
+      padding: 1.25rem 0;
       border-top: 1px solid rgba(21, 28, 25, 0.16);
       border-bottom: 1px solid rgba(21, 28, 25, 0.16);
     }
@@ -1958,49 +1962,58 @@ pub const DASHBOARD_HTML: &str = r##"<!doctype html>
     .stat-cell {
       display: flex;
       flex-direction: column;
-      gap: 0.28rem;
+      gap: 0.3rem;
+      min-width: 0;
     }
 
     .stat-val {
       font-family: var(--serif);
-      font-size: 1.65rem;
+      font-size: 1.6rem;
       font-weight: 300;
       color: var(--ink);
       line-height: 1.1;
+      min-height: 1.9rem;
+      display: flex;
+      align-items: baseline;
       font-variant-numeric: tabular-nums;
     }
 
-    .stat-lbl {
-      font-size: 0.74rem;
-      color: var(--ink-secondary);
-      letter-spacing: 0.02em;
+    .stat-val-mono {
+      font-family: var(--mono);
+      font-size: 1.12rem;
+      font-weight: 500;
+      color: var(--accent);
+      letter-spacing: -0.02em;
     }
 
-    .hero-actions {
-      display: flex;
-      align-items: center;
-      gap: 0.85rem;
-      flex-wrap: wrap;
+    .stat-lbl {
+      font-size: 0.75rem;
+      color: var(--ink-secondary);
+      line-height: 1.4;
+      letter-spacing: 0.01em;
     }
 
     /* Nordic Workflow Plate (Right Column) */
     .hero-art {
-      background: rgba(250, 248, 244, 0.90);
+      background: rgba(250, 248, 244, 0.92);
       backdrop-filter: blur(14px);
       -webkit-backdrop-filter: blur(14px);
       border: 1px solid rgba(21, 28, 25, 0.16);
       box-shadow: 0 20px 48px rgba(21, 28, 25, 0.06);
-      padding: 1.35rem 1.6rem;
+      padding: 1.35rem 1.65rem;
       display: flex;
       flex-direction: column;
       justify-content: space-between;
       gap: 0.85rem;
+      min-width: 0;
     }
 
     .art-header, .art-caption {
       display: flex;
       justify-content: space-between;
       align-items: center;
+      gap: 0.75rem;
+      flex-wrap: wrap;
       font-family: var(--mono);
       font-size: 0.68rem;
       letter-spacing: 0.08em;
@@ -2019,28 +2032,24 @@ pub const DASHBOARD_HTML: &str = r##"<!doctype html>
 
     .art-svg {
       width: 100%;
-      height: 215px;
+      height: auto;
+      max-height: 215px;
+      aspect-ratio: 460 / 210;
       display: block;
     }
 
     /* Content Sections */
-    .sec-primary {
-      background: var(--bg-primary);
-      padding: 3.75rem 0;
-    }
-
     .sec-linen {
       background: var(--bg-neutral);
       border-top: 1px solid var(--border);
-      border-bottom: 1px solid var(--border);
-      padding: 3.75rem 0;
+      padding: 3.5rem 0 4rem;
     }
 
     .section-header {
       display: flex;
       align-items: baseline;
       justify-content: space-between;
-      gap: 1.5rem;
+      gap: 1rem;
       margin-bottom: 1.75rem;
       padding-bottom: 0.9rem;
       border-bottom: 1px solid var(--border);
@@ -2054,123 +2063,117 @@ pub const DASHBOARD_HTML: &str = r##"<!doctype html>
       flex-wrap: wrap;
     }
 
-    .section-num {
-      font-family: var(--serif);
-      font-size: 1.35rem;
-      color: var(--accent);
+    .onboarding-grid {
+      display: grid;
+      grid-template-columns: minmax(0, 1fr) minmax(0, 1fr);
+      gap: 2rem;
+      align-items: stretch;
     }
 
     .editorial-card {
       background: var(--bg-elevated);
       border: 1px solid var(--border);
-      padding: 1.65rem 1.85rem;
+      padding: 1.65rem 1.75rem;
+      display: flex;
+      flex-direction: column;
+      justify-content: space-between;
+      gap: 1.15rem;
+      min-width: 0;
+      max-width: 100%;
     }
 
-    /* Approval Rows */
-    .approval-row {
-      background: var(--bg-elevated);
-      border: 1px solid var(--border);
-      border-left: 3px solid var(--accent-warm);
-      padding: 1.15rem 1.35rem;
-      margin-bottom: 0.75rem;
+    .editorial-card-pro {
+      border-color: var(--accent);
+    }
+
+    .card-body {
+      display: flex;
+      flex-direction: column;
+      min-width: 0;
+    }
+
+    .card-head {
+      display: flex;
+      justify-content: space-between;
+      align-items: flex-start;
+      gap: 0.85rem;
+      padding-bottom: 0.95rem;
+      border-bottom: 1px solid var(--border);
+      margin-bottom: 0.95rem;
+      min-height: 4.5rem;
+    }
+
+    .card-title {
+      font-family: var(--serif);
+      font-size: 1.32rem;
+      font-weight: 400;
+      margin-top: 0.42rem;
+      line-height: 1.25;
+      color: var(--ink);
+    }
+
+    .card-desc {
+      font-size: 0.85rem;
+      line-height: 1.65;
+      color: var(--ink-secondary);
+      margin-bottom: 1rem;
+      min-height: 2.85rem;
+    }
+
+    .cmd-bar {
       display: flex;
       justify-content: space-between;
       align-items: center;
-      gap: 1.25rem;
-      flex-wrap: wrap;
+      gap: 0.75rem;
+      margin-bottom: 0.55rem;
     }
 
-    .approval-meta {
-      display: flex;
-      flex-direction: column;
-      gap: 0.35rem;
+    .cmd-title {
+      font-size: 0.82rem;
+      font-weight: 600;
+      color: var(--ink);
     }
 
-    .actions {
-      display: flex;
-      align-items: center;
-      gap: 0.5rem;
-      flex-wrap: wrap;
-    }
-
-    /* Tables */
-    .table-wrap {
-      overflow-x: auto;
-    }
-
-    table {
-      width: 100%;
-      border-collapse: collapse;
-      font-size: 0.85rem;
-    }
-
-    th {
-      text-align: left;
-      padding: 0.75rem 0.9rem;
-      font-size: 0.75rem;
-      font-weight: 500;
-      color: var(--ink-secondary);
-      border-bottom: 1px solid var(--border);
-    }
-
-    td {
-      padding: 0.95rem 0.9rem;
-      border-bottom: 1px solid var(--border);
-      vertical-align: middle;
-    }
-
-    tr:last-child td {
-      border-bottom: none;
-    }
-
-    .inline-bar {
-      display: flex;
-      align-items: center;
-      gap: 0.55rem;
-      flex-wrap: wrap;
-      margin-bottom: 1.25rem;
-      padding-bottom: 1.15rem;
-      border-bottom: 1px solid var(--border);
-    }
-
-    /* Code & Diff Viewer */
+    /* Code Viewer (Strict Overflow Containment) */
     pre.code {
       background: #151C19;
       color: #F4F1EA;
       border: 1px solid var(--border-strong);
-      padding: 1.1rem 1.35rem;
+      padding: 1rem 1.15rem;
       font-family: var(--mono);
-      font-size: 0.76rem;
-      line-height: 1.68;
+      font-size: 0.74rem;
+      line-height: 1.65;
       overflow-x: auto;
-      max-height: 380px;
+      max-width: 100%;
+      width: 100%;
+      white-space: pre;
+      -webkit-overflow-scrolling: touch;
     }
 
-    #diff-drawer {
-      display: none;
-      margin-top: 1.25rem;
-      padding-top: 1.15rem;
-      border-top: 1px solid var(--border);
+    .sub-box {
+      background: var(--bg-primary);
+      border: 1px solid var(--border);
+      padding: 0.85rem 1rem;
+      min-width: 0;
     }
 
-    .onboarding-grid {
-      display: grid;
-      grid-template-columns: 1.12fr 0.88fr;
-      gap: 1.75rem;
-      margin-bottom: 1.75rem;
+    .claim-row {
+      display: flex;
+      gap: 0.5rem;
+      align-items: stretch;
     }
 
-    .empty {
-      color: var(--ink-muted);
-      font-size: 0.86rem;
-      padding: 0.85rem 0;
+    .claim-row input {
+      flex: 1;
+      min-width: 0;
+      background: var(--bg-elevated);
     }
 
     /* Footer */
     .foot {
       background: var(--bg-primary);
       border-top: 1px solid var(--border);
-      padding: 2.15rem 0;
+      padding: 2rem 0;
     }
 
     .foot-bar {
@@ -2185,7 +2188,7 @@ pub const DASHBOARD_HTML: &str = r##"<!doctype html>
       display: flex;
       flex-wrap: wrap;
       align-items: center;
-      gap: 1.5rem;
+      gap: 1.35rem;
       font-size: 0.78rem;
       color: var(--ink-muted);
     }
@@ -2199,23 +2202,151 @@ pub const DASHBOARD_HTML: &str = r##"<!doctype html>
 
     #toast {
       position: fixed;
-      bottom: 24px;
-      right: 28px;
+      bottom: 20px;
+      right: 20px;
+      left: 20px;
+      max-width: 420px;
+      margin-left: auto;
       z-index: 100;
       background: var(--ink);
       color: var(--ink-light);
       border-left: 3px solid var(--heurion-mint);
-      padding: 0.7rem 1.15rem;
+      padding: 0.7rem 1.1rem;
       font-size: 0.8rem;
       box-shadow: 0 16px 36px rgba(21, 28, 25, 0.18);
       display: none;
     }
 
+    /* Tablet Breakpoint */
     @media (max-width: 991px) {
-      .container, .nav-inner { padding-left: 1.5rem; padding-right: 1.5rem; }
-      .hero-grid, .onboarding-grid { grid-template-columns: 1fr; }
-      .telemetry-strip { grid-template-columns: repeat(2, 1fr); }
-      .nav-links { display: none; }
+      .container, .nav-inner {
+        padding-left: 1.5rem;
+        padding-right: 1.5rem;
+      }
+      .hero-grid, .onboarding-grid {
+        grid-template-columns: minmax(0, 1fr);
+        gap: 1.5rem;
+      }
+      .nav-links {
+        display: none;
+      }
+      .card-head, .card-desc {
+        min-height: 0;
+      }
+    }
+
+    /* Mobile Phone Breakpoint */
+    @media (max-width: 640px) {
+      .container {
+        padding-left: 1rem;
+        padding-right: 1rem;
+      }
+      .nav-inner {
+        padding: 0.75rem 1rem;
+        gap: 0.5rem;
+      }
+      .brand-sep, .brand-sub {
+        display: none;
+      }
+      .brand-word {
+        font-size: 0.82rem;
+        letter-spacing: 0.16em;
+      }
+      .nav-right {
+        gap: 0.4rem;
+      }
+      .nav-right .btn {
+        padding: 0.38rem 0.62rem;
+        font-size: 0.73rem;
+      }
+      .lang-btn {
+        padding: 0.34rem 0.5rem;
+        font-size: 0.65rem;
+      }
+      .sec-hero {
+        padding: 2rem 0 2.25rem;
+      }
+      .sec-linen {
+        padding: 2.25rem 0 2.75rem;
+      }
+      .heading-1 {
+        font-size: 1.68rem;
+        line-height: 1.24;
+      }
+      html[lang="zh-CN"] .heading-1 {
+        font-size: 1.55rem;
+        line-height: 1.34;
+      }
+      .heading-2 {
+        font-size: 1.28rem;
+      }
+      .telemetry-strip {
+        grid-template-columns: minmax(0, 1fr);
+        gap: 0.7rem;
+        padding: 0.95rem 0;
+      }
+      .stat-cell {
+        flex-direction: row;
+        justify-content: space-between;
+        align-items: center;
+        padding-bottom: 0.55rem;
+        border-bottom: 1px dashed rgba(21, 28, 25, 0.14);
+      }
+      .stat-cell:last-child {
+        padding-bottom: 0;
+        border-bottom: none;
+      }
+      .stat-val {
+        font-size: 1.35rem;
+        min-height: 0;
+      }
+      .stat-val-mono {
+        font-size: 0.98rem;
+      }
+      .hero-art {
+        padding: 1rem 1.05rem;
+      }
+      .editorial-card {
+        padding: 1.2rem 1.05rem;
+      }
+      .card-head {
+        flex-direction: column;
+        align-items: stretch;
+        gap: 0.75rem;
+      }
+      .card-head .btn {
+        width: 100%;
+        justify-content: center;
+      }
+      .cmd-bar {
+        flex-direction: column;
+        align-items: stretch;
+        gap: 0.45rem;
+      }
+      .cmd-bar .btn {
+        width: 100%;
+        justify-content: center;
+      }
+      .claim-row {
+        flex-direction: column;
+      }
+      .claim-row input, .claim-row .btn {
+        width: 100%;
+        justify-content: center;
+      }
+      pre.code {
+        padding: 0.85rem 0.9rem;
+        font-size: 0.7rem;
+      }
+      .foot-bar {
+        flex-direction: column;
+        align-items: flex-start;
+        gap: 0.9rem;
+      }
+      .foot-right {
+        gap: 0.85rem;
+        font-size: 0.74rem;
+      }
     }
   </style>
 </head>
@@ -2262,20 +2393,18 @@ pub const DASHBOARD_HTML: &str = r##"<!doctype html>
               <p class="text-muted" data-i18n="hero_desc">把吃内存的编译、测试和多 AI 并行改代码全部放到 64GB 云端服务器上跑。AI 在独立的云端临时副本里干活，不碰你的原项目；改好后你先在终端用 cloud diff 看代码对比，满意再用 cloud pull 一键同步回电脑。</p>
             </div>
 
-            <div>
-              <div class="telemetry-strip" style="grid-template-columns: repeat(3, 1fr);">
-                <div class="stat-cell">
-                  <span class="stat-val" style="color:var(--accent);">64 GB</span>
-                  <span class="stat-lbl" data-i18n="st_lbl_ram">云端独占编译内存</span>
-                </div>
-                <div class="stat-cell">
-                  <span class="stat-val">0%</span>
-                  <span class="stat-lbl" data-i18n="st_lbl_cpu">本地电脑 CPU / 内存占用</span>
-                </div>
-                <div class="stat-cell">
-                  <span class="stat-val" style="font-size:1.15rem; font-family:var(--mono);">diff → pull</span>
-                  <span class="stat-lbl" data-i18n="st_lbl_safe">先看对比，满意再同步回电脑</span>
-                </div>
+            <div class="telemetry-strip">
+              <div class="stat-cell">
+                <span class="stat-val" style="color:var(--accent);">64 GB</span>
+                <span class="stat-lbl" data-i18n="st_lbl_ram">云端独占编译内存</span>
+              </div>
+              <div class="stat-cell">
+                <span class="stat-val">0%</span>
+                <span class="stat-lbl" data-i18n="st_lbl_cpu">本地电脑 CPU / 内存占用</span>
+              </div>
+              <div class="stat-cell">
+                <span class="stat-val stat-val-mono">diff → pull</span>
+                <span class="stat-lbl" data-i18n="st_lbl_safe">先看对比，满意再同步回电脑</span>
               </div>
             </div>
           </div>
@@ -2283,8 +2412,8 @@ pub const DASHBOARD_HTML: &str = r##"<!doctype html>
           <!-- Clear 3-Step E2E Workflow Diagram Plate -->
           <div class="hero-art" aria-hidden="true">
             <div class="art-header">
-              <span data-i18n="art_top_l">端到端工作流 — 云端改代码跑测试，本地看对比再同步</span>
-              <span data-i18n="art_top_r">64GB 云端服务器</span>
+              <span data-i18n="art_top_l">云端沙箱端到端工作流</span>
+              <span data-i18n="art_top_r">64GB 云端主机</span>
             </div>
             <svg class="art-svg" viewBox="0 0 460 210" fill="none" xmlns="http://www.w3.org/2000/svg">
               <circle cx="230" cy="105" r="92" stroke="#DCD6CA" stroke-width="1" stroke-dasharray="2 4"/>
@@ -2325,8 +2454,8 @@ pub const DASHBOARD_HTML: &str = r##"<!doctype html>
               <text x="394" y="126" text-anchor="middle" fill="#00C472" font-family="JetBrains Mono, PingFang SC, sans-serif" font-size="7.6" data-i18n="svg_step3_s">满意再同步回电脑</text>
             </svg>
             <div class="art-caption">
-              <span data-i18n="art_bot_l">云主机：HEURION.ORG (64GB 内存)</span>
-              <span data-i18n="art_bot_r">cloud down 随时休眠 · 用时秒唤醒</span>
+              <span data-i18n="art_bot_l">节点：HEURION.ORG</span>
+              <span data-i18n="art_bot_r">cloud down 休眠 · 秒级唤醒</span>
             </div>
           </div>
         </div>
@@ -2334,7 +2463,7 @@ pub const DASHBOARD_HTML: &str = r##"<!doctype html>
     </section>
 
     <!-- Single Main Section: Free vs. Pro End-to-End Quickstart -->
-    <section class="sec-linen" id="sec-onboarding" style="border-bottom:none;">
+    <section class="sec-linen" id="sec-onboarding">
       <div class="container">
         <div class="section-header">
           <div class="section-title-group">
@@ -2343,69 +2472,65 @@ pub const DASHBOARD_HTML: &str = r##"<!doctype html>
           <p class="label-caps" data-i18n="sec3_label">免费版开箱即用 · PRO 版支持多工作区与 8 个 AI 并行</p>
         </div>
 
-        <div class="onboarding-grid" style="grid-template-columns: 1fr 1fr; align-items: stretch; margin-bottom: 0;">
+        <div class="onboarding-grid">
           <!-- Left Card: Free Plan (Complete E2E Loop) -->
-          <div class="editorial-card" style="display:flex; flex-direction:column; justify-content:space-between; gap:1.15rem;">
-            <div>
-              <div style="display:flex; justify-content:space-between; align-items:flex-start; gap:0.75rem; padding-bottom:0.9rem; border-bottom:1px solid var(--border); margin-bottom:0.9rem;">
+          <div class="editorial-card">
+            <div class="card-body">
+              <div class="card-head">
                 <div>
                   <span class="tag" data-i18n="tier_free_tag">免费版 · 无需注册或绑卡</span>
-                  <h3 style="font-family:var(--serif); font-size:1.35rem; font-weight:400; margin-top:0.4rem;" data-i18n="tier_free_title">$0 / 月 · 1 个云端工作区 · 1 个 AI</h3>
+                  <h3 class="card-title" data-i18n="tier_free_title">$0 / 月 · 1 个云端工作区 · 1 个 AI</h3>
                 </div>
               </div>
-              <p class="text-muted" style="font-size:0.85rem; margin-bottom:1rem;" data-i18n="tier_free_desc">无需传 --api-key 参数（系统自动生成密钥并绑定你唯一的免费云端工作区）。完整使用流程只需以下终端命令：</p>
+              <p class="card-desc" data-i18n="tier_free_desc">无需传 --api-key 参数（系统自动生成密钥并绑定你唯一的免费云端工作区）。完整使用流程只需以下终端命令：</p>
 
-              <div style="display:flex; justify-content:space-between; align-items:center; margin-bottom:0.55rem;">
-                <span style="font-size:0.82rem; font-weight:600; color:var(--ink);" data-i18n="free_cmd_title">① 安装客户端 &amp; ② 开启云端沙箱：</span>
+              <div class="cmd-bar">
+                <span class="cmd-title" data-i18n="free_cmd_title">① 安装客户端 &amp; ② 开启云端沙箱：</span>
                 <button class="btn" onclick="copyFreeSnippet()" data-i18n="btn_copy_free">复制开启命令</button>
               </div>
-              <pre class="code" id="cli-snippet-free" style="max-height:200px; margin-bottom:1rem;"></pre>
+              <pre class="code" id="cli-snippet-free"></pre>
+            </div>
 
-              <div style="background:var(--bg-primary); border:1px solid var(--border); padding:0.85rem 1rem;">
-                <div style="font-size:0.8rem; font-weight:600; color:var(--ink); margin-bottom:0.45rem;" data-i18n="free_step3_title">③ AI 在云端改完代码后（日常 3 条命令）：</div>
-                <div style="display:grid; gap:0.35rem; font-size:0.78rem; color:var(--ink-secondary);">
-                  <div><code class="mono" style="color:var(--accent); font-weight:600;">aegis-os cloud diff</code> — <span data-i18n="cmd_diff_desc">查看 AI 在云端改了哪些代码</span></div>
-                  <div><code class="mono" style="color:var(--accent); font-weight:600;">aegis-os cloud pull</code> — <span data-i18n="cmd_pull_desc">确认无误后，把云端改动同步回你的电脑</span></div>
-                  <div><code class="mono" style="color:var(--accent); font-weight:600;">aegis-os cloud down</code> — <span data-i18n="cmd_down_desc">断开并休眠云端沙箱（下次 cloud up 秒唤醒）</span></div>
-                </div>
+            <div class="sub-box">
+              <div style="font-size:0.8rem; font-weight:600; color:var(--ink); margin-bottom:0.45rem;" data-i18n="free_step3_title">③ AI 在云端改完代码后（日常 3 条命令）：</div>
+              <div style="display:grid; gap:0.35rem; font-size:0.78rem; color:var(--ink-secondary);">
+                <div><code class="mono" style="color:var(--accent); font-weight:600;">aegis-os cloud diff</code> — <span data-i18n="cmd_diff_desc">查看 AI 在云端改了哪些代码</span></div>
+                <div><code class="mono" style="color:var(--accent); font-weight:600;">aegis-os cloud pull</code> — <span data-i18n="cmd_pull_desc">确认无误后，把云端改动同步回你的电脑</span></div>
+                <div><code class="mono" style="color:var(--accent); font-weight:600;">aegis-os cloud down</code> — <span data-i18n="cmd_down_desc">断开并休眠云端沙箱（下次 cloud up 秒唤醒）</span></div>
               </div>
             </div>
           </div>
 
           <!-- Right Card: Pro Plan ($29/mo, Guided 3-Step Purchase & Parallel Activation) -->
-          <div class="editorial-card" style="display:flex; flex-direction:column; justify-content:space-between; gap:1.15rem; border-color:var(--accent);">
-            <div>
-              <div style="display:flex; justify-content:space-between; align-items:flex-start; gap:0.75rem; padding-bottom:0.9rem; border-bottom:1px solid var(--border); margin-bottom:0.9rem; flex-wrap:wrap;">
+          <div class="editorial-card editorial-card-pro">
+            <div class="card-body">
+              <div class="card-head">
                 <div>
                   <span class="tag tag-active"><span class="dot-mint"></span><span data-i18n="tier_pro_tag">PRO 专业版 · 多 AI 并行</span></span>
-                  <h3 style="font-family:var(--serif); font-size:1.35rem; font-weight:400; margin-top:0.4rem;" data-i18n="tier_pro_title">$29 / 月 · 多个工作区 · 8 个 AI 并行</h3>
+                  <h3 class="card-title" data-i18n="tier_pro_title">$29 / 月 · 多个工作区 · 8 个 AI 并行</h3>
                 </div>
                 <a class="btn btn-solid" href="https://buy.polar.sh/polar_cl_jCPpzbp4eOAyRbkDP4YzNIFVnYLddbvJZI5Fc27zL0x" target="_blank" rel="noopener" data-i18n="btn_buy_pro">① 立即订阅 Pro ($29/月) →</a>
               </div>
 
-              <p class="text-muted" style="font-size:0.85rem; margin-bottom:0.95rem;" data-i18n="tier_pro_desc">解锁多项目工作区（最多 16 个）与多 AI 并行（最多 8 个 AI 助手在 64GB 内存云主机各自的独立副本里同时改代码、跑测试、做审查）。</p>
+              <p class="card-desc" data-i18n="tier_pro_desc">解锁多项目工作区（最多 16 个）与多 AI 并行（最多 8 个 AI 助手在 64GB 内存云主机各自的独立副本里同时改代码、跑测试、做审查）。</p>
 
-              <!-- Step 2: Claim Pro Key by Checkout Email -->
-              <div style="background:var(--bg-primary); border:1px solid var(--border); padding:0.85rem 1rem; margin-bottom:0.95rem;">
-                <div style="font-size:0.82rem; font-weight:600; color:var(--accent); margin-bottom:0.35rem;" data-i18n="claim_card_title">② 完成付款后：输入付款邮箱提取你的 Pro 专属密钥</div>
-                <div style="display:flex; gap:0.5rem; flex-wrap:wrap;">
-                  <input class="mono-input" id="claim-email" type="email" placeholder="你付款时填写的邮箱 (如 you@company.com)" style="flex:1; min-width:170px; background:var(--bg-elevated);" />
-                  <button class="btn btn-mint" onclick="claimSubscriptionKey()" data-i18n="btn_claim">提取 Pro 密钥 →</button>
-                </div>
+              <div class="cmd-bar">
+                <span class="cmd-title" data-i18n="pro_cmd_title">③ 在项目文件夹启动多 AI 云端并行：</span>
+                <button class="btn" onclick="copyProSnippet()" data-i18n="btn_copy_pro">复制 Pro 命令</button>
               </div>
-
-              <!-- Step 3: Pro Parallel Command -->
-              <div>
-                <div style="display:flex; justify-content:space-between; align-items:center; margin-bottom:0.55rem;">
-                  <span style="font-size:0.82rem; font-weight:600; color:var(--ink);" data-i18n="pro_cmd_title">③ 在项目文件夹启动多 AI 云端并行：</span>
-                  <button class="btn" onclick="copyProSnippet()" data-i18n="btn_copy_pro">复制 Pro 命令</button>
-                </div>
-                <pre class="code" id="cli-snippet-pro" style="max-height:190px;"></pre>
-              </div>
+              <pre class="code" id="cli-snippet-pro"></pre>
             </div>
 
-            <div style="padding-top:0.85rem; border-top:1px solid var(--border); font-size:0.78rem; color:var(--ink-secondary);" data-i18n="pro_footer_tip">
-              多 AI 并行时：可用 aegis-os cloud diff --agent &lt;名称&gt; 查看指定 AI 的改动，aegis-os cloud pull --agent &lt;名称&gt; 同步回电脑。
+            <!-- Step 2: Claim Pro Key by Checkout Email (Aligned with Left Card Bottom Box) -->
+            <div class="sub-box">
+              <div style="font-size:0.8rem; font-weight:600; color:var(--accent); margin-bottom:0.42rem;" data-i18n="claim_card_title">② 完成付款后：输入付款邮箱提取你的 Pro 专属密钥（自动填入上方命令）</div>
+              <div class="claim-row">
+                <input class="mono-input" id="claim-email" type="email" placeholder="付款邮箱 (如 you@company.com)" />
+                <button class="btn btn-mint" onclick="claimSubscriptionKey()" data-i18n="btn_claim">提取 Pro 密钥 →</button>
+              </div>
+              <div style="margin-top:0.45rem; font-size:0.75rem; color:var(--ink-muted);" data-i18n="pro_footer_tip">
+                多 AI 并行时：可用 aegis-os cloud diff --agent &lt;名称&gt; 查看指定 AI 的改动，cloud pull --agent &lt;名称&gt; 同步回电脑。
+              </div>
             </div>
           </div>
         </div>
@@ -2452,8 +2577,8 @@ pub const DASHBOARD_HTML: &str = r##"<!doctype html>
         st_lbl_ram: '云端独占编译内存',
         st_lbl_cpu: '本地电脑 CPU / 内存占用',
         st_lbl_safe: '先看对比，满意再同步回电脑',
-        art_top_l: '端到端工作流 — 云端改代码跑测试，本地看对比再同步',
-        art_top_r: '64GB 云端服务器',
+        art_top_l: '云端沙箱端到端工作流',
+        art_top_r: '64GB 云端主机',
         svg_step1_t: '1. cloud up 开启',
         svg_step1_d: '秒建云端独立副本',
         svg_step1_s: '0% 本地内存占用',
@@ -2463,8 +2588,8 @@ pub const DASHBOARD_HTML: &str = r##"<!doctype html>
         svg_step3_t: '2. diff & pull',
         svg_step3_d: '先看改动对比',
         svg_step3_s: '满意再同步回电脑',
-        art_bot_l: '云主机：HEURION.ORG (64GB 内存)',
-        art_bot_r: 'cloud down 随时休眠 · 用时秒唤醒',
+        art_bot_l: '节点：HEURION.ORG',
+        art_bot_r: 'cloud down 休眠 · 秒级唤醒',
         sec3_title: '选择方案与 <em>30 秒完整使用流程</em>',
         sec3_label: '免费版开箱即用 · PRO 版支持多工作区与 8 个 AI 并行',
         tier_free_tag: '免费版 · 无需注册或绑卡',
@@ -2480,11 +2605,11 @@ pub const DASHBOARD_HTML: &str = r##"<!doctype html>
         tier_pro_title: '$29 / 月 · 多个工作区 · 8 个 AI 并行',
         btn_buy_pro: '① 立即订阅 Pro ($29/月) →',
         tier_pro_desc: '解锁多项目工作区（最多 16 个）与多 AI 并行（最多 8 个 AI 助手在 64GB 内存云主机各自的独立副本里同时改代码、跑测试、做审查）。',
-        claim_card_title: '② 完成付款后：输入付款邮箱提取你的 Pro 专属密钥',
+        claim_card_title: '② 完成付款后：输入付款邮箱提取你的 Pro 专属密钥（自动填入上方命令）',
         btn_claim: '提取 Pro 密钥 →',
         pro_cmd_title: '③ 在项目文件夹启动多 AI 云端并行：',
         btn_copy_pro: '复制 Pro 命令',
-        pro_footer_tip: '多 AI 并行时：可用 aegis-os cloud diff --agent <名称> 查看指定 AI 的改动，aegis-os cloud pull --agent <名称> 同步回电脑。'
+        pro_footer_tip: '多 AI 并行时：可用 aegis-os cloud diff --agent <名称> 查看指定 AI 的改动，cloud pull --agent <名称> 同步回电脑。'
       },
       en: {
         nav_home: 'Heurion.org ↗',
@@ -2495,8 +2620,8 @@ pub const DASHBOARD_HTML: &str = r##"<!doctype html>
         st_lbl_ram: 'Dedicated Cloud RAM',
         st_lbl_cpu: 'Local CPU / RAM Usage',
         st_lbl_safe: 'Review diff first, then pull to laptop',
-        art_top_l: 'END-TO-END FLOW — EDIT & TEST IN CLOUD, DIFF & PULL LOCALLY',
-        art_top_r: '64GB CLOUD SERVER',
+        art_top_l: 'CLOUD SANDBOX WORKFLOW',
+        art_top_r: '64GB CLOUD HOST',
         svg_step1_t: '1. cloud up',
         svg_step1_d: 'Instant cloud copy',
         svg_step1_s: '0% local CPU / RAM',
@@ -2506,8 +2631,8 @@ pub const DASHBOARD_HTML: &str = r##"<!doctype html>
         svg_step3_t: '2. diff & pull',
         svg_step3_d: 'Inspect diff first',
         svg_step3_s: 'Pull when satisfied',
-        art_bot_l: 'HOST: HEURION.ORG (64GB RAM)',
-        art_bot_r: 'CLOUD DOWN TO SLEEP · INSTANT WAKE',
+        art_bot_l: 'HOST: HEURION.ORG',
+        art_bot_r: 'AUTO-SLEEP · INSTANT WAKE',
         sec3_title: 'Choose Your Plan &amp; <em>30-Second Workflow</em>',
         sec3_label: 'FREE PLAN READY OUT OF THE BOX · PRO FOR MULTI-AI PARALLELISM',
         tier_free_tag: 'FREE PLAN · NO SIGNUP REQUIRED',
@@ -2527,7 +2652,7 @@ pub const DASHBOARD_HTML: &str = r##"<!doctype html>
         btn_claim: 'Claim Pro Key →',
         pro_cmd_title: '③ Launch parallel AIs inside your project folder:',
         btn_copy_pro: 'Copy Pro Commands',
-        pro_footer_tip: 'With multiple AIs: run aegis-os cloud diff --agent <name> to review a specific AI, and aegis-os cloud pull --agent <name> to sync.'
+        pro_footer_tip: 'With multiple AIs: run aegis-os cloud diff --agent <name> to review a specific AI, and cloud pull --agent <name> to sync.'
       }
     };
 
@@ -2570,12 +2695,12 @@ pub const DASHBOARD_HTML: &str = r##"<!doctype html>
           ? `# 1. One-line install (macOS & Linux)
 curl -fsSL ${origin}/aegis-cloud/install.sh | sh
 
-# 2. Run inside your project folder (auto-generates key & binds 1 free workspace)
+# 2. Start free cloud sandbox (auto-generates key)
 cd /path/to/your/project && aegis-os cloud up`
           : `# 1. 一行命令安装客户端（自动配置你的 AI 编程工具）
 curl -fsSL ${origin}/aegis-cloud/install.sh | sh
 
-# 2. 进入你的项目文件夹，一键开启免费云端沙箱（自动生成密钥，无需传参）
+# 2. 进入项目文件夹开启免费云端沙箱（自动生成密钥）
 cd 你的项目文件夹 && aegis-os cloud up`;
       }
       if (proBox) {
@@ -2583,13 +2708,17 @@ cd 你的项目文件夹 && aegis-os cloud up`;
           ? `# 1. Install CLI (if not installed yet)
 curl -fsSL ${origin}/aegis-cloud/install.sh | sh
 
-# 2. Launch up to 8 parallel AIs with your claimed Pro key
-cd /path/to/your/project && aegis-os cloud up --api-key ${latestKey} --agents agy-agent,claude-code,codex-cli`
+# 2. Launch parallel AIs with your Pro key
+cd /path/to/your/project && aegis-os cloud up \\
+  --api-key ${latestKey} \\
+  --agents agy-agent,claude-code,codex-cli`
           : `# 1. 若尚未安装客户端，先运行一行安装命令：
 curl -fsSL ${origin}/aegis-cloud/install.sh | sh
 
-# 2. 使用上方提取的 Pro 专属密钥，在项目文件夹启动多 AI 云端并行：
-cd 你的项目文件夹 && aegis-os cloud up --api-key ${latestKey} --agents agy-agent,claude-code,codex-cli`;
+# 2. 使用提取的 Pro 密钥启动多 AI 云端并行：
+cd 你的项目文件夹 && aegis-os cloud up \\
+  --api-key ${latestKey} \\
+  --agents agy-agent,claude-code,codex-cli`;
       }
     }
 
