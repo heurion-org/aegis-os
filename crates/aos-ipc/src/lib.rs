@@ -687,6 +687,31 @@ impl IpcBus for AegisIpcBus {
                 .with_context(|| format!("Original message '{}' not found", original_msg_id))?
         };
 
+        // Only a recipient may answer: otherwise any agent that learns a msg_id (task lists,
+        // status views) could complete someone else's task with forged results. Topic fan-out
+        // copies are delivered as `<msg_id>-<agent>`.
+        if !aos_core::ablated("tenant_gate") {
+            let fanout_id = format!("{}-{}", original_msg_id, responder.agent_id);
+            let delivered = self
+                .mailboxes
+                .read()
+                .await
+                .get(&Self::mailbox_key(&responder.org_id, &responder.agent_id))
+                .map_or(false, |inbox| {
+                    inbox
+                        .iter()
+                        .any(|m| m.msg_id == original_msg_id || m.msg_id == fanout_id)
+                });
+            if !delivered {
+                bail!(
+                    "IPC reply forbidden: message '{}' was not delivered to '{}/{}'; only its recipient can reply",
+                    original_msg_id,
+                    responder.org_id,
+                    responder.agent_id
+                );
+            }
+        }
+
         let (reply_target_org, reply_target_agent, reply_from_agent) =
             if let Some((orig_from_org, orig_from_agent)) = original.from_agent.split_once('/') {
                 (
@@ -988,6 +1013,47 @@ mod tests {
 
         let planner_notif = planner_wakeup.try_recv().unwrap();
         assert_eq!(planner_notif.msg_id, reply.msg_id);
+    }
+
+    #[tokio::test]
+    async fn only_the_recipient_can_reply_to_a_task() {
+        let bus = AegisIpcBus::new();
+        let planner = AgentIdentity::new("acme", "planner-1", "Architect");
+        let coder = AgentIdentity::new("acme", "coder-1", "Rust Engineer");
+        let intruder = AgentIdentity::new("acme", "rogue-1", "Rust Engineer");
+        let outsider = AgentIdentity::new("evil", "coder-1", "Rust Engineer");
+        for p in [&planner, &coder, &intruder, &outsider] {
+            bus.register_peer(p, vec![]).await.unwrap();
+        }
+        let req = bus
+            .send(IpcEnvelope {
+                msg_id: String::new(),
+                org_id: "acme".to_string(),
+                from_agent: "planner-1".to_string(),
+                to_target: "coder-1".to_string(),
+                kind: IpcKind::TaskRequest { timeout_secs: None },
+                subject: "Run the test suite".to_string(),
+                payload: json!({}),
+                attachments: vec![],
+                status: MessageDeliveryStatus::Unread,
+                created_at_ms: 0,
+            })
+            .await
+            .unwrap();
+
+        for forger in [&intruder, &outsider] {
+            let err = bus
+                .reply(forger, &req.msg_id, true, json!({"tests_passed": 999}), vec![])
+                .await
+                .unwrap_err();
+            assert!(err.to_string().contains("only its recipient can reply"), "{err}");
+        }
+        assert!(bus.recv_inbox("acme", "planner-1", true, 10).await.unwrap().is_empty());
+
+        bus.reply(&coder, &req.msg_id, true, json!({"tests_passed": 12}), vec![])
+            .await
+            .unwrap();
+        assert_eq!(bus.recv_inbox("acme", "planner-1", true, 10).await.unwrap().len(), 1);
     }
 
     #[tokio::test]
