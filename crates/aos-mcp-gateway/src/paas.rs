@@ -247,6 +247,8 @@ pub struct PaasControlPlane {
     state_file: PathBuf,
     workspaces_root: PathBuf,
     state: RwLock<PersistedPaasState>,
+    /// Server-side secrets: `(admin, billing_webhook)`. Never derived from request data.
+    secrets: std::sync::RwLock<(String, String)>,
 }
 
 impl PaasControlPlane {
@@ -257,11 +259,31 @@ impl PaasControlPlane {
             .ok()
             .and_then(|b| serde_json::from_slice::<PersistedPaasState>(&b).ok())
             .unwrap_or_default();
+        let env_secret = |k: &str| std::env::var(k).unwrap_or_default().trim().to_string();
         Self {
             state_file,
             workspaces_root,
             state: RwLock::new(initial),
+            secrets: std::sync::RwLock::new((
+                env_secret("AOS_ADMIN_SECRET"),
+                env_secret("AOS_BILLING_WEBHOOK_SECRET"),
+            )),
         }
+    }
+
+    /// Overrides the secrets loaded from `AOS_ADMIN_SECRET` / `AOS_BILLING_WEBHOOK_SECRET`.
+    pub fn set_secrets(&self, admin: &str, billing_webhook: &str) {
+        *self.secrets.write().unwrap() = (admin.trim().to_string(), billing_webhook.trim().to_string());
+    }
+
+    /// Empty when no admin secret is configured.
+    pub fn admin_secret(&self) -> String {
+        self.secrets.read().unwrap().0.clone()
+    }
+
+    /// Empty when no billing webhook secret is configured.
+    pub fn webhook_secret(&self) -> String {
+        self.secrets.read().unwrap().1.clone()
     }
 
     fn sha256_hex(input: &str) -> String {
@@ -301,8 +323,21 @@ impl PaasControlPlane {
         hex::encode(outer.finalize())
     }
 
-    /// Verify webhook HMAC-SHA256 signature from Polar.sh, Lemon Squeezy, or Stripe when
-    /// `secret` (`AOS_BILLING_WEBHOOK_SECRET`) is configured.
+    /// Constant-time comparison for secrets and hex digests (ASCII case-insensitive, so hex
+    /// signatures match regardless of case). Length is not secret.
+    pub fn secrets_match(provided: &str, expected: &str) -> bool {
+        let (a, b) = (provided.as_bytes(), expected.as_bytes());
+        if a.is_empty() || a.len() != b.len() {
+            return false;
+        }
+        a.iter()
+            .zip(b)
+            .fold(0u8, |acc, (x, y)| acc | (x.to_ascii_lowercase() ^ y.to_ascii_lowercase()))
+            == 0
+    }
+
+    /// Verify webhook HMAC-SHA256 signature from Polar.sh, Lemon Squeezy, or Stripe. Fails closed:
+    /// an unset `secret` (`AOS_BILLING_WEBHOOK_SECRET`) rejects every request.
     pub fn verify_webhook_signature(
         secret: &str,
         headers: &std::collections::HashMap<String, String>,
@@ -310,7 +345,7 @@ impl PaasControlPlane {
     ) -> bool {
         let secret = secret.trim();
         if secret.is_empty() {
-            return true;
+            return false;
         }
         let expected_hex = Self::hmac_sha256_hex(secret.as_bytes(), raw_body.as_bytes());
 
@@ -327,7 +362,7 @@ impl PaasControlPlane {
                     .strip_prefix("sha256=")
                     .or_else(|| sig_val.trim().strip_prefix("v1="))
                     .unwrap_or(sig_val.trim());
-                if cleaned.eq_ignore_ascii_case(&expected_hex) {
+                if Self::secrets_match(cleaned, &expected_hex) {
                     return true;
                 }
             }
@@ -348,11 +383,11 @@ impl PaasControlPlane {
                 let signed_payload = format!("{}.{}", ts, raw_body);
                 let stripe_expected =
                     Self::hmac_sha256_hex(secret.as_bytes(), signed_payload.as_bytes());
-                if v1.eq_ignore_ascii_case(&stripe_expected) {
+                if Self::secrets_match(v1, &stripe_expected) {
                     return true;
                 }
             }
-            if stripe_sig.trim().eq_ignore_ascii_case(&expected_hex) {
+            if Self::secrets_match(stripe_sig.trim(), &expected_hex) {
                 return true;
             }
         }
@@ -3420,4 +3455,47 @@ pub fn render_dashboard_html(workspace_root: &Path) -> String {
         }
     }
     DASHBOARD_HTML.to_string()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::collections::HashMap;
+
+    #[test]
+    fn secrets_match_is_exact_and_rejects_empty() {
+        assert!(PaasControlPlane::secrets_match("s3cret", "s3cret"));
+        assert!(PaasControlPlane::secrets_match("ABCDEF", "abcdef"));
+        assert!(!PaasControlPlane::secrets_match("s3cret", "s3cre"));
+        assert!(!PaasControlPlane::secrets_match("s3cret", "s3creT!"));
+        assert!(!PaasControlPlane::secrets_match("", ""));
+    }
+
+    #[test]
+    fn webhook_signature_fails_closed_without_secret() {
+        let body = r#"{"type":"subscription.created"}"#;
+        let mut headers = HashMap::new();
+        headers.insert(
+            "x-signature".to_string(),
+            PaasControlPlane::hmac_sha256_hex(b"", body.as_bytes()),
+        );
+        assert!(!PaasControlPlane::verify_webhook_signature("", &headers, body));
+        assert!(!PaasControlPlane::verify_webhook_signature("  ", &headers, body));
+    }
+
+    #[test]
+    fn webhook_signature_accepts_only_matching_hmac() {
+        let body = r#"{"type":"subscription.created"}"#;
+        let good = PaasControlPlane::hmac_sha256_hex(b"whsec", body.as_bytes());
+        let mut headers = HashMap::new();
+        headers.insert("x-signature".to_string(), format!("sha256={good}"));
+        assert!(PaasControlPlane::verify_webhook_signature("whsec", &headers, body));
+        assert!(!PaasControlPlane::verify_webhook_signature("other", &headers, body));
+
+        let stripe_payload = format!("1700000000.{body}");
+        let v1 = PaasControlPlane::hmac_sha256_hex(b"whsec", stripe_payload.as_bytes());
+        let mut stripe = HashMap::new();
+        stripe.insert("stripe-signature".to_string(), format!("t=1700000000,v1={v1}"));
+        assert!(PaasControlPlane::verify_webhook_signature("whsec", &stripe, body));
+    }
 }

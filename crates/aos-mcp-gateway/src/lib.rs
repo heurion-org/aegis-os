@@ -2800,11 +2800,8 @@ impl AegisRuntimeKernel {
                         let tier = paas::PlanTier::from_str_lossy(raw_tier);
 
                         // Enforce admin secret guard when upgrading to a paid tier in production (`AOS_ADMIN_SECRET` or `AOS_REQUIRE_API_KEY=1`)
-                        let expected_admin = headers
-                            .get("x-aegis-admin-secret-override")
-                            .cloned()
-                            .or_else(|| std::env::var("AOS_ADMIN_SECRET").ok())
-                            .unwrap_or_default();
+                        // The expected secret is server-side configuration, never request data.
+                        let expected_admin = k.paas.admin_secret();
                         let provided_admin = headers
                             .get("x-aegis-admin-secret")
                             .map(|s| s.trim())
@@ -2814,8 +2811,7 @@ impl AegisRuntimeKernel {
                                 && tier != paas::PlanTier::Community);
 
                         if require_admin
-                            && (expected_admin.trim().is_empty()
-                                || provided_admin != expected_admin.trim())
+                            && !paas::PaasControlPlane::secrets_match(provided_admin, expected_admin.trim())
                         {
                             let checkout = k.paas.build_checkout_info(t_org, tier, None);
                             (
@@ -2919,12 +2915,16 @@ impl AegisRuntimeKernel {
                         let info = k.paas.build_checkout_info(&c_org, tier, c_email.as_deref());
                         ("HTTP/1.1 200 OK", info.to_string())
                     } else if method == "POST" && full_target.starts_with("/v1/billing/webhook") {
-                        let webhook_secret = headers
-                            .get("x-aegis-webhook-secret-override")
-                            .cloned()
-                            .or_else(|| std::env::var("AOS_BILLING_WEBHOOK_SECRET").ok())
-                            .unwrap_or_default();
-                        if !paas::PaasControlPlane::verify_webhook_signature(
+                        let webhook_secret = k.paas.webhook_secret();
+                        if webhook_secret.trim().is_empty() {
+                            (
+                                "HTTP/1.1 503 Service Unavailable",
+                                json!({
+                                    "error": "Billing webhooks are disabled: AOS_BILLING_WEBHOOK_SECRET is not configured on this server."
+                                })
+                                .to_string(),
+                            )
+                        } else if !paas::PaasControlPlane::verify_webhook_signature(
                             &webhook_secret,
                             &headers,
                             &body_str,
@@ -2972,19 +2972,14 @@ impl AegisRuntimeKernel {
 
                         // Prevent unauthenticated key minting on paid tenants (`Pro` / `Team` / `Enterprise`) when `AOS_REQUIRE_API_KEY=1` or admin secret is enforced
                         let target_tier = k.paas.get_tenant_plan(k_org).await;
-                        let expected_admin = headers
-                            .get("x-aegis-admin-secret-override")
-                            .cloned()
-                            .or_else(|| std::env::var("AOS_ADMIN_SECRET").ok())
-                            .unwrap_or_default();
-                        let has_valid_admin = !expected_admin.trim().is_empty()
-                            && headers
-                                .get("x-aegis-admin-secret")
-                                .map(|s| s.trim() == expected_admin.trim())
-                                .unwrap_or(false);
+                        let expected_admin = k.paas.admin_secret();
+                        let has_valid_admin = headers
+                            .get("x-aegis-admin-secret")
+                            .map(|s| paas::PaasControlPlane::secrets_match(s.trim(), expected_admin.trim()))
+                            .unwrap_or(false);
                         let has_same_org_auth = raw_auth.is_some() && !auth_failed && org_id == k_org;
                         let enforce_paid_guard = std::env::var("AOS_REQUIRE_API_KEY").as_deref() == Ok("1")
-                            || headers.contains_key("x-aegis-admin-secret-override");
+                            || !expected_admin.trim().is_empty();
 
                         if enforce_paid_guard
                             && target_tier != paas::PlanTier::Community
@@ -4238,6 +4233,7 @@ mod tests {
 
         // 2. Verify HMAC-SHA256 webhook signature rejection on forged signature
         let webhook_secret = "whsec_polar_test_secret_123";
+        kernel.paas.set_secrets("adm_secret_999", webhook_secret);
         let polar_activate = json!({
             "type": "subscription.created",
             "data": {
@@ -4254,7 +4250,6 @@ mod tests {
             "POST",
             "/v1/billing/webhook",
             &[
-                ("X-Aegis-Webhook-Secret-Override", webhook_secret),
                 ("X-Polar-Signature", "sha256=deadbeef0000"),
             ],
             Some(polar_activate.clone()),
@@ -4273,7 +4268,6 @@ mod tests {
             "POST",
             "/v1/billing/webhook",
             &[
-                ("X-Aegis-Webhook-Secret-Override", webhook_secret),
                 ("X-Polar-Signature", &format!("sha256={}", valid_sig)),
             ],
             Some(polar_activate),
@@ -4352,7 +4346,6 @@ mod tests {
             "POST",
             "/v1/billing/webhook",
             &[
-                ("X-Aegis-Webhook-Secret-Override", webhook_secret),
                 ("X-Signature", &cancel_sig),
             ],
             Some(ls_cancel),
@@ -4379,7 +4372,11 @@ mod tests {
             addr,
             "POST",
             "/v1/tenants/plan",
-            &[("X-Aegis-Admin-Secret-Override", "adm_secret_999")],
+            // A client-chosen "override" must not let it pick the secret it then presents.
+            &[
+                ("X-Aegis-Admin-Secret-Override", "attacker"),
+                ("X-Aegis-Admin-Secret", "attacker"),
+            ],
             Some(json!({ "org_id": "free-org", "plan_tier": "pro" })),
         )
         .await;
