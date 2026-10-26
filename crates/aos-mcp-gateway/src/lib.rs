@@ -35,6 +35,65 @@ pub mod paas;
 use app_store::AppStoreRegistry;
 use paas::PaasControlPlane;
 
+/// Splits an agent-supplied path into plain components relative to the shadow root. A leading `/`
+/// is tolerated (agents often write repo-absolute paths); `..`, drive prefixes and empty paths are not.
+fn shadow_relative(rel: &str) -> anyhow::Result<PathBuf> {
+    use std::path::Component;
+    let mut out = PathBuf::new();
+    for comp in Path::new(rel.trim_start_matches('/')).components() {
+        match comp {
+            Component::Normal(c) => out.push(c),
+            Component::CurDir => {}
+            _ => bail!("Path traversal outside shadow workspace is forbidden: '{}'", rel),
+        }
+    }
+    if out.as_os_str().is_empty() {
+        bail!("Path must name a file inside the shadow workspace");
+    }
+    Ok(out)
+}
+
+/// Resolves a path for `fs_write` / `fs_edit` / `fs_delete`. The gateway runs unsandboxed, so a
+/// symlink planted from `proc_exec` (or a host-linked `node_modules`) would redirect the write to
+/// the host; any symlink on the path is therefore refused.
+fn shadow_path_for_write(root: &Path, rel: &str) -> anyhow::Result<(String, PathBuf)> {
+    let rel_path = shadow_relative(rel)?;
+    let mut cur = root.to_path_buf();
+    for comp in rel_path.components() {
+        cur.push(comp);
+        match std::fs::symlink_metadata(&cur) {
+            Ok(meta) if meta.file_type().is_symlink() => bail!(
+                "Refusing to write through symlink '{}' in the shadow workspace",
+                cur.strip_prefix(root).unwrap_or(&cur).display()
+            ),
+            Ok(_) => {}
+            Err(_) => break, // the rest does not exist yet and will be created as real entries
+        }
+    }
+    let full = root.join(&rel_path);
+    Ok((rel_path.to_string_lossy().into_owned(), full))
+}
+
+/// Resolves a path for `fs_read`. Symlinks may be followed (host-linked `node_modules`/`.venv` are
+/// expected), but the real target must stay inside the shadow workspace or the host repo.
+fn shadow_path_for_read(root: &Path, host_root: &Path, rel: &str) -> anyhow::Result<(String, PathBuf)> {
+    let rel_path = shadow_relative(rel)?;
+    let full = root.join(&rel_path);
+    let real = std::fs::canonicalize(&full)
+        .with_context(|| format!("File '{}' not found in CoW workspace", rel_path.display()))?;
+    let allowed = [root, host_root]
+        .iter()
+        .filter_map(|r| std::fs::canonicalize(r).ok())
+        .any(|r| real.starts_with(&r));
+    if !allowed {
+        bail!(
+            "Refusing to read '{}': it resolves outside the shadow workspace and host repo",
+            rel_path.display()
+        );
+    }
+    Ok((rel_path.to_string_lossy().into_owned(), real))
+}
+
 pub struct AgentEnvironment {
     pub identity: AgentIdentity,
     pub workspace: Arc<dyn TransactionalWorkspace>,
@@ -642,8 +701,11 @@ impl AegisRuntimeKernel {
                     .get("path")
                     .and_then(|v| v.as_str())
                     .context("Missing 'path'")?;
-                let clean = rel_path.trim_start_matches('/');
-                let full_path = env.workspace.shadow_root().join(clean);
+                let (clean, full_path) = shadow_path_for_read(
+                    env.workspace.shadow_root(),
+                    env.workspace.host_source_root(),
+                    rel_path,
+                )?;
                 let content = tokio::fs::read_to_string(&full_path).await?;
                 Ok(json!({
                     "path": clean,
@@ -661,11 +723,8 @@ impl AegisRuntimeKernel {
                     .get("content")
                     .and_then(|v| v.as_str())
                     .context("Missing 'content'")?;
-                let clean = rel_path.trim_start_matches('/');
-                if clean.contains("..") {
-                    bail!("Path traversal outside shadow workspace is forbidden");
-                }
-                let full_path = env.workspace.shadow_root().join(clean);
+                let (clean, full_path) =
+                    shadow_path_for_write(env.workspace.shadow_root(), rel_path)?;
                 if let Some(parent) = full_path.parent() {
                     tokio::fs::create_dir_all(parent).await?;
                 }
@@ -691,11 +750,8 @@ impl AegisRuntimeKernel {
                     .get("replacement")
                     .and_then(|v| v.as_str())
                     .context("Missing 'replacement'")?;
-                let clean = rel_path.trim_start_matches('/');
-                if clean.contains("..") {
-                    bail!("Path traversal outside shadow workspace is forbidden");
-                }
-                let full_path = env.workspace.shadow_root().join(clean);
+                let (clean, full_path) =
+                    shadow_path_for_write(env.workspace.shadow_root(), rel_path)?;
                 let original = tokio::fs::read_to_string(&full_path)
                     .await
                     .with_context(|| format!("File '{}' not found in CoW workspace", clean))?;
@@ -719,11 +775,8 @@ impl AegisRuntimeKernel {
                     .get("path")
                     .and_then(|v| v.as_str())
                     .context("Missing 'path'")?;
-                let clean = rel_path.trim_start_matches('/');
-                if clean.contains("..") {
-                    bail!("Path traversal outside shadow workspace is forbidden");
-                }
-                let full_path = env.workspace.shadow_root().join(clean);
+                let (clean, full_path) =
+                    shadow_path_for_write(env.workspace.shadow_root(), rel_path)?;
                 if full_path.exists() {
                     tokio::fs::remove_file(&full_path).await?;
                 }
@@ -3524,6 +3577,53 @@ impl AegisRuntimeKernel {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn shadow_paths_reject_traversal() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (shadow, host) = (tmp.path().join("shadow"), tmp.path().join("host"));
+        std::fs::create_dir_all(&shadow).unwrap();
+        std::fs::create_dir_all(&host).unwrap();
+        for bad in ["../x", "a/../../x", "", "/", "./"] {
+            assert!(shadow_path_for_write(&shadow, bad).is_err(), "{bad}");
+            assert!(shadow_path_for_read(&shadow, &host, bad).is_err(), "{bad}");
+        }
+        // Repo-absolute paths and names merely containing ".." stay allowed.
+        let (clean, full) = shadow_path_for_write(&shadow, "/src/a..b.rs").unwrap();
+        assert_eq!(clean, "src/a..b.rs");
+        assert_eq!(full, shadow.join("src/a..b.rs"));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn shadow_paths_refuse_symlink_escapes() {
+        use std::os::unix::fs::symlink;
+        let tmp = tempfile::tempdir().unwrap();
+        let (shadow, host, outside) = (
+            tmp.path().join("shadow"),
+            tmp.path().join("host"),
+            tmp.path().join("outside"),
+        );
+        for d in [&shadow, &host, &outside] {
+            std::fs::create_dir_all(d).unwrap();
+        }
+        std::fs::write(outside.join("secret"), "s").unwrap();
+        std::fs::write(host.join("dep.js"), "d").unwrap();
+        symlink(outside.join("secret"), shadow.join("rc")).unwrap();
+        symlink(&outside, shadow.join("out")).unwrap();
+        symlink(&host, shadow.join("node_modules")).unwrap();
+
+        // Writes never go through a symlink, whether it is the leaf or a parent directory.
+        assert!(shadow_path_for_write(&shadow, "rc").is_err());
+        assert!(shadow_path_for_write(&shadow, "out/new.txt").is_err());
+        assert!(shadow_path_for_write(&shadow, "node_modules/dep.js").is_err());
+        assert!(shadow_path_for_write(&shadow, "fresh/dir/file.txt").is_ok());
+
+        // Reads may follow links into the host repo, never elsewhere.
+        assert!(shadow_path_for_read(&shadow, &host, "rc").is_err());
+        assert!(shadow_path_for_read(&shadow, &host, "out/secret").is_err());
+        assert!(shadow_path_for_read(&shadow, &host, "node_modules/dep.js").is_ok());
+    }
 
     #[tokio::test]
     async fn test_end_to_end_multi_agent_ipc_and_cow_workflow() {
