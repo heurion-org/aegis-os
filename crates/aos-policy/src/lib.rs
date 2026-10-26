@@ -123,6 +123,20 @@ impl AegisPolicyKernel {
             || file_name == "CMakeLists.txt"
             || file_name == "package.json"
             || file_name == "setup.py"
+            // Also execute code on routine dev commands (git hooks, test runners, build scripts).
+            || norm.starts_with(".husky/")
+            || norm.contains("/.husky/")
+            || file_name == ".pre-commit-config.yaml"
+            || file_name == ".gitattributes"
+            || file_name == "pyproject.toml"
+            || file_name == "setup.cfg"
+            || file_name == "conftest.py"
+            || file_name == "noxfile.py"
+            || file_name == "tox.ini"
+            || file_name == "Cargo.toml"
+            || file_name.eq_ignore_ascii_case("justfile")
+            || file_name == "Rakefile"
+            || file_name == ".npmrc"
     }
 
     async fn check_active_lease(&self, ctx: &PolicyContext) -> Option<LeaseGrant> {
@@ -534,6 +548,25 @@ mod tests {
     use super::*;
     use aos_core::AgentIdentity;
     use serde_json::json;
+
+    #[test]
+    fn commit_guard_covers_code_executing_config() {
+        for p in [
+            ".husky/pre-commit",
+            "web/.husky/pre-push",
+            ".pre-commit-config.yaml",
+            "pyproject.toml",
+            "tests/conftest.py",
+            "crates/x/Cargo.toml",
+            "justfile",
+            ".gitattributes",
+        ] {
+            assert!(AegisPolicyKernel::is_commit_poisoning_path(p), "{p}");
+        }
+        for p in ["src/main.rs", "README.md", "docs/husky.md", "Cargo.lock"] {
+            assert!(!AegisPolicyKernel::is_commit_poisoning_path(p), "{p}");
+        }
+    }
 
     #[tokio::test]
     async fn test_zero_prompt_for_sandbox_and_intra_org_ipc() {
