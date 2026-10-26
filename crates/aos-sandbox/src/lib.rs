@@ -230,6 +230,14 @@ impl NativeOsSandboxInstance {
             .to_string()
     }
 
+    /// A path quoted for an SBPL string literal; a `"` or `\` in a workspace path must not be able
+    /// to close the literal and inject rules.
+    fn sbpl_path(p: &Path) -> String {
+        Self::canonical_or_orig(p)
+            .replace('\\', "\\\\")
+            .replace('"', "\\\"")
+    }
+
     /// Generates an Apple Seatbelt (`.sb`) profile that locks `file-write*` strictly to:
     /// - The Agent's CoW Shadow Workspace (`workspace_dir`)
     /// - The Agent's private persistent Home (`agent_home_dir`)
@@ -238,9 +246,9 @@ impl NativeOsSandboxInstance {
     /// `~/.kube`, `~/.config/gh`, `~/.npmrc`, `~/.pypirc`, `~/Library/Keychains`).
     /// When `egress_proxy_addr` is set, also enforces `(deny network-outbound)` except to localhost proxy.
     pub fn generate_macos_seatbelt_profile(&self) -> String {
-        let ws = Self::canonical_or_orig(&self.config.workspace_dir);
-        let home = Self::canonical_or_orig(&self.config.agent_home_dir);
-        let pub_dir = Self::canonical_or_orig(&self.config.org_agent_pub_dir);
+        let ws = Self::sbpl_path(&self.config.workspace_dir);
+        let home = Self::sbpl_path(&self.config.agent_home_dir);
+        let pub_dir = Self::sbpl_path(&self.config.org_agent_pub_dir);
 
         let net_rules = if !aos_core::ablated("net_isolation") {
             if let Some(ref proxy_str) = self.config.egress_proxy_addr {
@@ -288,30 +296,51 @@ impl NativeOsSandboxInstance {
             ""
         };
 
+        // Runtime state lives under `<runtime>/` next to `orgs/`: policy/IPC/PaaS state (incl. unclaimed
+        // keys), audit logs, other agents' shadows and other tenants' PaaS workspaces. Only this
+        // agent's own tree and its org's shared/pub/PaaS directories stay readable. File *data* is
+        // denied (contents, directory listings) while metadata stays readable, so path resolution
+        // through these directories (realpath/stat) keeps working.
         let tenant_rules = if !aos_core::ablated("tenant_gate") {
-            if let Some(own_org_dir) = self.config.org_shared_ro_dir.parent() {
-                if let Some(orgs_root) = own_org_dir.parent() {
-                    if orgs_root.file_name().and_then(|n| n.to_str()) == Some("orgs") {
-                        let orgs_str = Self::canonical_or_orig(orgs_root);
-                        let own_str = Self::canonical_or_orig(own_org_dir);
-                        format!(
-                            r#"
-(deny file-read* (subpath "{orgs_str}"))
-(allow file-read* (literal "{orgs_str}"))
-(allow file-read* (subpath "{own_str}"))"#
-                        )
-                    } else {
-                        String::new()
-                    }
-                } else {
-                    String::new()
+            let org_dir = self.config.org_shared_ro_dir.parent();
+            let orgs_root = org_dir.and_then(Path::parent);
+            match (org_dir, orgs_root, orgs_root.and_then(Path::parent)) {
+                (Some(org_dir), Some(orgs_root), Some(runtime_root))
+                    if orgs_root.file_name().and_then(|n| n.to_str()) == Some("orgs") =>
+                {
+                    let runtime = Self::sbpl_path(runtime_root);
+                    let agent_root = Self::sbpl_path(
+                        self.config.agent_home_dir.parent().unwrap_or(&self.config.agent_home_dir),
+                    );
+                    let shared_ro = Self::sbpl_path(&self.config.org_shared_ro_dir);
+                    let org_pub = Self::sbpl_path(&org_dir.join("pub"));
+                    let org_paas = Self::sbpl_path(
+                        &runtime_root
+                            .join("paas_workspaces")
+                            .join(&self.config.identity.org_id),
+                    );
+                    format!(
+                        r#"
+(deny file-read-data (subpath "{runtime}"))
+(allow file-read-data
+    (subpath "{agent_root}")
+    (subpath "{shared_ro}")
+    (subpath "{org_pub}")
+    (subpath "{org_paas}")
+)"#
+                    )
                 }
-            } else {
-                String::new()
+                _ => String::new(),
             }
         } else {
             String::new()
         };
+
+        // LaunchServices would start programs (`open -a Terminal x.command`) as children of
+        // launchd, i.e. outside this sandbox. It spans several `coreservices`/`lsd` services, so
+        // match the whole family; compilers, interpreters, git and TLS do not use them.
+        let launch_rules = r##"
+(deny mach-lookup (global-name-regex #"^com\.apple\.(coreservices\.|lsd\.)"))"##;
 
         format!(
             r#"(version 1)
@@ -327,7 +356,7 @@ impl NativeOsSandboxInstance {
     (literal "/dev/random")
     (literal "/dev/urandom")
     (literal "/dev/tty")
-){tenant_rules}{cred_rules}{net_rules}
+){launch_rules}{tenant_rules}{cred_rules}{net_rules}
 "#
         )
     }
@@ -1148,6 +1177,90 @@ mod tests {
             eprintln!("skipping: bubblewrap is not installed");
         }
         nested || no_bwrap
+    }
+
+    #[test]
+    fn seatbelt_profile_escapes_injected_quotes() {
+        let tmp = tempfile::tempdir().unwrap();
+        let evil = tmp.path().join("ws\")) (allow file-write* (subpath \"/");
+        let cfg = SandboxConfig {
+            identity: AgentIdentity::new("acme", "coder-1", "Engineer"),
+            tier: IsolationTier::NativeOsSandbox,
+            limits: ResourceLimits::default(),
+            workspace_dir: evil,
+            agent_home_dir: tmp.path().join("home"),
+            org_shared_ro_dir: tmp.path().join("ro"),
+            org_agent_pub_dir: tmp.path().join("pub"),
+            egress_proxy_addr: None,
+        };
+        let profile = NativeOsSandboxInstance::new(cfg).generate_macos_seatbelt_profile();
+        assert!(profile.contains(r#"ws\")) (allow file-write* (subpath \"/"#), "{profile}");
+        assert!(!profile.contains(r#"(subpath "/")"#), "{profile}");
+    }
+
+    #[cfg(target_os = "macos")]
+    #[tokio::test]
+    async fn seatbelt_hides_runtime_state_and_other_agents() {
+        if nested_in_aegis_sandbox() || !Path::new("/usr/bin/sandbox-exec").exists() {
+            return;
+        }
+        let tmp = tempfile::tempdir().unwrap();
+        let rt = tmp.path().join("runtime");
+        let org = rt.join("orgs/acme");
+        let me = org.join("agents/coder-1");
+        let files = [
+            (me.join("cow_workspace/ws/own.txt"), true),
+            (me.join("home/note.txt"), true),
+            (org.join("shared_ro/doc.txt"), true),
+            (org.join("pub/peer/out.txt"), true),
+            (rt.join("paas_workspaces/acme/src.txt"), true),
+            (rt.join("paas_state.json"), false),
+            (rt.join("policy_state.json"), false),
+            (rt.join("audit/flight_recorder.jsonl"), false),
+            (org.join("agents/peer/cow_workspace/ws/secret.txt"), false),
+            (rt.join("orgs/rival/agents/x/home/secret.txt"), false),
+            (rt.join("paas_workspaces/rival/src.txt"), false),
+        ];
+        for (f, _) in &files {
+            std::fs::create_dir_all(f.parent().unwrap()).unwrap();
+            std::fs::write(f, "data").unwrap();
+        }
+        let sbx = NativeOsSandboxDriver
+            .create_sandbox(SandboxConfig {
+                identity: AgentIdentity::new("acme", "coder-1", "Engineer"),
+                tier: IsolationTier::NativeOsSandbox,
+                limits: ResourceLimits::default(),
+                workspace_dir: me.join("cow_workspace/ws"),
+                agent_home_dir: me.join("home"),
+                org_shared_ro_dir: org.join("shared_ro"),
+                org_agent_pub_dir: org.join("pub/coder-1"),
+                egress_proxy_addr: None,
+            })
+            .await
+            .unwrap();
+        let run = |cmd: String| ExecSpec {
+            command: "sh".to_string(),
+            args: vec!["-c".to_string(), cmd],
+            cwd: None,
+            env: HashMap::new(),
+            timeout_ms: Some(5000),
+            background: false,
+        };
+        for (f, readable) in &files {
+            let out = sbx.exec(run(format!("cat '{}'", f.display()))).await.unwrap();
+            assert_eq!(out.exit_code == Some(0), *readable, "{}: {:?}", f.display(), out);
+        }
+        // Listing the runtime root is denied, but resolving paths through it still works.
+        let ls = sbx.exec(run(format!("ls '{}'", rt.display()))).await.unwrap();
+        assert_ne!(ls.exit_code, Some(0));
+        let pwd = sbx.exec(run("pwd -P && ls".to_string())).await.unwrap();
+        assert_eq!(pwd.exit_code, Some(0), "{pwd:?}");
+        // LaunchServices is unreachable, so `open` cannot start programs outside the sandbox.
+        let open = sbx
+            .exec(run("open -g -a /System/Applications/Calculator.app".to_string()))
+            .await
+            .unwrap();
+        assert_ne!(open.exit_code, Some(0), "{open:?}");
     }
 
     #[tokio::test]
