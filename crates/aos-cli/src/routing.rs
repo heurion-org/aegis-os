@@ -419,10 +419,15 @@ pub fn classify_native_write(path: &Path, repo_root: &Path) -> Route {
     }
 
     // Writes into the agent's CoW shadow workspace or client brain/artifact scratch directory are allowed.
+    // `/tmp` counts as scratch only outside the repo: a repo that itself lives under `/tmp` (common
+    // on Linux) must still have its writes redirected.
+    let in_repo = target.starts_with(&root);
     if t.contains("/cow_workspace/")
         || t.contains("/upper_workspace/")
         || t.contains("/.gemini/antigravity-cli/brain/")
-        || ((t.starts_with("/tmp/") || t.starts_with("/private/tmp/")) && !t.contains("/orgs/"))
+        || (!in_repo
+            && (t.starts_with("/tmp/") || t.starts_with("/private/tmp/"))
+            && !t.contains("/orgs/"))
     {
         return Route::Pass;
     }
@@ -580,7 +585,7 @@ mod tests {
         let root = repo.path();
         assert_eq!(classify_native_write(Path::new("/tmp/scratch.txt"), root).kind(), "pass");
         assert_eq!(
-            classify_native_write(&root.join("../outside.txt"), root).kind(),
+            classify_native_write(Path::new("/srv/elsewhere/outside.txt"), root).kind(),
             "host_boundary_ask"
         );
         assert_eq!(
