@@ -102,6 +102,64 @@ pub const HUMAN_ONLY_TOOLS: &[&str] = &["policy_approve_escalation", "policy_gra
 /// "never expires"). The CLI's `aegis-os policy approve` calls the policy kernel directly.
 const MAX_TOOL_LEASE_TTL_SECS: i64 = 24 * 3600;
 
+/// Whether the HTTP daemon authenticates callers.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DaemonAuth {
+    /// Default. Non-public routes need the operator token or a tenant API key; keys are confined
+    /// to their own org; approvals and cross-org views are operator-only.
+    Required,
+    /// No authentication; identity comes from `X-Aegis-*` headers. Local debugging only
+    /// (`aegis-os daemon --insecure-no-auth`).
+    Disabled,
+}
+
+fn route_path(target: &str) -> &str {
+    target.split('?').next().unwrap_or(target)
+}
+
+/// Routes anonymous callers may use: static pages, discovery, installers, and the billing flow,
+/// which authenticates with its own credentials (webhook HMAC, claim token, first-key signup).
+fn is_public_route(method: &str, target: &str) -> bool {
+    let path = route_path(target);
+    let get_public = path == "/"
+        || ["/dashboard", "/ui", "/install.sh", "/health", "/.well-known/", "/releases/", "/v1/billing/status"]
+            .iter()
+            .any(|p| path.starts_with(p));
+    let any_public = ["/v1/billing/checkout", "/v1/billing/webhook", "/v1/billing/claim"]
+        .iter()
+        .any(|p| path.starts_with(p));
+    // Key signup: the route itself only lets anonymous callers mint an org's *first* key.
+    let signup = method == "POST" && path.starts_with("/v1/tenants/keys");
+    (method == "GET" && get_public) || any_public || signup
+}
+
+/// Routes no tenant key may use: approving escalations (agents hold tenant keys), simulating
+/// approvals, fleet-wide GC, and cross-org status views.
+fn is_operator_only_route(method: &str, target: &str) -> bool {
+    let path = route_path(target);
+    let _ = method;
+    path.starts_with("/v1/approvals/")
+        || path.starts_with("/v1/workspaces/gc-idle")
+        || ((path.starts_with("/api/status") || path.starts_with("/v1/status"))
+            && requested_org(target, "").as_deref() == Some("*"))
+}
+
+/// The org a request asks to act on, from the `org_id` query parameter or JSON body field.
+fn requested_org(target: &str, body: &str) -> Option<String> {
+    let from_query = target.split_once('?').and_then(|(_, qs)| {
+        qs.split('&').find_map(|pair| match pair.split_once('=') {
+            Some(("org_id", v)) if !v.is_empty() => Some(v.replace("%2A", "*").replace("%2a", "*")),
+            _ => None,
+        })
+    });
+    from_query.or_else(|| {
+        serde_json::from_str::<Value>(body.trim())
+            .ok()
+            .and_then(|v| v.get("org_id").and_then(|o| o.as_str()).map(|o| o.to_string()))
+            .filter(|o| !o.is_empty())
+    })
+}
+
 /// HTTP daemon limits: the declared body size is trusted only up to this bound, and the whole
 /// request (head + body) must arrive within the timeout.
 const MAX_HTTP_BODY_BYTES: usize = 64 * 1024 * 1024;
@@ -2598,11 +2656,33 @@ impl AegisRuntimeKernel {
     }
 
     /// Start the multi-tenant Aegis OS HTTP Daemon (`POST /mcp` Streamable HTTP & `GET /api/status`).
+    /// Starts the HTTP daemon with authentication required (see [`DaemonAuth::Required`]).
     pub async fn start_http_daemon(
         self: Arc<Self>,
         bind_addr: &str,
         default_workspace: PathBuf,
     ) -> anyhow::Result<std::net::SocketAddr> {
+        self.start_http_daemon_with_auth(bind_addr, default_workspace, DaemonAuth::Required)
+            .await
+    }
+
+    /// The operator credential (`Authorization: Bearer <token>` or `X-Aegis-Admin-Secret`):
+    /// `AOS_ADMIN_SECRET`, or a random token generated when the daemon starts without one.
+    pub fn operator_token(&self) -> String {
+        self.paas.admin_secret()
+    }
+
+    pub async fn start_http_daemon_with_auth(
+        self: Arc<Self>,
+        bind_addr: &str,
+        default_workspace: PathBuf,
+        auth_mode: DaemonAuth,
+    ) -> anyhow::Result<std::net::SocketAddr> {
+        if auth_mode == DaemonAuth::Required && self.paas.admin_secret().is_empty() {
+            // Held only in memory and printed by the CLI; never written where a sandbox could read it.
+            let generated = format!("aop_{}{}", Uuid::new_v4().simple(), Uuid::new_v4().simple());
+            self.paas.set_secrets(&generated, &self.paas.webhook_secret());
+        }
         let listener = tokio::net::TcpListener::bind(bind_addr).await?;
         let local_addr = listener.local_addr()?;
         let kernel = self.clone();
@@ -2716,14 +2796,37 @@ impl AegisRuntimeKernel {
                     let mut bound_ws_id = headers.get("x-aegis-workspace").cloned();
                     let mut bound_ws_path = ws_path.clone();
 
-                    // Optional Bearer API Key / X-Aegis-Api-Key Authentication (`ak_live_*`)
+                    // Callers are the operator (admin secret / generated token), a tenant API key
+                    // (`ak_live_*`), or anonymous. With `DaemonAuth::Required`, anonymous callers
+                    // only reach public routes and keys are confined to their own org.
                     let raw_auth = headers
                         .get("authorization")
                         .or_else(|| headers.get("x-aegis-api-key"))
                         .cloned();
+                    let bearer = raw_auth.as_deref().map(|t| {
+                        let t = t.trim();
+                        t.strip_prefix("Bearer ")
+                            .or_else(|| t.strip_prefix("bearer "))
+                            .unwrap_or(t)
+                            .trim()
+                            .to_string()
+                    });
+                    let operator_secret = k.paas.admin_secret();
+                    let is_operator = [bearer.as_deref(), headers.get("x-aegis-admin-secret").map(|s| s.trim())]
+                        .into_iter()
+                        .flatten()
+                        .any(|cred| paas::PaasControlPlane::secrets_match(cred, &operator_secret));
+                    let mut key_org: Option<String> = None;
                     let mut auth_failed = false;
-                    if let Some(ref token_hdr) = raw_auth {
+                    if is_operator {
+                        if let Some(ref ws_id) = bound_ws_id {
+                            if let Some(ws_rec) = k.paas.get_workspace(&org_id, ws_id).await {
+                                bound_ws_path = ws_rec.host_repo_path;
+                            }
+                        }
+                    } else if let Some(ref token_hdr) = raw_auth {
                         if let Some(key_rec) = k.paas.authenticate_token(token_hdr).await {
+                            key_org = Some(key_rec.org_id.clone());
                             org_id = key_rec.org_id;
                             if !headers.contains_key("x-aegis-agent") {
                                 agent_id = key_rec.agent_id;
@@ -2740,18 +2843,27 @@ impl AegisRuntimeKernel {
                         } else {
                             auth_failed = true;
                         }
+                    } else if auth_mode == DaemonAuth::Required {
+                        // Anonymous: identity headers carry no authority.
+                        if !is_public_route(method, full_target) {
+                            auth_failed = true;
+                        }
                     } else if let Some(ref ws_id) = bound_ws_id {
                         if let Some(ws_rec) = k.paas.get_workspace(&org_id, ws_id).await {
                             bound_ws_path = ws_rec.host_repo_path;
                         }
-                    } else if std::env::var("AOS_REQUIRE_API_KEY").as_deref() == Ok("1")
-                        && (full_target.starts_with("/mcp")
-                            || full_target.starts_with("/v1/mcp")
-                            || full_target.starts_with("/a2a")
-                            || full_target.starts_with("/v1/a2a"))
-                    {
-                        auth_failed = true;
                     }
+                    let forbidden: Option<String> = if auth_mode == DaemonAuth::Disabled || auth_failed {
+                        None
+                    } else if is_operator_only_route(method, full_target) && !is_operator {
+                        Some("This endpoint is reserved for the operator (Authorization: Bearer <operator token> or X-Aegis-Admin-Secret); tenant/agent API keys cannot use it.".to_string())
+                    } else {
+                        key_org.as_deref().and_then(|own| {
+                            requested_org(full_target, &body_str)
+                                .filter(|req| req != own)
+                                .map(|req| format!("API key for org '{}' cannot access org '{}'", own, req))
+                        })
+                    };
 
                     if method == "GET" && full_target.starts_with("/releases/") {
                         let name = full_target
@@ -2782,6 +2894,8 @@ impl AegisRuntimeKernel {
                             })
                             .to_string(),
                         )
+                    } else if let Some(reason) = forbidden {
+                        ("HTTP/1.1 403 Forbidden", json!({ "error": reason }).to_string())
                     } else if method == "GET"
                         && (full_target == "/"
                             || full_target.starts_with("/dashboard")
@@ -2900,6 +3014,7 @@ impl AegisRuntimeKernel {
                                 && tier != paas::PlanTier::Community);
 
                         if require_admin
+                            && !is_operator
                             && !paas::PaasControlPlane::secrets_match(provided_admin, expected_admin.trim())
                         {
                             let checkout = k.paas.build_checkout_info(t_org, tier, None, None);
@@ -3073,11 +3188,29 @@ impl AegisRuntimeKernel {
                         let has_same_org_auth = raw_auth.is_some() && !auth_failed && org_id == k_org;
                         let enforce_paid_guard = std::env::var("AOS_REQUIRE_API_KEY").as_deref() == Ok("1")
                             || !expected_admin.trim().is_empty();
+                        // Anonymous callers may only bootstrap an org that has no keys yet; otherwise
+                        // anyone could mint keys into someone else's tenant.
+                        let org_has_keys = !k.paas.list_api_keys(Some(k_org)).await.is_empty();
+                        let anonymous_takeover = auth_mode == DaemonAuth::Required
+                            && !is_operator
+                            && !has_same_org_auth
+                            && org_has_keys;
 
-                        if enforce_paid_guard
+                        if anonymous_takeover {
+                            (
+                                "HTTP/1.1 403 Forbidden",
+                                json!({
+                                    "error": "This org already has API keys: minting another requires an existing key for that org or the operator token. If this is a different project that happens to share the name, use a distinct org id.",
+                                    "code": "KEY_MINT_ORG_EXISTS",
+                                    "org_id": k_org
+                                })
+                                .to_string(),
+                            )
+                        } else if enforce_paid_guard
                             && target_tier != paas::PlanTier::Community
                             && !has_same_org_auth
                             && !has_valid_admin
+                            && !is_operator
                         {
                             (
                                 "HTTP/1.1 403 Forbidden",
@@ -3106,7 +3239,8 @@ impl AegisRuntimeKernel {
                             }
                         }
                     } else if method == "GET" && full_target.starts_with("/v1/tenants/keys") {
-                        let keys = k.paas.list_api_keys(None).await;
+                        let scope = (auth_mode == DaemonAuth::Required && !is_operator).then_some(org_id.as_str());
+                        let keys = k.paas.list_api_keys(scope).await;
                         ("HTTP/1.1 200 OK", json!({ "api_keys": keys }).to_string())
                     } else if method == "POST" && full_target == "/v1/workspaces" {
                         let payload: Value = serde_json::from_str(body_str.trim()).unwrap_or_else(|_| json!({}));
@@ -3880,6 +4014,19 @@ mod tests {
             .start_http_daemon("127.0.0.1:0", host_project)
             .await
             .unwrap();
+        let op = kernel.operator_token();
+        assert!(op.starts_with("aop_"), "an operator token is generated when none is configured");
+
+        // Identity headers alone carry no authority: anonymous /mcp is rejected.
+        let mut anon = tokio::net::TcpStream::connect(addr).await.unwrap();
+        anon.write_all(
+            format!("POST /mcp HTTP/1.1\r\nHost: {addr}\r\nX-Aegis-Org: acme\r\nX-Aegis-Agent: agy-agent\r\nContent-Length: 2\r\n\r\n{{}}").as_bytes(),
+        )
+        .await
+        .unwrap();
+        let mut anon_resp = Vec::new();
+        tokio::io::AsyncReadExt::read_to_end(&mut anon, &mut anon_resp).await.unwrap();
+        assert!(String::from_utf8_lossy(&anon_resp).starts_with("HTTP/1.1 401"));
 
         // Connect over TCP and send a POST /mcp JSON-RPC initialize request
         let mut stream = tokio::net::TcpStream::connect(addr).await.unwrap();
@@ -3890,8 +4037,9 @@ mod tests {
         })
         .to_string();
         let http_req = format!(
-            "POST /mcp HTTP/1.1\r\nHost: {}\r\nX-Aegis-Org: acme\r\nX-Aegis-Agent: agy-agent\r\nContent-Length: {}\r\n\r\n{}",
+            "POST /mcp HTTP/1.1\r\nHost: {}\r\nAuthorization: Bearer {}\r\nX-Aegis-Org: acme\r\nX-Aegis-Agent: agy-agent\r\nContent-Length: {}\r\n\r\n{}",
             addr,
+            op,
             rpc_body.len(),
             rpc_body
         );
@@ -3935,8 +4083,9 @@ mod tests {
         })
         .to_string();
         let send_req = format!(
-            "POST /a2a HTTP/1.1\r\nHost: {}\r\nX-Aegis-Org: acme\r\nX-Aegis-Agent: agy-agent\r\nContent-Length: {}\r\n\r\n{}",
+            "POST /a2a HTTP/1.1\r\nHost: {}\r\nAuthorization: Bearer {}\r\nX-Aegis-Org: acme\r\nX-Aegis-Agent: agy-agent\r\nContent-Length: {}\r\n\r\n{}",
             addr,
+            op,
             send_body.len(),
             send_body
         );
@@ -3967,6 +4116,7 @@ mod tests {
             .start_http_daemon("127.0.0.1:0", source_repo.clone())
             .await
             .unwrap();
+        let op = kernel.operator_token();
 
         async fn http_call(
             addr: std::net::SocketAddr,
@@ -4014,7 +4164,7 @@ mod tests {
             addr,
             "POST",
             "/v1/tenants/plan",
-            None,
+            Some(&op),
             Some(json!({ "org_id": "acme-cloud", "plan_tier": "community" })),
         )
         .await;
@@ -4027,7 +4177,7 @@ mod tests {
             addr,
             "POST",
             "/v1/workspaces",
-            None,
+            Some(&op),
             Some(json!({
                 "org_id": "acme-cloud",
                 "workspace_id": "ws-over-quota",
@@ -4044,7 +4194,7 @@ mod tests {
             addr,
             "POST",
             "/v1/tenants/plan",
-            None,
+            Some(&op),
             Some(json!({ "org_id": "acme-cloud", "plan_tier": "pro" })),
         )
         .await;
@@ -4055,7 +4205,7 @@ mod tests {
             addr,
             "POST",
             "/v1/approvals/simulate",
-            None,
+            Some(&op),
             Some(json!({ "org_id": "acme-cloud", "agent_id": "demo-agent" })),
         )
         .await;
@@ -4066,7 +4216,7 @@ mod tests {
             addr,
             "POST",
             "/v1/approvals/decide",
-            None,
+            Some(&op),
             Some(json!({ "escalation_id": sim_esc_id, "decision": "deny" })),
         )
         .await;
@@ -4077,7 +4227,7 @@ mod tests {
             addr,
             "POST",
             "/v1/workspaces",
-            None,
+            Some(&op),
             Some(json!({
                 "org_id": "acme-cloud",
                 "workspace_id": "ws-billing",
@@ -4095,7 +4245,7 @@ mod tests {
             addr,
             "POST",
             "/v1/tenants/keys",
-            None,
+            Some(&op),
             Some(json!({
                 "org_id": "acme-cloud",
                 "agent_id": "coder-alpha",
@@ -4197,11 +4347,44 @@ mod tests {
         assert_eq!(ask_json["status"], "approval_required");
         let esc_id = ask_json["escalation_id"].as_str().unwrap();
 
+        // The tenant key is what agents hold: it must not approve escalations, see other orgs, or
+        // act on another org's resources.
+        let (self_approve_head, _) = http_call(
+            addr,
+            "POST",
+            "/v1/approvals/decide",
+            Some(&api_key),
+            Some(json!({ "escalation_id": esc_id, "decision": "approve" })),
+        )
+        .await;
+        assert!(self_approve_head.contains("403 Forbidden"), "{self_approve_head}");
+        let (all_orgs_head, _) =
+            http_call(addr, "GET", "/api/status?org_id=*", Some(&api_key), None).await;
+        assert!(all_orgs_head.contains("403 Forbidden"), "{all_orgs_head}");
+        let (cross_head, _) = http_call(
+            addr,
+            "POST",
+            "/v1/workspaces/hibernate",
+            Some(&api_key),
+            Some(json!({ "org_id": "victim-org", "workspace_id": "ws-x" })),
+        )
+        .await;
+        assert!(cross_head.contains("403 Forbidden"), "{cross_head}");
+        let (anon_mint_head, _) = http_call(
+            addr,
+            "POST",
+            "/v1/tenants/keys",
+            None,
+            Some(json!({ "org_id": "acme-cloud", "agent_id": "intruder" })),
+        )
+        .await;
+        assert!(anon_mint_head.contains("403 Forbidden"), "{anon_mint_head}");
+
         let (app_head, app_resp) = http_call(
             addr,
             "POST",
             "/v1/approvals/decide",
-            None,
+            Some(&op),
             Some(json!({
                 "escalation_id": esc_id,
                 "decision": "approve",
@@ -4611,8 +4794,9 @@ mod tests {
             Some(json!({ "org_id": "free-org", "plan_tier": "pro" })),
         )
         .await;
-        assert!(unauth_plan_head.contains("403 Forbidden"));
-        assert_eq!(unauth_plan_resp["code"], "PAYWALL_ADMIN_SECRET_REQUIRED");
+        assert!(unauth_plan_head.contains("401 Unauthorized"), "{unauth_plan_head}");
+        assert!(unauth_plan_resp["error"].is_string());
+        let op_bearer = format!("Bearer {}", kernel.operator_token());
 
         // 8. Verify `/v1/mcp` Dynamic Concurrent Agent Paywall on Free (`community`) plan (max 1 active Agent)
         let (agent1_head, agent1_resp) = http_req_with_headers(
@@ -4620,6 +4804,7 @@ mod tests {
             "POST",
             "/v1/mcp",
             &[
+                ("Authorization", op_bearer.as_str()),
                 ("X-Aegis-Org", "free-org"),
                 ("X-Aegis-Agent", "claude-agent-1"),
             ],
@@ -4643,6 +4828,7 @@ mod tests {
             "POST",
             "/v1/mcp",
             &[
+                ("Authorization", op_bearer.as_str()),
                 ("X-Aegis-Org", "free-org"),
                 ("X-Aegis-Agent", "cursor-agent-2"),
             ],
@@ -4674,6 +4860,7 @@ mod tests {
             "POST",
             "/v1/mcp",
             &[
+                ("Authorization", op_bearer.as_str()),
                 ("X-Aegis-Org", "free-org"),
                 ("X-Aegis-Agent", "cursor-agent-2"),
                 ("X-Aegis-Paywall-Mode", "http-402"),

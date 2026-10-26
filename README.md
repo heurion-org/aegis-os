@@ -148,6 +148,15 @@ brew install aegis-os
    - **Without Subscription (Local Mode)**: The agent calls `runtime_configure_mode(mode="local")` and runs immediately in **Free Local Community Mode** using your local CoW shadow workspace and native OS sandbox.
 3. **Switch Anytime in Natural Language**: Simply tell your agent *"Switch to Cloud mode"* or *"Switch back to Local mode"* at any point in a conversation.
 
+### Daemon authentication
+
+`aegis-os daemon` requires authentication by default. Static pages, discovery (`/.well-known/*`), `/health` and the billing flow are public. Every other endpoint needs one of:
+
+- **Operator token**: `AOS_ADMIN_SECRET`, or a random token printed at startup when it is unset. Send it as `Authorization: Bearer <token>`. Only the operator can approve escalations (`/v1/approvals/*`), see all orgs (`/api/status?org_id=*`) or upgrade plans.
+- **Tenant API key** (`ak_live_*`): confined to its own org. Any `org_id` naming another org is rejected with 403.
+
+Anonymous callers can mint only the *first* key of an org that has none. `--insecure-no-auth` turns all of this off, for local debugging only.
+
 ### 2. CLI-First Cloud Control (`aegis-os cloud`)
 
 For developers who prefer explicit terminal control, 100% of Cloud PaaS operations (including Polar.sh subscription checkout & instant `ak_live_*` key activation) are available as first-class CLI subcommands:

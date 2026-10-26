@@ -128,6 +128,10 @@ enum Commands {
         listen: String,
         #[arg(long, default_value = "127.0.0.1:18080")]
         egress_listen: String,
+        /// Disable authentication: identity comes from `X-Aegis-*` headers and every endpoint
+        /// (including approvals) is open to anything that can reach the port. Local debugging only.
+        #[arg(long, default_value_t = false)]
+        insecure_no_auth: bool,
     },
 
     /// Display the Mission Control dashboard for all Agents, CoW Workspaces, IPC & Escalations
@@ -724,6 +728,7 @@ async fn main() -> anyhow::Result<()> {
         Commands::Daemon {
             listen,
             egress_listen,
+            insecure_no_auth,
         } => {
             let kernel = std::sync::Arc::new(AegisRuntimeKernel::new(&cli.runtime_dir).await?);
             let egress_addr = kernel
@@ -731,9 +736,15 @@ async fn main() -> anyhow::Result<()> {
                 .clone()
                 .start_local_proxy(&egress_listen)
                 .await?;
+            let admin_from_env = !kernel.operator_token().is_empty();
+            let auth_mode = if insecure_no_auth {
+                aos_mcp_gateway::DaemonAuth::Disabled
+            } else {
+                aos_mcp_gateway::DaemonAuth::Required
+            };
             let daemon_addr = kernel
                 .clone()
-                .start_http_daemon(&listen, workspace.clone())
+                .start_http_daemon_with_auth(&listen, workspace.clone(), auth_mode)
                 .await?;
             println!("=========================================================================");
             println!("  Aegis Cloud PaaS & Runtime Daemon (v0.3.0) Started");
@@ -745,6 +756,15 @@ async fn main() -> anyhow::Result<()> {
             println!("  Secret Vault API:    http://{}/v1/vault/secrets", daemon_addr);
             println!("  HITL Approvals API:  http://{}/v1/approvals/decide", daemon_addr);
             println!("  Zero-Trust Egress:   http://{}", egress_addr);
+            if insecure_no_auth {
+                println!("  Auth:                DISABLED (--insecure-no-auth): anything that can reach this port,");
+                println!("                       including sandboxed agents, can approve escalations and act as any org.");
+            } else if admin_from_env {
+                println!("  Operator auth:       AOS_ADMIN_SECRET (send as `Authorization: Bearer <secret>`)");
+            } else {
+                println!("  Operator token:      {}", kernel.operator_token());
+                println!("                       (send as `Authorization: Bearer <token>`; regenerated on every start)");
+            }
             println!("=========================================================================");
             tokio::signal::ctrl_c().await?;
         }

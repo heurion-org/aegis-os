@@ -581,27 +581,7 @@ pub async fn handle_cloud_command(
                 .cloned()
                 .unwrap_or_else(|| "agy-agent".to_string());
 
-            // 1. Provision Cloud CoW Workspace on the remote node
-            let prov_resp = cloud_http_json(
-                "POST",
-                &clean_ep,
-                "/v1/workspaces",
-                api_key.as_deref(),
-                &[],
-                Some(&json!({
-                    "org_id": identity.org_id,
-                    "workspace_id": ws_id,
-                    "source_url": "cloud-sync",
-                    "branch": "main",
-                    "agents": agent_list,
-                })),
-            )
-            .await?;
-            if let Some(err_msg) = prov_resp.get("error").and_then(|v| v.as_str()) {
-                bail!("Cloud workspace provisioning rejected: {}", err_msg);
-            }
-
-            // 2. Obtain or mint a scoped `ak_live_*` key bound to this workspace
+            // 1. Obtain or mint a scoped `ak_live_*` key first: the daemon rejects anonymous provisioning
             let resolved_key = match api_key.or_else(|| store.auth.as_ref().map(|a| a.api_key.clone())) {
                 Some(k) if !k.trim().is_empty() => k,
                 _ => {
@@ -627,6 +607,26 @@ pub async fn handle_cloud_command(
                         .to_string()
                 }
             };
+
+            // 2. Provision Cloud CoW Workspace on the remote node
+            let prov_resp = cloud_http_json(
+                "POST",
+                &clean_ep,
+                "/v1/workspaces",
+                Some(resolved_key.as_str()),
+                &[],
+                Some(&json!({
+                    "org_id": identity.org_id,
+                    "workspace_id": ws_id,
+                    "source_url": "cloud-sync",
+                    "branch": "main",
+                    "agents": agent_list,
+                })),
+            )
+            .await?;
+            if let Some(err_msg) = prov_resp.get("error").and_then(|v| v.as_str()) {
+                bail!("Cloud workspace provisioning rejected: {}", err_msg);
+            }
 
             // 3. Push local source-only files to initialize the Cloud Workspace baseline
             let files = collect_local_source_bundle(&canon).await?;
@@ -1820,12 +1820,18 @@ mod tests {
             .set_tenant_plan("my_local_project", aos_mcp_gateway::paas::PlanTier::Pro)
             .await
             .unwrap();
+        // A paid tenant's key comes from the billing claim; anonymous minting is refused for it.
+        let (paid_key, _) = cloud_kernel
+            .paas
+            .issue_api_key("my_local_project", "agy-agent", "Lead Agent", None, "claimed")
+            .await
+            .unwrap();
 
         // 1. Run `aegis-os cloud up` -> binds local repo to Cloud Sandbox and uploads source files
         handle_cloud_command(
             CloudAction::Up {
                 endpoint: Some(endpoint.clone()),
-                api_key: None,
+                api_key: Some(paid_key.clone()),
                 workspace_id: Some("ws-pro-1".to_string()),
                 agents: "agy-agent,claude-code".to_string(),
             },
@@ -1929,6 +1935,18 @@ mod tests {
         let endpoint = format!("http://{}", cloud_addr);
 
         let identity = AgentIdentity::new("fresh_project", "agy-agent", "Lead Agent");
+        // Paid plans are granted server-side (billing webhook / operator); the agent's own
+        // `plan_tier` request cannot self-upgrade.
+        cloud_kernel
+            .paas
+            .set_tenant_plan("fresh_project", aos_mcp_gateway::paas::PlanTier::Pro)
+            .await
+            .unwrap();
+        let (paid_key, _) = cloud_kernel
+            .paas
+            .issue_api_key("fresh_project", "agy-agent", "Lead Agent", None, "claimed")
+            .await
+            .unwrap();
 
         // 1. Fresh project after `brew install aegis-os`: mode is unconfigured, so PreInvocation
         //    prompts `agy` to ask the user whether they have a subscription.
@@ -1946,7 +1964,8 @@ mod tests {
             &json!({
                 "mode": "cloud",
                 "endpoint": endpoint,
-                "plan_tier": "pro"
+                "plan_tier": "pro",
+                "api_key": paid_key
             }),
         )
         .await

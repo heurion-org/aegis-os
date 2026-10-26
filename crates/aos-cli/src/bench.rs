@@ -1553,6 +1553,7 @@ async fn run_exp3_live_cow_and_daemon_latencies() -> anyhow::Result<(Vec<Exp3Cow
         .clone()
         .start_http_daemon("127.0.0.1:0", daemon_ws)
         .await?;
+    let operator = kernel.operator_token();
 
     let mut http_us = Vec::with_capacity(200);
     let t_http = Instant::now();
@@ -1571,8 +1572,9 @@ async fn run_exp3_live_cow_and_daemon_latencies() -> anyhow::Result<(Vec<Exp3Cow
         let s = Instant::now();
         let mut stream = tokio::net::TcpStream::connect(daemon_addr).await?;
         let req = format!(
-            "POST /mcp HTTP/1.1\r\nHost: {}\r\nX-Aegis-Org: acme\r\nX-Aegis-Agent: agy-agent\r\nContent-Length: {}\r\n\r\n{}",
+            "POST /mcp HTTP/1.1\r\nHost: {}\r\nAuthorization: Bearer {}\r\nX-Aegis-Org: acme\r\nX-Aegis-Agent: agy-agent\r\nContent-Length: {}\r\n\r\n{}",
             daemon_addr,
+            operator,
             rpc_payload.len(),
             rpc_payload
         );
