@@ -14,7 +14,9 @@ use async_trait::async_trait;
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
+use tokio::io::{AsyncRead, AsyncReadExt};
 use tokio::process::Command;
 use uuid::Uuid;
 
@@ -34,6 +36,112 @@ impl Drop for EgressBridge {
         let _ = std::fs::remove_file(&self.sock);
     }
 }
+
+/// How long stdout/stderr may keep draining after a foreground command exits before its process
+/// group is killed. Grandchildren (vitest/jest workers, watchers) inherit the pipes, so waiting for
+/// pipe EOF alone can block the single-threaded MCP loop forever.
+const PIPE_DRAIN_GRACE: Duration = Duration::from_secs(2);
+
+struct ForegroundOutput {
+    pid: u32,
+    status: std::process::ExitStatus,
+    stdout: Vec<u8>,
+    stderr: Vec<u8>,
+}
+
+#[cfg(unix)]
+fn kill_process_group(pgid: u32) {
+    extern "C" {
+        fn kill(pid: i32, sig: i32) -> i32;
+    }
+    if pgid > 0 {
+        // SIGKILL the whole group; a negative pid targets the process group.
+        unsafe { kill(-(pgid as i32), 9) };
+    }
+}
+
+#[cfg(not(unix))]
+fn kill_process_group(_pgid: u32) {}
+
+/// Reads a pipe into a shared buffer so partial output survives the reader being aborted.
+fn spawn_pipe_reader<R>(pipe: Option<R>) -> (Arc<Mutex<Vec<u8>>>, tokio::task::JoinHandle<()>)
+where
+    R: AsyncRead + Unpin + Send + 'static,
+{
+    let buf = Arc::new(Mutex::new(Vec::new()));
+    let sink = buf.clone();
+    let handle = tokio::spawn(async move {
+        let Some(mut pipe) = pipe else { return };
+        let mut chunk = [0u8; 8192];
+        while let Ok(n) = pipe.read(&mut chunk).await {
+            if n == 0 {
+                break;
+            }
+            sink.lock().unwrap().extend_from_slice(&chunk[..n]);
+        }
+    });
+    (buf, handle)
+}
+
+/// Runs `cmd` in its own process group and waits for the process itself rather than pipe EOF.
+/// On timeout, or when descendants still hold the pipes after the grace window, the whole group
+/// is killed so no orphaned worker can wedge the caller.
+async fn run_foreground(
+    mut cmd: Command,
+    timeout: Duration,
+    timeout_hint: &str,
+) -> anyhow::Result<ForegroundOutput> {
+    #[cfg(unix)]
+    cmd.process_group(0);
+    cmd.kill_on_drop(true);
+    let mut child = cmd.spawn()?;
+    let pid = child.id().unwrap_or(0);
+    let (out_buf, mut out_task) = spawn_pipe_reader(child.stdout.take());
+    let (err_buf, mut err_task) = spawn_pipe_reader(child.stderr.take());
+
+    let status = match tokio::time::timeout(timeout, child.wait()).await {
+        Ok(res) => res?,
+        Err(_) => {
+            kill_process_group(pid);
+            out_task.abort();
+            err_task.abort();
+            bail!(
+                "Command timed out after {}ms (process group {} killed).{}",
+                timeout.as_millis(),
+                pid,
+                timeout_hint
+            );
+        }
+    };
+
+    async fn drain(out: &mut tokio::task::JoinHandle<()>, err: &mut tokio::task::JoinHandle<()>) {
+        let _ = out.await;
+        let _ = err.await;
+    }
+    if tokio::time::timeout(PIPE_DRAIN_GRACE, drain(&mut out_task, &mut err_task))
+        .await
+        .is_err()
+    {
+        kill_process_group(pid);
+        let _ = tokio::time::timeout(
+            Duration::from_millis(500),
+            drain(&mut out_task, &mut err_task),
+        )
+        .await;
+        out_task.abort();
+        err_task.abort();
+    }
+
+    let stdout = std::mem::take(&mut *out_buf.lock().unwrap());
+    let stderr = std::mem::take(&mut *err_buf.lock().unwrap());
+    Ok(ForegroundOutput {
+        pid,
+        status,
+        stdout,
+        stderr,
+    })
+}
+
 // ============================================================================
 // Tier 1: Native OS Sandbox Instance (macOS Seatbelt / Linux Bubblewrap)
 // ============================================================================
@@ -560,21 +668,14 @@ impl SandboxInstance for NativeOsSandboxInstance {
             });
         }
 
-        cmd.kill_on_drop(true);
-        let child = cmd.spawn()?;
-        let pid = child.id().unwrap_or(0);
-
         let timeout_dur = Duration::from_millis(spec.timeout_ms.unwrap_or(30_000));
-        let output = match tokio::time::timeout(timeout_dur, child.wait_with_output()).await {
-            Ok(res) => res?,
-            Err(_) => {
-                anyhow::bail!(
-                    "Command timed out after {}ms (pid {} terminated cleanly). For long-running tasks (>2m, such as online LLM benchmarks), pass `\"background\": true` to `proc_exec` and poll with `\"poll_pid\": <pid>`.",
-                    timeout_dur.as_millis(),
-                    pid
-                );
-            }
-        };
+        let output = run_foreground(
+            cmd,
+            timeout_dur,
+            " For long-running tasks (>2m, such as online LLM benchmarks), pass `\"background\": true` to `proc_exec` and poll with `\"poll_pid\": <pid>`.",
+        )
+        .await?;
+        let pid = output.pid;
         let stderr_str = String::from_utf8_lossy(&output.stderr).to_string();
 
         // When `cargo test` is executed inside an outer `proc_exec` Seatbelt sandbox on macOS,
@@ -605,8 +706,7 @@ impl SandboxInstance for NativeOsSandboxInstance {
                 .env("AOS_ORG_SHARED_RO", &self.config.org_shared_ro_dir)
                 .env("AOS_ORG_AGENT_PUB", &self.config.org_agent_pub_dir)
                 .stdout(Stdio::piped())
-                .stderr(Stdio::piped())
-                .kill_on_drop(true);
+                .stderr(Stdio::piped());
             for (var, default_sub) in [("CARGO_HOME", ".cargo"), ("RUSTUP_HOME", ".rustup")] {
                 let candidate = std::env::var(var)
                     .ok()
@@ -625,20 +725,9 @@ impl SandboxInstance for NativeOsSandboxInstance {
             for (k, v) in &spec.env {
                 fallback.env(k, v);
             }
-            let fb_child = fallback.spawn()?;
-            let fb_pid = fb_child.id().unwrap_or(0);
-            let fb_out = match tokio::time::timeout(timeout_dur, fb_child.wait_with_output()).await {
-                Ok(res) => res?,
-                Err(_) => {
-                    anyhow::bail!(
-                        "Command timed out after {}ms (pid {} terminated cleanly).",
-                        timeout_dur.as_millis(),
-                        fb_pid
-                    );
-                }
-            };
+            let fb_out = run_foreground(fallback, timeout_dur, "").await?;
             return Ok(ExecOutput {
-                pid: fb_pid,
+                pid: fb_out.pid,
                 exit_code: fb_out.status.code(),
                 stdout: String::from_utf8_lossy(&fb_out.stdout).to_string(),
                 stderr: String::from_utf8_lossy(&fb_out.stderr).to_string(),
@@ -839,6 +928,36 @@ mod tests {
             tmpfs_pos < ws_pos,
             "`--tmpfs /tmp` must precede the workspace bind or it hides workspaces under /tmp"
         );
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn foreground_exec_does_not_wait_on_orphans_holding_pipes() {
+        // Mimics vitest: the parent exits but a worker keeps the inherited stdout open.
+        let mut cmd = Command::new("/bin/sh");
+        cmd.arg("-c")
+            .arg("sleep 30 & echo done")
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped());
+        let start = Instant::now();
+        let out = run_foreground(cmd, Duration::from_secs(20), "").await.unwrap();
+        assert!(start.elapsed() < Duration::from_secs(5), "took {:?}", start.elapsed());
+        assert_eq!(out.status.code(), Some(0));
+        assert_eq!(String::from_utf8_lossy(&out.stdout).trim(), "done");
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn foreground_exec_timeout_kills_whole_process_group() {
+        let mut cmd = Command::new("/bin/sh");
+        cmd.arg("-c")
+            .arg("sleep 30 & wait")
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped());
+        let start = Instant::now();
+        let err = run_foreground(cmd, Duration::from_millis(300), "").await.err().unwrap();
+        assert!(err.to_string().contains("timed out"), "{err}");
+        assert!(start.elapsed() < Duration::from_secs(5));
     }
 
     #[tokio::test]
