@@ -102,6 +102,11 @@ pub const HUMAN_ONLY_TOOLS: &[&str] = &["policy_approve_escalation", "policy_gra
 /// "never expires"). The CLI's `aegis-os policy approve` calls the policy kernel directly.
 const MAX_TOOL_LEASE_TTL_SECS: i64 = 24 * 3600;
 
+/// HTTP daemon limits: the declared body size is trusted only up to this bound, and the whole
+/// request (head + body) must arrive within the timeout.
+const MAX_HTTP_BODY_BYTES: usize = 64 * 1024 * 1024;
+const HTTP_REQUEST_READ_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
+
 pub struct AgentEnvironment {
     pub identity: AgentIdentity,
     pub workspace: Arc<dyn TransactionalWorkspace>,
@@ -2622,13 +2627,18 @@ impl AegisRuntimeKernel {
                 let ws_path = default_workspace.clone();
                 tokio::spawn(async move {
                     use tokio::io::AsyncReadExt;
+                    // One deadline for the whole request so slow or stalled clients cannot pin
+                    // connections (and their tasks) forever.
+                    let deadline = tokio::time::Instant::now() + HTTP_REQUEST_READ_TIMEOUT;
                     let mut buf = Vec::with_capacity(8192);
                     let mut chunk = [0u8; 8192];
                     let header_end = loop {
                         if let Some(pos) = buf.windows(4).position(|w| w == b"\r\n\r\n") {
                             break pos + 4;
                         }
-                        let Ok(n) = stream.read(&mut chunk).await else {
+                        let Ok(Ok(n)) =
+                            tokio::time::timeout_at(deadline, stream.read(&mut chunk)).await
+                        else {
                             return;
                         };
                         if n == 0 || buf.len() > 4 * 1024 * 1024 {
@@ -2648,8 +2658,27 @@ impl AegisRuntimeKernel {
                             }
                         })
                         .unwrap_or(0);
+                    if content_length > MAX_HTTP_BODY_BYTES {
+                        let msg = format!(
+                            "{{\"error\":\"Request body exceeds {} bytes\"}}",
+                            MAX_HTTP_BODY_BYTES
+                        );
+                        let _ = stream
+                            .write_all(
+                                format!(
+                                    "HTTP/1.1 413 Payload Too Large\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                                    msg.len(),
+                                    msg
+                                )
+                                .as_bytes(),
+                            )
+                            .await;
+                        return;
+                    }
                     while buf.len() < header_end + content_length {
-                        let Ok(n) = stream.read(&mut chunk).await else {
+                        let Ok(Ok(n)) =
+                            tokio::time::timeout_at(deadline, stream.read(&mut chunk)).await
+                        else {
                             break;
                         };
                         if n == 0 {
@@ -3599,6 +3628,25 @@ mod tests {
         let (clean, full) = shadow_path_for_write(&shadow, "/src/a..b.rs").unwrap();
         assert_eq!(clean, "src/a..b.rs");
         assert_eq!(full, shadow.join("src/a..b.rs"));
+    }
+
+    #[tokio::test]
+    async fn http_daemon_rejects_oversized_bodies() {
+        let temp = tempfile::tempdir().unwrap();
+        let repo = temp.path().join("repo");
+        tokio::fs::create_dir_all(&repo).await.unwrap();
+        let kernel = Arc::new(AegisRuntimeKernel::new(&temp.path().join("rt")).await.unwrap());
+        let addr = kernel.start_http_daemon("127.0.0.1:0", repo).await.unwrap();
+
+        let mut stream = tokio::net::TcpStream::connect(addr).await.unwrap();
+        let req = format!(
+            "POST /mcp HTTP/1.1\r\nHost: {addr}\r\nContent-Length: {}\r\n\r\n{{",
+            MAX_HTTP_BODY_BYTES + 1
+        );
+        stream.write_all(req.as_bytes()).await.unwrap();
+        let mut resp = Vec::new();
+        tokio::io::AsyncReadExt::read_to_end(&mut stream, &mut resp).await.unwrap();
+        assert!(String::from_utf8_lossy(&resp).starts_with("HTTP/1.1 413"));
     }
 
     #[tokio::test]
