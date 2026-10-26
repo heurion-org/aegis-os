@@ -49,14 +49,14 @@ struct ForegroundOutput {
     stderr: Vec<u8>,
 }
 
+/// How much of each stream's tail to surface when a command times out.
+const TIMEOUT_TAIL_BYTES: usize = 4096;
+
 #[cfg(unix)]
 fn kill_process_group(pgid: u32) {
-    extern "C" {
-        fn kill(pid: i32, sig: i32) -> i32;
-    }
     if pgid > 0 {
-        // SIGKILL the whole group; a negative pid targets the process group.
-        unsafe { kill(-(pgid as i32), 9) };
+        // A negative pid targets the whole process group.
+        unsafe { libc::kill(-(pgid as libc::pid_t), libc::SIGKILL) };
     }
 }
 
@@ -83,6 +83,12 @@ where
     (buf, handle)
 }
 
+fn tail_lossy(buf: &Mutex<Vec<u8>>) -> String {
+    let buf = buf.lock().unwrap();
+    let start = buf.len().saturating_sub(TIMEOUT_TAIL_BYTES);
+    String::from_utf8_lossy(&buf[start..]).trim_end().to_string()
+}
+
 /// Runs `cmd` in its own process group and waits for the process itself rather than pipe EOF.
 /// On timeout, or when descendants still hold the pipes after the grace window, the whole group
 /// is killed so no orphaned worker can wedge the caller.
@@ -91,6 +97,9 @@ async fn run_foreground(
     timeout: Duration,
     timeout_hint: &str,
 ) -> anyhow::Result<ForegroundOutput> {
+    // A non-foreground process group that reads a tty gets SIGTTIN-stopped, and under MCP stdio
+    // the inherited stdin is the JSON-RPC stream; commands never get interactive input.
+    cmd.stdin(Stdio::null());
     #[cfg(unix)]
     cmd.process_group(0);
     cmd.kill_on_drop(true);
@@ -99,18 +108,32 @@ async fn run_foreground(
     let (out_buf, mut out_task) = spawn_pipe_reader(child.stdout.take());
     let (err_buf, mut err_task) = spawn_pipe_reader(child.stderr.take());
 
-    let status = match tokio::time::timeout(timeout, child.wait()).await {
-        Ok(res) => res?,
+    let waited = tokio::time::timeout(timeout, child.wait()).await;
+    let status = match waited {
+        Ok(Ok(status)) => status,
+        Ok(Err(err)) => {
+            kill_process_group(pid);
+            out_task.abort();
+            err_task.abort();
+            return Err(err.into());
+        }
         Err(_) => {
             kill_process_group(pid);
             out_task.abort();
             err_task.abort();
-            bail!(
+            let mut msg = format!(
                 "Command timed out after {}ms (process group {} killed).{}",
                 timeout.as_millis(),
                 pid,
                 timeout_hint
             );
+            for (label, buf) in [("stdout", &out_buf), ("stderr", &err_buf)] {
+                let tail = tail_lossy(buf);
+                if !tail.is_empty() {
+                    msg.push_str(&format!("\n--- last {label} before timeout ---\n{tail}"));
+                }
+            }
+            bail!(msg);
         }
     };
 
@@ -118,10 +141,13 @@ async fn run_foreground(
         let _ = out.await;
         let _ = err.await;
     }
-    if tokio::time::timeout(PIPE_DRAIN_GRACE, drain(&mut out_task, &mut err_task))
-        .await
-        .is_err()
-    {
+    let pipes_held_open = tokio::time::timeout(
+        PIPE_DRAIN_GRACE,
+        drain(&mut out_task, &mut err_task),
+    )
+    .await
+    .is_err();
+    if pipes_held_open {
         kill_process_group(pid);
         let _ = tokio::time::timeout(
             Duration::from_millis(500),
@@ -133,7 +159,20 @@ async fn run_foreground(
     }
 
     let stdout = std::mem::take(&mut *out_buf.lock().unwrap());
-    let stderr = std::mem::take(&mut *err_buf.lock().unwrap());
+    let mut stderr = std::mem::take(&mut *err_buf.lock().unwrap());
+    if pipes_held_open {
+        // The exit status only covers the leader; make the forced cleanup visible to the caller.
+        stderr.extend_from_slice(
+            format!(
+                "\n[aegis-os] Process exited but descendants still held stdout/stderr after {}ms; \
+                 killed process group {}. Output may be truncated and background processes were \
+                 terminated (use `\"background\": true` for long-lived services).\n",
+                PIPE_DRAIN_GRACE.as_millis(),
+                pid
+            )
+            .as_bytes(),
+        );
+    }
     Ok(ForegroundOutput {
         pid,
         status,
@@ -944,6 +983,24 @@ mod tests {
         assert!(start.elapsed() < Duration::from_secs(5), "took {:?}", start.elapsed());
         assert_eq!(out.status.code(), Some(0));
         assert_eq!(String::from_utf8_lossy(&out.stdout).trim(), "done");
+        assert!(
+            String::from_utf8_lossy(&out.stderr).contains("killed process group"),
+            "forced cleanup must be reported"
+        );
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn foreground_exec_gets_empty_stdin() {
+        // Must see EOF instead of blocking on (or stealing from) the server's stdin.
+        let mut cmd = Command::new("/bin/sh");
+        cmd.arg("-c")
+            .arg("read line; echo \"eof:$?\"")
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped());
+        let out = run_foreground(cmd, Duration::from_secs(5), "").await.unwrap();
+        assert_eq!(String::from_utf8_lossy(&out.stdout).trim(), "eof:1");
+        assert!(out.stderr.is_empty());
     }
 
     #[cfg(unix)]
@@ -951,12 +1008,15 @@ mod tests {
     async fn foreground_exec_timeout_kills_whole_process_group() {
         let mut cmd = Command::new("/bin/sh");
         cmd.arg("-c")
-            .arg("sleep 30 & wait")
+            .arg("echo stuck-in-test-42; echo warn >&2; sleep 30 & wait")
             .stdout(Stdio::piped())
             .stderr(Stdio::piped());
         let start = Instant::now();
         let err = run_foreground(cmd, Duration::from_millis(300), "").await.err().unwrap();
-        assert!(err.to_string().contains("timed out"), "{err}");
+        let msg = err.to_string();
+        assert!(msg.contains("timed out"), "{msg}");
+        assert!(msg.contains("stuck-in-test-42"), "partial stdout kept: {msg}");
+        assert!(msg.contains("last stderr before timeout ---\nwarn"), "{msg}");
         assert!(start.elapsed() < Duration::from_secs(5));
     }
 
