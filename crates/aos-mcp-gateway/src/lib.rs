@@ -1007,17 +1007,18 @@ impl AegisRuntimeKernel {
                     };
                     #[cfg(not(unix))]
                     let running = recorded_exit.is_none();
-                    let exit_code = if let Some(code) = recorded_exit {
-                        Some(code)
-                    } else if !running {
-                        Some(0)
-                    } else {
-                        None
+                    // No `.exit` record while the pid is gone means the job outlived the gateway that
+                    // started it (or is being reaped right now): its status is unknown, not success.
+                    let exit_status = match (recorded_exit, running) {
+                        (Some(_), _) => "exited",
+                        (None, true) => "running",
+                        (None, false) => "unknown",
                     };
                     return Ok(json!({
                         "pid": pid,
                         "running": running,
-                        "exit_code": exit_code,
+                        "exit_code": recorded_exit,
+                        "exit_status": exit_status,
                         "stdout": stdout,
                         "stderr": stderr,
                         "sandbox_profile_used": "background-job-poll"
@@ -4667,7 +4668,7 @@ mod tests {
                 .call_tool(&agent, "proc_exec", json!({ "poll_pid": pid }))
                 .await
                 .unwrap();
-            if poll["running"].as_bool() == Some(false)
+            if poll["exit_status"] == "exited"
                 && poll["stdout"]
                     .as_str()
                     .unwrap_or("")
