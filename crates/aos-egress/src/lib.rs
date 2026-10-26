@@ -116,8 +116,10 @@ impl AegisEgressGateway {
                 continue;
             }
             let scope = scopes.get(k).cloned().unwrap_or_default();
-            let redacted = if entry.real_secret_value.len() > 6 {
-                format!("{}****", &entry.real_secret_value[..4])
+            let redacted = if entry.real_secret_value.chars().count() > 6 {
+                // Char-based: a byte slice would panic inside a multi-byte character.
+                let head: String = entry.real_secret_value.chars().take(4).collect();
+                format!("{}****", head)
             } else {
                 "****".to_string()
             };
@@ -521,6 +523,20 @@ impl AegisEgressGateway {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn redacted_secret_listing_handles_multibyte_values() {
+        let gw = AegisEgressGateway::new();
+        gw.register_secret(SecretVaultEntry {
+            org_id: "acme".to_string(),
+            placeholder: "$AOS_SECRET_PW".to_string(),
+            real_secret_value: "密码密码-très-secret".to_string(),
+            allowed_domains: vec![],
+        })
+        .await;
+        let listed = gw.list_redacted_secrets("acme").await;
+        assert_eq!(listed[0]["value_redacted"], "密码密码****");
+    }
 
     #[tokio::test]
     async fn test_boundary_secret_injection_and_exfiltration_prevention() {
