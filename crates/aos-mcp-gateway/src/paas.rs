@@ -84,6 +84,42 @@ impl PlanTier {
         }
     }
 
+    /// Maximum allowed daily MCP syscalls before hitting the commercial paywall.
+    pub fn max_daily_syscalls(&self) -> u64 {
+        match self {
+            Self::Community => std::env::var("AOS_FREE_DAILY_SYSCALLS")
+                .ok()
+                .and_then(|s| s.parse::<u64>().ok())
+                .unwrap_or(200),
+            Self::Pro => 20_000,
+            Self::Team => 100_000,
+            Self::Enterprise => u64::MAX,
+        }
+    }
+
+    /// Maximum allowed daily sandbox CPU execution duration (in milliseconds).
+    pub fn max_daily_exec_ms(&self) -> u64 {
+        match self {
+            Self::Community => std::env::var("AOS_FREE_DAILY_EXEC_MS")
+                .ok()
+                .and_then(|s| s.parse::<u64>().ok())
+                .unwrap_or(600_000), // 10 minutes/day on Free tier
+            Self::Pro => 36_000_000,   // 10 hours/day on Pro tier
+            Self::Team => 180_000_000, // 50 hours/day on Team tier
+            Self::Enterprise => u64::MAX,
+        }
+    }
+
+    /// Idle duration (in milliseconds) before an active Cloud Workspace automatically Scale-to-Zero hibernates.
+    pub fn idle_hibernate_timeout_ms(&self) -> i64 {
+        match self {
+            Self::Community => 15 * 60 * 1000,       // 15 minutes
+            Self::Pro => 2 * 60 * 60 * 1000,         // 2 hours
+            Self::Team => 12 * 60 * 60 * 1000,       // 12 hours
+            Self::Enterprise => 24 * 60 * 60 * 1000, // 24 hours
+        }
+    }
+
     pub fn as_str(&self) -> &'static str {
         match self {
             Self::Community => "community",
@@ -138,6 +174,14 @@ pub struct TenantUsageRecord {
     pub cow_saved_bytes: u64,
     #[serde(default)]
     pub wake_count: u64,
+    #[serde(default)]
+    pub quota_day_utc: String,
+    #[serde(default)]
+    pub daily_syscalls: u64,
+    #[serde(default)]
+    pub daily_exec_ms: u64,
+    #[serde(default)]
+    pub active_agents: Vec<String>,
     #[serde(default)]
     pub updated_at_ms: i64,
 }
@@ -356,11 +400,17 @@ impl PaasControlPlane {
     ) -> anyhow::Result<TenantUsageRecord> {
         self.reload().await;
         let now = Utc::now().timestamp_millis();
+        let today = Utc::now().format("%Y-%m-%d").to_string();
         let rec = {
             let mut state = self.state.write().await;
             if let Some(existing) = state.tenants.iter_mut().find(|t| t.org_id == org_id) {
                 existing.plan_tier = plan_tier;
                 existing.max_concurrent_agents = plan_tier.max_concurrent_agents();
+                if existing.active_agents.len() > existing.max_concurrent_agents {
+                    existing
+                        .active_agents
+                        .truncate(existing.max_concurrent_agents);
+                }
                 existing.updated_at_ms = now;
                 existing.clone()
             } else {
@@ -372,6 +422,10 @@ impl PaasControlPlane {
                     sandbox_exec_ms: 0,
                     cow_saved_bytes: 0,
                     wake_count: 0,
+                    quota_day_utc: today,
+                    daily_syscalls: 0,
+                    daily_exec_ms: 0,
+                    active_agents: Vec::new(),
                     updated_at_ms: now,
                 };
                 state.tenants.push(created.clone());
@@ -393,12 +447,20 @@ impl PaasControlPlane {
     ) -> anyhow::Result<()> {
         self.reload().await;
         let now = Utc::now().timestamp_millis();
+        let today = Utc::now().format("%Y-%m-%d").to_string();
         {
             let mut state = self.state.write().await;
             if let Some(t) = state.tenants.iter_mut().find(|t| t.org_id == org_id) {
+                if t.quota_day_utc != today {
+                    t.quota_day_utc = today.clone();
+                    t.daily_syscalls = 0;
+                    t.daily_exec_ms = 0;
+                }
                 t.total_syscalls = t.total_syscalls.saturating_add(syscalls_delta);
                 t.sandbox_exec_ms = t.sandbox_exec_ms.saturating_add(exec_ms_delta);
                 t.cow_saved_bytes = t.cow_saved_bytes.saturating_add(cow_saved_delta);
+                t.daily_syscalls = t.daily_syscalls.saturating_add(syscalls_delta);
+                t.daily_exec_ms = t.daily_exec_ms.saturating_add(exec_ms_delta);
                 t.updated_at_ms = now;
             } else {
                 state.tenants.push(TenantUsageRecord {
@@ -409,6 +471,10 @@ impl PaasControlPlane {
                     sandbox_exec_ms: exec_ms_delta,
                     cow_saved_bytes: cow_saved_delta,
                     wake_count: 0,
+                    quota_day_utc: today,
+                    daily_syscalls: syscalls_delta,
+                    daily_exec_ms: exec_ms_delta,
+                    active_agents: Vec::new(),
                     updated_at_ms: now,
                 });
             }
@@ -425,6 +491,288 @@ impl PaasControlPlane {
             }
         }
         self.flush().await
+    }
+
+    /// Enforce commercial paywall quotas on `/v1/mcp` tool invocations:
+    /// 1. Dynamic concurrent Agent limit (`max_concurrent_agents`: Free=1, Pro=8, Team=32)
+    /// 2. Daily MCP syscall quota (`max_daily_syscalls`: Free=200/day, Pro=20,000/day)
+    /// 3. Daily sandbox CPU execution time quota (`max_daily_exec_ms`: Free=10m/day, Pro=10h/day)
+    pub async fn check_and_enforce_paywall(
+        &self,
+        org_id: &str,
+        agent_id: &str,
+        tool_name: &str,
+    ) -> Result<PlanTier, Value> {
+        self.reload().await;
+        let now = Utc::now().timestamp_millis();
+        let today = Utc::now().format("%Y-%m-%d").to_string();
+        let clean_agent = agent_id.trim();
+
+        let (
+            tier,
+            max_agents,
+            daily_syscalls,
+            max_syscalls,
+            daily_exec_ms,
+            max_exec_ms,
+            active_agents_snapshot,
+            violation,
+        ) = {
+            let mut state = self.state.write().await;
+            if !state.tenants.iter().any(|t| t.org_id == org_id) {
+                state.tenants.push(TenantUsageRecord {
+                    org_id: org_id.to_string(),
+                    plan_tier: PlanTier::Community,
+                    max_concurrent_agents: PlanTier::Community.max_concurrent_agents(),
+                    total_syscalls: 0,
+                    sandbox_exec_ms: 0,
+                    cow_saved_bytes: 0,
+                    wake_count: 0,
+                    quota_day_utc: today.clone(),
+                    daily_syscalls: 0,
+                    daily_exec_ms: 0,
+                    active_agents: Vec::new(),
+                    updated_at_ms: now,
+                });
+            }
+            let t = state
+                .tenants
+                .iter_mut()
+                .find(|t| t.org_id == org_id)
+                .unwrap();
+            if t.quota_day_utc != today {
+                t.quota_day_utc = today;
+                t.daily_syscalls = 0;
+                t.daily_exec_ms = 0;
+            }
+            let tier = t.plan_tier;
+            let max_ag = t.max_concurrent_agents.max(tier.max_concurrent_agents());
+            let max_sys = tier.max_daily_syscalls();
+            let max_ex = tier.max_daily_exec_ms();
+
+            // Replace placeholder `"cloud-coder-1"` if the user's real Agent client connects first
+            if !clean_agent.is_empty()
+                && clean_agent != "cloud-coder-1"
+                && t.active_agents.len() == 1
+                && t.active_agents[0] == "cloud-coder-1"
+            {
+                t.active_agents[0] = clean_agent.to_string();
+            }
+
+            let mut viol: Option<(&'static str, String, String)> = None;
+            if !clean_agent.is_empty() && !t.active_agents.iter().any(|a| a == clean_agent) {
+                if t.active_agents.len() >= max_ag {
+                    let existing_list = t.active_agents.join(", ");
+                    viol = Some((
+                        "PAYWALL_CONCURRENT_AGENTS_LIMIT",
+                        format!(
+                            "Tenant '{}' ({} plan) allows at most {} active Agent runtime (currently active: [{}]), cannot attach parallel Agent '{}'. Upgrade to Aegis Cloud Pro ($29/mo) for 8 parallel Agent runtimes.",
+                            org_id,
+                            tier.as_str(),
+                            max_ag,
+                            existing_list,
+                            clean_agent
+                        ),
+                        format!(
+                            "当前租户 '{}'（{} 免费档）最多允许 {} 个并发 Agent 运行时（当前已挂载：[{}]），无法同时接入新 Agent '{}'。升级 Aegis Cloud Pro ($29/月) 即可解锁 8 个 Agent 并行运行时与 16 个线上工作区。",
+                            org_id,
+                            tier.as_str(),
+                            max_ag,
+                            existing_list,
+                            clean_agent
+                        ),
+                    ));
+                } else {
+                    t.active_agents.push(clean_agent.to_string());
+                    t.updated_at_ms = now;
+                }
+            }
+
+            if viol.is_none() && t.daily_syscalls >= max_sys {
+                viol = Some((
+                    "PAYWALL_DAILY_SYSCALL_LIMIT",
+                    format!(
+                        "Daily MCP syscall quota reached for tenant '{}' on {} plan ({}/{} syscalls used today). Upgrade to Aegis Cloud Pro ($29/mo) for 20,000 daily syscalls.",
+                        org_id,
+                        tier.as_str(),
+                        t.daily_syscalls,
+                        max_sys
+                    ),
+                    format!(
+                        "当前租户 '{}' 今日免费系统调用额度已用尽（已用 {}/{} 次）。升级 Aegis Cloud Pro ($29/月) 即可解锁每日 20,000 次系统调用与 64GB 独享 OS 运行时。",
+                        org_id, t.daily_syscalls, max_sys
+                    ),
+                ));
+            }
+
+            if viol.is_none() && tool_name == "proc_exec" && t.daily_exec_ms >= max_ex {
+                viol = Some((
+                    "PAYWALL_DAILY_EXEC_TIME_LIMIT",
+                    format!(
+                        "Daily sandbox CPU execution quota reached for tenant '{}' on {} plan ({} ms / {} ms used today). Upgrade to Aegis Cloud Pro ($29/mo) for 10 hours/day of 64GB sandbox compute.",
+                        org_id,
+                        tier.as_str(),
+                        t.daily_exec_ms,
+                        max_ex
+                    ),
+                    format!(
+                        "当前租户 '{}' 今日免费沙箱 CPU 执行时长已达上限（已用 {}s / {}s）。升级 Aegis Cloud Pro ($29/月) 即可解锁每日 10 小时 64GB 独享沙箱算力。",
+                        org_id,
+                        t.daily_exec_ms / 1000,
+                        max_ex / 1000
+                    ),
+                ));
+            }
+
+            (
+                tier,
+                max_ag,
+                t.daily_syscalls,
+                max_sys,
+                t.daily_exec_ms,
+                max_ex,
+                t.active_agents.clone(),
+                viol,
+            )
+        };
+        let _ = self.flush().await;
+
+        if let Some((code, reason_en, reason_zh)) = violation {
+            let checkout = self.build_checkout_info(org_id, PlanTier::Pro, None);
+            let checkout_url = checkout
+                .get("checkout_url")
+                .and_then(|v| v.as_str())
+                .unwrap_or(Self::DEFAULT_POLAR_PRO_CHECKOUT_URL);
+            let notice = format!(
+                "[AEGIS CLOUD PAYWALL — {}]\n{}\n{}\n\n👉 立即升级 Aegis Cloud Pro ($29/mo · 16 Workspaces · 8 Parallel Agents · 64GB Online OS Runtime):\n   • Web Console: https://heurion.org/aegis-cloud/dashboard\n   • Direct Checkout: {}\n   • 付款后在终端一行命令激活 (密钥存本机，不经过大模型):\n     aegis-os cloud subscribe --claim --email <你的付款邮箱> && aegis-os cloud up",
+                code, reason_zh, reason_en, checkout_url
+            );
+            return Err(json!({
+                "status": "paywall_exceeded",
+                "http_status": 402,
+                "code": code,
+                "org_id": org_id,
+                "agent_id": clean_agent,
+                "current_plan": tier.as_str(),
+                "reason": reason_en,
+                "reason_zh": reason_zh,
+                "quotas": {
+                    "daily_syscalls_used": daily_syscalls,
+                    "daily_syscalls_limit": max_syscalls,
+                    "daily_exec_ms_used": daily_exec_ms,
+                    "daily_exec_ms_limit": max_exec_ms,
+                    "active_agents": active_agents_snapshot,
+                    "max_concurrent_agents": max_agents
+                },
+                "upgrade": {
+                    "target_plan": "pro",
+                    "monthly_price_usd": 29,
+                    "checkout_url": checkout_url,
+                    "dashboard_url": "https://heurion.org/aegis-cloud/dashboard",
+                    "cli_command": "aegis-os cloud subscribe --claim --email <your-email> && aegis-os cloud up"
+                },
+                "agent_notice": notice
+            }));
+        }
+
+        Ok(tier)
+    }
+
+    /// Return read-only subscription & daily quota status for the Web Console or CLI (never exposes raw `ak_live_*` secrets).
+    pub async fn get_subscription_and_quota_status(
+        &self,
+        org_id: Option<&str>,
+        customer_email: Option<&str>,
+    ) -> Value {
+        self.reload().await;
+        let email_norm = customer_email
+            .map(|e| e.trim().to_lowercase())
+            .filter(|e| !e.is_empty());
+        let org_norm = org_id
+            .map(|o| o.trim().to_string())
+            .filter(|o| !o.is_empty() && o != "*" && o != "default-org");
+
+        let state = self.state.read().await;
+        let matched_sub = state
+            .subscriptions
+            .iter()
+            .rev()
+            .find(|s| {
+                email_norm
+                    .as_ref()
+                    .map_or(false, |em| s.customer_email.as_ref() == Some(em))
+                    || org_norm.as_ref().map_or(false, |og| &s.org_id == og)
+            })
+            .cloned();
+
+        let resolved_org = matched_sub
+            .as_ref()
+            .map(|s| s.org_id.clone())
+            .or_else(|| org_norm.clone())
+            .or_else(|| {
+                email_norm
+                    .as_deref()
+                    .and_then(|e| e.split('@').next())
+                    .map(|p| {
+                        p.chars()
+                            .map(|c| if c.is_ascii_alphanumeric() { c } else { '-' })
+                            .collect::<String>()
+                    })
+            })
+            .unwrap_or_else(|| "aegis-os".to_string());
+
+        let tenant = state
+            .tenants
+            .iter()
+            .find(|t| t.org_id == resolved_org)
+            .cloned();
+
+        let tier = tenant
+            .as_ref()
+            .map(|t| t.plan_tier)
+            .or_else(|| matched_sub.as_ref().map(|s| s.plan_tier))
+            .unwrap_or(PlanTier::Community);
+
+        let today = Utc::now().format("%Y-%m-%d").to_string();
+        let (daily_sys, daily_ex, active_agents) = match tenant {
+            Some(ref t) if t.quota_day_utc == today => (
+                t.daily_syscalls,
+                t.daily_exec_ms,
+                t.active_agents.clone(),
+            ),
+            Some(ref t) => (0, 0, t.active_agents.clone()),
+            None => (0, 0, Vec::new()),
+        };
+
+        let email_display = matched_sub
+            .as_ref()
+            .and_then(|s| s.customer_email.clone())
+            .or(email_norm.clone())
+            .unwrap_or_else(|| "you@company.com".to_string());
+
+        json!({
+            "found_subscription": matched_sub.is_some(),
+            "subscription_status": matched_sub.as_ref().map(|s| s.status.as_str()).unwrap_or("none"),
+            "provider": matched_sub.as_ref().map(|s| s.provider.as_str()).unwrap_or("none"),
+            "org_id": resolved_org,
+            "customer_email": matched_sub.as_ref().and_then(|s| s.customer_email.clone()).or(email_norm),
+            "plan_tier": tier.as_str(),
+            "monthly_price_usd": tier.monthly_price_usd(),
+            "key_claim_ready": matched_sub.as_ref().map_or(false, |s| s.status == "active" && s.claimable_api_key.is_some()),
+            "quotas": {
+                "daily_syscalls_used": daily_sys,
+                "daily_syscalls_limit": tier.max_daily_syscalls(),
+                "daily_exec_ms_used": daily_ex,
+                "daily_exec_ms_limit": tier.max_daily_exec_ms(),
+                "active_agents": active_agents,
+                "active_agents_count": active_agents.len(),
+                "max_concurrent_agents": tier.max_concurrent_agents(),
+                "max_workspaces": tier.max_workspaces(),
+                "max_exec_timeout_ms": tier.max_exec_timeout_ms(),
+                "idle_hibernate_timeout_ms": tier.idle_hibernate_timeout_ms()
+            },
+            "claim_command": format!("aegis-os cloud subscribe --claim --email {} && aegis-os cloud up", email_display)
+        })
     }
 
     pub async fn list_tenants(&self, org_id: Option<&str>) -> Vec<TenantUsageRecord> {
@@ -1104,13 +1452,65 @@ impl PaasControlPlane {
                 })?;
             ws.status = WorkspaceLifecycleState::Hibernated;
             ws.hibernated_at_ms = Some(now);
-            ws.clone()
+            let cloned = ws.clone();
+            if let Some(t) = state.tenants.iter_mut().find(|t| t.org_id == cloned.org_id) {
+                t.active_agents.clear();
+                t.updated_at_ms = now;
+            }
+            cloned
         };
         kernel
             .evict_agent_environments(&record.org_id, &record.agents)
             .await;
         self.flush().await?;
         Ok(record)
+    }
+
+    /// Automatically Scale-to-Zero (`Hibernate`) any active Cloud Workspaces whose inactivity
+    /// exceeds their tenant plan's `idle_hibernate_timeout_ms` (Free = 15m, Pro = 2h, Team = 12h).
+    pub async fn hibernate_idle_workspaces(
+        &self,
+        kernel: &AegisRuntimeKernel,
+        idle_override_ms: Option<i64>,
+    ) -> anyhow::Result<Vec<String>> {
+        self.reload().await;
+        let now = Utc::now().timestamp_millis();
+        let candidates: Vec<(String, String)> = {
+            let state = self.state.read().await;
+            state
+                .workspaces
+                .iter()
+                .filter(|w| w.status == WorkspaceLifecycleState::Active)
+                .filter_map(|w| {
+                    let tier = state
+                        .tenants
+                        .iter()
+                        .find(|t| t.org_id == w.org_id)
+                        .map(|t| t.plan_tier)
+                        .unwrap_or(PlanTier::Community);
+                    let threshold_ms =
+                        idle_override_ms.unwrap_or_else(|| tier.idle_hibernate_timeout_ms());
+                    let last = if w.last_active_ms > 0 {
+                        w.last_active_ms
+                    } else {
+                        w.created_at_ms
+                    };
+                    if now.saturating_sub(last) >= threshold_ms {
+                        Some((w.org_id.clone(), w.workspace_id.clone()))
+                    } else {
+                        None
+                    }
+                })
+                .collect()
+        };
+
+        let mut hibernated_ids = Vec::new();
+        for (org, ws_id) in candidates {
+            if self.hibernate_workspace(kernel, &org, &ws_id).await.is_ok() {
+                hibernated_ids.push(format!("{}/{}", org, ws_id));
+            }
+        }
+        Ok(hibernated_ids)
     }
 
     /// Delete a Cloud Workspace and evict its in-memory sandbox handles.
@@ -2286,6 +2686,48 @@ pub const DASHBOARD_HTML: &str = r##"<!doctype html>
       flex: 1;
       min-width: 0;
       background: var(--bg-elevated);
+      border: 1px solid var(--border);
+      padding: 0.45rem 0.75rem;
+      font-family: var(--mono);
+      font-size: 0.76rem;
+      color: var(--ink);
+      outline: none;
+    }
+
+    .claim-row input:focus {
+      border-color: var(--accent);
+    }
+
+    .quota-pills {
+      display: flex;
+      flex-wrap: wrap;
+      gap: 0.45rem;
+      padding: 0.55rem 0.7rem;
+      background: var(--bg-primary);
+      border: 1px solid var(--border);
+      font-family: var(--mono);
+      font-size: 0.68rem;
+      color: var(--ink-secondary);
+    }
+
+    .quota-pill {
+      display: inline-flex;
+      align-items: center;
+      gap: 0.35rem;
+    }
+
+    .quota-sep {
+      color: var(--border);
+    }
+
+    .status-banner {
+      display: none;
+      background: var(--accent-soft);
+      border: 1px solid var(--accent);
+      padding: 0.7rem 0.85rem;
+      font-size: 0.78rem;
+      line-height: 1.55;
+      color: var(--ink);
     }
 
     /* Footer */
@@ -2623,6 +3065,14 @@ pub const DASHBOARD_HTML: &str = r##"<!doctype html>
               </div>
               <p class="card-desc" data-i18n="tier_free_desc">一键为你的本地 AI Agent（Claude / Cursor / Codex / AGY）挂载免费的线上安全 OS 运行时，自动生成本机凭证，无需手动传参：</p>
 
+              <div class="quota-pills">
+                <span class="quota-pill" data-i18n="free_q1">200 次系统调用 / 日</span>
+                <span class="quota-sep">·</span>
+                <span class="quota-pill" data-i18n="free_q2">10 分钟沙箱算力 / 日</span>
+                <span class="quota-sep">·</span>
+                <span class="quota-pill" data-i18n="free_q3">单次 30s 超时 · 闲置 15m 休眠</span>
+              </div>
+
               <div class="cmd-bar">
                 <span class="cmd-title" data-i18n="free_cmd_title">在终端运行（安装并挂载免费线上 Runtime）：</span>
                 <button class="btn" onclick="copyFreeSnippet()" data-i18n="btn_copy_free">复制命令</button>
@@ -2639,10 +3089,24 @@ pub const DASHBOARD_HTML: &str = r##"<!doctype html>
                   <span class="tag tag-active"><span class="dot-mint"></span><span data-i18n="tier_pro_tag">PRO 专业版 · 多 AGENT 并行运行时</span></span>
                   <h3 class="card-title" data-i18n="tier_pro_title">$29 / 月 · 16 个线上工作区 · 8 个 Agent 并行</h3>
                 </div>
-                <a class="btn btn-solid" href="https://buy.polar.sh/polar_cl_jCPpzbp4eOAyRbkDP4YzNIFVnYLddbvJZI5Fc27zL0x" target="_blank" rel="noopener" data-i18n="btn_buy_pro">① 立即订阅 Pro ($29/月) →</a>
+                <a class="btn btn-solid" id="btn-buy-pro" href="https://buy.polar.sh/polar_cl_jCPpzbp4eOAyRbkDP4YzNIFVnYLddbvJZI5Fc27zL0x" target="_blank" rel="noopener" data-i18n="btn_buy_pro">① 立即订阅 Pro ($29/月) →</a>
               </div>
 
               <p class="card-desc" data-i18n="tier_pro_desc">解锁最多 16 个线上 OS 工作区与 8 个 Agent 并行运行时：付款后在本机直接认领凭证并挂载，密钥直存本机（不经过大模型）：</p>
+
+              <div class="quota-pills">
+                <span class="quota-pill"><span class="dot-mint"></span><span data-i18n="pro_q1">20,000 次系统调用 / 日</span></span>
+                <span class="quota-sep">·</span>
+                <span class="quota-pill" data-i18n="pro_q2">10 小时 64GB 沙箱算力 / 日</span>
+                <span class="quota-sep">·</span>
+                <span class="quota-pill" data-i18n="pro_q3">单次 300s · 2h 超长保活</span>
+              </div>
+
+              <div class="claim-row">
+                <input type="email" id="sub-email-input" placeholder="输入邮箱：预填付款 / 查询已购 Pro 配额 (you@company.com)" oninput="onSubEmailChange()" />
+                <button class="btn" type="button" onclick="checkSubStatus()" data-i18n="btn_check_sub">查询订阅 / 配额</button>
+              </div>
+              <div id="sub-status-box" class="status-banner"></div>
 
               <div class="cmd-bar">
                 <span class="cmd-title" data-i18n="pro_cmd_title">② 付款后在终端运行（绑定 Pro 凭证并挂载）：</span>
@@ -2718,12 +3182,19 @@ pub const DASHBOARD_HTML: &str = r##"<!doctype html>
         tier_free_tag: '免费版 · 无需注册或绑卡',
         tier_free_title: '$0 / 月 · 1 个线上 Runtime 工作区 · 1 个 Agent',
         tier_free_desc: '一键为你的本地 AI Agent（Claude / Cursor / Codex / AGY）挂载免费的线上安全 OS 运行时，自动生成本机凭证，无需手动传参：',
+        free_q1: '200 次系统调用 / 日',
+        free_q2: '10 分钟沙箱算力 / 日',
+        free_q3: '单次 30s 超时 · 闲置 15m 休眠',
         free_cmd_title: '在终端运行（安装并挂载免费线上 Runtime）：',
         btn_copy_free: '复制命令',
         tier_pro_tag: 'PRO 专业版 · 多 AGENT 并行运行时',
         tier_pro_title: '$29 / 月 · 16 个线上工作区 · 8 个 Agent 并行',
         btn_buy_pro: '① 立即订阅 Pro ($29/月) →',
         tier_pro_desc: '解锁最多 16 个线上 OS 工作区与 8 个 Agent 并行运行时：付款后在本机直接认领凭证并挂载，密钥直存本机（不经过大模型）：',
+        pro_q1: '20,000 次系统调用 / 日',
+        pro_q2: '10 小时 64GB 沙箱算力 / 日',
+        pro_q3: '单次 300s · 2h 超长保活',
+        btn_check_sub: '查询订阅 / 配额',
         pro_cmd_title: '② 付款后在终端运行（绑定 Pro 凭证并挂载）：',
         btn_copy_pro: '复制命令'
       },
@@ -2759,16 +3230,25 @@ pub const DASHBOARD_HTML: &str = r##"<!doctype html>
         tier_free_tag: 'FREE PLAN · NO SIGNUP REQUIRED',
         tier_free_title: '$0 / mo · 1 Runtime Workspace · 1 Agent',
         tier_free_desc: 'Mount a free online OS Runtime for your local AI Agent (Claude, Cursor, Codex, or AGY) with an auto-provisioned local key — zero manual flags:',
+        free_q1: '200 Syscalls / Day',
+        free_q2: '10 Min Sandbox CPU / Day',
+        free_q3: '30s Exec Timeout · 15m Idle Sleep',
         free_cmd_title: 'Run in terminal (install & mount free online Runtime):',
         btn_copy_free: 'Copy Command',
         tier_pro_tag: 'PRO PLAN · MULTI-AGENT RUNTIME',
         tier_pro_title: '$29 / mo · 16 Workspaces · 8 Parallel Agents',
         btn_buy_pro: '① Subscribe to Pro ($29/mo) →',
         tier_pro_desc: 'Unlock up to 16 online OS workspaces and 8 parallel Agent runtimes: claim your Pro key directly in terminal so it stays in ~/.aegis-os and never touches the LLM:',
+        pro_q1: '20,000 Syscalls / Day',
+        pro_q2: '10 Hr 64GB Sandbox CPU / Day',
+        pro_q3: '300s Exec Timeout · 2h Keep-Alive',
+        btn_check_sub: 'Check Status / Quota',
         pro_cmd_title: '② After payment, run in terminal (bind Pro key & mount Runtime):',
         btn_copy_pro: 'Copy Command'
       }
     };
+
+    const POLAR_BASE_URL = 'https://buy.polar.sh/polar_cl_jCPpzbp4eOAyRbkDP4YzNIFVnYLddbvJZI5Fc27zL0x';
 
     function applyLang(lang) {
       currentLang = lang;
@@ -2783,6 +3263,12 @@ pub const DASHBOARD_HTML: &str = r##"<!doctype html>
         const k = el.getAttribute('data-i18n-html');
         if (dict[k]) el.innerHTML = dict[k];
       });
+      const emailInput = document.getElementById('sub-email-input');
+      if (emailInput) {
+        emailInput.placeholder = lang === 'en'
+          ? 'Enter billing email to prefill checkout or check Pro quota (you@company.com)'
+          : '输入邮箱：预填付款 / 查询已购 Pro 配额 (you@company.com)';
+      }
       const btn = document.getElementById('langBtn');
       if (btn) btn.textContent = lang === 'zh' ? 'EN' : '中文';
       updateCliSnippets();
@@ -2800,8 +3286,62 @@ pub const DASHBOARD_HTML: &str = r##"<!doctype html>
       window.__t = setTimeout(() => { el.style.display = 'none'; }, 3600);
     }
 
+    function getEnteredEmail() {
+      const el = document.getElementById('sub-email-input');
+      return el && el.value.trim() ? el.value.trim() : '';
+    }
+
+    function onSubEmailChange() {
+      const email = getEnteredEmail();
+      if (email) {
+        localStorage.setItem('aegis_billing_email', email);
+      }
+      const buyBtn = document.getElementById('btn-buy-pro');
+      if (buyBtn) {
+        buyBtn.href = email
+          ? `${POLAR_BASE_URL}?customer_email=${encodeURIComponent(email)}`
+          : POLAR_BASE_URL;
+      }
+      updateCliSnippets();
+    }
+
+    async function checkSubStatus() {
+      const email = getEnteredEmail();
+      const box = document.getElementById('sub-status-box');
+      if (!box) return;
+      if (!email) {
+        toast(currentLang === 'en' ? 'Please enter your billing email first' : '请先输入付款邮箱');
+        return;
+      }
+      const apiBase = window.location.pathname.startsWith('/aegis-cloud') ? '/aegis-cloud' : '';
+      try {
+        const res = await fetch(`${apiBase}/v1/billing/status?email=${encodeURIComponent(email)}`);
+        const data = await res.json();
+        const q = data.quotas || {};
+        const tierUpper = (data.plan_tier || 'community').toUpperCase();
+        const isPaid = data.plan_tier && data.plan_tier !== 'community';
+        box.style.display = 'block';
+        if (currentLang === 'en') {
+          box.innerHTML = `<strong>Plan: ${tierUpper}</strong> (${isPaid ? 'Active Subscription' : 'Free Tier'}) · Org: <code>${data.org_id}</code><br>` +
+            `Daily Syscalls: <code>${q.daily_syscalls_used || 0} / ${q.daily_syscalls_limit || 200}</code> · Parallel Agents: <code>${q.active_agents_count || 0} / ${q.max_concurrent_agents || 1}</code><br>` +
+            (data.key_claim_ready
+              ? `✓ <strong>Pro API Key ready to claim!</strong> Copy and run Step ② in your terminal below.`
+              : (isPaid ? `✓ Pro quota active. Run Step ② in terminal on new machines.` : `→ Click ① Subscribe to Pro ($29/mo) above to unlock 8 parallel Agents & 20,000 daily syscalls.`));
+        } else {
+          box.innerHTML = `<strong>当前档位：${tierUpper}</strong>（${isPaid ? 'Pro 订阅已生效' : '免费共享档'}）· 租户：<code>${data.org_id}</code><br>` +
+            `今日系统调用：<code>${q.daily_syscalls_used || 0} / ${q.daily_syscalls_limit || 200}</code> · 并发 Agent：<code>${q.active_agents_count || 0} / ${q.max_concurrent_agents || 1}</code><br>` +
+            (data.key_claim_ready
+              ? `✓ <strong>Pro 专属凭证已就绪！</strong>直接复制下方「② 终端命令」运行即可完成本机挂载。`
+              : (isPaid ? `✓ Pro 独享运行时配额已激活。` : `→ 点击上方「① 立即订阅 Pro」即可解锁 8 个并发 Agent 与每日 20,000 次调用。`));
+        }
+      } catch (e) {
+        toast(currentLang === 'en' ? 'Failed to query subscription status' : '查询订阅状态失败');
+      }
+    }
+
     function updateCliSnippets() {
       const origin = window.location.origin;
+      const email = getEnteredEmail() || (currentLang === 'en' ? 'you@company.com' : '你的付款邮箱');
       const freeBox = document.getElementById('cli-snippet-free');
       const proBox = document.getElementById('cli-snippet-pro');
       if (freeBox) {
@@ -2820,11 +3360,11 @@ aegis-os cloud up`;
           ? `# 1. Install CLI if not already installed
 curl -fsSL ${origin}/aegis-cloud/install.sh | sh
 # 2. Claim Pro key locally (~/.aegis-os) & enable Cloud Sandbox
-aegis-os cloud subscribe --claim --email you@company.com && aegis-os cloud up`
+aegis-os cloud subscribe --claim --email ${email} && aegis-os cloud up`
           : `# 1. 若首次使用，先运行一行安装命令（已安装可跳过）
 curl -fsSL ${origin}/aegis-cloud/install.sh | sh
 # 2. 用付款邮箱在本机认领 Pro 密钥并启用云端沙箱（密钥不经过 LLM）
-aegis-os cloud subscribe --claim --email 你的付款邮箱 && aegis-os cloud up`;
+aegis-os cloud subscribe --claim --email ${email} && aegis-os cloud up`;
       }
     }
 
@@ -2840,7 +3380,29 @@ aegis-os cloud subscribe --claim --email 你的付款邮箱 && aegis-os cloud up
       toast(currentLang === 'en' ? 'Local terminal bind command copied' : '本地终端绑定命令已复制到剪贴板');
     }
 
-    applyLang(currentLang);
+    (function initSubState() {
+      const params = new URLSearchParams(window.location.search);
+      const qEmail = params.get('email') || params.get('customer_email') || localStorage.getItem('aegis_billing_email') || '';
+      const emailInput = document.getElementById('sub-email-input');
+      if (emailInput && qEmail) {
+        emailInput.value = qEmail;
+      }
+      applyLang(currentLang);
+      onSubEmailChange();
+      if (params.get('checkout') === 'success' || params.get('subscribed') === '1') {
+        if (qEmail) {
+          checkSubStatus();
+        } else {
+          const box = document.getElementById('sub-status-box');
+          if (box) {
+            box.style.display = 'block';
+            box.innerHTML = currentLang === 'en'
+              ? '✅ <strong>Payment completed!</strong> Enter your billing email above and run Step ② in your terminal to bind your Pro key.'
+              : '✅ <strong>付款已完成！</strong>在上方输入你的付款邮箱，然后复制下方「② 终端命令」即可激活 Pro 线上运行时。';
+          }
+        }
+      }
+    })();
   </script>
 </body>
 </html>

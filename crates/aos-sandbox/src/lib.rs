@@ -127,7 +127,7 @@ impl NativeOsSandboxInstance {
                         format!(
                             r#"
 (deny file-read* (subpath "{orgs_str}"))
-(allow file-read-metadata (literal "{orgs_str}"))
+(allow file-read* (literal "{orgs_str}"))
 (allow file-read* (subpath "{own_str}"))"#
                         )
                     } else {

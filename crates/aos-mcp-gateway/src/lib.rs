@@ -2542,6 +2542,17 @@ impl AegisRuntimeKernel {
         let local_addr = listener.local_addr()?;
         let kernel = self.clone();
 
+        // Background Scale-to-Zero Idle Workspace Hibernation Daemon (scans every 60s)
+        let k_gc = self.clone();
+        tokio::spawn(async move {
+            let mut ticker = tokio::time::interval(std::time::Duration::from_secs(60));
+            ticker.tick().await;
+            loop {
+                ticker.tick().await;
+                let _ = k_gc.paas.hibernate_idle_workspaces(&k_gc, None).await;
+            }
+        });
+
         tokio::spawn(async move {
             loop {
                 let Ok((mut stream, _)) = listener.accept().await else {
@@ -2787,22 +2798,91 @@ impl AegisRuntimeKernel {
                         let t_org = payload.get("org_id").and_then(|v| v.as_str()).unwrap_or(&org_id);
                         let raw_tier = payload.get("plan_tier").and_then(|v| v.as_str()).unwrap_or("pro");
                         let tier = paas::PlanTier::from_str_lossy(raw_tier);
-                        match k.paas.set_tenant_plan(t_org, tier).await {
-                            Ok(rec) => (
-                                "HTTP/1.1 200 OK",
+
+                        // Enforce admin secret guard when upgrading to a paid tier in production (`AOS_ADMIN_SECRET` or `AOS_REQUIRE_API_KEY=1`)
+                        let expected_admin = headers
+                            .get("x-aegis-admin-secret-override")
+                            .cloned()
+                            .or_else(|| std::env::var("AOS_ADMIN_SECRET").ok())
+                            .unwrap_or_default();
+                        let provided_admin = headers
+                            .get("x-aegis-admin-secret")
+                            .map(|s| s.trim())
+                            .unwrap_or("");
+                        let require_admin = !expected_admin.trim().is_empty()
+                            || (std::env::var("AOS_REQUIRE_API_KEY").as_deref() == Ok("1")
+                                && tier != paas::PlanTier::Community);
+
+                        if require_admin
+                            && (expected_admin.trim().is_empty()
+                                || provided_admin != expected_admin.trim())
+                        {
+                            let checkout = k.paas.build_checkout_info(t_org, tier, None);
+                            (
+                                "HTTP/1.1 403 Forbidden",
                                 json!({
-                                    "status": "plan_updated",
-                                    "tenant": rec,
-                                    "monthly_price_usd": tier.monthly_price_usd(),
-                                    "max_exec_timeout_ms": tier.max_exec_timeout_ms()
+                                    "error": "Direct plan upgrades require X-Aegis-Admin-Secret or a verified billing webhook (/v1/billing/webhook).",
+                                    "code": "PAYWALL_ADMIN_SECRET_REQUIRED",
+                                    "org_id": t_org,
+                                    "requested_plan": tier.as_str(),
+                                    "checkout_url": checkout["checkout_url"],
+                                    "cli_command": "aegis-os cloud subscribe --claim --email <your-email> && aegis-os cloud up"
                                 })
                                 .to_string(),
-                            ),
-                            Err(e) => (
-                                "HTTP/1.1 500 Internal Server Error",
-                                json!({ "error": e.to_string() }).to_string(),
-                            ),
+                            )
+                        } else {
+                            match k.paas.set_tenant_plan(t_org, tier).await {
+                                Ok(rec) => (
+                                    "HTTP/1.1 200 OK",
+                                    json!({
+                                        "status": "plan_updated",
+                                        "tenant": rec,
+                                        "monthly_price_usd": tier.monthly_price_usd(),
+                                        "max_exec_timeout_ms": tier.max_exec_timeout_ms(),
+                                        "max_daily_syscalls": tier.max_daily_syscalls(),
+                                        "max_daily_exec_ms": tier.max_daily_exec_ms()
+                                    })
+                                    .to_string(),
+                                ),
+                                Err(e) => (
+                                    "HTTP/1.1 500 Internal Server Error",
+                                    json!({ "error": e.to_string() }).to_string(),
+                                ),
+                            }
                         }
+                    } else if full_target.starts_with("/v1/billing/status") {
+                        let payload: Value = serde_json::from_str(body_str.trim()).unwrap_or_else(|_| json!({}));
+                        let mut s_org = payload
+                            .get("org_id")
+                            .and_then(|v| v.as_str())
+                            .map(|s| s.to_string());
+                        let mut s_email = payload
+                            .get("email")
+                            .or_else(|| payload.get("customer_email"))
+                            .and_then(|v| v.as_str())
+                            .map(|s| s.to_string());
+                        if let Some((_, qs)) = full_target.split_once('?') {
+                            for pair in qs.split('&') {
+                                if let Some((qk, qv)) = pair.split_once('=') {
+                                    let decoded = qv.replace("%40", "@").replace('+', " ");
+                                    match qk {
+                                        "org_id" if !decoded.is_empty() => s_org = Some(decoded),
+                                        "email" | "customer_email" if !decoded.is_empty() => {
+                                            s_email = Some(decoded)
+                                        }
+                                        _ => {}
+                                    }
+                                }
+                            }
+                        }
+                        if s_org.is_none() && org_id != "default-org" {
+                            s_org = Some(org_id.clone());
+                        }
+                        let status_val = k
+                            .paas
+                            .get_subscription_and_quota_status(s_org.as_deref(), s_email.as_deref())
+                            .await;
+                        ("HTTP/1.1 200 OK", status_val.to_string())
                     } else if full_target.starts_with("/v1/billing/checkout") {
                         let payload: Value = serde_json::from_str(body_str.trim()).unwrap_or_else(|_| json!({}));
                         let mut c_org = payload
@@ -2889,20 +2969,53 @@ impl AegisRuntimeKernel {
                         let k_role = payload.get("role").and_then(|v| v.as_str()).unwrap_or("Aegis Cloud Agent");
                         let k_ws = payload.get("workspace_id").and_then(|v| v.as_str()).map(|s| s.to_string());
                         let k_label = payload.get("label").and_then(|v| v.as_str()).unwrap_or("PaaS API Key");
-                        match k.paas.issue_api_key(k_org, k_agent, k_role, k_ws, k_label).await {
-                            Ok((raw_key, record)) => (
-                                "HTTP/1.1 200 OK",
+
+                        // Prevent unauthenticated key minting on paid tenants (`Pro` / `Team` / `Enterprise`) when `AOS_REQUIRE_API_KEY=1` or admin secret is enforced
+                        let target_tier = k.paas.get_tenant_plan(k_org).await;
+                        let expected_admin = headers
+                            .get("x-aegis-admin-secret-override")
+                            .cloned()
+                            .or_else(|| std::env::var("AOS_ADMIN_SECRET").ok())
+                            .unwrap_or_default();
+                        let has_valid_admin = !expected_admin.trim().is_empty()
+                            && headers
+                                .get("x-aegis-admin-secret")
+                                .map(|s| s.trim() == expected_admin.trim())
+                                .unwrap_or(false);
+                        let has_same_org_auth = raw_auth.is_some() && !auth_failed && org_id == k_org;
+                        let enforce_paid_guard = std::env::var("AOS_REQUIRE_API_KEY").as_deref() == Ok("1")
+                            || headers.contains_key("x-aegis-admin-secret-override");
+
+                        if enforce_paid_guard
+                            && target_tier != paas::PlanTier::Community
+                            && !has_same_org_auth
+                            && !has_valid_admin
+                        {
+                            (
+                                "HTTP/1.1 403 Forbidden",
                                 json!({
-                                    "status": "issued",
-                                    "api_key": raw_key,
-                                    "record": record
+                                    "error": "Minting additional API keys for a paid tenant requires an existing Bearer token for that org or X-Aegis-Admin-Secret.",
+                                    "code": "PAYWALL_KEY_MINT_FORBIDDEN",
+                                    "org_id": k_org
                                 })
                                 .to_string(),
-                            ),
-                            Err(e) => (
-                                "HTTP/1.1 500 Internal Server Error",
-                                json!({ "error": e.to_string() }).to_string(),
-                            ),
+                            )
+                        } else {
+                            match k.paas.issue_api_key(k_org, k_agent, k_role, k_ws, k_label).await {
+                                Ok((raw_key, record)) => (
+                                    "HTTP/1.1 200 OK",
+                                    json!({
+                                        "status": "issued",
+                                        "api_key": raw_key,
+                                        "record": record
+                                    })
+                                    .to_string(),
+                                ),
+                                Err(e) => (
+                                    "HTTP/1.1 500 Internal Server Error",
+                                    json!({ "error": e.to_string() }).to_string(),
+                                ),
+                            }
                         }
                     } else if method == "GET" && full_target.starts_with("/v1/tenants/keys") {
                         let keys = k.paas.list_api_keys(None).await;
@@ -2951,6 +3064,24 @@ impl AegisRuntimeKernel {
                     } else if method == "GET" && full_target == "/v1/workspaces" {
                         let list = k.paas.list_workspaces(None).await;
                         ("HTTP/1.1 200 OK", json!({ "workspaces": list }).to_string())
+                    } else if method == "POST" && full_target.starts_with("/v1/workspaces/gc-idle") {
+                        let payload: Value = serde_json::from_str(body_str.trim()).unwrap_or_else(|_| json!({}));
+                        let idle_override = payload.get("idle_timeout_ms").and_then(|v| v.as_i64());
+                        match k.paas.hibernate_idle_workspaces(&k, idle_override).await {
+                            Ok(hibernated) => (
+                                "HTTP/1.1 200 OK",
+                                json!({
+                                    "status": "gc_completed",
+                                    "hibernated_count": hibernated.len(),
+                                    "hibernated_workspaces": hibernated
+                                })
+                                .to_string(),
+                            ),
+                            Err(e) => (
+                                "HTTP/1.1 500 Internal Server Error",
+                                json!({ "error": e.to_string() }).to_string(),
+                            ),
+                        }
                     } else if method == "POST" && full_target.starts_with("/v1/workspaces/hibernate") {
                         let payload: Value = serde_json::from_str(body_str.trim()).unwrap_or_else(|_| json!({}));
                         let w_org = payload.get("org_id").and_then(|v| v.as_str()).unwrap_or(&org_id);
@@ -3254,47 +3385,123 @@ impl AegisRuntimeKernel {
                             let _ = k.paas.wake_workspace_if_needed(&k, &org_id, ws_id).await;
                         }
                         let identity = AgentIdentity::new(org_id.clone(), agent_id, role);
-                        let _ = k
-                            .ensure_agent_environment(
-                                identity.clone(),
-                                &bound_ws_path,
-                                IsolationTier::NativeOsSandbox,
-                                vec!["*".to_string()],
-                            )
-                            .await;
                         let call_started = std::time::Instant::now();
                         match serde_json::from_str::<Value>(body_str.trim()) {
                             Ok(mut rpc_req) => {
-                                // Enforce per-tier `max_exec_timeout_ms` on remote `proc_exec` calls
-                                let tier = k.paas.get_tenant_plan(&org_id).await;
-                                let max_timeout = tier.max_exec_timeout_ms();
-                                if let Some(params) = rpc_req.get_mut("params") {
-                                    if params.get("name").and_then(|v| v.as_str()) == Some("proc_exec") {
-                                        if let Some(args) = params.get_mut("arguments").and_then(|v| v.as_object_mut()) {
-                                            let req_t = args
-                                                .get("timeout_ms")
-                                                .and_then(|v| v.as_u64())
-                                                .unwrap_or(max_timeout);
-                                            args.insert(
-                                                "timeout_ms".to_string(),
-                                                json!(req_t.min(max_timeout)),
-                                            );
+                                let rpc_method = rpc_req
+                                    .get("method")
+                                    .and_then(|v| v.as_str())
+                                    .unwrap_or("")
+                                    .to_string();
+                                let tool_name = rpc_req
+                                    .get("params")
+                                    .and_then(|p| p.get("name"))
+                                    .and_then(|v| v.as_str())
+                                    .unwrap_or(&rpc_method)
+                                    .to_string();
+
+                                // Enforce commercial paywall quotas (`max_concurrent_agents`, `max_daily_syscalls`, `max_daily_exec_ms`)
+                                // on tool invocations BEFORE allocating CoW shadow workspaces or spawning sandbox processes.
+                                let paywall_check = if rpc_method == "tools/call"
+                                    || rpc_method == "tasks/send"
+                                    || rpc_method == "message/send"
+                                {
+                                    k.paas
+                                        .check_and_enforce_paywall(
+                                            &org_id,
+                                            &identity.agent_id,
+                                            &tool_name,
+                                        )
+                                        .await
+                                } else {
+                                    Ok(k.paas.get_tenant_plan(&org_id).await)
+                                };
+
+                                match paywall_check {
+                                    Err(paywall_err) => {
+                                        if headers
+                                            .get("x-aegis-paywall-mode")
+                                            .map(|s| s.as_str())
+                                            == Some("http-402")
+                                        {
+                                            ("HTTP/1.1 402 Payment Required", paywall_err.to_string())
+                                        } else {
+                                            let req_id =
+                                                rpc_req.get("id").cloned().unwrap_or(Value::Null);
+                                            let notice = paywall_err
+                                                .get("agent_notice")
+                                                .and_then(|v| v.as_str())
+                                                .unwrap_or("Aegis Cloud Paywall quota exceeded.");
+                                            (
+                                                "HTTP/1.1 200 OK",
+                                                json!({
+                                                    "jsonrpc": "2.0",
+                                                    "id": req_id,
+                                                    "result": {
+                                                        "isError": true,
+                                                        "paywall": paywall_err,
+                                                        "content": [{
+                                                            "type": "text",
+                                                            "text": notice
+                                                        }]
+                                                    }
+                                                })
+                                                .to_string(),
+                                            )
                                         }
                                     }
-                                }
-                                match k.handle_jsonrpc_message(&identity, rpc_req).await {
-                                Ok(rpc_resp) => {
-                                    let elapsed_ms = call_started.elapsed().as_millis() as u64;
-                                    let _ = k
-                                        .paas
-                                        .record_usage(&org_id, bound_ws_id.as_deref(), 1, elapsed_ms, 0)
-                                        .await;
-                                    ("HTTP/1.1 200 OK", rpc_resp.to_string())
-                                }
-                                Err(e) => (
-                                    "HTTP/1.1 500 Internal Server Error",
-                                    json!({ "error": e.to_string() }).to_string(),
-                                ),
+                                    Ok(tier) => {
+                                        let _ = k
+                                            .ensure_agent_environment(
+                                                identity.clone(),
+                                                &bound_ws_path,
+                                                IsolationTier::NativeOsSandbox,
+                                                vec!["*".to_string()],
+                                            )
+                                            .await;
+                                        // Enforce per-tier `max_exec_timeout_ms` on remote `proc_exec` calls
+                                        let max_timeout = tier.max_exec_timeout_ms();
+                                        if let Some(params) = rpc_req.get_mut("params") {
+                                            if params.get("name").and_then(|v| v.as_str())
+                                                == Some("proc_exec")
+                                            {
+                                                if let Some(args) = params
+                                                    .get_mut("arguments")
+                                                    .and_then(|v| v.as_object_mut())
+                                                {
+                                                    let req_t = args
+                                                        .get("timeout_ms")
+                                                        .and_then(|v| v.as_u64())
+                                                        .unwrap_or(max_timeout);
+                                                    args.insert(
+                                                        "timeout_ms".to_string(),
+                                                        json!(req_t.min(max_timeout)),
+                                                    );
+                                                }
+                                            }
+                                        }
+                                        match k.handle_jsonrpc_message(&identity, rpc_req).await {
+                                            Ok(rpc_resp) => {
+                                                let elapsed_ms =
+                                                    call_started.elapsed().as_millis() as u64;
+                                                let _ = k
+                                                    .paas
+                                                    .record_usage(
+                                                        &org_id,
+                                                        bound_ws_id.as_deref(),
+                                                        1,
+                                                        elapsed_ms,
+                                                        0,
+                                                    )
+                                                    .await;
+                                                ("HTTP/1.1 200 OK", rpc_resp.to_string())
+                                            }
+                                            Err(e) => (
+                                                "HTTP/1.1 500 Internal Server Error",
+                                                json!({ "error": e.to_string() }).to_string(),
+                                            ),
+                                        }
+                                    }
                                 }
                             }
                             Err(e) => (
@@ -4104,7 +4311,7 @@ mod tests {
         assert!(reclaim_head.contains("404 Not Found"));
 
         // 5. Provision an active Cloud Workspace for `polar-org` using the claimed key
-        let (ws_head, _) = http_req_with_headers(
+        let (ws_head, ws_resp) = http_req_with_headers(
             addr,
             "POST",
             "/v1/workspaces",
@@ -4117,7 +4324,12 @@ mod tests {
             })),
         )
         .await;
-        assert!(ws_head.contains("200 OK"));
+        assert!(
+            ws_head.contains("200 OK"),
+            "ws_head={}, ws_resp={}",
+            ws_head,
+            ws_resp
+        );
 
         // 6. Send Lemon Squeezy `subscription_cancelled` webhook -> revokes subscription key, downgrades to Community, and hibernates workspace!
         let ls_cancel = json!({
@@ -4161,6 +4373,111 @@ mod tests {
         )
         .await;
         assert!(revoked_head.contains("401 Unauthorized"));
+
+        // 7. Verify Admin Secret Guard on `POST /v1/tenants/plan` blocks unauthorized self-upgrades
+        let (unauth_plan_head, unauth_plan_resp) = http_req_with_headers(
+            addr,
+            "POST",
+            "/v1/tenants/plan",
+            &[("X-Aegis-Admin-Secret-Override", "adm_secret_999")],
+            Some(json!({ "org_id": "free-org", "plan_tier": "pro" })),
+        )
+        .await;
+        assert!(unauth_plan_head.contains("403 Forbidden"));
+        assert_eq!(unauth_plan_resp["code"], "PAYWALL_ADMIN_SECRET_REQUIRED");
+
+        // 8. Verify `/v1/mcp` Dynamic Concurrent Agent Paywall on Free (`community`) plan (max 1 active Agent)
+        let (agent1_head, agent1_resp) = http_req_with_headers(
+            addr,
+            "POST",
+            "/v1/mcp",
+            &[
+                ("X-Aegis-Org", "free-org"),
+                ("X-Aegis-Agent", "claude-agent-1"),
+            ],
+            Some(json!({
+                "jsonrpc": "2.0",
+                "id": 10,
+                "method": "tools/call",
+                "params": {
+                    "name": "workspace_status",
+                    "arguments": {}
+                }
+            })),
+        )
+        .await;
+        assert!(agent1_head.contains("200 OK"));
+        assert!(agent1_resp["result"]["isError"].is_null());
+
+        // Second concurrent Agent (`cursor-agent-2`) on Free (`community`) plan is blocked by the Paywall!
+        let (agent2_head, agent2_resp) = http_req_with_headers(
+            addr,
+            "POST",
+            "/v1/mcp",
+            &[
+                ("X-Aegis-Org", "free-org"),
+                ("X-Aegis-Agent", "cursor-agent-2"),
+            ],
+            Some(json!({
+                "jsonrpc": "2.0",
+                "id": 11,
+                "method": "tools/call",
+                "params": {
+                    "name": "workspace_status",
+                    "arguments": {}
+                }
+            })),
+        )
+        .await;
+        assert!(agent2_head.contains("200 OK"));
+        assert_eq!(agent2_resp["result"]["isError"], true);
+        assert_eq!(
+            agent2_resp["result"]["paywall"]["code"],
+            "PAYWALL_CONCURRENT_AGENTS_LIMIT"
+        );
+        assert!(agent2_resp["result"]["content"][0]["text"]
+            .as_str()
+            .unwrap()
+            .contains("[AEGIS CLOUD PAYWALL"));
+
+        // 9. Verify `X-Aegis-Paywall-Mode: http-402` returns HTTP 402 Payment Required
+        let (p402_head, p402_resp) = http_req_with_headers(
+            addr,
+            "POST",
+            "/v1/mcp",
+            &[
+                ("X-Aegis-Org", "free-org"),
+                ("X-Aegis-Agent", "cursor-agent-2"),
+                ("X-Aegis-Paywall-Mode", "http-402"),
+            ],
+            Some(json!({
+                "jsonrpc": "2.0",
+                "id": 12,
+                "method": "tools/call",
+                "params": {
+                    "name": "workspace_status",
+                    "arguments": {}
+                }
+            })),
+        )
+        .await;
+        assert!(p402_head.contains("402 Payment Required"));
+        assert_eq!(p402_resp["code"], "PAYWALL_CONCURRENT_AGENTS_LIMIT");
+
+        // 10. Verify `/v1/billing/status` returns live quota & subscription status without leaking `ak_live_*`
+        let (stat_head, stat_resp) = http_req_with_headers(
+            addr,
+            "GET",
+            "/v1/billing/status?org_id=free-org",
+            &[],
+            None,
+        )
+        .await;
+        assert!(stat_head.contains("200 OK"));
+        assert_eq!(stat_resp["plan_tier"], "community");
+        assert_eq!(stat_resp["quotas"]["daily_syscalls_used"], 1);
+        assert_eq!(stat_resp["quotas"]["daily_syscalls_limit"], 200);
+        assert_eq!(stat_resp["quotas"]["active_agents_count"], 1);
     }
 
     #[tokio::test]
