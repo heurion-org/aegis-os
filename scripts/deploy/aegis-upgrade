@@ -1,0 +1,104 @@
+#!/usr/bin/env bash
+# Upgrades this Aegis Cloud node to a signed release. Installed as /usr/local/sbin/aegis-upgrade and
+# used as the SSH forced command of the CI deploy key, so the caller can only pick *which signed tag*
+# to run: `ssh root@node v1.2.3`.
+#
+# Downloads the tag's assets from GitHub Releases, verifies every one against the pinned release key
+# (/etc/aegis-cloud/release_signer), swaps the binary atomically, restarts the daemon and rolls back
+# if it does not come up healthy. Only then does it refresh the installer mirror (<data>/releases).
+set -euo pipefail
+
+CONF_DIR="${AEGIS_CONF_DIR:-/etc/aegis-cloud}"
+# Root-owned overrides (DATA_ROOT, SERVICE, PORT, RELEASE_BASE_URL, BIN); never taken from the caller.
+if [[ -f "$CONF_DIR/deploy.conf" ]]; then
+  # shellcheck disable=SC1091
+  . "$CONF_DIR/deploy.conf"
+fi
+DATA_ROOT="${DATA_ROOT:-/mnt/btrfs/aegis-cloud}"
+SERVICE="${SERVICE:-aegis-cloud}"
+PORT="${PORT:-17080}"
+BIN="${BIN:-/usr/local/bin/aegis-os}"
+RELEASE_BASE_URL="${RELEASE_BASE_URL:-https://github.com/heurion-org/aegis-os/releases/download}"
+PRINCIPAL="aegis-os-release@heurion.org"
+NAMESPACE="aegis-os-release"
+ASSETS=(aegis-os-darwin-arm64 aegis-os-darwin-x86_64 aegis-os-linux-aarch64 aegis-os-linux-x86_64 SHA256SUMS)
+
+TAG="${SSH_ORIGINAL_COMMAND:-${1:-}}"
+if [[ ! "$TAG" =~ ^v[0-9]+\.[0-9]+\.[0-9]+(-[0-9A-Za-z.]+)?$ ]]; then
+  echo "usage: aegis-upgrade vX.Y.Z" >&2
+  exit 2
+fi
+case "$(uname -m)" in
+  x86_64 | amd64) ASSET="aegis-os-linux-x86_64" ;;
+  aarch64 | arm64) ASSET="aegis-os-linux-aarch64" ;;
+  *) echo "unsupported architecture $(uname -m)" >&2; exit 2 ;;
+esac
+if [[ ! -s "$CONF_DIR/release_signer" ]]; then
+  echo "missing $CONF_DIR/release_signer (run bootstrap_server.sh)" >&2
+  exit 2
+fi
+
+exec 9>/run/aegis-upgrade.lock
+flock -n 9 || { echo "another upgrade is already running" >&2; exit 3; }
+
+WORK="$(mktemp -d)"
+trap 'rm -rf "$WORK"' EXIT
+
+echo "==> Downloading $TAG"
+for a in "${ASSETS[@]}"; do
+  curl -fsSL "$RELEASE_BASE_URL/$TAG/$a" -o "$WORK/$a"
+  curl -fsSL "$RELEASE_BASE_URL/$TAG/$a.sig" -o "$WORK/$a.sig"
+done
+
+echo "==> Verifying signatures"
+for a in "${ASSETS[@]}"; do
+  if ! ssh-keygen -Y verify -f "$CONF_DIR/release_signer" -I "$PRINCIPAL" -n "$NAMESPACE" \
+    -s "$WORK/$a.sig" < "$WORK/$a" >/dev/null 2>&1; then
+    echo "signature verification FAILED for $a; aborting without changes" >&2
+    exit 4
+  fi
+done
+
+healthy() {
+  for _ in $(seq 1 30); do
+    if curl -fsS -m 2 "http://127.0.0.1:$PORT/health" >/dev/null 2>&1; then
+      return 0
+    fi
+    sleep 1
+  done
+  return 1
+}
+
+# Always replace by rename: rewriting an executable in place can break the running copy.
+swap_in() {
+  install -m 0755 "$1" "$BIN.new"
+  mv -f "$BIN.new" "$BIN"
+}
+
+echo "==> Installing $ASSET"
+if [[ -f "$BIN" ]]; then
+  cp -p "$BIN" "$BIN.prev"
+fi
+swap_in "$WORK/$ASSET"
+systemctl restart "$SERVICE"
+
+if ! healthy; then
+  echo "$SERVICE unhealthy after upgrade to $TAG; rolling back" >&2
+  if [[ -f "$BIN.prev" ]]; then
+    swap_in "$BIN.prev"
+    systemctl restart "$SERVICE"
+    healthy && echo "rolled back to previous binary" >&2 || echo "ROLLBACK ALSO UNHEALTHY: check journalctl -u $SERVICE" >&2
+  fi
+  exit 5
+fi
+
+echo "==> Refreshing installer mirror"
+mkdir -p "$DATA_ROOT/releases"
+for a in "${ASSETS[@]}"; do
+  for f in "$a" "$a.sig"; do
+    install -m 0644 "$WORK/$f" "$DATA_ROOT/releases/.$f.new"
+    mv -f "$DATA_ROOT/releases/.$f.new" "$DATA_ROOT/releases/$f"
+  done
+done
+echo "$TAG" > "$CONF_DIR/deployed_tag"
+echo "==> Deployed $TAG"

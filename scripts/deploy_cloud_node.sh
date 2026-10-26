@@ -44,7 +44,21 @@ fi
 chmod +x /usr/local/bin/aegis-os
 ln -sf /usr/local/bin/aegis-os /usr/local/bin/aos
 
-echo "==> [4/6] Configuring systemd service (aegis-cloud.service on 127.0.0.1:${PORT})..."
+echo "==> [4/6] Configuring systemd service (aegis-cloud.service on port ${PORT})..."
+# Secrets live in a root-only EnvironmentFile, not in the world-readable unit. AOS_ADMIN_SECRET is the
+# operator token (approvals, plan changes, cross-org views); keep it out of agents' reach.
+install -d -m 0755 /etc/aegis-cloud
+if [[ ! -f /etc/aegis-cloud/env ]]; then
+  ( umask 077; cat > /etc/aegis-cloud/env <<EOF
+AOS_BILLING_WEBHOOK_SECRET=${POLAR_WEBHOOK_SECRET}
+AOS_CHECKOUT_URL_PRO=https://buy.polar.sh/polar_cl_jCPpzbp4eOAyRbkDP4YzNIFVnYLddbvJZI5Fc27zL0x
+AOS_ADMIN_SECRET=$(openssl rand -hex 32)
+EOF
+  )
+fi
+chmod 0600 /etc/aegis-cloud/env
+# Listens on all interfaces so a containerized reverse proxy can reach it over the Docker bridge:
+# the firewall MUST restrict ${PORT} to the proxy (e.g. `ufw allow from 172.16.0.0/12 to any port ${PORT}`).
 cat > /etc/systemd/system/aegis-cloud.service <<EOF
 [Unit]
 Description=Aegis OS Multi-Tenant Cloud Sandbox PaaS Daemon
@@ -53,9 +67,7 @@ After=network.target
 [Service]
 Type=simple
 WorkingDirectory=${DATA_ROOT}
-Environment="AOS_REQUIRE_API_KEY=1"
-Environment="AOS_BILLING_WEBHOOK_SECRET=${POLAR_WEBHOOK_SECRET}"
-Environment="AOS_CHECKOUT_URL_PRO=https://buy.polar.sh/polar_cl_jCPpzbp4eOAyRbkDP4YzNIFVnYLddbvJZI5Fc27zL0x"
+EnvironmentFile=/etc/aegis-cloud/env
 ExecStart=/usr/local/bin/aegis-os --runtime-dir ${DATA_ROOT} --workspace ${DATA_ROOT}/default_workspace daemon --listen 0.0.0.0:${PORT}
 Restart=always
 RestartSec=2
@@ -97,4 +109,6 @@ if [[ -n "${DOMAIN}" ]]; then
 else
   echo "  Local Endpoint  : http://127.0.0.1:${PORT}"
 fi
+echo "  Operator token  : AOS_ADMIN_SECRET in /etc/aegis-cloud/env (root-only)"
+echo "  CI deploys      : run scripts/deploy/bootstrap_server.sh once to enable signed upgrades"
 echo "=================================================================="
