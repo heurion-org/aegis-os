@@ -1,0 +1,140 @@
+name: release
+
+# Tag push -> build & test 4 targets -> [approval: release] sign, publish, Formula PR
+#          -> [approval: production] deploy the signed Linux binary to the cloud node.
+on:
+  push:
+    tags: ["v*"]
+
+permissions:
+  contents: read
+
+concurrency:
+  group: release
+  cancel-in-progress: false
+
+jobs:
+  build:
+    name: build (${{ matrix.triple }})
+    runs-on: ${{ matrix.runner }}
+    strategy:
+      fail-fast: true
+      matrix:
+        include:
+          - { runner: macos-14, triple: aarch64-apple-darwin, asset: aegis-os-darwin-arm64, test: true }
+          - { runner: macos-14, triple: x86_64-apple-darwin, asset: aegis-os-darwin-x86_64, test: false }
+          # Ubuntu 22.04 runners: glibc 2.35 keeps binaries runnable on 22.04 servers.
+          - { runner: ubuntu-22.04, triple: x86_64-unknown-linux-gnu, asset: aegis-os-linux-x86_64, test: true }
+          - { runner: ubuntu-22.04-arm, triple: aarch64-unknown-linux-gnu, asset: aegis-os-linux-aarch64, test: true }
+    env:
+      MACOSX_DEPLOYMENT_TARGET: "11.0"
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust toolchain
+        run: |
+          command -v rustup >/dev/null || curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y --profile minimal
+          echo "$HOME/.cargo/bin" >> "$GITHUB_PATH"
+          "$HOME/.cargo/bin/rustup" target add ${{ matrix.triple }}
+
+      - name: Install bubblewrap (Linux sandbox tests)
+        if: runner.os == 'Linux'
+        run: sudo apt-get update -qq && sudo apt-get install -y -qq bubblewrap
+
+      - name: Test
+        if: matrix.test
+        run: cargo test --workspace --locked
+
+      - name: Build
+        run: cargo build --release --locked -p aos-cli --target ${{ matrix.triple }}
+
+      - name: Package
+        run: |
+          mkdir -p out
+          bin="target/${{ matrix.triple }}/release/aegis-os"
+          cp "$bin" "out/${{ matrix.asset }}"
+          tar -czf "out/aegis-os-${GITHUB_REF_NAME}-${{ matrix.triple }}.tar.gz" \
+            -C "$(dirname "$bin")" aegis-os -C "$GITHUB_WORKSPACE" README.md Formula/aegis-os.rb
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.asset }}
+          path: out/*
+          if-no-files-found: error
+
+  release:
+    needs: build
+    runs-on: ubuntu-22.04
+    # Configure required reviewers on this environment; it is the only place the signing key exists.
+    environment: release
+    permissions:
+      contents: write
+      pull-requests: write
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/download-artifact@v4
+        with:
+          path: dist
+          merge-multiple: true
+
+      - name: Sign
+        env:
+          RELEASE_SIGNING_KEY: ${{ secrets.RELEASE_SIGNING_KEY }}
+        run: |
+          keyfile="$(mktemp)"
+          trap 'rm -f "$keyfile"' EXIT
+          chmod 600 "$keyfile"
+          printf '%s\n' "$RELEASE_SIGNING_KEY" > "$keyfile"
+          scripts/release/sign.sh "$keyfile" dist
+
+      - name: Verify against the key end users trust
+        run: scripts/release/verify.sh dist
+
+      - name: Publish GitHub release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: gh release create "$GITHUB_REF_NAME" dist/* --verify-tag --generate-notes --title "Aegis OS $GITHUB_REF_NAME"
+
+      - name: Open Homebrew formula PR
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          scripts/release/update_formula.py "$GITHUB_REF_NAME" dist/SHA256SUMS
+          branch="release/formula-$GITHUB_REF_NAME"
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git switch -c "$branch"
+          git commit -am "chore(formula): update to $GITHUB_REF_NAME"
+          git push origin "$branch"
+          gh pr create --base main --head "$branch" \
+            --title "chore(formula): update to $GITHUB_REF_NAME" \
+            --body "Points Formula/aegis-os.rb at the signed $GITHUB_REF_NAME release artifacts."
+
+  deploy:
+    needs: release
+    runs-on: ubuntu-22.04
+    # Configure required reviewers; holds the deploy key, whose only power on the node is the
+    # `aegis-upgrade` forced command (download + verify a signed tag, swap, health-check, roll back).
+    environment: production
+    steps:
+      - name: Upgrade cloud node
+        env:
+          DEPLOY_HOST: ${{ vars.DEPLOY_HOST }}
+          DEPLOY_SSH_KEY: ${{ secrets.DEPLOY_SSH_KEY }}
+          DEPLOY_KNOWN_HOSTS: ${{ secrets.DEPLOY_KNOWN_HOSTS }}
+        run: |
+          install -d -m 700 ~/.ssh
+          printf '%s\n' "$DEPLOY_SSH_KEY" > ~/.ssh/deploy_key
+          printf '%s\n' "$DEPLOY_KNOWN_HOSTS" > ~/.ssh/known_hosts
+          chmod 600 ~/.ssh/deploy_key ~/.ssh/known_hosts
+          ssh -i ~/.ssh/deploy_key -o IdentitiesOnly=yes -o StrictHostKeyChecking=yes \
+            "root@$DEPLOY_HOST" "$GITHUB_REF_NAME"
+
+      - name: Public health check
+        run: |
+          for _ in $(seq 1 10); do
+            curl -fsS https://heurion.org/aegis-cloud/health && exit 0
+            sleep 3
+          done
+          exit 1
