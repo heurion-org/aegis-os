@@ -96,7 +96,11 @@ where
 
 fn tail_lossy(buf: &Mutex<Vec<u8>>) -> String {
     let buf = buf.lock().unwrap();
-    let start = buf.len().saturating_sub(TIMEOUT_TAIL_BYTES);
+    let mut start = buf.len().saturating_sub(TIMEOUT_TAIL_BYTES);
+    // Skip UTF-8 continuation bytes so the cut never lands mid-character.
+    while start < buf.len() && (buf[start] & 0xC0) == 0x80 {
+        start += 1;
+    }
     String::from_utf8_lossy(&buf[start..]).trim_end().to_string()
 }
 
@@ -119,6 +123,10 @@ async fn run_foreground(
     let (out_buf, mut out_task) = spawn_pipe_reader(child.stdout.take());
     let (err_buf, mut err_task) = spawn_pipe_reader(child.stderr.take());
 
+    async fn drain(out: &mut tokio::task::JoinHandle<()>, err: &mut tokio::task::JoinHandle<()>) {
+        let _ = out.await;
+        let _ = err.await;
+    }
     let waited = tokio::time::timeout(timeout, child.wait()).await;
     let status = match waited {
         Ok(Ok(status)) => status,
@@ -130,6 +138,13 @@ async fn run_foreground(
         }
         Err(_) => {
             kill_process_group(pid);
+            // Let the readers pick up what is still buffered in the pipes: the last output before
+            // a hang is usually the most useful part.
+            let _ = tokio::time::timeout(
+                Duration::from_millis(200),
+                drain(&mut out_task, &mut err_task),
+            )
+            .await;
             out_task.abort();
             err_task.abort();
             let mut msg = format!(
@@ -148,10 +163,6 @@ async fn run_foreground(
         }
     };
 
-    async fn drain(out: &mut tokio::task::JoinHandle<()>, err: &mut tokio::task::JoinHandle<()>) {
-        let _ = out.await;
-        let _ = err.await;
-    }
     let pipes_held_open = tokio::time::timeout(
         PIPE_DRAIN_GRACE,
         drain(&mut out_task, &mut err_task),
@@ -176,8 +187,9 @@ async fn run_foreground(
         stderr.extend_from_slice(
             format!(
                 "\n[aegis-os] Process exited but descendants still held stdout/stderr after {}ms; \
-                 killed process group {}. Output may be truncated and background processes were \
-                 terminated (use `\"background\": true` for long-lived services).\n",
+                 killed process group {}. Output may be truncated. Processes that left the group \
+                 (setsid/daemonized) may still be running (use `\"background\": true` for \
+                 long-lived services).\n",
                 PIPE_DRAIN_GRACE.as_millis(),
                 pid
             )
@@ -689,7 +701,9 @@ impl SandboxInstance for NativeOsSandboxInstance {
             let tmp_err = bg_dir.join(format!("job-{}.stderr.log", tag));
             let out_file = std::fs::File::create(&tmp_out)?;
             let err_file = std::fs::File::create(&tmp_err)?;
-            cmd.stdout(Stdio::from(out_file))
+            // Never inherit the server's stdin: under MCP stdio it is the JSON-RPC stream.
+            cmd.stdin(Stdio::null())
+                .stdout(Stdio::from(out_file))
                 .stderr(Stdio::from(err_file))
                 .kill_on_drop(false);
 
@@ -1006,6 +1020,15 @@ mod tests {
             String::from_utf8_lossy(&out.stderr).contains("killed process group"),
             "forced cleanup must be reported"
         );
+    }
+
+    #[test]
+    fn timeout_tail_never_splits_utf8() {
+        // 3-byte chars whose total length is not a multiple of 3 once cut at TIMEOUT_TAIL_BYTES.
+        let text = format!("x{}", "中".repeat(TIMEOUT_TAIL_BYTES));
+        let tail = tail_lossy(&Mutex::new(text.into_bytes()));
+        assert!(!tail.contains('\u{FFFD}'));
+        assert!(tail.chars().all(|c| c == '中'));
     }
 
     #[cfg(unix)]
