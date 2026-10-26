@@ -94,6 +94,14 @@ fn shadow_path_for_read(root: &Path, host_root: &Path, rel: &str) -> anyhow::Res
     Ok((rel_path.to_string_lossy().into_owned(), real))
 }
 
+/// Tools that mint leases. They stay callable in-process (CLI `aegis-os policy approve`, dashboard,
+/// benches) but are never exposed to agents over MCP: an agent must not approve its own escalation.
+pub const HUMAN_ONLY_TOOLS: &[&str] = &["policy_approve_escalation", "policy_grant_lease"];
+
+/// Upper bound for leases minted through `call_tool`; never permanent (`ttl <= 0` used to mean
+/// "never expires"). The CLI's `aegis-os policy approve` calls the policy kernel directly.
+const MAX_TOOL_LEASE_TTL_SECS: i64 = 24 * 3600;
+
 pub struct AgentEnvironment {
     pub identity: AgentIdentity,
     pub workspace: Arc<dyn TransactionalWorkspace>,
@@ -681,7 +689,7 @@ impl AegisRuntimeKernel {
                         "reason": reason,
                         "suggested_lease_scope": suggested_lease_scope,
                         "hint": format!(
-                            "Run `aegis-os policy approve {}` in terminal or call `policy_approve_escalation` to grant a Session Lease.",
+                            "Ask the user to approve in a terminal: `aegis-os policy approve {0}` (in Claude Code: `! aegis-os policy approve {0}`). Agents cannot approve their own escalations.",
                             escalation_id
                         )
                     }));
@@ -1475,7 +1483,8 @@ impl AegisRuntimeKernel {
                 let ttl_secs = args
                     .get("ttl_secs")
                     .and_then(|v| v.as_i64())
-                    .unwrap_or(3600);
+                    .unwrap_or(3600)
+                    .clamp(1, MAX_TOOL_LEASE_TTL_SECS);
 
                 let lease = self
                     .policy
@@ -1500,7 +1509,21 @@ impl AegisRuntimeKernel {
                 let ttl_secs = args
                     .get("ttl_secs")
                     .and_then(|v| v.as_i64())
-                    .unwrap_or(3600);
+                    .unwrap_or(3600)
+                    .clamp(1, MAX_TOOL_LEASE_TTL_SECS);
+                let in_org = self
+                    .policy
+                    .list_escalations(&identity.org_id)
+                    .await?
+                    .iter()
+                    .any(|e| e.escalation_id == esc_id);
+                if !in_org {
+                    bail!(
+                        "Escalation '{}' not found in organization '{}'",
+                        esc_id,
+                        identity.org_id
+                    );
+                }
                 let lease = self
                     .policy
                     .approve_escalation(esc_id, ttl_secs, "user_owner")
@@ -1984,31 +2007,6 @@ impl AegisRuntimeKernel {
                     "inputSchema": { "type": "object", "properties": {} }
                 },
                 {
-                    "name": "policy_approve_escalation",
-                    "description": "Approve a pending escalation ID and issue a Session Lease so boundary operations proceed without repeated prompts.",
-                    "inputSchema": {
-                        "type": "object",
-                        "properties": {
-                            "escalation_id": { "type": "string" },
-                            "ttl_secs": { "type": "integer" }
-                        },
-                        "required": ["escalation_id"]
-                    }
-                },
-                {
-                    "name": "policy_grant_lease",
-                    "description": "Grant a session lease for boundary actions (e.g. `workspace_commit`) to eliminate repeated prompts.",
-                    "inputSchema": {
-                        "type": "object",
-                        "properties": {
-                            "action_pattern": { "type": "string" },
-                            "resource_pattern": { "type": "string" },
-                            "ttl_secs": { "type": "integer" }
-                        },
-                        "required": ["action_pattern"]
-                    }
-                },
-                {
                     "name": "runtime_configure_mode",
                     "description": "[Zero-Prompt] Configure or switch the current workspace's Aegis OS execution mode directly from the Coding Agent (`mode`: `\"cloud\"` for Zero-Local-Load Cloud Sandbox, `\"pro\"` for Pro Multi-Agent Cloud Sandbox, `\"local\"` for Free Local CoW Sandbox mode, or `\"status\"` to inspect current mode). Credentials are automatically loaded from local `~/.aegis-os/cloud_bindings.json` or auto-provisioned by the local runtime — NEVER ask the user to paste raw `ak_live_*` API keys into chat.",
                     "inputSchema": {
@@ -2329,7 +2327,15 @@ impl AegisRuntimeKernel {
                     .cloned()
                     .unwrap_or_else(|| json!({}));
 
-                match self.call_tool(identity, name, arguments).await {
+                let result = if HUMAN_ONLY_TOOLS.contains(&name) {
+                    Err(anyhow::anyhow!(
+                        "`{}` is reserved for the human operator; agents cannot grant leases or approve escalations. Ask the user to run `aegis-os policy approve <escalation_id>` in a terminal (in Claude Code: `! aegis-os policy approve <escalation_id>`).",
+                        name
+                    ))
+                } else {
+                    self.call_tool(identity, name, arguments).await
+                };
+                match result {
                     Ok(mut val) => {
                         // Push channel for every MCP client (incl. ones without lifecycle hooks):
                         // piggyback a compact unread-mail summary on each tool result.
@@ -3592,6 +3598,47 @@ mod tests {
         let (clean, full) = shadow_path_for_write(&shadow, "/src/a..b.rs").unwrap();
         assert_eq!(clean, "src/a..b.rs");
         assert_eq!(full, shadow.join("src/a..b.rs"));
+    }
+
+    #[tokio::test]
+    async fn agents_cannot_grant_leases_or_approve_escalations_over_mcp() {
+        let temp = tempfile::tempdir().unwrap();
+        let kernel = AegisRuntimeKernel::new(&temp.path().join("rt")).await.unwrap();
+        let agent = AgentIdentity::new("acme", "coder-1", "Engineer");
+
+        let list = kernel
+            .handle_jsonrpc_message(&agent, json!({ "jsonrpc": "2.0", "id": 1, "method": "tools/list" }))
+            .await
+            .unwrap();
+        let names: Vec<&str> = list["result"]["tools"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter_map(|t| t["name"].as_str())
+            .collect();
+        assert!(names.contains(&"policy_list_escalations"));
+        for tool in HUMAN_ONLY_TOOLS {
+            assert!(!names.contains(tool), "{tool} must not be advertised to agents");
+            let resp = kernel
+                .handle_jsonrpc_message(
+                    &agent,
+                    json!({
+                        "jsonrpc": "2.0",
+                        "id": 2,
+                        "method": "tools/call",
+                        "params": { "name": tool, "arguments": { "escalation_id": "esc-x", "action_pattern": "*" } }
+                    }),
+                )
+                .await
+                .unwrap();
+            assert_eq!(resp["result"]["isError"], true, "{tool}");
+            assert!(resp["result"]["content"][0]["text"]
+                .as_str()
+                .unwrap()
+                .contains("reserved for the human operator"));
+        }
+        let leases = kernel.policy.list_leases("acme", None).await.unwrap();
+        assert!(leases.is_empty(), "no lease may be minted via MCP");
     }
 
     #[cfg(unix)]
