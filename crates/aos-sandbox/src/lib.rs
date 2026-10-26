@@ -37,6 +37,17 @@ impl Drop for EgressBridge {
     }
 }
 
+/// Bubblewrap is looked up only at fixed system paths; resolving it through `PATH` would let
+/// whoever controls the server's environment substitute an unconfined `bwrap`.
+fn linux_bwrap_path() -> Option<&'static str> {
+    if !cfg!(target_os = "linux") {
+        return None;
+    }
+    ["/usr/bin/bwrap", "/usr/local/bin/bwrap", "/bin/bwrap"]
+        .into_iter()
+        .find(|p| Path::new(p).exists())
+}
+
 /// How long stdout/stderr may keep draining after a foreground command exits before its process
 /// group is killed. Grandchildren (vitest/jest workers, watchers) inherit the pipes, so waiting for
 /// pipe EOF alone can block the single-threaded MCP loop forever.
@@ -553,11 +564,10 @@ impl SandboxInstance for NativeOsSandboxInstance {
             let mut c = Command::new("/usr/bin/sandbox-exec");
             c.arg("-p").arg(sbpl).arg(&spec.command).args(&spec.args);
             (c, "macos-seatbelt-kernel-enforced".to_string())
-        } else if cfg!(target_os = "linux")
-            && !kernel_sandbox_disabled
-            && Path::new("/usr/bin/bwrap").exists()
+        } else if let Some(bwrap) = linux_bwrap_path()
+            .filter(|_| !kernel_sandbox_disabled && !nested_bg_inherited)
         {
-            let mut c = Command::new("/usr/bin/bwrap");
+            let mut c = Command::new(bwrap);
             c.args(self.generate_linux_bwrap_args()).arg("--");
             // `--unshare-net` also cuts the sandbox off from its own proxy; relay through the
             // Unix-socket bridge so it can reach exactly that proxy and nothing else.
@@ -577,10 +587,18 @@ impl SandboxInstance for NativeOsSandboxInstance {
             }
             c.arg(&spec.command).args(&spec.args);
             (c, "linux-bwrap-namespace-enforced".to_string())
-        } else {
+        } else if kernel_sandbox_disabled || nested_bg_inherited {
             let mut c = Command::new(&spec.command);
             c.args(&spec.args);
             (c, "posix-isolated-env".to_string())
+        } else {
+            // Fail closed: running unconfined while reporting a sandbox would silently hand the
+            // agent full user privileges.
+            bail!(
+                "No kernel sandbox available: proc_exec requires /usr/bin/sandbox-exec (macOS) or \
+                 bubblewrap at /usr/bin/bwrap, /usr/local/bin/bwrap or /bin/bwrap (Linux). Install \
+                 bubblewrap (e.g. `apt install bubblewrap`) and retry."
+            );
         };
 
         cmd.current_dir(&work_dir)
@@ -875,7 +893,8 @@ impl SandboxInstance for MicroVmSandboxInstance {
             bail!("MicroVM '{}' is paused", self.instance_id);
         }
         let mut out = native.exec(spec).await?;
-        out.sandbox_profile_used = "microvm-virtiofs-v1".to_string();
+        // No hypervisor is launched yet; report the confinement that actually ran.
+        out.sandbox_profile_used = format!("microvm-emulated({})", out.sandbox_profile_used);
         Ok(out)
     }
 
@@ -1100,7 +1119,12 @@ mod tests {
         if nested {
             eprintln!("skipping: running inside an Aegis Seatbelt sandbox (nested sandbox_apply is not permitted)");
         }
-        nested
+        // exec now fails closed on Linux hosts without bubblewrap.
+        let no_bwrap = cfg!(target_os = "linux") && linux_bwrap_path().is_none();
+        if no_bwrap {
+            eprintln!("skipping: bubblewrap is not installed");
+        }
+        nested || no_bwrap
     }
 
     #[tokio::test]
