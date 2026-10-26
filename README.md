@@ -155,9 +155,10 @@ For developers who prefer explicit terminal control, 100% of Cloud PaaS operatio
 - **Subscribe to Aegis Cloud Pro ($29/mo)**: [https://buy.polar.sh/polar_cl_jCPpzbp4eOAyRbkDP4YzNIFVnYLddbvJZI5Fc27zL0x](https://buy.polar.sh/polar_cl_jCPpzbp4eOAyRbkDP4YzNIFVnYLddbvJZI5Fc27zL0x)
 
 ```bash
-# Subscribe to Aegis Cloud Pro ($29/mo) via Polar.sh & claim your `ak_live_*` key after checkout
+# Subscribe to Aegis Cloud Pro ($29/mo) via Polar.sh & claim your `ak_live_*` key after checkout.
+# `subscribe` saves a one-time claim token locally; only that token can collect the paid key.
 aegis-os cloud subscribe --plan pro --email you@example.com
-aegis-os cloud subscribe --claim --email you@example.com
+aegis-os cloud subscribe --claim
 
 # Authenticate or bind current project to an Aegis Cloud Sandbox (0% local CPU/RAM load)
 aegis-os cloud login --endpoint https://heurion.org

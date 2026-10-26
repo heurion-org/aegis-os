@@ -2902,7 +2902,7 @@ impl AegisRuntimeKernel {
                         if require_admin
                             && !paas::PaasControlPlane::secrets_match(provided_admin, expected_admin.trim())
                         {
-                            let checkout = k.paas.build_checkout_info(t_org, tier, None);
+                            let checkout = k.paas.build_checkout_info(t_org, tier, None, None);
                             (
                                 "HTTP/1.1 403 Forbidden",
                                 json!({
@@ -2911,7 +2911,7 @@ impl AegisRuntimeKernel {
                                     "org_id": t_org,
                                     "requested_plan": tier.as_str(),
                                     "checkout_url": checkout["checkout_url"],
-                                    "cli_command": "aegis-os cloud subscribe --claim --email <your-email> && aegis-os cloud up"
+                                    "cli_command": "aegis-os cloud subscribe --plan pro  # pay in browser, then: aegis-os cloud subscribe --claim && aegis-os cloud up"
                                 })
                                 .to_string(),
                             )
@@ -3001,8 +3001,13 @@ impl AegisRuntimeKernel {
                             }
                         }
                         let tier = paas::PlanTier::from_str_lossy(&c_plan);
-                        let info = k.paas.build_checkout_info(&c_org, tier, c_email.as_deref());
-                        ("HTTP/1.1 200 OK", info.to_string())
+                        match k.paas.create_checkout(&c_org, tier, c_email.as_deref()).await {
+                            Ok(info) => ("HTTP/1.1 200 OK", info.to_string()),
+                            Err(e) => (
+                                "HTTP/1.1 500 Internal Server Error",
+                                json!({ "error": e.to_string() }).to_string(),
+                            ),
+                        }
                     } else if method == "POST" && full_target.starts_with("/v1/billing/webhook") {
                         let webhook_secret = k.paas.webhook_secret();
                         if webhook_secret.trim().is_empty() {
@@ -3039,12 +3044,11 @@ impl AegisRuntimeKernel {
                     } else if method == "POST" && full_target.starts_with("/v1/billing/claim") {
                         let payload: Value =
                             serde_json::from_str(body_str.trim()).unwrap_or_else(|_| json!({}));
-                        let c_org = payload.get("org_id").and_then(|v| v.as_str());
-                        let c_email = payload
-                            .get("email")
-                            .or_else(|| payload.get("customer_email"))
-                            .and_then(|v| v.as_str());
-                        match k.paas.claim_subscription_key(c_org, c_email).await {
+                        let claim_token = payload
+                            .get("claim_token")
+                            .and_then(|v| v.as_str())
+                            .unwrap_or("");
+                        match k.paas.claim_subscription_key(claim_token).await {
                             Ok(val) => ("HTTP/1.1 200 OK", val.to_string()),
                             Err(e) => (
                                 "HTTP/1.1 404 Not Found",
@@ -4426,6 +4430,24 @@ mod tests {
             .as_str()
             .unwrap()
             .contains("checkout[custom][org_id]=polar-org"));
+        let claim_id = chk_resp["claim_id"].as_str().unwrap().to_string();
+        let claim_token = chk_resp["claim_token"].as_str().unwrap().to_string();
+        assert!(chk_resp["checkout_url"]
+            .as_str()
+            .unwrap()
+            .contains(&format!("metadata[claim_id]={claim_id}")));
+        assert!(!chk_resp["checkout_url"].as_str().unwrap().contains(&claim_token));
+
+        // Someone else starting a checkout for the same org gets a token that can't collect our key.
+        let (_, other_chk) = http_req_with_headers(
+            addr,
+            "GET",
+            "/v1/billing/checkout?org_id=polar-org&plan=team",
+            &[],
+            None,
+        )
+        .await;
+        let other_token = other_chk["claim_token"].as_str().unwrap().to_string();
 
         // 2. Verify HMAC-SHA256 webhook signature rejection on forged signature
         let webhook_secret = "whsec_polar_test_secret_123";
@@ -4437,7 +4459,8 @@ mod tests {
                 "customer_email": "founder@polar-org.dev",
                 "metadata": {
                     "org_id": "polar-org",
-                    "plan_tier": "team"
+                    "plan_tier": "team",
+                    "claim_id": claim_id
                 }
             }
         });
@@ -4474,14 +4497,26 @@ mod tests {
         assert_eq!(wh_resp["provider"], "polar");
         assert_eq!(wh_resp["plan_tier"], "team");
         assert_eq!(wh_resp["max_concurrent_agents"], 32);
+        assert!(wh_resp.get("api_key").is_none(), "raw key must not be echoed to the provider");
 
-        // 4. Subscriber claims their newly minted `ak_live_*` key via `POST /v1/billing/claim`
+        // 4. An email or org id alone, or another checkout's token, can't collect the key.
+        for body in [
+            json!({ "email": "founder@polar-org.dev" }),
+            json!({ "org_id": "polar-org" }),
+            json!({ "claim_token": other_token }),
+        ] {
+            let (head, _) =
+                http_req_with_headers(addr, "POST", "/v1/billing/claim", &[], Some(body)).await;
+            assert!(head.contains("404 Not Found"), "{head}");
+        }
+
+        // The buyer claims their newly minted `ak_live_*` key with the checkout's claim token.
         let (claim_head, claim_resp) = http_req_with_headers(
             addr,
             "POST",
             "/v1/billing/claim",
             &[],
-            Some(json!({ "email": "founder@polar-org.dev" })),
+            Some(json!({ "claim_token": claim_token })),
         )
         .await;
         assert!(claim_head.contains("200 OK"));
@@ -4495,7 +4530,7 @@ mod tests {
             "POST",
             "/v1/billing/claim",
             &[],
-            Some(json!({ "email": "founder@polar-org.dev" })),
+            Some(json!({ "claim_token": claim_token })),
         )
         .await;
         assert!(reclaim_head.contains("404 Not Found"));

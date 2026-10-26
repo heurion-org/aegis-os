@@ -143,7 +143,21 @@ pub struct BillingSubscriptionRecord {
     pub issued_key_id: Option<String>,
     #[serde(default)]
     pub claimable_api_key: Option<String>,
+    /// Public id of the checkout that paid for this subscription (from checkout metadata); the
+    /// matching secret claim token is the only way to collect `claimable_api_key`.
+    #[serde(default)]
+    pub claim_id: Option<String>,
     pub updated_at_ms: i64,
+}
+
+/// A checkout started via `/v1/billing/checkout`. Only the SHA-256 of the claim token is stored;
+/// the raw token is returned once, to whoever started the checkout.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PendingClaimRecord {
+    pub claim_id: String,
+    pub token_sha256: String,
+    pub org_id: String,
+    pub created_at_ms: i64,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -241,6 +255,8 @@ struct PersistedPaasState {
     tenants: Vec<TenantUsageRecord>,
     #[serde(default)]
     subscriptions: Vec<BillingSubscriptionRecord>,
+    #[serde(default)]
+    pending_claims: Vec<PendingClaimRecord>,
 }
 
 pub struct PaasControlPlane {
@@ -673,13 +689,13 @@ impl PaasControlPlane {
         let _ = self.flush().await;
 
         if let Some((code, reason_en, reason_zh)) = violation {
-            let checkout = self.build_checkout_info(org_id, PlanTier::Pro, None);
+            let checkout = self.build_checkout_info(org_id, PlanTier::Pro, None, None);
             let checkout_url = checkout
                 .get("checkout_url")
                 .and_then(|v| v.as_str())
                 .unwrap_or(Self::DEFAULT_POLAR_PRO_CHECKOUT_URL);
             let notice = format!(
-                "[AEGIS CLOUD PAYWALL — {}]\n{}\n{}\n\n👉 立即升级 Aegis Cloud Pro ($29/mo · 16 Workspaces · 8 Parallel Agents · 64GB Online OS Runtime):\n   • Web Console: https://heurion.org/aegis-cloud/dashboard\n   • Direct Checkout: {}\n   • 付款后在终端一行命令激活 (密钥存本机，不经过大模型):\n     aegis-os cloud subscribe --claim --email <你的付款邮箱> && aegis-os cloud up",
+                "[AEGIS CLOUD PAYWALL — {}]\n{}\n{}\n\n👉 立即升级 Aegis Cloud Pro ($29/mo · 16 Workspaces · 8 Parallel Agents · 64GB Online OS Runtime):\n   • Web Console: https://heurion.org/aegis-cloud/dashboard\n   • Direct Checkout: {}\n   • 付款后在终端一行命令激活 (密钥存本机，不经过大模型):\n     aegis-os cloud subscribe --plan pro  (先在终端发起结账，付款后再运行) aegis-os cloud subscribe --claim && aegis-os cloud up",
                 code, reason_zh, reason_en, checkout_url
             );
             return Err(json!({
@@ -704,7 +720,7 @@ impl PaasControlPlane {
                     "monthly_price_usd": 29,
                     "checkout_url": checkout_url,
                     "dashboard_url": "https://heurion.org/aegis-cloud/dashboard",
-                    "cli_command": "aegis-os cloud subscribe --claim --email <your-email> && aegis-os cloud up"
+                    "cli_command": "aegis-os cloud subscribe --plan pro  # pay in browser, then: aegis-os cloud subscribe --claim && aegis-os cloud up"
                 },
                 "agent_notice": notice
             }));
@@ -779,12 +795,6 @@ impl PaasControlPlane {
             None => (0, 0, Vec::new()),
         };
 
-        let email_display = matched_sub
-            .as_ref()
-            .and_then(|s| s.customer_email.clone())
-            .or(email_norm.clone())
-            .unwrap_or_else(|| "you@company.com".to_string());
-
         json!({
             "found_subscription": matched_sub.is_some(),
             "subscription_status": matched_sub.as_ref().map(|s| s.status.as_str()).unwrap_or("none"),
@@ -806,7 +816,7 @@ impl PaasControlPlane {
                 "max_exec_timeout_ms": tier.max_exec_timeout_ms(),
                 "idle_hibernate_timeout_ms": tier.idle_hibernate_timeout_ms()
             },
-            "claim_command": format!("aegis-os cloud subscribe --claim --email {} && aegis-os cloud up", email_display)
+            "claim_command": "aegis-os cloud subscribe --claim && aegis-os cloud up  # uses the claim token saved when the checkout was started"
         })
     }
 
@@ -844,6 +854,7 @@ impl PaasControlPlane {
         org_id: &str,
         plan_tier: PlanTier,
         customer_email: Option<&str>,
+        claim_id: Option<&str>,
     ) -> Value {
         let base_url = match plan_tier {
             PlanTier::Team => std::env::var("AOS_CHECKOUT_URL_TEAM")
@@ -858,14 +869,18 @@ impl PaasControlPlane {
             .filter(|e| !e.trim().is_empty())
             .map(|e| format!("&customer_email={}", e.trim()))
             .unwrap_or_default();
+        let claim_qs = claim_id
+            .map(|c| format!("&metadata[claim_id]={}", c))
+            .unwrap_or_default();
         let checkout_url = format!(
-            "{}{}reference_id={}&metadata[org_id]={}&metadata[plan_tier]={}{}",
+            "{}{}reference_id={}&metadata[org_id]={}&metadata[plan_tier]={}{}{}",
             base_url,
             sep,
             org_id,
             org_id,
             plan_tier.as_str(),
-            email_qs
+            email_qs,
+            claim_qs
         );
 
         let ls_base = std::env::var("AOS_LEMONSQUEEZY_CHECKOUT_URL").unwrap_or_else(|_| {
@@ -875,13 +890,16 @@ impl PaasControlPlane {
             )
         });
         let ls_url = format!(
-            "{}?checkout[custom][org_id]={}&checkout[custom][plan_tier]={}{}",
+            "{}?checkout[custom][org_id]={}&checkout[custom][plan_tier]={}{}{}",
             ls_base,
             org_id,
             plan_tier.as_str(),
             customer_email
                 .filter(|e| !e.trim().is_empty())
                 .map(|e| format!("&checkout[email]={}", e.trim()))
+                .unwrap_or_default(),
+            claim_id
+                .map(|c| format!("&checkout[custom][claim_id]={}", c))
                 .unwrap_or_default()
         );
 
@@ -898,6 +916,52 @@ impl PaasControlPlane {
             },
             "next_step": "Complete checkout in browser; our `/v1/billing/webhook` automatically upgrades your tenant and mints an `ak_live_*` key. Then run `aegis-os cloud subscribe --claim` to activate locally."
         })
+    }
+
+    /// Most pending checkouts kept per org; older ones are dropped (bounds unauthenticated growth).
+    const MAX_PENDING_CLAIMS_PER_ORG: usize = 5;
+
+    /// Starts a checkout: like [`Self::build_checkout_info`], plus a one-time `claim_token` that is
+    /// the only credential able to collect the API key minted when this checkout is paid.
+    pub async fn create_checkout(
+        &self,
+        org_id: &str,
+        plan_tier: PlanTier,
+        customer_email: Option<&str>,
+    ) -> anyhow::Result<Value> {
+        self.reload().await;
+        let claim_id = format!("clm-{}", &Uuid::new_v4().simple().to_string()[..12]);
+        let claim_token = format!("ct_{}{}", Uuid::new_v4().simple(), Uuid::new_v4().simple());
+        {
+            let mut state = self.state.write().await;
+            state.pending_claims.push(PendingClaimRecord {
+                claim_id: claim_id.clone(),
+                token_sha256: Self::sha256_hex(&claim_token),
+                org_id: org_id.to_string(),
+                created_at_ms: Utc::now().timestamp_millis(),
+            });
+            let for_org = state.pending_claims.iter().filter(|c| c.org_id == org_id).count();
+            let mut excess = for_org.saturating_sub(Self::MAX_PENDING_CLAIMS_PER_ORG);
+            state.pending_claims.retain(|c| {
+                if excess > 0 && c.org_id == org_id {
+                    excess -= 1;
+                    false
+                } else {
+                    true
+                }
+            });
+        }
+        self.flush().await?;
+        let mut info = self.build_checkout_info(org_id, plan_tier, customer_email, Some(&claim_id));
+        if let Some(obj) = info.as_object_mut() {
+            obj.insert("claim_id".into(), json!(claim_id));
+            obj.insert("claim_token".into(), json!(claim_token));
+            obj.insert(
+                "claim_hint".into(),
+                json!("Keep `claim_token` secret: after paying, it is the only way to collect your API key (`aegis-os cloud subscribe --claim`)."),
+            );
+        }
+        Ok(info)
     }
 
     /// Process a Polar.sh, Lemon Squeezy, or Stripe billing webhook payload:
@@ -1113,7 +1177,12 @@ impl PaasControlPlane {
             plan_tier,
             status: "active".to_string(),
             issued_key_id: Some(key_rec.key_id.clone()),
-            claimable_api_key: Some(raw_key.clone()),
+            claimable_api_key: Some(raw_key),
+            claim_id: metadata_node
+                .and_then(|m| m.get("claim_id"))
+                .and_then(|v| v.as_str())
+                .map(|s| s.trim().to_string())
+                .filter(|s| !s.is_empty()),
             updated_at_ms: now,
         };
 
@@ -1136,37 +1205,34 @@ impl PaasControlPlane {
             "plan_tier": tenant.plan_tier,
             "max_concurrent_agents": tenant.max_concurrent_agents,
             "max_exec_timeout_ms": plan_tier.max_exec_timeout_ms(),
-            "api_key": raw_key,
+            // The raw key is never echoed to the billing provider; the buyer collects it with
+            // their claim token.
             "key_id": key_rec.key_id
         }))
     }
 
-    /// Claim the newly minted `ak_live_*` API key for an active subscription by `org_id` or `customer_email`.
-    pub async fn claim_subscription_key(
-        &self,
-        org_id: Option<&str>,
-        customer_email: Option<&str>,
-    ) -> anyhow::Result<Value> {
+    /// Collects the `ak_live_*` key minted for a paid checkout. Requires the one-time claim token
+    /// returned by [`Self::create_checkout`]; an org id or email alone is not proof of payment.
+    pub async fn claim_subscription_key(&self, claim_token: &str) -> anyhow::Result<Value> {
         self.reload().await;
-        let email_norm = customer_email
-            .map(|e| e.trim().to_lowercase())
-            .filter(|e| !e.is_empty());
-        let org_norm = org_id.map(|o| o.trim()).filter(|o| !o.is_empty());
-
+        let token = claim_token.trim();
+        if token.is_empty() {
+            bail!("Missing claim_token (returned by `aegis-os cloud subscribe` when the checkout was started)");
+        }
+        let hash = Self::sha256_hex(token);
         let mut state = self.state.write().await;
+        let pending = state
+            .pending_claims
+            .iter()
+            .find(|c| Self::secrets_match(&c.token_sha256, &hash))
+            .cloned()
+            .context("Unknown or already used claim token")?;
         let sub = state
             .subscriptions
             .iter_mut()
             .rev()
-            .find(|s| {
-                s.status == "active"
-                    && (email_norm
-                        .as_ref()
-                        .map_or(false, |em| s.customer_email.as_ref() == Some(em))
-                        || org_norm.map_or(false, |og| s.org_id == og))
-            })
-            .context("No active subscription found for the given org_id or email")?;
-
+            .find(|s| s.status == "active" && s.claim_id.as_deref() == Some(pending.claim_id.as_str()))
+            .context("Checkout not paid yet: no active subscription for this claim token (retry after the payment webhook arrives)")?;
         let claimed_key = sub
             .claimable_api_key
             .take()
@@ -1180,6 +1246,7 @@ impl PaasControlPlane {
             "plan_tier": sub.plan_tier,
             "api_key": claimed_key
         });
+        state.pending_claims.retain(|c| c.claim_id != pending.claim_id);
         drop(state);
         self.flush().await?;
         Ok(out)
@@ -2975,7 +3042,7 @@ pub const DASHBOARD_HTML: &str = r##"<!doctype html>
 
       <div class="nav-right">
         <button class="lang-btn" id="langBtn" type="button" onclick="toggleLang()">EN</button>
-        <a class="btn btn-solid" href="https://buy.polar.sh/polar_cl_jCPpzbp4eOAyRbkDP4YzNIFVnYLddbvJZI5Fc27zL0x" target="_blank" rel="noopener" data-i18n="nav_subscribe">立即订阅 Pro ($29/月) →</a>
+        <a class="btn btn-solid" href="https://buy.polar.sh/polar_cl_jCPpzbp4eOAyRbkDP4YzNIFVnYLddbvJZI5Fc27zL0x" target="_blank" rel="noopener" onclick="return startCheckout(event, this)" data-i18n="nav_subscribe">立即订阅 Pro ($29/月) →</a>
       </div>
     </div>
   </header>
@@ -3124,7 +3191,7 @@ pub const DASHBOARD_HTML: &str = r##"<!doctype html>
                   <span class="tag tag-active"><span class="dot-mint"></span><span data-i18n="tier_pro_tag">PRO 专业版 · 多 AGENT 并行运行时</span></span>
                   <h3 class="card-title" data-i18n="tier_pro_title">$29 / 月 · 16 个线上工作区 · 8 个 Agent 并行</h3>
                 </div>
-                <a class="btn btn-solid" id="btn-buy-pro" href="https://buy.polar.sh/polar_cl_jCPpzbp4eOAyRbkDP4YzNIFVnYLddbvJZI5Fc27zL0x" target="_blank" rel="noopener" data-i18n="btn_buy_pro">① 立即订阅 Pro ($29/月) →</a>
+                <a class="btn btn-solid" id="btn-buy-pro" href="https://buy.polar.sh/polar_cl_jCPpzbp4eOAyRbkDP4YzNIFVnYLddbvJZI5Fc27zL0x" target="_blank" rel="noopener" onclick="return startCheckout(event, this)" data-i18n="btn_buy_pro">① 立即订阅 Pro ($29/月) →</a>
               </div>
 
               <p class="card-desc" data-i18n="tier_pro_desc">解锁最多 16 个线上 OS 工作区与 8 个 Agent 并行运行时：付款后在本机直接认领凭证并挂载，密钥直存本机（不经过大模型）：</p>
@@ -3321,6 +3388,43 @@ pub const DASHBOARD_HTML: &str = r##"<!doctype html>
       window.__t = setTimeout(() => { el.style.display = 'none'; }, 3600);
     }
 
+    function claimToken() {
+      try { return localStorage.getItem('aegis_claim_token') || ''; } catch (e) { return ''; }
+    }
+
+    // Same org derivation the billing webhook uses for email-only checkouts.
+    function orgFromEmail(email) {
+      const prefix = (email || '').split('@')[0].replace(/[^A-Za-z0-9]/g, '-');
+      return prefix || 'aegis-os';
+    }
+
+    // Starts the checkout through the API so it carries a claim id, and keeps the one-time claim
+    // token (the only credential that can collect the paid key) in this browser.
+    async function startCheckout(ev, link) {
+      ev.preventDefault();
+      const win = window.open('', '_blank');
+      const email = getEnteredEmail();
+      const apiBase = window.location.pathname.startsWith('/aegis-cloud') ? '/aegis-cloud' : '';
+      let url = link.href;
+      try {
+        const res = await fetch(`${apiBase}/v1/billing/checkout`, {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ plan_tier: 'pro', email: email || undefined, org_id: orgFromEmail(email) })
+        });
+        const data = await res.json();
+        if (data.checkout_url && data.claim_token) {
+          url = data.checkout_url;
+          try { localStorage.setItem('aegis_claim_token', data.claim_token); } catch (e) {}
+          updateCliSnippets();
+        }
+      } catch (e) {
+        toast(currentLang === 'en' ? 'Could not reach billing API; opening plain checkout' : '无法连接计费接口，已打开普通结账页');
+      }
+      if (win) { win.location = url; } else { window.location = url; }
+      return false;
+    }
+
     function getEnteredEmail() {
       const el = document.getElementById('sub-email-input');
       return el && el.value.trim() ? el.value.trim() : '';
@@ -3376,7 +3480,7 @@ pub const DASHBOARD_HTML: &str = r##"<!doctype html>
 
     function updateCliSnippets() {
       const origin = window.location.origin;
-      const email = getEnteredEmail() || (currentLang === 'en' ? 'you@company.com' : '你的付款邮箱');
+      const claimArg = claimToken() || (currentLang === 'en' ? '<click ① Subscribe in this browser first>' : '<请先在本浏览器点击 ① 订阅>');
       const freeBox = document.getElementById('cli-snippet-free');
       const proBox = document.getElementById('cli-snippet-pro');
       if (freeBox) {
@@ -3395,11 +3499,11 @@ aegis-os cloud up`;
           ? `# 1. Install CLI if not already installed
 curl -fsSL ${origin}/aegis-cloud/install.sh | sh
 # 2. Claim Pro key locally (~/.aegis-os) & enable Cloud Sandbox
-aegis-os cloud subscribe --claim --email ${email} && aegis-os cloud up`
+aegis-os cloud subscribe --claim --claim-token ${claimArg} && aegis-os cloud up`
           : `# 1. 若首次使用，先运行一行安装命令（已安装可跳过）
 curl -fsSL ${origin}/aegis-cloud/install.sh | sh
-# 2. 用付款邮箱在本机认领 Pro 密钥并启用云端沙箱（密钥不经过 LLM）
-aegis-os cloud subscribe --claim --email ${email} && aegis-os cloud up`;
+# 2. 用本浏览器保存的一次性认领凭证在本机认领 Pro 密钥并启用云端沙箱（密钥不经过 LLM）
+aegis-os cloud subscribe --claim --claim-token ${claimArg} && aegis-os cloud up`;
       }
     }
 

@@ -108,6 +108,9 @@ pub enum CloudAction {
         /// Claim the `ak_live_*` API key minted by `/v1/billing/webhook` after completing checkout
         #[arg(long, default_value_t = false)]
         claim: bool,
+        /// Claim token from the checkout (defaults to the one saved by the last `cloud subscribe`)
+        #[arg(long)]
+        claim_token: Option<String>,
         #[arg(long)]
         endpoint: Option<String>,
     },
@@ -155,6 +158,9 @@ struct CloudBindingsStore {
     auth: Option<CloudAuthConfig>,
     #[serde(default)]
     bindings: Vec<CloudWorkspaceBinding>,
+    /// One-time token from the last `cloud subscribe` checkout; needed by `--claim`.
+    #[serde(default)]
+    pending_claim_token: Option<String>,
 }
 
 fn store_path(runtime_dir: &Path) -> PathBuf {
@@ -175,7 +181,13 @@ fn save_store(runtime_dir: &Path, store: &CloudBindingsStore) -> anyhow::Result<
         std::fs::create_dir_all(parent)?;
     }
     let bytes = serde_json::to_vec_pretty(store)?;
-    std::fs::write(p, bytes)?;
+    std::fs::write(&p, bytes)?;
+    // Holds API keys and claim tokens: owner-only.
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&p, std::fs::Permissions::from_mode(0o600))?;
+    }
     Ok(())
 }
 
@@ -956,6 +968,7 @@ pub async fn handle_cloud_command(
             plan,
             email,
             claim,
+            claim_token,
             endpoint,
         } => {
             let active = resolve_active_cloud_binding(runtime_dir, &canon);
@@ -968,16 +981,16 @@ pub async fn handle_cloud_command(
                 .to_string();
 
             if claim {
+                let Some(token) = claim_token.or_else(|| store.pending_claim_token.clone()) else {
+                    bail!("No claim token found: run `aegis-os cloud subscribe` to start the checkout (it saves the token), or pass --claim-token");
+                };
                 let resp = cloud_http_json(
                     "POST",
                     &ep,
                     "/v1/billing/claim",
                     None,
                     &[],
-                    Some(&json!({
-                        "org_id": identity.org_id,
-                        "email": email
-                    })),
+                    Some(&json!({ "claim_token": token })),
                 )
                 .await?;
                 if let Some(claimed_key) = resp.get("api_key").and_then(|v| v.as_str()) {
@@ -987,6 +1000,7 @@ pub async fn handle_cloud_command(
                         org_id: identity.org_id.clone(),
                         updated_at_ms: Utc::now().timestamp_millis(),
                     });
+                    store.pending_claim_token = None;
                     save_store(runtime_dir, &store)?;
                 }
                 println!("{}", serde_json::to_string_pretty(&resp)?);
@@ -1024,9 +1038,14 @@ pub async fn handle_cloud_command(
                         "checkout_url": fallback_url,
                         "providers": {
                             "polar_sh": fallback_url
-                        }
+                        },
+                        "warning": "Endpoint unreachable: this offline checkout link has no claim token, so `--claim` will not work for it. Retry once the endpoint is reachable."
                     })
                 });
+                if let Some(token) = resp.get("claim_token").and_then(|v| v.as_str()) {
+                    store.pending_claim_token = Some(token.to_string());
+                    save_store(runtime_dir, &store)?;
+                }
                 println!("{}", serde_json::to_string_pretty(&resp)?);
             }
         }
