@@ -479,6 +479,17 @@ impl NativeOsSandboxInstance {
             "--ro-bind".to_string(),
             "/".to_string(),
             "/".to_string(),
+            // Fresh procfs for the sandbox's PID namespace: the host `/proc` carried in by the
+            // root bind lists every host process and its command line (tokens passed as args).
+            "--proc".to_string(),
+            "/proc".to_string(),
+            // Minimal writable devtmpfs: the read-only root bind otherwise makes `/dev/null`
+            // unwritable, breaking every `> /dev/null`.
+            "--dev".to_string(),
+            "/dev".to_string(),
+            // Detach from the caller's controlling terminal so TIOCSTI cannot inject keystrokes
+            // into the user's shell on kernels that still allow it.
+            "--new-session".to_string(),
             // The private `/tmp` must be mounted *before* the writable binds below: bwrap applies
             // mounts in order, so a later `--tmpfs /tmp` would hide any workspace/home living under
             // `/tmp` (the default runtime dir is `/tmp/aegis-os-runtime`).
@@ -1261,6 +1272,58 @@ mod tests {
             .await
             .unwrap();
         assert_ne!(open.exit_code, Some(0), "{open:?}");
+    }
+
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn bwrap_hides_host_processes_and_keeps_dev_usable() {
+        if nested_in_aegis_sandbox() {
+            return;
+        }
+        let tmp = tempfile::tempdir().unwrap();
+        let sbx = NativeOsSandboxDriver
+            .create_sandbox(SandboxConfig {
+                identity: AgentIdentity::new("acme", "coder-1", "Engineer"),
+                tier: IsolationTier::NativeOsSandbox,
+                limits: ResourceLimits::default(),
+                workspace_dir: tmp.path().join("ws"),
+                agent_home_dir: tmp.path().join("home"),
+                org_shared_ro_dir: tmp.path().join("ro"),
+                org_agent_pub_dir: tmp.path().join("pub"),
+                egress_proxy_addr: None,
+            })
+            .await
+            .unwrap();
+        let run = |cmd: &str, timeout_ms: u64| ExecSpec {
+            command: "sh".to_string(),
+            args: vec!["-c".to_string(), cmd.to_string()],
+            cwd: None,
+            env: HashMap::new(),
+            timeout_ms: Some(timeout_ms),
+            background: false,
+        };
+
+        // Only the sandbox's own PID namespace is visible, so host command lines can't leak.
+        let ps = sbx.exec(run("ls -d /proc/[0-9]* | wc -l", 5000)).await.unwrap();
+        assert!(ps.stdout.trim().parse::<u32>().unwrap() < 10, "{ps:?}");
+        let host_pid = std::process::id();
+        let peek = sbx.exec(run(&format!("cat /proc/{host_pid}/cmdline"), 5000)).await.unwrap();
+        assert_ne!(peek.exit_code, Some(0), "{peek:?}");
+
+        // `/dev/null` stays writable despite the read-only root bind.
+        let devnull = sbx.exec(run("echo x > /dev/null && echo ok", 5000)).await.unwrap();
+        assert_eq!(devnull.stdout.trim(), "ok", "{devnull:?}");
+
+        // `--new-session` moves the command out of our process group, but orphans holding the
+        // pipes still die with bwrap's PID namespace instead of wedging the call.
+        let start = Instant::now();
+        let orphan = sbx.exec(run("sleep 30 & echo done", 20_000)).await.unwrap();
+        assert_eq!(orphan.stdout.trim(), "done");
+        assert!(start.elapsed() < Duration::from_secs(5), "{:?}", start.elapsed());
+        let start = Instant::now();
+        let hung = sbx.exec(run("sleep 30 & wait", 500)).await;
+        assert!(hung.unwrap_err().to_string().contains("timed out"));
+        assert!(start.elapsed() < Duration::from_secs(5));
     }
 
     #[tokio::test]
