@@ -69,7 +69,6 @@ jobs:
     environment: release
     permissions:
       contents: write
-      pull-requests: write
     steps:
       - uses: actions/checkout@v4
 
@@ -96,10 +95,21 @@ jobs:
           GH_TOKEN: ${{ github.token }}
         run: gh release create "$GITHUB_REF_NAME" dist/* --verify-tag --generate-notes --title "Aegis OS $GITHUB_REF_NAME"
 
+  # Separate job so a formula hiccup never blocks the deploy of an already-published release.
+  formula:
+    needs: release
+    runs-on: ubuntu-22.04
+    permissions:
+      contents: write
+      pull-requests: write
+    steps:
+      - uses: actions/checkout@v4
+
       - name: Open Homebrew formula PR
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
+          gh release download "$GITHUB_REF_NAME" -p SHA256SUMS -D dist
           scripts/release/update_formula.py "$GITHUB_REF_NAME" dist/SHA256SUMS
           branch="release/formula-$GITHUB_REF_NAME"
           git config user.name "github-actions[bot]"
@@ -107,9 +117,11 @@ jobs:
           git switch -c "$branch"
           git commit -am "chore(formula): update to $GITHUB_REF_NAME"
           git push origin "$branch"
+          # Needs Settings -> Actions -> "Allow GitHub Actions to create and approve pull requests".
           gh pr create --base main --head "$branch" \
             --title "chore(formula): update to $GITHUB_REF_NAME" \
-            --body "Points Formula/aegis-os.rb at the signed $GITHUB_REF_NAME release artifacts."
+            --body "Points Formula/aegis-os.rb at the signed $GITHUB_REF_NAME release artifacts." \
+            || echo "::warning::Could not open the PR; open it from branch $branch"
 
   deploy:
     needs: release
