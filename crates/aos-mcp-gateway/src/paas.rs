@@ -3177,7 +3177,7 @@ pub const DASHBOARD_HTML: &str = r##"<!doctype html>
           <span class="brand-word">HEURION</span>
         </a>
         <div class="foot-right">
-          <span>© 2026 Heurion Research · Aegis Cloud v{{AOS_VERSION}} · MIT Licensed</span>
+          <span>© 2026 Heurion Research · Aegis Cloud v{{AOS_VERSION}} · Apache-2.0</span>
           <a href="https://heurion.org/" class="foot-link">Heurion.org</a>
           <a href="https://github.com/heurion-org/aegis-os" target="_blank" rel="noopener" class="foot-link">GitHub</a>
           <a href="https://heurion.org/llms.txt" class="foot-link">LLMs.txt</a>
