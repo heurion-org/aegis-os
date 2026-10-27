@@ -276,12 +276,38 @@ pub fn sandbox_redirect_reason(cmd: &str, shadow_root: &Path, host_root: &Path) 
 }
 
 /// Classify a native `run_command` invocation.
+/// `aegis-os … policy approve|lease`, `aegis-os … cloud approve`, `aegis-os … cloud approver enroll`
+/// anywhere in the command line (also through `sh -c`, `env`, `script`, … wrappers).
+pub fn invokes_approval_cli(cmd: &str) -> bool {
+    let words: Vec<String> = cmd
+        .split(|c: char| c.is_whitespace() || matches!(c, '"' | '\'' | ';' | '&' | '|' | '(' | ')' | '`'))
+        .filter(|w| !w.is_empty())
+        .map(|w| w.to_string())
+        .collect();
+    words.iter().enumerate().any(|(i, w)| {
+        if basename(w) != "aegis-os" {
+            return false;
+        }
+        let rest: Vec<&str> = words[i + 1..].iter().map(|s| s.as_str()).filter(|w| !w.starts_with('-')).collect();
+        rest.windows(2).any(|pair| {
+            matches!(pair, ["policy", "approve"] | ["policy", "lease"] | ["cloud", "approve"] | ["cloud", "approver"])
+        })
+    })
+}
+
 pub fn classify_run_command(cmd: &str, shadow_root: &Path, host_root: &Path) -> Route {
     let trimmed = cmd.trim();
     if trimmed.is_empty() {
         return Route::Pass;
     }
     let segments = split_segments(trimmed);
+
+    // Approvals are for the human: an agent must not run the CLI that approves its own escalations.
+    if invokes_approval_cli(trimmed) {
+        return Route::Deny {
+            reason: "Blocked by Aegis OS: approving escalations, granting leases and enrolling approvers is done by a human in their own terminal, not by an agent. Ask the user to run it.".to_string(),
+        };
+    }
 
     // Ring-0 first: any segment.
     for seg in &segments {
@@ -463,6 +489,24 @@ pub fn classify_native_write(path: &Path, repo_root: &Path) -> Route {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn agents_cannot_run_approval_commands() {
+        let root = Path::new("/tmp/none");
+        for cmd in [
+            "aegis-os policy approve esc-1",
+            "~/.local/bin/aegis-os --org acme policy lease --ttl-secs 60",
+            "cd x && aegis-os cloud approve esc-1",
+            "sh -c 'aegis-os cloud approve esc-1'",
+            "script -q /dev/null /usr/local/bin/aegis-os policy approve esc-1",
+            "aegis-os cloud approver enroll --email a@b.co",
+        ] {
+            assert!(matches!(classify_run_command(cmd, root, root), Route::Deny { .. }), "{cmd}");
+        }
+        for cmd in ["aegis-os policy status", "aegis-os cloud approvals", "echo approve policy", "grep -rn 'policy approve' README.md"] {
+            assert!(!invokes_approval_cli(cmd), "{cmd}");
+        }
+    }
 
     fn shadow() -> PathBuf {
         PathBuf::from("/tmp/aegis-os-runtime/orgs/o/agents/a/cow_workspace/upper_workspace")

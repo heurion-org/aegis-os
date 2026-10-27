@@ -1140,7 +1140,7 @@ impl AppStoreRegistry {
                         "reason": reason,
                         "suggested_lease_scope": suggested_lease_scope,
                         "hint": format!(
-                            "Tool `{}:{}` is lease-gated under AAP-1.0. Approve with `aegis-os --org {} policy approve {}`.",
+                            "Tool `{}:{}` is lease-gated under AAP-1.0. Ask the user to approve in their terminal: `aegis-os --org {} policy approve {}`.",
                             clean_app, clean_tool, identity.org_id, escalation_id
                         )
                     }));

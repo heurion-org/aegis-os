@@ -1718,6 +1718,28 @@ async fn handle_agy_hook(
             let _ = kernel.ipc.touch_peer(&identity).await;
             coord::reset_stop_budget(&cli.runtime_dir, &identity.agent_id);
 
+            // Claude Code sends `tool_name` / `tool_input` and reads `hookSpecificOutput`. Its Bash
+            // calls get the approval guard; other Claude tools are not routed by this hook.
+            if payload.get("tool_name").and_then(|v| v.as_str()) == Some("Bash") {
+                let command = payload
+                    .get("tool_input")
+                    .and_then(|i| i.get("command"))
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("");
+                if routing::invokes_approval_cli(command) {
+                    println!(
+                        "{}",
+                        serde_json::to_string(&json!({
+                            "hookSpecificOutput": {
+                                "hookEventName": "PreToolUse",
+                                "permissionDecision": "deny",
+                                "permissionDecisionReason": "Blocked by Aegis OS: approving escalations, granting leases and enrolling approvers is done by a human in their own terminal, not by an agent. Ask the user to run it (in Claude Code: `! <command>`)."
+                            }
+                        }))?
+                    );
+                    return Ok(());
+                }
+            }
             let tool_name = payload
                 .get("toolCall")
                 .and_then(|tc| tc.get("name"))
