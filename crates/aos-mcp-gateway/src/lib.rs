@@ -98,6 +98,53 @@ fn shadow_path_for_read(root: &Path, host_root: &Path, rel: &str) -> anyhow::Res
 /// benches) but are never exposed to agents over MCP: an agent must not approve its own escalation.
 pub const HUMAN_ONLY_TOOLS: &[&str] = &["policy_approve_escalation", "policy_grant_lease"];
 
+/// MCP tool annotations, `(name, readOnlyHint, destructiveHint, idempotentHint, openWorldHint)`,
+/// declared on every tool so hosts can decide what to confirm. "Read-only" means the call leaves the
+/// shadow workspace, host repo and shared Org state untouched; "open world" means it can reach
+/// systems outside the runtime. Keep in step with each handler when its behaviour changes.
+pub const TOOL_ANNOTATIONS: &[(&str, bool, bool, bool, bool)] = &[
+    ("fs_read", true, false, true, false),
+    ("fs_write", false, true, true, false),
+    ("fs_edit", false, true, false, false),
+    ("fs_delete", false, true, true, false),
+    ("fs_glob", true, false, true, false),
+    // Auto-rebases the shadow onto the host before reporting.
+    ("workspace_status", false, false, true, false),
+    ("workspace_sync", false, false, true, false),
+    ("workspace_snapshot", false, false, false, false),
+    ("workspace_diff", false, false, true, false),
+    ("workspace_rollback", false, true, true, false),
+    ("workspace_commit", false, true, false, false),
+    ("workspace_export_pr", false, false, false, false),
+    // Arbitrary sandboxed commands; network policy depends on the sandbox profile.
+    ("proc_exec", false, true, false, true),
+    ("org_artifact_publish", false, false, true, false),
+    ("org_artifact_fetch", true, false, true, false),
+    ("org_kv_put", false, false, false, false),
+    ("org_kv_get", true, false, true, false),
+    ("ipc_list_peers", true, false, true, false),
+    ("ipc_update_card", false, false, true, false),
+    ("ipc_task_update", false, false, false, false),
+    ("ipc_task_get", true, false, true, false),
+    ("ipc_task_list", true, false, true, false),
+    ("ipc_send", false, false, false, false),
+    ("ipc_request", false, false, false, false),
+    ("ipc_reply", false, false, false, false),
+    ("ipc_recv", true, false, true, false),
+    ("ipc_publish", false, false, false, false),
+    ("ipc_subscribe", false, false, true, false),
+    ("ipc_ack", false, false, true, false),
+    // Inspects and rewrites the request at the boundary; it does not forward it (yet).
+    ("egress_http_request", true, false, true, false),
+    ("coord_claim", false, false, true, false),
+    ("coord_release", false, false, true, false),
+    ("policy_list_escalations", true, false, true, false),
+    ("runtime_configure_mode", false, false, true, true),
+    ("app_catalog_search", true, false, true, false),
+    ("app_mount_session", false, false, true, true),
+    ("app_call_tool", false, true, false, true),
+];
+
 /// Upper bound for leases minted through `call_tool`; never permanent (`ttl <= 0` used to mean
 /// "never expires"). The CLI's `aegis-os policy approve` calls the policy kernel directly.
 const MAX_TOOL_LEASE_TTL_SECS: i64 = 24 * 3600;
@@ -1678,6 +1725,26 @@ impl AegisRuntimeKernel {
     }
 
     pub fn mcp_tools_schema() -> Value {
+        let mut schema = Self::mcp_tools_schema_unannotated();
+        if let Some(tools) = schema["tools"].as_array_mut() {
+            for tool in tools {
+                let name = tool["name"].as_str().unwrap_or_default();
+                if let Some(&(_, read_only, destructive, idempotent, open_world)) =
+                    TOOL_ANNOTATIONS.iter().find(|(n, ..)| *n == name)
+                {
+                    tool["annotations"] = json!({
+                        "readOnlyHint": read_only,
+                        "destructiveHint": destructive,
+                        "idempotentHint": idempotent,
+                        "openWorldHint": open_world,
+                    });
+                }
+            }
+        }
+        schema
+    }
+
+    fn mcp_tools_schema_unannotated() -> Value {
         json!({
             "tools": [
                 {
@@ -2183,7 +2250,7 @@ impl AegisRuntimeKernel {
                     "protocolVersion": "2024-11-05",
                     "serverInfo": {
                         "name": "aegis-os-runtime",
-                        "version": "0.2.0"
+                        "version": env!("CARGO_PKG_VERSION")
                     },
                     "capabilities": {
                         "tools": { "listChanged": true },
@@ -3785,6 +3852,28 @@ mod tests {
         let mut resp = Vec::new();
         tokio::io::AsyncReadExt::read_to_end(&mut stream, &mut resp).await.unwrap();
         assert!(String::from_utf8_lossy(&resp).starts_with("HTTP/1.1 413"));
+    }
+
+    #[test]
+    fn every_mcp_tool_declares_all_four_annotation_hints() {
+        let schema = AegisRuntimeKernel::mcp_tools_schema();
+        let tools = schema["tools"].as_array().unwrap();
+        let names: Vec<&str> = tools.iter().map(|t| t["name"].as_str().unwrap()).collect();
+        for tool in tools {
+            for hint in ["readOnlyHint", "destructiveHint", "idempotentHint", "openWorldHint"] {
+                assert!(
+                    tool["annotations"][hint].is_boolean(),
+                    "{} lacks a boolean {hint}",
+                    tool["name"]
+                );
+            }
+            if tool["annotations"]["readOnlyHint"] == true {
+                assert_eq!(tool["annotations"]["destructiveHint"], false, "{}", tool["name"]);
+            }
+        }
+        for (name, ..) in TOOL_ANNOTATIONS {
+            assert!(names.contains(name), "annotation for unknown tool {name}");
+        }
     }
 
     #[tokio::test]
