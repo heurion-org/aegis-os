@@ -73,7 +73,9 @@ pub enum CloudAction {
     /// List pending Human-in-the-Loop (HITL) boundary escalations in the Cloud Workspace
     Approvals,
 
-    /// Approve a pending Cloud Sandbox escalation and optionally grant a session lease from CLI
+    /// Approve a pending Cloud Sandbox escalation and optionally grant a session lease from CLI.
+    /// Operator only: reads the daemon's operator token from `AOS_ADMIN_SECRET`, since the tenant
+    /// key is also what the tenant's agents hold.
     Approve {
         /// Escalation ID (e.g. `esc-...`)
         escalation_id: String,
@@ -503,6 +505,18 @@ pub async fn collect_local_source_bundle(workspace: &Path) -> anyhow::Result<Vec
     Ok(entries)
 }
 
+/// Cloud approvals need the daemon's operator token: agents hold the tenant key, so a tenant key
+/// that could approve would let an agent approve its own escalation.
+fn operator_token_from(env_value: Option<String>) -> anyhow::Result<String> {
+    env_value
+        .map(|v| v.trim().to_string())
+        .filter(|v| !v.is_empty())
+        .context(
+            "Cloud approvals are operator-only: set AOS_ADMIN_SECRET to the daemon's operator token \
+             (on the cloud node: /etc/aegis-cloud/env)",
+        )
+}
+
 pub async fn handle_cloud_command(
     action: CloudAction,
     identity: &AgentIdentity,
@@ -868,7 +882,7 @@ pub async fn handle_cloud_command(
                 serde_json::to_string_pretty(&json!({
                     "org_id": identity.org_id,
                     "pending_escalations": pending,
-                    "cli_hint": "Approve via `aegis-os cloud approve <escalation_id> --grant-lease`"
+                    "cli_hint": "Operator approves via `AOS_ADMIN_SECRET=<operator token> aegis-os cloud approve <escalation_id>`"
                 }))?
             );
         }
@@ -884,16 +898,13 @@ pub async fn handle_cloud_command(
                 .map(|b| b.endpoint.clone())
                 .or_else(|| store.auth.as_ref().map(|a| a.endpoint.clone()))
                 .unwrap_or_else(|| "https://heurion.org".to_string());
-            let key = active
-                .as_ref()
-                .map(|b| b.api_key.as_str())
-                .or_else(|| store.auth.as_ref().map(|a| a.api_key.as_str()));
+            let operator_token = operator_token_from(std::env::var("AOS_ADMIN_SECRET").ok())?;
 
             let resp = cloud_http_json(
                 "POST",
                 &ep,
                 "/v1/approvals/decide",
-                key,
+                Some(&operator_token),
                 &[],
                 Some(&json!({
                     "escalation_id": escalation_id,
@@ -1785,6 +1796,13 @@ pub async fn serve_unified_stdio(
 mod tests {
     use super::*;
     use std::sync::Arc;
+
+    #[test]
+    fn cloud_approve_requires_an_operator_token() {
+        assert!(operator_token_from(None).is_err());
+        assert!(operator_token_from(Some("  ".into())).is_err());
+        assert_eq!(operator_token_from(Some(" aop_x \n".into())).unwrap(), "aop_x");
+    }
 
     #[tokio::test]
     async fn test_end_to_end_cloud_up_zero_local_load_exec_pull_and_down() {
