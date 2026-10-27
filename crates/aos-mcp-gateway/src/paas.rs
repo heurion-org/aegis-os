@@ -3177,7 +3177,7 @@ pub const DASHBOARD_HTML: &str = r##"<!doctype html>
           <span class="brand-word">HEURION</span>
         </a>
         <div class="foot-right">
-          <span>© 2026 Heurion Research · Aegis Cloud v0.3.0 · MIT Licensed</span>
+          <span>© 2026 Heurion Research · Aegis Cloud v{{AOS_VERSION}} · MIT Licensed</span>
           <a href="https://heurion.org/" class="foot-link">Heurion.org</a>
           <a href="https://github.com/heurion-org/aegis-os" target="_blank" rel="noopener" class="foot-link">GitHub</a>
           <a href="https://heurion.org/llms.txt" class="foot-link">LLMs.txt</a>
@@ -3490,6 +3490,10 @@ aegis-os cloud subscribe --claim --claim-token ${claimArg} && aegis-os cloud up`
 
 /// Serves the Mission Control HTML, hot-reloading from `crates/aos-mcp-gateway/src/paas.rs` if present on disk.
 pub fn render_dashboard_html(workspace_root: &Path) -> String {
+    load_dashboard_html(workspace_root).replace("{{AOS_VERSION}}", env!("CARGO_PKG_VERSION"))
+}
+
+fn load_dashboard_html(workspace_root: &Path) -> String {
     let live_paas_rs = workspace_root.join("crates/aos-mcp-gateway/src/paas.rs");
     if let Ok(raw) = std::fs::read_to_string(&live_paas_rs) {
         if let Some(start_idx) = raw.find("pub const DASHBOARD_HTML: &str = r##\"") {

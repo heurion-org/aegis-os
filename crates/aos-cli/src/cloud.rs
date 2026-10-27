@@ -1531,7 +1531,7 @@ pub async fn serve_unified_stdio(
                     "protocolVersion": "2024-11-05",
                     "serverInfo": {
                         "name": "aegis-os-mcp-gateway",
-                        "version": "0.3.0"
+                        "version": env!("CARGO_PKG_VERSION")
                     },
                     "capabilities": {
                         "tools": { "listChanged": true },

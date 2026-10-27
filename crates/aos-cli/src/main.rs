@@ -25,7 +25,7 @@ use std::path::{Path, PathBuf};
 #[derive(Parser)]
 #[command(
     name = "aegis-os",
-    version = "0.1.0",
+    version,
     about = "Aegis OS: Zero-Config Agent Operating System Runtime for AGY, Claude Code & Codex"
 )]
 struct Cli {
@@ -747,7 +747,7 @@ async fn main() -> anyhow::Result<()> {
                 .start_http_daemon_with_auth(&listen, workspace.clone(), auth_mode)
                 .await?;
             println!("=========================================================================");
-            println!("  Aegis Cloud PaaS & Runtime Daemon (v0.3.0) Started");
+            println!("  Aegis Cloud PaaS & Runtime Daemon (v{}) Started", env!("CARGO_PKG_VERSION"));
             println!("  Web Mission Control: http://{}/dashboard", daemon_addr);
             println!("  MCP Streamable HTTP: http://{}/v1/mcp (or /mcp)", daemon_addr);
             println!("  Google A2A Hub:      http://{}/v1/a2a (Card: /.well-known/agent.json)", daemon_addr);

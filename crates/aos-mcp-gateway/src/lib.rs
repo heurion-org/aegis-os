@@ -2909,7 +2909,7 @@ impl AegisRuntimeKernel {
                     } else if method == "GET" && full_target.starts_with("/health") {
                         (
                             "HTTP/1.1 200 OK",
-                            json!({ "status": "ok", "service": "aegis-os-paas-daemon", "version": "0.3.0" }).to_string(),
+                            json!({ "status": "ok", "service": "aegis-os-paas-daemon", "version": env!("CARGO_PKG_VERSION") }).to_string(),
                         )
                     } else if method == "GET"
                         && (full_target.starts_with("/.well-known/agent.json")
@@ -2932,7 +2932,7 @@ impl AegisRuntimeKernel {
                                 "name": "aegis-os-workstation-gateway",
                                 "description": "Aegis OS Policy-Governed Multi-Agent A2A & MCP Gateway",
                                 "url": format!("{}/a2a", base_url),
-                                "version": "0.3.0",
+                                "version": env!("CARGO_PKG_VERSION"),
                                 "protocolVersion": "0.2.0",
                                 "capabilities": {
                                     "streaming": true,
