@@ -132,10 +132,11 @@ jobs:
     steps:
       - name: Upgrade cloud node
         env:
-          DEPLOY_HOST: ${{ vars.DEPLOY_HOST }}
+          DEPLOY_HOST: ${{ vars.DEPLOY_HOST || secrets.DEPLOY_HOST }}
           DEPLOY_SSH_KEY: ${{ secrets.DEPLOY_SSH_KEY }}
           DEPLOY_KNOWN_HOSTS: ${{ secrets.DEPLOY_KNOWN_HOSTS }}
         run: |
+          [[ -n "$DEPLOY_HOST" ]] || { echo "::error::DEPLOY_HOST is not set in the production environment"; exit 1; }
           install -d -m 700 ~/.ssh
           printf '%s\n' "$DEPLOY_SSH_KEY" > ~/.ssh/deploy_key
           printf '%s\n' "$DEPLOY_KNOWN_HOSTS" > ~/.ssh/known_hosts
