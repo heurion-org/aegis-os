@@ -50,6 +50,19 @@ ssh root@95.217.106.25 'bash /tmp/aegis-deploy/bootstrap_server.sh \
 
 This installs `/usr/local/sbin/aegis-upgrade` and pins the release key. It moves secrets from the unit into `/etc/aegis-cloud/env` (0600) and adds a stable `AOS_ADMIN_SECRET` (the operator token). It also authorizes the deploy key with the forced command.
 
+### Mail for approver enrollment (optional)
+
+`aegis-os cloud approver enroll --email` needs SMTP on the node. Add to `/etc/aegis-cloud/env`, then `systemctl restart aegis-cloud`:
+
+```
+AOS_SMTP_URL=smtps://smtp.gmail.com:465
+AOS_SMTP_USER=you@gmail.com
+AOS_SMTP_PASS=<app password>
+AOS_SMTP_FROM=Aegis Cloud <you@gmail.com>
+```
+
+Without it, paid orgs still enroll through the billing claim; email enrollment returns an error.
+
 ### 4. Environments
 
 In repo Settings → Environments, create `release` and `production`, each with yourself as required reviewer and restricted to `v*` tags. Protect `v*` tags in Settings → Rules.

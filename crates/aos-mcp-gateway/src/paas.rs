@@ -257,6 +257,38 @@ struct PersistedPaasState {
     subscriptions: Vec<BillingSubscriptionRecord>,
     #[serde(default)]
     pending_claims: Vec<PendingClaimRecord>,
+    #[serde(default)]
+    approvers: Vec<ApproverRecord>,
+    #[serde(default)]
+    approver_enrollments: Vec<ApproverEnrollmentRecord>,
+}
+
+/// The human who approves an org's Cloud escalations, holding the TOTP secret on their phone.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ApproverRecord {
+    pub org_id: String,
+    pub secret_hex: String,
+    #[serde(default)]
+    pub email: Option<String>,
+    /// `billing_claim` or `email`.
+    pub enrolled_via: String,
+    pub enrolled_at_ms: i64,
+    /// Highest TOTP step already used; codes at or below it are replays.
+    #[serde(default)]
+    pub last_used_step: i64,
+    #[serde(default)]
+    pub failed_attempts: u32,
+    #[serde(default)]
+    pub locked_until_ms: i64,
+}
+
+/// A mailed enrollment link. Only the token's SHA-256 is stored.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ApproverEnrollmentRecord {
+    pub token_sha256: String,
+    pub org_id: String,
+    pub email: String,
+    pub expires_at_ms: i64,
 }
 
 pub struct PaasControlPlane {
@@ -265,6 +297,9 @@ pub struct PaasControlPlane {
     state: RwLock<PersistedPaasState>,
     /// Server-side secrets: `(admin, billing_webhook)`. Never derived from request data.
     secrets: std::sync::RwLock<(String, String)>,
+    mailer: std::sync::RwLock<crate::approver::Mailer>,
+    /// Public base URL used in mailed links (`AOS_PUBLIC_URL`).
+    public_url: std::sync::RwLock<String>,
 }
 
 impl PaasControlPlane {
@@ -284,7 +319,18 @@ impl PaasControlPlane {
                 env_secret("AOS_ADMIN_SECRET"),
                 env_secret("AOS_BILLING_WEBHOOK_SECRET"),
             )),
+            mailer: std::sync::RwLock::new(crate::approver::Mailer::from_env()),
+            public_url: std::sync::RwLock::new(match env_secret("AOS_PUBLIC_URL") {
+                u if u.is_empty() => "https://heurion.org/aegis-cloud".to_string(),
+                u => u.trim_end_matches('/').to_string(),
+            }),
         }
+    }
+
+    /// Overrides the mailer and public URL loaded from the environment (tests, local setups).
+    pub fn set_mailer(&self, mailer: crate::approver::Mailer, public_url: &str) {
+        *self.mailer.write().unwrap() = mailer;
+        *self.public_url.write().unwrap() = public_url.trim_end_matches('/').to_string();
     }
 
     /// Overrides the secrets loaded from `AOS_ADMIN_SECRET` / `AOS_BILLING_WEBHOOK_SECRET`.
@@ -425,7 +471,15 @@ impl PaasControlPlane {
         }
         let snapshot = self.state.read().await.clone();
         let bytes = serde_json::to_vec_pretty(&snapshot)?;
-        tokio::fs::write(&self.state_file, bytes).await?;
+        // Holds claimable keys and approver TOTP secrets: owner-only, replaced atomically.
+        let tmp = self.state_file.with_extension("json.tmp");
+        tokio::fs::write(&tmp, bytes).await?;
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            tokio::fs::set_permissions(&tmp, std::fs::Permissions::from_mode(0o600)).await?;
+        }
+        tokio::fs::rename(&tmp, &self.state_file).await?;
         Ok(())
     }
 
@@ -1247,9 +1301,210 @@ impl PaasControlPlane {
             "api_key": claimed_key
         });
         state.pending_claims.retain(|c| c.claim_id != pending.claim_id);
+        // Whoever holds the checkout's claim token paid for the org: make them its approver unless
+        // one is already enrolled (replacing an approver goes through the mailed link).
+        let mut out = out;
+        if !state.approvers.iter().any(|a| a.org_id == pending.org_id) {
+            let email = out["customer_email"].as_str().map(|e| e.trim().to_lowercase());
+            let enrollment = Self::new_approver(&mut state, &pending.org_id, email, "billing_claim");
+            out["approver"] = enrollment;
+        }
         drop(state);
         self.flush().await?;
         Ok(out)
+    }
+
+    /// Creates (or replaces) the org's approver and returns the one-time enrollment payload.
+    fn new_approver(state: &mut PersistedPaasState, org_id: &str, email: Option<String>, via: &str) -> Value {
+        use crate::approver::{base32_encode, generate_secret, otpauth_uri, qr_svg, qr_terminal};
+        let secret = generate_secret();
+        let secret_b32 = base32_encode(&secret);
+        let uri = otpauth_uri(org_id, &secret_b32);
+        state.approvers.retain(|a| a.org_id != org_id);
+        state.approvers.push(ApproverRecord {
+            org_id: org_id.to_string(),
+            secret_hex: hex::encode(&secret),
+            email,
+            enrolled_via: via.to_string(),
+            enrolled_at_ms: Utc::now().timestamp_millis(),
+            last_used_step: 0,
+            failed_attempts: 0,
+            locked_until_ms: 0,
+        });
+        json!({
+            "org_id": org_id,
+            "secret": secret_b32,
+            "otpauth_uri": uri,
+            "qr_svg": qr_svg(&uri),
+            "qr_terminal": qr_terminal(&uri),
+            "note": "Shown once. Add it to your authenticator app; approving escalations requires its 6-digit code."
+        })
+    }
+
+    pub async fn approver_status(&self, org_id: &str) -> Value {
+        self.reload().await;
+        let state = self.state.read().await;
+        match state.approvers.iter().find(|a| a.org_id == org_id) {
+            Some(a) => json!({
+                "org_id": org_id,
+                "enrolled": true,
+                "enrolled_via": a.enrolled_via,
+                "enrolled_at_ms": a.enrolled_at_ms,
+                "email": a.email.as_deref().map(crate::approver::mask_email),
+            }),
+            None => json!({ "org_id": org_id, "enrolled": false }),
+        }
+    }
+
+    const ENROLLMENT_LINK_TTL_MS: i64 = 30 * 60 * 1000;
+    const MAX_PENDING_ENROLLMENTS_PER_ORG: usize = 3;
+    const MAX_FAILED_APPROVAL_CODES: u32 = 5;
+    const APPROVAL_LOCKOUT_MS: i64 = 5 * 60 * 1000;
+
+    /// Mails a one-time enrollment link. The address must match the org's existing approver or
+    /// billing email when there is one, so a tenant key alone cannot redirect enrollment.
+    pub async fn request_approver_email_enrollment(&self, org_id: &str, email: &str) -> anyhow::Result<Value> {
+        let email = email.trim().to_lowercase();
+        if !crate::approver::valid_email(&email) {
+            bail!("Invalid email address");
+        }
+        let mailer = self.mailer.read().unwrap().clone();
+        if !mailer.is_enabled() {
+            bail!("Email enrollment is not configured on this Aegis Cloud node (ask the operator)");
+        }
+        self.reload().await;
+        let token = format!("aet_{}{}", Uuid::new_v4().simple(), Uuid::new_v4().simple());
+        {
+            let mut state = self.state.write().await;
+            let bound = state
+                .approvers
+                .iter()
+                .find(|a| a.org_id == org_id)
+                .and_then(|a| a.email.clone())
+                .or_else(|| {
+                    state
+                        .subscriptions
+                        .iter()
+                        .rev()
+                        .find(|s| s.org_id == org_id && s.status == "active")
+                        .and_then(|s| s.customer_email.clone())
+                })
+                .map(|e| e.trim().to_lowercase());
+            if let Some(bound) = bound {
+                if bound != email {
+                    bail!(
+                        "Org '{}' is bound to {}; enrollment links can only go to that address",
+                        org_id,
+                        crate::approver::mask_email(&bound)
+                    );
+                }
+            }
+            let now = Utc::now().timestamp_millis();
+            state.approver_enrollments.retain(|e| e.expires_at_ms > now);
+            if state.approver_enrollments.iter().filter(|e| e.org_id == org_id).count()
+                >= Self::MAX_PENDING_ENROLLMENTS_PER_ORG
+            {
+                bail!("Too many pending enrollment links for org '{}'; use the latest email or wait 30 minutes", org_id);
+            }
+            state.approver_enrollments.push(ApproverEnrollmentRecord {
+                token_sha256: Self::sha256_hex(&token),
+                org_id: org_id.to_string(),
+                email: email.clone(),
+                expires_at_ms: now + Self::ENROLLMENT_LINK_TTL_MS,
+            });
+        }
+        self.flush().await?;
+        let link = format!("{}/approver/enroll?token={}", self.public_url.read().unwrap(), token);
+        let body = format!(
+            "Someone asked to make this address the approver for Aegis Cloud org '{org_id}'.\n\n\
+             Open this link within 30 minutes to enroll your authenticator app:\n{link}\n\n\
+             If this wasn't you, ignore this email; nothing changes until the link is used."
+        );
+        let mail_result = tokio::task::spawn_blocking(move || {
+            mailer.send(&email, "Aegis Cloud: enroll as approver", &body)
+        })
+        .await
+        .context("mail task failed")?;
+        if let Err(e) = mail_result {
+            let hash = Self::sha256_hex(&token);
+            self.state.write().await.approver_enrollments.retain(|r| r.token_sha256 != hash);
+            self.flush().await?;
+            return Err(e);
+        }
+        Ok(json!({ "status": "enrollment_email_sent", "org_id": org_id, "expires_in_secs": Self::ENROLLMENT_LINK_TTL_MS / 1000 }))
+    }
+
+    /// Redeems a mailed link: (re)enrolls the org's approver and returns the secret, once.
+    pub async fn confirm_approver_email_enrollment(&self, token: &str) -> anyhow::Result<Value> {
+        self.reload().await;
+        let hash = Self::sha256_hex(token.trim());
+        let now = Utc::now().timestamp_millis();
+        let out = {
+            let mut state = self.state.write().await;
+            let rec = state
+                .approver_enrollments
+                .iter()
+                .find(|e| Self::secrets_match(&e.token_sha256, &hash) && e.expires_at_ms > now)
+                .cloned()
+                .context("This enrollment link is invalid, expired or already used")?;
+            // One approver device per org: every outstanding link for it dies with this one.
+            state.approver_enrollments.retain(|e| e.org_id != rec.org_id);
+            Self::new_approver(&mut state, &rec.org_id, Some(rec.email.clone()), "email")
+        };
+        self.flush().await?;
+        Ok(out)
+    }
+
+    /// Checks an approver's TOTP code for `org_id`, with replay protection and a lockout after
+    /// repeated failures.
+    pub async fn verify_approver_code(&self, org_id: &str, code: &str) -> anyhow::Result<()> {
+        self.reload().await;
+        let now = Utc::now();
+        let now_ms = now.timestamp_millis();
+        let result = {
+            let mut state = self.state.write().await;
+            let approver = state
+                .approvers
+                .iter_mut()
+                .find(|a| a.org_id == org_id)
+                .context("No approver enrolled for this org (`aegis-os cloud approver enroll --email <you>`)")?;
+            if approver.locked_until_ms > now_ms {
+                bail!("Too many wrong codes; approvals for this org are locked for a few minutes");
+            }
+            let secret = hex::decode(&approver.secret_hex).context("corrupt approver secret")?;
+            match crate::approver::match_totp(&secret, code, now.timestamp()) {
+                Some(step) if step > approver.last_used_step => {
+                    approver.last_used_step = step;
+                    approver.failed_attempts = 0;
+                    Ok(())
+                }
+                Some(_) => Err(anyhow::anyhow!("This code was already used; wait for the next one")),
+                None => {
+                    approver.failed_attempts += 1;
+                    if approver.failed_attempts >= Self::MAX_FAILED_APPROVAL_CODES {
+                        approver.failed_attempts = 0;
+                        approver.locked_until_ms = now_ms + Self::APPROVAL_LOCKOUT_MS;
+                    }
+                    Err(anyhow::anyhow!("Wrong approval code"))
+                }
+            }
+        };
+        self.flush().await?;
+        result
+    }
+
+    /// Operator reset, e.g. when an approver loses their phone.
+    pub async fn remove_approver(&self, org_id: &str) -> anyhow::Result<bool> {
+        self.reload().await;
+        let removed = {
+            let mut state = self.state.write().await;
+            let before = state.approvers.len();
+            state.approvers.retain(|a| a.org_id != org_id);
+            state.approver_enrollments.retain(|e| e.org_id != org_id);
+            before != state.approvers.len()
+        };
+        self.flush().await?;
+        Ok(removed)
     }
 
     /// Issue a new scoped `ak_live_*` API key for a tenant organization and agent principal.

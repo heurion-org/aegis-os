@@ -154,10 +154,22 @@ brew install aegis-os
 
 `aegis-os daemon` requires authentication by default. Static pages, discovery (`/.well-known/*`), `/health` and the billing flow are public. Every other endpoint needs one of:
 
-- **Operator token**: `AOS_ADMIN_SECRET`, or a random token printed at startup when it is unset. Send it as `Authorization: Bearer <token>`. Only the operator can approve escalations (`/v1/approvals/*`), see all orgs (`/api/status?org_id=*`) or upgrade plans.
+- **Operator token**: `AOS_ADMIN_SECRET`, or a random token printed at startup when it is unset. Send it as `Authorization: Bearer <token>`. Only the operator can see all orgs (`/api/status?org_id=*`), reset approvers or upgrade plans.
 - **Tenant API key** (`ak_live_*`): confined to its own org. Any `org_id` naming another org is rejected with 403.
 
 Anonymous callers can mint only the *first* key of an org that has none. `--insecure-no-auth` turns all of this off, for local debugging only.
+
+### Approving Cloud escalations
+
+Agents hold the tenant key, so a tenant key alone never approves anything. Each org has one **approver**: a person with an authenticator app (TOTP, RFC 6238). Approving an escalation takes the tenant key **plus** the app's current 6-digit code, which the agent does not have.
+
+- **Enroll, paid plans**: `aegis-os cloud subscribe --claim` claims the key with the checkout's one-time claim token and, if the org has no approver yet, shows the authenticator QR code once.
+- **Enroll, any plan**: `aegis-os cloud approver enroll --email you@example.com` mails a one-time link (30 min). Open it in a browser and press the button to get the QR code. Once an org has a billing or approver email, links only go to that address. Opening the link alone changes nothing.
+- **Approve**: `aegis-os cloud approve <escalation_id>` shows the escalation and asks for the code (or `--code 123456`; `--deny` rejects). Codes are single-use, tenant leases are capped at 24h, and 5 wrong codes lock approvals for 5 minutes.
+- **Operator**: `AOS_ADMIN_SECRET=<operator token> aegis-os cloud approve <id>` still works; `DELETE /v1/approver?org_id=<org>` resets a lost device.
+- **Agents are blocked** from running `aegis-os policy approve|lease`, `cloud approve` and `cloud approver …` by the PreToolUse hook. Locally, approve with `aegis-os policy approve <id>` in your terminal (in Claude Code: `! aegis-os policy approve <id>`).
+
+Mail delivery on the node: `AOS_SMTP_URL` (e.g. `smtps://smtp.gmail.com:465`), `AOS_SMTP_USER`, `AOS_SMTP_PASS`, `AOS_SMTP_FROM`, and `AOS_PUBLIC_URL` for the link (default `https://heurion.org/aegis-cloud`).
 
 ### 2. CLI-First Cloud Control (`aegis-os cloud`)
 
@@ -178,8 +190,8 @@ aegis-os cloud up
 # Inspect remote CoW unified code diff, pending HITL approvals, and tenant metering in terminal
 aegis-os cloud diff
 aegis-os cloud approvals
-# Operator only: approvals need the daemon operator token, never a tenant key
-AOS_ADMIN_SECRET=<operator token> aegis-os cloud approve <escalation_id>
+aegis-os cloud approver enroll --email you@example.com   # once: add your authenticator app
+aegis-os cloud approve <escalation_id>                    # asks for the 6-digit code
 aegis-os cloud status
 
 # Sync source-only files, export a GitHub PR bundle, or trigger Scale-to-Zero hibernation

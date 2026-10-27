@@ -73,9 +73,8 @@ pub enum CloudAction {
     /// List pending Human-in-the-Loop (HITL) boundary escalations in the Cloud Workspace
     Approvals,
 
-    /// Approve a pending Cloud Sandbox escalation and optionally grant a session lease from CLI.
-    /// Operator only: reads the daemon's operator token from `AOS_ADMIN_SECRET`, since the tenant
-    /// key is also what the tenant's agents hold.
+    /// Approve (or `--deny`) a pending Cloud escalation. Asks for the org approver's 6-digit
+    /// authenticator code; the operator can instead set `AOS_ADMIN_SECRET`.
     Approve {
         /// Escalation ID (e.g. `esc-...`)
         escalation_id: String,
@@ -83,6 +82,18 @@ pub enum CloudAction {
         grant_lease: bool,
         #[arg(long, default_value_t = 900)]
         ttl_secs: u64,
+        /// Reject the escalation instead of approving it
+        #[arg(long)]
+        deny: bool,
+        /// Approver's 6-digit authenticator code (prompted for when omitted)
+        #[arg(long)]
+        code: Option<String>,
+    },
+
+    /// Manage this org's approver: the person whose authenticator code approves escalations
+    Approver {
+        #[command(subcommand)]
+        action: ApproverAction,
     },
 
     /// Export a GitHub/GitLab Pull Request bundle from the bound Cloud CoW Workspace
@@ -132,6 +143,17 @@ pub enum CloudAction {
 
     /// Show Aegis Cloud binding, tenant plan tier, usage metering, and remote workspace status
     Status,
+}
+
+#[derive(Subcommand, Debug, Clone)]
+pub enum ApproverAction {
+    /// Show whether this org has an approver
+    Status,
+    /// Mail a one-time enrollment link; open it in a browser to add the authenticator app
+    Enroll {
+        #[arg(long)]
+        email: String,
+    },
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
@@ -517,6 +539,33 @@ fn operator_token_from(env_value: Option<String>) -> anyhow::Result<String> {
         )
 }
 
+/// Reads the approver's code from the controlling terminal (falls back to stdin).
+fn prompt_approver_code() -> anyhow::Result<String> {
+    use std::io::{BufRead, Write};
+    let mut line = String::new();
+    match std::fs::OpenOptions::new().read(true).write(true).open("/dev/tty") {
+        Ok(tty) => {
+            let mut w = &tty;
+            write!(w, "Approver code (6 digits from your authenticator app): ")?;
+            w.flush()?;
+            std::io::BufReader::new(&tty).read_line(&mut line)?;
+        }
+        Err(_) => {
+            eprint!("Approver code (6 digits from your authenticator app): ");
+            std::io::stdin().lock().read_line(&mut line)?;
+        }
+    }
+    normalize_approver_code(&line)
+}
+
+fn normalize_approver_code(raw: &str) -> anyhow::Result<String> {
+    let code: String = raw.chars().filter(|c| !c.is_whitespace()).collect();
+    if code.len() != 6 || !code.chars().all(|c| c.is_ascii_digit()) {
+        bail!("Expected a 6-digit code");
+    }
+    Ok(code)
+}
+
 pub async fn handle_cloud_command(
     action: CloudAction,
     identity: &AgentIdentity,
@@ -882,7 +931,7 @@ pub async fn handle_cloud_command(
                 serde_json::to_string_pretty(&json!({
                     "org_id": identity.org_id,
                     "pending_escalations": pending,
-                    "cli_hint": "Operator approves via `AOS_ADMIN_SECRET=<operator token> aegis-os cloud approve <escalation_id>`"
+                    "cli_hint": "Approve with `aegis-os cloud approve <escalation_id>` and the approver's authenticator code"
                 }))?
             );
         }
@@ -891,6 +940,8 @@ pub async fn handle_cloud_command(
             escalation_id,
             grant_lease,
             ttl_secs,
+            deny,
+            code,
         } => {
             let active = resolve_active_cloud_binding(runtime_dir, &canon);
             let ep = active
@@ -898,22 +949,83 @@ pub async fn handle_cloud_command(
                 .map(|b| b.endpoint.clone())
                 .or_else(|| store.auth.as_ref().map(|a| a.endpoint.clone()))
                 .unwrap_or_else(|| "https://heurion.org".to_string());
-            let operator_token = operator_token_from(std::env::var("AOS_ADMIN_SECRET").ok())?;
+            let key = active
+                .as_ref()
+                .map(|b| b.api_key.clone())
+                .or_else(|| store.auth.as_ref().map(|a| a.api_key.clone()));
+            let decision = if deny { "deny" } else { "approve" };
+            let mut body = json!({
+                "escalation_id": escalation_id,
+                "decision": decision,
+                "grant_lease": grant_lease,
+                "ttl_secs": ttl_secs
+            });
 
-            let resp = cloud_http_json(
-                "POST",
-                &ep,
-                "/v1/approvals/decide",
-                Some(&operator_token),
-                &[],
-                Some(&json!({
-                    "escalation_id": escalation_id,
-                    "decision": "approve",
-                    "grant_lease": grant_lease,
-                    "ttl_secs": ttl_secs
-                })),
-            )
-            .await?;
+            let resp = if let Ok(operator_token) = operator_token_from(std::env::var("AOS_ADMIN_SECRET").ok()) {
+                cloud_http_json("POST", &ep, "/v1/approvals/decide", Some(&operator_token), &[], Some(&body)).await?
+            } else {
+                let key = key.context("Not logged in to Aegis Cloud (`aegis-os cloud login`)")?;
+                // Show what is being approved before asking for the code.
+                let status = cloud_http_json(
+                    "GET",
+                    &ep,
+                    &format!("/v1/status?org_id={}", identity.org_id),
+                    Some(&key),
+                    &[],
+                    None,
+                )
+                .await?;
+                let esc = status
+                    .get("pending_escalations")
+                    .and_then(|v| v.as_array())
+                    .and_then(|list| list.iter().find(|e| e["escalation_id"] == escalation_id.as_str()).cloned())
+                    .with_context(|| format!("No pending escalation '{}' in this org (`aegis-os cloud approvals`)", escalation_id))?;
+                eprintln!("{} escalation {}", if deny { "Deny" } else { "Approve" }, escalation_id);
+                for (label, field) in [("Agent", "agent_id"), ("Action", "action"), ("Target", "target_resource"), ("Reason", "reason"), ("Lease scope", "suggested_lease_scope")] {
+                    if let Some(v) = esc.get(field).and_then(|v| v.as_str()) {
+                        eprintln!("  {label:<12} {v}");
+                    }
+                }
+                let code = match code {
+                    Some(c) => normalize_approver_code(&c)?,
+                    None => prompt_approver_code()?,
+                };
+                body["totp"] = json!(code);
+                cloud_http_json("POST", &ep, "/v1/approvals/decide", Some(&key), &[], Some(&body)).await?
+            };
+            println!("{}", serde_json::to_string_pretty(&resp)?);
+        }
+
+        CloudAction::Approver { action } => {
+            let active = resolve_active_cloud_binding(runtime_dir, &canon);
+            let ep = active
+                .as_ref()
+                .map(|b| b.endpoint.clone())
+                .or_else(|| store.auth.as_ref().map(|a| a.endpoint.clone()))
+                .unwrap_or_else(|| "https://heurion.org".to_string());
+            let key = active
+                .as_ref()
+                .map(|b| b.api_key.clone())
+                .or_else(|| store.auth.as_ref().map(|a| a.api_key.clone()))
+                .context("Not logged in to Aegis Cloud (`aegis-os cloud login`)")?;
+            let resp = match action {
+                ApproverAction::Status => cloud_http_json("GET", &ep, "/v1/approver", Some(&key), &[], None).await?,
+                ApproverAction::Enroll { email } => {
+                    let resp = cloud_http_json(
+                        "POST",
+                        &ep,
+                        "/v1/approver/email",
+                        Some(&key),
+                        &[],
+                        Some(&json!({ "email": email })),
+                    )
+                    .await?;
+                    if resp.get("error").is_none() {
+                        eprintln!("Check {email}: open the link in a browser within 30 minutes to add your authenticator app.");
+                    }
+                    resp
+                }
+            };
             println!("{}", serde_json::to_string_pretty(&resp)?);
         }
 
@@ -1013,6 +1125,16 @@ pub async fn handle_cloud_command(
                     });
                     store.pending_claim_token = None;
                     save_store(runtime_dir, &store)?;
+                }
+                let mut resp = resp;
+                if let Some(approver) = resp.get_mut("approver").and_then(|a| a.as_object_mut()) {
+                    approver.remove("qr_svg");
+                    if let Some(qr) = approver.remove("qr_terminal") {
+                        eprintln!("\nYou are now this org's approver. Scan with your authenticator app (shown once):\n");
+                        eprintln!("{}", qr.as_str().unwrap_or_default());
+                        eprintln!("Manual key: {}", approver.get("secret").and_then(|v| v.as_str()).unwrap_or_default());
+                        eprintln!("Approve escalations with `aegis-os cloud approve <id>` and the app's 6-digit code.\n");
+                    }
                 }
                 println!("{}", serde_json::to_string_pretty(&resp)?);
             } else {

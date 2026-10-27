@@ -31,6 +31,7 @@ use tokio::sync::RwLock;
 use uuid::Uuid;
 
 pub mod app_store;
+pub mod approver;
 pub mod paas;
 use app_store::AppStoreRegistry;
 use paas::PaasControlPlane;
@@ -172,7 +173,8 @@ fn is_public_route(method: &str, target: &str) -> bool {
         || ["/dashboard", "/ui", "/install.sh", "/health", "/.well-known/", "/releases/", "/v1/billing/status"]
             .iter()
             .any(|p| path.starts_with(p));
-    let any_public = ["/v1/billing/checkout", "/v1/billing/webhook", "/v1/billing/claim"]
+    // `/approver/enroll` authenticates with the one-time token from the mailed link.
+    let any_public = ["/v1/billing/checkout", "/v1/billing/webhook", "/v1/billing/claim", "/approver/enroll"]
         .iter()
         .any(|p| path.starts_with(p));
     // Key signup: the route itself only lets anonymous callers mint an org's *first* key.
@@ -180,12 +182,13 @@ fn is_public_route(method: &str, target: &str) -> bool {
     (method == "GET" && get_public) || any_public || signup
 }
 
-/// Routes no tenant key may use: approving escalations (agents hold tenant keys), simulating
-/// approvals, fleet-wide GC, and cross-org status views.
+/// Routes no tenant key may use: simulating approvals, resetting approvers, fleet-wide GC, and
+/// cross-org status views. (`/v1/approvals/decide` takes a tenant key only together with the
+/// approver's TOTP code, checked in the handler: agents hold tenant keys but not the code.)
 fn is_operator_only_route(method: &str, target: &str) -> bool {
     let path = route_path(target);
-    let _ = method;
-    path.starts_with("/v1/approvals/")
+    (path.starts_with("/v1/approvals/") && !path.starts_with("/v1/approvals/decide"))
+        || (method == "DELETE" && path.starts_with("/v1/approver"))
         || path.starts_with("/v1/workspaces/gc-idle")
         || ((path.starts_with("/api/status") || path.starts_with("/v1/status"))
             && requested_org(target, "").as_deref() == Some("*"))
@@ -3555,6 +3558,37 @@ impl AegisRuntimeKernel {
                     } else if method == "GET" && full_target.starts_with("/v1/vault/secrets") {
                         let list = k.egress.list_redacted_secrets(&org_id).await;
                         ("HTTP/1.1 200 OK", json!({ "secrets": list }).to_string())
+                    } else if method == "GET" && route_path(full_target) == "/approver/enroll" {
+                        content_type = "text/html; charset=utf-8";
+                        ("HTTP/1.1 200 OK", approver::ENROLL_PAGE_HTML.to_string())
+                    } else if method == "POST" && route_path(full_target) == "/approver/enroll" {
+                        let payload: Value = serde_json::from_str(body_str.trim()).unwrap_or_else(|_| json!({}));
+                        let token = payload.get("token").and_then(|v| v.as_str()).unwrap_or("");
+                        match k.paas.confirm_approver_email_enrollment(token).await {
+                            Ok(v) => ("HTTP/1.1 200 OK", v.to_string()),
+                            Err(e) => ("HTTP/1.1 400 Bad Request", json!({ "error": e.to_string() }).to_string()),
+                        }
+                    } else if route_path(full_target).starts_with("/v1/approver") {
+                        let payload: Value = serde_json::from_str(body_str.trim()).unwrap_or_else(|_| json!({}));
+                        let target_org = key_org
+                            .clone()
+                            .or_else(|| requested_org(full_target, &body_str))
+                            .unwrap_or_else(|| org_id.clone());
+                        match (method, route_path(full_target)) {
+                            ("GET", "/v1/approver") => ("HTTP/1.1 200 OK", k.paas.approver_status(&target_org).await.to_string()),
+                            ("POST", "/v1/approver/email") => {
+                                let email = payload.get("email").and_then(|v| v.as_str()).unwrap_or("");
+                                match k.paas.request_approver_email_enrollment(&target_org, email).await {
+                                    Ok(v) => ("HTTP/1.1 200 OK", v.to_string()),
+                                    Err(e) => ("HTTP/1.1 400 Bad Request", json!({ "error": e.to_string() }).to_string()),
+                                }
+                            }
+                            ("DELETE", "/v1/approver") => match k.paas.remove_approver(&target_org).await {
+                                Ok(removed) => ("HTTP/1.1 200 OK", json!({ "org_id": target_org, "removed": removed }).to_string()),
+                                Err(e) => ("HTTP/1.1 500 Internal Server Error", json!({ "error": e.to_string() }).to_string()),
+                            },
+                            _ => ("HTTP/1.1 404 Not Found", json!({ "error": "Unknown approver route" }).to_string()),
+                        }
                     } else if method == "POST" && full_target.starts_with("/v1/approvals/decide") {
                         let payload: Value = serde_json::from_str(body_str.trim()).unwrap_or_else(|_| json!({}));
                         let esc_id = payload
@@ -3565,15 +3599,48 @@ impl AegisRuntimeKernel {
                             .get("decision")
                             .and_then(|v| v.as_str())
                             .unwrap_or("approve");
-                        let ttl_secs = payload
+                        let mut ttl_secs = payload
                             .get("ttl_secs")
                             .and_then(|v| v.as_i64())
                             .unwrap_or(0);
-                        let actor = payload
+                        let mut actor = payload
                             .get("approved_by")
                             .and_then(|v| v.as_str())
-                            .unwrap_or("mission-control-dashboard");
-                        if decision.eq_ignore_ascii_case("deny") || decision.eq_ignore_ascii_case("reject") {
+                            .unwrap_or("mission-control-dashboard")
+                            .to_string();
+                        // Tenant approvals: the escalation must belong to the key's org and the
+                        // request must carry that org's approver code. Leases stay bounded.
+                        let tenant_check: Result<(), String> = if is_operator || auth_mode == DaemonAuth::Disabled {
+                            Ok(())
+                        } else if let Some(own) = key_org.clone() {
+                            let in_org = k
+                                .policy
+                                .list_escalations(&own)
+                                .await
+                                .map(|list| list.iter().any(|e| e.escalation_id == esc_id))
+                                .unwrap_or(false);
+                            let code = payload.get("totp").and_then(|v| v.as_str()).unwrap_or("");
+                            if !in_org {
+                                Err(format!("Escalation '{}' not found in org '{}'", esc_id, own))
+                            } else if code.is_empty() {
+                                Err("Approving as a tenant requires the approver's 6-digit code (`totp`)".to_string())
+                            } else {
+                                match k.paas.verify_approver_code(&own, code).await {
+                                    Ok(()) => {
+                                        ttl_secs = ttl_secs.clamp(60, MAX_TOOL_LEASE_TTL_SECS);
+                                        actor = format!("tenant-approver:{}", own);
+                                        Ok(())
+                                    }
+                                    Err(e) => Err(e.to_string()),
+                                }
+                            }
+                        } else {
+                            Err("Approvals require an operator token or a tenant key with an approver code".to_string())
+                        };
+                        let actor = actor.as_str();
+                        if let Err(reason) = tenant_check {
+                            ("HTTP/1.1 403 Forbidden", json!({ "error": reason }).to_string())
+                        } else if decision.eq_ignore_ascii_case("deny") || decision.eq_ignore_ascii_case("reject") {
                             match k.policy.deny_escalation(esc_id, actor).await {
                                 Ok(esc) => (
                                     "HTTP/1.1 200 OK",
@@ -3874,6 +3941,141 @@ mod tests {
         for (name, ..) in TOOL_ANNOTATIONS {
             assert!(names.contains(name), "annotation for unknown tool {name}");
         }
+    }
+
+    async fn raw_http(addr: std::net::SocketAddr, method: &str, path: &str, auth: Option<&str>, body: Option<Value>) -> (String, Value) {
+        let mut stream = tokio::net::TcpStream::connect(addr).await.unwrap();
+        let body_str = body.map(|b| b.to_string()).unwrap_or_default();
+        let auth_hdr = auth.map(|a| format!("Authorization: Bearer {a}\r\n")).unwrap_or_default();
+        let req = format!(
+            "{method} {path} HTTP/1.1\r\nHost: {addr}\r\n{auth_hdr}Content-Length: {}\r\n\r\n{body_str}",
+            body_str.len()
+        );
+        stream.write_all(req.as_bytes()).await.unwrap();
+        let mut buf = Vec::new();
+        tokio::io::AsyncReadExt::read_to_end(&mut stream, &mut buf).await.unwrap();
+        let raw = String::from_utf8_lossy(&buf).to_string();
+        let (head, b) = raw.split_once("\r\n\r\n").unwrap_or((&raw, "{}"));
+        let parsed = serde_json::from_str::<Value>(b).unwrap_or_else(|_| json!({ "html": b }));
+        (head.to_string(), parsed)
+    }
+
+    fn code_for(secret_b32: &str, step_offset: i64) -> String {
+        // Decode RFC 4648 base32 (test-only; the server stores raw bytes).
+        let mut bits = 0u32;
+        let mut buf = 0u32;
+        let mut bytes = Vec::new();
+        for c in secret_b32.bytes() {
+            let v = b"ABCDEFGHIJKLMNOPQRSTUVWXYZ234567".iter().position(|x| *x == c).unwrap() as u32;
+            buf = (buf << 5) | v;
+            bits += 5;
+            if bits >= 8 {
+                bytes.push((buf >> (bits - 8)) as u8);
+                bits -= 8;
+            }
+        }
+        let step = approver::totp_step(chrono::Utc::now().timestamp()) + step_offset;
+        format!("{:06}", approver::hotp(&bytes, step as u64))
+    }
+
+    #[tokio::test]
+    async fn tenant_approver_enrolls_by_email_and_approves_with_totp() {
+        let temp = tempfile::tempdir().unwrap();
+        let repo = temp.path().join("repo");
+        tokio::fs::create_dir_all(&repo).await.unwrap();
+        let outbox = temp.path().join("outbox");
+        let kernel = Arc::new(AegisRuntimeKernel::new(&temp.path().join("rt")).await.unwrap());
+        kernel.paas.set_mailer(approver::Mailer::Directory(outbox.clone()), "https://cloud.example/aegis-cloud");
+        let addr = kernel.clone().start_http_daemon("127.0.0.1:0", repo).await.unwrap();
+        let op = kernel.operator_token();
+        let (acme_key, _) = kernel.paas.issue_api_key("acme", "coder", "Engineer", None, "test").await.unwrap();
+        let (other_key, _) = kernel.paas.issue_api_key("other", "coder", "Engineer", None, "test").await.unwrap();
+
+        let simulate = |org: &'static str| {
+            let op = op.clone();
+            async move {
+                let (_, v) = raw_http(addr, "POST", "/v1/approvals/simulate", Some(&op), Some(json!({ "org_id": org, "agent_id": "coder" }))).await;
+                v["escalation_id"].as_str().unwrap().to_string()
+            }
+        };
+        let esc1 = simulate("acme").await;
+
+        // Without an approver, a tenant key cannot approve, code or not.
+        let (head, _) = raw_http(addr, "POST", "/v1/approvals/decide", Some(&acme_key), Some(json!({ "escalation_id": esc1 }))).await;
+        assert!(head.contains("403"), "{head}");
+        let (head, _) = raw_http(addr, "POST", "/v1/approvals/decide", Some(&acme_key), Some(json!({ "escalation_id": esc1, "totp": "123456" }))).await;
+        assert!(head.contains("403"), "{head}");
+
+        // Enrollment is mailed; the API response never contains the link or secret.
+        let (head, resp) = raw_http(addr, "POST", "/v1/approver/email", Some(&acme_key), Some(json!({ "email": "Lead@Acme.dev" }))).await;
+        assert!(head.contains("200 OK"), "{head} {resp}");
+        assert!(!resp.to_string().contains("aet_"));
+        let mail = std::fs::read_dir(&outbox).unwrap().next().unwrap().unwrap().path();
+        let mail = std::fs::read_to_string(mail).unwrap();
+        assert!(mail.starts_with("To: lead@acme.dev"));
+        let token = mail.split("token=").nth(1).unwrap().split_whitespace().next().unwrap().to_string();
+        assert!(mail.contains("https://cloud.example/aegis-cloud/approver/enroll?token="));
+
+        // Opening the link changes nothing; pressing the button issues the secret exactly once.
+        let (head, page) = raw_http(addr, "GET", &format!("/approver/enroll?token={token}"), None, None).await;
+        assert!(head.contains("200 OK") && page["html"].as_str().unwrap().contains("Enroll my authenticator"));
+        assert_eq!(kernel.paas.approver_status("acme").await["enrolled"], false);
+        let (head, enrolled) = raw_http(addr, "POST", "/approver/enroll", None, Some(json!({ "token": token }))).await;
+        assert!(head.contains("200 OK"), "{head} {enrolled}");
+        assert_eq!(enrolled["org_id"], "acme");
+        assert!(enrolled["qr_svg"].as_str().unwrap().contains("<svg"));
+        let secret = enrolled["secret"].as_str().unwrap().to_string();
+        let (head, _) = raw_http(addr, "POST", "/approver/enroll", None, Some(json!({ "token": token }))).await;
+        assert!(head.contains("400"), "{head}");
+        let (_, status) = raw_http(addr, "GET", "/v1/approver", Some(&acme_key), None).await;
+        assert_eq!(status["enrolled"], true);
+        assert_eq!(status["email"], "l***@acme.dev");
+
+        // Later links can only go to the bound address.
+        let (head, _) = raw_http(addr, "POST", "/v1/approver/email", Some(&acme_key), Some(json!({ "email": "agent@evil.dev" }))).await;
+        assert!(head.contains("400"), "{head}");
+
+        // Wrong code is refused; the right code approves with a bounded lease.
+        let (head, _) = raw_http(addr, "POST", "/v1/approvals/decide", Some(&acme_key), Some(json!({ "escalation_id": esc1, "totp": "000000" }))).await;
+        assert!(head.contains("403"), "{head}");
+        let code = code_for(&secret, 0);
+        let (head, resp) = raw_http(addr, "POST", "/v1/approvals/decide", Some(&acme_key), Some(json!({ "escalation_id": esc1, "totp": code, "ttl_secs": 0 }))).await;
+        assert!(head.contains("200 OK"), "{head} {resp}");
+        assert_eq!(resp["status"], "approved");
+        assert!(resp["lease"]["expires_at_ms"].as_i64().unwrap() > 0, "tenant leases are never permanent: {resp}");
+
+        // A used code cannot be replayed, and another org's escalation is out of reach.
+        let esc2 = simulate("acme").await;
+        let (head, resp) = raw_http(addr, "POST", "/v1/approvals/decide", Some(&acme_key), Some(json!({ "escalation_id": esc2, "totp": code }))).await;
+        assert!(head.contains("403") && resp["error"].as_str().unwrap().contains("already used"), "{head} {resp}");
+        let foreign = simulate("other").await;
+        let (head, _) = raw_http(addr, "POST", "/v1/approvals/decide", Some(&acme_key), Some(json!({ "escalation_id": foreign, "totp": code_for(&secret, 1) }))).await;
+        assert!(head.contains("403"), "{head}");
+        let (head, _) = raw_http(addr, "POST", "/v1/approvals/decide", Some(&other_key), Some(json!({ "escalation_id": esc2, "totp": code_for(&secret, 1) }))).await;
+        assert!(head.contains("403"), "{head}");
+
+        // Tenants cannot reset approvers; the operator can.
+        let (head, _) = raw_http(addr, "DELETE", "/v1/approver", Some(&acme_key), None).await;
+        assert!(head.contains("403"), "{head}");
+        let (head, resp) = raw_http(addr, "DELETE", "/v1/approver?org_id=acme", Some(&op), None).await;
+        assert!(head.contains("200 OK") && resp["removed"] == true, "{head} {resp}");
+    }
+
+    #[tokio::test]
+    async fn approver_lockout_after_repeated_wrong_codes() {
+        let temp = tempfile::tempdir().unwrap();
+        let kernel = AegisRuntimeKernel::new(&temp.path().join("rt")).await.unwrap();
+        kernel.paas.set_mailer(approver::Mailer::Directory(temp.path().join("outbox")), "https://x.example");
+        kernel.paas.request_approver_email_enrollment("acme", "a@acme.dev").await.unwrap();
+        let mail = std::fs::read_dir(temp.path().join("outbox")).unwrap().next().unwrap().unwrap().path();
+        let token = std::fs::read_to_string(mail).unwrap().split("token=").nth(1).unwrap().split_whitespace().next().unwrap().to_string();
+        let enrolled = kernel.paas.confirm_approver_email_enrollment(&token).await.unwrap();
+        let secret = enrolled["secret"].as_str().unwrap().to_string();
+        for _ in 0..5 {
+            assert!(kernel.paas.verify_approver_code("acme", "000000").await.is_err());
+        }
+        let err = kernel.paas.verify_approver_code("acme", &code_for(&secret, 0)).await.unwrap_err();
+        assert!(err.to_string().contains("locked"), "{err}");
     }
 
     #[tokio::test]
@@ -4795,6 +4997,10 @@ mod tests {
         assert_eq!(claim_resp["status"], "subscription_claimed");
         let claimed_key = claim_resp["api_key"].as_str().unwrap().to_string();
         assert!(claimed_key.starts_with("ak_live_"));
+        // The claim token holder paid for the org, so the claim also enrolls them as its approver.
+        assert!(claim_resp["approver"]["secret"].as_str().unwrap().len() >= 32);
+        assert!(claim_resp["approver"]["otpauth_uri"].as_str().unwrap().starts_with("otpauth://totp/"));
+        assert_eq!(kernel.paas.approver_status("polar-org").await["enrolled_via"], "billing_claim");
 
         // Second claim attempt for the same key is rejected (one-time claim security)
         let (reclaim_head, _) = http_req_with_headers(
