@@ -141,36 +141,53 @@ pub fn mask_email(email: &str) -> String {
     }
 }
 
-/// How enrollment links are delivered.
+/// How enrollment links are delivered. Same provider order as Heurion's mailer: standard SMTP
+/// first, then the Resend API. Both go through `curl` (already required on cloud nodes) with
+/// credentials on stdin, never in argv.
 #[derive(Debug, Clone)]
 pub enum Mailer {
     /// No mail configured: email enrollment is unavailable.
     Disabled,
-    /// SMTP through `curl` (already required on cloud nodes); credentials go over stdin, not argv.
-    Smtp { url: String, user: String, pass: String, from: String },
+    Smtp { host: String, port: u16, secure: bool, user: String, pass: String, from: String },
+    Resend { api_key: String, from: String },
     /// Writes each message to a file (tests and local development).
     Directory(PathBuf),
 }
 
+pub const DEFAULT_EMAIL_FROM: &str = "Aegis Cloud <no-reply@heurion.org>";
+
 impl Mailer {
-    /// `AOS_SMTP_URL` (e.g. `smtps://smtp.gmail.com:465`), `AOS_SMTP_USER`, `AOS_SMTP_PASS`,
-    /// `AOS_SMTP_FROM`; or `AOS_MAIL_DIR` to write messages to files (local development).
+    /// `AOS_SMTP_HOST`, `AOS_SMTP_PORT` (465), `AOS_SMTP_SECURE` (implicit TLS; defaults to on for
+    /// port 465, otherwise STARTTLS is required), `AOS_SMTP_USER`, `AOS_SMTP_PASS`; or
+    /// `AOS_RESEND_API_KEY`. Sender: `AOS_EMAIL_FROM`. `AOS_MAIL_DIR` writes messages to files.
     pub fn from_env() -> Self {
-        let var = |k: &str| std::env::var(k).unwrap_or_default().trim().to_string();
+        Self::from_vars(|k| std::env::var(k).unwrap_or_default().trim().to_string())
+    }
+
+    pub fn from_vars(var: impl Fn(&str) -> String) -> Self {
         let dir = var("AOS_MAIL_DIR");
         if !dir.is_empty() {
             return Mailer::Directory(PathBuf::from(dir));
         }
-        let url = var("AOS_SMTP_URL");
-        if url.is_empty() {
-            return Mailer::Disabled;
-        }
-        let user = var("AOS_SMTP_USER");
-        let from = match var("AOS_SMTP_FROM") {
-            f if f.is_empty() => user.clone(),
+        let from = match var("AOS_EMAIL_FROM") {
+            f if f.is_empty() || f.contains(['\r', '\n']) => DEFAULT_EMAIL_FROM.to_string(),
             f => f,
         };
-        Mailer::Smtp { url, user, pass: var("AOS_SMTP_PASS"), from }
+        let host = var("AOS_SMTP_HOST");
+        if !host.is_empty() {
+            let port = var("AOS_SMTP_PORT").parse().unwrap_or(465);
+            let secure = match var("AOS_SMTP_SECURE").to_ascii_lowercase().as_str() {
+                "1" | "true" => true,
+                "0" | "false" => false,
+                _ => port == 465,
+            };
+            return Mailer::Smtp { host, port, secure, user: var("AOS_SMTP_USER"), pass: var("AOS_SMTP_PASS"), from };
+        }
+        let api_key = var("AOS_RESEND_API_KEY");
+        if !api_key.is_empty() {
+            return Mailer::Resend { api_key, from };
+        }
+        Mailer::Disabled
     }
 
     pub fn is_enabled(&self) -> bool {
@@ -181,6 +198,7 @@ impl Mailer {
         if !valid_email(to) {
             bail!("invalid recipient address");
         }
+        let quote = |s: &str| s.replace('\\', "\\\\").replace('"', "\\\"");
         match self {
             Mailer::Disabled => bail!("Email delivery is not configured on this Aegis Cloud node"),
             Mailer::Directory(dir) => {
@@ -189,7 +207,7 @@ impl Mailer {
                 std::fs::write(dir.join(name), format!("To: {to}\nSubject: {subject}\n\n{body}"))?;
                 Ok(())
             }
-            Mailer::Smtp { url, user, pass, from } => {
+            Mailer::Smtp { host, port, secure, user, pass, from } => {
                 let from_addr = from
                     .rsplit_once('<')
                     .map(|(_, a)| a.trim_end_matches('>').trim().to_string())
@@ -198,40 +216,62 @@ impl Mailer {
                     "From: {from}\r\nTo: <{to}>\r\nSubject: {subject}\r\nMIME-Version: 1.0\r\nContent-Type: text/plain; charset=utf-8\r\nContent-Transfer-Encoding: 8bit\r\n\r\n{}\r\n",
                     body.replace('\n', "\r\n")
                 );
-                let mut msg_file = tempfile_in_tmp()?;
-                msg_file.1.write_all(message.as_bytes())?;
-                drop(msg_file.1);
-                let quote = |s: &str| s.replace('\\', "\\\\").replace('"', "\\\"");
-                let config = format!(
-                    "url = \"{}\"\nuser = \"{}:{}\"\nmail-from = \"{}\"\nmail-rcpt = \"{}\"\nupload-file = \"{}\"\nssl-reqd\nsilent\nshow-error\nmax-time = 30\n",
-                    quote(url),
-                    quote(user),
-                    quote(pass),
+                let msg = private_temp_file("eml", message.as_bytes())?;
+                let scheme = if *secure { "smtps" } else { "smtp" };
+                let mut config = format!(
+                    "url = \"{scheme}://{}:{port}\"\nmail-from = \"{}\"\nmail-rcpt = \"{}\"\nupload-file = \"{}\"\nssl-reqd\n",
+                    quote(host),
                     quote(&from_addr),
                     quote(to),
-                    quote(&msg_file.0.to_string_lossy())
+                    quote(&msg.to_string_lossy())
                 );
-                let mut child = Command::new("curl")
-                    .args(["-K", "-"])
-                    .stdin(Stdio::piped())
-                    .stdout(Stdio::null())
-                    .stderr(Stdio::piped())
-                    .spawn()
-                    .context("failed to run curl for SMTP delivery")?;
-                child.stdin.take().context("curl stdin")?.write_all(config.as_bytes())?;
-                let out = child.wait_with_output()?;
-                let _ = std::fs::remove_file(&msg_file.0);
-                if !out.status.success() {
-                    bail!("SMTP delivery failed: {}", String::from_utf8_lossy(&out.stderr).trim());
+                if !user.is_empty() {
+                    config.push_str(&format!("user = \"{}:{}\"\n", quote(user), quote(pass)));
                 }
-                Ok(())
+                let result = run_curl(&config);
+                let _ = std::fs::remove_file(&msg);
+                result.context("SMTP delivery failed")
+            }
+            Mailer::Resend { api_key, from } => {
+                let payload = serde_json::json!({ "from": from, "to": [to], "subject": subject, "text": body });
+                let data = private_temp_file("json", payload.to_string().as_bytes())?;
+                let config = format!(
+                    "url = \"https://api.resend.com/emails\"\nheader = \"Authorization: Bearer {}\"\nheader = \"Content-Type: application/json\"\ndata-binary = \"@{}\"\nfail-with-body\n",
+                    quote(api_key),
+                    quote(&data.to_string_lossy())
+                );
+                let result = run_curl(&config);
+                let _ = std::fs::remove_file(&data);
+                result.context("Resend delivery failed")
             }
         }
     }
 }
 
-fn tempfile_in_tmp() -> anyhow::Result<(PathBuf, std::fs::File)> {
-    let path = std::env::temp_dir().join(format!("aegis-mail-{}.eml", uuid::Uuid::new_v4().simple()));
+/// Runs `curl -K -` with `config` on stdin so secrets never show up in the process list.
+fn run_curl(config: &str) -> anyhow::Result<()> {
+    let config = format!("{config}silent\nshow-error\nmax-time = 30\n");
+    let mut child = Command::new("curl")
+        .args(["-K", "-"])
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .context("failed to run curl")?;
+    child.stdin.take().context("curl stdin")?.write_all(config.as_bytes())?;
+    let out = child.wait_with_output()?;
+    if !out.status.success() {
+        bail!(
+            "{} {}",
+            String::from_utf8_lossy(&out.stderr).trim(),
+            String::from_utf8_lossy(&out.stdout).chars().take(300).collect::<String>()
+        );
+    }
+    Ok(())
+}
+
+fn private_temp_file(ext: &str, contents: &[u8]) -> anyhow::Result<PathBuf> {
+    let path = std::env::temp_dir().join(format!("aegis-mail-{}.{ext}", uuid::Uuid::new_v4().simple()));
     let mut opts = std::fs::OpenOptions::new();
     opts.write(true).create_new(true);
     #[cfg(unix)]
@@ -239,7 +279,8 @@ fn tempfile_in_tmp() -> anyhow::Result<(PathBuf, std::fs::File)> {
         use std::os::unix::fs::OpenOptionsExt;
         opts.mode(0o600);
     }
-    Ok((path.clone(), opts.open(&path)?))
+    opts.open(&path)?.write_all(contents)?;
+    Ok(path)
 }
 
 /// Page behind the mailed link. Opening it changes nothing (mail scanners prefetch links); the
@@ -350,6 +391,23 @@ mod tests {
         assert!(!valid_email("nodomain@"));
         assert!(!valid_email("x@localhost"));
         assert_eq!(mask_email("alice@example.com"), "a***@example.com");
+    }
+
+    #[test]
+    fn mailer_config_follows_heurion_provider_order() {
+        let vars = |pairs: &'static [(&'static str, &'static str)]| {
+            move |k: &str| pairs.iter().find(|(n, _)| *n == k).map(|(_, v)| v.to_string()).unwrap_or_default()
+        };
+        assert!(matches!(Mailer::from_vars(vars(&[])), Mailer::Disabled));
+        match Mailer::from_vars(vars(&[("AOS_SMTP_HOST", "smtp.163.com"), ("AOS_RESEND_API_KEY", "re_x")])) {
+            Mailer::Smtp { port: 465, secure: true, ref from, .. } => assert_eq!(from, DEFAULT_EMAIL_FROM),
+            other => panic!("{other:?}"),
+        }
+        assert!(matches!(
+            Mailer::from_vars(vars(&[("AOS_SMTP_HOST", "mail"), ("AOS_SMTP_PORT", "587")])),
+            Mailer::Smtp { port: 587, secure: false, .. }
+        ));
+        assert!(matches!(Mailer::from_vars(vars(&[("AOS_RESEND_API_KEY", "re_x")])), Mailer::Resend { .. }));
     }
 
     #[test]

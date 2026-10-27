@@ -163,13 +163,13 @@ Anonymous callers can mint only the *first* key of an org that has none. `--inse
 
 Agents hold the tenant key, so a tenant key alone never approves anything. Each org has one **approver**: a person with an authenticator app (TOTP, RFC 6238). Approving an escalation takes the tenant key **plus** the app's current 6-digit code, which the agent does not have.
 
-- **Enroll, paid plans**: `aegis-os cloud subscribe --claim` claims the key with the checkout's one-time claim token and, if the org has no approver yet, shows the authenticator QR code once.
+- **Enroll, paid plans**: `aegis-os cloud subscribe --claim` claims the key and, if the org has no approver yet, mails an enrollment link to the **billing email** (from the payment provider). The claim itself never returns the secret, because the claim token is stored on disk where an agent could read it.
 - **Enroll, any plan**: `aegis-os cloud approver enroll --email you@example.com` mails a one-time link (30 min). Open it in a browser and press the button to get the QR code. Once an org has a billing or approver email, links only go to that address. Opening the link alone changes nothing.
 - **Approve**: `aegis-os cloud approve <escalation_id>` shows the escalation and asks for the code (or `--code 123456`; `--deny` rejects). Codes are single-use, tenant leases are capped at 24h, and 5 wrong codes lock approvals for 5 minutes.
 - **Operator**: `AOS_ADMIN_SECRET=<operator token> aegis-os cloud approve <id>` still works; `DELETE /v1/approver?org_id=<org>` resets a lost device.
 - **Agents are blocked** from running `aegis-os policy approve|lease`, `cloud approve` and `cloud approver …` by the PreToolUse hook. Locally, approve with `aegis-os policy approve <id>` in your terminal (in Claude Code: `! aegis-os policy approve <id>`).
 
-Mail delivery on the node: `AOS_SMTP_URL` (e.g. `smtps://smtp.gmail.com:465`), `AOS_SMTP_USER`, `AOS_SMTP_PASS`, `AOS_SMTP_FROM`, and `AOS_PUBLIC_URL` for the link (default `https://heurion.org/aegis-cloud`).
+Mail delivery on the node follows Heurion's mailer: SMTP (`AOS_SMTP_HOST`, `AOS_SMTP_PORT` default 465, `AOS_SMTP_SECURE`, `AOS_SMTP_USER`, `AOS_SMTP_PASS`) first, else the Resend API (`AOS_RESEND_API_KEY`); sender `AOS_EMAIL_FROM` (default `Aegis Cloud <no-reply@heurion.org>`); `AOS_PUBLIC_URL` for the link (default `https://heurion.org/aegis-cloud`).
 
 ### 2. CLI-First Cloud Control (`aegis-os cloud`)
 

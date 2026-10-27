@@ -270,7 +270,7 @@ pub struct ApproverRecord {
     pub secret_hex: String,
     #[serde(default)]
     pub email: Option<String>,
-    /// `billing_claim` or `email`.
+    /// How the approver was enrolled (`email`).
     pub enrolled_via: String,
     pub enrolled_at_ms: i64,
     /// Highest TOTP step already used; codes at or below it are replays.
@@ -1301,16 +1301,22 @@ impl PaasControlPlane {
             "api_key": claimed_key
         });
         state.pending_claims.retain(|c| c.claim_id != pending.claim_id);
-        // Whoever holds the checkout's claim token paid for the org: make them its approver unless
-        // one is already enrolled (replacing an approver goes through the mailed link).
-        let mut out = out;
-        if !state.approvers.iter().any(|a| a.org_id == pending.org_id) {
-            let email = out["customer_email"].as_str().map(|e| e.trim().to_lowercase());
-            let enrollment = Self::new_approver(&mut state, &pending.org_id, email, "billing_claim");
-            out["approver"] = enrollment;
-        }
+        let has_approver = state.approvers.iter().any(|a| a.org_id == pending.org_id);
         drop(state);
         self.flush().await?;
+        // The claim token can sit on disk where an agent may read it, so the claim itself never
+        // hands out the approver secret. Instead the enrollment link goes to the billing email,
+        // which comes from the payment provider.
+        let mut out = out;
+        if !has_approver {
+            out["approver_enrollment"] = match out["customer_email"].as_str().map(str::to_string) {
+                Some(email) => match self.request_approver_email_enrollment(&pending.org_id, &email).await {
+                    Ok(_) => json!({ "status": "email_sent", "email": crate::approver::mask_email(&email) }),
+                    Err(e) => json!({ "status": "not_sent", "reason": e.to_string() }),
+                },
+                None => json!({ "status": "not_sent", "reason": "no billing email on the subscription" }),
+            };
+        }
         Ok(out)
     }
 

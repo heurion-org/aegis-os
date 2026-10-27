@@ -4844,6 +4844,8 @@ mod tests {
             .unwrap();
 
         let kernel = Arc::new(AegisRuntimeKernel::new(&runtime_root).await.unwrap());
+        let outbox = runtime_root.join("outbox");
+        kernel.paas.set_mailer(approver::Mailer::Directory(outbox.clone()), "https://cloud.example");
         let addr = kernel
             .clone()
             .start_http_daemon("127.0.0.1:0", source_repo.clone())
@@ -4997,10 +4999,15 @@ mod tests {
         assert_eq!(claim_resp["status"], "subscription_claimed");
         let claimed_key = claim_resp["api_key"].as_str().unwrap().to_string();
         assert!(claimed_key.starts_with("ak_live_"));
-        // The claim token holder paid for the org, so the claim also enrolls them as its approver.
-        assert!(claim_resp["approver"]["secret"].as_str().unwrap().len() >= 32);
-        assert!(claim_resp["approver"]["otpauth_uri"].as_str().unwrap().starts_with("otpauth://totp/"));
-        assert_eq!(kernel.paas.approver_status("polar-org").await["enrolled_via"], "billing_claim");
+        // The claim never carries the approver secret (the claim token may sit on disk where an
+        // agent can read it); it mails an enrollment link to the billing address instead.
+        assert!(claim_resp.get("approver").is_none());
+        assert!(!claim_resp.to_string().contains("otpauth"));
+        assert_eq!(claim_resp["approver_enrollment"]["status"], "email_sent", "{claim_resp}");
+        let mail = std::fs::read_dir(&outbox).unwrap().next().unwrap().unwrap().path();
+        let mail = std::fs::read_to_string(mail).unwrap();
+        assert!(mail.starts_with(&format!("To: {}", claim_resp["customer_email"].as_str().unwrap().to_lowercase())), "{mail}");
+        assert_eq!(kernel.paas.approver_status("polar-org").await["enrolled"], false);
 
         // Second claim attempt for the same key is rejected (one-time claim security)
         let (reclaim_head, _) = http_req_with_headers(

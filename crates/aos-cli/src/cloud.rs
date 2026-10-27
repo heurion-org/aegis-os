@@ -1126,15 +1126,16 @@ pub async fn handle_cloud_command(
                     store.pending_claim_token = None;
                     save_store(runtime_dir, &store)?;
                 }
-                let mut resp = resp;
-                if let Some(approver) = resp.get_mut("approver").and_then(|a| a.as_object_mut()) {
-                    approver.remove("qr_svg");
-                    if let Some(qr) = approver.remove("qr_terminal") {
-                        eprintln!("\nYou are now this org's approver. Scan with your authenticator app (shown once):\n");
-                        eprintln!("{}", qr.as_str().unwrap_or_default());
-                        eprintln!("Manual key: {}", approver.get("secret").and_then(|v| v.as_str()).unwrap_or_default());
-                        eprintln!("Approve escalations with `aegis-os cloud approve <id>` and the app's 6-digit code.\n");
-                    }
+                match resp["approver_enrollment"]["status"].as_str() {
+                    Some("email_sent") => eprintln!(
+                        "\nTo approve your agents' escalations, open the link just sent to {} and add your authenticator app.\n",
+                        resp["approver_enrollment"]["email"].as_str().unwrap_or("your billing email")
+                    ),
+                    Some(_) => eprintln!(
+                        "\nNo approver enrollment email was sent ({}). Run `aegis-os cloud approver enroll --email <billing email>` later.\n",
+                        resp["approver_enrollment"]["reason"].as_str().unwrap_or("unknown reason")
+                    ),
+                    None => {}
                 }
                 println!("{}", serde_json::to_string_pretty(&resp)?);
             } else {
