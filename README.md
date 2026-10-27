@@ -10,6 +10,8 @@
 
 ![Paper](https://img.shields.io/badge/Paper-arXiv%20Preprint-b31b1b.svg)
 
+[![M8ven Score](https://m8ven.ai/badge/mcp/heurion-org-aegis-os-1e08v9?v=32d7b373cf3b8ccc6fc0fbb8229507d1)](https://m8ven.ai/mcp/heurion-org-aegis-os-1e08v9?s=readme)
+
 ---
 
 ## Overview
