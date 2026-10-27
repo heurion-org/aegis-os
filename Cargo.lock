@@ -78,7 +78,7 @@ checksum = "330a5ed07fa54e4702c9d6c4174f74427fc0ef6e214bbd677ae50a5099946470"
 
 [[package]]
 name = "aos-cli"
-version = "0.4.1"
+version = "0.4.2"
 dependencies = [
  "anyhow",
  "aos-core",
@@ -100,7 +100,7 @@ dependencies = [
 
 [[package]]
 name = "aos-core"
-version = "0.4.1"
+version = "0.4.2"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -116,7 +116,7 @@ dependencies = [
 
 [[package]]
 name = "aos-egress"
-version = "0.4.1"
+version = "0.4.2"
 dependencies = [
  "anyhow",
  "aos-core",
@@ -127,7 +127,7 @@ dependencies = [
 
 [[package]]
 name = "aos-ipc"
-version = "0.4.1"
+version = "0.4.2"
 dependencies = [
  "anyhow",
  "aos-core",
@@ -141,7 +141,7 @@ dependencies = [
 
 [[package]]
 name = "aos-mcp-gateway"
-version = "0.4.1"
+version = "0.4.2"
 dependencies = [
  "anyhow",
  "aos-core",
@@ -166,7 +166,7 @@ dependencies = [
 
 [[package]]
 name = "aos-policy"
-version = "0.4.1"
+version = "0.4.2"
 dependencies = [
  "anyhow",
  "aos-core",
@@ -180,7 +180,7 @@ dependencies = [
 
 [[package]]
 name = "aos-recorder"
-version = "0.4.1"
+version = "0.4.2"
 dependencies = [
  "anyhow",
  "aos-core",
@@ -194,7 +194,7 @@ dependencies = [
 
 [[package]]
 name = "aos-sandbox"
-version = "0.4.1"
+version = "0.4.2"
 dependencies = [
  "anyhow",
  "aos-core",
@@ -210,7 +210,7 @@ dependencies = [
 
 [[package]]
 name = "aos-vfs"
-version = "0.4.1"
+version = "0.4.2"
 dependencies = [
  "anyhow",
  "aos-core",
