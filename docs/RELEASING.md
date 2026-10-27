@@ -62,7 +62,7 @@ AOS_SMTP_USER=you@gmail.com
 AOS_SMTP_PASS=<app password>
 # or Resend
 # AOS_RESEND_API_KEY=re_...
-AOS_EMAIL_FROM=Aegis Cloud <no-reply@heurion.org>
+AOS_EMAIL_FROM="Aegis Cloud <no-reply@heurion.org>"
 ```
 
 Without it, no one can enroll as a tenant approver; the operator token still approves.
