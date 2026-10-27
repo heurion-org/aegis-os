@@ -264,6 +264,18 @@ pub fn resolve_active_cloud_binding(
         .find(|b| b.enabled && b.local_workspace == canon_str)
 }
 
+/// The hosted service lives under `/aegis-cloud` on heurion.org (the site root is Heurion itself).
+/// Bare `https://heurion.org` endpoints — the old default, still in saved logins — map there.
+pub fn api_base(endpoint: &str) -> String {
+    let base = endpoint.trim().trim_end_matches('/');
+    match base {
+        "https://heurion.org" | "https://www.heurion.org" | "http://heurion.org" => {
+            "https://heurion.org/aegis-cloud".to_string()
+        }
+        other => other.to_string(),
+    }
+}
+
 /// Lightweight HTTP/HTTPS JSON client using native `TcpStream` for `http://` and `curl` fallback for `https://`.
 pub async fn cloud_http_json(
     method: &str,
@@ -273,7 +285,8 @@ pub async fn cloud_http_json(
     extra_headers: &[(&str, &str)],
     body: Option<&Value>,
 ) -> anyhow::Result<Value> {
-    let base = endpoint.trim().trim_end_matches('/');
+    let base = api_base(endpoint);
+    let base = base.as_str();
     let full_url = format!("{}{}", base, path);
 
     if let Some(rest) = base.strip_prefix("http://") {
@@ -729,7 +742,7 @@ pub async fn handle_cloud_command(
                     "synced_source_files": files_count,
                     "provision": prov_resp.get("status").cloned().unwrap_or(json!("ok")),
                     "sync_up": sync_resp.get("status").cloned().unwrap_or(json!("ok")),
-                    "dashboard_url": format!("{}/aegis-cloud/dashboard", clean_ep)
+                    "dashboard_url": format!("{}/dashboard", api_base(&clean_ep))
                 }))?
             );
         }
@@ -1919,6 +1932,14 @@ pub async fn serve_unified_stdio(
 mod tests {
     use super::*;
     use std::sync::Arc;
+
+    #[test]
+    fn heurion_root_endpoint_maps_to_the_aegis_cloud_prefix() {
+        assert_eq!(api_base("https://heurion.org"), "https://heurion.org/aegis-cloud");
+        assert_eq!(api_base("https://heurion.org/"), "https://heurion.org/aegis-cloud");
+        assert_eq!(api_base("https://heurion.org/aegis-cloud/"), "https://heurion.org/aegis-cloud");
+        assert_eq!(api_base("http://127.0.0.1:17080"), "http://127.0.0.1:17080");
+    }
 
     #[test]
     fn cloud_approve_requires_an_operator_token() {
