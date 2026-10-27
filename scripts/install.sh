@@ -4,7 +4,7 @@ set -eu
 # Release signing key. Every downloaded binary must carry a valid OpenSSH signature from this key
 # (namespace `aegis-os-release`), produced by the release workflow. There is deliberately no switch
 # to skip verification: the mirror is not trusted, the signature is.
-RELEASE_SIGNER='aegis-os-release@heurion.org ssh-ed25519 REPLACE_WITH_RELEASE_PUBLIC_KEY'
+RELEASE_SIGNER='aegis-os-release@heurion.org ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIObpFSqmFZ8/ObqSlGmN/zhTbFeDHDxlKx6ha6Y9Zi37'
 RELEASE_PRINCIPAL="aegis-os-release@heurion.org"
 RELEASE_NAMESPACE="aegis-os-release"
 
