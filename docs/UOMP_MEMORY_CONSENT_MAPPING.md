@@ -605,6 +605,19 @@ CREATE TABLE uomp_sessions (
 
 这张表只是 UOMP API 的兼容视图，不是第二套授权状态。真正的授权状态在 Aegis policy/lease 中。
 
+### 13.2 Phase 1 当前实现
+
+`crates/aos-memory` 已经落地第一批纯映射逻辑：
+
+- `MemoryScope` / `MemoryScopes`：与 UOMP `uom.json` 的 `requested_scopes` 兼容。
+- `scope_resources()`：tag/key → `memory:tag:<tag>` / `memory:key:<key>`。
+- `lease_plan()`：一个 Session 生成 1..N 个 `LeaseGrant`，支持 TTL 与 one-shot。
+- `filter_item()`：deny tag/key 优先，字段级 projection。
+- `high_sensitivity_keys()`：找出未显式选择的高敏 key。
+- `lease_covers()`：复刻 Aegis 的 exact / prefix / `*` lease 匹配。
+
+它还没有接入 MCP gateway、memory store 或 trusted UI；这是 Phase 1b 的工作。
+
 ### 13.1 服务接口
 
 | 接口 | 输入 | 输出 |

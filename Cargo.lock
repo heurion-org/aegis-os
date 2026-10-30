@@ -165,6 +165,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "aos-memory"
+version = "0.4.3"
+dependencies = [
+ "aos-core",
+ "serde",
+ "serde_json",
+]
+
+[[package]]
 name = "aos-policy"
 version = "0.4.3"
 dependencies = [

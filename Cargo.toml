@@ -8,6 +8,7 @@ members = [
     "crates/aos-sandbox",
     "crates/aos-egress",
     "crates/aos-recorder",
+    "crates/aos-memory",
     "crates/aos-mcp-gateway",
     "crates/aos-cli",
 ]
@@ -44,4 +45,5 @@ aos-ipc = { path = "crates/aos-ipc" }
 aos-sandbox = { path = "crates/aos-sandbox" }
 aos-egress = { path = "crates/aos-egress" }
 aos-recorder = { path = "crates/aos-recorder" }
+aos-memory = { path = "crates/aos-memory" }
 aos-mcp-gateway = { path = "crates/aos-mcp-gateway" }
