@@ -103,8 +103,8 @@ function printServer(server: ServerStatus): void {
 
   if (!server.running) {
     console.log(chalk.gray('  not running'));
-    console.log(chalk.gray('  start with: uomp connect claude --scope <tag>'));
-    console.log(chalk.gray('  or:         uomp start'));
+    console.log(chalk.gray('  start with: aegis-os memory connect claude --scope <tag>'));
+    console.log(chalk.gray('  or:         aegis-os memory start'));
     console.log('');
     return;
   }
@@ -112,10 +112,10 @@ function printServer(server: ServerStatus): void {
   if (server.managed) {
     console.log(`  ${chalk.green('running in background')}  ${server.url}`);
     console.log(chalk.gray(`  pid ${server.pid} · log ${server.logPath}`));
-    console.log(chalk.gray('  stop with: uomp stop'));
+    console.log(chalk.gray('  stop with: aegis-os memory stop'));
   } else {
     console.log(`  ${chalk.green('running')}  ${server.url}`);
-    console.log(chalk.gray('  started outside uomp connect (foreground uomp serve)'));
+    console.log(chalk.gray('  started outside aegis-os memory connect (foreground aegis-os memory serve)'));
   }
   console.log('');
 }

@@ -229,40 +229,40 @@ Product entry:
   $ aegis-os memory ...   (delegates to this reference CLI during migration)
 
 Fast path:
-  $ uomp setup claude --vault ~/Obsidian/MyVault
+  $ aegis-os memory setup claude --vault ~/Obsidian/MyVault
   $ open Claude and ask it to read your notes
-  $ uomp status
+  $ aegis-os memory status
 
 The first tool call opens the local UOMP approval page.
 
 Manual / pre-authorize:
-  $ uomp connect claude --vault ~/Obsidian/MyVault --scope notes/projects
-  $ uomp connect ./my-agent --scope notes/projects
-  $ uomp authorize --scope notes/projects --output ~/.uomp/sessions/client.env --no-server
-  $ uomp mcp --session ~/.uomp/sessions/client.env --print-config
+  $ aegis-os memory connect claude --vault ~/Obsidian/MyVault --scope notes/projects
+  $ aegis-os memory connect ./my-agent --scope notes/projects
+  $ aegis-os memory authorize --scope notes/projects --output ~/.uomp/sessions/client.env --no-server
+  $ aegis-os memory mcp --session ~/.uomp/sessions/client.env --print-config
 
 Manage access:
-  $ uomp revoke <session-id>
-  $ uomp staged list
-  $ uomp staged approve <staged-write-id>
-  $ uomp payload list
-  $ uomp payload get <payload-id>
-  $ uomp approvals
-  $ uomp disconnect claude
-  $ uomp stop
+  $ aegis-os memory revoke <session-id>
+  $ aegis-os memory staged list
+  $ aegis-os memory staged approve <staged-write-id>
+  $ aegis-os memory payload list
+  $ aegis-os memory payload get <payload-id>
+  $ aegis-os memory approvals
+  $ aegis-os memory disconnect claude
+  $ aegis-os memory stop
 
 On-demand consent:
-  $ uomp pending
-  $ uomp approve <request-id>
-  $ uomp deny <request-id>
+  $ aegis-os memory pending
+  $ aegis-os memory approve <request-id>
+  $ aegis-os memory deny <request-id>
 
 Optional:
-  $ uomp demo
-  $ uomp init
-  $ uomp doctor
+  $ aegis-os memory demo
+  $ aegis-os memory init
+  $ aegis-os memory doctor
 
 Advanced commands (hidden): memory, registry, discover, inspect, agent
-Run \`uomp help <command>\` for details.
+Run \`aegis-os memory help <command>\` for details.
 `);
 
 program.parse();

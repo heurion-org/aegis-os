@@ -94,16 +94,16 @@ export class SetupCommands {
           console.log('');
           console.log(chalk.bold('No access has been granted yet.'));
           if (options.server === false) {
-            console.log(chalk.gray('Start the local server with: uomp start'));
+            console.log(chalk.gray('Start the local server with: aegis-os memory start'));
           }
           console.log(`Open ${clientLabel(client)} and ask it to read your notes.`);
           console.log('The first request opens the local UOMP approval page.');
           console.log('');
           console.log(chalk.gray('If the page does not open:'));
-          console.log(`  ${chalk.cyan('uomp pending')}`);
-          console.log(`  ${chalk.cyan('uomp approve <request-id>')}`);
+          console.log(`  ${chalk.cyan('aegis-os memory pending')}`);
+          console.log(`  ${chalk.cyan('aegis-os memory approve <request-id>')}`);
           console.log('');
-          console.log(chalk.gray('Check access with: uomp status'));
+          console.log(chalk.gray('Check access with: aegis-os memory status'));
         } catch (error) {
           console.error(chalk.red(error instanceof Error ? error.message : String(error)));
           process.exitCode = 1;
