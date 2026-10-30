@@ -17,6 +17,8 @@ mod routing;
 
 use aos_core::{AgentIdentity, IsolationTier};
 use aos_mcp_gateway::AegisRuntimeKernel;
+use aos_memory::RemoteProfile;
+use aos_memory_gateway::{serve as serve_memory_gateway, GatewayConfig};
 use clap::{Parser, Subcommand};
 use serde_json::{json, Value};
 use std::io::Read;
@@ -102,6 +104,28 @@ enum Commands {
     Policy {
         #[command(subcommand)]
         action: PolicyAction,
+    },
+
+    /// Start the local Aegis Memory Gateway for remote UOMP Agents
+    MemoryGateway {
+        /// Listen address (put a TLS 1.3 / mTLS terminator in front in production).
+        #[arg(long, default_value = "127.0.0.1:9443")]
+        listen: String,
+        /// Local UOMP Memory Guard base URL.
+        #[arg(long, default_value = "http://127.0.0.1:9374")]
+        guard_url: String,
+        /// Path to the UOMP Ed25519 public JWK.
+        #[arg(long)]
+        public_key: PathBuf,
+        /// Expected UOMP token audience (Gateway public URL).
+        #[arg(long)]
+        audience: String,
+        /// Allowed request endpoint prefix. Repeatable.
+        #[arg(long = "allowed-endpoint")]
+        allowed_endpoints: Vec<String>,
+        /// Maximum accepted token lifetime in seconds.
+        #[arg(long, default_value_t = 600)]
+        max_token_ttl_secs: i64,
     },
 
     /// Monitor and interact with the Organization's Inter-Agent Communication (IPC) Bus
@@ -617,6 +641,28 @@ async fn main() -> anyhow::Result<()> {
                     println!("{}", serde_json::to_string_pretty(&res)?);
                 }
             }
+        }
+
+        Commands::MemoryGateway {
+            listen,
+            guard_url,
+            public_key,
+            audience,
+            allowed_endpoints,
+            max_token_ttl_secs,
+        } => {
+            let jwk = tokio::fs::read_to_string(&public_key).await?;
+            let config = GatewayConfig::from_jwk(
+                RemoteProfile {
+                    gateway_id: format!("{}:{}", identity.org_id, identity.agent_id),
+                    audience,
+                    allowed_endpoints,
+                    max_token_ttl_secs,
+                },
+                &jwk,
+            )?;
+            println!("Aegis Memory Gateway listening on {listen} -> {guard_url}");
+            serve_memory_gateway(config, &listen, &guard_url).await?;
         }
 
         Commands::Policy { action } => {

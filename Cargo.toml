@@ -9,6 +9,7 @@ members = [
     "crates/aos-egress",
     "crates/aos-recorder",
     "crates/aos-memory",
+    "crates/aos-memory-gateway",
     "crates/aos-mcp-gateway",
     "crates/aos-cli",
 ]
@@ -27,6 +28,8 @@ serde_json = "1.0"
 tokio = { version = "1.40", features = ["full"] }
 async-trait = "0.1"
 sha2 = "0.10"
+base64 = "0.22"
+ed25519-dalek = "2"
 hex = "0.4"
 hmac = "0.12"
 sha1 = "0.10"
@@ -46,4 +49,5 @@ aos-sandbox = { path = "crates/aos-sandbox" }
 aos-egress = { path = "crates/aos-egress" }
 aos-recorder = { path = "crates/aos-recorder" }
 aos-memory = { path = "crates/aos-memory" }
+aos-memory-gateway = { path = "crates/aos-memory-gateway" }
 aos-mcp-gateway = { path = "crates/aos-mcp-gateway" }

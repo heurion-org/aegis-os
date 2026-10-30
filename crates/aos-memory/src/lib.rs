@@ -53,11 +53,11 @@ pub struct MemoryScope {
     pub tags: Vec<String>,
     #[serde(default)]
     pub keys: Vec<String>,
-    #[serde(default)]
+    #[serde(default, alias = "denyTags")]
     pub deny_tags: Vec<String>,
-    #[serde(default)]
+    #[serde(default, alias = "denyKeys")]
     pub deny_keys: Vec<String>,
-    #[serde(default)]
+    #[serde(default, alias = "allowedFields")]
     pub allowed_fields: Vec<String>,
     #[serde(default)]
     pub fields: HashMap<String, Vec<String>>,

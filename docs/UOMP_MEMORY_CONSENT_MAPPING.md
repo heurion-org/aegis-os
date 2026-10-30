@@ -701,11 +701,14 @@ Memory Store (user device)
 - 本地 Gateway 仍然执行 UOMP scope、deny、field 过滤和审计。
 - 远程审批必须绑定用户在场或 Aegis Cloud 的 tenant approver。
 
-Phase 1 已实现远程入口的策略核心：
+Phase 1 已实现远程入口的策略核心和最小网络层：
 
 - `aos_memory::RemoteProfile`：`gateway_id`、`audience`、`allowed_endpoints`、`max_token_ttl_secs`。
 - `aos_memory::validate_remote_access()`：校验 `profile == "remote"`、audience、过期、撤销、endpoint 白名单、token TTL 和 scope。
-- mTLS 终止、限流和 HTTP 转发仍由 Aegis Memory Gateway 运行时负责。
+- `aos-memory-gateway`：EdDSA JWT 验签、`/v1/memory` 路由、转发到本地 Memory Guard。
+- CLI：`aegis-os memory-gateway --public-key <jwk> --audience <url> --guard-url <url>`。
+- 当前网络层是明文 HTTP；生产部署必须在前面加 TLS 1.3 / mTLS 终止器（或后续在 runtime 内补 TLS）。
+- 会话撤销状态目前由本地 Guard 最终校验；Gateway 侧的显式 session 查询是下一步。
 
 ## 16. 相关文档
 
