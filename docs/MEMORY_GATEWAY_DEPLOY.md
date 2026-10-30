@@ -37,6 +37,7 @@ aegis-os memory-gateway \
   --public-key ~/.uomp/.secrets/ed25519-public.jwk \
   --audience https://memory.example.com \
   --allowed-endpoint /v1/memory \
+  --allowed-endpoint /v1/payload \
   --audit-log ~/.aegis-os/memory-gateway-audit.jsonl
 ```
 
@@ -49,7 +50,7 @@ The gateway:
 - enforces the token scope and endpoint allowlist;
 - applies a per-session rate limit (60 req/min by default);
 - writes `gateway_access` JSONL audit events;
-- forwards `GET /v1/memory` reads and `PUT /v1/memory/:key` staged writes.
+- forwards `GET /v1/memory` reads, `PUT /v1/memory/:key` staged writes, and `/v1/payload` encrypted envelopes.
 
 ## 3. Native TLS 1.3 / mTLS
 
@@ -60,6 +61,7 @@ aegis-os memory-gateway \
   --public-key ~/.uomp/.secrets/ed25519-public.jwk \
   --audience https://memory.example.com \
   --allowed-endpoint /v1/memory \
+  --allowed-endpoint /v1/payload \
   --tls-cert /etc/aegis-memory/server.pem \
   --tls-key /etc/aegis-memory/server-key.pem \
   --client-ca /etc/aegis-memory/client-ca.pem \
@@ -113,6 +115,7 @@ ExecStart=%h/.local/bin/aegis-os memory-gateway \
   --public-key %h/.uomp/.secrets/ed25519-public.jwk \
   --audience https://memory.example.com \
   --allowed-endpoint /v1/memory \
+  --allowed-endpoint /v1/payload \
   --audit-log %h/.aegis-os/memory-gateway-audit.jsonl
 Restart=on-failure
 NoNewPrivileges=true
@@ -162,5 +165,5 @@ Expected:
 
 - The gateway forwards reads and staged writes (`PUT /v1/memory/:key`); writes require UOMP approval before they are applied.
 - Native TLS 1.3 / mTLS is supported; Caddy remains an optional public edge.
-- Payload delivery (`/v1/payload/*`) is not implemented yet.
+- Payload delivery is implemented as encrypted envelope storage; decryption happens on the user side.
 - Aegis Cloud remote Agent provisioning is a separate step; this guide only covers the local memory entry point.

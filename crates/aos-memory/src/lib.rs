@@ -329,13 +329,11 @@ pub enum RemoteAccessError {
 ///
 /// This is the pure policy core of Aegis Memory Gateway: transport (mTLS),
 /// rate limiting, and proxying are handled by the runtime around it.
-pub fn validate_remote_access(
+pub fn validate_remote_identity(
     profile: &RemoteProfile,
     claims: &RemoteTokenClaims,
     session_revoked: bool,
     request_endpoint: &str,
-    action: MemoryAction,
-    resource: &str,
     now_ms: i64,
 ) -> Result<(), RemoteAccessError> {
     if claims.profile != "remote" {
@@ -361,6 +359,19 @@ pub fn validate_remote_access(
     {
         return Err(RemoteAccessError::EndpointNotAllowed);
     }
+    Ok(())
+}
+
+pub fn validate_remote_access(
+    profile: &RemoteProfile,
+    claims: &RemoteTokenClaims,
+    session_revoked: bool,
+    request_endpoint: &str,
+    action: MemoryAction,
+    resource: &str,
+    now_ms: i64,
+) -> Result<(), RemoteAccessError> {
+    validate_remote_identity(profile, claims, session_revoked, request_endpoint, now_ms)?;
     if !scope_allows(&claims.scopes, action, resource) {
         return Err(RemoteAccessError::ScopeDenied);
     }

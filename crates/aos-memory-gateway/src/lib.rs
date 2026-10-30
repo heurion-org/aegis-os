@@ -11,7 +11,8 @@ use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use aos_memory::{
-    validate_remote_access, MemoryAction, RemoteAccessError, RemoteProfile, RemoteTokenClaims,
+    validate_remote_access, validate_remote_identity, MemoryAction, RemoteAccessError,
+    RemoteProfile, RemoteTokenClaims,
 };
 use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine as _};
 use ed25519_dalek::{Signature, VerifyingKey};
@@ -174,6 +175,11 @@ pub struct AuthorizedRequest {
     pub resource: String,
 }
 
+enum GatewayRoute {
+    Memory(MemoryAction, String),
+    Payload,
+}
+
 /// Validate a remote HTTP request before forwarding it to local Memory Guard.
 pub fn authorize_request(
     config: &GatewayConfig,
@@ -190,31 +196,63 @@ pub fn authorize_request(
         .ok_or(GatewayError::MissingBearerToken)?;
     let claims = verify_token(token, config)?;
 
-    let (action, resource) = memory_route(&request.method, &request.path)?;
-    validate_remote_access(
-        &config.profile,
-        &claims,
-        session_revoked,
-        &request.path,
-        action,
-        &resource,
-        now_ms,
-    )?;
-
-    Ok(AuthorizedRequest {
-        claims,
-        action,
-        resource,
-    })
+    match route_request(&request.method, &request.path)? {
+        GatewayRoute::Memory(action, resource) => {
+            validate_remote_access(
+                &config.profile,
+                &claims,
+                session_revoked,
+                &request.path,
+                action,
+                &resource,
+                now_ms,
+            )?;
+            Ok(AuthorizedRequest {
+                claims,
+                action,
+                resource,
+            })
+        }
+        GatewayRoute::Payload => {
+            // Payload envelopes are already end-to-end encrypted and are bound
+            // to the session by Guard. They do not consume a memory scope.
+            validate_remote_identity(
+                &config.profile,
+                &claims,
+                session_revoked,
+                &request.path,
+                now_ms,
+            )?;
+            let (action, resource) = if request.method == "POST" {
+                (MemoryAction::Write, "payload".to_string())
+            } else {
+                (MemoryAction::Read, "payload".to_string())
+            };
+            Ok(AuthorizedRequest {
+                claims,
+                action,
+                resource,
+            })
+        }
+    }
 }
 
-fn memory_route(method: &str, path: &str) -> Result<(MemoryAction, String), GatewayError> {
+fn route_request(method: &str, path: &str) -> Result<GatewayRoute, GatewayError> {
+    if method == "POST" && path == "/v1/payload" {
+        return Ok(GatewayRoute::Payload);
+    }
+    if method == "GET" && path.starts_with("/v1/payload/") {
+        return Ok(GatewayRoute::Payload);
+    }
     if method == "PUT" {
         if let Some(key) = path.strip_prefix("/v1/memory/") {
             if key.is_empty() || key.contains('/') {
                 return Err(GatewayError::UnsupportedEndpoint);
             }
-            return Ok((MemoryAction::Write, format!("memory:key:{key}")));
+            return Ok(GatewayRoute::Memory(
+                MemoryAction::Write,
+                format!("memory:key:{key}"),
+            ));
         }
         return Err(GatewayError::UnsupportedEndpoint);
     }
@@ -225,7 +263,10 @@ fn memory_route(method: &str, path: &str) -> Result<(MemoryAction, String), Gate
         if key.is_empty() || key.contains('/') {
             return Err(GatewayError::UnsupportedEndpoint);
         }
-        return Ok((MemoryAction::Read, format!("memory:key:{key}")));
+        return Ok(GatewayRoute::Memory(
+            MemoryAction::Read,
+            format!("memory:key:{key}"),
+        ));
     }
     if path == "/v1/memory" || path.starts_with("/v1/memory?") {
         let tag = path
@@ -233,7 +274,10 @@ fn memory_route(method: &str, path: &str) -> Result<(MemoryAction, String), Gate
             .map(|(_, value)| value.split('&').next().unwrap_or(value))
             .filter(|value| !value.is_empty())
             .ok_or(GatewayError::UnsupportedEndpoint)?;
-        return Ok((MemoryAction::Read, format!("memory:tag:{tag}")));
+        return Ok(GatewayRoute::Memory(
+            MemoryAction::Read,
+            format!("memory:tag:{tag}"),
+        ));
     }
     Err(GatewayError::UnsupportedEndpoint)
 }
@@ -936,6 +980,45 @@ mod tests {
         assert!(limiter.allow("sess-1"));
         assert!(!limiter.allow("sess-1"));
         assert!(limiter.allow("sess-2"));
+    }
+
+    #[test]
+    fn routes_encrypted_payloads_without_a_memory_scope() {
+        let signing_key = SigningKey::from_bytes(&[7u8; 32]);
+        let mut config = config(&signing_key);
+        config.profile.allowed_endpoints = vec![];
+        let token = token(
+            &signing_key,
+            "remote",
+            "https://gateway.example.com",
+            1_300,
+            MemoryScopes::default(),
+        );
+
+        let upload = GatewayRequest {
+            method: "POST".to_string(),
+            path: "/v1/payload".to_string(),
+            authorization: Some(format!("Bearer {token}")),
+            body: b"{}".to_vec(),
+        };
+        assert!(authorize_request(&config, &upload, false, 1_000_000).is_ok());
+
+        let fetch = GatewayRequest {
+            method: "GET".to_string(),
+            path: "/v1/payload/pay_1".to_string(),
+            ..upload
+        };
+        assert!(authorize_request(&config, &fetch, false, 1_000_000).is_ok());
+
+        let memory = GatewayRequest {
+            method: "GET".to_string(),
+            path: "/v1/memory?tag=notes/projects".to_string(),
+            ..fetch
+        };
+        assert!(matches!(
+            authorize_request(&config, &memory, false, 1_000_000),
+            Err(GatewayError::Access(RemoteAccessError::ScopeDenied))
+        ));
     }
 
     #[test]
