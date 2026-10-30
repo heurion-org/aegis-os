@@ -624,6 +624,13 @@ Phase 1b 已经补上两个关键点：
 
 仍未接入 memory store 或 trusted UI；这是 Phase 2 的工作。
 
+UOMP 侧的 Phase 1 adapter 已经落地在 `uomp-mvp/packages/aegis-adapter`：
+
+- `HttpAegisMcpClient`：通过 Aegis `/mcp` 调用 `memory_policy_evaluate` 与 `policy_approve_escalation`。
+- `AegisConsentBridge`：把 UOMP `Scopes` 展开为多个 Aegis resource，按 `deny > ask > allow` 聚合。
+- `AuthService` 新增可选 `aegis` evaluator：`ask` 时保存 `aegis_escalation_ids`，批准时先批准 Aegis escalations，再签发 UOMP token。
+- 服务端通过 `UOMP_AEGIS_MCP_URL` / `UOMP_AEGIS_TOKEN` / `UOMP_AEGIS_ORG` / `UOMP_AEGIS_AGENT` 启用；未配置时保持原有本地流程。
+
 ### 13.2 服务接口
 
 | 接口 | 输入 | 输出 |
