@@ -697,7 +697,7 @@ Memory Store (user device)
 | Gateway | Aegis Memory Gateway（本地入口） |
 | Remote identity | Aegis Cloud tenant key + agent id |
 | Token `audience` | Gateway endpoint |
-| Remote approval | Aegis Cloud / local trusted approval |
+| Remote approval | Aegis Cloud / local trusted approval; `/v1/remote/requests` device flow |
 | Lease | Aegis `LeaseGrant`（本地 Gateway 执行） |
 | Payload E2E encryption | 仍由 UOMP payload envelope 负责 |
 | Cloud Relay | 已退役，不再提供 |

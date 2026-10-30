@@ -517,6 +517,11 @@ impl GuardTarget {
     }
 }
 
+fn is_public_route(method: &str, path: &str) -> bool {
+    (method == "POST" && path == "/v1/remote/requests")
+        || (method == "GET" && path.starts_with("/v1/remote/requests/"))
+}
+
 async fn handle_connection<S>(
     mut stream: S,
     config: &GatewayConfig,
@@ -584,6 +589,13 @@ where
         authorization,
         body,
     };
+
+    if is_public_route(&request.method, &request.path) {
+        audit
+            .record("", "", &request.method, &request.path, "allow", 200)
+            .await;
+        return forward(stream, request, guard).await;
+    }
 
     if config.check_session {
         let token = request
@@ -980,6 +992,14 @@ mod tests {
         assert!(limiter.allow("sess-1"));
         assert!(!limiter.allow("sess-1"));
         assert!(limiter.allow("sess-2"));
+    }
+
+    #[test]
+    fn remote_onboarding_routes_are_public() {
+        assert!(is_public_route("POST", "/v1/remote/requests"));
+        assert!(is_public_route("GET", "/v1/remote/requests/req-1"));
+        assert!(!is_public_route("GET", "/v1/memory?tag=notes/projects"));
+        assert!(!is_public_route("POST", "/v1/payload"));
     }
 
     #[test]
