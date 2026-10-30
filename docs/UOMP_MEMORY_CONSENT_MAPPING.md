@@ -626,9 +626,9 @@ Phase 1b 已经补上两个关键点：
 
 UOMP 侧的 Phase 1 adapter 已经落地在 `uomp-mvp/packages/aegis-adapter`：
 
-- `HttpAegisMcpClient`：通过 Aegis `/mcp` 调用 `memory_policy_evaluate` 与 `policy_approve_escalation`。
+- `HttpAegisMcpClient`：通过 Aegis `/mcp` 调用 `memory_policy_evaluate`，通过 `/v1/approvals/decide` 完成 approve / deny。
 - `AegisConsentBridge`：把 UOMP `Scopes` 展开为多个 Aegis resource，按 `deny > ask > allow` 聚合。
-- `AuthService` 新增可选 `aegis` evaluator：`ask` 时保存 `aegis_escalation_ids`，批准时先批准 Aegis escalations，再签发 UOMP token。
+- `AuthService` 新增可选 `aegis` evaluator：`ask` 时保存 `aegis_escalation_ids`；批准时先批准 Aegis escalations，拒绝时先关闭它们，再签发 UOMP token 或关闭会话。
 - 服务端通过 `UOMP_AEGIS_MCP_URL` / `UOMP_AEGIS_TOKEN` / `UOMP_AEGIS_ORG` / `UOMP_AEGIS_AGENT` 启用；未配置时保持原有本地流程。
 
 ### 13.2 服务接口
@@ -700,6 +700,12 @@ Memory Store (user device)
 - 远程 Agent 只能通过 Gateway 获得 scoped response。
 - 本地 Gateway 仍然执行 UOMP scope、deny、field 过滤和审计。
 - 远程审批必须绑定用户在场或 Aegis Cloud 的 tenant approver。
+
+Phase 1 已实现远程入口的策略核心：
+
+- `aos_memory::RemoteProfile`：`gateway_id`、`audience`、`allowed_endpoints`、`max_token_ttl_secs`。
+- `aos_memory::validate_remote_access()`：校验 `profile == "remote"`、audience、过期、撤销、endpoint 白名单、token TTL 和 scope。
+- mTLS 终止、限流和 HTTP 转发仍由 Aegis Memory Gateway 运行时负责。
 
 ## 16. 相关文档
 

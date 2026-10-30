@@ -172,6 +172,7 @@ dependencies = [
  "aos-core",
  "serde",
  "serde_json",
+ "thiserror",
 ]
 
 [[package]]

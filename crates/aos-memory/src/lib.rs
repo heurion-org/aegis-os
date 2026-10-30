@@ -277,6 +277,107 @@ fn sanitize_id(value: &str) -> String {
         .collect()
 }
 
+/// Configuration for a remote Agent entry point.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct RemoteProfile {
+    /// Stable gateway identifier (for audit).
+    pub gateway_id: String,
+    /// Expected `audience` claim in the UOMP token.
+    pub audience: String,
+    /// Allowed request endpoint prefixes. Empty means "any endpoint".
+    #[serde(default)]
+    pub allowed_endpoints: Vec<String>,
+    /// Maximum accepted token lifetime, in seconds. UOMP recommends <= 600.
+    #[serde(default = "default_remote_ttl_secs")]
+    pub max_token_ttl_secs: i64,
+}
+
+fn default_remote_ttl_secs() -> i64 {
+    600
+}
+
+/// Minimal UOMP remote token claims needed by the gateway.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct RemoteTokenClaims {
+    pub profile: String,
+    pub audience: String,
+    pub session_id: String,
+    pub agent_id: String,
+    pub expires_at_ms: i64,
+    pub scopes: MemoryScopes,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
+pub enum RemoteAccessError {
+    #[error("token profile must be 'remote'")]
+    WrongProfile,
+    #[error("token audience does not match this gateway")]
+    AudienceMismatch,
+    #[error("remote token has expired")]
+    Expired,
+    #[error("remote session has been revoked")]
+    SessionRevoked,
+    #[error("request endpoint is not allowed by this gateway")]
+    EndpointNotAllowed,
+    #[error("remote token lifetime exceeds the gateway limit")]
+    TokenTtlTooLong,
+    #[error("request is outside the token scope")]
+    ScopeDenied,
+}
+
+/// Validate a remote request before forwarding it to local Memory Guard.
+///
+/// This is the pure policy core of Aegis Memory Gateway: transport (mTLS),
+/// rate limiting, and proxying are handled by the runtime around it.
+pub fn validate_remote_access(
+    profile: &RemoteProfile,
+    claims: &RemoteTokenClaims,
+    session_revoked: bool,
+    request_endpoint: &str,
+    action: MemoryAction,
+    resource: &str,
+    now_ms: i64,
+) -> Result<(), RemoteAccessError> {
+    if claims.profile != "remote" {
+        return Err(RemoteAccessError::WrongProfile);
+    }
+    if claims.audience != profile.audience {
+        return Err(RemoteAccessError::AudienceMismatch);
+    }
+    if claims.expires_at_ms <= now_ms {
+        return Err(RemoteAccessError::Expired);
+    }
+    if session_revoked {
+        return Err(RemoteAccessError::SessionRevoked);
+    }
+    if claims.expires_at_ms - now_ms > profile.max_token_ttl_secs * 1000 {
+        return Err(RemoteAccessError::TokenTtlTooLong);
+    }
+    if !profile.allowed_endpoints.is_empty()
+        && !profile
+            .allowed_endpoints
+            .iter()
+            .any(|allowed| request_endpoint.starts_with(allowed))
+    {
+        return Err(RemoteAccessError::EndpointNotAllowed);
+    }
+    if !scope_allows(&claims.scopes, action, resource) {
+        return Err(RemoteAccessError::ScopeDenied);
+    }
+    Ok(())
+}
+
+/// Whether a UOMP scope grants a specific Aegis memory resource.
+pub fn scope_allows(scopes: &MemoryScopes, action: MemoryAction, resource: &str) -> bool {
+    let scope = match action {
+        MemoryAction::Read => &scopes.read,
+        MemoryAction::Write | MemoryAction::Delete => &scopes.write,
+    };
+    scope_resources(scope)
+        .iter()
+        .any(|pattern| pattern_matches(pattern, resource))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -432,6 +533,125 @@ mod tests {
         assert_eq!(scopes.read.tags, vec!["notes/projects".to_string()]);
         assert_eq!(scopes.read.deny_tags, vec!["notes/journal".to_string()]);
         assert!(scopes.write.tags.is_empty());
+    }
+
+    #[test]
+    fn remote_profile_validates_token_audience_expiry_and_scope() {
+        let profile = RemoteProfile {
+            gateway_id: "gw-1".to_string(),
+            audience: "https://gateway.example.com".to_string(),
+            allowed_endpoints: vec!["/v1/memory".to_string()],
+            max_token_ttl_secs: 600,
+        };
+        let claims = RemoteTokenClaims {
+            profile: "remote".to_string(),
+            audience: profile.audience.clone(),
+            session_id: "sess-1".to_string(),
+            agent_id: "remote-agent".to_string(),
+            expires_at_ms: 1_300_000,
+            scopes: MemoryScopes {
+                read: scope(&["notes/projects"], &[]),
+                write: MemoryScope::default(),
+            },
+        };
+
+        assert_eq!(
+            validate_remote_access(
+                &profile,
+                &claims,
+                false,
+                "/v1/memory?tag=notes/projects",
+                MemoryAction::Read,
+                "memory:tag:notes/projects",
+                1_000_000,
+            ),
+            Ok(())
+        );
+        assert_eq!(
+            validate_remote_access(
+                &profile,
+                &claims,
+                false,
+                "/v1/memory?tag=notes/journal",
+                MemoryAction::Read,
+                "memory:tag:notes/journal",
+                1_000_000,
+            ),
+            Err(RemoteAccessError::ScopeDenied)
+        );
+        assert_eq!(
+            validate_remote_access(
+                &profile,
+                &claims,
+                true,
+                "/v1/memory?tag=notes/projects",
+                MemoryAction::Read,
+                "memory:tag:notes/projects",
+                1_000_000,
+            ),
+            Err(RemoteAccessError::SessionRevoked)
+        );
+        assert_eq!(
+            validate_remote_access(
+                &profile,
+                &claims,
+                false,
+                "/admin",
+                MemoryAction::Read,
+                "memory:tag:notes/projects",
+                1_000_000,
+            ),
+            Err(RemoteAccessError::EndpointNotAllowed)
+        );
+    }
+
+    #[test]
+    fn remote_profile_rejects_wrong_audience_and_long_ttl() {
+        let profile = RemoteProfile {
+            gateway_id: "gw-1".to_string(),
+            audience: "https://gateway.example.com".to_string(),
+            allowed_endpoints: vec![],
+            max_token_ttl_secs: 600,
+        };
+        let mut claims = RemoteTokenClaims {
+            profile: "remote".to_string(),
+            audience: "https://other.example.com".to_string(),
+            session_id: "sess-1".to_string(),
+            agent_id: "remote-agent".to_string(),
+            expires_at_ms: 1_100_000,
+            scopes: MemoryScopes {
+                read: scope(&["notes"], &[]),
+                write: MemoryScope::default(),
+            },
+        };
+
+        assert_eq!(
+            validate_remote_access(
+                &profile,
+                &claims,
+                false,
+                "/v1/memory",
+                MemoryAction::Read,
+                "memory:tag:notes",
+                1_000_000,
+            ),
+            Err(RemoteAccessError::AudienceMismatch)
+        );
+
+        claims.audience = profile.audience.clone();
+        claims.expires_at_ms = 1_700_000;
+        assert_eq!(
+            validate_remote_access(
+                &profile,
+                &claims,
+                false,
+                "/v1/memory",
+                MemoryAction::Read,
+                "memory:tag:notes",
+                1_000_000,
+            ),
+            Err(RemoteAccessError::TokenTtlTooLong)
+        );
     }
 
     #[test]
