@@ -47,6 +47,11 @@ struct Ed25519Jwk {
 pub struct GatewayConfig {
     pub profile: RemoteProfile,
     pub verifying_key: VerifyingKey,
+    /// Ask the local Guard whether the UOMP session is still active before
+    /// forwarding. Enabled by default; tests may disable it to run a mock Guard.
+    pub check_session: bool,
+    /// Per-session request limit per 60-second window. `0` disables the limit.
+    pub rate_limit_per_minute: u32,
 }
 
 impl GatewayConfig {
@@ -65,6 +70,8 @@ impl GatewayConfig {
         Ok(Self {
             profile,
             verifying_key,
+            check_session: true,
+            rate_limit_per_minute: 60,
         })
     }
 }
@@ -220,6 +227,47 @@ fn now_ms() -> i64 {
         .as_millis() as i64
 }
 
+struct RateLimiter {
+    limit: u32,
+    windows: std::sync::Mutex<
+        std::collections::HashMap<String, std::collections::VecDeque<std::time::Instant>>,
+    >,
+}
+
+impl RateLimiter {
+    fn new(limit: u32) -> Self {
+        Self {
+            limit,
+            windows: std::sync::Mutex::new(std::collections::HashMap::new()),
+        }
+    }
+
+    fn allow(&self, key: &str) -> bool {
+        if self.limit == 0 {
+            return true;
+        }
+        let now = std::time::Instant::now();
+        let mut windows = self
+            .windows
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+        let window = windows.entry(key.to_string()).or_default();
+        while let Some(front) = window.front() {
+            if now.duration_since(*front).as_secs() >= 60 {
+                window.pop_front();
+            } else {
+                break;
+            }
+        }
+        if window.len() >= self.limit as usize {
+            false
+        } else {
+            window.push_back(now);
+            true
+        }
+    }
+}
+
 /// Start a minimal HTTP gateway that forwards authorized requests to Guard.
 ///
 /// This listener is intentionally plain HTTP. In production, put it behind a
@@ -228,12 +276,14 @@ fn now_ms() -> i64 {
 pub async fn serve(config: GatewayConfig, listen: &str, guard_url: &str) -> anyhow::Result<()> {
     let listener = TcpListener::bind(listen).await?;
     let guard = GuardTarget::parse(guard_url)?;
+    let limiter = std::sync::Arc::new(RateLimiter::new(config.rate_limit_per_minute));
     loop {
         let (stream, _) = listener.accept().await?;
         let config = config.clone();
         let guard = guard.clone();
+        let limiter = limiter.clone();
         tokio::spawn(async move {
-            if let Err(error) = handle_connection(stream, &config, &guard).await {
+            if let Err(error) = handle_connection(stream, &config, &guard, &limiter).await {
                 eprintln!("memory gateway connection error: {error}");
             }
         });
@@ -266,6 +316,7 @@ async fn handle_connection(
     mut stream: TcpStream,
     config: &GatewayConfig,
     guard: &GuardTarget,
+    limiter: &RateLimiter,
 ) -> anyhow::Result<()> {
     let mut buffer = Vec::new();
     let mut chunk = [0u8; 4096];
@@ -325,8 +376,37 @@ async fn handle_connection(
         body,
     };
 
+    if config.check_session {
+        let token = request
+            .authorization
+            .as_deref()
+            .and_then(|value| value.strip_prefix("Bearer "));
+        if let Some(token) = token {
+            if !session_is_active(guard, token).await.unwrap_or(false) {
+                let body = serde_json::json!({ "error": "session is not active" }).to_string();
+                let response = format!(
+                    "HTTP/1.1 401 Unauthorized\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{body}",
+                    body.len()
+                );
+                stream.write_all(response.as_bytes()).await?;
+                return Ok(());
+            }
+        }
+    }
+
     match authorize_request(config, &request, false, now_ms()) {
-        Ok(_) => forward(stream, request, guard).await,
+        Ok(authorized) => {
+            if !limiter.allow(&authorized.claims.session_id) {
+                let body = serde_json::json!({ "error": "rate limit exceeded" }).to_string();
+                let response = format!(
+                    "HTTP/1.1 429 Too Many Requests\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{body}",
+                    body.len()
+                );
+                stream.write_all(response.as_bytes()).await?;
+                return Ok(());
+            }
+            forward(stream, request, guard).await
+        }
         Err(error) => {
             let status = match error {
                 GatewayError::Access(_) | GatewayError::InvalidSignature => "403 Forbidden",
@@ -341,6 +421,29 @@ async fn handle_connection(
             Ok(())
         }
     }
+}
+
+async fn session_is_active(guard: &GuardTarget, token: &str) -> anyhow::Result<bool> {
+    let body = serde_json::json!({ "token": token }).to_string();
+    let mut upstream = TcpStream::connect((guard.host.as_str(), guard.port)).await?;
+    let request = format!(
+        "POST /v1/tokens/validate HTTP/1.1\r\nHost: {}:{}\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{body}",
+        guard.host,
+        guard.port,
+        body.len()
+    );
+    upstream.write_all(request.as_bytes()).await?;
+    let mut response = Vec::new();
+    upstream.read_to_end(&mut response).await?;
+    let response = String::from_utf8_lossy(&response);
+    let Some((_, body)) = response.split_once("\r\n\r\n") else {
+        return Ok(false);
+    };
+    let value: Value = serde_json::from_str(body).unwrap_or(Value::Null);
+    Ok(value
+        .get("valid")
+        .and_then(|v| v.as_bool())
+        .unwrap_or(false))
 }
 
 async fn forward(
@@ -417,6 +520,8 @@ mod tests {
                 max_token_ttl_secs: 600,
             },
             verifying_key: signing_key.verifying_key(),
+            check_session: false,
+            rate_limit_per_minute: 0,
         }
     }
 
@@ -539,6 +644,90 @@ mod tests {
         assert!(response.contains("{\"ok\":true}"), "{response}");
 
         guard_task.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn checks_session_state_before_forwarding() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        use tokio::net::TcpListener;
+        use tokio::time::{sleep, Duration};
+
+        let guard = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let guard_addr = guard.local_addr().unwrap();
+        let guard_task = tokio::spawn(async move {
+            // 1. Session validation call.
+            let (mut socket, _) = guard.accept().await.unwrap();
+            let mut buffer = [0u8; 4096];
+            let read = socket.read(&mut buffer).await.unwrap();
+            let request = String::from_utf8_lossy(&buffer[..read]);
+            assert!(request.contains("POST /v1/tokens/validate"));
+            socket
+                .write_all(b"HTTP/1.1 200 OK\r\ncontent-length: 11\r\nconnection: close\r\n\r\n{\"valid\":true}")
+                .await
+                .unwrap();
+            drop(socket);
+
+            // 2. Actual memory read.
+            let (mut socket, _) = guard.accept().await.unwrap();
+            let read = socket.read(&mut buffer).await.unwrap();
+            let request = String::from_utf8_lossy(&buffer[..read]);
+            assert!(request.contains("GET /v1/memory?tag=notes/projects"));
+            socket
+                .write_all(b"HTTP/1.1 200 OK\r\ncontent-length: 11\r\nconnection: close\r\n\r\n{\"ok\":true}")
+                .await
+                .unwrap();
+        });
+
+        let signing_key = SigningKey::from_bytes(&[7u8; 32]);
+        let mut config = config(&signing_key);
+        config.check_session = true;
+        let exp = now_ms() / 1000 + 600;
+        let token = token(
+            &signing_key,
+            "remote",
+            "https://gateway.example.com",
+            exp,
+            scopes("notes/projects"),
+        );
+
+        let probe = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let gateway_addr = probe.local_addr().unwrap();
+        drop(probe);
+        let listen = gateway_addr.to_string();
+        let guard_url = format!("http://{guard_addr}");
+        tokio::spawn(async move {
+            let _ = serve(config, &listen, &guard_url).await;
+        });
+
+        let mut stream = None;
+        for _ in 0..50 {
+            if let Ok(candidate) = TcpStream::connect(gateway_addr).await {
+                stream = Some(candidate);
+                break;
+            }
+            sleep(Duration::from_millis(10)).await;
+        }
+        let mut stream = stream.expect("gateway should accept connections");
+        let request = format!(
+            "GET /v1/memory?tag=notes/projects HTTP/1.1\r\nHost: {gateway_addr}\r\nAuthorization: Bearer {token}\r\nConnection: close\r\n\r\n"
+        );
+        stream.write_all(request.as_bytes()).await.unwrap();
+        let mut response = Vec::new();
+        stream.read_to_end(&mut response).await.unwrap();
+        let response = String::from_utf8_lossy(&response);
+        assert!(response.starts_with("HTTP/1.1 200 OK"), "{response}");
+        assert!(response.contains("{\"ok\":true}"), "{response}");
+
+        guard_task.await.unwrap();
+    }
+
+    #[test]
+    fn rate_limiter_blocks_after_the_per_minute_budget() {
+        let limiter = RateLimiter::new(2);
+        assert!(limiter.allow("sess-1"));
+        assert!(limiter.allow("sess-1"));
+        assert!(!limiter.allow("sess-1"));
+        assert!(limiter.allow("sess-2"));
     }
 
     #[test]
