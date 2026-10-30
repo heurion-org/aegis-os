@@ -622,22 +622,22 @@ Phase 1b 已经补上两个关键点：
 - MCP 工具 `memory_policy_evaluate`：Agent 可以请求 `memory.read` / `memory.write` / `memory.delete` 的单项资源评估，返回 `allow` / `ask`（含 `escalation_id`）/ `deny`。它不读取数据，只做策略判断。
 - `approve_escalation` 对 `memory.*` 动作保留 `target_resource`，不再退化成 `*`。否则批准一个 tag 会等于批准全部记忆。
 
-仍未接入 memory store 或 trusted UI；这是 Phase 2 的工作。
+Phase 2 已完成：memory store、staged writes、payload、consent server 和 audit 已接入原生实现；trusted UI 目前是 CLI 审批。
 
 写入路径已经进入 Staging 模式：
 
 - Agent `PUT /v1/memory/:key` → Guard 校验 `write` scope → 写入 `staged_writes`，返回 `202`。
 - 高敏写入直接 `403`，不进入 staging。
-- 用户通过 `uomp staged list/approve/deny` 或管理员 HTTP 端点审批。
+- 用户通过 `aegis-os memory staged list/approve/deny` 或管理员 HTTP 端点审批。
 - 批准后才调用 Memory Store，`source=agent`，并写审计。
 - Aegis 映射：`action=memory.write`、`resource=memory:key:<key>`；批准对应 trusted approval。
 
-UOMP 侧的 Phase 1 adapter 已经落地在 `uomp-mvp/packages/aegis-adapter`：
+原生实现已经落在 Aegis OS：
 
-- `HttpAegisMcpClient`：通过 Aegis `/mcp` 调用 `memory_policy_evaluate`，通过 `/v1/approvals/decide` 完成 approve / deny。
-- `AegisConsentBridge`：把 UOMP `Scopes` 展开为多个 Aegis resource，按 `deny > ask > allow` 聚合。
-- `AuthService` 新增可选 `aegis` evaluator：`ask` 时保存 `aegis_escalation_ids`；批准时先批准 Aegis escalations，拒绝时先关闭它们，再签发 UOMP token 或关闭会话。
-- 服务端通过 `UOMP_AEGIS_MCP_URL` / `UOMP_AEGIS_TOKEN` / `UOMP_AEGIS_ORG` / `UOMP_AEGIS_AGENT` 启用；未配置时保持原有本地流程。
+- `aos-memory-server`：consent request、session、Ed25519 JWT、撤销、audit；`aegis-os memory serve` 启动。
+- `aos-memory-store`：SQLite memory store、staged writes、encrypted payloads。
+- `aegis-os memory mcp`：首次 tool call 通过 `UOMP_BRIDGE_FILE` 发起 consent request，等待 `memory approve` 后取回 token；每次 tool call 回写 audit。
+- 高敏写入在 server 边界直接拒绝；staged write 需要单独批准。
 
 ### 13.2 服务接口
 
@@ -706,7 +706,7 @@ Memory Store (user device)
 
 - Aegis Cloud 只运行 Agent，不保存 Memory Store。
 - 远程 Agent 只能通过 Gateway 获得 scoped response。
-- 本地 Gateway 仍然执行 UOMP scope、deny、field 过滤和审计。
+- 本地 Gateway / native server 执行 UOMP scope、deny、field 过滤和审计。
 - 远程审批必须绑定用户在场或 Aegis Cloud 的 tenant approver。
 
 Phase 1 已实现远程入口的策略核心和最小网络层：
@@ -714,17 +714,17 @@ Phase 1 已实现远程入口的策略核心和最小网络层：
 - `aos_memory::RemoteProfile`：`gateway_id`、`audience`、`allowed_endpoints`、`max_token_ttl_secs`。
 - `aos_memory::validate_remote_access()`：校验 `profile == "remote"`、audience、过期、撤销、endpoint 白名单、token TTL 和 scope。
 - `aos-memory-store`：UOMP 兼容的 SQLite `memory_items` schema、get/get_by_tag/set/delete/list_tags/count、Markdown 导入与 path-derived tags。
-- `aos-memory-gateway`：EdDSA JWT 验签、`/v1/memory` 读写路由（PUT 进入 Guard staging）与 `/v1/payload` 加密 envelope 路由、转发前调用 Guard `/v1/tokens/validate` 检查 session 状态、per-session 限流（默认 60 req/min）、JSONL `gateway_access` 审计、可选原生 TLS 1.3 / mTLS、再转发到本地 Memory Guard。
+- `aos-memory-gateway`：EdDSA JWT 验签、`/v1/memory` 读写路由（PUT 进入 staged writes）与 `/v1/payload` 加密 envelope 路由、转发前调用 `/v1/tokens/validate` 检查 session 状态、per-session 限流（默认 60 req/min）、JSONL `gateway_access` 审计、可选原生 TLS 1.3 / mTLS、再转发到本地 native server。
 - CLI：`aegis-os memory-gateway --public-key <jwk> --audience <url> --guard-url <url>`。
-- 统一审批视图：`uomp approvals` 同时列出 UOMP consent requests 与 Aegis escalations；Aegis escalation 可在同一命令中 approve/deny。
-- 用户入口收口：`aegis-os memory ...` 委托给 `uomp` 参考 CLI；后续用 Rust 原生命令替换委托。
+- 统一审批视图：`aegis-os memory approvals` 列出 pending consent requests；`approve` / `deny` 完成审批。
+- 用户入口收口：`aegis-os memory ...` 全部为原生 Rust 命令；`uomp` 只保留协议网站/规范。
 - 网络层支持原生 TLS 1.3 / mTLS（`--tls-cert` / `--tls-key` / `--client-ca`）；也支持在 Caddy 等代理后运行明文 HTTP。
-- Gateway 转发前会检查 session 状态；本地 Guard 仍然做最终校验。
+- Gateway 转发前会检查 session 状态；native server 仍然做最终校验。
 
 ## 16. 相关文档
 
 - [UOMP 协议规范](https://www.uomp.org/spec/)
 - [Aegis Application Protocol (AAP-1.0)](./AEGIS_APPLICATION_PROTOCOL.md)
 - [Aegis OS README · Memory Consent (UOMP)](../README.md#memory-consent-uomp)
-- [Vendored UOMP reference implementation](../modules/uomp/reference)
+- [UOMP module](../modules/uomp)
 - [Aegis Memory Gateway deployment](./MEMORY_GATEWAY_DEPLOY.md)

@@ -1,25 +1,22 @@
 # Aegis Memory Data Plane
 
-`crates/aos-memory-store` is the Rust-side foundation for moving the UOMP memory store and Markdown connector into Aegis OS.
+`crates/aos-memory-store` is the native Rust data plane for UOMP memory. It is used by the CLI, the MCP bridge, and the native consent server.
 
 ## Status
 
 Implemented:
 
-- SQLite schema compatible with `uomp-mvp` (`memory_items`).
+- SQLite schema compatible with the historical UOMP store (`memory_items`).
 - `get`, `get_by_tag`, `set`, `delete`, `list_tags`, `count`.
 - Markdown directory import with path-derived tags:
   - `projects/uomp/plan.md` → `notes`, `notes/projects`, `notes/projects/uomp`.
 - Frontmatter `sensitivity: high|medium|low` parsing.
 - Skips `.obsidian`, hidden directories, and `node_modules`.
+- Staged Agent writes with user approval (`staged_writes`).
+- Encrypted payload envelopes (`payloads`).
+- Native consent server (`aos-memory-server`) with sessions, Ed25519 JWT issuance, consent requests, revocation, and audit.
 
-Not yet wired:
-
-- The Aegis Memory Gateway still forwards requests to the local UOMP Guard.
-- `aegis-os memory status/import/read/list/search/staged/payload/mcp` are now native; setup/serve/approvals still use the vendored reference.
-- CSV/JSON and richer connectors remain in `uomp-mvp`.
-- Staged writes and payloads are still handled by UOMP Guard.
-- The Aegis policy/lease layer does not yet read directly from `aos-memory-store`.
+The CLI entry point is `aegis-os memory ...`. `status`, `import`, `read`, `list`, `search`, `serve`, `setup`, `pending`, `approve`, `deny`, `connect`, `disconnect`, `sessions`, `revoke`, `audit`, `approvals`, `stop`, `staged`, `payload`, and `mcp` are all native. The archived `uomp-core` / `uomp-mvp` reference is not vendored or invoked.
 
 ## Why the schema is compatible
 
@@ -40,18 +37,24 @@ CREATE TABLE memory_items (
 
 This lets Aegis open an existing `~/.uomp/memory.db` without a destructive migration.
 
+## Consent and audit
+
+`aegis-os memory serve` opens the local auth DB (`~/.uomp/auth.db`), issues short-lived Ed25519 tokens after approval, and records read/write decisions in `audit_logs`. `aegis-os memory mcp` uses `UOMP_BRIDGE_FILE` to request consent on the first tool call, polls the request status, then verifies the returned token locally. Every MCP tool call posts an audit event back to the server.
+
+High-sensitivity writes are denied at the server boundary. Staged writes require a separate user approval.
+
 ## Next steps
 
-1. Add a `MemoryDataPlane` trait and make `SqliteMemoryStore` one implementation.
-2. Port CSV/JSON import (Markdown import is native).
-3. Move staged writes and payload metadata into the Aegis data plane.
-4. Replace the Gateway's UOMP Guard proxy with the native data plane.
-5. Keep `uomp-mvp` as the reference connector/CLI until parity is reached.
+1. Add CSV/JSON import connectors.
+2. Add the browser consent page (CLI approval is the current path).
+3. Add deletion proof / retention policy.
+4. Wire the policy/lease layer to read directly from `aos-memory-store`.
 
 ## Test
 
 ```bash
 cargo test -p aos-memory-store
+cargo test -p aos-memory-server
 ```
 
 Current tests cover:
@@ -59,3 +62,4 @@ Current tests cover:
 - set/get/get_by_tag/list_tags/delete
 - Markdown import with path tags and high sensitivity
 - hidden directory skipping
+- native auth, consent, memory, staged writes, payloads, and audit

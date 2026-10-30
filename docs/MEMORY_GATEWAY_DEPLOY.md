@@ -1,6 +1,6 @@
 # Aegis Memory Gateway deployment
 
-This guide puts **Aegis Memory Gateway** in front of a local UOMP Memory Guard so a remote Agent (for example, one running in Aegis Cloud) can read scoped memory without exposing the Guard directly.
+This guide puts **Aegis Memory Gateway** in front of the local Aegis memory server so a remote Agent (for example, one running in Aegis Cloud) can read scoped memory without exposing the server directly.
 
 ```text
 Remote Agent (Aegis Cloud)
@@ -12,7 +12,7 @@ Native TLS 1.3 / mTLS  (or Caddy / reverse proxy)
 aegis-os memory-gateway  (127.0.0.1:9443)
         │  session check + scope check + audit
         ▼
-UOMP Memory Guard  (127.0.0.1:9374)
+Aegis memory server  (127.0.0.1:9374)
         │
         ▼
 Memory Store (stays on the user device)
@@ -23,7 +23,7 @@ The gateway supports native TLS 1.3 / mTLS via `--tls-cert`, `--tls-key`, and `-
 ## 1. Prerequisites
 
 - Aegis OS installed (`aegis-os --version`).
-- UOMP running locally (`uomp status`), with Memory Guard on `127.0.0.1:9374`.
+- Aegis memory server running locally (`aegis-os memory serve`), on `127.0.0.1:9374` by default.
 - The UOMP public JWK, normally at `~/.uomp/.secrets/ed25519-public.jwk`.
 - A public hostname for the gateway, for example `memory.example.com`.
 - A client certificate authority for remote Agents.
@@ -46,7 +46,7 @@ aegis-os memory-gateway \
 The gateway:
 
 - verifies the UOMP EdDSA JWT;
-- calls Guard `POST /v1/tokens/validate` before forwarding;
+- calls `POST /v1/tokens/validate` on the memory server before forwarding;
 - enforces the token scope and endpoint allowlist;
 - applies a per-session rate limit (60 req/min by default);
 - writes `gateway_access` JSONL audit events;
@@ -159,11 +159,11 @@ Expected:
 - UOMP token TTL is short (10 minutes or less for remote).
 - Audit log is append-only and outside the Agent sandbox.
 - Memory Store and `~/.uomp` are never mounted into the remote Agent environment.
-- Revocation is tested: `uomp revoke <session-id>` must make the next gateway request fail.
+- Revocation is tested: `aegis-os memory revoke <session-id>` must make the next gateway request fail.
 
 ## 8. Current limits
 
-- The gateway forwards reads and staged writes (`PUT /v1/memory/:key`); writes require UOMP approval before they are applied.
+- The gateway forwards reads and staged writes (`PUT /v1/memory/:key`); staged writes require user approval before they are applied.
 - Native TLS 1.3 / mTLS is supported; Caddy remains an optional public edge.
 - Payload delivery is implemented as encrypted envelope storage; decryption happens on the user side.
 - Aegis Cloud remote Agent provisioning is a separate step; this guide only covers the local memory entry point.

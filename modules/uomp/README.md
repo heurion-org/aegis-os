@@ -6,15 +6,15 @@ UOMP (User-Owned Memory Protocol) is the **memory consent module** of Aegis OS.
 - **Protocol spec:** <https://www.uomp.org/spec/>
 - **Native crates:**
   - `crates/aos-memory` — scope/lease mapping, deny/field filtering, remote token policy
-  - `crates/aos-memory-store` — SQLite data plane and Markdown importer
+  - `crates/aos-memory-store` — SQLite data plane, staged writes, payloads, Markdown importer
+  - `crates/aos-memory-server` — native consent/auth server, session and audit store
   - `crates/aos-memory-gateway` — TLS/mTLS remote Agent gateway
 - **CLI:** `aegis-os memory ...`
 - **Website repository:** the separate `uomp` repository is documentation/website only.
-- **Vendored reference:** [`modules/uomp/reference`](./reference) is a temporary copy of the archived `uomp-core` implementation.
 
 ## Role in Aegis OS
 
-UOMP defines how an Agent asks for personal memory: scope, duration, revocation, and audit. Aegis OS enforces those semantics with policy, leases, sandboxing, trusted approval, and the memory data plane.
+UOMP defines how an Agent asks for personal memory: scope, duration, revocation, and audit. Aegis OS enforces those semantics with policy, leases, sandboxing, trusted approval, and the native memory data plane.
 
 ```text
 Agent
@@ -22,19 +22,35 @@ Agent
   ▼
 Aegis OS
   ├─ policy / lease / approval
+  ├─ memory server (consent, sessions, tokens, audit)
+  ├─ memory store (SQLite + Markdown connector + staged writes + payloads)
   ├─ memory gateway (remote Agent entry point)
-  ├─ memory store (SQLite + Markdown connector)
   └─ audit
 ```
 
-## Migration status
+## Native status
 
-The native module is being completed in phases:
+Native parity is complete. The archived `uomp-core` / `uomp-mvp` reference is no longer vendored or invoked at runtime; `aegis-os` is the only product CLI entry point.
 
-1. Policy/lease mapping and gateway — done.
-2. Staged writes, payloads, remote device flow — done.
-3. Native CLI commands — `status`, `import`, `read`, `list`, `search`, `staged`, `payload`, `mcp` are native; setup/serve/approvals delegate to the UOMP reference CLI.
-4. Native data-plane cutover — `aos-memory-store` foundation landed; Gateway still proxies to UOMP Guard.
-5. Unified trusted UI — pending.
+```bash
+aegis-os memory serve                 # start the local consent/auth server
+aegis-os memory setup claude --vault ~/Notes
+aegis-os memory pending               # review consent requests
+aegis-os memory approve <request-id>  # approve one request
+aegis-os memory deny <request-id>
+aegis-os memory sessions              # list sessions
+aegis-os memory revoke <session-id>   # revoke one session
+aegis-os memory audit                 # show the access audit log
+aegis-os memory status
+aegis-os memory import ~/Notes
+aegis-os memory read <key>
+aegis-os memory list --tag notes
+aegis-os memory search <query>
+aegis-os memory staged list
+aegis-os memory payload list
+aegis-os memory mcp                   # MCP stdio bridge
+```
 
-Until the cutover is complete, the vendored [`reference`](./reference) copy is the compatibility implementation and `uomp` remains the reference/debug CLI. The standalone `uomp-core` repository is archived.
+Agent-first consent: `memory setup` writes a bridge profile, not a pre-authorized token. The first `memory mcp` tool call creates a consent request and waits; the user approves it with `aegis-os memory approve`. High-sensitivity items stay outside Agent scopes, and no Agent can approve its own request.
+
+The browser consent page is deferred. CLI approval is the native approval path for now.

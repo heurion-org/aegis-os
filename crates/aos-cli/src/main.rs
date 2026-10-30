@@ -17,11 +17,12 @@ mod routing;
 
 use aos_core::{AgentIdentity, IsolationTier};
 use aos_mcp_gateway::AegisRuntimeKernel;
-use aos_memory::RemoteProfile;
+use aos_memory::{MemoryScope, MemoryScopes, RemoteProfile, RemoteTokenClaims};
 use aos_memory_gateway::{
     serve as serve_memory_gateway, serve_tls as serve_memory_gateway_tls, tls_acceptor, verify_token,
     GatewayConfig,
 };
+use aos_memory_server::{run_server, ServerConfig};
 use aos_memory_store::SqliteMemoryStore;
 use clap::{Parser, Subcommand};
 use serde_json::{json, Value};
@@ -110,8 +111,7 @@ enum Commands {
         action: PolicyAction,
     },
 
-    /// Local memory commands (native; unknown commands delegate to the reference CLI)
-    #[command(after_help = "Delegated commands: setup, connect, serve, pending, approve, deny, staged, payload, approvals, disconnect, stop")]
+    /// Local memory commands
     Memory {
         #[command(subcommand)]
         action: MemoryAction,
@@ -248,7 +248,7 @@ enum MemoryAction {
         #[arg(long)]
         db: Option<PathBuf>,
     },
-    /// Run a read-only MCP stdio server over the local memory store
+    /// Run an MCP stdio bridge with on-demand consent
     Mcp {
         #[arg(long)]
         store: Option<PathBuf>,
@@ -256,6 +256,114 @@ enum MemoryAction {
         public_key: Option<PathBuf>,
         #[arg(long)]
         token: Option<String>,
+    },
+    /// Start the local Aegis memory server
+    Serve {
+        #[arg(long, default_value = "127.0.0.1:9374")]
+        listen: String,
+        #[arg(long)]
+        store: Option<PathBuf>,
+        #[arg(long)]
+        auth_db: Option<PathBuf>,
+        #[arg(long)]
+        secrets: Option<PathBuf>,
+        #[arg(long)]
+        admin_token: Option<String>,
+        #[arg(long)]
+        bridge_token: Option<String>,
+        #[arg(long)]
+        public_url: Option<String>,
+    },
+    /// Set up an MCP client with on-demand consent
+    Setup {
+        client: String,
+        #[arg(long)]
+        vault: Option<PathBuf>,
+        #[arg(long, default_value = "notes")]
+        tag: String,
+        #[arg(long)]
+        config: Option<PathBuf>,
+        #[arg(long)]
+        listen: Option<String>,
+        #[arg(long)]
+        no_server: bool,
+    },
+    /// List pending consent requests
+    Pending {
+        #[arg(long, default_value = "http://127.0.0.1:9374")]
+        url: String,
+        #[arg(long)]
+        admin_token: Option<String>,
+    },
+    /// Approve a pending consent request
+    Approve {
+        id: String,
+        #[arg(long, default_value = "http://127.0.0.1:9374")]
+        url: String,
+        #[arg(long)]
+        admin_token: Option<String>,
+    },
+    /// Deny a pending consent request
+    Deny {
+        id: String,
+        #[arg(long, default_value = "http://127.0.0.1:9374")]
+        url: String,
+        #[arg(long)]
+        admin_token: Option<String>,
+    },
+    /// Connect a client with a pre-authorized token
+    Connect {
+        client: String,
+        #[arg(long)]
+        scope: Vec<String>,
+        #[arg(long)]
+        config: Option<PathBuf>,
+        #[arg(long)]
+        listen: Option<String>,
+        #[arg(long)]
+        no_server: bool,
+    },
+    /// Remove a client config and revoke its session
+    Disconnect {
+        client: String,
+        #[arg(long)]
+        config: Option<PathBuf>,
+    },
+    /// List memory sessions
+    Sessions {
+        #[arg(long, default_value = "http://127.0.0.1:9374")]
+        url: String,
+        #[arg(long)]
+        admin_token: Option<String>,
+    },
+    /// Revoke a memory session
+    Revoke {
+        id: String,
+        #[arg(long, default_value = "http://127.0.0.1:9374")]
+        url: String,
+        #[arg(long)]
+        admin_token: Option<String>,
+    },
+    /// Show the access audit log
+    Audit {
+        #[arg(long, default_value = "http://127.0.0.1:9374")]
+        url: String,
+        #[arg(long)]
+        admin_token: Option<String>,
+        #[arg(long, default_value_t = 50)]
+        limit: usize,
+    },
+    /// Alias for `pending`
+    Approvals {
+        #[arg(long, default_value = "http://127.0.0.1:9374")]
+        url: String,
+        #[arg(long)]
+        admin_token: Option<String>,
+    },
+    /// Stop the background memory server
+    Stop {
+        #[arg(long)]
+        pid_file: Option<PathBuf>,
     },
     /// Review staged Agent writes
     Staged {
@@ -267,9 +375,6 @@ enum MemoryAction {
         #[command(subcommand)]
         action: PayloadAction,
     },
-    /// Delegate other commands to the vendored reference CLI
-    #[command(external_subcommand)]
-    External(Vec<String>),
 }
 
 #[derive(Subcommand)]
@@ -644,6 +749,674 @@ fn native_memory_status(db: Option<&Path>) -> anyhow::Result<()> {
     Ok(())
 }
 
+fn default_data_dir() -> PathBuf {
+    std::env::var_os("HOME")
+        .map(PathBuf::from)
+        .unwrap_or_else(|| PathBuf::from("."))
+        .join(".uomp")
+}
+
+fn default_secrets_dir() -> PathBuf {
+    default_data_dir().join(".secrets")
+}
+
+fn default_auth_db_path() -> PathBuf {
+    default_data_dir().join("auth.db")
+}
+
+fn default_pid_file() -> PathBuf {
+    default_data_dir().join("server.pid")
+}
+
+fn load_or_create_secret(path: &Path) -> anyhow::Result<String> {
+    if path.exists() {
+        return Ok(std::fs::read_to_string(path)?.trim().to_string());
+    }
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
+    let secret = format!("{}{}", uuid::Uuid::new_v4(), uuid::Uuid::new_v4());
+    std::fs::write(path, &secret)?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let _ = std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600));
+    }
+    Ok(secret)
+}
+
+fn read_admin_token(explicit: Option<&str>) -> anyhow::Result<String> {
+    if let Some(token) = explicit {
+        return Ok(token.to_string());
+    }
+    let path = default_secrets_dir().join("admin-token");
+    Ok(std::fs::read_to_string(&path)
+        .map_err(|error| anyhow::anyhow!("failed to read {}: {error}", path.display()))?
+        .trim()
+        .to_string())
+}
+
+fn http_json_with_headers(
+    method: &str,
+    url: &str,
+    headers: &[(&str, &str)],
+    body: Option<Value>,
+) -> anyhow::Result<Value> {
+    let mut request = ureq::request(method, url);
+    for (name, value) in headers {
+        request = request.set(name, value);
+    }
+    let response = match body {
+        Some(body) => request.send_json(body),
+        None => request.call(),
+    };
+    match response {
+        Ok(response) => Ok(response.into_json::<Value>()?),
+        Err(ureq::Error::Status(status, response)) => {
+            let body = response.into_string().unwrap_or_default();
+            anyhow::bail!("HTTP {status}: {body}")
+        }
+        Err(error) => Err(error.into()),
+    }
+}
+
+fn http_json(
+    method: &str,
+    url: &str,
+    admin_token: Option<&str>,
+    body: Option<Value>,
+) -> anyhow::Result<Value> {
+    let headers: Vec<(&str, &str)> = admin_token
+        .map(|token| vec![("x-uomp-admin-token", token)])
+        .unwrap_or_default();
+    http_json_with_headers(method, url, &headers, body)
+}
+
+fn wait_health(url: &str) -> anyhow::Result<()> {
+    for _ in 0..50 {
+        if ureq::get(&format!("{url}/health")).call().is_ok() {
+            return Ok(());
+        }
+        std::thread::sleep(std::time::Duration::from_millis(100));
+    }
+    anyhow::bail!("memory server did not become healthy at {url}")
+}
+
+fn ensure_memory_server(listen: &str, no_server: bool) -> anyhow::Result<String> {
+    let base_url = format!("http://{listen}");
+    if no_server || ureq::get(&format!("{base_url}/health")).call().is_ok() {
+        return Ok(base_url);
+    }
+    let exe = std::env::current_exe()?;
+    let child = std::process::Command::new(exe)
+        .args(["memory", "serve", "--listen", listen])
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .spawn()
+        .map_err(|error| anyhow::anyhow!("failed to start memory server: {error}"))?;
+    std::fs::create_dir_all(default_data_dir())?;
+    std::fs::write(default_pid_file(), child.id().to_string())?;
+    wait_health(&base_url)?;
+    Ok(base_url)
+}
+
+fn write_mcp_config(
+    client: &str,
+    config_path: Option<&Path>,
+    store_path: &Path,
+    env_path: &Path,
+    env_key: &str,
+) -> anyhow::Result<PathBuf> {
+    let public_key = default_secrets_dir().join("ed25519-public.jwk");
+    let args = vec![
+        "memory".to_string(),
+        "mcp".to_string(),
+        "--store".to_string(),
+        store_path.to_string_lossy().to_string(),
+        "--public-key".to_string(),
+        public_key.to_string_lossy().to_string(),
+    ];
+    let env = json!({ env_key: env_path.to_string_lossy() });
+    let config_path = config_path
+        .map(Path::to_path_buf)
+        .unwrap_or_else(|| default_client_config(client));
+    let mut config = if config_path.exists() {
+        serde_json::from_str::<Value>(&std::fs::read_to_string(&config_path)?)?
+    } else {
+        json!({})
+    };
+    if client == "opencode" {
+        let mut command = vec!["aegis-os".to_string()];
+        command.extend(args.iter().cloned());
+        config["mcp"] = json!({
+            "uomp": {
+                "type": "local",
+                "command": command,
+                "environment": env
+            }
+        });
+    } else {
+        config["mcpServers"] = config
+            .get("mcpServers")
+            .cloned()
+            .unwrap_or_else(|| json!({}));
+        config["mcpServers"]["uomp"] = json!({
+            "command": "aegis-os",
+            "args": args,
+            "env": env
+        });
+    }
+    if let Some(parent) = config_path.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
+    std::fs::write(&config_path, serde_json::to_vec_pretty(&config)?)?;
+    Ok(config_path)
+}
+
+fn memory_connect(
+    client: &str,
+    scope: &[String],
+    config_path: Option<&Path>,
+    listen: Option<&str>,
+    no_server: bool,
+) -> anyhow::Result<()> {
+    let store_path = memory_db_path(None);
+    let listen = listen.unwrap_or("127.0.0.1:9374");
+    let base_url = ensure_memory_server(listen, no_server)?;
+    let admin_token = load_or_create_secret(&default_secrets_dir().join("admin-token"))?;
+    let read_tags: Vec<String> = scope
+        .iter()
+        .filter(|tag| !tag.trim().is_empty())
+        .cloned()
+        .collect();
+    let scopes = json!({
+        "read": { "tags": read_tags, "keys": [], "denyTags": [], "denyKeys": [] },
+        "write": { "tags": [], "keys": [], "denyTags": [], "denyKeys": [] }
+    });
+    let session = http_json(
+        "POST",
+        &format!("{base_url}/v1/sessions"),
+        Some(&admin_token),
+        Some(json!({
+            "agent_id": client,
+            "agent_name": client,
+            "requested_scopes": scopes,
+            "duration_minutes": 30
+        })),
+    )?;
+    let session_id = session["session_id"]
+        .as_str()
+        .ok_or_else(|| anyhow::anyhow!("session response missing session_id"))?
+        .to_string();
+    let grant = http_json(
+        "POST",
+        &format!("{base_url}/v1/sessions/{session_id}/grant"),
+        Some(&admin_token),
+        Some(json!({ "granted_scopes": scopes })),
+    )?;
+    let token = grant["token"]
+        .as_str()
+        .ok_or_else(|| anyhow::anyhow!("grant response missing token"))?;
+
+    let env_path = default_data_dir()
+        .join("sessions")
+        .join(format!("{client}.env"));
+    std::fs::create_dir_all(env_path.parent().unwrap_or(Path::new(".")))?;
+    std::fs::write(
+        &env_path,
+        format!(
+            "UOMP_TOKEN={token}\nUOMP_BASE_URL={base_url}\nUOMP_SESSION_ID={session_id}\nUOMP_STORE={}\nUOMP_PUBLIC_KEY={}\n",
+            store_path.display(),
+            default_secrets_dir().join("ed25519-public.jwk").display()
+        ),
+    )?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let _ = std::fs::set_permissions(&env_path, std::fs::Permissions::from_mode(0o600));
+    }
+    let config_path = write_mcp_config(client, config_path, &store_path, &env_path, "UOMP_TOKEN_FILE")?;
+
+    println!("UOMP is connected for {client} (pre-authorized).");
+    println!("  Server  {base_url}");
+    println!("  Env     {}", env_path.display());
+    println!("  Config  {}", config_path.display());
+    println!("  Store   {}", store_path.display());
+    Ok(())
+}
+
+fn memory_setup(
+    client: &str,
+    vault: Option<&Path>,
+    tag: &str,
+    config_path: Option<&Path>,
+    listen: Option<&str>,
+    no_server: bool,
+) -> anyhow::Result<()> {
+    let store_path = memory_db_path(None);
+    if let Some(vault) = vault {
+        let store = open_memory_store(None)?;
+        let result = store.import_markdown_dir(vault, tag)?;
+        println!("Imported {} note(s), skipped {}, errors {}", result.imported, result.skipped, result.errors.len());
+    }
+
+    let listen = listen.unwrap_or("127.0.0.1:9374");
+    let base_url = ensure_memory_server(listen, no_server)?;
+
+    let bridge_token = load_or_create_secret(&default_secrets_dir().join("bridge-token"))?;
+    let env_path = default_data_dir().join("sessions").join(format!("{client}.env"));
+    std::fs::create_dir_all(env_path.parent().unwrap_or(Path::new(".")))?;
+    std::fs::write(
+        &env_path,
+        format!(
+            "UOMP_BRIDGE_URL={base_url}\nUOMP_BRIDGE_TOKEN={bridge_token}\nUOMP_AGENT_ID={client}\nUOMP_STORE={}\nUOMP_PUBLIC_KEY={}\n",
+            store_path.display(),
+            default_secrets_dir().join("ed25519-public.jwk").display()
+        ),
+    )?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let _ = std::fs::set_permissions(&env_path, std::fs::Permissions::from_mode(0o600));
+    }
+
+    let config_path = write_mcp_config(
+        client,
+        config_path,
+        &store_path,
+        &env_path,
+        "UOMP_BRIDGE_FILE",
+    )?;
+
+    println!("UOMP is set up for {client}.");
+    println!("  Server  {base_url}");
+    println!("  Env     {}", env_path.display());
+    println!("  Config  {}", config_path.display());
+    println!("  Store   {}", store_path.display());
+    Ok(())
+}
+
+fn default_client_config(client: &str) -> PathBuf {
+    let home = std::env::var_os("HOME")
+        .map(PathBuf::from)
+        .unwrap_or_else(|| PathBuf::from("."));
+    match client {
+        "cursor" => home.join(".cursor").join("mcp.json"),
+        "opencode" => home.join(".config").join("opencode").join("opencode.json"),
+        _ => {
+            #[cfg(target_os = "macos")]
+            {
+                home.join("Library").join("Application Support").join("Claude").join("claude_desktop_config.json")
+            }
+            #[cfg(not(target_os = "macos"))]
+            {
+                home.join(".config").join("Claude").join("claude_desktop_config.json")
+            }
+        }
+    }
+}
+
+fn memory_sessions(url: &str, admin_token: Option<&str>) -> anyhow::Result<()> {
+    let token = read_admin_token(admin_token)?;
+    let response = http_json("GET", &format!("{url}/v1/sessions"), Some(&token), None)?;
+    println!("{}", serde_json::to_string_pretty(&response)?);
+    Ok(())
+}
+
+fn memory_revoke(id: &str, url: &str, admin_token: Option<&str>) -> anyhow::Result<()> {
+    let token = read_admin_token(admin_token)?;
+    let response = http_json(
+        "POST",
+        &format!("{url}/v1/sessions/{id}/revoke"),
+        Some(&token),
+        Some(json!({})),
+    )?;
+    println!("{}", serde_json::to_string_pretty(&response)?);
+    Ok(())
+}
+
+fn memory_audit(url: &str, admin_token: Option<&str>, limit: usize) -> anyhow::Result<()> {
+    let token = read_admin_token(admin_token)?;
+    let response = http_json(
+        "GET",
+        &format!("{url}/v1/audit?limit={limit}"),
+        Some(&token),
+        None,
+    )?;
+    println!("{}", serde_json::to_string_pretty(&response)?);
+    Ok(())
+}
+
+fn memory_disconnect(client: &str, config_path: Option<&Path>) -> anyhow::Result<()> {
+    let env_path = default_data_dir().join("sessions").join(format!("{client}.env"));
+    if env_path.exists() {
+        let contents = std::fs::read_to_string(&env_path)?;
+        let session_id = contents.lines().find_map(|line| line.strip_prefix("UOMP_SESSION_ID="));
+        let base_url = contents
+            .lines()
+            .find_map(|line| line.strip_prefix("UOMP_BASE_URL="))
+            .unwrap_or("http://127.0.0.1:9374");
+        if let Some(session_id) = session_id {
+            let token = read_admin_token(None)?;
+            let _ = http_json(
+                "POST",
+                &format!("{base_url}/v1/sessions/{session_id}/revoke"),
+                Some(&token),
+                Some(serde_json::json!({})),
+            );
+        }
+        std::fs::remove_file(&env_path)?;
+    }
+
+    let config_path = config_path
+        .map(Path::to_path_buf)
+        .unwrap_or_else(|| default_client_config(client));
+    if config_path.exists() {
+        let mut config: Value = serde_json::from_str(&std::fs::read_to_string(&config_path)?)?;
+        if client == "opencode" {
+            if let Some(mcp) = config.get_mut("mcp").and_then(|value| value.as_object_mut()) {
+                mcp.remove("uomp");
+            }
+        } else if let Some(servers) = config.get_mut("mcpServers").and_then(|value| value.as_object_mut()) {
+            servers.remove("uomp");
+        }
+        std::fs::write(&config_path, serde_json::to_vec_pretty(&config)?)?;
+    }
+    println!("Disconnected {client}.");
+    Ok(())
+}
+
+fn memory_pending(url: &str, admin_token: Option<&str>) -> anyhow::Result<()> {
+    let token = read_admin_token(admin_token)?;
+    let response = http_json("GET", &format!("{url}/v1/consent/requests?status=pending"), Some(&token), None)?;
+    let requests = response["requests"].as_array().cloned().unwrap_or_default();
+    if requests.is_empty() {
+        println!("No pending consent requests.");
+        return Ok(());
+    }
+    for request in requests {
+        println!(
+            "{}  {}  {}  {}",
+            request["request_id"].as_str().unwrap_or("-"),
+            request["agent_id"].as_str().unwrap_or("-"),
+            request["session_id"].as_str().unwrap_or("-"),
+            request["expires_at"].as_str().unwrap_or("-")
+        );
+    }
+    Ok(())
+}
+
+fn memory_approve(id: &str, url: &str, admin_token: Option<&str>) -> anyhow::Result<()> {
+    let token = read_admin_token(admin_token)?;
+    let response = http_json(
+        "POST",
+        &format!("{url}/v1/consent/requests/{id}/approve"),
+        Some(&token),
+        Some(serde_json::json!({})),
+    )?;
+    println!("{}", serde_json::to_string_pretty(&response)?);
+    Ok(())
+}
+
+fn memory_deny(id: &str, url: &str, admin_token: Option<&str>) -> anyhow::Result<()> {
+    let token = read_admin_token(admin_token)?;
+    let response = http_json(
+        "POST",
+        &format!("{url}/v1/consent/requests/{id}/deny"),
+        Some(&token),
+        Some(serde_json::json!({})),
+    )?;
+    println!("{}", serde_json::to_string_pretty(&response)?);
+    Ok(())
+}
+
+fn memory_stop(pid_file: Option<&Path>) -> anyhow::Result<()> {
+    let pid_file = pid_file.map(Path::to_path_buf).unwrap_or_else(default_pid_file);
+    let pid = std::fs::read_to_string(&pid_file)
+        .map_err(|error| anyhow::anyhow!("failed to read {}: {error}", pid_file.display()))?;
+    let status = std::process::Command::new("kill")
+        .arg(pid.trim())
+        .status()
+        .map_err(|error| anyhow::anyhow!("failed to stop memory server: {error}"))?;
+    if !status.success() {
+        anyhow::bail!("failed to stop memory server pid {}", pid.trim());
+    }
+    let _ = std::fs::remove_file(&pid_file);
+    println!("Stopped memory server.");
+    Ok(())
+}
+
+struct BridgeSettings {
+    url: String,
+    token: String,
+    agent_id: String,
+    store: Option<PathBuf>,
+    public_key: Option<PathBuf>,
+}
+
+struct McpAuth {
+    bridge: Option<BridgeSettings>,
+    base_url: Option<String>,
+    jwk: String,
+    token: Option<String>,
+    claims: Option<RemoteTokenClaims>,
+}
+
+fn parse_env_file(path: &Path) -> anyhow::Result<std::collections::HashMap<String, String>> {
+    let contents = std::fs::read_to_string(path)
+        .map_err(|error| anyhow::anyhow!("failed to read {}: {error}", path.display()))?;
+    Ok(contents
+        .lines()
+        .filter_map(|line| line.split_once('='))
+        .map(|(key, value)| (key.trim().to_string(), value.trim().to_string()))
+        .collect())
+}
+
+fn bridge_settings() -> anyhow::Result<Option<BridgeSettings>> {
+    let from_file = std::env::var_os("UOMP_BRIDGE_FILE").map(PathBuf::from);
+    if let Some(path) = from_file {
+        let env = parse_env_file(&path)?;
+        let url = env
+            .get("UOMP_BRIDGE_URL")
+            .cloned()
+            .ok_or_else(|| anyhow::anyhow!("{} is missing UOMP_BRIDGE_URL", path.display()))?;
+        let token = env
+            .get("UOMP_BRIDGE_TOKEN")
+            .cloned()
+            .ok_or_else(|| anyhow::anyhow!("{} is missing UOMP_BRIDGE_TOKEN", path.display()))?;
+        return Ok(Some(BridgeSettings {
+            url,
+            token,
+            agent_id: env
+                .get("UOMP_AGENT_ID")
+                .cloned()
+                .unwrap_or_else(|| "agent".to_string()),
+            store: env.get("UOMP_STORE").map(PathBuf::from),
+            public_key: env.get("UOMP_PUBLIC_KEY").map(PathBuf::from),
+        }));
+    }
+
+    if let (Ok(url), Ok(token)) = (
+        std::env::var("UOMP_BRIDGE_URL"),
+        std::env::var("UOMP_BRIDGE_TOKEN"),
+    ) {
+        return Ok(Some(BridgeSettings {
+            url,
+            token,
+            agent_id: std::env::var("UOMP_AGENT_ID").unwrap_or_else(|_| "agent".to_string()),
+            store: std::env::var_os("UOMP_STORE").map(PathBuf::from),
+            public_key: std::env::var_os("UOMP_PUBLIC_KEY").map(PathBuf::from),
+        }));
+    }
+    Ok(None)
+}
+
+fn verify_mcp_token(token: &str, jwk: &str) -> anyhow::Result<RemoteTokenClaims> {
+    let config = GatewayConfig::from_jwk(
+        RemoteProfile {
+            gateway_id: "local-mcp".to_string(),
+            audience: "local".to_string(),
+            allowed_endpoints: vec![],
+            max_token_ttl_secs: 86_400,
+        },
+        jwk,
+    )?;
+    Ok(verify_token(token, &config)?)
+}
+
+fn scopes_for_tool(name: &str, args: &Value) -> Option<MemoryScopes> {
+    let mut read = MemoryScope::default();
+    match name {
+        "list_memory" | "search_memory" => {
+            let tag = args.get("tag").and_then(|value| value.as_str())?;
+            if tag.is_empty() {
+                return None;
+            }
+            read.tags.push(tag.to_string());
+        }
+        "read_memory" => {
+            let key = args.get("key").and_then(|value| value.as_str())?;
+            if key.is_empty() {
+                return None;
+            }
+            read.keys.push(key.to_string());
+        }
+        _ => return None,
+    }
+    Some(MemoryScopes {
+        read,
+        write: MemoryScope::default(),
+    })
+}
+
+fn token_covers(granted: &MemoryScopes, requested: &MemoryScopes) -> bool {
+    let tags_cover = requested.read.tags.iter().all(|tag| {
+        granted
+            .read
+            .tags
+            .iter()
+            .any(|allowed| tag == allowed || tag.starts_with(allowed))
+    });
+    let keys_cover = requested.read.keys.iter().all(|key| {
+        granted.read.keys.iter().any(|allowed| allowed == key) || !granted.read.tags.is_empty()
+    });
+    tags_cover && keys_cover
+}
+
+fn request_bridge_consent(
+    bridge: &BridgeSettings,
+    scopes: &MemoryScopes,
+) -> anyhow::Result<String> {
+    let body = json!({
+        "agent_id": bridge.agent_id,
+        "agent_name": bridge.agent_id,
+        "requested_scopes": scopes,
+        "duration_minutes": 30
+    });
+    let response = http_json_with_headers(
+        "POST",
+        &format!("{}/v1/consent/requests", bridge.url),
+        &[("x-uomp-bridge-token", bridge.token.as_str())],
+        Some(body),
+    )?;
+    let request_id = response["request_id"]
+        .as_str()
+        .ok_or_else(|| anyhow::anyhow!("consent response missing request_id"))?
+        .to_string();
+    eprintln!("Aegis memory: consent required for {}", bridge.agent_id);
+    eprintln!("  Approve with: aegis-os memory approve {request_id}");
+    eprintln!("  Review with:  aegis-os memory pending");
+
+    for _ in 0..120 {
+        std::thread::sleep(std::time::Duration::from_secs(1));
+        let status = http_json_with_headers(
+            "GET",
+            &format!("{}/v1/consent/requests/{request_id}/status", bridge.url),
+            &[("x-uomp-bridge-token", bridge.token.as_str())],
+            None,
+        )?;
+        match status["status"].as_str() {
+            Some("approved") => {
+                if let Some(token) = status["token"].as_str() {
+                    return Ok(token.to_string());
+                }
+                anyhow::bail!("consent {request_id} was approved but no token was issued");
+            }
+            Some("denied") => anyhow::bail!("consent {request_id} was denied"),
+            Some("expired") => anyhow::bail!("consent {request_id} expired"),
+            _ => {}
+        }
+    }
+    anyhow::bail!("timed out waiting for consent {request_id}")
+}
+
+fn ensure_mcp_claims(
+    auth: &mut McpAuth,
+    requested: Option<&MemoryScopes>,
+) -> anyhow::Result<RemoteTokenClaims> {
+    if let (Some(_token), Some(claims)) = (&auth.token, &auth.claims) {
+        let fresh = claims.expires_at_ms > chrono::Utc::now().timestamp_millis() + 5_000;
+        let covers = requested
+            .map(|requested| token_covers(&claims.scopes, requested))
+            .unwrap_or(true);
+        if fresh && covers {
+            return Ok(claims.clone());
+        }
+    }
+
+    let bridge = auth
+        .bridge
+        .as_ref()
+        .ok_or_else(|| anyhow::anyhow!("no memory token and no bridge configured"))?;
+    let scopes = requested
+        .cloned()
+        .ok_or_else(|| anyhow::anyhow!("cannot request consent without a memory scope"))?;
+    let token = request_bridge_consent(bridge, &scopes)?;
+    let claims = verify_mcp_token(&token, &auth.jwk)?;
+    auth.token = Some(token);
+    auth.claims = Some(claims.clone());
+    Ok(claims)
+}
+
+fn audit_target(name: &str, args: &Value) -> (&'static str, String) {
+    match name {
+        "read_memory" => (
+            "read",
+            format!(
+                "memory:key:{}",
+                args.get("key").and_then(|value| value.as_str()).unwrap_or("")
+            ),
+        ),
+        "list_memory" | "search_memory" => (
+            "read",
+            format!(
+                "memory:tag:{}",
+                args.get("tag").and_then(|value| value.as_str()).unwrap_or("")
+            ),
+        ),
+        other => ("access", format!("tool:{other}")),
+    }
+}
+
+fn log_mcp_audit(auth: &McpAuth, action: &str, resource: &str, decision: &str, reason: &str) {
+    let (Some(base_url), Some(token)) = (auth.base_url.as_deref(), auth.token.as_deref()) else {
+        return;
+    };
+    let body = json!({
+        "action": action,
+        "resource": resource,
+        "decision": decision,
+        "reason": reason
+    });
+    let authorization = format!("Bearer {token}");
+    let _ = http_json_with_headers(
+        "POST",
+        &format!("{base_url}/v1/audit"),
+        &[("authorization", authorization.as_str())],
+        Some(body),
+    );
+}
+
 fn run_memory_mcp(
     store_path: Option<&Path>,
     public_key_path: Option<&Path>,
@@ -651,11 +1424,26 @@ fn run_memory_mcp(
 ) -> anyhow::Result<()> {
     use std::io::{BufRead, Write};
 
-    let token = token
-        .or_else(|| std::env::var("UOMP_TOKEN").ok())
-        .ok_or_else(|| anyhow::anyhow!("set UOMP_TOKEN or pass --token"))?;
+    let bridge = bridge_settings()?;
+    let token_file = std::env::var_os("UOMP_TOKEN_FILE").map(PathBuf::from);
+    let token_file_env = token_file
+        .as_ref()
+        .and_then(|path| parse_env_file(path).ok());
+    let base_url = bridge
+        .as_ref()
+        .map(|bridge| bridge.url.clone())
+        .or_else(|| std::env::var("UOMP_BASE_URL").ok())
+        .or_else(|| {
+            token_file_env
+                .as_ref()
+                .and_then(|env| env.get("UOMP_BASE_URL").cloned())
+        });
+    let store_path = store_path
+        .map(Path::to_path_buf)
+        .or_else(|| bridge.as_ref().and_then(|bridge| bridge.store.clone()));
     let key_path = public_key_path
         .map(Path::to_path_buf)
+        .or_else(|| bridge.as_ref().and_then(|bridge| bridge.public_key.clone()))
         .unwrap_or_else(|| {
             let home = std::env::var_os("HOME")
                 .map(PathBuf::from)
@@ -664,17 +1452,32 @@ fn run_memory_mcp(
         });
     let jwk = std::fs::read_to_string(&key_path)
         .map_err(|error| anyhow::anyhow!("failed to read {}: {error}", key_path.display()))?;
-    let config = GatewayConfig::from_jwk(
-        RemoteProfile {
-            gateway_id: "local-mcp".to_string(),
-            audience: "local".to_string(),
-            allowed_endpoints: vec![],
-            max_token_ttl_secs: 86_400,
-        },
-        &jwk,
-    )?;
-    let claims = verify_token(&token, &config)?;
-    let store = open_memory_store(store_path)?;
+
+    let static_token = token
+        .or_else(|| std::env::var("UOMP_TOKEN").ok())
+        .or_else(|| {
+            token_file_env
+                .as_ref()
+                .and_then(|env| env.get("UOMP_TOKEN").cloned())
+        });
+    let claims = match &static_token {
+        Some(token) => Some(verify_mcp_token(token, &jwk)?),
+        None => None,
+    };
+    if static_token.is_none() && bridge.is_none() {
+        anyhow::bail!(
+            "set UOMP_BRIDGE_FILE (recommended), UOMP_TOKEN, UOMP_TOKEN_FILE, or pass --token"
+        );
+    }
+
+    let mut auth = McpAuth {
+        bridge,
+        base_url,
+        jwk,
+        token: static_token,
+        claims,
+    };
+    let store = open_memory_store(store_path.as_deref())?;
 
     let stdin = std::io::stdin();
     let mut stdout = std::io::stdout();
@@ -712,7 +1515,30 @@ fn run_memory_mcp(
             "tools/list" => json!({ "jsonrpc": "2.0", "id": id, "result": { "tools": memory_mcp_tools() } }),
             "tools/call" => {
                 let params = request.get("params").cloned().unwrap_or_else(|| json!({}));
-                match memory_mcp_call(&store, &claims, &params) {
+                let name = params.get("name").and_then(|value| value.as_str()).unwrap_or("");
+                let args = params.get("arguments").cloned().unwrap_or_else(|| json!({}));
+                let requested = scopes_for_tool(name, &args);
+                let result = ensure_mcp_claims(&mut auth, requested.as_ref()).and_then(|claims| {
+                    match memory_mcp_call(&store, &claims, &params) {
+                        Ok(value) => Ok(value),
+                        Err(error) if error.to_string().contains("ACCESS_DENIED") => {
+                            let Some(scopes) = scopes_for_tool(name, &args) else {
+                                return Err(error);
+                            };
+                            let claims = ensure_mcp_claims(&mut auth, Some(&scopes))?;
+                            memory_mcp_call(&store, &claims, &params)
+                        }
+                        Err(error) => Err(error),
+                    }
+                });
+                let (action, resource) = audit_target(name, &args);
+                match &result {
+                    Ok(_) => log_mcp_audit(&auth, action, &resource, "allow", "tool call allowed"),
+                    Err(error) => {
+                        log_mcp_audit(&auth, action, &resource, "deny", &error.to_string())
+                    }
+                }
+                match result {
                     Ok(value) => json!({
                         "jsonrpc": "2.0",
                         "id": id,
@@ -962,36 +1788,6 @@ fn sensitivity_label(value: aos_memory::Sensitivity) -> &'static str {
         aos_memory::Sensitivity::Low => "low",
         aos_memory::Sensitivity::Medium => "medium",
         aos_memory::Sensitivity::High => "high",
-    }
-}
-
-fn run_memory_reference(args: &[String]) -> anyhow::Result<std::process::ExitStatus> {
-    if let Ok(bin) = std::env::var("UOMP_BIN") {
-        return std::process::Command::new(&bin)
-            .args(args)
-            .status()
-            .map_err(|error| anyhow::anyhow!("failed to run UOMP_BIN='{bin}': {error}"));
-    }
-
-    let cli = Path::new(env!("CARGO_MANIFEST_DIR"))
-        .join("../../modules/uomp/reference/packages/cli/dist/cli.js");
-    if cli.exists() {
-        return std::process::Command::new("node")
-            .arg(&cli)
-            .args(args)
-            .status()
-            .map_err(|node_error| anyhow::anyhow!(
-                "failed to run vendored UOMP reference at {}: {node_error}",
-                cli.display()
-            ));
-    }
-
-    match std::process::Command::new("uomp").args(args).status() {
-        Ok(status) => Ok(status),
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Err(anyhow::anyhow!(
-            "`uomp` is not on PATH and the vendored reference was not built. Set UOMP_BIN, or run `pnpm install && pnpm build` in modules/uomp/reference."
-        )),
-        Err(error) => Err(anyhow::anyhow!("failed to run `uomp`: {error}")),
     }
 }
 
@@ -1249,6 +2045,55 @@ async fn main() -> anyhow::Result<()> {
             MemoryAction::Mcp { store, public_key, token } => {
                 run_memory_mcp(store.as_deref(), public_key.as_deref(), token)?
             }
+            MemoryAction::Serve {
+                listen,
+                store,
+                auth_db,
+                secrets,
+                admin_token,
+                bridge_token,
+                public_url,
+            } => {
+                let secrets = secrets.unwrap_or_else(default_secrets_dir);
+                let admin_token = match admin_token {
+                    Some(token) => token,
+                    None => load_or_create_secret(&secrets.join("admin-token"))?,
+                };
+                let bridge_token = match bridge_token {
+                    Some(token) => token,
+                    None => load_or_create_secret(&secrets.join("bridge-token"))?,
+                };
+                let config = ServerConfig {
+                    listen: listen.clone(),
+                    store_path: memory_db_path(store.as_deref()),
+                    auth_db_path: auth_db.unwrap_or_else(default_auth_db_path),
+                    secrets_dir: secrets,
+                    admin_token,
+                    bridge_token,
+                    public_url: public_url.unwrap_or_else(|| format!("http://{listen}")),
+                };
+                run_server(config).await?;
+            }
+            MemoryAction::Setup {
+                client,
+                vault,
+                tag,
+                config,
+                listen,
+                no_server,
+            } => memory_setup(&client, vault.as_deref(), &tag, config.as_deref(), listen.as_deref(), no_server)?,
+            MemoryAction::Pending { url, admin_token } => memory_pending(&url, admin_token.as_deref())?,
+            MemoryAction::Approve { id, url, admin_token } => memory_approve(&id, &url, admin_token.as_deref())?,
+            MemoryAction::Deny { id, url, admin_token } => memory_deny(&id, &url, admin_token.as_deref())?,
+            MemoryAction::Connect { client, scope, config, listen, no_server } => {
+                memory_connect(&client, &scope, config.as_deref(), listen.as_deref(), no_server)?
+            }
+            MemoryAction::Disconnect { client, config } => memory_disconnect(&client, config.as_deref())?,
+            MemoryAction::Sessions { url, admin_token } => memory_sessions(&url, admin_token.as_deref())?,
+            MemoryAction::Revoke { id, url, admin_token } => memory_revoke(&id, &url, admin_token.as_deref())?,
+            MemoryAction::Audit { url, admin_token, limit } => memory_audit(&url, admin_token.as_deref(), limit)?,
+            MemoryAction::Approvals { url, admin_token } => memory_pending(&url, admin_token.as_deref())?,
+            MemoryAction::Stop { pid_file } => memory_stop(pid_file.as_deref())?,
             MemoryAction::Staged { action } => match action {
                 StagedAction::List { status, db } => native_memory_staged_list(status.as_deref(), db.as_deref())?,
                 StagedAction::Approve { id, reviewed_by, db } => native_memory_staged_approve(&id, &reviewed_by, db.as_deref())?,
@@ -1259,12 +2104,6 @@ async fn main() -> anyhow::Result<()> {
                 PayloadAction::Get { id, output, db } => native_memory_payload_get(&id, output.as_deref(), db.as_deref())?,
                 PayloadAction::Delete { id, db } => native_memory_payload_delete(&id, db.as_deref())?,
             },
-            MemoryAction::External(args) => {
-                let status = run_memory_reference(&args)?;
-                if !status.success() {
-                    std::process::exit(status.code().unwrap_or(1));
-                }
-            }
         },
 
         Commands::MemoryGateway {
