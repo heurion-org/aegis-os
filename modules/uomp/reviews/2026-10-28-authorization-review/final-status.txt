@@ -1,0 +1,17 @@
+ M README.md
+ M apps/gateway/src/index.ts
+ M apps/server/src/index.ts
+ M package.json
+ M packages/auth/src/index.ts
+ M packages/cli/src/commands/authorize.ts
+ M packages/cli/src/commands/run.ts
+ M packages/cli/src/commands/sessions.ts
+ M packages/cli/src/config.ts
+ M packages/core/src/index.ts
+ M packages/guard/src/index.ts
+ M packages/sdk/src/auth.ts
+ M scripts/test-gateway-remote.sh
+ M scripts/test-stock-analyst.sh
+?? .agent/
+?? packages/auth/src/admin.ts
+?? tests/
