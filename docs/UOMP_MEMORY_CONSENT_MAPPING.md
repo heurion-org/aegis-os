@@ -667,7 +667,41 @@ Phase 1 至少覆盖以下行为：
 
 这些测试应同时存在于 UOMP 的协议 conformance suite 和 Aegis 的集成测试中，避免两套行为漂移。
 
-## 15. 相关文档
+## 15. Remote Agent Profile
+
+远程 Agent 不把记忆数据搬到云端。计算和记忆访问分开：
+
+```text
+Remote Agent (Aegis Cloud VM / container)
+        │  mTLS / tunnel
+        ▼
+Aegis Memory Gateway (user device)
+        │  policy + lease + approval
+        ▼
+Memory Store (user device)
+```
+
+映射：
+
+| UOMP Remote Agent Profile | Aegis OS |
+|---|---|
+| Remote Agent runtime | Aegis Cloud tenant workspace / VM |
+| Gateway | Aegis Memory Gateway（本地入口） |
+| Remote identity | Aegis Cloud tenant key + agent id |
+| Token `audience` | Gateway endpoint |
+| Remote approval | Aegis Cloud / local trusted approval |
+| Lease | Aegis `LeaseGrant`（本地 Gateway 执行） |
+| Payload E2E encryption | 仍由 UOMP payload envelope 负责 |
+| Cloud Relay | 已退役，不再提供 |
+
+关键约束：
+
+- Aegis Cloud 只运行 Agent，不保存 Memory Store。
+- 远程 Agent 只能通过 Gateway 获得 scoped response。
+- 本地 Gateway 仍然执行 UOMP scope、deny、field 过滤和审计。
+- 远程审批必须绑定用户在场或 Aegis Cloud 的 tenant approver。
+
+## 16. 相关文档
 
 - [UOMP 协议规范](https://www.uomp.org/spec/)
 - [Aegis Application Protocol (AAP-1.0)](./AEGIS_APPLICATION_PROTOCOL.md)
