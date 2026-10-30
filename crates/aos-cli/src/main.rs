@@ -19,7 +19,8 @@ use aos_core::{AgentIdentity, IsolationTier};
 use aos_mcp_gateway::AegisRuntimeKernel;
 use aos_memory::RemoteProfile;
 use aos_memory_gateway::{
-    serve as serve_memory_gateway, serve_tls as serve_memory_gateway_tls, tls_acceptor, GatewayConfig,
+    serve as serve_memory_gateway, serve_tls as serve_memory_gateway_tls, tls_acceptor, verify_token,
+    GatewayConfig,
 };
 use aos_memory_store::SqliteMemoryStore;
 use clap::{Parser, Subcommand};
@@ -246,6 +247,15 @@ enum MemoryAction {
     Status {
         #[arg(long)]
         db: Option<PathBuf>,
+    },
+    /// Run a read-only MCP stdio server over the local memory store
+    Mcp {
+        #[arg(long)]
+        store: Option<PathBuf>,
+        #[arg(long)]
+        public_key: Option<PathBuf>,
+        #[arg(long)]
+        token: Option<String>,
     },
     /// Review staged Agent writes
     Staged {
@@ -634,6 +644,231 @@ fn native_memory_status(db: Option<&Path>) -> anyhow::Result<()> {
     Ok(())
 }
 
+fn run_memory_mcp(
+    store_path: Option<&Path>,
+    public_key_path: Option<&Path>,
+    token: Option<String>,
+) -> anyhow::Result<()> {
+    use std::io::{BufRead, Write};
+
+    let token = token
+        .or_else(|| std::env::var("UOMP_TOKEN").ok())
+        .ok_or_else(|| anyhow::anyhow!("set UOMP_TOKEN or pass --token"))?;
+    let key_path = public_key_path
+        .map(Path::to_path_buf)
+        .unwrap_or_else(|| {
+            let home = std::env::var_os("HOME")
+                .map(PathBuf::from)
+                .unwrap_or_else(|| PathBuf::from("."));
+            home.join(".uomp").join(".secrets").join("ed25519-public.jwk")
+        });
+    let jwk = std::fs::read_to_string(&key_path)
+        .map_err(|error| anyhow::anyhow!("failed to read {}: {error}", key_path.display()))?;
+    let config = GatewayConfig::from_jwk(
+        RemoteProfile {
+            gateway_id: "local-mcp".to_string(),
+            audience: "local".to_string(),
+            allowed_endpoints: vec![],
+            max_token_ttl_secs: 86_400,
+        },
+        &jwk,
+    )?;
+    let claims = verify_token(&token, &config)?;
+    let store = open_memory_store(store_path)?;
+
+    let stdin = std::io::stdin();
+    let mut stdout = std::io::stdout();
+    for line in stdin.lock().lines() {
+        let line = line?;
+        if line.trim().is_empty() {
+            continue;
+        }
+        let request: Value = match serde_json::from_str(&line) {
+            Ok(value) => value,
+            Err(error) => {
+                let response = json!({
+                    "jsonrpc": "2.0",
+                    "id": Value::Null,
+                    "error": { "code": -32700, "message": error.to_string() }
+                });
+                writeln!(stdout, "{response}")?;
+                stdout.flush()?;
+                continue;
+            }
+        };
+        let id = request.get("id").cloned().unwrap_or(Value::Null);
+        let method = request.get("method").and_then(|value| value.as_str()).unwrap_or("");
+        let response = match method {
+            "initialize" => json!({
+                "jsonrpc": "2.0",
+                "id": id,
+                "result": {
+                    "protocolVersion": "2024-11-05",
+                    "serverInfo": { "name": "aegis-memory", "version": env!("CARGO_PKG_VERSION") },
+                    "capabilities": { "tools": {} }
+                }
+            }),
+            "ping" => json!({ "jsonrpc": "2.0", "id": id, "result": {} }),
+            "tools/list" => json!({ "jsonrpc": "2.0", "id": id, "result": { "tools": memory_mcp_tools() } }),
+            "tools/call" => {
+                let params = request.get("params").cloned().unwrap_or_else(|| json!({}));
+                match memory_mcp_call(&store, &claims, &params) {
+                    Ok(value) => json!({
+                        "jsonrpc": "2.0",
+                        "id": id,
+                        "result": { "content": [{ "type": "text", "text": value.to_string() }] }
+                    }),
+                    Err(error) => json!({
+                        "jsonrpc": "2.0",
+                        "id": id,
+                        "result": {
+                            "isError": true,
+                            "content": [{ "type": "text", "text": error.to_string() }]
+                        }
+                    }),
+                }
+            }
+            other => json!({
+                "jsonrpc": "2.0",
+                "id": id,
+                "error": { "code": -32601, "message": format!("Method not found: {other}") }
+            }),
+        };
+        writeln!(stdout, "{response}")?;
+        stdout.flush()?;
+    }
+    Ok(())
+}
+
+fn memory_mcp_tools() -> Value {
+    json!([
+        {
+            "name": "list_memory",
+            "description": "List memory items under a tag.",
+            "inputSchema": {
+                "type": "object",
+                "properties": { "tag": { "type": "string" } },
+                "required": ["tag"]
+            }
+        },
+        {
+            "name": "search_memory",
+            "description": "Search memory items under a tag.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "tag": { "type": "string" },
+                    "query": { "type": "string" }
+                },
+                "required": ["tag", "query"]
+            }
+        },
+        {
+            "name": "read_memory",
+            "description": "Read one memory item by key.",
+            "inputSchema": {
+                "type": "object",
+                "properties": { "key": { "type": "string" } },
+                "required": ["key"]
+            }
+        }
+    ])
+}
+
+fn memory_mcp_call(
+    store: &SqliteMemoryStore,
+    claims: &aos_memory::RemoteTokenClaims,
+    params: &Value,
+) -> anyhow::Result<Value> {
+    let name = params.get("name").and_then(|value| value.as_str()).unwrap_or("");
+    let args = params.get("arguments").cloned().unwrap_or_else(|| json!({}));
+    match name {
+        "list_memory" => {
+            let tag = args.get("tag").and_then(|value| value.as_str()).unwrap_or("");
+            if tag.is_empty() {
+                anyhow::bail!("tag is required");
+            }
+            let items = store.get_by_tag(tag)?;
+            let visible: Vec<Value> = items
+                .into_iter()
+                .filter(|item| mcp_item_allowed(&claims.scopes.read, item))
+                .map(|item| json!({
+                    "key": item.key,
+                    "tags": item.tags,
+                    "sensitivity": sensitivity_label(item.sensitivity),
+                    "description": item.description
+                }))
+                .collect();
+            Ok(json!({ "items": visible }))
+        }
+        "search_memory" => {
+            let tag = args.get("tag").and_then(|value| value.as_str()).unwrap_or("");
+            let query = args.get("query").and_then(|value| value.as_str()).unwrap_or("");
+            if tag.is_empty() || query.is_empty() {
+                anyhow::bail!("tag and query are required");
+            }
+            let needle = query.to_lowercase();
+            let items = store.get_by_tag(tag)?;
+            let visible: Vec<Value> = items
+                .into_iter()
+                .filter(|item| mcp_item_allowed(&claims.scopes.read, item))
+                .filter(|item| {
+                    format!("{} {} {}", item.key, item.description.as_deref().unwrap_or(""), item.value)
+                        .to_lowercase()
+                        .contains(&needle)
+                })
+                .map(|item| json!({
+                    "key": item.key,
+                    "tags": item.tags,
+                    "sensitivity": sensitivity_label(item.sensitivity),
+                    "description": item.description
+                }))
+                .collect();
+            Ok(json!({ "items": visible }))
+        }
+        "read_memory" => {
+            let key = args.get("key").and_then(|value| value.as_str()).unwrap_or("");
+            if key.is_empty() {
+                anyhow::bail!("key is required");
+            }
+            let Some(item) = store.get(key)? else {
+                anyhow::bail!("memory item '{key}' not found");
+            };
+            if !mcp_item_allowed(&claims.scopes.read, &item) {
+                anyhow::bail!("ACCESS_DENIED: key is outside the token scope");
+            }
+            Ok(json!({
+                "key": item.key,
+                "value": item.value,
+                "tags": item.tags,
+                "sensitivity": sensitivity_label(item.sensitivity),
+                "description": item.description
+            }))
+        }
+        other => anyhow::bail!("unknown memory tool '{other}'"),
+    }
+}
+
+fn mcp_item_allowed(scope: &aos_memory::MemoryScope, item: &aos_memory_store::MemoryItem) -> bool {
+    if scope.deny_keys.iter().any(|key| key == &item.key) {
+        return false;
+    }
+    if item
+        .tags
+        .iter()
+        .any(|tag| scope.deny_tags.iter().any(|denied| denied == tag))
+    {
+        return false;
+    }
+    if scope.keys.iter().any(|key| key == &item.key) {
+        return true;
+    }
+    if item.sensitivity == aos_memory::Sensitivity::High {
+        return false;
+    }
+    item.tags.iter().any(|tag| scope.tags.iter().any(|granted| granted == tag))
+}
+
 fn native_memory_payload_list(db: Option<&Path>) -> anyhow::Result<()> {
     let store = open_memory_store(db)?;
     let payloads = store.list_payloads()?;
@@ -1011,6 +1246,9 @@ async fn main() -> anyhow::Result<()> {
             MemoryAction::List { tag, db } => native_memory_list(tag.as_deref(), db.as_deref())?,
             MemoryAction::Search { query, tag, db } => native_memory_search(&query, tag.as_deref(), db.as_deref())?,
             MemoryAction::Status { db } => native_memory_status(db.as_deref())?,
+            MemoryAction::Mcp { store, public_key, token } => {
+                run_memory_mcp(store.as_deref(), public_key.as_deref(), token)?
+            }
             MemoryAction::Staged { action } => match action {
                 StagedAction::List { status, db } => native_memory_staged_list(status.as_deref(), db.as_deref())?,
                 StagedAction::Approve { id, reviewed_by, db } => native_memory_staged_approve(&id, &reviewed_by, db.as_deref())?,

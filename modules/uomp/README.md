@@ -33,7 +33,7 @@ The native module is being completed in phases:
 
 1. Policy/lease mapping and gateway — done.
 2. Staged writes, payloads, remote device flow — done.
-3. Native CLI commands — `status`, `import`, `read`, `list`, `search`, `staged`, `payload` are native; setup/serve/approvals delegate to the UOMP reference CLI.
+3. Native CLI commands — `status`, `import`, `read`, `list`, `search`, `staged`, `payload`, `mcp` are native; setup/serve/approvals delegate to the UOMP reference CLI.
 4. Native data-plane cutover — `aos-memory-store` foundation landed; Gateway still proxies to UOMP Guard.
 5. Unified trusted UI — pending.
 

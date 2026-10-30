@@ -16,7 +16,7 @@ Implemented:
 Not yet wired:
 
 - The Aegis Memory Gateway still forwards requests to the local UOMP Guard.
-- `aegis-os memory status/import/read/list/search/staged/payload` are now native; setup/serve/approvals still use the vendored reference.
+- `aegis-os memory status/import/read/list/search/staged/payload/mcp` are now native; setup/serve/approvals still use the vendored reference.
 - CSV/JSON and richer connectors remain in `uomp-mvp`.
 - Staged writes and payloads are still handled by UOMP Guard.
 - The Aegis policy/lease layer does not yet read directly from `aos-memory-store`.
