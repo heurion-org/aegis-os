@@ -12,7 +12,7 @@ use aos_memory::{
 };
 use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine as _};
 use ed25519_dalek::{Signature, VerifyingKey};
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use thiserror::Error;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
@@ -52,6 +52,8 @@ pub struct GatewayConfig {
     pub check_session: bool,
     /// Per-session request limit per 60-second window. `0` disables the limit.
     pub rate_limit_per_minute: u32,
+    /// Optional JSONL audit log. `None` writes to stderr.
+    pub audit_log: Option<std::path::PathBuf>,
 }
 
 impl GatewayConfig {
@@ -72,6 +74,7 @@ impl GatewayConfig {
             verifying_key,
             check_session: true,
             rate_limit_per_minute: 60,
+            audit_log: None,
         })
     }
 }
@@ -227,6 +230,66 @@ fn now_ms() -> i64 {
         .as_millis() as i64
 }
 
+#[derive(Debug, Serialize)]
+struct GatewayAuditEvent<'a> {
+    timestamp_ms: i64,
+    gateway_id: &'a str,
+    session_id: &'a str,
+    agent_id: &'a str,
+    method: &'a str,
+    path: &'a str,
+    decision: &'a str,
+    status: u16,
+}
+
+#[derive(Clone)]
+struct AuditLog {
+    path: Option<std::path::PathBuf>,
+    gateway_id: String,
+}
+
+impl AuditLog {
+    fn new(path: Option<std::path::PathBuf>, gateway_id: String) -> Self {
+        Self { path, gateway_id }
+    }
+
+    async fn record(
+        &self,
+        session_id: &str,
+        agent_id: &str,
+        method: &str,
+        path: &str,
+        decision: &str,
+        status: u16,
+    ) {
+        let event = GatewayAuditEvent {
+            timestamp_ms: now_ms(),
+            gateway_id: &self.gateway_id,
+            session_id,
+            agent_id,
+            method,
+            path,
+            decision,
+            status,
+        };
+        let Ok(line) = serde_json::to_string(&event) else {
+            return;
+        };
+        if let Some(path) = &self.path {
+            if let Ok(mut file) = tokio::fs::OpenOptions::new()
+                .create(true)
+                .append(true)
+                .open(path)
+                .await
+            {
+                let _ = file.write_all(format!("{line}\n").as_bytes()).await;
+            }
+        } else {
+            eprintln!("{line}");
+        }
+    }
+}
+
 struct RateLimiter {
     limit: u32,
     windows: std::sync::Mutex<
@@ -277,13 +340,18 @@ pub async fn serve(config: GatewayConfig, listen: &str, guard_url: &str) -> anyh
     let listener = TcpListener::bind(listen).await?;
     let guard = GuardTarget::parse(guard_url)?;
     let limiter = std::sync::Arc::new(RateLimiter::new(config.rate_limit_per_minute));
+    let audit = std::sync::Arc::new(AuditLog::new(
+        config.audit_log.clone(),
+        config.profile.gateway_id.clone(),
+    ));
     loop {
         let (stream, _) = listener.accept().await?;
         let config = config.clone();
         let guard = guard.clone();
         let limiter = limiter.clone();
+        let audit = audit.clone();
         tokio::spawn(async move {
-            if let Err(error) = handle_connection(stream, &config, &guard, &limiter).await {
+            if let Err(error) = handle_connection(stream, &config, &guard, &limiter, &audit).await {
                 eprintln!("memory gateway connection error: {error}");
             }
         });
@@ -317,6 +385,7 @@ async fn handle_connection(
     config: &GatewayConfig,
     guard: &GuardTarget,
     limiter: &RateLimiter,
+    audit: &AuditLog,
 ) -> anyhow::Result<()> {
     let mut buffer = Vec::new();
     let mut chunk = [0u8; 4096];
@@ -383,6 +452,9 @@ async fn handle_connection(
             .and_then(|value| value.strip_prefix("Bearer "));
         if let Some(token) = token {
             if !session_is_active(guard, token).await.unwrap_or(false) {
+                audit
+                    .record("", "", &request.method, &request.path, "deny", 401)
+                    .await;
                 let body = serde_json::json!({ "error": "session is not active" }).to_string();
                 let response = format!(
                     "HTTP/1.1 401 Unauthorized\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{body}",
@@ -397,6 +469,16 @@ async fn handle_connection(
     match authorize_request(config, &request, false, now_ms()) {
         Ok(authorized) => {
             if !limiter.allow(&authorized.claims.session_id) {
+                audit
+                    .record(
+                        &authorized.claims.session_id,
+                        &authorized.claims.agent_id,
+                        &request.method,
+                        &request.path,
+                        "rate_limited",
+                        429,
+                    )
+                    .await;
                 let body = serde_json::json!({ "error": "rate limit exceeded" }).to_string();
                 let response = format!(
                     "HTTP/1.1 429 Too Many Requests\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{body}",
@@ -405,9 +487,22 @@ async fn handle_connection(
                 stream.write_all(response.as_bytes()).await?;
                 return Ok(());
             }
+            audit
+                .record(
+                    &authorized.claims.session_id,
+                    &authorized.claims.agent_id,
+                    &request.method,
+                    &request.path,
+                    "allow",
+                    200,
+                )
+                .await;
             forward(stream, request, guard).await
         }
         Err(error) => {
+            audit
+                .record("", "", &request.method, &request.path, "deny", 401)
+                .await;
             let status = match error {
                 GatewayError::Access(_) | GatewayError::InvalidSignature => "403 Forbidden",
                 _ => "401 Unauthorized",
@@ -522,6 +617,7 @@ mod tests {
             verifying_key: signing_key.verifying_key(),
             check_session: false,
             rate_limit_per_minute: 0,
+            audit_log: None,
         }
     }
 

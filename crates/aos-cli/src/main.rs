@@ -126,6 +126,9 @@ enum Commands {
         /// Maximum accepted token lifetime in seconds.
         #[arg(long, default_value_t = 600)]
         max_token_ttl_secs: i64,
+        /// Optional JSONL audit log. Defaults to stderr.
+        #[arg(long)]
+        audit_log: Option<PathBuf>,
     },
 
     /// Monitor and interact with the Organization's Inter-Agent Communication (IPC) Bus
@@ -650,9 +653,10 @@ async fn main() -> anyhow::Result<()> {
             audience,
             allowed_endpoints,
             max_token_ttl_secs,
+            audit_log,
         } => {
             let jwk = tokio::fs::read_to_string(&public_key).await?;
-            let config = GatewayConfig::from_jwk(
+            let mut config = GatewayConfig::from_jwk(
                 RemoteProfile {
                     gateway_id: format!("{}:{}", identity.org_id, identity.agent_id),
                     audience,
@@ -661,6 +665,7 @@ async fn main() -> anyhow::Result<()> {
                 },
                 &jwk,
             )?;
+            config.audit_log = audit_log;
             println!("Aegis Memory Gateway listening on {listen} -> {guard_url}");
             serve_memory_gateway(config, &listen, &guard_url).await?;
         }
