@@ -115,7 +115,7 @@ Aegis OS is the reference runtime for **[UOMP](https://www.uomp.org/)**, an open
 | Audit trail | `aos-recorder` append-only event log |
 | High-sensitivity approval | R4 human escalation + trusted approver UI |
 
-The first Phase 1 building block lives in [`crates/aos-memory`](./crates/aos-memory): UOMP scope → Aegis resource mapping, lease planning, deny/field filtering, and high-sensitivity key detection. It is not yet wired into the MCP gateway or memory store.
+The first Phase 1 building block lives in [`crates/aos-memory`](./crates/aos-memory): UOMP scope → Aegis resource mapping, lease planning, deny/field filtering, and high-sensitivity key detection. The `memory_policy_evaluate` MCP tool evaluates one UOMP memory resource and returns `allow`, `ask` (with an `escalation_id`), or `deny`. It is not yet wired into a memory store or trusted UI.
 
 The protocol remains vendor-neutral and independently specified; Aegis OS is one implementation. See the [UOMP specification](https://www.uomp.org/spec/), the [reference CLI repository](https://github.com/0xSynapse/uomp-core), and the [UOMP → Aegis OS memory consent mapping](./docs/UOMP_MEMORY_CONSENT_MAPPING.md).
 

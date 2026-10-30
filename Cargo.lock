@@ -147,6 +147,7 @@ dependencies = [
  "aos-core",
  "aos-egress",
  "aos-ipc",
+ "aos-memory",
  "aos-policy",
  "aos-recorder",
  "aos-sandbox",

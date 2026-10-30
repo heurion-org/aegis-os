@@ -487,7 +487,9 @@ impl PolicyEngine for AegisPolicyKernel {
         } else {
             Utc::now().timestamp_millis() + (ttl_secs * 1000)
         };
-        let resource_pattern = if target.action == "workspace_commit_sensitive" {
+        let resource_pattern = if target.action == "workspace_commit_sensitive"
+            || target.action.starts_with("memory.")
+        {
             target.target_resource.clone()
         } else {
             "*".to_string()
@@ -607,6 +609,47 @@ mod tests {
         assert!(matches!(
             kernel.evaluate(&cross_org_ctx).await.unwrap(),
             PolicyDecision::Deny { .. }
+        ));
+    }
+
+    #[tokio::test]
+    async fn test_memory_escalation_preserves_resource_pattern() {
+        let kernel = AegisPolicyKernel::new();
+        let agent = AgentIdentity::new("local", "claude-desktop", "Memory Reader");
+
+        let ctx = PolicyContext {
+            principal: agent.clone(),
+            action: "memory.read".to_string(),
+            target_org_id: "local".to_string(),
+            target_resource: "memory:tag:notes/projects".to_string(),
+            metadata: json!({}),
+        };
+
+        let esc_id = match kernel.evaluate(&ctx).await.unwrap() {
+            PolicyDecision::Ask { escalation_id, .. } => escalation_id,
+            other => panic!("Expected Ask, got {:?}", other),
+        };
+
+        let lease = kernel
+            .approve_escalation(&esc_id, 1800, "user")
+            .await
+            .unwrap();
+        assert_eq!(lease.action_pattern, "memory.read");
+        assert_eq!(lease.resource_pattern, "memory:tag:notes/projects");
+
+        assert!(matches!(
+            kernel.evaluate(&ctx).await.unwrap(),
+            PolicyDecision::Allow { matched_rule } if matched_rule == format!("session_lease:{}", lease.lease_id)
+        ));
+
+        // A lease for one tag must not authorize a different tag.
+        let other = PolicyContext {
+            target_resource: "memory:tag:notes/journal".to_string(),
+            ..ctx
+        };
+        assert!(matches!(
+            kernel.evaluate(&other).await.unwrap(),
+            PolicyDecision::Ask { .. }
         ));
     }
 

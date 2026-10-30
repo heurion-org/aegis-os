@@ -521,6 +521,7 @@ UOMP Memory Guard
 | `PendingEscalation` 没有结构化 scopes | 审批页只能解析字符串 | 增加 `details` 或 typed `requested_scopes` |
 | `LeaseGrant` 没有显式 revoked 状态 | 撤销只能删除 lease，审计不完整 | 增加 `revoked_at_ms` 或 `LeaseStatus` |
 | `LeaseGrant.resource_pattern` 只有前缀/通配 | 无法表达 deny、字段级 | 由 memory module 二次校验 |
+| `approve_escalation` 对非 `workspace_commit_sensitive` 动作把 `resource_pattern` 设为 `*` | 批准一条记忆请求会意外获得全部记忆权限 | 对 `memory.*` 保留 `target_resource`，或增加显式 `lease_scope` |
 | `AuditEvent` 没有 UOMP session id | 跨系统审计关联困难 | 放入 `details` 或扩展字段 |
 | `AgentIdentity` 没有 publisher/DID | UOMP agent identity 信息丢失 | 放入 `capabilities` 或 `details` |
 | 没有 data retention / deletion proof | UOMP 删除证明无法落地 | Phase 2 在 memory module 实现 |
@@ -605,7 +606,7 @@ CREATE TABLE uomp_sessions (
 
 这张表只是 UOMP API 的兼容视图，不是第二套授权状态。真正的授权状态在 Aegis policy/lease 中。
 
-### 13.2 Phase 1 当前实现
+### 13.1 Phase 1 当前实现
 
 `crates/aos-memory` 已经落地第一批纯映射逻辑：
 
@@ -616,9 +617,14 @@ CREATE TABLE uomp_sessions (
 - `high_sensitivity_keys()`：找出未显式选择的高敏 key。
 - `lease_covers()`：复刻 Aegis 的 exact / prefix / `*` lease 匹配。
 
-它还没有接入 MCP gateway、memory store 或 trusted UI；这是 Phase 1b 的工作。
+Phase 1b 已经补上两个关键点：
 
-### 13.1 服务接口
+- MCP 工具 `memory_policy_evaluate`：Agent 可以请求 `memory.read` / `memory.write` / `memory.delete` 的单项资源评估，返回 `allow` / `ask`（含 `escalation_id`）/ `deny`。它不读取数据，只做策略判断。
+- `approve_escalation` 对 `memory.*` 动作保留 `target_resource`，不再退化成 `*`。否则批准一个 tag 会等于批准全部记忆。
+
+仍未接入 memory store 或 trusted UI；这是 Phase 2 的工作。
+
+### 13.2 服务接口
 
 | 接口 | 输入 | 输出 |
 |---|---|---|

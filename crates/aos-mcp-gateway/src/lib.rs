@@ -15,6 +15,7 @@ use aos_core::{
 };
 use aos_egress::{AegisEgressGateway, SecretVaultEntry};
 use aos_ipc::AegisIpcBus;
+use aos_memory::MemoryAction;
 use aos_policy::AegisPolicyKernel;
 use aos_recorder::AegisFlightRecorder;
 use aos_sandbox::{MicroVmSandboxDriver, NativeOsSandboxDriver};
@@ -140,6 +141,7 @@ pub const TOOL_ANNOTATIONS: &[(&str, bool, bool, bool, bool)] = &[
     ("coord_claim", false, false, true, false),
     ("coord_release", false, false, true, false),
     ("policy_list_escalations", true, false, true, false),
+    ("memory_policy_evaluate", true, false, true, false),
     ("runtime_configure_mode", false, false, true, true),
     ("app_catalog_search", true, false, true, false),
     ("app_mount_session", false, false, true, true),
@@ -663,12 +665,81 @@ impl AegisRuntimeKernel {
         Ok(decision)
     }
 
+    async fn memory_policy_evaluate(
+        &self,
+        identity: &AgentIdentity,
+        args: Value,
+    ) -> anyhow::Result<Value> {
+        let action = args
+            .get("action")
+            .and_then(|v| v.as_str())
+            .unwrap_or("read");
+        let resource = args
+            .get("resource")
+            .and_then(|v| v.as_str())
+            .context("Missing 'resource' (e.g. memory:tag:notes/projects)")?;
+        let memory_action = match action {
+            "read" => MemoryAction::Read,
+            "write" => MemoryAction::Write,
+            "delete" => MemoryAction::Delete,
+            other => bail!("Unknown memory action '{}'", other),
+        };
+
+        let decision = self
+            .authorize_and_audit(
+                identity,
+                memory_action.as_str(),
+                &identity.org_id,
+                resource,
+                json!({
+                    "protocol": "uomp",
+                    "protocol_version": "1.0",
+                    "resource": resource,
+                }),
+            )
+            .await?;
+
+        Ok(match decision {
+            PolicyDecision::Allow { matched_rule } => json!({
+                "protocol": "uomp",
+                "decision": "allow",
+                "action": memory_action.as_str(),
+                "resource": resource,
+                "matched_rule": matched_rule,
+            }),
+            PolicyDecision::Ask {
+                escalation_id,
+                reason,
+                suggested_lease_scope,
+            } => json!({
+                "protocol": "uomp",
+                "decision": "ask",
+                "action": memory_action.as_str(),
+                "resource": resource,
+                "escalation_id": escalation_id,
+                "reason": reason,
+                "suggested_lease_scope": suggested_lease_scope,
+            }),
+            PolicyDecision::Deny { reason } => json!({
+                "protocol": "uomp",
+                "decision": "deny",
+                "action": memory_action.as_str(),
+                "resource": resource,
+                "reason": reason,
+            }),
+        })
+    }
+
     pub async fn call_tool(
         &self,
         identity: &AgentIdentity,
         tool_name: &str,
         args: Value,
     ) -> anyhow::Result<Value> {
+        if tool_name == "memory_policy_evaluate" {
+            return self.memory_policy_evaluate(identity, args).await;
+        }
+
         let key = Self::agent_key(&identity.org_id, &identity.agent_id);
         let env = self
             .agents
@@ -2139,6 +2210,18 @@ impl AegisRuntimeKernel {
                     "name": "policy_list_escalations",
                     "description": "List pending boundary authorization escalations for the Organization.",
                     "inputSchema": { "type": "object", "properties": {} }
+                },
+                {
+                    "name": "memory_policy_evaluate",
+                    "description": "[UOMP] Evaluate a memory read/write request against Aegis policy. Returns allow, ask (with escalation_id), or deny. Does not read memory data.",
+                    "inputSchema": {
+                        "type": "object",
+                        "properties": {
+                            "action": { "type": "string", "enum": ["read", "write", "delete"] },
+                            "resource": { "type": "string", "description": "UOMP memory resource, e.g. memory:tag:notes/projects or memory:key:note.projects.plan" }
+                        },
+                        "required": ["action", "resource"]
+                    }
                 },
                 {
                     "name": "runtime_configure_mode",
@@ -4076,6 +4159,74 @@ mod tests {
         }
         let err = kernel.paas.verify_approver_code("acme", &code_for(&secret, 0)).await.unwrap_err();
         assert!(err.to_string().contains("locked"), "{err}");
+    }
+
+    #[tokio::test]
+    async fn memory_policy_evaluate_asks_then_allows_after_approval() {
+        let temp = tempfile::tempdir().unwrap();
+        let kernel = AegisRuntimeKernel::new(&temp.path().join("rt"))
+            .await
+            .unwrap();
+        let agent = AgentIdentity::new("local", "claude-desktop", "Memory Reader");
+
+        let call = |id: u64, resource: &str| {
+            json!({
+                "jsonrpc": "2.0",
+                "id": id,
+                "method": "tools/call",
+                "params": {
+                    "name": "memory_policy_evaluate",
+                    "arguments": { "action": "read", "resource": resource }
+                }
+            })
+        };
+
+        let resp = kernel
+            .handle_jsonrpc_message(&agent, call(1, "memory:tag:notes/projects"))
+            .await
+            .unwrap();
+        let payload: Value = serde_json::from_str(
+            resp["result"]["content"][0]["text"]
+                .as_str()
+                .expect("tool result text"),
+        )
+        .unwrap();
+        assert_eq!(payload["decision"], "ask");
+        let escalation_id = payload["escalation_id"]
+            .as_str()
+            .expect("escalation id")
+            .to_string();
+
+        kernel
+            .policy
+            .approve_escalation(&escalation_id, 1800, "user")
+            .await
+            .unwrap();
+
+        let resp = kernel
+            .handle_jsonrpc_message(&agent, call(2, "memory:tag:notes/projects"))
+            .await
+            .unwrap();
+        let payload: Value = serde_json::from_str(
+            resp["result"]["content"][0]["text"]
+                .as_str()
+                .expect("tool result text"),
+        )
+        .unwrap();
+        assert_eq!(payload["decision"], "allow");
+
+        // A tag lease must not authorize a different tag.
+        let resp = kernel
+            .handle_jsonrpc_message(&agent, call(3, "memory:tag:notes/journal"))
+            .await
+            .unwrap();
+        let payload: Value = serde_json::from_str(
+            resp["result"]["content"][0]["text"]
+                .as_str()
+                .expect("tool result text"),
+        )
+        .unwrap();
+        assert_eq!(payload["decision"], "ask");
     }
 
     #[tokio::test]

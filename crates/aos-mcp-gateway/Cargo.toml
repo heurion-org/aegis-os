@@ -12,6 +12,7 @@ aos-ipc.workspace = true
 aos-sandbox.workspace = true
 aos-egress.workspace = true
 aos-recorder.workspace = true
+aos-memory.workspace = true
 anyhow.workspace = true
 serde.workspace = true
 serde_json.workspace = true
