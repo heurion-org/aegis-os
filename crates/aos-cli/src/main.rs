@@ -21,6 +21,7 @@ use aos_memory::RemoteProfile;
 use aos_memory_gateway::{
     serve as serve_memory_gateway, serve_tls as serve_memory_gateway_tls, tls_acceptor, GatewayConfig,
 };
+use aos_memory_store::SqliteMemoryStore;
 use clap::{Parser, Subcommand};
 use serde_json::{json, Value};
 use std::io::Read;
@@ -108,11 +109,11 @@ enum Commands {
         action: PolicyAction,
     },
 
-    /// UOMP memory commands (delegates to the reference CLI)
+    /// Local memory commands (native; unknown commands delegate to the reference CLI)
+    #[command(after_help = "Delegated commands: setup, connect, serve, pending, approve, deny, staged, payload, approvals, disconnect, stop")]
     Memory {
-        /// Arguments passed to `uomp`, e.g. `setup claude --vault ~/Notes`
-        #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
-        args: Vec<String>,
+        #[command(subcommand)]
+        action: MemoryAction,
     },
 
     /// Start the local Aegis Memory Gateway for remote UOMP Agents
@@ -206,6 +207,49 @@ enum Commands {
         #[arg(trailing_var_arg = true, allow_hyphen_values = true, required = true)]
         cmd: Vec<String>,
     },
+}
+
+#[derive(Subcommand)]
+enum MemoryAction {
+    /// Import a Markdown directory into the local memory store
+    Import {
+        path: PathBuf,
+        #[arg(long, default_value = "notes")]
+        tag: String,
+        #[arg(long)]
+        db: Option<PathBuf>,
+    },
+    /// Read one memory item by key
+    Read {
+        key: String,
+        #[arg(long)]
+        json: bool,
+        #[arg(long)]
+        db: Option<PathBuf>,
+    },
+    /// List memory items
+    List {
+        #[arg(long)]
+        tag: Option<String>,
+        #[arg(long)]
+        db: Option<PathBuf>,
+    },
+    /// Search memory items by key, tag, description, or value
+    Search {
+        query: String,
+        #[arg(long)]
+        tag: Option<String>,
+        #[arg(long)]
+        db: Option<PathBuf>,
+    },
+    /// Show local memory store status
+    Status {
+        #[arg(long)]
+        db: Option<PathBuf>,
+    },
+    /// Delegate other commands to the vendored reference CLI
+    #[command(external_subcommand)]
+    External(Vec<String>),
 }
 
 #[derive(Subcommand)]
@@ -417,6 +461,125 @@ fn resolve_identity(
     };
 
     AgentIdentity::new(org_id, agent_id, role)
+}
+
+fn memory_db_path(db: Option<&Path>) -> PathBuf {
+    db.map(Path::to_path_buf).unwrap_or_else(|| {
+        let home = std::env::var_os("HOME")
+            .map(PathBuf::from)
+            .unwrap_or_else(|| PathBuf::from("."));
+        home.join(".uomp").join("memory.db")
+    })
+}
+
+fn open_memory_store(db: Option<&Path>) -> anyhow::Result<SqliteMemoryStore> {
+    let path = memory_db_path(db);
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
+    SqliteMemoryStore::open(&path)
+}
+
+fn native_memory_import(path: &Path, tag: &str, db: Option<&Path>) -> anyhow::Result<()> {
+    let store = open_memory_store(db)?;
+    let result = store.import_markdown_dir(path, tag)?;
+    println!("Imported {} note(s), skipped {}, errors {}", result.imported, result.skipped, result.errors.len());
+    for error in &result.errors {
+        eprintln!("  {error}");
+    }
+    println!("Store: {}", memory_db_path(db).display());
+    Ok(())
+}
+
+fn native_memory_read(key: &str, json: bool, db: Option<&Path>) -> anyhow::Result<()> {
+    let store = open_memory_store(db)?;
+    let Some(item) = store.get(key)? else {
+        anyhow::bail!("memory item '{key}' not found");
+    };
+    if json {
+        println!("{}", serde_json::to_string_pretty(&item.value)?);
+    } else if let Some(title) = item.value.get("title").and_then(|value| value.as_str()) {
+        println!("{title}");
+        if let Some(body) = item.value.get("body").and_then(|value| value.as_str()) {
+            println!();
+            println!("{body}");
+        }
+    } else {
+        println!("{}", serde_json::to_string_pretty(&item.value)?);
+    }
+    Ok(())
+}
+
+fn native_memory_list(tag: Option<&str>, db: Option<&Path>) -> anyhow::Result<()> {
+    let store = open_memory_store(db)?;
+    let items = match tag {
+        Some(tag) => store.get_by_tag(tag)?,
+        None => store.all()?,
+    };
+    if items.is_empty() {
+        println!("No memory items.");
+        return Ok(());
+    }
+    for item in items {
+        println!(
+            "{}  [{}]  {}  {}",
+            item.key,
+            item.tags.join(", "),
+            sensitivity_label(item.sensitivity),
+            item.description.as_deref().unwrap_or("")
+        );
+    }
+    Ok(())
+}
+
+fn native_memory_search(query: &str, tag: Option<&str>, db: Option<&Path>) -> anyhow::Result<()> {
+    let store = open_memory_store(db)?;
+    let items = match tag {
+        Some(tag) => store.get_by_tag(tag)?,
+        None => store.all()?,
+    };
+    let needle = query.to_lowercase();
+    let mut found = 0;
+    for item in items {
+        let haystack = format!(
+            "{} {} {} {}",
+            item.key,
+            item.tags.join(" "),
+            item.description.as_deref().unwrap_or(""),
+            item.value
+        )
+        .to_lowercase();
+        if haystack.contains(&needle) {
+            println!("{}  [{}]", item.key, item.tags.join(", "));
+            found += 1;
+        }
+    }
+    if found == 0 {
+        println!("No matches.");
+    }
+    Ok(())
+}
+
+fn native_memory_status(db: Option<&Path>) -> anyhow::Result<()> {
+    let path = memory_db_path(db);
+    println!("Aegis memory");
+    println!("  Store  {}", path.display());
+    println!("  Exists {}", path.exists());
+    if path.exists() {
+        let store = open_memory_store(db)?;
+        println!("  Items  {}", store.count()?);
+        let tags = store.list_tags()?;
+        println!("  Tags   {}", if tags.is_empty() { "-".to_string() } else { tags.join(", ") });
+    }
+    Ok(())
+}
+
+fn sensitivity_label(value: aos_memory::Sensitivity) -> &'static str {
+    match value {
+        aos_memory::Sensitivity::Low => "low",
+        aos_memory::Sensitivity::Medium => "medium",
+        aos_memory::Sensitivity::High => "high",
+    }
 }
 
 fn run_memory_reference(args: &[String]) -> anyhow::Result<std::process::ExitStatus> {
@@ -694,28 +857,19 @@ async fn main() -> anyhow::Result<()> {
             }
         }
 
-        Commands::Memory { args } => {
-            if args.is_empty() || matches!(args[0].as_str(), "-h" | "--help" | "help") {
-                println!(
-                    "Aegis memory commands (delegated to the UOMP reference CLI):\n\
-                     \n  aegis-os memory setup claude --vault ~/Notes\n\
-                     \n  aegis-os memory import ~/Notes\n\
-                     \n  aegis-os memory status\n\
-                     \n  aegis-os memory pending\n\
-                     \n  aegis-os memory approve <request-id>\n\
-                     \n  aegis-os memory staged list\n\
-                     \n  aegis-os memory payload list\n\
-                     \n  aegis-os memory approvals\n\
-                     \n  aegis-os memory disconnect claude\n\
-                     \nSet UOMP_BIN if `uomp` is not on PATH."
-                );
-                return Ok(());
+        Commands::Memory { action } => match action {
+            MemoryAction::Import { path, tag, db } => native_memory_import(&path, &tag, db.as_deref())?,
+            MemoryAction::Read { key, json, db } => native_memory_read(&key, json, db.as_deref())?,
+            MemoryAction::List { tag, db } => native_memory_list(tag.as_deref(), db.as_deref())?,
+            MemoryAction::Search { query, tag, db } => native_memory_search(&query, tag.as_deref(), db.as_deref())?,
+            MemoryAction::Status { db } => native_memory_status(db.as_deref())?,
+            MemoryAction::External(args) => {
+                let status = run_memory_reference(&args)?;
+                if !status.success() {
+                    std::process::exit(status.code().unwrap_or(1));
+                }
             }
-            let status = run_memory_reference(&args)?;
-            if !status.success() {
-                std::process::exit(status.code().unwrap_or(1));
-            }
-        }
+        },
 
         Commands::MemoryGateway {
             listen,

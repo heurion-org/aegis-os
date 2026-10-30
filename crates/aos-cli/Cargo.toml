@@ -17,6 +17,7 @@ aos-sandbox.workspace = true
 aos-egress.workspace = true
 aos-memory.workspace = true
 aos-memory-gateway.workspace = true
+aos-memory-store.workspace = true
 aos-mcp-gateway.workspace = true
 anyhow.workspace = true
 clap.workspace = true

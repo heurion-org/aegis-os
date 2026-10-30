@@ -85,6 +85,15 @@ impl SqliteMemoryStore {
         Ok(row)
     }
 
+    pub fn all(&self) -> anyhow::Result<Vec<MemoryItem>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT key, value, tags, sensitivity, source, created_at, updated_at, description
+             FROM memory_items ORDER BY key",
+        )?;
+        let rows = stmt.query_map([], row_to_item)?;
+        Ok(rows.collect::<Result<Vec<_>, _>>()?)
+    }
+
     pub fn get_by_tag(&self, tag: &str) -> anyhow::Result<Vec<MemoryItem>> {
         let mut stmt = self.conn.prepare(
             "SELECT key, value, tags, sensitivity, source, created_at, updated_at, description

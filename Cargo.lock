@@ -99,6 +99,7 @@ dependencies = [
  "aos-mcp-gateway",
  "aos-memory",
  "aos-memory-gateway",
+ "aos-memory-store",
  "aos-policy",
  "aos-sandbox",
  "aos-vfs",

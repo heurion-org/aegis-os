@@ -16,6 +16,7 @@ Implemented:
 Not yet wired:
 
 - The Aegis Memory Gateway still forwards requests to the local UOMP Guard.
+- `aegis-os memory status/import/read/list/search` are now native; setup/serve/staged/payload/approvals still use the vendored reference.
 - CSV/JSON and richer connectors remain in `uomp-mvp`.
 - Staged writes and payloads are still handled by UOMP Guard.
 - The Aegis policy/lease layer does not yet read directly from `aos-memory-store`.
@@ -42,7 +43,7 @@ This lets Aegis open an existing `~/.uomp/memory.db` without a destructive migra
 ## Next steps
 
 1. Add a `MemoryDataPlane` trait and make `SqliteMemoryStore` one implementation.
-2. Port CSV/JSON import.
+2. Port CSV/JSON import (Markdown import is native).
 3. Move staged writes and payload metadata into the Aegis data plane.
 4. Replace the Gateway's UOMP Guard proxy with the native data plane.
 5. Keep `uomp-mvp` as the reference connector/CLI until parity is reached.
