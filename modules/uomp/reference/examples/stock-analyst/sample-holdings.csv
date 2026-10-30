@@ -1,0 +1,11 @@
+symbol,name,quantity,cost_basis,market_value,currency,sector
+AAPL,Apple Inc.,100,150.00,17500.00,USD,Technology
+MSFT,Microsoft Corp.,40,320.00,14000.00,USD,Technology
+GOOGL,Alphabet Inc.,30,140.00,4500.00,USD,Technology
+NVDA,NVIDIA Corp.,30,300.00,12000.00,USD,Technology
+TSLA,Tesla Inc.,50,200.00,9500.00,USD,Consumer Cyclical
+AMZN,Amazon.com Inc.,25,170.00,4250.00,USD,Consumer Cyclical
+JPM,JPMorgan Chase,60,155.00,9000.00,USD,Financial
+BAC,Bank of America,200,32.00,6600.00,USD,Financial
+JNJ,Johnson & Johnson,40,160.00,6000.00,USD,Healthcare
+XOM,Exxon Mobil,50,100.00,5200.00,USD,Energy

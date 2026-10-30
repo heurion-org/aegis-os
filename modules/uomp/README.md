@@ -10,6 +10,7 @@ UOMP (User-Owned Memory Protocol) is the **memory consent module** of Aegis OS.
   - `crates/aos-memory-gateway` — TLS/mTLS remote Agent gateway
 - **CLI:** `aegis-os memory ...`
 - **Website repository:** the separate `uomp` repository is documentation/website only.
+- **Vendored reference:** [`modules/uomp/reference`](./reference) is a temporary copy of the archived `uomp-core` implementation.
 
 ## Role in Aegis OS
 
@@ -36,4 +37,4 @@ The native module is being completed in phases:
 4. Native data-plane cutover — `aos-memory-store` foundation landed; Gateway still proxies to UOMP Guard.
 5. Unified trusted UI — pending.
 
-Until the cutover is complete, `uomp` remains the reference/debug CLI and the `uomp-mvp` repository remains the compatibility implementation.
+Until the cutover is complete, the vendored [`reference`](./reference) copy is the compatibility implementation and `uomp` remains the reference/debug CLI. The standalone `uomp-core` repository is archived.

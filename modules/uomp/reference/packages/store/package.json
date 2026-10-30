@@ -1,0 +1,29 @@
+{
+  "name": "@uomp/store",
+  "version": "0.0.1",
+  "type": "module",
+  "description": "UOMP Memory Store - SQLite persistence for memory items",
+  "main": "./dist/index.js",
+  "types": "./dist/index.d.ts",
+  "exports": {
+    ".": {
+      "import": "./dist/index.js",
+      "types": "./dist/index.d.ts"
+    }
+  },
+  "scripts": {
+    "build": "tsc -p tsconfig.json",
+    "typecheck": "tsc -p tsconfig.json --noEmit",
+    "lint": "echo 'lint not configured'",
+    "test": "echo 'no tests'"
+  },
+  "dependencies": {
+    "@uomp/core": "workspace:*",
+    "better-sqlite3": "^12.0.0"
+  },
+  "devDependencies": {
+    "@types/better-sqlite3": "^7.6.11",
+    "@types/node": "^22.0.0",
+    "typescript": "^5.5.0"
+  }
+}

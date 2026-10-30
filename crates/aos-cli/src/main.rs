@@ -419,6 +419,36 @@ fn resolve_identity(
     AgentIdentity::new(org_id, agent_id, role)
 }
 
+fn run_memory_reference(args: &[String]) -> anyhow::Result<std::process::ExitStatus> {
+    if let Ok(bin) = std::env::var("UOMP_BIN") {
+        return std::process::Command::new(&bin)
+            .args(args)
+            .status()
+            .map_err(|error| anyhow::anyhow!("failed to run UOMP_BIN='{bin}': {error}"));
+    }
+
+    let cli = Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("../../modules/uomp/reference/packages/cli/dist/cli.js");
+    if cli.exists() {
+        return std::process::Command::new("node")
+            .arg(&cli)
+            .args(args)
+            .status()
+            .map_err(|node_error| anyhow::anyhow!(
+                "failed to run vendored UOMP reference at {}: {node_error}",
+                cli.display()
+            ));
+    }
+
+    match std::process::Command::new("uomp").args(args).status() {
+        Ok(status) => Ok(status),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Err(anyhow::anyhow!(
+            "`uomp` is not on PATH and the vendored reference was not built. Set UOMP_BIN, or run `pnpm install && pnpm build` in modules/uomp/reference."
+        )),
+        Err(error) => Err(anyhow::anyhow!("failed to run `uomp`: {error}")),
+    }
+}
+
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
     let mut cli = Cli::parse();
@@ -681,13 +711,7 @@ async fn main() -> anyhow::Result<()> {
                 );
                 return Ok(());
             }
-            let bin = std::env::var("UOMP_BIN").unwrap_or_else(|_| "uomp".to_string());
-            let status = std::process::Command::new(&bin)
-                .args(&args)
-                .status()
-                .map_err(|error| anyhow::anyhow!(
-                    "failed to run '{bin}': {error}. Install UOMP or set UOMP_BIN."
-                ))?;
+            let status = run_memory_reference(&args)?;
             if !status.success() {
                 std::process::exit(status.code().unwrap_or(1));
             }

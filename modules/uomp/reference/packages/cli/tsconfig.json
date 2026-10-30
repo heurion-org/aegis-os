@@ -1,0 +1,21 @@
+{
+  "extends": "../../tsconfig.json",
+  "compilerOptions": {
+    "outDir": "./dist",
+    "rootDir": "./src",
+    "tsBuildInfoFile": "./dist/.tsbuildinfo"
+  },
+  "include": ["src/**/*"],
+  "exclude": ["dist", "node_modules"],
+  "references": [
+    { "path": "../core" },
+    { "path": "../aegis-adapter" },
+    { "path": "../store" },
+    { "path": "../auth" },
+    { "path": "../guard" },
+    { "path": "../token" },
+    { "path": "../identity" },
+    { "path": "../registry" },
+    { "path": "../sdk" }
+  ]
+}

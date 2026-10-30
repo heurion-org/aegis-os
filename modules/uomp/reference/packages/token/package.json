@@ -1,0 +1,28 @@
+{
+  "name": "@uomp/token",
+  "version": "0.0.1",
+  "type": "module",
+  "description": "UOMP Capability Token - JWT-based session authorization",
+  "main": "./dist/index.js",
+  "types": "./dist/index.d.ts",
+  "exports": {
+    ".": {
+      "import": "./dist/index.js",
+      "types": "./dist/index.d.ts"
+    }
+  },
+  "scripts": {
+    "build": "tsc -p tsconfig.json",
+    "typecheck": "tsc -p tsconfig.json --noEmit",
+    "lint": "echo 'lint not configured'",
+    "test": "echo 'no tests'"
+  },
+  "dependencies": {
+    "@uomp/core": "workspace:*",
+    "jose": "^5.6.0"
+  },
+  "devDependencies": {
+    "@types/node": "^22.0.0",
+    "typescript": "^5.5.0"
+  }
+}

@@ -1,0 +1,9 @@
+{
+  "name": "@uomp-examples/calendar-agent",
+  "version": "0.0.1",
+  "type": "module",
+  "private": true,
+  "dependencies": {
+    "@uomp/sdk": "workspace:*"
+  }
+}

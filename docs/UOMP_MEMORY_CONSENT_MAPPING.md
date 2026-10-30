@@ -726,5 +726,5 @@ Phase 1 已实现远程入口的策略核心和最小网络层：
 - [UOMP 协议规范](https://www.uomp.org/spec/)
 - [Aegis Application Protocol (AAP-1.0)](./AEGIS_APPLICATION_PROTOCOL.md)
 - [Aegis OS README · Memory Consent (UOMP)](../README.md#memory-consent-uomp)
-- [UOMP reference CLI](https://github.com/0xSynapse/uomp-core)
+- [Vendored UOMP reference implementation](../modules/uomp/reference)
 - [Aegis Memory Gateway deployment](./MEMORY_GATEWAY_DEPLOY.md)

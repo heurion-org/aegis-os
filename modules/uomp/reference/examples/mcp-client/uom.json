@@ -1,0 +1,24 @@
+{
+  "uomp_version": "1.0",
+  "agent": {
+    "id": "mcp-client",
+    "name": "MCP Client",
+    "version": "0.1.0",
+    "description": "Claude Desktop, Cursor, or another MCP client",
+    "publisher": "uomp"
+  },
+  "requested_scopes": {
+    "read": {
+      "tags": [],
+      "keys": [],
+      "deny_tags": [],
+      "deny_keys": []
+    },
+    "write": {
+      "tags": [],
+      "keys": [],
+      "deny_tags": [],
+      "deny_keys": []
+    }
+  }
+}

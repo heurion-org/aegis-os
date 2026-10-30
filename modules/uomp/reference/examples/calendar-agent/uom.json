@@ -1,0 +1,27 @@
+{
+  "uomp_version": "1.0",
+  "agent": {
+    "id": "calendar_agent",
+    "name": "Calendar Assistant",
+    "version": "1.0.0",
+    "description": "A simple calendar assistant that reads user preferences",
+    "publisher": "uomp-community"
+  },
+  "requested_scopes": {
+    "read": {
+      "tags": ["preference"],
+      "keys": [],
+      "deny_tags": [],
+      "deny_keys": []
+    },
+    "write": {
+      "tags": [],
+      "keys": [],
+      "deny_tags": [],
+      "deny_keys": []
+    }
+  },
+  "required_capabilities": ["memory.read"],
+  "optional_capabilities": [],
+  "requires_remote": false
+}

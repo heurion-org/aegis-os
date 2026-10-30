@@ -1,0 +1,31 @@
+{
+  "name": "@uomp/identity",
+  "version": "0.0.1",
+  "type": "module",
+  "description": "UOMP Agent identity verification - DID and GPG support",
+  "main": "./dist/index.js",
+  "types": "./dist/index.d.ts",
+  "exports": {
+    ".": {
+      "import": "./dist/index.js",
+      "types": "./dist/index.d.ts"
+    }
+  },
+  "scripts": {
+    "build": "tsc -p tsconfig.json",
+    "typecheck": "tsc -p tsconfig.json --noEmit",
+    "lint": "echo 'lint not configured'",
+    "test": "echo 'no tests'"
+  },
+  "dependencies": {
+    "@uomp/core": "workspace:*",
+    "did-resolver": "^4.1.0",
+    "ethr-did-resolver": "^11.0.0",
+    "web-did-resolver": "^2.0.27",
+    "openpgp": "^5.11.2"
+  },
+  "devDependencies": {
+    "@types/node": "^22.0.0",
+    "typescript": "^5.5.0"
+  }
+}

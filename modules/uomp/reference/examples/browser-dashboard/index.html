@@ -1,0 +1,223 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>UOMP Portfolio Dashboard</title>
+<style>
+  :root { --bg:#0A0A0A; --card:#111; --border:#1F2937; --text:#E5E7EB; --mid:#9CA3AF; --dim:#6B7280; --green:#34D399; --red:#F87171; --blue:#3B82F6; --yellow:#FBBF24; }
+  * { margin:0; padding:0; box-sizing:border-box; }
+  body { font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',Roboto,sans-serif; background:var(--bg); color:var(--text); min-height:100vh; }
+  .container { max-width:1200px; margin:0 auto; padding:2rem 1.5rem; }
+  header { display:flex; justify-content:space-between; align-items:center; margin-bottom:2rem; flex-wrap:wrap; gap:1rem; }
+  h1 { font-size:1.5rem; color:#fff; display:flex; align-items:center; gap:.5rem; }
+  .logo { width:28px; height:28px; }
+  .connect-bar { display:flex; gap:.5rem; align-items:center; flex-wrap:wrap; }
+  input { background:var(--card); border:1px solid var(--border); color:var(--text); padding:.5rem .75rem; border-radius:6px; font-size:.85rem; width:320px; }
+  input::placeholder { color:var(--dim); }
+  button { background:var(--blue); color:#fff; border:none; padding:.5rem 1rem; border-radius:6px; font-size:.85rem; font-weight:600; cursor:pointer; white-space:nowrap; }
+  button:hover { opacity:.9; }
+  button:disabled { background:#374151; cursor:not-allowed; }
+  .status { font-size:.8rem; padding:.25rem .6rem; border-radius:4px; }
+  .status-ok { background:#064E3B; color:var(--green); }
+  .status-err { background:#7F1D1D; color:var(--red); }
+
+  .grid { display:grid; grid-template-columns:repeat(auto-fit,minmax(220px,1fr)); gap:1rem; margin-bottom:2rem; }
+  .card { background:var(--card); border:1px solid var(--border); border-radius:10px; padding:1.25rem; }
+  .card-label { font-size:.8rem; color:var(--mid); margin-bottom:.3rem; }
+  .card-value { font-size:1.6rem; font-weight:700; }
+  .card-sub { font-size:.8rem; color:var(--dim); margin-top:.2rem; }
+  .pos { color:var(--green); } .neg { color:var(--red); }
+
+  h2 { font-size:1.1rem; margin:2rem 0 1rem; color:#fff; }
+  table { width:100%; border-collapse:collapse; font-size:.85rem; }
+  th,td { padding:.6rem .75rem; text-align:right; border-bottom:1px solid var(--border); }
+  th { background:var(--card); color:var(--mid); font-weight:600; }
+  th:first-child,td:first-child { text-align:left; }
+  th:nth-child(2),td:nth-child(2) { text-align:left; }
+ 
+  .bar-wrap { display:flex; align-items:center; gap:.5rem; margin:.4rem 0; }
+  .bar-label { width:120px; font-size:.8rem; color:var(--mid); text-align:right; flex-shrink:0; }
+  .bar-track { flex:1; background:var(--border); height:8px; border-radius:4px; overflow:hidden; }
+  .bar-fill { height:100%; border-radius:4px; min-width:2px; transition:width .3s; }
+  .bar-pct { width:50px; font-size:.8rem; color:var(--dim); }
+
+  .signal { display:flex; align-items:center; gap:.5rem; padding:.4rem 0; border-bottom:1px solid var(--border); font-size:.85rem; }
+
+  @media(max-width:640px) { .container { padding:1rem; } input { width:100%; } .connect-bar { flex-direction:column; } }
+</style>
+</head>
+<body>
+<div class="container">
+  <header>
+    <h1>
+      <svg class="logo" viewBox="0 0 24 24" fill="none" stroke="white" stroke-width="2"><path d="M12 2L2 7l10 5 10-5-10-5z"/><path d="M2 17l10 5 10-5"/><path d="M2 12l10 5 10-5"/></svg>
+      UOMP Portfolio
+    </h1>
+    <div class="connect-bar">
+      <input id="gatewayUrl" placeholder="Gateway URL (https://xxx.trycloudflare.com)" value="">
+      <input id="token" placeholder="Capability Token (UOM_TOKEN)" type="password">
+      <button id="connectBtn" onclick="connect()">Connect</button>
+      <span id="status" class="status" style="display:none"></span>
+    </div>
+  </header>
+
+  <div class="grid" id="summary"></div>
+  <div id="holdings"></div>
+  <div id="sectors" style="display:none"></div>
+  <div id="signals" style="display:none"></div>
+</div>
+
+<script>
+// ── Mini UOMP Client ──────────────────────────────────────────
+class UompGateway {
+  constructor(token, gatewayUrl) {
+    this.token = token;
+    this.base = gatewayUrl.replace(/\/$/,'');
+  }
+  async get(path) {
+    const r = await fetch(`${this.base}${path}`, {
+      headers: { Authorization:`Bearer ${this.token}`, Accept:'application/json','X-UOMP-Agent-Id':'browser-dashboard' }
+    });
+    if (!r.ok) { const e = await r.json().catch(()=>({})); throw new Error(e.error?.message || `HTTP ${r.status}`); }
+    return r.json();
+  }
+  async getByTag(tag) {
+    const d = await this.get(`/v1/memory?tag=${encodeURIComponent(tag)}`);
+    return d.items || [];
+  }
+  async getKey(key) { return this.get(`/v1/memory/${encodeURIComponent(key)}`); }
+  async aggregate(op, tag, field) {
+    const p = new URLSearchParams({ tag, op }); if (field) p.set('field', field);
+    return this.get(`/v1/memory/aggregate?${p}`);
+  }
+  async health() { return this.get('/v1/health'); }
+}
+
+// ── Render ─────────────────────────────────────────────────────
+function fmt(n) { return n.toLocaleString('en-US',{minimumFractionDigits:2,maximumFractionDigits:2}); }
+function pct(n) { return n.toFixed(2)+'%'; }
+
+const COLORS = ['#3B82F6','#8B5CF6','#EC4899','#F59E0B','#10B981','#EF4444','#6366F1','#14B8A6'];
+
+function renderDashboard(holdings, risk) {
+  let totalCost=0, totalVal=0;
+  const sectors={}, rows=[];
+
+  for (const item of holdings) {
+    const h = item.value;
+    const qty = parseFloat(h.quantity), cost = parseFloat(h.cost_basis);
+    const mktVal = parseFloat(h.market_value), price = mktVal/qty;
+    const costVal = cost*qty, pnl=mktVal-costVal, pnlPct=costVal>0?(pnl/costVal)*100:0;
+    totalCost+=costVal; totalVal+=mktVal;
+    const sec = h.sector||'Unknown';
+    sectors[sec]=(sectors[sec]||0)+mktVal;
+    rows.push({...h,qty,costBasis:cost,price,curVal:mktVal,pnl,pnlPct,weight:0,sector:sec});
+  }
+  for (const r of rows) r.weight=totalVal>0?(r.curVal/totalVal)*100:0;
+
+  const totalPnl=totalVal-totalCost, totalPnlPct=totalCost>0?(totalPnl/totalCost)*100:0;
+  const hhi=rows.reduce((s,r)=>s+r.weight*r.weight,0);
+
+  // Signals
+  const signals=[];
+  const stopLoss=risk?.stop_loss_pct||15, takeProfit=risk?.take_profit_pct||50;
+  for (const r of rows) {
+    if (r.pnlPct <= -stopLoss) signals.push({type:'stop_loss',msg:`${r.symbol} 浮亏 ${r.pnlPct.toFixed(1)}% (止损线 ${stopLoss}%)`});
+    if (r.pnlPct >= takeProfit) signals.push({type:'take_profit',msg:`${r.symbol} 浮盈 ${r.pnlPct.toFixed(1)}% (止盈线 ${takeProfit}%)`});
+  }
+
+  // Summary cards
+  document.getElementById('summary').innerHTML = `
+    <div class="card"><div class="card-label">总市值</div><div class="card-value">$${fmt(totalVal)}</div></div>
+    <div class="card"><div class="card-label">总盈亏</div><div class="card-value ${totalPnl>=0?'pos':'neg'}">$${fmt(totalPnl)}</div><div class="card-sub ${totalPnl>=0?'pos':'neg'}">${pct(totalPnlPct)}</div></div>
+    <div class="card"><div class="card-label">集中度 HHI</div><div class="card-value">${hhi.toFixed(1)}</div><div class="card-sub">${hhi>2500?'⚠ 偏高':'✓ 正常'}</div></div>
+    <div class="card"><div class="card-label">持仓数</div><div class="card-value">${holdings.length}</div><div class="card-sub">${Object.keys(sectors).length} 行业</div></div>
+    <div class="card"><div class="card-label">风险偏好</div><div class="card-value">${risk?.risk_level||'?'}</div><div class="card-sub">回撤≤${(risk?.max_drawdown||0)*100}%</div></div>
+  `;
+
+  // Holdings table
+  let tbl = `<h2>持仓明细</h2><table><thead><tr><th>标的</th><th>名称</th><th>数量</th><th>成本</th><th>市价</th><th>市值</th><th>盈亏</th><th>盈亏%</th><th>权重%</th><th>行业</th></tr></thead><tbody>`;
+  for (const r of rows) {
+    tbl += `<tr><td><b>${r.symbol}</b></td><td>${r.name||r.symbol}</td><td>${r.qty}</td><td>${fmt(r.costBasis)}</td><td>${fmt(r.price)}</td><td>$${fmt(r.curVal)}</td><td class="${r.pnl>=0?'pos':'neg'}">$${fmt(r.pnl)}</td><td class="${r.pnl>=0?'pos':'neg'}">${pct(r.pnlPct)}</td><td>${pct(r.weight)}</td><td>${r.sector}</td></tr>`;
+  }
+  tbl += '</tbody></table>';
+  document.getElementById('holdings').innerHTML = tbl;
+
+  // Sector bars
+  const secDiv = document.getElementById('sectors');
+  secDiv.style.display='block';
+  let secHTML = '<h2>行业分布</h2>';
+  const secs = Object.entries(sectors).sort((a,b)=>b[1]-a[1]);
+  const colors=[...COLORS];
+  for (const [s,v] of secs) {
+    const p = totalVal>0?(v/totalVal)*100:0;
+    secHTML += `<div class="bar-wrap">
+      <span class="bar-label">${s}</span>
+      <div class="bar-track"><div class="bar-fill" style="width:${Math.min(p,100)}%;background:${colors.shift()||'#6B7280'}"></div></div>
+      <span class="bar-pct">${pct(p)}</span>
+    </div>`;
+  }
+  secDiv.innerHTML = secHTML;
+
+  // Signals
+  if (signals.length > 0) {
+    const sigDiv = document.getElementById('signals');
+    sigDiv.style.display='block';
+    sigDiv.innerHTML = `<h2>交易信号</h2>${signals.map(s=>`<div class="signal">${s.type==='stop_loss'?'🔴':'🟢'} ${s.msg}</div>`).join('')}`;
+  }
+}
+
+// ── Connect ────────────────────────────────────────────────────
+async function connect() {
+  const gateway = document.getElementById('gatewayUrl').value.trim();
+  const token = document.getElementById('token').value.trim();
+  const btn = document.getElementById('connectBtn');
+  const status = document.getElementById('status');
+
+  if (!token) { showStatus('请输入 Token', 'err'); return; }
+  if (!gateway) { showStatus('请输入 Gateway URL', 'err'); return; }
+
+  btn.disabled = true;
+  btn.textContent = 'Connecting...';
+  showStatus('Connecting...', 'ok');
+
+  try {
+    const client = new UompGateway(token, gateway);
+    const health = await client.health();
+    showStatus(`✓ Gateway: ${health.audience}`, 'ok');
+
+    const holdings = await client.getByTag('portfolio:holdings');
+    const riskItems = await client.getByTag('profile:risk');
+    const risk = riskItems[0]?.value || {};
+
+    renderDashboard(holdings, risk);
+    btn.textContent = 'Connected';
+  } catch(e) {
+    showStatus(`✗ ${e.message}`, 'err');
+    btn.textContent = 'Connect';
+  } finally {
+    btn.disabled = false;
+  }
+}
+
+function showStatus(msg, type) {
+  const s = document.getElementById('status');
+  s.style.display = 'inline-block';
+  s.textContent = msg;
+  s.className = `status status-${type}`;
+}
+
+// Auto-fill from URL hash: #token=xxx&gateway=xxx
+(function(){
+  const h = window.location.hash.slice(1);
+  if (!h) return;
+  const p = new URLSearchParams(h);
+  const t = p.get('token'), g = p.get('gateway');
+  if (t) document.getElementById('token').value = t;
+  if (g) document.getElementById('gatewayUrl').value = g;
+  if (t && g) connect();
+})();
+</script>
+</body>
+</html>
