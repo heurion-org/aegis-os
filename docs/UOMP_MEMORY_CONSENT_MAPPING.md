@@ -624,6 +624,14 @@ Phase 1b 已经补上两个关键点：
 
 仍未接入 memory store 或 trusted UI；这是 Phase 2 的工作。
 
+写入路径已经进入 Staging 模式：
+
+- Agent `PUT /v1/memory/:key` → Guard 校验 `write` scope → 写入 `staged_writes`，返回 `202`。
+- 高敏写入直接 `403`，不进入 staging。
+- 用户通过 `uomp staged list/approve/deny` 或管理员 HTTP 端点审批。
+- 批准后才调用 Memory Store，`source=agent`，并写审计。
+- Aegis 映射：`action=memory.write`、`resource=memory:key:<key>`；批准对应 trusted approval。
+
 UOMP 侧的 Phase 1 adapter 已经落地在 `uomp-mvp/packages/aegis-adapter`：
 
 - `HttpAegisMcpClient`：通过 Aegis `/mcp` 调用 `memory_policy_evaluate`，通过 `/v1/approvals/decide` 完成 approve / deny。
@@ -705,7 +713,7 @@ Phase 1 已实现远程入口的策略核心和最小网络层：
 
 - `aos_memory::RemoteProfile`：`gateway_id`、`audience`、`allowed_endpoints`、`max_token_ttl_secs`。
 - `aos_memory::validate_remote_access()`：校验 `profile == "remote"`、audience、过期、撤销、endpoint 白名单、token TTL 和 scope。
-- `aos-memory-gateway`：EdDSA JWT 验签、`/v1/memory` 路由、转发前调用 Guard `/v1/tokens/validate` 检查 session 状态、per-session 限流（默认 60 req/min）、JSONL `gateway_access` 审计、可选原生 TLS 1.3 / mTLS、再转发到本地 Memory Guard。
+- `aos-memory-gateway`：EdDSA JWT 验签、`/v1/memory` 读写路由（PUT 进入 Guard staging）、转发前调用 Guard `/v1/tokens/validate` 检查 session 状态、per-session 限流（默认 60 req/min）、JSONL `gateway_access` 审计、可选原生 TLS 1.3 / mTLS、再转发到本地 Memory Guard。
 - CLI：`aegis-os memory-gateway --public-key <jwk> --audience <url> --guard-url <url>`。
 - 网络层支持原生 TLS 1.3 / mTLS（`--tls-cert` / `--tls-key` / `--client-ca`）；也支持在 Caddy 等代理后运行明文 HTTP。
 - Gateway 转发前会检查 session 状态；本地 Guard 仍然做最终校验。

@@ -49,7 +49,7 @@ The gateway:
 - enforces the token scope and endpoint allowlist;
 - applies a per-session rate limit (60 req/min by default);
 - writes `gateway_access` JSONL audit events;
-- forwards only `GET /v1/memory` reads.
+- forwards `GET /v1/memory` reads and `PUT /v1/memory/:key` staged writes.
 
 ## 3. Native TLS 1.3 / mTLS
 
@@ -160,7 +160,7 @@ Expected:
 
 ## 8. Current limits
 
-- The gateway is read-only (`GET /v1/memory`).
+- The gateway forwards reads and staged writes (`PUT /v1/memory/:key`); writes require UOMP approval before they are applied.
 - Native TLS 1.3 / mTLS is supported; Caddy remains an optional public edge.
 - Payload delivery (`/v1/payload/*`) is not implemented yet.
 - Aegis Cloud remote Agent provisioning is a separate step; this guide only covers the local memory entry point.

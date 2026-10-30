@@ -209,6 +209,15 @@ pub fn authorize_request(
 }
 
 fn memory_route(method: &str, path: &str) -> Result<(MemoryAction, String), GatewayError> {
+    if method == "PUT" {
+        if let Some(key) = path.strip_prefix("/v1/memory/") {
+            if key.is_empty() || key.contains('/') {
+                return Err(GatewayError::UnsupportedEndpoint);
+            }
+            return Ok((MemoryAction::Write, format!("memory:key:{key}")));
+        }
+        return Err(GatewayError::UnsupportedEndpoint);
+    }
     if method != "GET" {
         return Err(GatewayError::UnsupportedEndpoint);
     }
@@ -927,6 +936,45 @@ mod tests {
         assert!(limiter.allow("sess-1"));
         assert!(!limiter.allow("sess-1"));
         assert!(limiter.allow("sess-2"));
+    }
+
+    #[test]
+    fn routes_put_requests_with_write_scope() {
+        let signing_key = SigningKey::from_bytes(&[7u8; 32]);
+        let config = config(&signing_key);
+        let token = token(
+            &signing_key,
+            "remote",
+            "https://gateway.example.com",
+            1_300,
+            MemoryScopes {
+                read: MemoryScope::default(),
+                write: MemoryScope {
+                    keys: vec!["note.projects.plan".to_string()],
+                    ..Default::default()
+                },
+            },
+        );
+
+        let request = GatewayRequest {
+            method: "PUT".to_string(),
+            path: "/v1/memory/note.projects.plan".to_string(),
+            authorization: Some(format!("Bearer {token}")),
+            body: b"{\"value\":\"x\"}".to_vec(),
+        };
+        let authorized = authorize_request(&config, &request, false, 1_000_000).unwrap();
+        assert_eq!(authorized.action, MemoryAction::Write);
+        assert_eq!(authorized.resource, "memory:key:note.projects.plan");
+
+        let read_request = GatewayRequest {
+            method: "GET".to_string(),
+            path: "/v1/memory/note.projects.plan".to_string(),
+            ..request
+        };
+        assert!(matches!(
+            authorize_request(&config, &read_request, false, 1_000_000),
+            Err(GatewayError::Access(RemoteAccessError::ScopeDenied))
+        ));
     }
 
     #[test]
