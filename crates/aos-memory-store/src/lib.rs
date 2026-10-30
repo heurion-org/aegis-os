@@ -13,6 +13,7 @@ use chrono::Utc;
 use rusqlite::{params, Connection, OptionalExtension};
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
+use uuid::Uuid;
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct MemoryItem {
@@ -31,6 +32,44 @@ pub struct ImportResult {
     pub imported: usize,
     pub skipped: usize,
     pub errors: Vec<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct PayloadMeta {
+    pub payload_id: String,
+    pub session_id: String,
+    pub agent_id: String,
+    pub created_at: String,
+    pub format: Option<String>,
+    pub size: Option<i64>,
+    pub hash: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct StageWriteInput {
+    pub session_id: String,
+    pub agent_id: String,
+    pub key: String,
+    pub value: Value,
+    pub tags: Vec<String>,
+    pub sensitivity: Sensitivity,
+    pub description: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct StagedWrite {
+    pub id: String,
+    pub session_id: String,
+    pub agent_id: String,
+    pub key: String,
+    pub value: Value,
+    pub tags: Vec<String>,
+    pub sensitivity: Sensitivity,
+    pub description: Option<String>,
+    pub status: String,
+    pub created_at: String,
+    pub reviewed_at: Option<String>,
+    pub reviewed_by: Option<String>,
 }
 
 pub struct SqliteMemoryStore {
@@ -67,6 +106,31 @@ impl SqliteMemoryStore {
             );
             CREATE INDEX IF NOT EXISTS idx_memory_items_tags ON memory_items(tags);
             CREATE INDEX IF NOT EXISTS idx_memory_items_source ON memory_items(source);
+
+            CREATE TABLE IF NOT EXISTS staged_writes (
+                id TEXT PRIMARY KEY,
+                session_id TEXT NOT NULL,
+                agent_id TEXT NOT NULL,
+                key TEXT NOT NULL,
+                value TEXT NOT NULL,
+                tags TEXT NOT NULL,
+                sensitivity TEXT NOT NULL,
+                description TEXT,
+                status TEXT NOT NULL,
+                created_at TEXT NOT NULL,
+                reviewed_at TEXT,
+                reviewed_by TEXT
+            );
+            CREATE INDEX IF NOT EXISTS idx_staged_writes_status ON staged_writes(status);
+
+            CREATE TABLE IF NOT EXISTS payloads (
+                payload_id TEXT PRIMARY KEY,
+                session_id TEXT NOT NULL,
+                agent_id TEXT NOT NULL,
+                envelope TEXT NOT NULL,
+                created_at TEXT NOT NULL
+            );
+            CREATE INDEX IF NOT EXISTS idx_payloads_session ON payloads(session_id);
             "#,
         )?;
         Ok(())
@@ -144,6 +208,195 @@ impl SqliteMemoryStore {
             ],
         )?;
         Ok(true)
+    }
+
+    pub fn stage_write(&self, input: StageWriteInput) -> anyhow::Result<StagedWrite> {
+        let staged = StagedWrite {
+            id: format!("stage-{}", Uuid::new_v4()),
+            session_id: input.session_id,
+            agent_id: input.agent_id,
+            key: input.key,
+            value: input.value,
+            tags: input.tags,
+            sensitivity: input.sensitivity,
+            description: input.description,
+            status: "pending".to_string(),
+            created_at: Utc::now().to_rfc3339(),
+            reviewed_at: None,
+            reviewed_by: None,
+        };
+        self.conn.execute(
+            "INSERT INTO staged_writes
+             (id, session_id, agent_id, key, value, tags, sensitivity, description, status, created_at)
+             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            params![
+                staged.id,
+                staged.session_id,
+                staged.agent_id,
+                staged.key,
+                serde_json::to_string(&staged.value)?,
+                serde_json::to_string(&staged.tags)?,
+                sensitivity_str(staged.sensitivity),
+                staged.description,
+                staged.status,
+                staged.created_at,
+            ],
+        )?;
+        Ok(staged)
+    }
+
+    pub fn list_staged_writes(&self, status: Option<&str>) -> anyhow::Result<Vec<StagedWrite>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT id, session_id, agent_id, key, value, tags, sensitivity, description,
+                    status, created_at, reviewed_at, reviewed_by
+             FROM staged_writes
+             WHERE (?1 IS NULL OR status = ?1)
+             ORDER BY created_at DESC",
+        )?;
+        let rows = stmt.query_map(params![status], row_to_staged)?;
+        Ok(rows.collect::<Result<Vec<_>, _>>()?)
+    }
+
+    pub fn approve_staged_write(
+        &self,
+        id: &str,
+        reviewed_by: &str,
+    ) -> anyhow::Result<Option<MemoryItem>> {
+        let Some(staged) = self.get_staged_write(id)? else {
+            return Ok(None);
+        };
+        if staged.status != "pending" {
+            return Ok(None);
+        }
+        let now = Utc::now().to_rfc3339();
+        self.set(&MemoryItem {
+            key: staged.key.clone(),
+            value: staged.value,
+            tags: staged.tags,
+            sensitivity: staged.sensitivity,
+            source: "agent".to_string(),
+            created_at: now.clone(),
+            updated_at: now.clone(),
+            description: staged.description,
+        })?;
+        self.conn.execute(
+            "UPDATE staged_writes SET status = 'approved', reviewed_at = ?, reviewed_by = ?
+             WHERE id = ? AND status = 'pending'",
+            params![now, reviewed_by, id],
+        )?;
+        self.get(&staged.key)
+    }
+
+    pub fn deny_staged_write(
+        &self,
+        id: &str,
+        reviewed_by: &str,
+    ) -> anyhow::Result<Option<StagedWrite>> {
+        let Some(staged) = self.get_staged_write(id)? else {
+            return Ok(None);
+        };
+        if staged.status != "pending" {
+            return Ok(None);
+        }
+        self.conn.execute(
+            "UPDATE staged_writes SET status = 'denied', reviewed_at = ?, reviewed_by = ?
+             WHERE id = ? AND status = 'pending'",
+            params![Utc::now().to_rfc3339(), reviewed_by, id],
+        )?;
+        self.get_staged_write(id)
+    }
+
+    pub fn get_staged_write(&self, id: &str) -> anyhow::Result<Option<StagedWrite>> {
+        let row = self
+            .conn
+            .query_row(
+                "SELECT id, session_id, agent_id, key, value, tags, sensitivity, description,
+                        status, created_at, reviewed_at, reviewed_by
+                 FROM staged_writes WHERE id = ?",
+                params![id],
+                row_to_staged,
+            )
+            .optional()?;
+        Ok(row)
+    }
+
+    pub fn store_payload(
+        &self,
+        session_id: &str,
+        agent_id: &str,
+        mut envelope: Value,
+    ) -> anyhow::Result<String> {
+        let payload_id = format!("pay-{}", Uuid::new_v4());
+        let created_at = Utc::now().to_rfc3339();
+        if let Some(object) = envelope.as_object_mut() {
+            object.insert("payload_id".to_string(), Value::String(payload_id.clone()));
+            object.insert(
+                "session_id".to_string(),
+                Value::String(session_id.to_string()),
+            );
+            object.insert("agent_id".to_string(), Value::String(agent_id.to_string()));
+            object
+                .entry("timestamp".to_string())
+                .or_insert_with(|| Value::String(created_at.clone()));
+        }
+        self.conn.execute(
+            "INSERT INTO payloads (payload_id, session_id, agent_id, envelope, created_at)
+             VALUES (?, ?, ?, ?, ?)",
+            params![
+                payload_id,
+                session_id,
+                agent_id,
+                serde_json::to_string(&envelope)?,
+                created_at
+            ],
+        )?;
+        Ok(payload_id)
+    }
+
+    pub fn get_payload(&self, id: &str) -> anyhow::Result<Option<Value>> {
+        let row = self
+            .conn
+            .query_row(
+                "SELECT envelope FROM payloads WHERE payload_id = ?",
+                params![id],
+                |row| row.get::<_, String>(0),
+            )
+            .optional()?;
+        Ok(row.and_then(|raw| serde_json::from_str(&raw).ok()))
+    }
+
+    pub fn list_payloads(&self) -> anyhow::Result<Vec<PayloadMeta>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT payload_id, session_id, agent_id, envelope, created_at
+             FROM payloads ORDER BY created_at DESC",
+        )?;
+        let rows = stmt.query_map([], |row| {
+            let envelope: String = row.get(3)?;
+            let value: Value = serde_json::from_str(&envelope).unwrap_or(Value::Null);
+            Ok(PayloadMeta {
+                payload_id: row.get(0)?,
+                session_id: row.get(1)?,
+                agent_id: row.get(2)?,
+                created_at: row.get(4)?,
+                format: value
+                    .get("format")
+                    .and_then(|value| value.as_str())
+                    .map(str::to_string),
+                size: value.get("size").and_then(|value| value.as_i64()),
+                hash: value
+                    .get("hash")
+                    .and_then(|value| value.as_str())
+                    .map(str::to_string),
+            })
+        })?;
+        Ok(rows.collect::<Result<Vec<_>, _>>()?)
+    }
+
+    pub fn delete_payload(&self, id: &str) -> anyhow::Result<bool> {
+        Ok(self
+            .conn
+            .execute("DELETE FROM payloads WHERE payload_id = ?", params![id])?
+            > 0)
     }
 
     pub fn delete(&self, key: &str) -> anyhow::Result<bool> {
@@ -280,6 +533,26 @@ impl SqliteMemoryStore {
     }
 }
 
+fn row_to_staged(row: &rusqlite::Row<'_>) -> rusqlite::Result<StagedWrite> {
+    let value: String = row.get(4)?;
+    let tags: String = row.get(5)?;
+    let sensitivity: String = row.get(6)?;
+    Ok(StagedWrite {
+        id: row.get(0)?,
+        session_id: row.get(1)?,
+        agent_id: row.get(2)?,
+        key: row.get(3)?,
+        value: serde_json::from_str(&value).unwrap_or(Value::Null),
+        tags: serde_json::from_str(&tags).unwrap_or_default(),
+        sensitivity: parse_sensitivity_str(&sensitivity),
+        description: row.get(7)?,
+        status: row.get(8)?,
+        created_at: row.get(9)?,
+        reviewed_at: row.get(10)?,
+        reviewed_by: row.get(11)?,
+    })
+}
+
 fn row_to_item(row: &rusqlite::Row<'_>) -> rusqlite::Result<MemoryItem> {
     let value: String = row.get(1)?;
     let tags: String = row.get(2)?;
@@ -354,6 +627,85 @@ mod tests {
         assert_eq!(store.list_tags().unwrap(), vec!["notes", "notes/projects"]);
         assert!(store.delete("note.projects.plan").unwrap());
         assert!(store.get("note.projects.plan").unwrap().is_none());
+    }
+
+    #[test]
+    fn stores_and_lists_encrypted_payloads() {
+        let store = SqliteMemoryStore::in_memory().unwrap();
+        let payload_id = store
+            .store_payload(
+                "sess-1",
+                "agent-1",
+                json!({
+                    "encryption": { "algorithm": "ECDH-X25519-AES256GCM" },
+                    "ciphertext": "base64ciphertext",
+                    "format": "text/markdown",
+                    "size": 2048,
+                    "hash": "sha256:abc"
+                }),
+            )
+            .unwrap();
+
+        let envelope = store.get_payload(&payload_id).unwrap().unwrap();
+        assert_eq!(envelope["ciphertext"], "base64ciphertext");
+        assert_eq!(envelope["session_id"], "sess-1");
+        let listed = store.list_payloads().unwrap();
+        assert_eq!(listed.len(), 1);
+        assert_eq!(listed[0].format.as_deref(), Some("text/markdown"));
+        assert!(store.delete_payload(&payload_id).unwrap());
+        assert!(store.get_payload(&payload_id).unwrap().is_none());
+    }
+
+    #[test]
+    fn stages_writes_and_applies_them_after_approval() {
+        let store = SqliteMemoryStore::in_memory().unwrap();
+        let staged = store
+            .stage_write(StageWriteInput {
+                session_id: "sess-1".to_string(),
+                agent_id: "agent-1".to_string(),
+                key: "note.projects.new".to_string(),
+                value: json!({ "title": "New" }),
+                tags: vec!["notes".to_string()],
+                sensitivity: Sensitivity::Low,
+                description: Some("New note".to_string()),
+            })
+            .unwrap();
+
+        assert_eq!(store.get("note.projects.new").unwrap(), None);
+        assert_eq!(store.list_staged_writes(Some("pending")).unwrap().len(), 1);
+
+        let applied = store
+            .approve_staged_write(&staged.id, "user")
+            .unwrap()
+            .unwrap();
+        assert_eq!(applied.source, "agent");
+        assert_eq!(
+            store.get("note.projects.new").unwrap().unwrap().value["title"],
+            "New"
+        );
+    }
+
+    #[test]
+    fn denies_staged_writes_without_touching_the_store() {
+        let store = SqliteMemoryStore::in_memory().unwrap();
+        let staged = store
+            .stage_write(StageWriteInput {
+                session_id: "sess-1".to_string(),
+                agent_id: "agent-1".to_string(),
+                key: "note.projects.denied".to_string(),
+                value: json!("nope"),
+                tags: vec!["notes".to_string()],
+                sensitivity: Sensitivity::Low,
+                description: None,
+            })
+            .unwrap();
+
+        let denied = store
+            .deny_staged_write(&staged.id, "user")
+            .unwrap()
+            .unwrap();
+        assert_eq!(denied.status, "denied");
+        assert_eq!(store.get("note.projects.denied").unwrap(), None);
     }
 
     #[test]

@@ -247,9 +247,69 @@ enum MemoryAction {
         #[arg(long)]
         db: Option<PathBuf>,
     },
+    /// Review staged Agent writes
+    Staged {
+        #[command(subcommand)]
+        action: StagedAction,
+    },
+    /// Inspect encrypted Agent payloads
+    Payload {
+        #[command(subcommand)]
+        action: PayloadAction,
+    },
     /// Delegate other commands to the vendored reference CLI
     #[command(external_subcommand)]
     External(Vec<String>),
+}
+
+#[derive(Subcommand)]
+enum PayloadAction {
+    /// List stored payloads
+    List {
+        #[arg(long)]
+        db: Option<PathBuf>,
+    },
+    /// Fetch an encrypted payload envelope
+    Get {
+        id: String,
+        #[arg(short, long)]
+        output: Option<PathBuf>,
+        #[arg(long)]
+        db: Option<PathBuf>,
+    },
+    /// Delete a payload
+    Delete {
+        id: String,
+        #[arg(long)]
+        db: Option<PathBuf>,
+    },
+}
+
+#[derive(Subcommand)]
+enum StagedAction {
+    /// List staged writes
+    List {
+        #[arg(long)]
+        status: Option<String>,
+        #[arg(long)]
+        db: Option<PathBuf>,
+    },
+    /// Approve and apply a staged write
+    Approve {
+        id: String,
+        #[arg(long, default_value = "cli")]
+        reviewed_by: String,
+        #[arg(long)]
+        db: Option<PathBuf>,
+    },
+    /// Deny a staged write without changing the store
+    Deny {
+        id: String,
+        #[arg(long, default_value = "cli")]
+        reviewed_by: String,
+        #[arg(long)]
+        db: Option<PathBuf>,
+    },
 }
 
 #[derive(Subcommand)]
@@ -574,6 +634,94 @@ fn native_memory_status(db: Option<&Path>) -> anyhow::Result<()> {
     Ok(())
 }
 
+fn native_memory_payload_list(db: Option<&Path>) -> anyhow::Result<()> {
+    let store = open_memory_store(db)?;
+    let payloads = store.list_payloads()?;
+    if payloads.is_empty() {
+        println!("No payloads.");
+        return Ok(());
+    }
+    for payload in payloads {
+        println!(
+            "{}  {}  {} bytes  agent={}  session={}",
+            payload.payload_id,
+            payload.format.as_deref().unwrap_or("-"),
+            payload.size.unwrap_or(0),
+            payload.agent_id,
+            payload.session_id
+        );
+    }
+    Ok(())
+}
+
+fn native_memory_payload_get(id: &str, output: Option<&Path>, db: Option<&Path>) -> anyhow::Result<()> {
+    let store = open_memory_store(db)?;
+    let Some(envelope) = store.get_payload(id)? else {
+        anyhow::bail!("payload '{id}' not found");
+    };
+    let json = serde_json::to_string_pretty(&envelope)?;
+    if let Some(output) = output {
+        std::fs::write(output, format!("{json}\n"))?;
+        println!("Wrote {id} to {}", output.display());
+    } else {
+        println!("{json}");
+    }
+    Ok(())
+}
+
+fn native_memory_payload_delete(id: &str, db: Option<&Path>) -> anyhow::Result<()> {
+    let store = open_memory_store(db)?;
+    if store.delete_payload(id)? {
+        println!("Deleted payload {id}.");
+        Ok(())
+    } else {
+        anyhow::bail!("payload '{id}' not found")
+    }
+}
+
+fn native_memory_staged_list(status: Option<&str>, db: Option<&Path>) -> anyhow::Result<()> {
+    let store = open_memory_store(db)?;
+    let writes = store.list_staged_writes(status)?;
+    if writes.is_empty() {
+        println!("No staged writes.");
+        return Ok(());
+    }
+    for write in writes {
+        println!(
+            "{}  {}  [{}]  {}  {}  {}",
+            write.id,
+            write.key,
+            write.tags.join(", "),
+            sensitivity_label(write.sensitivity),
+            write.status,
+            write.agent_id
+        );
+    }
+    Ok(())
+}
+
+fn native_memory_staged_approve(id: &str, reviewed_by: &str, db: Option<&Path>) -> anyhow::Result<()> {
+    let store = open_memory_store(db)?;
+    match store.approve_staged_write(id, reviewed_by)? {
+        Some(item) => {
+            println!("Approved {} -> {}", id, item.key);
+            Ok(())
+        }
+        None => anyhow::bail!("staged write '{id}' not found or not pending"),
+    }
+}
+
+fn native_memory_staged_deny(id: &str, reviewed_by: &str, db: Option<&Path>) -> anyhow::Result<()> {
+    let store = open_memory_store(db)?;
+    match store.deny_staged_write(id, reviewed_by)? {
+        Some(write) => {
+            println!("Denied {} -> {}", id, write.key);
+            Ok(())
+        }
+        None => anyhow::bail!("staged write '{id}' not found or not pending"),
+    }
+}
+
 fn sensitivity_label(value: aos_memory::Sensitivity) -> &'static str {
     match value {
         aos_memory::Sensitivity::Low => "low",
@@ -863,6 +1011,16 @@ async fn main() -> anyhow::Result<()> {
             MemoryAction::List { tag, db } => native_memory_list(tag.as_deref(), db.as_deref())?,
             MemoryAction::Search { query, tag, db } => native_memory_search(&query, tag.as_deref(), db.as_deref())?,
             MemoryAction::Status { db } => native_memory_status(db.as_deref())?,
+            MemoryAction::Staged { action } => match action {
+                StagedAction::List { status, db } => native_memory_staged_list(status.as_deref(), db.as_deref())?,
+                StagedAction::Approve { id, reviewed_by, db } => native_memory_staged_approve(&id, &reviewed_by, db.as_deref())?,
+                StagedAction::Deny { id, reviewed_by, db } => native_memory_staged_deny(&id, &reviewed_by, db.as_deref())?,
+            },
+            MemoryAction::Payload { action } => match action {
+                PayloadAction::List { db } => native_memory_payload_list(db.as_deref())?,
+                PayloadAction::Get { id, output, db } => native_memory_payload_get(&id, output.as_deref(), db.as_deref())?,
+                PayloadAction::Delete { id, db } => native_memory_payload_delete(&id, db.as_deref())?,
+            },
             MemoryAction::External(args) => {
                 let status = run_memory_reference(&args)?;
                 if !status.success() {
