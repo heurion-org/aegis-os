@@ -98,6 +98,27 @@ Autonomous coding agents such as **Google Antigravity (`agy`)**, **Anthropic Cla
 
 ---
 
+## Memory Consent (UOMP)
+
+Aegis OS is the reference runtime for **[UOMP](https://www.uomp.org/)**, an open protocol for agent memory consent. UOMP defines how an agent asks for personal memory — scope, duration, revocation, and audit — and Aegis OS enforces those semantics with its kernel sandbox, policy engine, leases, and trusted approval flow.
+
+> **UOMP defines how agents ask for memory. Aegis OS enforces it.**
+
+| UOMP concept | Aegis OS mechanism |
+| :--- | :--- |
+| Memory scope (`tag` / `key` / `field`) | Policy resources and actions in `aos-policy` |
+| Consent request | Boundary escalation (`approval_required` + `escalation_id`) |
+| Session / capability token | TTL or one-shot `LeaseGrant` |
+| Memory Guard | MCP gateway + policy engine + sandboxed runtime |
+| `uom.json` memory profile | Aegis manifest / policy resource declarations |
+| Revocation | Lease expiry, explicit revoke, or session close |
+| Audit trail | `aos-recorder` append-only event log |
+| High-sensitivity approval | R4 human escalation + trusted approver UI |
+
+The protocol remains vendor-neutral and independently specified; Aegis OS is one implementation. See the [UOMP specification](https://www.uomp.org/spec/), the [reference CLI repository](https://github.com/0xSynapse/uomp-core), and the [UOMP → Aegis OS memory consent mapping](./docs/UOMP_MEMORY_CONSENT_MAPPING.md).
+
+---
+
 ## MCP Tools, Dynamic URI Resources & Cloud PaaS Endpoints
 
 | Subsystem                                                            | MCP Tools / Resources / HTTP Endpoints                                                                                                                                                                                                                                                                                | Default Policy & Runtime Semantics                                                                                                                                          |
