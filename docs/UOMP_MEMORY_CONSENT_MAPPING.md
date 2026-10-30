@@ -713,6 +713,7 @@ Phase 1 已实现远程入口的策略核心和最小网络层：
 
 - `aos_memory::RemoteProfile`：`gateway_id`、`audience`、`allowed_endpoints`、`max_token_ttl_secs`。
 - `aos_memory::validate_remote_access()`：校验 `profile == "remote"`、audience、过期、撤销、endpoint 白名单、token TTL 和 scope。
+- `aos-memory-store`：UOMP 兼容的 SQLite `memory_items` schema、get/get_by_tag/set/delete/list_tags/count、Markdown 导入与 path-derived tags。
 - `aos-memory-gateway`：EdDSA JWT 验签、`/v1/memory` 读写路由（PUT 进入 Guard staging）与 `/v1/payload` 加密 envelope 路由、转发前调用 Guard `/v1/tokens/validate` 检查 session 状态、per-session 限流（默认 60 req/min）、JSONL `gateway_access` 审计、可选原生 TLS 1.3 / mTLS、再转发到本地 Memory Guard。
 - CLI：`aegis-os memory-gateway --public-key <jwk> --audience <url> --guard-url <url>`。
 - 统一审批视图：`uomp approvals` 同时列出 UOMP consent requests 与 Aegis escalations；Aegis escalation 可在同一命令中 approve/deny。

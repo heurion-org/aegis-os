@@ -10,6 +10,7 @@ members = [
     "crates/aos-recorder",
     "crates/aos-memory",
     "crates/aos-memory-gateway",
+    "crates/aos-memory-store",
     "crates/aos-mcp-gateway",
     "crates/aos-cli",
 ]
@@ -32,6 +33,7 @@ base64 = "0.22"
 ed25519-dalek = "2"
 tokio-rustls = "0.26"
 rustls-pemfile = "2"
+rusqlite = { version = "0.32", features = ["bundled"] }
 hex = "0.4"
 hmac = "0.12"
 sha1 = "0.10"
@@ -52,4 +54,5 @@ aos-egress = { path = "crates/aos-egress" }
 aos-recorder = { path = "crates/aos-recorder" }
 aos-memory = { path = "crates/aos-memory" }
 aos-memory-gateway = { path = "crates/aos-memory-gateway" }
+aos-memory-store = { path = "crates/aos-memory-store" }
 aos-mcp-gateway = { path = "crates/aos-mcp-gateway" }
