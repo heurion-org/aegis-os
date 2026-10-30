@@ -5,6 +5,9 @@
 //! connection management belong to the runtime around this crate; the core
 //! here is the token/request policy boundary.
 
+use std::io::BufReader;
+use std::path::Path;
+use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use aos_memory::{
@@ -15,8 +18,11 @@ use ed25519_dalek::{Signature, VerifyingKey};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use thiserror::Error;
-use tokio::io::{AsyncReadExt, AsyncWriteExt};
+use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
+use tokio_rustls::rustls::server::WebPkiClientVerifier;
+use tokio_rustls::rustls::{RootCertStore, ServerConfig};
+use tokio_rustls::TlsAcceptor;
 
 #[derive(Debug, Error)]
 pub enum GatewayError {
@@ -290,6 +296,53 @@ impl AuditLog {
     }
 }
 
+/// Build a TLS 1.3 acceptor. When `client_ca_path` is provided, client
+/// certificates are required and verified against that CA (mTLS).
+pub fn tls_acceptor(
+    cert_path: &Path,
+    key_path: &Path,
+    client_ca_path: Option<&Path>,
+) -> anyhow::Result<TlsAcceptor> {
+    let certs = load_certs(cert_path)?;
+    let key = load_private_key(key_path)?;
+    let config = if let Some(ca_path) = client_ca_path {
+        let mut roots = RootCertStore::empty();
+        for cert in load_certs(ca_path)? {
+            roots.add(cert)?;
+        }
+        let verifier = WebPkiClientVerifier::builder(Arc::new(roots)).build()?;
+        ServerConfig::builder()
+            .with_client_cert_verifier(verifier)
+            .with_single_cert(certs, key)?
+    } else {
+        ServerConfig::builder()
+            .with_no_client_auth()
+            .with_single_cert(certs, key)?
+    };
+    Ok(TlsAcceptor::from(Arc::new(config)))
+}
+
+fn load_certs(
+    path: &Path,
+) -> anyhow::Result<Vec<tokio_rustls::rustls::pki_types::CertificateDer<'static>>> {
+    let file = std::fs::File::open(path)?;
+    let mut reader = BufReader::new(file);
+    let certs = rustls_pemfile::certs(&mut reader).collect::<Result<Vec<_>, _>>()?;
+    if certs.is_empty() {
+        anyhow::bail!("no certificates found in {}", path.display());
+    }
+    Ok(certs)
+}
+
+fn load_private_key(
+    path: &Path,
+) -> anyhow::Result<tokio_rustls::rustls::pki_types::PrivateKeyDer<'static>> {
+    let file = std::fs::File::open(path)?;
+    let mut reader = BufReader::new(file);
+    rustls_pemfile::private_key(&mut reader)?
+        .ok_or_else(|| anyhow::anyhow!("no private key found in {}", path.display()))
+}
+
 struct RateLimiter {
     limit: u32,
     windows: std::sync::Mutex<
@@ -333,10 +386,28 @@ impl RateLimiter {
 
 /// Start a minimal HTTP gateway that forwards authorized requests to Guard.
 ///
-/// This listener is intentionally plain HTTP. In production, put it behind a
-/// TLS 1.3 / mTLS terminator (or add the TLS layer in the runtime) and bind it
-/// to loopback only.
+/// This listener is intentionally plain HTTP. In production, use
+/// [`serve_tls`] or put a TLS 1.3 / mTLS terminator in front.
 pub async fn serve(config: GatewayConfig, listen: &str, guard_url: &str) -> anyhow::Result<()> {
+    serve_inner(config, listen, guard_url, None).await
+}
+
+/// Start the gateway with native TLS 1.3 (and optional mTLS).
+pub async fn serve_tls(
+    config: GatewayConfig,
+    listen: &str,
+    guard_url: &str,
+    tls: TlsAcceptor,
+) -> anyhow::Result<()> {
+    serve_inner(config, listen, guard_url, Some(tls)).await
+}
+
+async fn serve_inner(
+    config: GatewayConfig,
+    listen: &str,
+    guard_url: &str,
+    tls: Option<TlsAcceptor>,
+) -> anyhow::Result<()> {
     let listener = TcpListener::bind(listen).await?;
     let guard = GuardTarget::parse(guard_url)?;
     let limiter = std::sync::Arc::new(RateLimiter::new(config.rate_limit_per_minute));
@@ -350,8 +421,21 @@ pub async fn serve(config: GatewayConfig, listen: &str, guard_url: &str) -> anyh
         let guard = guard.clone();
         let limiter = limiter.clone();
         let audit = audit.clone();
+        let tls = tls.clone();
         tokio::spawn(async move {
-            if let Err(error) = handle_connection(stream, &config, &guard, &limiter, &audit).await {
+            let result = match tls {
+                Some(acceptor) => match acceptor.accept(stream).await {
+                    Ok(stream) => {
+                        handle_connection(stream, &config, &guard, &limiter, &audit).await
+                    }
+                    Err(error) => {
+                        eprintln!("memory gateway TLS handshake failed: {error}");
+                        return;
+                    }
+                },
+                None => handle_connection(stream, &config, &guard, &limiter, &audit).await,
+            };
+            if let Err(error) = result {
                 eprintln!("memory gateway connection error: {error}");
             }
         });
@@ -380,13 +464,16 @@ impl GuardTarget {
     }
 }
 
-async fn handle_connection(
-    mut stream: TcpStream,
+async fn handle_connection<S>(
+    mut stream: S,
     config: &GatewayConfig,
     guard: &GuardTarget,
     limiter: &RateLimiter,
     audit: &AuditLog,
-) -> anyhow::Result<()> {
+) -> anyhow::Result<()>
+where
+    S: AsyncRead + AsyncWrite + Unpin,
+{
     let mut buffer = Vec::new();
     let mut chunk = [0u8; 4096];
     loop {
@@ -541,11 +628,14 @@ async fn session_is_active(guard: &GuardTarget, token: &str) -> anyhow::Result<b
         .unwrap_or(false))
 }
 
-async fn forward(
-    mut client: TcpStream,
+async fn forward<S>(
+    mut client: S,
     request: GatewayRequest,
     guard: &GuardTarget,
-) -> anyhow::Result<()> {
+) -> anyhow::Result<()>
+where
+    S: AsyncRead + AsyncWrite + Unpin,
+{
     let mut upstream = TcpStream::connect((guard.host.as_str(), guard.port)).await?;
     let body = request.body;
     let request_head = format!(
@@ -815,6 +905,19 @@ mod tests {
         assert!(response.contains("{\"ok\":true}"), "{response}");
 
         guard_task.await.unwrap();
+    }
+
+    #[test]
+    fn builds_tls_acceptor_from_pem_files() {
+        let dir = tempfile::tempdir().unwrap();
+        let generated = rcgen::generate_simple_self_signed(vec!["localhost".to_string()]).unwrap();
+        let cert_path = dir.path().join("cert.pem");
+        let key_path = dir.path().join("key.pem");
+        std::fs::write(&cert_path, generated.cert.pem()).unwrap();
+        std::fs::write(&key_path, generated.key_pair.serialize_pem()).unwrap();
+
+        assert!(tls_acceptor(&cert_path, &key_path, None).is_ok());
+        assert!(tls_acceptor(&cert_path, &key_path, Some(&cert_path)).is_ok());
     }
 
     #[test]

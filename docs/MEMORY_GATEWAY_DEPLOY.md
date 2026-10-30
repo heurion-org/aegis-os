@@ -6,7 +6,7 @@ This guide puts **Aegis Memory Gateway** in front of a local UOMP Memory Guard s
 Remote Agent (Aegis Cloud)
         │  TLS 1.3 + mTLS
         ▼
-Caddy / reverse proxy  (public entry point)
+Native TLS 1.3 / mTLS  (or Caddy / reverse proxy)
         │  loopback HTTP
         ▼
 aegis-os memory-gateway  (127.0.0.1:9443)
@@ -18,7 +18,7 @@ UOMP Memory Guard  (127.0.0.1:9374)
 Memory Store (stays on the user device)
 ```
 
-The gateway itself speaks plain HTTP on loopback. **Do not expose it directly.** Terminate TLS 1.3 and mTLS in Caddy, nginx, or another trusted proxy.
+The gateway supports native TLS 1.3 / mTLS via `--tls-cert`, `--tls-key`, and `--client-ca`. It can also run as plain HTTP on loopback behind Caddy, nginx, or another trusted proxy. **Do not expose a plain-HTTP listener directly.**
 
 ## 1. Prerequisites
 
@@ -51,7 +51,26 @@ The gateway:
 - writes `gateway_access` JSONL audit events;
 - forwards only `GET /v1/memory` reads.
 
-## 3. Caddy with TLS 1.3 and mTLS
+## 3. Native TLS 1.3 / mTLS
+
+```bash
+aegis-os memory-gateway \
+  --listen 127.0.0.1:9443 \
+  --guard-url http://127.0.0.1:9374 \
+  --public-key ~/.uomp/.secrets/ed25519-public.jwk \
+  --audience https://memory.example.com \
+  --allowed-endpoint /v1/memory \
+  --tls-cert /etc/aegis-memory/server.pem \
+  --tls-key /etc/aegis-memory/server-key.pem \
+  --client-ca /etc/aegis-memory/client-ca.pem \
+  --audit-log ~/.aegis-os/memory-gateway-audit.jsonl
+```
+
+- `--tls-cert` + `--tls-key` enable TLS 1.3.
+- `--client-ca` additionally requires and verifies client certificates (mTLS).
+- Bind to `0.0.0.0:9443` only when a firewall restricts access to the public edge.
+
+## 4. Caddy with TLS 1.3 and mTLS (optional)
 
 `/etc/caddy/Caddyfile`:
 
@@ -78,7 +97,7 @@ sudo systemctl reload caddy
 
 The gateway port stays bound to loopback; only Caddy is public.
 
-## 4. systemd user service
+## 5. systemd user service
 
 `~/.config/systemd/user/aegis-memory-gateway.service`:
 
@@ -110,7 +129,7 @@ systemctl --user enable --now aegis-memory-gateway
 journalctl --user -u aegis-memory-gateway -f
 ```
 
-## 5. Test
+## 6. Test
 
 Use a remote token whose `profile` is `remote` and whose `audience` is `https://memory.example.com`:
 
@@ -128,7 +147,7 @@ Expected:
 - revoked session → `401`;
 - too many requests in a minute → `429`.
 
-## 6. Security checklist
+## 7. Security checklist
 
 - Gateway listens on `127.0.0.1` only.
 - Public entry point requires TLS 1.3 + mTLS.
@@ -139,9 +158,9 @@ Expected:
 - Memory Store and `~/.uomp` are never mounted into the remote Agent environment.
 - Revocation is tested: `uomp revoke <session-id>` must make the next gateway request fail.
 
-## 7. Current limits
+## 8. Current limits
 
 - The gateway is read-only (`GET /v1/memory`).
-- TLS/mTLS is terminated by Caddy or another proxy, not by the Rust listener.
+- Native TLS 1.3 / mTLS is supported; Caddy remains an optional public edge.
 - Payload delivery (`/v1/payload/*`) is not implemented yet.
 - Aegis Cloud remote Agent provisioning is a separate step; this guide only covers the local memory entry point.

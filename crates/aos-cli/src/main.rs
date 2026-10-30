@@ -18,7 +18,9 @@ mod routing;
 use aos_core::{AgentIdentity, IsolationTier};
 use aos_mcp_gateway::AegisRuntimeKernel;
 use aos_memory::RemoteProfile;
-use aos_memory_gateway::{serve as serve_memory_gateway, GatewayConfig};
+use aos_memory_gateway::{
+    serve as serve_memory_gateway, serve_tls as serve_memory_gateway_tls, tls_acceptor, GatewayConfig,
+};
 use clap::{Parser, Subcommand};
 use serde_json::{json, Value};
 use std::io::Read;
@@ -129,6 +131,15 @@ enum Commands {
         /// Optional JSONL audit log. Defaults to stderr.
         #[arg(long)]
         audit_log: Option<PathBuf>,
+        /// TLS certificate chain (PEM). Requires --tls-key.
+        #[arg(long)]
+        tls_cert: Option<PathBuf>,
+        /// TLS private key (PEM). Requires --tls-cert.
+        #[arg(long)]
+        tls_key: Option<PathBuf>,
+        /// Client CA bundle (PEM). Enables mTLS when set.
+        #[arg(long)]
+        client_ca: Option<PathBuf>,
     },
 
     /// Monitor and interact with the Organization's Inter-Agent Communication (IPC) Bus
@@ -654,6 +665,9 @@ async fn main() -> anyhow::Result<()> {
             allowed_endpoints,
             max_token_ttl_secs,
             audit_log,
+            tls_cert,
+            tls_key,
+            client_ca,
         } => {
             let jwk = tokio::fs::read_to_string(&public_key).await?;
             let mut config = GatewayConfig::from_jwk(
@@ -666,8 +680,16 @@ async fn main() -> anyhow::Result<()> {
                 &jwk,
             )?;
             config.audit_log = audit_log;
+            let tls = match (tls_cert.as_deref(), tls_key.as_deref()) {
+                (Some(cert), Some(key)) => Some(tls_acceptor(cert, key, client_ca.as_deref())?),
+                (None, None) => None,
+                _ => anyhow::bail!("--tls-cert and --tls-key must be provided together"),
+            };
             println!("Aegis Memory Gateway listening on {listen} -> {guard_url}");
-            serve_memory_gateway(config, &listen, &guard_url).await?;
+            match tls {
+                Some(tls) => serve_memory_gateway_tls(config, &listen, &guard_url, tls).await?,
+                None => serve_memory_gateway(config, &listen, &guard_url).await?,
+            }
         }
 
         Commands::Policy { action } => {
