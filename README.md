@@ -115,7 +115,17 @@ Aegis OS is the reference runtime for **[UOMP](https://www.uomp.org/)**, an open
 | Audit trail | `aos-recorder` append-only event log |
 | High-sensitivity approval | R4 human escalation + trusted approver UI |
 
-The first Phase 1 building block lives in [`crates/aos-memory`](./crates/aos-memory): UOMP scope → Aegis resource mapping, lease planning, deny/field filtering, and high-sensitivity key detection. The `memory_policy_evaluate` MCP tool evaluates one UOMP memory resource and returns `allow`, `ask` (with an `escalation_id`), or `deny`. `aos_memory::validate_remote_access` provides the policy core for the remote Agent entry point (audience, expiry, revocation, endpoint, TTL, and scope checks). `aos-memory-gateway` adds EdDSA JWT verification, a Guard session-status check, per-session rate limiting, JSONL audit, optional native TLS 1.3 / mTLS, and a minimal HTTP proxy for reads, staged writes, and encrypted payloads: `aegis-os memory-gateway --public-key <jwk> --audience <url> --guard-url <url>` (put a TLS 1.3 / mTLS terminator in front in production; see [Aegis Memory Gateway deployment](./docs/MEMORY_GATEWAY_DEPLOY.md)). The Rust-side data plane foundation lives in [`crates/aos-memory-store`](./crates/aos-memory-store): a UOMP-compatible SQLite schema plus a Markdown importer. It is not yet wired into the Gateway or trusted UI; see [Aegis Memory Data Plane](./docs/MEMORY_DATA_PLANE.md).
+The first Phase 1 building block lives in [`crates/aos-memory`](./crates/aos-memory): UOMP scope → Aegis resource mapping, lease planning, deny/field filtering, and high-sensitivity key detection. The `memory_policy_evaluate` MCP tool evaluates one UOMP memory resource and returns `allow`, `ask` (with an `escalation_id`), or `deny`. `aos_memory::validate_remote_access` provides the policy core for the remote Agent entry point (audience, expiry, revocation, endpoint, TTL, and scope checks). `aos-memory-gateway` adds EdDSA JWT verification, a Guard session-status check, per-session rate limiting, JSONL audit, optional native TLS 1.3 / mTLS, and a minimal HTTP proxy for reads, staged writes, and encrypted payloads: `aegis-os memory-gateway --public-key <jwk> --audience <url> --guard-url <url>` (put a TLS 1.3 / mTLS terminator in front in production; see [Aegis Memory Gateway deployment](./docs/MEMORY_GATEWAY_DEPLOY.md)). The user-facing memory entry point is `aegis-os memory ...`, which currently delegates to the UOMP reference CLI (`uomp`). Set `UOMP_BIN` if `uomp` is not on `PATH`. The delegation is a migration step; native Rust commands will replace it as the `aos-memory-store` data plane takes over.
+
+```bash
+aegis-os memory setup claude --vault ~/Notes
+aegis-os memory status
+aegis-os memory staged list
+aegis-os memory payload list
+aegis-os memory approvals
+```
+
+The Rust-side data plane foundation lives in [`crates/aos-memory-store`](./crates/aos-memory-store): a UOMP-compatible SQLite schema plus a Markdown importer. It is not yet wired into the Gateway or trusted UI; see [Aegis Memory Data Plane](./docs/MEMORY_DATA_PLANE.md).
 
 The protocol remains vendor-neutral and independently specified; Aegis OS is one implementation. See the [UOMP specification](https://www.uomp.org/spec/), the [reference CLI repository](https://github.com/0xSynapse/uomp-core), and the [UOMP → Aegis OS memory consent mapping](./docs/UOMP_MEMORY_CONSENT_MAPPING.md).
 

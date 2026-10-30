@@ -108,6 +108,13 @@ enum Commands {
         action: PolicyAction,
     },
 
+    /// UOMP memory commands (delegates to the reference CLI)
+    Memory {
+        /// Arguments passed to `uomp`, e.g. `setup claude --vault ~/Notes`
+        #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
+        args: Vec<String>,
+    },
+
     /// Start the local Aegis Memory Gateway for remote UOMP Agents
     MemoryGateway {
         /// Listen address (put a TLS 1.3 / mTLS terminator in front in production).
@@ -654,6 +661,35 @@ async fn main() -> anyhow::Result<()> {
                     let res = kernel.call_tool(&identity, "workspace_commit", json!({})).await?;
                     println!("{}", serde_json::to_string_pretty(&res)?);
                 }
+            }
+        }
+
+        Commands::Memory { args } => {
+            if args.is_empty() || matches!(args[0].as_str(), "-h" | "--help" | "help") {
+                println!(
+                    "Aegis memory commands (delegated to the UOMP reference CLI):\n\
+                     \n  aegis-os memory setup claude --vault ~/Notes\n\
+                     \n  aegis-os memory import ~/Notes\n\
+                     \n  aegis-os memory status\n\
+                     \n  aegis-os memory pending\n\
+                     \n  aegis-os memory approve <request-id>\n\
+                     \n  aegis-os memory staged list\n\
+                     \n  aegis-os memory payload list\n\
+                     \n  aegis-os memory approvals\n\
+                     \n  aegis-os memory disconnect claude\n\
+                     \nSet UOMP_BIN if `uomp` is not on PATH."
+                );
+                return Ok(());
+            }
+            let bin = std::env::var("UOMP_BIN").unwrap_or_else(|_| "uomp".to_string());
+            let status = std::process::Command::new(&bin)
+                .args(&args)
+                .status()
+                .map_err(|error| anyhow::anyhow!(
+                    "failed to run '{bin}': {error}. Install UOMP or set UOMP_BIN."
+                ))?;
+            if !status.success() {
+                std::process::exit(status.code().unwrap_or(1));
             }
         }
 
