@@ -154,8 +154,9 @@
 | #5 task-scoped lease | 完成（有条件） | `builder-03.md`、`builder-04.md`、`review-builder-04.md` | `LeaseKind`、`task_id`、匹配、审批继承、终态撤销、revision/CAS、active task 注入 |
 | #6 consent 绑定 task_id | 完成 | `builder-05.md`、`review-builder-05.md` | `sessions.task_id` / `consent_requests.task_id`、旧库迁移、pending 显示 |
 | #7 撤销传播 | 完成（有条件） | 同上 | task 终态 → revoke-by-task；session revoke → task input-required |
+| 收尾 | 完成 | `builder-06.md`、`review-builder-06.md` | audit task_id、sessions 过滤、task-scoped revoke token、gateway mock 测试 |
 
-当前测试：`aos-ipc` 17 passed；`aos-mcp-gateway` 26 passed；`aos-policy` 7 passed；`aos-memory` 10 passed；`aos-memory-server` 1 passed；`aos-cli` 16 passed；`cargo check --workspace` 通过。代码未 commit / push。
+当前测试：`aos-ipc` 17 passed；`aos-mcp-gateway` 27 passed；`aos-policy` 7 passed；`aos-memory` 10 passed；`aos-memory-server` 2 passed；`aos-cli` 16 passed；`cargo check --workspace` 通过。代码未 commit / push。
 
 ## 8. 决策记录
 
