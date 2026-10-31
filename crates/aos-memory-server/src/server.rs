@@ -55,6 +55,7 @@ pub fn build_router(state: Arc<AppState>) -> Router {
         .route("/v1/sessions", get(list_sessions).post(create_session))
         .route("/v1/sessions/:id/grant", post(grant_session))
         .route("/v1/sessions/:id/revoke", post(revoke_session))
+        .route("/v1/sessions/revoke-by-task", post(revoke_sessions_by_task))
         .route("/v1/tokens/validate", post(validate_token))
         .route(
             "/v1/consent/requests",
@@ -217,6 +218,7 @@ async fn create_session(
         ));
     }
     let agent_name = body.get("agent_name").and_then(|value| value.as_str());
+    let task_id = body.get("task_id").and_then(|value| value.as_str());
     let requested: MemoryScopes =
         serde_json::from_value(body.get("requested_scopes").cloned().unwrap_or_else(|| {
             json!({
@@ -241,7 +243,7 @@ async fn create_session(
         .auth
         .lock()
         .unwrap_or_else(|value| value.into_inner())
-        .create_session(agent_id, agent_name, &requested, duration)
+        .create_session(agent_id, agent_name, &requested, duration, task_id)
         .map_err(|error| {
             api_error(
                 StatusCode::INTERNAL_SERVER_ERROR,
@@ -380,7 +382,7 @@ async fn revoke_session(
             "session not found",
         ));
     }
-    if let Some(session) = session {
+    if let Some(ref session) = session {
         let _ = auth.log_audit(
             &session.session_id,
             &session.agent_id,
@@ -390,7 +392,58 @@ async fn revoke_session(
             "user revoked the session",
         );
     }
-    Ok(Json(json!({ "session_id": id, "status": "revoked" })))
+    Ok(Json(json!({
+        "session_id": id,
+        "status": "revoked",
+        "task_id": session.and_then(|session| session.task_id)
+    })))
+}
+
+async fn revoke_sessions_by_task(
+    State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
+    Json(body): Json<Value>,
+) -> ApiResult {
+    check_bridge(&state, &headers)?;
+    let task_id = body
+        .get("task_id")
+        .and_then(|value| value.as_str())
+        .unwrap_or("");
+    if task_id.is_empty() {
+        return Err(api_error(
+            StatusCode::BAD_REQUEST,
+            "INVALID_REQUEST",
+            "task_id is required",
+        ));
+    }
+    let auth = state.auth.lock().unwrap_or_else(|value| value.into_inner());
+    let sessions = auth.revoke_sessions_for_task(task_id).map_err(|error| {
+        api_error(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "STORE_ERROR",
+            &error.to_string(),
+        )
+    })?;
+    for session in &sessions {
+        let _ = auth.log_audit(
+            &session.session_id,
+            &session.agent_id,
+            "revoke",
+            &format!("session:{}", session.session_id),
+            "allow",
+            &format!("A2A task {task_id} reached a terminal state"),
+        );
+    }
+    let ids: Vec<&str> = sessions
+        .iter()
+        .map(|session| session.session_id.as_str())
+        .collect();
+    Ok(Json(json!({
+        "task_id": task_id,
+        "status": "revoked",
+        "count": ids.len(),
+        "session_ids": ids
+    })))
 }
 
 async fn list_sessions(State(state): State<Arc<AppState>>, headers: HeaderMap) -> ApiResult {
@@ -471,10 +524,11 @@ async fn create_consent(
         .unwrap_or(10)
         .clamp(1, 1440);
     let agent_name = body.get("agent_name").and_then(|value| value.as_str());
+    let task_id = body.get("task_id").and_then(|value| value.as_str());
 
     let auth = state.auth.lock().unwrap_or_else(|value| value.into_inner());
     let session = auth
-        .create_session(agent_id, agent_name, &requested, duration)
+        .create_session(agent_id, agent_name, &requested, duration, task_id)
         .map_err(|error| {
             api_error(
                 StatusCode::INTERNAL_SERVER_ERROR,

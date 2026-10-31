@@ -176,6 +176,7 @@ fn native_server_auth_consent_memory_staged_payload_audit() {
         Some(json!({
             "agent_id": "device-agent",
             "agent_name": "Device Agent",
+            "task_id": "task-consent-1",
             "requested_scopes": scopes(),
             "duration_minutes": 5
         })),
@@ -236,6 +237,33 @@ fn native_server_auth_consent_memory_staged_payload_audit() {
         None,
     );
     assert_eq!(status, 200);
+
+    let (status, body) = request(&server, "GET", "/v1/sessions", &admin(), None);
+    assert_eq!(status, 200);
+    assert!(body["sessions"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .any(|session| session["task_id"] == "task-consent-1"));
+
+    let (status, body) = request(
+        &server,
+        "POST",
+        "/v1/sessions/revoke-by-task",
+        &bridge(),
+        Some(json!({ "task_id": "task-consent-1" })),
+    );
+    assert_eq!(status, 200);
+    assert_eq!(body["count"], 1);
+
+    let (status, _) = request(
+        &server,
+        "GET",
+        "/v1/memory?tag=notes",
+        &bearer(&consent_token),
+        None,
+    );
+    assert_eq!(status, 401);
 
     let (status, body) = request(&server, "GET", "/v1/audit?limit=100", &admin(), None);
     assert_eq!(status, 200);

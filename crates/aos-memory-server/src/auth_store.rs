@@ -10,6 +10,7 @@ pub struct Session {
     pub session_id: String,
     pub agent_id: String,
     pub agent_name: Option<String>,
+    pub task_id: Option<String>,
     pub status: String,
     pub created_at: String,
     pub expires_at: String,
@@ -23,6 +24,7 @@ pub struct ConsentRequest {
     pub session_id: String,
     pub agent_id: String,
     pub agent_name: Option<String>,
+    pub task_id: Option<String>,
     pub requested_scopes: MemoryScopes,
     pub status: String,
     pub created_at: String,
@@ -55,7 +57,8 @@ impl AuthStore {
                 expires_at TEXT NOT NULL,
                 requested_scopes TEXT NOT NULL,
                 granted_scopes TEXT,
-                token_hash TEXT
+                token_hash TEXT,
+                task_id TEXT
             );
             CREATE TABLE IF NOT EXISTS consent_requests (
                 request_id TEXT PRIMARY KEY,
@@ -69,7 +72,8 @@ impl AuthStore {
                 approved_at TEXT,
                 granted_scopes TEXT,
                 token TEXT,
-                token_delivered INTEGER NOT NULL DEFAULT 0
+                token_delivered INTEGER NOT NULL DEFAULT 0,
+                task_id TEXT
             );
             CREATE INDEX IF NOT EXISTS idx_consent_status ON consent_requests(status);
             CREATE TABLE IF NOT EXISTS audit_logs (
@@ -85,6 +89,23 @@ impl AuthStore {
             CREATE INDEX IF NOT EXISTS idx_audit_timestamp ON audit_logs(timestamp);
             "#,
         )?;
+        self.ensure_column("sessions", "task_id", "TEXT")?;
+        self.ensure_column("consent_requests", "task_id", "TEXT")?;
+        Ok(())
+    }
+
+    fn ensure_column(&self, table: &str, column: &str, decl: &str) -> anyhow::Result<()> {
+        let mut stmt = self.conn.prepare(&format!("PRAGMA table_info({table})"))?;
+        let exists = stmt
+            .query_map([], |row| row.get::<_, String>(1))?
+            .filter_map(Result::ok)
+            .any(|name| name == column);
+        if !exists {
+            self.conn.execute(
+                &format!("ALTER TABLE {table} ADD COLUMN {column} {decl}"),
+                [],
+            )?;
+        }
         Ok(())
     }
 
@@ -94,12 +115,14 @@ impl AuthStore {
         agent_name: Option<&str>,
         requested_scopes: &MemoryScopes,
         duration_minutes: i64,
+        task_id: Option<&str>,
     ) -> anyhow::Result<Session> {
         let now = Utc::now();
         let session = Session {
             session_id: format!("sess-{}", Uuid::new_v4()),
             agent_id: agent_id.to_string(),
             agent_name: agent_name.map(str::to_string),
+            task_id: task_id.map(str::to_string),
             status: "created".to_string(),
             created_at: now.to_rfc3339(),
             expires_at: (now + Duration::minutes(duration_minutes)).to_rfc3339(),
@@ -108,8 +131,8 @@ impl AuthStore {
         };
         self.conn.execute(
             "INSERT INTO sessions
-             (session_id, agent_id, agent_name, status, created_at, expires_at, requested_scopes)
-             VALUES (?, ?, ?, ?, ?, ?, ?)",
+             (session_id, agent_id, agent_name, status, created_at, expires_at, requested_scopes, task_id)
+             VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
             params![
                 session.session_id,
                 session.agent_id,
@@ -118,6 +141,7 @@ impl AuthStore {
                 session.created_at,
                 session.expires_at,
                 serde_json::to_string(&session.requested_scopes)?,
+                session.task_id,
             ],
         )?;
         Ok(session)
@@ -149,12 +173,28 @@ impl AuthStore {
         Ok(updated > 0)
     }
 
+    pub fn revoke_sessions_for_task(&self, task_id: &str) -> anyhow::Result<Vec<Session>> {
+        let sessions: Vec<Session> = self
+            .list_sessions(false)?
+            .into_iter()
+            .filter(|session| session.task_id.as_deref() == Some(task_id))
+            .filter(|session| session.status != "revoked")
+            .collect();
+        for session in &sessions {
+            self.conn.execute(
+                "UPDATE sessions SET status = 'revoked' WHERE session_id = ?",
+                params![session.session_id],
+            )?;
+        }
+        Ok(sessions)
+    }
+
     pub fn get_session(&self, session_id: &str) -> anyhow::Result<Option<Session>> {
         let row = self
             .conn
             .query_row(
                 "SELECT session_id, agent_id, agent_name, status, created_at, expires_at,
-                        requested_scopes, granted_scopes
+                        requested_scopes, granted_scopes, task_id
                  FROM sessions WHERE session_id = ?",
                 params![session_id],
                 row_to_session,
@@ -166,11 +206,11 @@ impl AuthStore {
     pub fn list_sessions(&self, active_only: bool) -> anyhow::Result<Vec<Session>> {
         let sql = if active_only {
             "SELECT session_id, agent_id, agent_name, status, created_at, expires_at,
-                    requested_scopes, granted_scopes
+                    requested_scopes, granted_scopes, task_id
              FROM sessions WHERE status = 'active' ORDER BY created_at DESC"
         } else {
             "SELECT session_id, agent_id, agent_name, status, created_at, expires_at,
-                    requested_scopes, granted_scopes
+                    requested_scopes, granted_scopes, task_id
              FROM sessions ORDER BY created_at DESC"
         };
         let mut stmt = self.conn.prepare(sql)?;
@@ -208,6 +248,7 @@ impl AuthStore {
             session_id: session.session_id.clone(),
             agent_id: session.agent_id.clone(),
             agent_name: session.agent_name.clone(),
+            task_id: session.task_id.clone(),
             requested_scopes: requested_scopes.clone(),
             status: "pending".to_string(),
             created_at: Utc::now().to_rfc3339(),
@@ -218,8 +259,8 @@ impl AuthStore {
         self.conn.execute(
             "INSERT INTO consent_requests
              (request_id, session_id, agent_id, agent_name, requested_scopes, status,
-              created_at, expires_at)
-             VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+              created_at, expires_at, task_id)
+             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
             params![
                 request.request_id,
                 request.session_id,
@@ -229,6 +270,7 @@ impl AuthStore {
                 request.status,
                 request.created_at,
                 request.expires_at,
+                request.task_id,
             ],
         )?;
         Ok(request)
@@ -239,7 +281,7 @@ impl AuthStore {
             .conn
             .query_row(
                 "SELECT request_id, session_id, agent_id, agent_name, requested_scopes,
-                        status, created_at, expires_at, approved_at, granted_scopes
+                        status, created_at, expires_at, approved_at, granted_scopes, task_id
                  FROM consent_requests WHERE request_id = ?",
                 params![request_id],
                 row_to_consent,
@@ -251,7 +293,7 @@ impl AuthStore {
     pub fn list_consent(&self, status: Option<&str>) -> anyhow::Result<Vec<ConsentRequest>> {
         let mut stmt = self.conn.prepare(
             "SELECT request_id, session_id, agent_id, agent_name, requested_scopes,
-                    status, created_at, expires_at, approved_at, granted_scopes
+                    status, created_at, expires_at, approved_at, granted_scopes, task_id
              FROM consent_requests
              WHERE (?1 IS NULL OR status = ?1)
              ORDER BY created_at DESC",
@@ -374,6 +416,7 @@ fn row_to_session(row: &rusqlite::Row<'_>) -> rusqlite::Result<Session> {
         session_id: row.get(0)?,
         agent_id: row.get(1)?,
         agent_name: row.get(2)?,
+        task_id: row.get(8)?,
         status: row.get(3)?,
         created_at: row.get(4)?,
         expires_at: row.get(5)?,
@@ -390,6 +433,7 @@ fn row_to_consent(row: &rusqlite::Row<'_>) -> rusqlite::Result<ConsentRequest> {
         session_id: row.get(1)?,
         agent_id: row.get(2)?,
         agent_name: row.get(3)?,
+        task_id: row.get(10)?,
         requested_scopes: serde_json::from_str(&requested).unwrap_or_default(),
         status: row.get(5)?,
         created_at: row.get(6)?,
