@@ -98,17 +98,23 @@ fn multi_process_stress_and_kill9_recovery() {
 
     let temp = tempfile::tempdir().unwrap();
     let state = temp.path().join("ipc_state.json");
+    let workers = std::env::var("AOS_IPC_STRESS_WORKERS")
+        .ok()
+        .and_then(|value| value.parse().ok())
+        .unwrap_or(WORKERS);
 
-    // 8 OS processes x 100 tasks, all sharing one state file.
+    // N OS processes x 100 tasks, all sharing one state file. Release CI uses a smaller
+    // worker count on constrained runners; set AOS_IPC_STRESS_WORKERS=8 for the full stress.
     let mut children = Vec::new();
-    for worker in 0..WORKERS {
+    for worker in 0..workers {
         children.push(spawn_child(&state, "stress", worker, &[]));
     }
     for (worker, child) in children.into_iter().enumerate() {
         let output = child.wait_with_output().unwrap();
         assert!(
             output.status.success(),
-            "worker {worker} failed: {}{}",
+            "worker {worker} failed ({:?}): {}{}",
+            output.status,
             String::from_utf8_lossy(&output.stdout),
             String::from_utf8_lossy(&output.stderr)
         );
@@ -120,15 +126,15 @@ fn multi_process_stress_and_kill9_recovery() {
         let tasks = bus.list_tasks(Some(ORG), None).await.unwrap();
         assert_eq!(
             tasks.len(),
-            WORKERS * CHILD_TASKS,
+            workers * CHILD_TASKS,
             "multi-process writers lost tasks"
         );
         let subjects: std::collections::HashSet<String> =
             tasks.iter().map(|task| task.subject.clone()).collect();
-        assert_eq!(subjects.len(), WORKERS * CHILD_TASKS);
+        assert_eq!(subjects.len(), workers * CHILD_TASKS);
         tasks.len()
     });
-    assert_eq!(count, 800);
+    assert_eq!(count, workers * CHILD_TASKS);
 
     // kill -9 a child that left a task in `working`; the task must become stale, not disappear.
     let mut kill_child = spawn_child(&state, "kill9", 0, &[]);
