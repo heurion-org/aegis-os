@@ -114,7 +114,7 @@ impl AegisIpcBus {
             #[cfg(unix)]
             {
                 use std::os::unix::io::AsRawFd;
-                let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+                let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
                 loop {
                     let rc = unsafe {
                         libc::flock(file.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB)

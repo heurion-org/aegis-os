@@ -57,6 +57,7 @@ A2A tasks can bind memory sessions: `consent_requests.task_id` and `sessions.tas
 ```bash
 cargo test -p aos-memory-store
 cargo test -p aos-memory-server
+cargo test -p aos-ipc --test multi_process
 ```
 
 Current tests cover:
