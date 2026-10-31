@@ -4,7 +4,8 @@
 //! Google A2A cross-org IPC policies, and persistent Escalation Queues (`leases.json` & `escalations.json`).
 
 use aos_core::{
-    EscalationStatus, LeaseGrant, PendingEscalation, PolicyContext, PolicyDecision, PolicyEngine,
+    EscalationStatus, LeaseGrant, LeaseKind, PendingEscalation, PolicyContext, PolicyDecision,
+    PolicyEngine,
 };
 use anyhow::Context;
 use async_trait::async_trait;
@@ -142,12 +143,32 @@ impl AegisPolicyKernel {
     async fn check_active_lease(&self, ctx: &PolicyContext) -> Option<LeaseGrant> {
         self.reload_from_disk().await;
         let now_ms = Utc::now().timestamp_millis();
+        let ctx_task_id = ctx
+            .metadata
+            .get("task_id")
+            .and_then(|value| value.as_str());
         let mut matched_idx = None;
         let mut matched_lease = None;
         {
             let leases = self.leases.read().await;
             for (idx, lease) in leases.iter().enumerate() {
-                if (lease.expires_at_ms > now_ms || lease.expires_at_ms == -1)
+                let kind = if lease.kind == LeaseKind::Ttl && lease.expires_at_ms == -1 {
+                    LeaseKind::OneShot
+                } else {
+                    lease.kind
+                };
+                let valid = match kind {
+                    LeaseKind::OneShot => true,
+                    LeaseKind::Ttl | LeaseKind::TaskScoped => lease.expires_at_ms > now_ms,
+                };
+                let task_ok = match kind {
+                    LeaseKind::TaskScoped => {
+                        ctx_task_id.is_some() && lease.task_id.as_deref() == ctx_task_id
+                    }
+                    LeaseKind::Ttl | LeaseKind::OneShot => true,
+                };
+                if valid
+                    && task_ok
                     && lease.org_id == ctx.principal.org_id
                     && (lease.agent_id == "*" || lease.agent_id == ctx.principal.agent_id)
                     && Self::matches_pattern(&lease.action_pattern, &ctx.action)
@@ -160,7 +181,12 @@ impl AegisPolicyKernel {
             }
         }
         if let (Some(idx), Some(ref l)) = (matched_idx, &matched_lease) {
-            if l.expires_at_ms == -1 {
+            let kind = if l.kind == LeaseKind::Ttl && l.expires_at_ms == -1 {
+                LeaseKind::OneShot
+            } else {
+                l.kind
+            };
+            if kind == LeaseKind::OneShot {
                 self.leases.write().await.remove(idx);
                 let _ = self.flush_to_disk().await;
             }
@@ -185,6 +211,11 @@ impl AegisPolicyKernel {
             suggested_lease_scope: suggested_lease_scope.clone(),
             status: EscalationStatus::Pending,
             created_at_ms: Utc::now().timestamp_millis(),
+            task_id: ctx
+                .metadata
+                .get("task_id")
+                .and_then(|value| value.as_str())
+                .map(str::to_string),
         };
         self.escalations.write().await.push(pending);
         self.flush_to_disk().await?;
@@ -494,6 +525,14 @@ impl PolicyEngine for AegisPolicyKernel {
         } else {
             "*".to_string()
         };
+        let task_id = target.task_id.clone();
+        let kind = if task_id.is_some() {
+            LeaseKind::TaskScoped
+        } else if expires_at_ms == -1 {
+            LeaseKind::OneShot
+        } else {
+            LeaseKind::Ttl
+        };
         let lease = LeaseGrant {
             lease_id: format!("lease-{}", &Uuid::new_v4().to_string()[..8]),
             org_id: target.org_id.clone(),
@@ -502,6 +541,8 @@ impl PolicyEngine for AegisPolicyKernel {
             resource_pattern,
             expires_at_ms,
             granted_by: approved_by.to_string(),
+            kind,
+            task_id: task_id.clone(),
         };
 
         {
@@ -518,11 +559,31 @@ impl PolicyEngine for AegisPolicyKernel {
                     resource_pattern: "*".to_string(),
                     expires_at_ms: -1,
                     granted_by: approved_by.to_string(),
+                    kind: if task_id.is_some() {
+                        LeaseKind::TaskScoped
+                    } else {
+                        LeaseKind::OneShot
+                    },
+                    task_id,
                 });
             }
         }
         self.flush_to_disk().await?;
         Ok(lease)
+    }
+
+    async fn revoke_leases_for_task(&self, task_id: &str) -> anyhow::Result<usize> {
+        self.reload_from_disk().await;
+        let removed = {
+            let mut leases = self.leases.write().await;
+            let before = leases.len();
+            leases.retain(|lease| lease.task_id.as_deref() != Some(task_id));
+            before - leases.len()
+        };
+        if removed > 0 {
+            self.flush_to_disk().await?;
+        }
+        Ok(removed)
     }
 
     async fn deny_escalation(
@@ -609,6 +670,99 @@ mod tests {
         assert!(matches!(
             kernel.evaluate(&cross_org_ctx).await.unwrap(),
             PolicyDecision::Deny { .. }
+        ));
+    }
+
+    #[tokio::test]
+    async fn revoking_task_leases_removes_only_bound_leases() {
+        let kernel = AegisPolicyKernel::new();
+        let now = Utc::now().timestamp_millis() + 60_000;
+        for (id, task_id, kind) in [
+            ("lease-1", Some("task-1"), LeaseKind::TaskScoped),
+            ("lease-2", Some("task-2"), LeaseKind::TaskScoped),
+            ("lease-3", None, LeaseKind::Ttl),
+        ] {
+            kernel
+                .grant_lease(LeaseGrant {
+                    lease_id: id.to_string(),
+                    org_id: "acme".to_string(),
+                    agent_id: "coder".to_string(),
+                    action_pattern: "workspace_commit".to_string(),
+                    resource_pattern: "*".to_string(),
+                    expires_at_ms: now,
+                    granted_by: "user".to_string(),
+                    kind,
+                    task_id: task_id.map(str::to_string),
+                })
+                .await
+                .unwrap();
+        }
+        assert_eq!(kernel.revoke_leases_for_task("task-1").await.unwrap(), 1);
+        let leases = kernel.list_leases("acme", None).await.unwrap();
+        assert_eq!(leases.len(), 2);
+        assert!(leases.iter().all(|lease| lease.lease_id != "lease-1"));
+    }
+
+    #[tokio::test]
+    async fn approving_task_escalation_creates_task_scoped_lease() {
+        let kernel = AegisPolicyKernel::new();
+        let agent = AgentIdentity::new("acme", "coder-1", "Coder");
+        let ctx = PolicyContext {
+            principal: agent,
+            action: "workspace_commit".to_string(),
+            target_org_id: "acme".to_string(),
+            target_resource: "/workspace".to_string(),
+            metadata: json!({ "task_id": "task-1" }),
+        };
+        let escalation_id = match kernel.evaluate(&ctx).await.unwrap() {
+            PolicyDecision::Ask { escalation_id, .. } => escalation_id,
+            other => panic!("expected Ask, got {other:?}"),
+        };
+        let lease = kernel
+            .approve_escalation(&escalation_id, 60, "user")
+            .await
+            .unwrap();
+        assert_eq!(lease.kind, LeaseKind::TaskScoped);
+        assert_eq!(lease.task_id.as_deref(), Some("task-1"));
+    }
+
+    #[tokio::test]
+    async fn task_scoped_lease_requires_matching_task_id() {
+        let kernel = AegisPolicyKernel::new();
+        let agent = AgentIdentity::new("acme", "coder-1", "Coder");
+        kernel
+            .grant_lease(LeaseGrant {
+                lease_id: "lease-task-1".to_string(),
+                org_id: "acme".to_string(),
+                agent_id: "coder-1".to_string(),
+                action_pattern: "workspace_commit".to_string(),
+                resource_pattern: "*".to_string(),
+                expires_at_ms: Utc::now().timestamp_millis() + 60_000,
+                granted_by: "user".to_string(),
+                kind: LeaseKind::TaskScoped,
+                task_id: Some("task-1".to_string()),
+            })
+            .await
+            .unwrap();
+
+        let ctx = |task_id: Option<&str>| PolicyContext {
+            principal: agent.clone(),
+            action: "workspace_commit".to_string(),
+            target_org_id: "acme".to_string(),
+            target_resource: "/workspace".to_string(),
+            metadata: json!({ "task_id": task_id }),
+        };
+        assert!(matches!(
+            kernel.evaluate(&ctx(Some("task-1"))).await.unwrap(),
+            PolicyDecision::Allow { .. }
+        ));
+        assert!(matches!(
+            kernel.evaluate(&ctx(Some("task-2"))).await.unwrap(),
+            PolicyDecision::Ask { .. }
+        ));
+        assert!(matches!(
+            kernel.evaluate(&ctx(None)).await.unwrap(),
+            PolicyDecision::Ask { .. }
         ));
     }
 
