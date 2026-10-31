@@ -84,13 +84,15 @@ impl AuthStore {
                 action TEXT NOT NULL,
                 resource TEXT NOT NULL,
                 decision TEXT NOT NULL,
-                reason TEXT NOT NULL
+                reason TEXT NOT NULL,
+                task_id TEXT
             );
             CREATE INDEX IF NOT EXISTS idx_audit_timestamp ON audit_logs(timestamp);
             "#,
         )?;
         self.ensure_column("sessions", "task_id", "TEXT")?;
         self.ensure_column("consent_requests", "task_id", "TEXT")?;
+        self.ensure_column("audit_logs", "task_id", "TEXT")?;
         Ok(())
     }
 
@@ -341,8 +343,8 @@ impl AuthStore {
     ) -> anyhow::Result<()> {
         self.conn.execute(
             "INSERT INTO audit_logs
-             (id, timestamp, session_id, agent_id, action, resource, decision, reason)
-             VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+             (id, timestamp, session_id, agent_id, action, resource, decision, reason, task_id)
+             VALUES (?, ?, ?, ?, ?, ?, ?, ?, (SELECT task_id FROM sessions WHERE session_id = ?))",
             params![
                 format!("evt-{}", Uuid::new_v4()),
                 Utc::now().to_rfc3339(),
@@ -351,7 +353,8 @@ impl AuthStore {
                 action,
                 resource,
                 decision,
-                reason
+                reason,
+                session_id
             ],
         )?;
         Ok(())
@@ -359,7 +362,7 @@ impl AuthStore {
 
     pub fn list_audit(&self, limit: usize) -> anyhow::Result<Vec<Value>> {
         let mut stmt = self.conn.prepare(
-            "SELECT id, timestamp, session_id, agent_id, action, resource, decision, reason
+            "SELECT id, timestamp, session_id, agent_id, action, resource, decision, reason, task_id
              FROM audit_logs ORDER BY timestamp DESC LIMIT ?",
         )?;
         let rows = stmt.query_map(params![limit as i64], |row| {
@@ -372,6 +375,7 @@ impl AuthStore {
                 "resource": row.get::<_, String>(5)?,
                 "decision": row.get::<_, String>(6)?,
                 "reason": row.get::<_, String>(7)?,
+                "task_id": row.get::<_, Option<String>>(8)?,
             }))
         })?;
         Ok(rows.collect::<Result<Vec<_>, _>>()?)

@@ -268,7 +268,9 @@ fn native_server_auth_consent_memory_staged_payload_audit() {
     let (status, body) = request(&server, "GET", "/v1/audit?limit=100", &admin(), None);
     assert_eq!(status, 200);
     assert!(body["events"].as_array().unwrap().iter().any(|event| {
-        event["action"] == "consent" && event["decision"] == "allow"
+        event["action"] == "consent"
+            && event["decision"] == "allow"
+            && event["task_id"] == "task-consent-1"
     }));
 
     let (status, body) = request(

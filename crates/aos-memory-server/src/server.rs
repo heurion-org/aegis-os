@@ -8,8 +8,9 @@ use axum::http::{HeaderMap, StatusCode};
 use axum::routing::{get, post};
 use axum::{Json, Router};
 use chrono::Utc;
+use hmac::{Hmac, Mac};
 use serde_json::{json, Value};
-use sha2::Digest;
+use sha2::{Digest, Sha256};
 
 use crate::auth::{IssueClaims, TokenIssuer};
 use crate::auth_store::AuthStore;
@@ -176,6 +177,42 @@ fn log_audit(
         .lock()
         .unwrap_or_else(|value| value.into_inner())
         .log_audit(session_id, agent_id, action, resource, decision, reason);
+}
+
+fn check_task_revoke(headers: &HeaderMap, task_id: &str) -> bool {
+    let Ok(secret) = std::env::var("AOS_MEMORY_TASK_SECRET") else {
+        return false;
+    };
+    if secret.is_empty() {
+        return false;
+    }
+    let Some(token) = headers
+        .get("x-aegis-task-token")
+        .and_then(|value| value.to_str().ok())
+    else {
+        return false;
+    };
+    let mut parts = token.split(':');
+    let Some(token_task) = parts.next() else {
+        return false;
+    };
+    let Some(timestamp) = parts.next().and_then(|value| value.parse::<i64>().ok()) else {
+        return false;
+    };
+    let Some(signature) = parts.next().and_then(|value| hex::decode(value).ok()) else {
+        return false;
+    };
+    if parts.next().is_some() || token_task != task_id {
+        return false;
+    }
+    if (Utc::now().timestamp() - timestamp).abs() > 120 {
+        return false;
+    }
+    let Ok(mut mac) = <Hmac<Sha256> as Mac>::new_from_slice(secret.as_bytes()) else {
+        return false;
+    };
+    mac.update(format!("{task_id}:{timestamp}").as_bytes());
+    mac.verify_slice(&signature).is_ok()
 }
 
 fn item_allowed(scope: &MemoryScope, item: &aos_memory_store::MemoryItem) -> bool {
@@ -404,7 +441,6 @@ async fn revoke_sessions_by_task(
     headers: HeaderMap,
     Json(body): Json<Value>,
 ) -> ApiResult {
-    check_bridge(&state, &headers)?;
     let task_id = body
         .get("task_id")
         .and_then(|value| value.as_str())
@@ -414,6 +450,13 @@ async fn revoke_sessions_by_task(
             StatusCode::BAD_REQUEST,
             "INVALID_REQUEST",
             "task_id is required",
+        ));
+    }
+    if check_bridge(&state, &headers).is_err() && !check_task_revoke(&headers, task_id) {
+        return Err(api_error(
+            StatusCode::UNAUTHORIZED,
+            "UNAUTHORIZED",
+            "bridge token or task-scoped revoke token required",
         ));
     }
     let auth = state.auth.lock().unwrap_or_else(|value| value.into_inner());
@@ -1261,4 +1304,37 @@ async fn record_audit(
         reason,
     );
     Ok(Json(json!({ "status": "recorded" })))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn task_revoke_token_is_bound_to_task_and_time() {
+        std::env::set_var("AOS_MEMORY_TASK_SECRET", "test-secret");
+        let task_id = "task-1";
+        let timestamp = Utc::now().timestamp();
+        let mut mac = <Hmac<Sha256> as Mac>::new_from_slice(b"test-secret").unwrap();
+        mac.update(format!("{task_id}:{timestamp}").as_bytes());
+        let token = format!(
+            "{task_id}:{timestamp}:{}",
+            hex::encode(mac.finalize().into_bytes())
+        );
+        let mut headers = HeaderMap::new();
+        headers.insert("x-aegis-task-token", token.parse().unwrap());
+        assert!(check_task_revoke(&headers, task_id));
+        assert!(!check_task_revoke(&headers, "task-2"));
+
+        let stale = timestamp - 300;
+        let mut mac = <Hmac<Sha256> as Mac>::new_from_slice(b"test-secret").unwrap();
+        mac.update(format!("{task_id}:{stale}").as_bytes());
+        let token = format!(
+            "{task_id}:{stale}:{}",
+            hex::encode(mac.finalize().into_bytes())
+        );
+        let mut headers = HeaderMap::new();
+        headers.insert("x-aegis-task-token", token.parse().unwrap());
+        assert!(!check_task_revoke(&headers, task_id));
+    }
 }
