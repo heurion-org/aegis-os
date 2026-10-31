@@ -188,6 +188,7 @@ dependencies = [
  "sha2",
  "tempfile",
  "tokio",
+ "ureq",
  "uuid",
 ]
 

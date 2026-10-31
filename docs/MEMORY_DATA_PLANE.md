@@ -43,6 +43,8 @@ This lets Aegis open an existing `~/.uomp/memory.db` without a destructive migra
 
 High-sensitivity writes are denied at the server boundary. Staged writes require a separate user approval.
 
+A2A tasks can bind memory sessions: `consent_requests.task_id` and `sessions.task_id` are carried through approval, so `aegis-os memory pending` shows the task context and `memory sessions` shows the task context. When a task reaches a terminal state, the gateway calls `POST /v1/sessions/revoke-by-task` (configured with `AOS_MEMORY_URL` + `AOS_MEMORY_BRIDGE_TOKEN`) to revoke its memory sessions. In the other direction, `aegis-os memory revoke <session-id>` returns the bound `task_id` and asks the local A2A store to move that task to `input-required`.
+
 ## Next steps
 
 1. Add CSV/JSON import connectors.

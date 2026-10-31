@@ -406,6 +406,42 @@ impl AegisIpcBus {
     }
 
 
+    /// User/CLI-initiated reverse propagation: a memory session bound to this task was revoked.
+    /// This is intentionally not an agent-facing method; it does not require task participation.
+    pub async fn request_task_input(&self, task_id: &str, reason: &str) -> anyhow::Result<bool> {
+        let _state = self.state_guard().await;
+        let _lock = self.state_lock().await?;
+        self.reload_from_disk().await;
+        let now_ms = Utc::now().timestamp_millis();
+        let changed = {
+            let mut tasks = self.tasks.write().await;
+            let Some(task) = tasks.get_mut(task_id) else {
+                return Ok(false);
+            };
+            if task.state.is_terminal() || task.state == A2ATaskState::InputRequired {
+                return Ok(false);
+            }
+            if !task.state.can_transition_to(A2ATaskState::InputRequired) {
+                return Ok(false);
+            }
+            task.state = A2ATaskState::InputRequired;
+            task.stale = false;
+            task.revision = task.revision.saturating_add(1);
+            task.updated_at_ms = now_ms;
+            task.history.push(A2ATaskStatusUpdate {
+                state: A2ATaskState::InputRequired,
+                actor: "system:memory".to_string(),
+                message: Some(reason.to_string()),
+                timestamp_ms: now_ms,
+            });
+            true
+        };
+        if changed {
+            self.flush_to_disk().await?;
+        }
+        Ok(changed)
+    }
+
     /// Mark non-terminal tasks whose assignee is no longer an active peer as `stale`. This is
     /// intentionally observation-only: it does not change task state, so a live assignee can
     /// clear the flag by continuing to update the task.
@@ -1696,6 +1732,40 @@ mod tests {
         for i in 0..8 {
             assert!(subjects.contains(&format!("concurrent-task-{i}")));
         }
+    }
+
+    #[tokio::test]
+    async fn memory_revoke_can_request_task_input() {
+        let bus = AegisIpcBus::new();
+        let task = bus
+            .send(IpcEnvelope {
+                msg_id: String::new(),
+                org_id: "repo".to_string(),
+                from_agent: "planner".to_string(),
+                to_target: "worker".to_string(),
+                kind: IpcKind::TaskRequest {
+                    timeout_secs: Some(60),
+                },
+                subject: "memory revoke".to_string(),
+                payload: json!({}),
+                attachments: vec![],
+                status: MessageDeliveryStatus::Unread,
+                created_at_ms: 0,
+            })
+            .await
+            .unwrap();
+        bus.ack("repo", "worker", &task.msg_id).await.unwrap();
+        assert!(bus
+            .request_task_input(&task.msg_id, "memory session revoked")
+            .await
+            .unwrap());
+        let updated = bus.get_task(&task.msg_id).await.unwrap().unwrap();
+        assert_eq!(updated.state, A2ATaskState::InputRequired);
+        assert_eq!(updated.history.last().unwrap().actor, "system:memory");
+        assert!(!bus
+            .request_task_input(&task.msg_id, "already input")
+            .await
+            .unwrap());
     }
 
     #[tokio::test]

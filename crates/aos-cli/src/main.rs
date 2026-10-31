@@ -1094,7 +1094,12 @@ fn memory_sessions(url: &str, admin_token: Option<&str>) -> anyhow::Result<()> {
     Ok(())
 }
 
-fn memory_revoke(id: &str, url: &str, admin_token: Option<&str>) -> anyhow::Result<()> {
+async fn memory_revoke(
+    id: &str,
+    url: &str,
+    admin_token: Option<&str>,
+    runtime_dir: &Path,
+) -> anyhow::Result<()> {
     let token = read_admin_token(admin_token)?;
     let response = http_json(
         "POST",
@@ -1102,6 +1107,12 @@ fn memory_revoke(id: &str, url: &str, admin_token: Option<&str>) -> anyhow::Resu
         Some(&token),
         Some(json!({})),
     )?;
+    if let Some(task_id) = response["task_id"].as_str() {
+        let bus = AegisIpcBus::with_state_file(Some(runtime_dir.join("ipc_state.json")));
+        let _ = bus
+            .request_task_input(task_id, "memory session revoked")
+            .await;
+    }
     println!("{}", serde_json::to_string_pretty(&response)?);
     Ok(())
 }
@@ -1167,9 +1178,10 @@ fn memory_pending(url: &str, admin_token: Option<&str>) -> anyhow::Result<()> {
     }
     for request in requests {
         println!(
-            "{}  {}  {}  {}",
+            "{}  {}  {}  {}  {}",
             request["request_id"].as_str().unwrap_or("-"),
             request["agent_id"].as_str().unwrap_or("-"),
+            request["task_id"].as_str().unwrap_or("-"),
             request["session_id"].as_str().unwrap_or("-"),
             request["expires_at"].as_str().unwrap_or("-")
         );
@@ -1221,6 +1233,7 @@ struct BridgeSettings {
     url: String,
     token: String,
     agent_id: String,
+    task_id: Option<String>,
     store: Option<PathBuf>,
     public_key: Option<PathBuf>,
 }
@@ -1262,6 +1275,10 @@ fn bridge_settings() -> anyhow::Result<Option<BridgeSettings>> {
                 .get("UOMP_AGENT_ID")
                 .cloned()
                 .unwrap_or_else(|| "agent".to_string()),
+            task_id: std::env::var("UOMP_TASK_ID")
+                .ok()
+                .filter(|value| !value.is_empty())
+                .or_else(|| env.get("UOMP_TASK_ID").cloned()),
             store: env.get("UOMP_STORE").map(PathBuf::from),
             public_key: env.get("UOMP_PUBLIC_KEY").map(PathBuf::from),
         }));
@@ -1275,6 +1292,9 @@ fn bridge_settings() -> anyhow::Result<Option<BridgeSettings>> {
             url,
             token,
             agent_id: std::env::var("UOMP_AGENT_ID").unwrap_or_else(|_| "agent".to_string()),
+            task_id: std::env::var("UOMP_TASK_ID")
+                .ok()
+                .filter(|value| !value.is_empty()),
             store: std::env::var_os("UOMP_STORE").map(PathBuf::from),
             public_key: std::env::var_os("UOMP_PUBLIC_KEY").map(PathBuf::from),
         }));
@@ -1341,6 +1361,7 @@ fn request_bridge_consent(
     let body = json!({
         "agent_id": bridge.agent_id,
         "agent_name": bridge.agent_id,
+        "task_id": bridge.task_id,
         "requested_scopes": scopes,
         "duration_minutes": 30
     });
@@ -2133,7 +2154,7 @@ async fn main() -> anyhow::Result<()> {
             }
             MemoryAction::Disconnect { client, config } => memory_disconnect(&client, config.as_deref())?,
             MemoryAction::Sessions { url, admin_token } => memory_sessions(&url, admin_token.as_deref())?,
-            MemoryAction::Revoke { id, url, admin_token } => memory_revoke(&id, &url, admin_token.as_deref())?,
+            MemoryAction::Revoke { id, url, admin_token } => memory_revoke(&id, &url, admin_token.as_deref(), &cli.runtime_dir).await?,
             MemoryAction::Audit { url, admin_token, limit } => memory_audit(&url, admin_token.as_deref(), limit)?,
             MemoryAction::Approvals { url, admin_token } => memory_pending(&url, admin_token.as_deref())?,
             MemoryAction::Stop { pid_file } => memory_stop(pid_file.as_deref())?,

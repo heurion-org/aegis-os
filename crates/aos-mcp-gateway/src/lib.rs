@@ -240,6 +240,8 @@ pub struct AegisRuntimeKernel {
     pub recorder: Arc<dyn FlightRecorder>,
     pub paas: Arc<PaasControlPlane>,
     pub app_store: Arc<AppStoreRegistry>,
+    memory_url: Option<String>,
+    memory_bridge_token: Option<String>,
     agents: Arc<RwLock<HashMap<String, Arc<AgentEnvironment>>>>,
     mounted_mcp_servers: Arc<RwLock<Vec<MountedMcpServer>>>,
 }
@@ -271,6 +273,12 @@ impl AegisRuntimeKernel {
             recorder,
             paas,
             app_store,
+            memory_url: std::env::var("AOS_MEMORY_URL")
+                .ok()
+                .filter(|value| !value.is_empty()),
+            memory_bridge_token: std::env::var("AOS_MEMORY_BRIDGE_TOKEN")
+                .ok()
+                .filter(|value| !value.is_empty()),
             agents: Arc::new(RwLock::new(HashMap::new())),
             mounted_mcp_servers: Arc::new(RwLock::new(Vec::new())),
         })
@@ -322,6 +330,26 @@ impl AegisRuntimeKernel {
         } else {
             None
         }
+    }
+
+    /// Best-effort reverse propagation: when an A2A task reaches a terminal state, ask the local
+    /// UOMP memory server to revoke sessions bound to that task. Configure with
+    /// `AOS_MEMORY_URL` + `AOS_MEMORY_BRIDGE_TOKEN`.
+    async fn revoke_memory_for_task(&self, task_id: &str) {
+        let (Some(url), Some(token)) = (
+            self.memory_url.clone(),
+            self.memory_bridge_token.clone(),
+        ) else {
+            return;
+        };
+        let endpoint = format!("{url}/v1/sessions/revoke-by-task");
+        let body = json!({ "task_id": task_id });
+        let _ = tokio::task::spawn_blocking(move || {
+            let _ = ureq::post(&endpoint)
+                .set("x-uomp-bridge-token", &token)
+                .send_json(body);
+        })
+        .await;
     }
 
     /// Current claim table and its KV version (None if the key does not exist yet).
@@ -1480,6 +1508,7 @@ impl AegisRuntimeKernel {
                     .await?;
                 if task.state.is_terminal() {
                     let _ = self.policy.revoke_leases_for_task(&task.id).await;
+                    self.revoke_memory_for_task(&task.id).await;
                 }
                 Ok(serde_json::to_value(task)?)
             }
@@ -1649,6 +1678,7 @@ impl AegisRuntimeKernel {
                     .policy
                     .revoke_leases_for_task(original_msg_id)
                     .await;
+                self.revoke_memory_for_task(original_msg_id).await;
                 Ok(serde_json::to_value(reply)?)
             }
 
@@ -2600,6 +2630,7 @@ impl AegisRuntimeKernel {
                 {
                     Ok(task) => {
                         let _ = self.policy.revoke_leases_for_task(&task.id).await;
+                        self.revoke_memory_for_task(&task.id).await;
                         json!({
                             "jsonrpc": "2.0",
                             "id": id,
