@@ -2392,34 +2392,59 @@ async fn main() -> anyhow::Result<()> {
 
         Commands::Ipc { action } => {
             let kernel = AegisRuntimeKernel::new(&cli.runtime_dir).await?;
-            kernel
-                .ensure_agent_environment(
-                    identity.clone(),
-                    &workspace,
-                    IsolationTier::NativeOsSandbox,
-                    vec!["*".to_string()],
-                )
-                .await?;
-
             match action {
+                // Read-only IPC commands must not materialize a CoW workspace.
                 IpcAction::Peers { org_only } => {
-                    let scope = if org_only { "org" } else { "all" };
-                    let res = kernel
-                        .call_tool(&identity, "ipc_list_peers", json!({ "scope": scope }))
+                    kernel
+                        .ipc
+                        .register_peer(&identity, vec!["*".to_string()])
                         .await?;
-                    println!("{}", serde_json::to_string_pretty(&res)?);
+                    let peers = kernel.ipc.list_peers(&identity.org_id).await?;
+                    let global_peers = if org_only {
+                        Vec::new()
+                    } else {
+                        kernel.ipc.list_all_peers().await?
+                    };
+                    println!(
+                        "{}",
+                        serde_json::to_string_pretty(&json!({
+                            "org_id": identity.org_id,
+                            "peers": peers,
+                            "global_peers": global_peers
+                        }))?
+                    );
                 }
                 IpcAction::Inbox { all } => {
-                    let res = kernel
-                        .call_tool(&identity, "ipc_recv", json!({ "unread_only": !all }))
+                    kernel
+                        .ipc
+                        .register_peer(&identity, vec!["*".to_string()])
                         .await?;
-                    println!("{}", serde_json::to_string_pretty(&res)?);
+                    let messages = kernel
+                        .ipc
+                        .recv_inbox(&identity.org_id, &identity.agent_id, !all, 20)
+                        .await?;
+                    println!(
+                        "{}",
+                        serde_json::to_string_pretty(&json!({
+                            "agent_id": identity.agent_id,
+                            "messages_count": messages.len(),
+                            "messages": messages
+                        }))?
+                    );
                 }
                 IpcAction::Send {
                     to,
                     subject,
                     message,
                 } => {
+                    kernel
+                        .ensure_agent_environment(
+                            identity.clone(),
+                            &workspace,
+                            IsolationTier::NativeOsSandbox,
+                            vec!["*".to_string()],
+                        )
+                        .await?;
                     let res = kernel
                         .call_tool(
                             &identity,
@@ -2439,6 +2464,14 @@ async fn main() -> anyhow::Result<()> {
                     message,
                     timeout_secs,
                 } => {
+                    kernel
+                        .ensure_agent_environment(
+                            identity.clone(),
+                            &workspace,
+                            IsolationTier::NativeOsSandbox,
+                            vec!["*".to_string()],
+                        )
+                        .await?;
                     let res = kernel
                         .call_tool(
                             &identity,
