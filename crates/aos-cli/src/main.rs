@@ -343,6 +343,9 @@ enum MemoryAction {
         url: String,
         #[arg(long)]
         admin_token: Option<String>,
+        /// Only show sessions bound to this A2A task
+        #[arg(long)]
+        task_id: Option<String>,
     },
     /// Revoke a memory session
     Revoke {
@@ -1087,9 +1090,25 @@ fn default_client_config(client: &str) -> PathBuf {
     }
 }
 
-fn memory_sessions(url: &str, admin_token: Option<&str>) -> anyhow::Result<()> {
+fn memory_sessions(
+    url: &str,
+    admin_token: Option<&str>,
+    task_id: Option<&str>,
+) -> anyhow::Result<()> {
     let token = read_admin_token(admin_token)?;
     let response = http_json("GET", &format!("{url}/v1/sessions"), Some(&token), None)?;
+    let response = if let Some(task_id) = task_id {
+        let sessions: Vec<Value> = response["sessions"]
+            .as_array()
+            .cloned()
+            .unwrap_or_default()
+            .into_iter()
+            .filter(|session| session["task_id"].as_str() == Some(task_id))
+            .collect();
+        json!({ "sessions": sessions })
+    } else {
+        response
+    };
     println!("{}", serde_json::to_string_pretty(&response)?);
     Ok(())
 }
@@ -2153,7 +2172,7 @@ async fn main() -> anyhow::Result<()> {
                 memory_connect(&client, &scope, config.as_deref(), listen.as_deref(), no_server)?
             }
             MemoryAction::Disconnect { client, config } => memory_disconnect(&client, config.as_deref())?,
-            MemoryAction::Sessions { url, admin_token } => memory_sessions(&url, admin_token.as_deref())?,
+            MemoryAction::Sessions { url, admin_token, task_id } => memory_sessions(&url, admin_token.as_deref(), task_id.as_deref())?,
             MemoryAction::Revoke { id, url, admin_token } => memory_revoke(&id, &url, admin_token.as_deref(), &cli.runtime_dir).await?,
             MemoryAction::Audit { url, admin_token, limit } => memory_audit(&url, admin_token.as_deref(), limit)?,
             MemoryAction::Approvals { url, admin_token } => memory_pending(&url, admin_token.as_deref())?,

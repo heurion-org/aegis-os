@@ -38,7 +38,7 @@ aegis-os memory setup claude --vault ~/Notes
 aegis-os memory pending               # review consent requests
 aegis-os memory approve <request-id>  # approve one request
 aegis-os memory deny <request-id>
-aegis-os memory sessions              # list sessions
+aegis-os memory sessions [--task-id]  # list sessions (optionally by A2A task)
 aegis-os memory revoke <session-id>   # revoke one session; bound A2A task -> input-required
 aegis-os memory audit                 # show the access audit log
 aegis-os memory status

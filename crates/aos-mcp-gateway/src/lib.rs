@@ -22,6 +22,8 @@ use aos_sandbox::{MicroVmSandboxDriver, NativeOsSandboxDriver};
 use aos_vfs::{CoWWorkspace, OrgCasAndKvStore};
 use anyhow::{bail, Context};
 use chrono::Utc;
+use hmac::{Hmac, Mac};
+use sha2::Sha256;
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use std::collections::HashMap;
@@ -242,6 +244,7 @@ pub struct AegisRuntimeKernel {
     pub app_store: Arc<AppStoreRegistry>,
     memory_url: Option<String>,
     memory_bridge_token: Option<String>,
+    memory_task_secret: Option<String>,
     agents: Arc<RwLock<HashMap<String, Arc<AgentEnvironment>>>>,
     mounted_mcp_servers: Arc<RwLock<Vec<MountedMcpServer>>>,
 }
@@ -277,6 +280,9 @@ impl AegisRuntimeKernel {
                 .ok()
                 .filter(|value| !value.is_empty()),
             memory_bridge_token: std::env::var("AOS_MEMORY_BRIDGE_TOKEN")
+                .ok()
+                .filter(|value| !value.is_empty()),
+            memory_task_secret: std::env::var("AOS_MEMORY_TASK_SECRET")
                 .ok()
                 .filter(|value| !value.is_empty()),
             agents: Arc::new(RwLock::new(HashMap::new())),
@@ -336,18 +342,32 @@ impl AegisRuntimeKernel {
     /// UOMP memory server to revoke sessions bound to that task. Configure with
     /// `AOS_MEMORY_URL` + `AOS_MEMORY_BRIDGE_TOKEN`.
     async fn revoke_memory_for_task(&self, task_id: &str) {
-        let (Some(url), Some(token)) = (
-            self.memory_url.clone(),
-            self.memory_bridge_token.clone(),
-        ) else {
+        let Some(url) = self.memory_url.clone() else {
             return;
         };
+        let task_token = self.memory_task_secret.as_ref().and_then(|secret| {
+            let timestamp = Utc::now().timestamp();
+            let mut mac = <Hmac<Sha256> as Mac>::new_from_slice(secret.as_bytes()).ok()?;
+            mac.update(format!("{task_id}:{timestamp}").as_bytes());
+            Some(format!(
+                "{task_id}:{timestamp}:{}",
+                hex::encode(mac.finalize().into_bytes())
+            ))
+        });
+        let bridge_token = self.memory_bridge_token.clone();
+        if task_token.is_none() && bridge_token.is_none() {
+            return;
+        }
         let endpoint = format!("{url}/v1/sessions/revoke-by-task");
         let body = json!({ "task_id": task_id });
         let _ = tokio::task::spawn_blocking(move || {
-            let _ = ureq::post(&endpoint)
-                .set("x-uomp-bridge-token", &token)
-                .send_json(body);
+            let mut request = ureq::post(&endpoint);
+            if let Some(token) = task_token {
+                request = request.set("x-aegis-task-token", &token);
+            } else if let Some(token) = bridge_token {
+                request = request.set("x-uomp-bridge-token", &token);
+            }
+            let _ = request.send_json(body);
         })
         .await;
     }
@@ -4678,6 +4698,43 @@ mod tests {
         assert!(send_str.contains("200 OK"));
         assert!(send_str.contains("\"state\":\"submitted\""));
         assert!(send_str.contains("ctx-http-a2a"));
+    }
+
+    #[tokio::test]
+    async fn terminal_task_sends_task_scoped_memory_revoke() {
+        let temp = tempfile::tempdir().unwrap();
+        let mut kernel = AegisRuntimeKernel::new(&temp.path().join("rt")).await.unwrap();
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let (tx, rx) = tokio::sync::oneshot::channel();
+        tokio::spawn(async move {
+            let (mut socket, _) = listener.accept().await.unwrap();
+            let mut buf = vec![0u8; 8192];
+            let read = tokio::io::AsyncReadExt::read(&mut socket, &mut buf)
+                .await
+                .unwrap();
+            let request = String::from_utf8_lossy(&buf[..read]).to_string();
+            assert!(request.contains("POST /v1/sessions/revoke-by-task"));
+            assert!(request.to_lowercase().contains("x-aegis-task-token: task-1:"));
+            let body = r#"{"status":"revoked","count":1}"#;
+            let response = format!(
+                "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n{}",
+                body.len(),
+                body
+            );
+            tokio::io::AsyncWriteExt::write_all(&mut socket, response.as_bytes())
+                .await
+                .unwrap();
+            let _ = tx.send(());
+        });
+        kernel.memory_url = Some(format!("http://{addr}"));
+        kernel.memory_task_secret = Some("test-secret".to_string());
+        kernel.memory_bridge_token = None;
+        kernel.revoke_memory_for_task("task-1").await;
+        tokio::time::timeout(std::time::Duration::from_secs(5), rx)
+            .await
+            .unwrap()
+            .unwrap();
     }
 
     #[tokio::test]
