@@ -358,19 +358,23 @@ pub fn tls_acceptor(
 ) -> anyhow::Result<TlsAcceptor> {
     let certs = load_certs(cert_path)?;
     let key = load_private_key(key_path)?;
+    // `ureq` enables rustls/ring while `tokio-rustls` enables rustls/aws-lc-rs. Selecting the
+    // provider explicitly keeps `cargo test --workspace` (and release builds) deterministic.
+    let provider = Arc::new(tokio_rustls::rustls::crypto::aws_lc_rs::default_provider());
+    let builder = ServerConfig::builder_with_provider(provider.clone())
+        .with_safe_default_protocol_versions()?;
     let config = if let Some(ca_path) = client_ca_path {
         let mut roots = RootCertStore::empty();
         for cert in load_certs(ca_path)? {
             roots.add(cert)?;
         }
-        let verifier = WebPkiClientVerifier::builder(Arc::new(roots)).build()?;
-        ServerConfig::builder()
+        let verifier = WebPkiClientVerifier::builder_with_provider(Arc::new(roots), provider)
+            .build()?;
+        builder
             .with_client_cert_verifier(verifier)
             .with_single_cert(certs, key)?
     } else {
-        ServerConfig::builder()
-            .with_no_client_auth()
-            .with_single_cert(certs, key)?
+        builder.with_no_client_auth().with_single_cert(certs, key)?
     };
     Ok(TlsAcceptor::from(Arc::new(config)))
 }
