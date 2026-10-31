@@ -15,7 +15,7 @@ mod cloud;
 mod coord;
 mod routing;
 
-use aos_core::{AgentIdentity, IsolationTier};
+use aos_core::{A2ATaskState, AgentIdentity, IpcBus, IsolationTier};
 use aos_mcp_gateway::AegisRuntimeKernel;
 use aos_memory::{MemoryScope, MemoryScopes, RemoteProfile, RemoteTokenClaims};
 use aos_memory_gateway::{
@@ -23,7 +23,9 @@ use aos_memory_gateway::{
     GatewayConfig,
 };
 use aos_memory_server::{run_server, ServerConfig};
+use aos_ipc::AegisIpcBus;
 use aos_memory_store::SqliteMemoryStore;
+use chrono::Utc;
 use clap::{Parser, Subcommand};
 use serde_json::{json, Value};
 use std::io::Read;
@@ -97,6 +99,12 @@ enum Commands {
         event: String,
         #[arg(long, default_value_t = true)]
         strict_cow: bool,
+    },
+
+    /// Inspect Google A2A multi-agent tasks
+    A2a {
+        #[command(subcommand)]
+        action: A2aAction,
     },
 
     /// Inspect and manage the Agent's Copy-on-Write Shadow Workspace
@@ -458,6 +466,9 @@ enum PolicyAction {
         action_pattern: String,
         #[arg(long, default_value_t = 3600)]
         ttl_secs: i64,
+        /// Optional A2A task id; binds the lease to that task
+        #[arg(long)]
+        task_id: Option<String>,
     },
 }
 
@@ -479,6 +490,26 @@ enum IpcAction {
         subject: String,
         #[arg(long)]
         message: String,
+    },
+}
+
+#[derive(Subcommand)]
+enum A2aAction {
+    /// Show A2A tasks for the current organization
+    Board {
+        /// Include terminal tasks older than 24 hours
+        #[arg(long, default_value_t = false)]
+        all: bool,
+        /// Machine-readable JSON
+        #[arg(long, default_value_t = false)]
+        json: bool,
+    },
+    /// Show one A2A task
+    Show {
+        id: String,
+        /// Machine-readable JSON
+        #[arg(long, default_value_t = false)]
+        json: bool,
     },
 }
 
@@ -1783,6 +1814,18 @@ fn native_memory_staged_deny(id: &str, reviewed_by: &str, db: Option<&Path>) -> 
     }
 }
 
+fn a2a_state_label(value: A2ATaskState) -> &'static str {
+    match value {
+        A2ATaskState::Submitted => "submitted",
+        A2ATaskState::Working => "working",
+        A2ATaskState::InputRequired => "input-required",
+        A2ATaskState::Completed => "completed",
+        A2ATaskState::Failed => "failed",
+        A2ATaskState::Canceled => "canceled",
+        A2ATaskState::Rejected => "rejected",
+    }
+}
+
 fn sensitivity_label(value: aos_memory::Sensitivity) -> &'static str {
     match value {
         aos_memory::Sensitivity::Low => "low",
@@ -2185,6 +2228,7 @@ async fn main() -> anyhow::Result<()> {
                 PolicyAction::Lease {
                     action_pattern,
                     ttl_secs,
+                    task_id,
                 } => {
                     let res = kernel
                         .call_tool(
@@ -2192,11 +2236,105 @@ async fn main() -> anyhow::Result<()> {
                             "policy_grant_lease",
                             json!({
                                 "action_pattern": action_pattern,
-                                "ttl_secs": ttl_secs
+                                "ttl_secs": ttl_secs,
+                                "task_id": task_id
                             }),
                         )
                         .await?;
                     println!("{}", serde_json::to_string_pretty(&res)?);
+                }
+            }
+        }
+
+        Commands::A2a { action } => {
+            let bus = AegisIpcBus::with_state_file(Some(cli.runtime_dir.join("ipc_state.json")));
+            match action {
+                A2aAction::Board { all, json } => {
+                    let mut tasks = bus.list_tasks(Some(&identity.org_id), None).await?;
+                    let now = Utc::now().timestamp_millis();
+                    if !all {
+                        tasks.retain(|task| {
+                            !task.state.is_terminal() || now - task.updated_at_ms < 24 * 60 * 60 * 1000
+                        });
+                    }
+                    tasks.sort_by(|a, b| {
+                        let a_blocked = a.state == A2ATaskState::InputRequired;
+                        let b_blocked = b.state == A2ATaskState::InputRequired;
+                        b_blocked
+                            .cmp(&a_blocked)
+                            .then_with(|| b.updated_at_ms.cmp(&a.updated_at_ms))
+                    });
+                    if json {
+                        println!("{}", serde_json::to_string_pretty(&json!({ "tasks": tasks }))?);
+                    } else if tasks.is_empty() {
+                        println!("No A2A tasks.");
+                    } else {
+                        println!(
+                            "{:<30} {:<14} {:<34} {:<8} {:<8} {}",
+                            "TASK", "STATE", "FROM -> TO", "AGE", "FLAGS", "SUBJECT"
+                        );
+                        for task in tasks {
+                            let age = now.saturating_sub(task.updated_at_ms) / 1000;
+                            let age = if age < 60 {
+                                format!("{age}s")
+                            } else if age < 3600 {
+                                format!("{}m", age / 60)
+                            } else {
+                                format!("{}h", age / 3600)
+                            };
+                            let mut flags = Vec::new();
+                            if task.state == A2ATaskState::InputRequired {
+                                flags.push("BLOCKED");
+                            }
+                            if task.stale {
+                                flags.push("STALE");
+                            }
+                            println!(
+                                "{:<30} {:<14} {:<34} {:<8} {:<8} {}",
+                                task.id,
+                                a2a_state_label(task.state),
+                                format!("{} -> {}", task.from_agent, task.to_agent),
+                                age,
+                                flags.join(","),
+                                task.subject
+                            );
+                        }
+                    }
+                }
+                A2aAction::Show { id, json } => {
+                    let task = bus
+                        .get_task(&id)
+                        .await?
+                        .filter(|task| task.visible_to_org(&identity.org_id))
+                        .ok_or_else(|| anyhow::anyhow!("A2A task '{id}' not found"))?;
+                    if json {
+                        println!("{}", serde_json::to_string_pretty(&task)?);
+                    } else {
+                        println!("Task      {}", task.id);
+                        println!("State     {:?}", task.state);
+                        println!("From      {}", task.from_agent);
+                        println!("To        {}", task.to_agent);
+                        println!("Context   {}", task.context_id);
+                        println!("Subject   {}", task.subject);
+                        println!("Revision  {}", task.revision);
+                        println!("Stale     {}", task.stale);
+                        if let Some(kind) = &task.failure_kind {
+                            println!("Failure   {kind}");
+                        }
+                        println!("History");
+                        for update in &task.history {
+                            println!(
+                                "  {:>13}ms  {:<14} {}  {}",
+                                update.timestamp_ms,
+                                a2a_state_label(update.state),
+                                update.actor,
+                                update.message.as_deref().unwrap_or("")
+                            );
+                        }
+                        if !task.artifacts.is_empty() {
+                            println!("Artifacts {}", task.artifacts.len());
+                        }
+                    }
                 }
             }
         }
