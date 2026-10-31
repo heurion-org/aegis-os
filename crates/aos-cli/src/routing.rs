@@ -290,7 +290,17 @@ pub fn invokes_approval_cli(cmd: &str) -> bool {
         }
         let rest: Vec<&str> = words[i + 1..].iter().map(|s| s.as_str()).filter(|w| !w.starts_with('-')).collect();
         rest.windows(2).any(|pair| {
-            matches!(pair, ["policy", "approve"] | ["policy", "lease"] | ["cloud", "approve"] | ["cloud", "approver"])
+            matches!(
+                pair,
+                ["policy", "approve"]
+                    | ["policy", "lease"]
+                    | ["cloud", "approve"]
+                    | ["cloud", "approver"]
+                    | ["memory", "approve"]
+                    | ["memory", "deny"]
+                    | ["memory", "ui"]
+                    | ["memory", "connect"]
+            )
         })
     })
 }
@@ -305,7 +315,7 @@ pub fn classify_run_command(cmd: &str, shadow_root: &Path, host_root: &Path) -> 
     // Approvals are for the human: an agent must not run the CLI that approves its own escalations.
     if invokes_approval_cli(trimmed) {
         return Route::Deny {
-            reason: "Blocked by Aegis OS: approving escalations, granting leases and enrolling approvers is done by a human in their own terminal, not by an agent. Ask the user to run it.".to_string(),
+            reason: "Blocked by Aegis OS: approving memory consent, approving escalations, granting leases and enrolling approvers is done by a human in their own terminal or trusted UI, not by an agent. Ask the user to run it.".to_string(),
         };
     }
 
@@ -500,6 +510,10 @@ mod tests {
             "sh -c 'aegis-os cloud approve esc-1'",
             "script -q /dev/null /usr/local/bin/aegis-os policy approve esc-1",
             "aegis-os cloud approver enroll --email a@b.co",
+            "aegis-os memory approve consent-1",
+            "aegis-os memory deny consent-1",
+            "aegis-os memory ui",
+            "aegis-os memory connect claude --scope notes",
         ] {
             assert!(matches!(classify_run_command(cmd, root, root), Route::Deny { .. }), "{cmd}");
         }

@@ -19,6 +19,7 @@ aos-memory.workspace = true
 aos-memory-gateway.workspace = true
 aos-memory-store.workspace = true
 aos-memory-server.workspace = true
+axum.workspace = true
 ureq.workspace = true
 uuid.workspace = true
 aos-mcp-gateway.workspace = true

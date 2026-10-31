@@ -13,6 +13,7 @@
 mod bench;
 mod cloud;
 mod coord;
+mod memory_ui;
 mod routing;
 
 use aos_core::{A2ATaskState, AgentIdentity, IpcBus, IsolationTier};
@@ -375,6 +376,17 @@ enum MemoryAction {
     Stop {
         #[arg(long)]
         pid_file: Option<PathBuf>,
+    },
+    /// Open the local consent approval UI
+    Ui {
+        #[arg(long, default_value = "127.0.0.1:9375")]
+        listen: String,
+        #[arg(long, default_value = "http://127.0.0.1:9374")]
+        url: String,
+        #[arg(long)]
+        admin_token: Option<String>,
+        #[arg(long)]
+        no_open: bool,
     },
     /// Review staged Agent writes
     Staged {
@@ -811,6 +823,43 @@ fn default_auth_db_path() -> PathBuf {
 
 fn default_pid_file() -> PathBuf {
     default_data_dir().join("server.pid")
+}
+
+fn default_ui_pid_file() -> PathBuf {
+    default_data_dir().join("ui.pid")
+}
+
+fn default_ui_url_file() -> PathBuf {
+    default_secrets_dir().join("ui.url")
+}
+
+fn ensure_memory_ui(memory_url: &str) -> anyhow::Result<()> {
+    if memory_ui_healthy() {
+        return Ok(());
+    }
+    let exe = std::env::current_exe()?;
+    let _ = std::process::Command::new(exe)
+        .args(["memory", "ui", "--no-open", "--url", memory_url])
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .spawn()?;
+    for _ in 0..20 {
+        if memory_ui_healthy() {
+            return Ok(());
+        }
+        std::thread::sleep(std::time::Duration::from_millis(50));
+    }
+    Ok(())
+}
+
+fn memory_ui_healthy() -> bool {
+    let Ok(response) = ureq::get("http://127.0.0.1:9375/health").call() else {
+        return false;
+    };
+    response
+        .into_json::<serde_json::Value>()
+        .map(|value| value["service"] == "aegis-memory-ui")
+        .unwrap_or(false)
 }
 
 fn load_or_create_secret(path: &Path) -> anyhow::Result<String> {
@@ -1255,6 +1304,12 @@ fn memory_stop(pid_file: Option<&Path>) -> anyhow::Result<()> {
         anyhow::bail!("failed to stop memory server pid {}", pid.trim());
     }
     let _ = std::fs::remove_file(&pid_file);
+    let ui_pid_file = default_ui_pid_file();
+    if let Ok(ui_pid) = std::fs::read_to_string(&ui_pid_file) {
+        let _ = std::process::Command::new("kill").arg(ui_pid.trim()).status();
+        let _ = std::fs::remove_file(&ui_pid_file);
+    }
+    let _ = std::fs::remove_file(default_ui_url_file());
     println!("Stopped memory server.");
     Ok(())
 }
@@ -1406,7 +1461,8 @@ fn request_bridge_consent(
         .ok_or_else(|| anyhow::anyhow!("consent response missing request_id"))?
         .to_string();
     eprintln!("Aegis memory: consent required for {}", bridge.agent_id);
-    eprintln!("  Approve with: aegis-os memory approve {request_id}");
+    eprintln!("  Approve in the local consent UI (opened automatically)");
+    eprintln!("  Or run: aegis-os memory approve {request_id}");
     eprintln!("  Review with:  aegis-os memory pending");
 
     for _ in 0..120 {
@@ -1507,6 +1563,9 @@ fn run_memory_mcp(
     use std::io::{BufRead, Write};
 
     let bridge = bridge_settings()?;
+    if let Some(bridge) = &bridge {
+        let _ = ensure_memory_ui(&bridge.url);
+    }
     let token_file = std::env::var_os("UOMP_TOKEN_FILE").map(PathBuf::from);
     let token_file_env = token_file
         .as_ref()
@@ -1607,6 +1666,13 @@ fn run_memory_mcp(
                             let Some(scopes) = scopes_for_tool(name, &args) else {
                                 return Err(error);
                             };
+                            // A tag session may not cover a high-sensitivity key. Ask for a
+                            // fresh key-scoped consent instead of retrying the same token.
+                            if auth.bridge.is_none() {
+                                return Err(error);
+                            }
+                            auth.token = None;
+                            auth.claims = None;
                             let claims = ensure_mcp_claims(&mut auth, Some(&scopes))?;
                             memory_mcp_call(&store, &claims, &params)
                         }
@@ -2188,6 +2254,23 @@ async fn main() -> anyhow::Result<()> {
             MemoryAction::Audit { url, admin_token, limit } => memory_audit(&url, admin_token.as_deref(), limit)?,
             MemoryAction::Approvals { url, admin_token } => memory_pending(&url, admin_token.as_deref())?,
             MemoryAction::Stop { pid_file } => memory_stop(pid_file.as_deref())?,
+            MemoryAction::Ui {
+                listen,
+                url,
+                admin_token,
+                no_open,
+            } => {
+                let admin_token = read_admin_token(admin_token.as_deref())?;
+                memory_ui::run(memory_ui::UiConfig {
+                    listen,
+                    memory_url: url,
+                    admin_token,
+                    pid_file: default_ui_pid_file(),
+                    url_file: default_ui_url_file(),
+                    open_on_start: !no_open,
+                })
+                .await?;
+            }
             MemoryAction::Staged { action } => match action {
                 StagedAction::List { status, db } => native_memory_staged_list(status.as_deref(), db.as_deref())?,
                 StagedAction::Approve { id, reviewed_by, db } => native_memory_staged_approve(&id, &reviewed_by, db.as_deref())?,

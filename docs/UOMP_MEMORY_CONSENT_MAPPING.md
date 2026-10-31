@@ -622,7 +622,7 @@ Phase 1b 已经补上两个关键点：
 - MCP 工具 `memory_policy_evaluate`：Agent 可以请求 `memory.read` / `memory.write` / `memory.delete` 的单项资源评估，返回 `allow` / `ask`（含 `escalation_id`）/ `deny`。它不读取数据，只做策略判断。
 - `approve_escalation` 对 `memory.*` 动作保留 `target_resource`，不再退化成 `*`。否则批准一个 tag 会等于批准全部记忆。
 
-Phase 2 已完成：memory store、staged writes、payload、consent server 和 audit 已接入原生实现；trusted UI 目前是 CLI 审批。
+Phase 2 已完成：memory store、staged writes、payload、consent server 和 audit 已接入原生实现；trusted UI 已提供本地同意页（`aegis-os memory ui`，默认 `127.0.0.1:9375`），MCP bridge 会在有 pending request 时自动打开浏览器；CLI `pending` / `approve` / `deny` 保留为 fallback。
 
 写入路径已经进入 Staging 模式：
 
@@ -636,7 +636,7 @@ Phase 2 已完成：memory store、staged writes、payload、consent server 和 
 
 - `aos-memory-server`：consent request、session、Ed25519 JWT、撤销、audit；`aegis-os memory serve` 启动。
 - `aos-memory-store`：SQLite memory store、staged writes、encrypted payloads。
-- `aegis-os memory mcp`：首次 tool call 通过 `UOMP_BRIDGE_FILE` 发起 consent request，等待 `memory approve` 后取回 token；每次 tool call 回写 audit。
+- `aegis-os memory mcp`：首次 tool call 通过 `UOMP_BRIDGE_FILE` 发起 consent request，自动启动本地同意页并等待用户批准后取回 token；每次 tool call 回写 audit。
 - 高敏写入在 server 边界直接拒绝；staged write 需要单独批准。
 
 ### 13.2 服务接口
@@ -716,7 +716,7 @@ Phase 1 已实现远程入口的策略核心和最小网络层：
 - `aos-memory-store`：UOMP 兼容的 SQLite `memory_items` schema、get/get_by_tag/set/delete/list_tags/count、Markdown 导入与 path-derived tags。
 - `aos-memory-gateway`：EdDSA JWT 验签、`/v1/memory` 读写路由（PUT 进入 staged writes）与 `/v1/payload` 加密 envelope 路由、转发前调用 `/v1/tokens/validate` 检查 session 状态、per-session 限流（默认 60 req/min）、JSONL `gateway_access` 审计、可选原生 TLS 1.3 / mTLS、再转发到本地 native server。
 - CLI：`aegis-os memory-gateway --public-key <jwk> --audience <url> --guard-url <url>`。
-- 统一审批视图：`aegis-os memory approvals` 列出 pending consent requests；`approve` / `deny` 完成审批。
+- 统一审批视图：`aegis-os memory ui` 提供 loopback-only 的本地同意页，按 tag/key 勾选范围；`aegis-os memory approvals` / `approve` / `deny` 保留为 CLI fallback。
 - 用户入口收口：`aegis-os memory ...` 全部为原生 Rust 命令；`uomp` 只保留协议网站/规范。
 - 网络层支持原生 TLS 1.3 / mTLS（`--tls-cert` / `--tls-key` / `--client-ca`）；也支持在 Caddy 等代理后运行明文 HTTP。
 - Gateway 转发前会检查 session 状态；native server 仍然做最终校验。

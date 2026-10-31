@@ -110,6 +110,7 @@ dependencies = [
  "aos-policy",
  "aos-sandbox",
  "aos-vfs",
+ "axum",
  "chrono",
  "clap",
  "serde",
