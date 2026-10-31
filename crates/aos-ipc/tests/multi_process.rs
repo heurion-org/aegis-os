@@ -48,6 +48,12 @@ fn run_child() -> anyhow::Result<()> {
             std::thread::sleep(Duration::from_secs(60));
             return Ok::<(), anyhow::Error>(());
         }
+        if mode == "slow-write" {
+            // The write hook sleeps between temp write and rename; the parent kills us there.
+            bus.send(envelope("slow-writer", "slow-write-task".to_string()))
+                .await?;
+            return Ok::<(), anyhow::Error>(());
+        }
         for i in 0..CHILD_TASKS {
             bus.send(envelope(
                 &format!("worker-{worker}"),
@@ -60,16 +66,24 @@ fn run_child() -> anyhow::Result<()> {
     Ok(())
 }
 
-fn spawn_child(state: &std::path::Path, mode: &str, worker: usize) -> std::process::Child {
+fn spawn_child(
+    state: &std::path::Path,
+    mode: &str,
+    worker: usize,
+    extra_env: &[(&str, &str)],
+) -> std::process::Child {
     let exe = std::env::current_exe().unwrap();
-    Command::new(exe)
+    let mut command = Command::new(exe);
+    command
         .env("AOS_IPC_STRESS_STATE", state)
         .env("AOS_IPC_STRESS_MODE", mode)
         .env("AOS_IPC_STRESS_WORKER", worker.to_string())
         .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .spawn()
-        .unwrap()
+        .stderr(Stdio::piped());
+    for (key, value) in extra_env {
+        command.env(key, value);
+    }
+    command.spawn().unwrap()
 }
 
 #[test]
@@ -88,7 +102,7 @@ fn multi_process_stress_and_kill9_recovery() {
     // 8 OS processes x 100 tasks, all sharing one state file.
     let mut children = Vec::new();
     for worker in 0..WORKERS {
-        children.push(spawn_child(&state, "stress", worker));
+        children.push(spawn_child(&state, "stress", worker, &[]));
     }
     for (worker, child) in children.into_iter().enumerate() {
         let output = child.wait_with_output().unwrap();
@@ -117,7 +131,7 @@ fn multi_process_stress_and_kill9_recovery() {
     assert_eq!(count, 800);
 
     // kill -9 a child that left a task in `working`; the task must become stale, not disappear.
-    let mut kill_child = spawn_child(&state, "kill9", 0);
+    let mut kill_child = spawn_child(&state, "kill9", 0, &[]);
     let deadline = Instant::now() + Duration::from_secs(10);
     let task_id = loop {
         let found = runtime.block_on(async {
@@ -148,5 +162,33 @@ fn multi_process_stress_and_kill9_recovery() {
         let task = bus.get_task(&task_id).await.unwrap().unwrap();
         assert_eq!(task.state, A2ATaskState::Working);
         assert!(task.stale, "killed worker task must be marked stale");
+    });
+
+    // kill -9 between temp write and rename: the old state must remain readable.
+    runtime.block_on(async {
+        let bus = AegisIpcBus::with_state_file(Some(state.clone()));
+        bus.send(envelope("seed", "seed-task".to_string()))
+            .await
+            .unwrap();
+    });
+    let mut slow_child = spawn_child(
+        &state,
+        "slow-write",
+        0,
+        &[("AOS_IPC_WRITE_DELAY_MS", "5000")],
+    );
+    let tmp = state.with_extension("json.tmp");
+    let deadline = Instant::now() + Duration::from_secs(10);
+    while !tmp.exists() {
+        assert!(Instant::now() < deadline, "slow writer never created .tmp");
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    slow_child.kill().unwrap();
+    let _ = slow_child.wait();
+    runtime.block_on(async {
+        let bus = AegisIpcBus::with_state_file(Some(state.clone()));
+        let tasks = bus.list_tasks(Some(ORG), None).await.unwrap();
+        assert!(tasks.iter().any(|task| task.subject == "seed-task"));
+        assert!(!tasks.iter().any(|task| task.subject == "slow-write-task"));
     });
 }

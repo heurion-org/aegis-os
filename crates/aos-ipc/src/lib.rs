@@ -192,6 +192,14 @@ impl AegisIpcBus {
             // the new complete state, never a truncated JSON file.
             let tmp = path.with_extension("json.tmp");
             tokio::fs::write(&tmp, bytes).await?;
+            // Test hook: hold the temp file before rename so an integration test can kill the
+            // writer mid-transaction. Debug builds only; release builds ignore it.
+            #[cfg(debug_assertions)]
+            if let Ok(ms) = std::env::var("AOS_IPC_WRITE_DELAY_MS") {
+                if let Ok(ms) = ms.parse::<u64>() {
+                    tokio::time::sleep(std::time::Duration::from_millis(ms)).await;
+                }
+            }
             tokio::fs::rename(&tmp, path).await?;
         }
         Ok(())
