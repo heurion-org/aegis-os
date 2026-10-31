@@ -691,6 +691,13 @@ async fn approve_consent(
             )
         })?
         .unwrap_or_else(|| consent.requested_scopes.clone());
+    if consent.status != "pending" {
+        return Err(api_error(
+            StatusCode::CONFLICT,
+            "REQUEST_NOT_PENDING",
+            "consent request is no longer pending",
+        ));
+    }
     let session = auth
         .get_session(&consent.session_id)
         .map_err(|error| {

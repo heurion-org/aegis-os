@@ -111,6 +111,29 @@ impl AuthStore {
         Ok(())
     }
 
+    pub fn expire_pending_consents(&self) -> anyhow::Result<()> {
+        let now = Utc::now();
+        let mut stmt = self
+            .conn
+            .prepare("SELECT request_id, expires_at FROM consent_requests WHERE status = 'pending'")?;
+        let rows: Vec<(String, String)> = stmt
+            .query_map([], |row| Ok((row.get(0)?, row.get(1)?)))?
+            .filter_map(Result::ok)
+            .collect();
+        for (request_id, expires_at) in rows {
+            if chrono::DateTime::parse_from_rfc3339(&expires_at)
+                .map(|value| value.with_timezone(&Utc) <= now)
+                .unwrap_or(false)
+            {
+                self.conn.execute(
+                    "UPDATE consent_requests SET status = 'expired' WHERE request_id = ? AND status = 'pending'",
+                    params![request_id],
+                )?;
+            }
+        }
+        Ok(())
+    }
+
     pub fn create_session(
         &self,
         agent_id: &str,
@@ -279,6 +302,7 @@ impl AuthStore {
     }
 
     pub fn get_consent(&self, request_id: &str) -> anyhow::Result<Option<ConsentRequest>> {
+        self.expire_pending_consents()?;
         let row = self
             .conn
             .query_row(
@@ -293,6 +317,7 @@ impl AuthStore {
     }
 
     pub fn list_consent(&self, status: Option<&str>) -> anyhow::Result<Vec<ConsentRequest>> {
+        self.expire_pending_consents()?;
         let mut stmt = self.conn.prepare(
             "SELECT request_id, session_id, agent_id, agent_name, requested_scopes,
                     status, created_at, expires_at, approved_at, granted_scopes, task_id
