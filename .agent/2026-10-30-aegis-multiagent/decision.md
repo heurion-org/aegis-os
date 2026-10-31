@@ -156,6 +156,7 @@
 | #7 撤销传播 | 完成（有条件） | 同上 | task 终态 → revoke-by-task；session revoke → task input-required |
 | 收尾 | 完成 | `builder-06.md`、`review-builder-06.md` | audit task_id、sessions 过滤、task-scoped revoke token、gateway mock 测试 |
 | 真实多进程 | 完成 | `builder-07.md`、`review-builder-07.md` | 8 OS 进程 × 100 task；kill -9 → stale；30s flock deadline |
+| Dogfood-01 | 完成 | `dogfood-01.md` | A2A task + consent + MCP read + revoke + audit；修复 ipc request / submitted→input-required / runtime-dir 文档 |
 
 当前测试：`aos-ipc` 17 + multi_process 1 passed；`aos-mcp-gateway` 27 passed；`aos-policy` 7 passed；`aos-memory` 10 passed；`aos-memory-server` 2 passed；`aos-cli` 16 passed；`cargo check --workspace` 通过。真实 8 进程 × 100 任务 + kill -9 连续 3 次通过（~21.3s/次）。代码未 commit / push。
 
