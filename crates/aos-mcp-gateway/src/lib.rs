@@ -9,7 +9,7 @@
 
 use aos_core::{
     claims, A2AArtifact, A2ATaskState, AgentIdentity, AgentSkill, AuditEvent, ExecSpec,
-    FlightRecorder, IpcBus, IpcEnvelope, IpcKind, IsolationTier, LeaseGrant, MessageDeliveryStatus,
+    FlightRecorder, IpcBus, IpcEnvelope, IpcKind, IsolationTier, LeaseGrant, LeaseKind, MessageDeliveryStatus,
     OrgSharedStorage, PolicyContext, PolicyDecision, PolicyEngine, ResourceLimits, SandboxConfig,
     SandboxDriver, SandboxInstance, TransactionalWorkspace,
 };
@@ -303,6 +303,25 @@ impl AegisRuntimeKernel {
             .filter(|p| p.online)
             .map(|p| p.agent_id)
             .collect()
+    }
+
+    /// If the agent has exactly one active A2A task, treat that task as the trusted task context
+    /// for task-scoped leases. Multiple active tasks are ambiguous and therefore not injected.
+    async fn active_task_id(&self, identity: &AgentIdentity) -> Option<String> {
+        let tasks = self
+            .ipc
+            .list_tasks(Some(&identity.org_id), Some(&identity.agent_id))
+            .await
+            .ok()?;
+        let active: Vec<_> = tasks
+            .into_iter()
+            .filter(|task| !task.state.is_terminal() && !task.stale)
+            .collect();
+        if active.len() == 1 {
+            Some(active[0].id.clone())
+        } else {
+            None
+        }
     }
 
     /// Current claim table and its KV version (None if the key does not exist yet).
@@ -632,8 +651,13 @@ impl AegisRuntimeKernel {
         action: &str,
         target_org_id: &str,
         target_resource: &str,
-        metadata: Value,
+        mut metadata: Value,
     ) -> anyhow::Result<PolicyDecision> {
+        if let Some(task_id) = self.active_task_id(identity).await {
+            if let Some(object) = metadata.as_object_mut() {
+                object.insert("task_id".to_string(), json!(task_id));
+            }
+        }
         let ctx = PolicyContext {
             principal: identity.clone(),
             action: action.to_string(),
@@ -1431,10 +1455,32 @@ impl AegisRuntimeKernel {
                     .get("artifacts")
                     .and_then(|v| serde_json::from_value(v.clone()).ok())
                     .unwrap_or_default();
+                if let Some(active) = self.active_task_id(identity).await {
+                    if active != task_id {
+                        bail!(
+                            "A2A task '{}' is not the agent's active task '{}'",
+                            task_id,
+                            active
+                        );
+                    }
+                }
+                let expected_revision = args
+                    .get("expected_revision")
+                    .and_then(|v| v.as_u64());
                 let task = self
                     .ipc
-                    .update_task_state(identity, task_id, state, message, artifacts)
+                    .update_task_state_cas(
+                        identity,
+                        task_id,
+                        expected_revision,
+                        state,
+                        message,
+                        artifacts,
+                    )
                     .await?;
+                if task.state.is_terminal() {
+                    let _ = self.policy.revoke_leases_for_task(&task.id).await;
+                }
                 Ok(serde_json::to_value(task)?)
             }
 
@@ -1448,6 +1494,7 @@ impl AegisRuntimeKernel {
                     .ipc
                     .get_task(task_id)
                     .await?
+                    .filter(|t| t.visible_to_org(&identity.org_id))
                     .with_context(|| format!("A2A task '{}' not found", task_id))?;
                 Ok(serde_json::to_value(task)?)
             }
@@ -1456,12 +1503,16 @@ impl AegisRuntimeKernel {
                 let scope = args
                     .get("scope")
                     .and_then(|v| v.as_str())
-                    .unwrap_or("all");
-                let org_filter = if scope == "org" {
-                    Some(identity.org_id.as_str())
-                } else {
-                    None
-                };
+                    .unwrap_or("org");
+                if scope == "all" {
+                    bail!(
+                        "scope='all' is operator-only; agents may only list A2A tasks in their own organization (use scope='org')"
+                    );
+                }
+                if scope != "org" {
+                    bail!("Invalid task list scope '{}'; expected 'org'", scope);
+                }
+                let org_filter = Some(identity.org_id.as_str());
                 let agent_filter = args.get("agent_id").and_then(|v| v.as_str());
                 let tasks = self.ipc.list_tasks(org_filter, agent_filter).await?;
                 Ok(json!({
@@ -1594,6 +1645,10 @@ impl AegisRuntimeKernel {
                     .ipc
                     .reply(identity, original_msg_id, success, payload, attachments)
                     .await?;
+                let _ = self
+                    .policy
+                    .revoke_leases_for_task(original_msg_id)
+                    .await;
                 Ok(serde_json::to_value(reply)?)
             }
 
@@ -1670,6 +1725,10 @@ impl AegisRuntimeKernel {
                     .and_then(|v| v.as_i64())
                     .unwrap_or(3600)
                     .clamp(1, MAX_TOOL_LEASE_TTL_SECS);
+                let task_id = args
+                    .get("task_id")
+                    .and_then(|v| v.as_str())
+                    .map(str::to_string);
 
                 let lease = self
                     .policy
@@ -1681,6 +1740,12 @@ impl AegisRuntimeKernel {
                         resource_pattern: resource_pattern.to_string(),
                         expires_at_ms: Utc::now().timestamp_millis() + (ttl_secs * 1000),
                         granted_by: "session_owner".to_string(),
+                        kind: if task_id.is_some() {
+                            LeaseKind::TaskScoped
+                        } else {
+                            LeaseKind::Ttl
+                        },
+                        task_id,
                     })
                     .await?;
                 Ok(serde_json::to_value(lease)?)
@@ -1925,6 +1990,10 @@ impl AegisRuntimeKernel {
                             "verify_timeout_ms": {
                                 "type": "integer",
                                 "description": "Optional timeout in milliseconds for `verify_cmd` (default: 30000)."
+                            },
+                            "task_id": {
+                                "type": "string",
+                                "description": "Optional A2A task id. When set, approval binds the resulting lease to this task."
                             }
                         }
                     }
@@ -2059,7 +2128,8 @@ impl AegisRuntimeKernel {
                                 "enum": ["submitted", "working", "input-required", "completed", "failed", "canceled", "rejected"]
                             },
                             "message": { "type": "string" },
-                            "artifacts": { "type": "array" }
+                            "artifacts": { "type": "array" },
+                            "expected_revision": { "type": "integer", "description": "Optional CAS revision; rejects the update if the task has moved." }
                         },
                         "required": ["task_id", "state"]
                     }
@@ -2075,11 +2145,11 @@ impl AegisRuntimeKernel {
                 },
                 {
                     "name": "ipc_task_list",
-                    "description": "[Zero-Prompt] List stateful Google A2A `Task`s across the current Organization or global workstation.",
+                    "description": "[Zero-Prompt] List stateful Google A2A `Task`s in the caller's Organization. Cross-org listing is operator-only.",
                     "inputSchema": {
                         "type": "object",
                         "properties": {
-                            "scope": { "type": "string", "enum": ["all", "org"] },
+                            "scope": { "type": "string", "enum": ["org"], "default": "org" },
                             "agent_id": { "type": "string" }
                         }
                     }
@@ -2487,7 +2557,7 @@ impl AegisRuntimeKernel {
                     .and_then(|v| v.as_str())
                     .unwrap_or("");
                 match self.ipc.get_task(task_id).await {
-                    Ok(Some(task)) => json!({
+                    Ok(Some(task)) if task.visible_to_org(&identity.org_id) => json!({
                         "jsonrpc": "2.0",
                         "id": id,
                         "result": task
@@ -2511,16 +2581,31 @@ impl AegisRuntimeKernel {
                     .and_then(|v| v.as_str())
                     .map(|s| s.to_string())
                     .or_else(|| Some("Canceled via A2A tasks/cancel".to_string()));
+                let expected_revision = params
+                    .get("expected_revision")
+                    .and_then(|v| v.as_u64());
+                // The IPC bus enforces org ownership plus requester-only cancellation, so a
+                // cross-org or non-requester caller gets the same `not found` / refusal answer.
                 match self
                     .ipc
-                    .update_task_state(identity, task_id, A2ATaskState::Canceled, reason, vec![])
+                    .update_task_state_cas(
+                        identity,
+                        task_id,
+                        expected_revision,
+                        A2ATaskState::Canceled,
+                        reason,
+                        vec![],
+                    )
                     .await
                 {
-                    Ok(task) => json!({
-                        "jsonrpc": "2.0",
-                        "id": id,
-                        "result": task
-                    }),
+                    Ok(task) => {
+                        let _ = self.policy.revoke_leases_for_task(&task.id).await;
+                        json!({
+                            "jsonrpc": "2.0",
+                            "id": id,
+                            "result": task
+                        })
+                    }
                     Err(e) => json!({
                         "jsonrpc": "2.0",
                         "id": id,
@@ -2529,7 +2614,11 @@ impl AegisRuntimeKernel {
                 }
             }
             "tasks/list" => {
-                let tasks = self.ipc.list_tasks(None, None).await.unwrap_or_default();
+                let tasks = self
+                    .ipc
+                    .list_tasks(Some(&identity.org_id), None)
+                    .await
+                    .unwrap_or_default();
                 json!({
                     "jsonrpc": "2.0",
                     "id": id,
@@ -3105,7 +3194,7 @@ impl AegisRuntimeKernel {
                         && (full_target.starts_with("/api/status")
                             || full_target.starts_with("/v1/status"))
                     {
-                        let query_org = if let Some((_, after)) = full_target.split_once("org_id=") {
+                        let requested_scope = if let Some((_, after)) = full_target.split_once("org_id=") {
                             let val = after.split('&').next().unwrap_or("*").trim();
                             if val.is_empty() { "*".to_string() } else { val.to_string() }
                         } else if org_id == "default-org" {
@@ -3113,30 +3202,48 @@ impl AegisRuntimeKernel {
                         } else {
                             org_id.clone()
                         };
-                        let peers = if query_org == "*" {
+                        // Only the operator (or insecure local mode) may widen the view. A tenant
+                        // key is always pinned to its own org, even when its org id is
+                        // `default-org` and the request omits `org_id`.
+                        let effective_org = if is_operator || auth_mode == DaemonAuth::Disabled {
+                            requested_scope
+                        } else {
+                            org_id.clone()
+                        };
+                        let peers = if effective_org == "*" {
                             k.ipc.list_all_peers().await.unwrap_or_default()
                         } else {
-                            k.ipc.list_peers(&query_org).await.unwrap_or_default()
+                            k.ipc.list_peers(&effective_org).await.unwrap_or_default()
                         };
-                        let global_peers = k.ipc.list_all_peers().await.unwrap_or_default();
-                        let tasks = k.ipc.list_tasks(None, None).await.unwrap_or_default();
-                        let escalations = k.policy.list_escalations(&query_org).await.unwrap_or_default();
-                        let leases = k.policy.list_leases(&query_org, None).await.unwrap_or_default();
-                        let workspaces = k.paas.list_workspaces(Some(&query_org)).await;
-                        let api_keys = k.paas.list_api_keys(Some(&query_org)).await;
-                        let tenants = k.paas.list_tenants(Some(&query_org)).await;
-                        let secrets = if query_org == "*" {
+                        let global_peers = if effective_org == "*" {
+                            k.ipc.list_all_peers().await.unwrap_or_default()
+                        } else {
+                            Vec::new()
+                        };
+                        // A2A tasks follow the same org scope as every other section: only the
+                        // operator (or insecure local mode) may see the whole workstation.
+                        let tasks = if effective_org == "*" {
+                            k.ipc.list_tasks(None, None).await.unwrap_or_default()
+                        } else {
+                            k.ipc.list_tasks(Some(&effective_org), None).await.unwrap_or_default()
+                        };
+                        let escalations = k.policy.list_escalations(&effective_org).await.unwrap_or_default();
+                        let leases = k.policy.list_leases(&effective_org, None).await.unwrap_or_default();
+                        let workspaces = k.paas.list_workspaces(Some(&effective_org)).await;
+                        let api_keys = k.paas.list_api_keys(Some(&effective_org)).await;
+                        let tenants = k.paas.list_tenants(Some(&effective_org)).await;
+                        let secrets = if effective_org == "*" {
                             let mut all_sec = k.egress.list_redacted_secrets("aegis-os").await;
                             all_sec.extend(k.egress.list_redacted_secrets("acme").await);
                             all_sec.extend(k.egress.list_redacted_secrets("default-org").await);
                             all_sec
                         } else {
-                            k.egress.list_redacted_secrets(&query_org).await
+                            k.egress.list_redacted_secrets(&effective_org).await
                         };
                         (
                             "HTTP/1.1 200 OK",
                             json!({
-                                "org_id": query_org,
+                                "org_id": effective_org,
                                 "peers": peers,
                                 "global_peers": global_peers,
                                 "a2a_tasks": tasks,
@@ -4540,6 +4647,187 @@ mod tests {
         assert!(send_str.contains("200 OK"));
         assert!(send_str.contains("\"state\":\"submitted\""));
         assert!(send_str.contains("ctx-http-a2a"));
+    }
+
+    #[tokio::test]
+    async fn a2a_tasks_are_org_scoped_across_http_and_status() {
+        let temp = tempfile::tempdir().unwrap();
+        let repo = temp.path().join("repo");
+        tokio::fs::create_dir_all(&repo).await.unwrap();
+        let kernel = Arc::new(AegisRuntimeKernel::new(&temp.path().join("rt")).await.unwrap());
+        let addr = kernel
+            .clone()
+            .start_http_daemon("127.0.0.1:0", repo)
+            .await
+            .unwrap();
+        let (org_a_key, _) = kernel
+            .paas
+            .issue_api_key("org-a", "agent-a", "Engineer", None, "test")
+            .await
+            .unwrap();
+        let (org_b_key, _) = kernel
+            .paas
+            .issue_api_key("org-b", "agent-b", "Engineer", None, "test")
+            .await
+            .unwrap();
+
+        let requester = AgentIdentity::new("org-b", "requester", "Planner");
+        let assignee = AgentIdentity::new("org-b", "assignee", "Worker");
+        kernel
+            .ipc
+            .register_peer(&requester, vec!["*".to_string()])
+            .await
+            .unwrap();
+        kernel
+            .ipc
+            .register_peer(&assignee, vec!["*".to_string()])
+            .await
+            .unwrap();
+        let task = kernel
+            .ipc
+            .send(IpcEnvelope {
+                msg_id: String::new(),
+                org_id: "org-b".to_string(),
+                from_agent: "org-b/requester".to_string(),
+                to_target: "assignee".to_string(),
+                kind: IpcKind::TaskRequest {
+                    timeout_secs: Some(60),
+                },
+                subject: "org-b secret task".to_string(),
+                payload: json!({ "secret": "do-not-leak" }),
+                attachments: vec![],
+                status: MessageDeliveryStatus::Unread,
+                created_at_ms: 0,
+            })
+            .await
+            .unwrap();
+        let task_id = task.msg_id;
+
+        let get = |key: &str, id: String| {
+            let key = key.to_string();
+            async move {
+                raw_http(
+                    addr,
+                    "POST",
+                    "/v1/a2a",
+                    Some(&key),
+                    Some(json!({
+                        "jsonrpc": "2.0",
+                        "id": 1,
+                        "method": "tasks/get",
+                        "params": { "id": id }
+                    })),
+                )
+                .await
+            }
+        };
+
+        let (owner_head, owner_body) = get(org_b_key.as_str(), task_id.clone()).await;
+        assert!(owner_head.contains("200 OK"), "{owner_head}");
+        assert_eq!(owner_body["result"]["id"], task_id);
+        assert_eq!(owner_body["result"]["org_id"], "org-b");
+
+        let (cross_head, cross_body) = get(org_a_key.as_str(), task_id.clone()).await;
+        assert!(cross_head.contains("200 OK"), "{cross_head}");
+        assert_eq!(cross_body["error"]["code"], -32004);
+        assert!(!cross_body.to_string().contains("do-not-leak"));
+
+        let (_, unknown_body) = get(org_a_key.as_str(), "task-does-not-exist".to_string()).await;
+        assert_eq!(cross_body["error"]["code"], unknown_body["error"]["code"]);
+
+        let (_, list_a) = raw_http(
+            addr,
+            "POST",
+            "/v1/a2a",
+            Some(&org_a_key),
+            Some(json!({
+                "jsonrpc": "2.0",
+                "id": 2,
+                "method": "tasks/list",
+                "params": {}
+            })),
+        )
+        .await;
+        assert!(list_a["result"]["tasks"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .all(|task| task["org_id"] != "org-b"));
+
+        let (_, list_b) = raw_http(
+            addr,
+            "POST",
+            "/v1/a2a",
+            Some(&org_b_key),
+            Some(json!({
+                "jsonrpc": "2.0",
+                "id": 3,
+                "method": "tasks/list",
+                "params": {}
+            })),
+        )
+        .await;
+        assert!(list_b["result"]["tasks"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|task| task["id"] == task_id));
+
+        let (_, status_a) = raw_http(addr, "GET", "/api/status", Some(&org_a_key), None).await;
+        assert!(status_a["a2a_tasks"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .all(|task| task["org_id"] != "org-b"));
+
+        let (_, status_b) = raw_http(addr, "GET", "/api/status", Some(&org_b_key), None).await;
+        assert!(status_b["a2a_tasks"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|task| task["id"] == task_id));
+
+        // A tenant whose org id is literally `default-org` must not be widened to `*` when the
+        // request omits `org_id`. This used to expose every org's peers/tasks/secrets.
+        let (default_org_key, _) = kernel
+            .paas
+            .issue_api_key("default-org", "default-agent", "Engineer", None, "test")
+            .await
+            .unwrap();
+        let (_, default_status) =
+            raw_http(addr, "GET", "/api/status", Some(&default_org_key), None).await;
+        assert_eq!(default_status["org_id"], "default-org");
+        assert!(default_status["a2a_tasks"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .all(|task| task["org_id"] != "org-b"));
+        assert!(default_status["peers"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .all(|peer| peer["org_id"] != "org-b"));
+        assert!(default_status["global_peers"]
+            .as_array()
+            .unwrap()
+            .is_empty());
+
+        let (_, cancel_cross) = raw_http(
+            addr,
+            "POST",
+            "/v1/a2a",
+            Some(&org_a_key),
+            Some(json!({
+                "jsonrpc": "2.0",
+                "id": 4,
+                "method": "tasks/cancel",
+                "params": { "id": task_id }
+            })),
+        )
+        .await;
+        assert_eq!(cancel_cross["error"]["code"], -32004);
+        let (_, after_cross_cancel) = get(org_b_key.as_str(), task_id.clone()).await;
+        assert_eq!(after_cross_cancel["result"]["state"], "submitted");
     }
 
     #[tokio::test]
