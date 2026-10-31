@@ -52,8 +52,8 @@ cargo check --workspace           # Finished
 
 ## 4. P2
 
-1. kill -9 发生在 idle sleep，不是写事务中途；`.tmp` 残留/旧状态可读性未覆盖。
-2. 30s deadline 是经验值；更大规模需重新压测。
+1. 已覆盖写事务中途 kill -9：旧 state 可读、新 task 未落盘；`.tmp` 残留不参与加载。
+2. `AOS_IPC_WRITE_DELAY_MS` 是 debug-only 测试钩子；release 忽略。
 3. 测试 ~21s，默认 `cargo test -p aos-ipc` 会跑；如果 CI 时间敏感，可标 `#[ignore]` 并放到 release gate。
 4. 没有磁盘满/权限错误模拟。
 5. 没有真实多机/远程 A2A 压测。

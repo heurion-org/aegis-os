@@ -29,6 +29,13 @@ kill -9 验证：
 3. `sweep_stale_tasks(now+1s, threshold=0)`
 4. 断言 task 仍是 `working`，但 `stale=true`
 
+写事务中途 kill：
+
+1. `flush_to_disk` 在 debug build 中支持 `AOS_IPC_WRITE_DELAY_MS`（temp write 与 rename 之间）
+2. 父进程等待 `ipc_state.json.tmp` 出现
+3. SIGKILL
+4. 重新打开 state file，断言旧 task 仍在、新 task 不在、JSON 可解析
+
 ## 2. 压测发现
 
 首次 8 进程 × 100 任务时，多个 worker 在 5s `flock` deadline 内超时：
@@ -51,12 +58,12 @@ cargo test -p aos-ipc --test multi_process -- --nocapture
 # 1 passed; 0 failed; finished in ~21.3s
 ```
 
-连续 3 次运行：
+连续运行：
 
 ```text
-run 1: 1 passed (21.33s)
-run 2: 1 passed (21.39s)
-run 3: 1 passed (21.37s)
+run 1: 1 passed (22.26s)
+run 2: 1 passed (21.94s)
+run 3: 1 passed (22.05s)
 ```
 
 其他测试：
@@ -70,10 +77,10 @@ cargo check --workspace           # Finished
 
 ## 4. 风险 / 未完成
 
-1. **kill -9 发生在 idle sleep，不是写事务中途**：尚未覆盖“写 temp 文件时被 kill”的场景。
+1. **`AOS_IPC_WRITE_DELAY_MS` 是 debug-only 测试钩子**：release build 忽略；不要在生产环境依赖。
 2. **没有模拟磁盘满 / 权限错误**。
 3. **30s deadline 是经验值**：800 任务/8 进程通过；更大规模需重新压测。
-4. **测试耗时 ~21s**：默认 `cargo test -p aos-ipc` 会跑它，CI 时间会增加；如需可标 `#[ignore]` 单独跑。
+4. **测试耗时 ~22s**：默认 `cargo test -p aos-ipc` 会跑它，CI 时间会增加；如需可标 `#[ignore]` 单独跑。
 5. **未 commit / push**。
 
 ## 5. 下一步
