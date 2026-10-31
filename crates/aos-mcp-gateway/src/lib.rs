@@ -4701,6 +4701,96 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn a2a_cancel_revokes_memory_sessions_end_to_end() {
+        let temp = tempfile::tempdir().unwrap();
+        let repo = temp.path().join("repo");
+        tokio::fs::create_dir_all(&repo).await.unwrap();
+        let mut kernel = AegisRuntimeKernel::new(&temp.path().join("rt")).await.unwrap();
+
+        let memory_listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let memory_addr = memory_listener.local_addr().unwrap();
+        let (tx, rx) = tokio::sync::oneshot::channel();
+        tokio::spawn(async move {
+            let (mut socket, _) = memory_listener.accept().await.unwrap();
+            let mut buf = vec![0u8; 8192];
+            let read = tokio::io::AsyncReadExt::read(&mut socket, &mut buf)
+                .await
+                .unwrap();
+            let request = String::from_utf8_lossy(&buf[..read]).to_string();
+            assert!(request.contains("POST /v1/sessions/revoke-by-task"));
+            assert!(request.to_lowercase().contains("x-aegis-task-token: msg-"));
+            let body = r#"{"status":"revoked","count":1}"#;
+            let response = format!(
+                "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n{}",
+                body.len(),
+                body
+            );
+            tokio::io::AsyncWriteExt::write_all(&mut socket, response.as_bytes())
+                .await
+                .unwrap();
+            let _ = tx.send(());
+        });
+        kernel.memory_url = Some(format!("http://{memory_addr}"));
+        kernel.memory_task_secret = Some("test-secret".to_string());
+        kernel.memory_bridge_token = None;
+
+        let task = kernel
+            .ipc
+            .send(IpcEnvelope {
+                msg_id: String::new(),
+                org_id: "acme".to_string(),
+                from_agent: "acme/planner".to_string(),
+                to_target: "worker".to_string(),
+                kind: IpcKind::TaskRequest {
+                    timeout_secs: Some(60),
+                },
+                subject: "e2e cancel".to_string(),
+                payload: json!({}),
+                attachments: vec![],
+                status: MessageDeliveryStatus::Unread,
+                created_at_ms: 0,
+            })
+            .await
+            .unwrap();
+        // Use a stable task id for the mock assertion.
+        let task_id = task.msg_id;
+        let kernel = Arc::new(kernel);
+        let addr = kernel
+            .clone()
+            .start_http_daemon("127.0.0.1:0", repo)
+            .await
+            .unwrap();
+        let op = kernel.operator_token();
+        let body = json!({
+            "jsonrpc": "2.0",
+            "id": 1,
+            "method": "tasks/cancel",
+            "params": { "id": task_id }
+        })
+        .to_string();
+        let mut stream = tokio::net::TcpStream::connect(addr).await.unwrap();
+        let request = format!(
+            "POST /v1/a2a HTTP/1.1\r\nHost: {addr}\r\nAuthorization: Bearer {op}\r\nX-Aegis-Org: acme\r\nX-Aegis-Agent: planner\r\nContent-Length: {}\r\n\r\n{}",
+            body.len(),
+            body
+        );
+        tokio::io::AsyncWriteExt::write_all(&mut stream, request.as_bytes())
+            .await
+            .unwrap();
+        let mut response = Vec::new();
+        tokio::io::AsyncReadExt::read_to_end(&mut stream, &mut response)
+            .await
+            .unwrap();
+        let response = String::from_utf8_lossy(&response);
+        assert!(response.contains("200 OK"), "{response}");
+        assert!(response.contains("\"state\":\"canceled\""), "{response}");
+        tokio::time::timeout(std::time::Duration::from_secs(5), rx)
+            .await
+            .unwrap()
+            .unwrap();
+    }
+
+    #[tokio::test]
     async fn terminal_task_sends_task_scoped_memory_revoke() {
         let temp = tempfile::tempdir().unwrap();
         let mut kernel = AegisRuntimeKernel::new(&temp.path().join("rt")).await.unwrap();

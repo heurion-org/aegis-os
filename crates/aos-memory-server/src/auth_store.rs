@@ -471,3 +471,33 @@ fn row_to_consent(row: &rusqlite::Row<'_>) -> rusqlite::Result<ConsentRequest> {
         granted_scopes: granted.and_then(|value| serde_json::from_str(&value).ok()),
     })
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn expired_consent_is_marked_expired_and_not_approvable() {
+        let temp = tempfile::tempdir().unwrap();
+        let store = AuthStore::open(temp.path().join("auth.db")).unwrap();
+        let scopes = MemoryScopes::default();
+        let session = store
+            .create_session("agent", None, &scopes, 1, Some("task-1"))
+            .unwrap();
+        let consent = store.create_consent(&session, &scopes).unwrap();
+        store
+            .conn
+            .execute(
+                "UPDATE consent_requests SET expires_at = ? WHERE request_id = ?",
+                params!["2000-01-01T00:00:00+00:00", consent.request_id],
+            )
+            .unwrap();
+        store.expire_pending_consents().unwrap();
+        let loaded = store.get_consent(&consent.request_id).unwrap().unwrap();
+        assert_eq!(loaded.status, "expired");
+        assert_eq!(loaded.task_id.as_deref(), Some("task-1"));
+        assert!(!store
+            .approve_consent(&consent.request_id, &scopes, "token")
+            .unwrap());
+    }
+}
