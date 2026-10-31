@@ -494,6 +494,17 @@ enum IpcAction {
         #[arg(long)]
         message: String,
     },
+    /// Send a stateful A2A task request
+    Request {
+        #[arg(long)]
+        to: String,
+        #[arg(long)]
+        subject: String,
+        #[arg(long)]
+        message: String,
+        #[arg(long)]
+        timeout_secs: Option<u64>,
+    },
 }
 
 #[derive(Subcommand)]
@@ -2417,6 +2428,26 @@ async fn main() -> anyhow::Result<()> {
                                 "to_agent": to,
                                 "subject": subject,
                                 "payload": { "text": message }
+                            }),
+                        )
+                        .await?;
+                    println!("{}", serde_json::to_string_pretty(&res)?);
+                }
+                IpcAction::Request {
+                    to,
+                    subject,
+                    message,
+                    timeout_secs,
+                } => {
+                    let res = kernel
+                        .call_tool(
+                            &identity,
+                            "ipc_request",
+                            json!({
+                                "to_agent": to,
+                                "subject": subject,
+                                "payload": { "text": message },
+                                "timeout_secs": timeout_secs
                             }),
                         )
                         .await?;

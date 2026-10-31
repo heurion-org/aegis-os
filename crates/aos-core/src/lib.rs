@@ -446,7 +446,12 @@ impl A2ATaskState {
         match self {
             Self::Submitted => matches!(
                 next,
-                Self::Working | Self::Completed | Self::Failed | Self::Canceled | Self::Rejected
+                Self::Working
+                    | Self::InputRequired
+                    | Self::Completed
+                    | Self::Failed
+                    | Self::Canceled
+                    | Self::Rejected
             ),
             Self::Working => matches!(
                 next,

@@ -1762,7 +1762,6 @@ mod tests {
             })
             .await
             .unwrap();
-        bus.ack("repo", "worker", &task.msg_id).await.unwrap();
         assert!(bus
             .request_task_input(&task.msg_id, "memory session revoked")
             .await
@@ -2074,18 +2073,16 @@ mod tests {
             .await
             .unwrap();
 
-        // Submitted may not jump directly to input-required.
-        let illegal = bus
-            .update_task_state(
-                &worker,
-                &task.msg_id,
-                A2ATaskState::InputRequired,
-                Some("need input".to_string()),
-                vec![],
-            )
-            .await;
-        assert!(illegal.is_err());
-        assert!(illegal.unwrap_err().to_string().contains("Illegal"));
+        // A task may request input before the assignee acknowledges it.
+        bus.update_task_state(
+            &worker,
+            &task.msg_id,
+            A2ATaskState::InputRequired,
+            Some("need input".to_string()),
+            vec![],
+        )
+        .await
+        .unwrap();
 
         // Acknowledging moves submitted -> working.
         bus.ack("repo", "worker", &task.msg_id).await.unwrap();
