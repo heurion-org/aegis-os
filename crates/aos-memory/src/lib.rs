@@ -16,7 +16,7 @@
 
 use std::collections::HashMap;
 
-use aos_core::{AgentIdentity, LeaseGrant, PolicyContext};
+use aos_core::{AgentIdentity, LeaseGrant, LeaseKind, PolicyContext};
 use serde::{Deserialize, Serialize};
 
 /// A UOMP read/write action mapped to an Aegis policy action.
@@ -162,6 +162,8 @@ pub fn lease_plan(
                 resource_pattern: resource,
                 expires_at_ms,
                 granted_by: granted_by.to_string(),
+                kind: LeaseKind::Ttl,
+                task_id: None,
             });
         }
     }
@@ -675,6 +677,8 @@ mod tests {
             resource_pattern: "memory:tag:notes/*".to_string(),
             expires_at_ms: 2_000,
             granted_by: "user".to_string(),
+            kind: LeaseKind::Ttl,
+            task_id: None,
         };
 
         assert!(lease_covers(

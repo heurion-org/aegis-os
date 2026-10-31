@@ -29,6 +29,12 @@ struct PersistedIpcState {
 
 pub struct AegisIpcBus {
     state_file: Option<PathBuf>,
+    /// Set when the on-disk state exists but cannot be read/parsed. Once set, writes refuse to
+    /// overwrite the file so a corrupt/partial file cannot silently wipe tasks.
+    state_error: Arc<std::sync::Mutex<Option<String>>>,
+    /// Process-local serialization for all reload/read-modify-write sequences. `flock` handles
+    /// cross-process writers; this mutex also protects readers that call `reload_from_disk`.
+    state_mutex: Arc<tokio::sync::Mutex<()>>,
     /// Key: `org_id` -> Map of `agent_id` -> `PeerInfo`
     peers: Arc<RwLock<HashMap<String, HashMap<String, PeerInfo>>>>,
     /// Key: `org_id::agent_id` -> Ordered list of `IpcEnvelope` in that Agent's mailbox
@@ -54,15 +60,31 @@ impl AegisIpcBus {
 
     pub fn with_state_file(state_file: Option<PathBuf>) -> Self {
         let mut initial = PersistedIpcState::default();
+        let mut state_error = None;
         if let Some(ref path) = state_file {
-            if let Ok(bytes) = std::fs::read(path) {
-                if let Ok(parsed) = serde_json::from_slice::<PersistedIpcState>(&bytes) {
-                    initial = parsed;
+            match std::fs::read(path) {
+                Ok(bytes) => match serde_json::from_slice::<PersistedIpcState>(&bytes) {
+                    Ok(parsed) => initial = parsed,
+                    Err(error) => {
+                        state_error = Some(format!(
+                            "failed to parse IPC state '{}': {error}",
+                            path.display()
+                        ));
+                    }
+                },
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+                Err(error) => {
+                    state_error = Some(format!(
+                        "failed to read IPC state '{}': {error}",
+                        path.display()
+                    ));
                 }
             }
         }
         Self {
             state_file,
+            state_error: Arc::new(std::sync::Mutex::new(state_error)),
+            state_mutex: Arc::new(tokio::sync::Mutex::new(())),
             peers: Arc::new(RwLock::new(initial.peers)),
             mailboxes: Arc::new(RwLock::new(initial.mailboxes)),
             msg_index: Arc::new(RwLock::new(initial.msg_index)),
@@ -71,20 +93,90 @@ impl AegisIpcBus {
         }
     }
 
+    /// Cross-process writer lock. Held for the whole read-modify-write sequence by mutating
+    /// methods, so two `agy`/CLI processes cannot overwrite each other's task/mailbox updates.
+    async fn state_lock(&self) -> anyhow::Result<Option<std::fs::File>> {
+        let Some(path) = self.state_file.clone() else {
+            return Ok(None);
+        };
+        // `flock` is blocking; acquire it on the blocking pool so a contended writer cannot
+        // starve the async runtime.
+        tokio::task::spawn_blocking(move || {
+            let lock_path = path.with_extension("lock");
+            if let Some(parent) = lock_path.parent() {
+                std::fs::create_dir_all(parent)?;
+            }
+            let file = std::fs::OpenOptions::new()
+                .create(true)
+                .read(true)
+                .write(true)
+                .open(&lock_path)?;
+            #[cfg(unix)]
+            {
+                use std::os::unix::io::AsRawFd;
+                let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+                loop {
+                    let rc = unsafe {
+                        libc::flock(file.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB)
+                    };
+                    if rc == 0 {
+                        break;
+                    }
+                    let error = std::io::Error::last_os_error();
+                    if error.kind() == std::io::ErrorKind::WouldBlock
+                        && std::time::Instant::now() < deadline
+                    {
+                        std::thread::sleep(std::time::Duration::from_millis(20));
+                        continue;
+                    }
+                    anyhow::bail!(
+                        "timed out waiting for IPC state lock '{}': {}",
+                        lock_path.display(),
+                        error
+                    );
+                }
+            }
+            Ok(Some(file))
+        })
+        .await?
+    }
+
+    async fn state_guard(&self) -> tokio::sync::MutexGuard<'_, ()> {
+        self.state_mutex.lock().await
+    }
+
     async fn reload_from_disk(&self) {
         if let Some(ref path) = self.state_file {
-            if let Ok(bytes) = tokio::fs::read(path).await {
-                if let Ok(parsed) = serde_json::from_slice::<PersistedIpcState>(&bytes) {
-                    *self.peers.write().await = parsed.peers;
-                    *self.mailboxes.write().await = parsed.mailboxes;
-                    *self.msg_index.write().await = parsed.msg_index;
-                    *self.tasks.write().await = parsed.tasks;
+            match tokio::fs::read(path).await {
+                Ok(bytes) => match serde_json::from_slice::<PersistedIpcState>(&bytes) {
+                    Ok(parsed) => {
+                        *self.peers.write().await = parsed.peers;
+                        *self.mailboxes.write().await = parsed.mailboxes;
+                        *self.msg_index.write().await = parsed.msg_index;
+                        *self.tasks.write().await = parsed.tasks;
+                    }
+                    Err(error) => {
+                        *self.state_error.lock().unwrap() = Some(format!(
+                            "failed to parse IPC state '{}': {error}",
+                            path.display()
+                        ));
+                    }
+                },
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+                Err(error) => {
+                    *self.state_error.lock().unwrap() = Some(format!(
+                        "failed to read IPC state '{}': {error}",
+                        path.display()
+                    ));
                 }
             }
         }
     }
 
     async fn flush_to_disk(&self) -> anyhow::Result<()> {
+        if let Some(error) = self.state_error.lock().unwrap().clone() {
+            anyhow::bail!("refusing to overwrite corrupt IPC state: {error}");
+        }
         if let Some(ref path) = self.state_file {
             if let Some(parent) = path.parent() {
                 tokio::fs::create_dir_all(parent).await?;
@@ -96,7 +188,11 @@ impl AegisIpcBus {
                 tasks: self.tasks.read().await.clone(),
             };
             let bytes = serde_json::to_vec_pretty(&state)?;
-            tokio::fs::write(path, bytes).await?;
+            // Write to a sibling temp file, then atomically rename. Readers see either the old or
+            // the new complete state, never a truncated JSON file.
+            let tmp = path.with_extension("json.tmp");
+            tokio::fs::write(&tmp, bytes).await?;
+            tokio::fs::rename(&tmp, path).await?;
         }
         Ok(())
     }
@@ -153,6 +249,8 @@ impl AegisIpcBus {
         &self,
         filter_org: Option<&str>,
     ) -> anyhow::Result<Vec<PeerInfo>> {
+        let _state = self.state_guard().await;
+        let _lock = self.state_lock().await?;
         self.reload_from_disk().await;
         let now_ms = Utc::now().timestamp_millis();
         let mut dirty = false;
@@ -187,6 +285,175 @@ impl AegisIpcBus {
         list.sort_by(|a, b| (&a.org_id, &a.agent_id).cmp(&(&b.org_id, &b.agent_id)));
         Ok(list)
     }
+
+    async fn update_task_state_inner(
+        &self,
+        actor: &AgentIdentity,
+        task_id: &str,
+        expected_revision: Option<u64>,
+        state: A2ATaskState,
+        message: Option<String>,
+        artifacts: Vec<A2AArtifact>,
+    ) -> anyhow::Result<A2ATask> {
+        let _state = self.state_guard().await;
+        let _lock = self.state_lock().await?;
+        self.reload_from_disk().await;
+        let now_ms = Utc::now().timestamp_millis();
+        let actor_addr = format!("{}/{}", actor.org_id, actor.agent_id);
+        let task = {
+            let mut tasks = self.tasks.write().await;
+            let t = tasks
+                .get_mut(task_id)
+                .with_context(|| format!("A2A task '{}' not found", task_id))?;
+
+            // Tenant isolation: only task participants may mutate it. Non-participants (including
+            // callers from another org) must not learn that the task exists.
+            let is_requester = t.is_requester(&actor.org_id, &actor.agent_id);
+            let is_assignee = t.is_assignee(&actor.org_id, &actor.agent_id);
+            if !is_requester && !is_assignee {
+                bail!("A2A task '{}' not found", task_id);
+            }
+            // `canceled` is the requester's stop signal. An assignee abandoning its own task
+            // reports `failed` with a reason instead, so the audit trail shows who stopped what.
+            if state == A2ATaskState::Canceled && !is_requester {
+                bail!(
+                    "Only the requester may cancel A2A task '{}'; the assignee must report `failed` with a reason instead",
+                    task_id
+                );
+            }
+            if let Some(expected) = expected_revision {
+                if t.revision != expected {
+                    bail!(
+                        "A2A task '{}' revision conflict: expected {}, current {}",
+                        task_id,
+                        expected,
+                        t.revision
+                    );
+                }
+            }
+            // Repeating the current state is an idempotent no-op; do not append history.
+            if t.state == state {
+                return Ok(t.clone());
+            }
+            // Terminal states are final, and only the legal lifecycle edges are allowed.
+            if !t.state.can_transition_to(state) {
+                bail!(
+                    "Illegal A2A task transition for '{}': {:?} -> {:?}",
+                    task_id,
+                    t.state,
+                    state
+                );
+            }
+
+            t.state = state;
+            t.stale = false;
+            t.revision = t.revision.saturating_add(1);
+            t.updated_at_ms = now_ms;
+            if state == A2ATaskState::Failed {
+                t.failure_kind = Some(
+                    message
+                        .clone()
+                        .unwrap_or_else(|| "unknown".to_string()),
+                );
+            }
+            if !artifacts.is_empty() {
+                t.artifacts.extend(artifacts);
+            }
+            t.history.push(A2ATaskStatusUpdate {
+                state,
+                actor: actor_addr.clone(),
+                message: message.clone(),
+                timestamp_ms: now_ms,
+            });
+            t.clone()
+        };
+
+        // When a task transitions to `input-required`, proactively push a high-priority notification
+        // to the original requester's inbox so `PreInvocation` / `Stop` hooks wake the requester up.
+        if state == A2ATaskState::InputRequired {
+            let (req_org, req_agent) = task
+                .from_agent
+                .split_once('/')
+                .map(|(o, a)| (o.to_string(), a.to_string()))
+                .unwrap_or_else(|| (task.org_id.clone(), task.from_agent.clone()));
+            let notif = IpcEnvelope {
+                msg_id: format!("a2a-inreq-{}", &Uuid::new_v4().to_string()[..8]),
+                org_id: req_org.clone(),
+                from_agent: if req_org == actor.org_id {
+                    actor.agent_id.clone()
+                } else {
+                    actor_addr
+                },
+                to_target: req_agent.clone(),
+                kind: IpcKind::DirectMessage,
+                subject: format!("[A2A input-required] {} (task={})", task.subject, task.id),
+                payload: serde_json::json!({
+                    "a2a_event": "TaskStatusUpdateEvent",
+                    "task_id": task.id,
+                    "context_id": task.context_id,
+                    "state": state,
+                    "message": message,
+                }),
+                attachments: Vec::new(),
+                status: MessageDeliveryStatus::Unread,
+                created_at_ms: now_ms,
+            };
+            self.deliver_to_agent(&req_org, &req_agent, notif).await;
+        }
+
+        self.flush_to_disk().await?;
+        Ok(task)
+    }
+
+
+    /// Mark non-terminal tasks whose assignee is no longer an active peer as `stale`. This is
+    /// intentionally observation-only: it does not change task state, so a live assignee can
+    /// clear the flag by continuing to update the task.
+    pub async fn sweep_stale_tasks(
+        &self,
+        now_ms: i64,
+        threshold_ms: i64,
+    ) -> anyhow::Result<usize> {
+        let _state = self.state_guard().await;
+        let _lock = self.state_lock().await?;
+        self.reload_from_disk().await;
+        let active: std::collections::HashSet<(String, String)> = {
+            let peers = self.peers.read().await;
+            peers
+                .iter()
+                .flat_map(|(org, agents)| {
+                    agents.values().filter(|peer| peer.online).map(move |peer| {
+                        (org.clone(), peer.agent_id.clone())
+                    })
+                })
+                .collect()
+        };
+        let mut count = 0;
+        {
+            let mut tasks = self.tasks.write().await;
+            for task in tasks.values_mut() {
+                if task.stale || task.state.is_terminal() {
+                    continue;
+                }
+                if now_ms.saturating_sub(task.updated_at_ms) < threshold_ms {
+                    continue;
+                }
+                let (org, agent) = {
+                    let (org, agent) = task.assignee();
+                    (org.to_string(), agent.to_string())
+                };
+                if !active.contains(&(org, agent)) {
+                    task.stale = true;
+                    count += 1;
+                }
+            }
+        }
+        if count > 0 {
+            self.flush_to_disk().await?;
+        }
+        Ok(count)
+    }
+
 }
 
 #[async_trait]
@@ -196,6 +463,8 @@ impl IpcBus for AegisIpcBus {
         identity: &AgentIdentity,
         subscribed_topics: Vec<String>,
     ) -> anyhow::Result<PeerInfo> {
+        let _state = self.state_guard().await;
+        let _lock = self.state_lock().await?;
         self.reload_from_disk().await;
         let now_ms = Utc::now().timestamp_millis();
         let existing = self
@@ -267,6 +536,8 @@ impl IpcBus for AegisIpcBus {
         start_time: Option<u64>,
         workspace_root: Option<String>,
     ) -> anyhow::Result<()> {
+        let _state = self.state_guard().await;
+        let _lock = self.state_lock().await?;
         self.reload_from_disk().await;
         let now_ms = Utc::now().timestamp_millis();
         {
@@ -316,6 +587,8 @@ impl IpcBus for AegisIpcBus {
         summary: Option<String>,
         skills: Vec<AgentSkill>,
     ) -> anyhow::Result<PeerInfo> {
+        let _state = self.state_guard().await;
+        let _lock = self.state_lock().await?;
         self.reload_from_disk().await;
         let now_ms = Utc::now().timestamp_millis();
         let updated = {
@@ -363,66 +636,25 @@ impl IpcBus for AegisIpcBus {
         message: Option<String>,
         artifacts: Vec<A2AArtifact>,
     ) -> anyhow::Result<A2ATask> {
-        self.reload_from_disk().await;
-        let now_ms = Utc::now().timestamp_millis();
-        let actor_addr = format!("{}/{}", actor.org_id, actor.agent_id);
-        let task = {
-            let mut tasks = self.tasks.write().await;
-            let t = tasks
-                .get_mut(task_id)
-                .with_context(|| format!("A2A task '{}' not found", task_id))?;
-            t.state = state;
-            t.updated_at_ms = now_ms;
-            if !artifacts.is_empty() {
-                t.artifacts.extend(artifacts);
-            }
-            t.history.push(A2ATaskStatusUpdate {
-                state,
-                actor: actor_addr.clone(),
-                message: message.clone(),
-                timestamp_ms: now_ms,
-            });
-            t.clone()
-        };
+        self.update_task_state_inner(actor, task_id, None, state, message, artifacts)
+            .await
+    }
 
-        // When a task transitions to `input-required`, proactively push a high-priority notification
-        // to the original requester's inbox so `PreInvocation` / `Stop` hooks wake the requester up.
-        if state == A2ATaskState::InputRequired {
-            let (req_org, req_agent) = task
-                .from_agent
-                .split_once('/')
-                .map(|(o, a)| (o.to_string(), a.to_string()))
-                .unwrap_or_else(|| (task.org_id.clone(), task.from_agent.clone()));
-            let notif = IpcEnvelope {
-                msg_id: format!("a2a-inreq-{}", &Uuid::new_v4().to_string()[..8]),
-                org_id: req_org.clone(),
-                from_agent: if req_org == actor.org_id {
-                    actor.agent_id.clone()
-                } else {
-                    actor_addr
-                },
-                to_target: req_agent.clone(),
-                kind: IpcKind::DirectMessage,
-                subject: format!("[A2A input-required] {} (task={})", task.subject, task.id),
-                payload: serde_json::json!({
-                    "a2a_event": "TaskStatusUpdateEvent",
-                    "task_id": task.id,
-                    "context_id": task.context_id,
-                    "state": state,
-                    "message": message,
-                }),
-                attachments: Vec::new(),
-                status: MessageDeliveryStatus::Unread,
-                created_at_ms: now_ms,
-            };
-            self.deliver_to_agent(&req_org, &req_agent, notif).await;
-        }
-
-        self.flush_to_disk().await?;
-        Ok(task)
+    async fn update_task_state_cas(
+        &self,
+        actor: &AgentIdentity,
+        task_id: &str,
+        expected_revision: Option<u64>,
+        state: A2ATaskState,
+        message: Option<String>,
+        artifacts: Vec<A2AArtifact>,
+    ) -> anyhow::Result<A2ATask> {
+        self.update_task_state_inner(actor, task_id, expected_revision, state, message, artifacts)
+            .await
     }
 
     async fn get_task(&self, task_id: &str) -> anyhow::Result<Option<A2ATask>> {
+        let _state = self.state_guard().await;
         self.reload_from_disk().await;
         Ok(self.tasks.read().await.get(task_id).cloned())
     }
@@ -432,6 +664,13 @@ impl IpcBus for AegisIpcBus {
         org_id: Option<&str>,
         agent_id: Option<&str>,
     ) -> anyhow::Result<Vec<A2ATask>> {
+        let _ = self
+            .sweep_stale_tasks(
+                Utc::now().timestamp_millis(),
+                5 * 60 * 1000,
+            )
+            .await;
+        let _state = self.state_guard().await;
         self.reload_from_disk().await;
         let mut out: Vec<A2ATask> = self
             .tasks
@@ -459,6 +698,8 @@ impl IpcBus for AegisIpcBus {
     }
 
     async fn send(&self, mut envelope: IpcEnvelope) -> anyhow::Result<IpcEnvelope> {
+        let _state = self.state_guard().await;
+        let _lock = self.state_lock().await?;
         self.reload_from_disk().await;
         if envelope.msg_id.is_empty() {
             envelope.msg_id = format!("msg-{}", &Uuid::new_v4().to_string()[..8]);
@@ -583,6 +824,9 @@ impl IpcBus for AegisIpcBus {
                         }],
                         created_at_ms: envelope.created_at_ms,
                         updated_at_ms: envelope.created_at_ms,
+                        failure_kind: None,
+                        stale: false,
+                        revision: 0,
                     };
                     self.tasks
                         .write()
@@ -606,6 +850,8 @@ impl IpcBus for AegisIpcBus {
         unread_only: bool,
         limit: usize,
     ) -> anyhow::Result<Vec<IpcEnvelope>> {
+        let _state = self.state_guard().await;
+        let _lock = self.state_lock().await?;
         self.reload_from_disk().await;
         let key = Self::mailbox_key(org_id, agent_id);
         let mut results = Vec::new();
@@ -639,6 +885,8 @@ impl IpcBus for AegisIpcBus {
     }
 
     async fn ack(&self, org_id: &str, agent_id: &str, msg_id: &str) -> anyhow::Result<()> {
+        let _state = self.state_guard().await;
+        let _lock = self.state_lock().await?;
         self.reload_from_disk().await;
         let key = Self::mailbox_key(org_id, agent_id);
         {
@@ -658,6 +906,8 @@ impl IpcBus for AegisIpcBus {
             if task.state == A2ATaskState::Submitted {
                 let now_ms = Utc::now().timestamp_millis();
                 task.state = A2ATaskState::Working;
+                task.stale = false;
+                task.revision = task.revision.saturating_add(1);
                 task.updated_at_ms = now_ms;
                 task.history.push(A2ATaskStatusUpdate {
                     state: A2ATaskState::Working,
@@ -679,6 +929,8 @@ impl IpcBus for AegisIpcBus {
         payload: serde_json::Value,
         attachments: Vec<String>,
     ) -> anyhow::Result<IpcEnvelope> {
+        let _state = self.state_guard().await;
+        let _lock = self.state_lock().await?;
         self.reload_from_disk().await;
         let original = {
             let idx = self.msg_index.read().await;
@@ -733,12 +985,9 @@ impl IpcBus for AegisIpcBus {
                 )
             };
 
-        let key = Self::mailbox_key(&responder.org_id, &responder.agent_id);
-        if let Some(inbox) = self.mailboxes.write().await.get_mut(&key) {
-            if let Some(m) = inbox.iter_mut().find(|m| m.msg_id == original_msg_id) {
-                m.status = MessageDeliveryStatus::Replied;
-            }
-        }
+        // Validate the response envelope before mutating task/mailbox state. A rejected reply must
+        // leave both the task and the original message untouched so it can be retried.
+        Self::validate_attachments(&reply_target_org, &reply_from_agent, &attachments)?;
 
         if let Some(task) = self.tasks.write().await.get_mut(original_msg_id) {
             let now_ms = Utc::now().timestamp_millis();
@@ -747,7 +996,27 @@ impl IpcBus for AegisIpcBus {
             } else {
                 A2ATaskState::Failed
             };
+            if task.state.is_terminal() {
+                bail!(
+                    "A2A task '{}' is already terminal ({:?}); reply is not allowed",
+                    original_msg_id,
+                    task.state
+                );
+            }
+            if !task.state.can_transition_to(next_state) {
+                bail!(
+                    "Illegal A2A task transition for '{}': {:?} -> {:?}",
+                    original_msg_id,
+                    task.state,
+                    next_state
+                );
+            }
             task.state = next_state;
+            task.stale = false;
+            task.revision = task.revision.saturating_add(1);
+            if !success {
+                task.failure_kind = Some("agent_error".to_string());
+            }
             task.updated_at_ms = now_ms;
             let mut artifact_parts = Vec::new();
             if !payload.is_null() {
@@ -777,7 +1046,19 @@ impl IpcBus for AegisIpcBus {
             });
         }
 
+        // Only consume the original message after the task transition has passed validation.
+        let key = Self::mailbox_key(&responder.org_id, &responder.agent_id);
+        if let Some(inbox) = self.mailboxes.write().await.get_mut(&key) {
+            if let Some(m) = inbox.iter_mut().find(|m| m.msg_id == original_msg_id) {
+                m.status = MessageDeliveryStatus::Replied;
+            }
+        }
+
         self.flush_to_disk().await?;
+        // The reply's task/mailbox mutation is committed. Release the writer lock before
+        // enqueueing the response through `send`, which acquires the same lock.
+        drop(_lock);
+        drop(_state);
 
         let response_env = IpcEnvelope {
             msg_id: format!("reply-{}", &Uuid::new_v4().to_string()[..8]),
@@ -818,6 +1099,7 @@ impl IpcBus for AegisIpcBus {
         agent_id: &str,
         limit: usize,
     ) -> anyhow::Result<Vec<IpcEnvelope>> {
+        let _state = self.state_guard().await;
         self.reload_from_disk().await;
         let key = Self::mailbox_key(org_id, agent_id);
         let mailboxes = self.mailboxes.read().await;
@@ -848,6 +1130,8 @@ impl IpcBus for AegisIpcBus {
         if msg_ids.is_empty() {
             return Ok(());
         }
+        let _state = self.state_guard().await;
+        let _lock = self.state_lock().await?;
         self.reload_from_disk().await;
         let key = Self::mailbox_key(org_id, agent_id);
         {
@@ -864,6 +1148,8 @@ impl IpcBus for AegisIpcBus {
     }
 
     async fn touch_peer(&self, identity: &AgentIdentity) -> anyhow::Result<()> {
+        let _state = self.state_guard().await;
+        let lock = self.state_lock().await?;
         self.reload_from_disk().await;
         let now_ms = Utc::now().timestamp_millis();
         let known = {
@@ -883,6 +1169,8 @@ impl IpcBus for AegisIpcBus {
         if known {
             self.flush_to_disk().await
         } else {
+            drop(lock);
+            drop(_state);
             self.register_peer(identity, vec!["*".to_string()]).await.map(|_| ())
         }
     }
@@ -1351,5 +1639,587 @@ mod tests {
         assert_eq!(t2.state, A2ATaskState::Completed);
         assert_eq!(t2.artifacts.len(), 1);
         assert_eq!(t2.history.len(), 4);
+    }
+
+    #[tokio::test]
+    async fn state_lock_sequential_register_peer() {
+        let temp = tempfile::tempdir().unwrap();
+        let state = temp.path().join("ipc_state.json");
+        let bus = AegisIpcBus::with_state_file(Some(state));
+        let a = AgentIdentity::new("org", "a", "A");
+        let b = AgentIdentity::new("org", "b", "B");
+        bus.register_peer(&a, vec![]).await.unwrap();
+        bus.register_peer(&b, vec![]).await.unwrap();
+        bus.update_peer_metadata(&a, None, Some(std::process::id()), None, None)
+            .await
+            .unwrap();
+        let peers = bus.list_peers("org").await.unwrap();
+        assert_eq!(peers.len(), 2);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn concurrent_state_file_writes_do_not_lose_tasks() {
+        let temp = tempfile::tempdir().unwrap();
+        let state = temp.path().join("ipc_state.json");
+        let mut handles = Vec::new();
+        for i in 0..8 {
+            let state = state.clone();
+            handles.push(tokio::spawn(async move {
+                let bus = AegisIpcBus::with_state_file(Some(state));
+                bus.send(IpcEnvelope {
+                    msg_id: String::new(),
+                    org_id: "org".to_string(),
+                    from_agent: "planner".to_string(),
+                    to_target: "worker".to_string(),
+                    kind: IpcKind::TaskRequest {
+                        timeout_secs: Some(60),
+                    },
+                    subject: format!("concurrent-task-{i}"),
+                    payload: json!({ "index": i }),
+                    attachments: vec![],
+                    status: MessageDeliveryStatus::Unread,
+                    created_at_ms: 0,
+                })
+                .await
+                .unwrap();
+            }));
+        }
+        for handle in handles {
+            handle.await.unwrap();
+        }
+
+        let bus = AegisIpcBus::with_state_file(Some(state));
+        let tasks = bus.list_tasks(Some("org"), None).await.unwrap();
+        assert_eq!(tasks.len(), 8, "concurrent writers must not lose tasks");
+        let subjects: std::collections::HashSet<String> =
+            tasks.into_iter().map(|task| task.subject).collect();
+        for i in 0..8 {
+            assert!(subjects.contains(&format!("concurrent-task-{i}")));
+        }
+    }
+
+    #[tokio::test]
+    async fn task_revision_cas_rejects_stale_update() {
+        let bus = AegisIpcBus::new();
+        let requester = AgentIdentity::new("repo", "planner", "Planner");
+        let worker = AgentIdentity::new("repo", "worker", "Worker");
+        bus.register_peer(&requester, vec!["*".to_string()])
+            .await
+            .unwrap();
+        bus.register_peer(&worker, vec!["*".to_string()])
+            .await
+            .unwrap();
+        let task = bus
+            .send(IpcEnvelope {
+                msg_id: String::new(),
+                org_id: "repo".to_string(),
+                from_agent: "repo/planner".to_string(),
+                to_target: "worker".to_string(),
+                kind: IpcKind::TaskRequest {
+                    timeout_secs: Some(60),
+                },
+                subject: "cas".to_string(),
+                payload: json!({}),
+                attachments: vec![],
+                status: MessageDeliveryStatus::Unread,
+                created_at_ms: 0,
+            })
+            .await
+            .unwrap();
+        assert_eq!(bus.get_task(&task.msg_id).await.unwrap().unwrap().revision, 0);
+        bus.ack("repo", "worker", &task.msg_id).await.unwrap();
+        assert_eq!(bus.get_task(&task.msg_id).await.unwrap().unwrap().revision, 1);
+
+        let stale = bus
+            .update_task_state_cas(
+                &worker,
+                &task.msg_id,
+                Some(0),
+                A2ATaskState::InputRequired,
+                Some("stale writer".to_string()),
+                vec![],
+            )
+            .await;
+        assert!(stale.is_err());
+        assert!(stale.unwrap_err().to_string().contains("revision conflict"));
+
+        let updated = bus
+            .update_task_state_cas(
+                &worker,
+                &task.msg_id,
+                Some(1),
+                A2ATaskState::InputRequired,
+                Some("current writer".to_string()),
+                vec![],
+            )
+            .await
+            .unwrap();
+        assert_eq!(updated.revision, 2);
+        assert_eq!(updated.state, A2ATaskState::InputRequired);
+    }
+
+    #[tokio::test]
+    async fn stale_tasks_are_marked_without_killing_them() {
+        let temp = tempfile::tempdir().unwrap();
+        let state = temp.path().join("ipc_state.json");
+        let bus = AegisIpcBus::with_state_file(Some(state));
+        let task = bus
+            .send(IpcEnvelope {
+                msg_id: String::new(),
+                org_id: "repo".to_string(),
+                from_agent: "planner".to_string(),
+                to_target: "worker".to_string(),
+                kind: IpcKind::TaskRequest {
+                    timeout_secs: Some(60),
+                },
+                subject: "stale".to_string(),
+                payload: json!({}),
+                attachments: vec![],
+                status: MessageDeliveryStatus::Unread,
+                created_at_ms: 0,
+            })
+            .await
+            .unwrap();
+        bus.ack("repo", "worker", &task.msg_id).await.unwrap();
+        let now = Utc::now().timestamp_millis();
+        let marked = bus.sweep_stale_tasks(now + 1_000, 0).await.unwrap();
+        assert_eq!(marked, 1);
+        let stale = bus.get_task(&task.msg_id).await.unwrap().unwrap();
+        assert!(stale.stale);
+        assert_eq!(stale.state, A2ATaskState::Working);
+
+        // A live assignee clears the observation flag on its next transition.
+        let worker = AgentIdentity::new("repo", "worker", "Worker");
+        bus.register_peer(&worker, vec!["*".to_string()])
+            .await
+            .unwrap();
+        bus.update_task_state(
+            &worker,
+            &task.msg_id,
+            A2ATaskState::InputRequired,
+            Some("still here".to_string()),
+            vec![],
+        )
+        .await
+        .unwrap();
+        let revived = bus.get_task(&task.msg_id).await.unwrap().unwrap();
+        assert!(!revived.stale);
+    }
+
+    #[tokio::test]
+    async fn corrupt_state_file_is_not_overwritten() {
+        let temp = tempfile::tempdir().unwrap();
+        let state = temp.path().join("ipc_state.json");
+        std::fs::write(&state, b"{not valid json").unwrap();
+        let bus = AegisIpcBus::with_state_file(Some(state.clone()));
+        let identity = AgentIdentity::new("repo", "agent", "Agent");
+        let error = bus
+            .register_peer(&identity, vec!["*".to_string()])
+            .await
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("corrupt"), "{error}");
+        assert_eq!(std::fs::read(&state).unwrap(), b"{not valid json");
+    }
+
+    #[tokio::test]
+    async fn rejected_reply_does_not_consume_message() {
+        let bus = AegisIpcBus::new();
+        let requester = AgentIdentity::new("repo", "planner", "Planner");
+        let worker = AgentIdentity::new("repo", "worker", "Worker");
+        bus.register_peer(&requester, vec!["*".to_string()])
+            .await
+            .unwrap();
+        bus.register_peer(&worker, vec!["*".to_string()])
+            .await
+            .unwrap();
+        let task = bus
+            .send(IpcEnvelope {
+                msg_id: String::new(),
+                org_id: "repo".to_string(),
+                from_agent: "repo/planner".to_string(),
+                to_target: "worker".to_string(),
+                kind: IpcKind::TaskRequest {
+                    timeout_secs: Some(60),
+                },
+                subject: "Cancel then reply".to_string(),
+                payload: json!({}),
+                attachments: vec![],
+                status: MessageDeliveryStatus::Unread,
+                created_at_ms: 0,
+            })
+            .await
+            .unwrap();
+        bus.ack("repo", "worker", &task.msg_id).await.unwrap();
+        bus.update_task_state(
+            &requester,
+            &task.msg_id,
+            A2ATaskState::Canceled,
+            Some("user stopped".to_string()),
+            vec![],
+        )
+        .await
+        .unwrap();
+
+        assert!(bus
+            .reply(&worker, &task.msg_id, true, json!({}), vec![])
+            .await
+            .is_err());
+        let inbox = bus
+            .recv_inbox("repo", "worker", false, 10)
+            .await
+            .unwrap();
+        let original = inbox.iter().find(|m| m.msg_id == task.msg_id).unwrap();
+        assert_ne!(original.status, MessageDeliveryStatus::Replied);
+
+        // An invalid attachment must fail before the task is marked completed.
+        let second = bus
+            .send(IpcEnvelope {
+                msg_id: String::new(),
+                org_id: "repo".to_string(),
+                from_agent: "repo/planner".to_string(),
+                to_target: "worker".to_string(),
+                kind: IpcKind::TaskRequest {
+                    timeout_secs: Some(60),
+                },
+                subject: "Invalid attachment".to_string(),
+                payload: json!({}),
+                attachments: vec![],
+                status: MessageDeliveryStatus::Unread,
+                created_at_ms: 0,
+            })
+            .await
+            .unwrap();
+        bus.ack("repo", "worker", &second.msg_id).await.unwrap();
+        assert!(bus
+            .reply(
+                &worker,
+                &second.msg_id,
+                true,
+                json!({}),
+                vec!["artifact://other-org/sha256:bad".to_string()]
+            )
+            .await
+            .is_err());
+        let after = bus.get_task(&second.msg_id).await.unwrap().unwrap();
+        assert_eq!(after.state, A2ATaskState::Working);
+    }
+
+    #[tokio::test]
+    async fn same_instance_reader_does_not_roll_back_writer() {
+        let temp = tempfile::tempdir().unwrap();
+        let state = temp.path().join("ipc_state.json");
+        let bus = std::sync::Arc::new(AegisIpcBus::with_state_file(Some(state)));
+        let requester = AgentIdentity::new("repo", "planner", "Planner");
+        let worker = AgentIdentity::new("repo", "worker", "Worker");
+        bus.register_peer(&requester, vec!["*".to_string()])
+            .await
+            .unwrap();
+        bus.register_peer(&worker, vec!["*".to_string()])
+            .await
+            .unwrap();
+
+        for i in 0..10 {
+            let task = bus
+                .send(IpcEnvelope {
+                    msg_id: String::new(),
+                    org_id: "repo".to_string(),
+                    from_agent: "repo/planner".to_string(),
+                    to_target: "worker".to_string(),
+                    kind: IpcKind::TaskRequest {
+                        timeout_secs: Some(60),
+                    },
+                    subject: format!("race-{i}"),
+                    payload: json!({}),
+                    attachments: vec![],
+                    status: MessageDeliveryStatus::Unread,
+                    created_at_ms: 0,
+                })
+                .await
+                .unwrap();
+            bus.ack("repo", "worker", &task.msg_id).await.unwrap();
+            let reader_bus = std::sync::Arc::clone(&bus);
+            let task_id = task.msg_id.clone();
+            let reader = async move {
+                for _ in 0..50 {
+                    let _ = reader_bus.peek_inbox("repo", "worker", 10).await;
+                    let _ = reader_bus.list_tasks(Some("repo"), None).await;
+                }
+            };
+            let writer_bus = std::sync::Arc::clone(&bus);
+            let writer_worker = worker.clone();
+            let writer = async move {
+                writer_bus
+                    .update_task_state(
+                        &writer_worker,
+                        &task_id,
+                        A2ATaskState::Completed,
+                        None,
+                        vec![],
+                    )
+                    .await
+                    .unwrap();
+            };
+            tokio::join!(reader, writer);
+            let persisted = bus.get_task(&task.msg_id).await.unwrap().unwrap();
+            assert_eq!(persisted.state, A2ATaskState::Completed, "reader rolled back writer at {i}");
+        }
+    }
+
+    #[tokio::test]
+    async fn a2a_task_state_machine_and_failure_kind() {
+        let bus = AegisIpcBus::new();
+        let requester = AgentIdentity::new("repo", "planner", "Planner");
+        let worker = AgentIdentity::new("repo", "worker", "Worker");
+        bus.register_peer(&requester, vec!["*".to_string()])
+            .await
+            .unwrap();
+        bus.register_peer(&worker, vec!["*".to_string()])
+            .await
+            .unwrap();
+
+        let task = bus
+            .send(IpcEnvelope {
+                msg_id: String::new(),
+                org_id: "repo".to_string(),
+                from_agent: "repo/planner".to_string(),
+                to_target: "worker".to_string(),
+                kind: IpcKind::TaskRequest {
+                    timeout_secs: Some(60),
+                },
+                subject: "State machine".to_string(),
+                payload: json!({}),
+                attachments: vec![],
+                status: MessageDeliveryStatus::Unread,
+                created_at_ms: 0,
+            })
+            .await
+            .unwrap();
+
+        // Submitted may not jump directly to input-required.
+        let illegal = bus
+            .update_task_state(
+                &worker,
+                &task.msg_id,
+                A2ATaskState::InputRequired,
+                Some("need input".to_string()),
+                vec![],
+            )
+            .await;
+        assert!(illegal.is_err());
+        assert!(illegal.unwrap_err().to_string().contains("Illegal"));
+
+        // Acknowledging moves submitted -> working.
+        bus.ack("repo", "worker", &task.msg_id).await.unwrap();
+        bus.update_task_state(
+            &worker,
+            &task.msg_id,
+            A2ATaskState::InputRequired,
+            Some("need input".to_string()),
+            vec![],
+        )
+        .await
+        .unwrap();
+        bus.update_task_state(
+            &worker,
+            &task.msg_id,
+            A2ATaskState::Working,
+            None,
+            vec![],
+        )
+        .await
+        .unwrap();
+        let completed = bus
+            .update_task_state(
+                &worker,
+                &task.msg_id,
+                A2ATaskState::Completed,
+                None,
+                vec![],
+            )
+            .await
+            .unwrap();
+        assert_eq!(completed.state, A2ATaskState::Completed);
+        assert_eq!(completed.failure_kind, None);
+
+        // Repeating the terminal state is an idempotent no-op, not a new history entry.
+        let history_len = completed.history.len();
+        let repeated = bus
+            .update_task_state(
+                &worker,
+                &task.msg_id,
+                A2ATaskState::Completed,
+                None,
+                vec![],
+            )
+            .await
+            .unwrap();
+        assert_eq!(repeated.state, A2ATaskState::Completed);
+        assert_eq!(repeated.history.len(), history_len);
+
+        // Terminal states cannot move back to working.
+        let terminal = bus
+            .update_task_state(
+                &worker,
+                &task.msg_id,
+                A2ATaskState::Working,
+                None,
+                vec![],
+            )
+            .await;
+        assert!(terminal.is_err());
+        assert!(terminal.unwrap_err().to_string().contains("Illegal"));
+
+        // A failed reply records a machine-readable failure kind.
+        let failed_task = bus
+            .send(IpcEnvelope {
+                msg_id: String::new(),
+                org_id: "repo".to_string(),
+                from_agent: "repo/planner".to_string(),
+                to_target: "worker".to_string(),
+                kind: IpcKind::TaskRequest {
+                    timeout_secs: Some(60),
+                },
+                subject: "Failure".to_string(),
+                payload: json!({}),
+                attachments: vec![],
+                status: MessageDeliveryStatus::Unread,
+                created_at_ms: 0,
+            })
+            .await
+            .unwrap();
+        bus.ack("repo", "worker", &failed_task.msg_id)
+            .await
+            .unwrap();
+        bus.reply(&worker, &failed_task.msg_id, false, json!({}), vec![])
+            .await
+            .unwrap();
+        let failed = bus
+            .get_task(&failed_task.msg_id)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(failed.state, A2ATaskState::Failed);
+        assert_eq!(failed.failure_kind.as_deref(), Some("agent_error"));
+        assert!(bus
+            .reply(&worker, &failed_task.msg_id, true, json!({}), vec![])
+            .await
+            .is_err());
+    }
+
+    #[tokio::test]
+    async fn a2a_task_mutation_requires_participant_and_requester_cancel() {
+        let bus = AegisIpcBus::new();
+        let planner = AgentIdentity::new("repo-frontend", "agy-plan", "Planner");
+        let worker = AgentIdentity::new("repo-backend", "claude-work", "Backend Worker");
+        let outsider = AgentIdentity::new("repo-other", "mallory", "Outsider");
+        bus.register_peer(&planner, vec!["*".to_string()])
+            .await
+            .unwrap();
+        bus.register_peer(&worker, vec!["*".to_string()])
+            .await
+            .unwrap();
+        bus.register_peer(&outsider, vec!["*".to_string()])
+            .await
+            .unwrap();
+        let my_pid = std::process::id();
+        bus.update_peer_metadata(
+            &planner,
+            Some("agy".to_string()),
+            Some(my_pid),
+            None,
+            Some("/work/frontend".to_string()),
+        )
+        .await
+        .unwrap();
+        bus.update_peer_metadata(
+            &worker,
+            Some("claude".to_string()),
+            Some(my_pid),
+            None,
+            Some("/work/backend".to_string()),
+        )
+        .await
+        .unwrap();
+
+        let req = bus
+            .send(IpcEnvelope {
+                msg_id: String::new(),
+                org_id: "repo-backend".to_string(),
+                from_agent: "repo-frontend/agy-plan".to_string(),
+                to_target: "claude-work".to_string(),
+                kind: IpcKind::TaskRequest {
+                    timeout_secs: Some(60),
+                },
+                subject: "Cross-org task authorization".to_string(),
+                payload: json!({}),
+                attachments: vec![],
+                status: MessageDeliveryStatus::Unread,
+                created_at_ms: 0,
+            })
+            .await
+            .unwrap();
+
+        // A non-participant from another org gets the same answer as an unknown task.
+        let denied = bus
+            .update_task_state(
+                &outsider,
+                &req.msg_id,
+                A2ATaskState::Canceled,
+                Some("not mine".to_string()),
+                vec![],
+            )
+            .await;
+        assert!(denied.is_err());
+        assert!(denied.unwrap_err().to_string().contains("not found"));
+
+        // The requester may move the task forward even when the task lives in the assignee org.
+        // `submitted -> input-required` is not a legal edge; acknowledge first.
+        bus.ack("repo-backend", "claude-work", &req.msg_id)
+            .await
+            .unwrap();
+        bus.update_task_state(
+            &planner,
+            &req.msg_id,
+            A2ATaskState::InputRequired,
+            Some("need input".to_string()),
+            vec![],
+        )
+        .await
+        .unwrap();
+
+        // The assignee may not cancel; it must report failure with a reason.
+        let assignee_cancel = bus
+            .update_task_state(
+                &worker,
+                &req.msg_id,
+                A2ATaskState::Canceled,
+                Some("assignee stop".to_string()),
+                vec![],
+            )
+            .await;
+        assert!(assignee_cancel.is_err());
+
+        // The requester can cancel, and terminal states are final.
+        bus.update_task_state(
+            &planner,
+            &req.msg_id,
+            A2ATaskState::Canceled,
+            Some("user stopped the task".to_string()),
+            vec![],
+        )
+        .await
+        .unwrap();
+        let after_cancel = bus
+            .update_task_state(
+                &worker,
+                &req.msg_id,
+                A2ATaskState::Completed,
+                None,
+                vec![],
+            )
+            .await;
+        assert!(after_cancel.is_err());
+        assert!(after_cancel.unwrap_err().to_string().contains("Illegal"));
     }
 }

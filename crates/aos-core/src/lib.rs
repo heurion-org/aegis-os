@@ -436,6 +436,33 @@ impl A2ATaskState {
             Self::Completed | Self::Failed | Self::Canceled | Self::Rejected
         )
     }
+
+    /// Legal lifecycle transitions. A task may be repeated in its current state as an idempotent
+    /// no-op; callers should avoid appending history in that case.
+    pub fn can_transition_to(self, next: Self) -> bool {
+        if self == next {
+            return true;
+        }
+        match self {
+            Self::Submitted => matches!(
+                next,
+                Self::Working | Self::Completed | Self::Failed | Self::Canceled | Self::Rejected
+            ),
+            Self::Working => matches!(
+                next,
+                Self::InputRequired
+                    | Self::Completed
+                    | Self::Failed
+                    | Self::Canceled
+                    | Self::Rejected
+            ),
+            Self::InputRequired => matches!(
+                next,
+                Self::Working | Self::Completed | Self::Failed | Self::Canceled | Self::Rejected
+            ),
+            Self::Completed | Self::Failed | Self::Canceled | Self::Rejected => false,
+        }
+    }
 }
 
 /// Google A2A Protocol typed message/artifact part (`TextPart`, `DataPart`, `FilePart`).
@@ -493,6 +520,54 @@ pub struct A2ATask {
     pub history: Vec<A2ATaskStatusUpdate>,
     pub created_at_ms: i64,
     pub updated_at_ms: i64,
+    /// Set when the task reaches `failed`; stable machine-readable reason
+    /// (`policy_denied`, `conflict`, `timeout`, `agent_error`, `revoked`, ...).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub failure_kind: Option<String>,
+    /// Assignee disappeared and the task has not advanced past the stale threshold. This is an
+    /// observation flag, not a terminal state; a live assignee can clear it on its next update.
+    #[serde(default)]
+    pub stale: bool,
+    /// Monotonic version for compare-and-swap task updates. Incremented on every real transition.
+    #[serde(default)]
+    pub revision: u64,
+}
+
+impl A2ATask {
+    /// `(org_id, agent_id)` of the requester. Legacy tasks may store a bare agent id, which is
+    /// resolved against the task's owning org.
+    pub fn requester(&self) -> (&str, &str) {
+        Self::split_address(&self.from_agent, &self.org_id)
+    }
+
+    /// `(org_id, agent_id)` of the assignee. Legacy tasks may store a bare agent id, which is
+    /// resolved against the task's owning org.
+    pub fn assignee(&self) -> (&str, &str) {
+        Self::split_address(&self.to_agent, &self.org_id)
+    }
+
+    fn split_address<'a>(address: &'a str, default_org: &'a str) -> (&'a str, &'a str) {
+        address
+            .split_once('/')
+            .map_or((default_org, address), |(org, agent)| (org, agent))
+    }
+
+    pub fn is_requester(&self, org_id: &str, agent_id: &str) -> bool {
+        let (org, agent) = self.requester();
+        org == org_id && agent == agent_id
+    }
+
+    pub fn is_assignee(&self, org_id: &str, agent_id: &str) -> bool {
+        let (org, agent) = self.assignee();
+        org == org_id && agent == agent_id
+    }
+
+    /// Org-level read visibility: only orgs participating in the task (owner, requester, or
+    /// assignee) may learn that it exists. Other orgs must receive the same answer as for an
+    /// unknown task id.
+    pub fn visible_to_org(&self, org_id: &str) -> bool {
+        self.org_id == org_id || self.requester().0 == org_id || self.assignee().0 == org_id
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -641,6 +716,22 @@ pub trait IpcBus: Send + Sync {
         anyhow::bail!("A2A task '{}' not found", task_id)
     }
 
+    /// Compare-and-swap variant of `update_task_state`. `expected_revision == None` behaves like
+    /// the plain update; `Some(n)` rejects the update when the current revision differs.
+    async fn update_task_state_cas(
+        &self,
+        actor: &AgentIdentity,
+        task_id: &str,
+        expected_revision: Option<u64>,
+        state: A2ATaskState,
+        message: Option<String>,
+        artifacts: Vec<A2AArtifact>,
+    ) -> anyhow::Result<A2ATask> {
+        let _ = expected_revision;
+        self.update_task_state(actor, task_id, state, message, artifacts)
+            .await
+    }
+
     /// Retrieve a stateful A2A `Task` by ID.
     async fn get_task(&self, _task_id: &str) -> anyhow::Result<Option<A2ATask>> {
         Ok(None)
@@ -771,6 +862,15 @@ pub struct PolicyContext {
     pub metadata: serde_json::Value,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum LeaseKind {
+    #[default]
+    Ttl,
+    OneShot,
+    TaskScoped,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct LeaseGrant {
     pub lease_id: String,
@@ -782,6 +882,11 @@ pub struct LeaseGrant {
     pub resource_pattern: String,
     pub expires_at_ms: i64,
     pub granted_by: String,
+    #[serde(default)]
+    pub kind: LeaseKind,
+    /// When `kind == task_scoped`, the A2A task this lease is bound to.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub task_id: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -803,6 +908,8 @@ pub struct PendingEscalation {
     pub suggested_lease_scope: String,
     pub status: EscalationStatus,
     pub created_at_ms: i64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub task_id: Option<String>,
 }
 
 #[async_trait]
@@ -834,6 +941,11 @@ pub trait PolicyEngine: Send + Sync {
         _denied_by: &str,
     ) -> anyhow::Result<PendingEscalation> {
         anyhow::bail!("Escalation '{}' not found", escalation_id)
+    }
+
+    /// Revoke every lease bound to an A2A task. Called when the task reaches a terminal state.
+    async fn revoke_leases_for_task(&self, _task_id: &str) -> anyhow::Result<usize> {
+        Ok(0)
     }
 }
 

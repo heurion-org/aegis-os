@@ -5,7 +5,7 @@
 //! and real multi-trial measurements (Mean ± StdDev) for publication.
 
 use aos_core::{
-    AgentIdentity, ExecSpec, IpcBus, IpcEnvelope, IpcKind, IsolationTier, LeaseGrant,
+    AgentIdentity, ExecSpec, IpcBus, IpcEnvelope, IpcKind, IsolationTier, LeaseGrant, LeaseKind,
     MessageDeliveryStatus, PolicyContext, PolicyDecision, PolicyEngine,
     ResourceLimits, SandboxConfig, SandboxDriver, TransactionalWorkspace,
 };
@@ -1035,6 +1035,8 @@ async fn run_exp2_live_redteam_attacks() -> anyhow::Result<Vec<Exp2RedTeamResult
                 resource_pattern: "*".to_string(),
                 expires_at_ms: chrono::Utc::now().timestamp_millis() + 3_600_000,
                 granted_by: "bench".to_string(),
+                kind: LeaseKind::Ttl,
+                task_id: None,
             })
             .await?;
         let poisoned_paths = [

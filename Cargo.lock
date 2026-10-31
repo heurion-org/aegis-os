@@ -157,8 +157,10 @@ dependencies = [
  "aos-core",
  "async-trait",
  "chrono",
+ "libc",
  "serde",
  "serde_json",
+ "tempfile",
  "tokio",
  "uuid",
 ]
