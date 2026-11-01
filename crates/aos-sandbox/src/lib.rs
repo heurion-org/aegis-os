@@ -433,7 +433,11 @@ impl NativeOsSandboxInstance {
         }
         homes.push(PathBuf::from("/root"));
         if let Ok(rd) = std::fs::read_dir("/home") {
-            homes.extend(rd.flatten().map(|e| e.path()).filter(|p| p.is_dir()));
+            homes.extend(
+                rd.flatten()
+                    .map(|e| e.path())
+                    .filter(|p| p.is_dir() && p.file_name().is_none_or(|n| n != "linuxbrew")),
+            );
         }
         if let Ok(extra) = std::env::var("AOS_EXTRA_CREDENTIAL_HOMES") {
             homes.extend(extra.split(':').filter(|s| !s.is_empty()).map(PathBuf::from));
@@ -515,7 +519,11 @@ impl NativeOsSandboxInstance {
         }
         homes.push(PathBuf::from("/root"));
         if let Ok(rd) = std::fs::read_dir("/home") {
-            homes.extend(rd.flatten().map(|e| e.path()).filter(|p| p.is_dir()));
+            homes.extend(
+                rd.flatten()
+                    .map(|e| e.path())
+                    .filter(|p| p.is_dir() && p.file_name().is_none_or(|n| n != "linuxbrew")),
+            );
         }
         if let Ok(extra) = std::env::var("AOS_EXTRA_CREDENTIAL_HOMES") {
             homes.extend(extra.split(':').filter(|s| !s.is_empty()).map(PathBuf::from));

@@ -493,13 +493,13 @@ enum PolicyAction {
     Status,
     Approve {
         escalation_id: String,
-        #[arg(long, default_value_t = 3600)]
+        #[arg(long, alias = "ttl", default_value_t = 3600)]
         ttl_secs: i64,
     },
     Lease {
         #[arg(long, default_value = "workspace_commit")]
         action_pattern: String,
-        #[arg(long, default_value_t = 3600)]
+        #[arg(long, alias = "ttl", default_value_t = 3600)]
         ttl_secs: i64,
         /// Optional A2A task id; binds the lease to that task
         #[arg(long)]

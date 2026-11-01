@@ -1,8 +1,10 @@
 # Aegis OS (`aegis-os`)
 
+**[English](README.md) | [简体中文](README_CN.md)**
+
 **A Transactional Multi-Tenant Operating System Runtime & Cloud PaaS for Eliminating Authorization Fatigue in Autonomous Coding Agents (`agy`, `claude`, `codex`)**
 
-![Rust](https://img.shields.io/badge/Rust-1.99%2B-orange.svg)
+![Rust](https://img.shields.io/badge/Rust-1.80%2B%20(2021)-orange.svg)
 
 ![MCP](https://img.shields.io/badge/Protocol-MCP%202024--11--05-blue.svg)
 
@@ -33,27 +35,70 @@ Autonomous coding agents such as **Google Antigravity (`agy`)**, **Anthropic Cla
                ▼                             ▼                             ▼
 ┌────────────────────────────────────────────────────────────────────────────────────────┐
 │  Aegis MCP, Google A2A & Cloud PaaS Gateway (aos-mcp-gateway)                          │
-│  • 35 MCP Tools + 7 Dynamic URI Resources (stdio, POST /mcp, POST /v1/mcp)             │
+│  • 38 MCP Tools + 7 Dynamic URI Resources (stdio, POST /mcp, POST /v1/mcp)             │
 │  • Google A2A Hub (GET /.well-known/agent.json, POST /a2a, POST /v1/a2a)               │
 │  • Cloud PaaS API (/v1/workspaces, /v1/workspaces/pr, /v1/tenants/keys, /v1/vault/*)   │
 │  • Embedded Vector Web Mission Control & HITL Approval Console (GET /dashboard)        │
 └───────────────────────────────────────────────┬────────────────────────────────────────┘
                                                 ▼
 ┌────────────────────────────────────────────────────────────────────────────────────────┐
-│  Cedar-Inspired 5-Stage Policy Engine & Session Lease Manager (aos-policy)             │
+│  Declarative Cedar Policy Engine & Session Lease Manager (aos-policy + default.cedar)  │
 │  R0a: Host Red-Line Deny │ R0b: Commit Hook/CI Guard │ R1: Cross-Tenant Gate           │
-│  R2: TTL/One-Shot Lease  │ R3: Green-Zone Auto-Allow │ R4: Human-Readable Escalation   │
+│  R2: TTL/One-Shot Lease  │ R3: Cedar Auto-Allow      │ R4: Human-Readable Escalation   │
 └───────┬──────────────────────────┬───────────────────────────┬────────────────────┬────┘
         ▼                          ▼                           ▼                    ▼
 ┌───────────────────┐  ┌───────────────────────┐  ┌──────────────────────┐  ┌────────────────────┐
 │ Transactional VFS │  │ Dual-Tier OS Sandbox  │  │ A2A IPC Bus & CAS    │  │ Zero-Trust Egress  │
 │ (aos-vfs)         │  │ (aos-sandbox)         │  │ (aos-ipc + aos-vfs)  │  │ (aos-egress)       │
-│ • APFS clonefile  │  │ • macOS sandbox-exec  │  │ • Global Peer List   │  │ • Identity-Pinned  │
-│ • Linux FICLONE   │  │ • Linux bwrap/MicroVM │  │ • A2A AgentCard/Task │  │   Loopback Proxy   │
-│ • 4-Tier LCS Diff3│  │ • Exact Port Filter   │  │ • Enforced Claims    │  │ • Domain + Path    │
-│ • Git-to-PR Export│  │ • Separate cargo cache│  │ • artifact://sha256  │  │   $AOS_SECRET_*    │
+│ • APFS clonefile  │  │ • macOS sandbox-exec  │  │ • Global Peer List   │  │ • HTTPS CONNECT &  │
+│ • Linux FICLONE   │  │ • Linux bwrap/MicroVM │  │ • A2A AgentCard/Task │  │   HTTP Proxy       │
+│ • 4-Tier LCS Diff3│  │ • PGID SIGSTOP/KILL   │  │ • Enforced Claims    │  │ • Domain + Path    │
+│ • Lazy-CoW Symlink│  │ • Separate cargo cache│  │ • artifact://sha256  │  │   $AOS_SECRET_*    │
 └───────────────────┘  └───────────────────────┘  └──────────────────────┘  └────────────────────┘
 ```
+
+---
+
+## Quick Start (30-Second Setup)
+
+### Option A: Homebrew (macOS & Linux)
+
+```bash
+# 1. Install the Aegis OS binary via Homebrew
+brew tap heurion-org/aegis-os https://github.com/heurion-org/aegis-os.git
+brew install aegis-os
+
+# 2. Wire Antigravity (agy), Claude Code (claude), and Codex CLI (codex) globally (run once)
+aegis-os install
+```
+
+### Option B: One-Line Signed Installer (Linux & macOS, No Homebrew Required)
+
+Downloads the precompiled binary for your OS/architecture, verifies its OpenSSH cryptographic release signature (`aegis-os-release@heurion.org`), and runs `aegis-os install` automatically:
+
+```bash
+curl -fsSL https://heurion.org/aegis-cloud/install.sh | sh
+# Or directly from GitHub:
+curl -fsSL https://raw.githubusercontent.com/heurion-org/aegis-os/main/scripts/install.sh | sh
+```
+
+### Option C: Build from Source (Rust 1.80+)
+
+```bash
+git clone https://github.com/heurion-org/aegis-os.git && cd aegis-os
+cargo install --path crates/aos-cli
+aegis-os install
+```
+
+### Daily Usage (Zero Manual Commands Needed)
+
+After running `aegis-os install` once, you **never need to invoke `aegis-os` manually** during daily coding:
+
+1. **Open your coding agent directly** (`agy`, `claude`, or `codex`) in any project directory.
+2. **Automatic First-Run Mode Selection**: On first launch in a project, Aegis OS's `PreInvocation` hook instructs the coding agent to ask whether you want **Cloud Sandbox Mode** or **Free Local Community Mode**:
+   - **Free Local Community Mode (`mode="local"`)**: Runs immediately inside a zero-copy Copy-on-Write shadow workspace with native OS kernel sandboxing (`sandbox-exec` on macOS, `bwrap` on Linux) and **zero intermediate permission prompts**.
+   - **Aegis Cloud Sandbox Mode (`mode="cloud"`)**: Offloads all heavy compilation (`cargo`, `npm`, `pytest`) and parallel multi-agent sandboxes to remote Linux `btrfs` cloud nodes (**0% local CPU/RAM load**), syncing verified text-only diffs back to your laptop on commit.
+3. **Verify Health Anytime**: Run `aegis-os doctor` to check client integrations, or `aegis-os top` to view the live multi-agent collaboration radar.
 
 ---
 
@@ -61,18 +106,18 @@ Autonomous coding agents such as **Google Antigravity (`agy`)**, **Anthropic Cla
 
 ### 1. Transactional Copy-on-Write VFS & 4-Tier Auto-Rebase/Merge (`aos-vfs`)
 
-- **Millisecond Zero-Copy Shadow Forking**: Clones repositories into `<runtime_dir>/orgs/<org>/agents/<agent>/cow_workspace/upper_workspace/` via **macOS APFS `libc::clonefile`** (`0.71–6.28 ms` for 100–1,000 files) or **Linux Btrfs/XFS single-open 7-syscall `ioctl(FICLONE)` reflink** (`15.6 ms` on btrfs; plus optional kernel `BTRFS_IOC_SNAP_CREATE_V2` subvolume snapshots via `AOS_BTRFS_SUBVOL=1`), allocating physical disk blocks only for modified files.
+- **Millisecond Zero-Copy Shadow Forking & Cross-Mount Lazy-CoW**: Clones repositories into `<runtime_dir>/orgs/<org>/agents/<agent>/cow_workspace/upper_workspace/` via **macOS APFS `libc::clonefile`** (`0.71–6.28 ms` for 100–1,000 files) or **Linux Btrfs/XFS single-open 7-syscall `ioctl(FICLONE)` reflink** (`15.6 ms` on btrfs; plus optional kernel `BTRFS_IOC_SNAP_CREATE_V2` subvolume snapshots via `AOS_BTRFS_SUBVOL=1`), allocating physical disk blocks only for modified files. On cross-mount setups (`ext4 -> tmpfs`), oversized assets (`>16 MB`, configurable via `AOS_MAX_COW_FILE_MB`) automatically fall back to read-only symlinks and un-symlink on first write.
 - **Continuous Auto-Rebase & `mtime` Sync**: Automatically runs `refresh_from_host()` at every turn start (`PreInvocation`) and workspace tool boundary (`workspace_status`, `workspace_sync`, `workspace_diff`, `workspace_commit`), bumping file `mtime`s on fast-forwarded and merged files so incremental compilers (`cargo`) always recompile peer-updated dependencies.
 - **4-Tier Conflict Resolution Engine (`three_way_merge_lines`) & Pre-Commit Semantic Verification Gate (`verify_cmd`)**:
   1. **Tier 1 (Zero-Copy Fast-Forward)**: Untouched text and binary files updated on the host by peer agents are fast-forwarded into the shadow workspace and baseline snapshot automatically.
-  2. **Tier 2 (2-Phase LCS Diff3 & Superset Merge)**: Concurrent edits to different lines, identical changes (`th == oh`), or superset line additions (`is_subsequence`) within the same file are spliced together automatically.
-  3. **Tier 3 (Non-Destructive Conflict Isolation & Sandboxed Semantic Gate)**: True overlapping same-line conflicts never corrupt shadow source files with `<<<<<<<` markers; instead, `RefreshReport.conflict_details` records the exact file, line number, and both versions, pushing an `[Aegis-OS Merge Conflict Alert]` to the agent at `PreInvocation`. In addition, `workspace_commit` supports an optional sandboxed `verify_cmd` (e.g., `rustc --emit=metadata` or `cargo check --offline`) that catches disjoint-line semantic regressions before any host file is modified.
+  2. **Tier 2 (2-Phase LCS Diff3, Superset & Commutative Declaration Merge)**: Concurrent edits to different lines, identical changes (`th == oh`), superset line additions (`is_subsequence`), or concurrent commutative import/module declarations (`use ...;`, `pub mod ...;`, `import ...`) at the same anchor line are merged automatically without false conflicts.
+  3. **Tier 3 (Non-Destructive Conflict Isolation & Sandboxed Semantic Gate)**: True overlapping same-line conflicts never corrupt shadow source files with `<<<<<<<` markers; instead, `RefreshReport.conflict_details` records the exact file, line number, and both versions, pushing an `[Aegis-OS Merge Conflict Alert]` to the agent at `PreInvocation`. In addition, `workspace_commit` supports an optional sandboxed `verify_cmd` (explicitly passed, via `AOS_VERIFY_CMD`, or configured in `<repo>/.aegis/verify.json`) that catches disjoint-line semantic regressions before any host file is modified.
   4. **Tier 4 (Binary Artifact Guard)**: Prevents accidental overwrite of concurrently generated binary artifacts (`.pdf`, `.tar.gz`), supporting scoped `paths` commits or explicit `overwrite_binaries: true`.
 
 ### 2. Dual-Tier Kernel Sandbox & Confused-Deputy-Safe Egress Proxy (`aos-sandbox`, `aos-egress`)
 
-- **Mandatory Access Control & Default-Deny `$HOME` Credential Isolation**: Executes every `proc_exec` command under macOS Seatbelt (`/usr/bin/sandbox-exec`) or Linux Bubblewrap (`/usr/bin/bwrap --unshare-all`) with a sanitized environment (`env_clear()`), denying all writes outside the shadow workspace (`(deny file-write*)`), blocking reads to `~/.ssh`, `~/.aws`, `~/.gnupg`, `~/.kube`, `~/.docker`, `~/.azure`, `~/.config/{gh,gcloud}`, `~/.npmrc`, `~/.netrc`, `~/.git-credentials`, and Keychains on macOS, and mounting a **default-deny empty `--tmpfs` over `$HOME`, `/root`, and `/home/*`** on Linux (before selectively re-binding read-only `.rustup` and `.cargo/{bin,registry,git}` toolchains) so even unknown custom credential paths in `$HOME` are completely hidden.
-- **L7 Method/Path-Scoped Boundary Secret Injection & Outbound DLP (`inspect_payload_dlp`)**: Agents receive only opaque `$AOS_SECRET_*` placeholders. Outbound requests traverse an identity-pinned local TCP proxy (`127.0.0.1:<port>`) enforced by Seatbelt `(allow network-outbound (remote ip "localhost:<port>"))` (or a token-authenticated Unix-socket egress bridge on Linux), which canonicalizes URL paths (RFC 3986 `normalize_request_path`), injects real credentials only when the destination `Host`, HTTP method, and URL path prefix match the secret's `SecretScopeRule`, and scans URL query strings and HTTP bodies via `inspect_payload_dlp` for leaked placeholders, vault values, and standard credential formats (PEM private keys, AWS `AKIA*`, GitHub `ghp_*`, `sk-*`, `xoxb-*`), rejecting exfiltration with `HTTP/1.1 403 Forbidden`.
+- **Mandatory Access Control, Default-Deny `$HOME` Credential Isolation & Process-Group Lifecycle**: Executes every `proc_exec` command under macOS Seatbelt (`/usr/bin/sandbox-exec`) or Linux Bubblewrap (`/usr/bin/bwrap --unshare-all`) with a sanitized environment (`env_clear()`), denying all writes outside the shadow workspace (`(deny file-write*)`), blocking reads to `~/.ssh`, `~/.aws`, `~/.gnupg`, `~/.kube`, `~/.docker`, `~/.azure`, `~/.config/{gh,gcloud}`, `~/.npmrc`, `~/.netrc`, `~/.git-credentials`, and Keychains on macOS, and mounting a **default-deny empty `--tmpfs` over `$HOME`, `/root`, and `/home/*`** on Linux (before selectively re-binding read-only `.rustup` and `.cargo/{bin,registry,git}` toolchains) so even unknown custom credential paths in `$HOME` are completely hidden. Tracks active sandbox process groups (`active_pgids`) to enforce real kernel `SIGSTOP` / `SIGCONT` / `SIGKILL` across `pause()`, `resume()`, and `destroy()`.
+- **L7 Method/Path-Scoped Boundary Secret Injection, HTTPS `CONNECT` Tunneling & Outbound DLP (`inspect_payload_dlp`)**: Agents receive only opaque `$AOS_SECRET_*` placeholders. Outbound requests traverse an identity-pinned local TCP proxy (`127.0.0.1:<port>`) enforced by Seatbelt `(allow network-outbound (remote ip "localhost:<port>"))` (or a token-authenticated Unix-socket egress bridge on Linux), supporting both **HTTPS `CONNECT host:port` bidirectional TCP tunnels** (validated against the organization domain allowlist) and **upstream HTTP forwarding** (`X-Aegis-Forward: 1` / `X-Aegis-Upstream`), which canonicalizes URL paths (RFC 3986 `normalize_request_path`), injects real credentials at the network boundary only when the destination `Host`, HTTP method, and URL path prefix match the secret's `SecretScopeRule`, and scans URL query strings and HTTP bodies via `inspect_payload_dlp` for leaked placeholders, vault values, and standard credential formats (PEM private keys, AWS `AKIA*`, GitHub `ghp_*`, `sk-*`, `xoxb-*`), rejecting exfiltration with `HTTP/1.1 403 Forbidden`.
 
 ### 3. Google A2A Inter-Agent IPC, Global Peer Discovery & Live Collaboration Radar (`aos-ipc`, `aos-cli`)
 
@@ -82,9 +127,9 @@ Autonomous coding agents such as **Google Antigravity (`agy`)**, **Anthropic Cla
 - **Task Board & Task-Scoped Leases**: `aegis-os a2a board` / `a2a show <id>` gives a terminal view of live, blocked, stale, and terminal tasks; `aegis-os ipc request` creates a stateful A2A task; `aegis-os policy lease --task-id <id>` binds a lease to one A2A task, and terminal task transitions revoke its task-scoped leases.
 - **Reference-Based CAS (`FilePart`)**: Publishes large specifications to Content-Addressable Storage (`artifact://<org>/sha256:<hash>`), reducing in-transit IPC payload tokens by **99.85%**.
 
-### 4. Cedar-Inspired 5-Stage Policy Engine & Commit-Time Poisoning Guards (`aos-policy`)
+### 4. Declarative Cedar 5-Stage Policy Engine & Commit-Time Poisoning Guards (`aos-policy`)
 
-- Evaluates every syscall across five priority tiers: **R0a** (Host Red-Line Deny), **R0b** (Commit-Time Hook, CI & Build-Script Guard forcing human review on `.git/hooks/*`, `.git/config`, `.envrc`, `.github/workflows/*`, `build.rs`, `Makefile`, `package.json`, and `.cargo/config.toml` even under an active lease), **R1** (Cross-Tenant Gate), **R2** (One-Shot `ttl=0` or TTL-Scoped `LeaseGrant`), **R3** (Green-Zone Auto-Allow with 0 prompts), and **R4** (Human-Readable Boundary Escalation with explicit `approve_escalation` / `deny_escalation`).
+- Parses and evaluates declarative `permit` / `forbid` rules from [`policy/default.cedar`](policy/default.cedar) (plus optional custom policies via `AOS_CEDAR_POLICY_FILE`) across five priority tiers: **R0a** (Host Red-Line & Custom Cedar `forbid` Deny), **R0b** (Commit-Time Hook, CI & Build-Script Guard forcing human review on `.git/hooks/*`, `.git/config`, `.envrc`, `.aegis/*`, `.github/workflows/*`, `build.rs`, `Makefile`, `package.json`, and `.cargo/config.toml` even under an active lease), **R1** (Cross-Tenant Gate), **R2** (One-Shot `ttl=0` or TTL-Scoped `LeaseGrant`), **R3** (Declarative Cedar Green-Zone Auto-Allow with 0 prompts), and **R4** (Human-Readable Boundary Escalation with explicit `approve_escalation` / `deny_escalation`).
 
 
 ### 5. Aegis Cloud PaaS Control Plane, Git-to-PR Pipeline & Vector Web Mission Control (`aos-mcp-gateway::paas`)
@@ -155,7 +200,7 @@ The protocol remains vendor-neutral and independently specified; Aegis OS is one
 
 ## Local Community Mode (Free) vs. Aegis Cloud Mode (Subscription)
 
-To coding agents (`agy`, `claude`, `codex`), **Local Mode** and **Cloud Mode** expose the **exact same 25+ MCP tools and transactional CoW semantics (100% behavioral isomorphism)**. Under the hood, they provide two distinct execution tiers:
+To coding agents (`agy`, `claude`, `codex`), **Local Mode** and **Cloud Mode** expose the **exact same 38 MCP tools and transactional CoW semantics (100% behavioral isomorphism)**. Under the hood, they provide two distinct execution tiers:
 
 | Dimension                                              | Local Community Mode (Free / Open-Core)                                                                                                                                                     | Aegis Cloud Sandbox Mode (`Pro` / `Team` / `Enterprise`)                                                                                                                                                                                                                                              | Developer Value of Cloud Mode                                                                                                                |
 | :----------------------------------------------------- | :------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------ | :---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | :------------------------------------------------------------------------------------------------------------------------------------------- |
@@ -168,23 +213,9 @@ To coding agents (`agy`, `claude`, `codex`), **Local Mode** and **Cloud Mode** e
 
 ---
 
-## Quick Start
+## Cloud Mode, Daemon Authentication & Approver Enrollment
 
-### 1. Homebrew Onboarding (`brew install` + `aegis-os install` → Directly Launch `agy` / `claude` / `codex`)
-
-Homebrew installs the binary; one Aegis command wires the clients:
-
-```bash
-# Install via Homebrew
-brew tap heurion-org/aegis-os https://github.com/heurion-org/aegis-os.git
-brew trust heurion-org/aegis-os
-brew install aegis-os
-
-# Wire AGY, Claude Code, and Codex CLI (run once)
-aegis-os install
-```
-
-Homebrew's post-install sandbox cannot update client configs in your home directory, so `aegis-os install` is explicit. After that, users **never need to run `aegis-os` manually**.
+### 1. Seamless Local <-> Cloud Mode Switching
 
 1. **Open your coding agent directly** (`agy`, `claude`, or `codex`) in any project directory.
 2. **Automatic First-Run Subscription Check**: On first launch in a project, Aegis OS's `PreInvocation` hook instructs the coding agent to ask whether you have an **Aegis Cloud Subscription**:
@@ -358,10 +389,30 @@ cargo build --release -p aos-cli --features ablation && python3 scripts/e5_ablat
 - [`crates/aos-sandbox`](crates/aos-sandbox): Dual-tier OS sandbox driver (`NativeOsSandboxDriver` via macOS Seatbelt / Linux `bwrap`, and `MicroVmSandboxDriver`).
 - [`crates/aos-egress`](crates/aos-egress): Identity-pinned Zero-Trust TCP HTTP Egress Proxy with domain, HTTP method, and URL path-prefix boundary secret injection (`$AOS_SECRET_*`).
 - [`crates/aos-recorder`](crates/aos-recorder): Append-only JSONL flight recorder for syscalls and security telemetry.
-- [`crates/aos-mcp-gateway`](crates/aos-mcp-gateway): Unified MCP JSON-RPC & Google A2A server (`lib.rs`), AAP-1.0 App Store & Progressive MCP Proxy (`app_store.rs`), and Cloud PaaS Control Plane & Embedded Vector Web Mission Control Console (`paas.rs`).
-- [`crates/aos-cli`](crates/aos-cli): Unified `aegis-os` binary (`up`, `down`, `status`, `install`, `doctor`, `top`, `daemon`, `agy-hook`, `workspace`, `policy`, `ipc`, `app`, `cloud`, `bench`, `demo`), MCP-first routing, and `PreInvocation` Live Collaboration Radar.
+- [`crates/aos-mcp-gateway`](crates/aos-mcp-gateway): Unified MCP JSON-RPC & Google A2A server (`lib.rs`), AAP-1.0 App Store & Progressive MCP Proxy (`app_store.rs`), and Cloud PaaS Control Plane & Embedded Vector Web Mission Control Console (`paas.rs`, `assets/dashboard.html`).
+- [`crates/aos-cli`](crates/aos-cli): Unified `aegis-os` binary (`install`, `doctor`, `stats`, `up`, `down`, `status`, `top`, `daemon`, `agy-hook`, `workspace`, `policy`, `ipc`, `app`, `cloud`, `memory`, `bench`, `demo`), modular installer & lifecycle hook handlers (`installer.rs`, `hooks.rs`, `telemetry.rs`, `memory_ui.rs`), MCP-first routing, and `PreInvocation` Live Collaboration Radar.
+- [`policy/default.cedar`](policy/default.cedar): Baseline declarative Cedar policy rules loaded into `aos-policy` at compile time (extensible via `AOS_CEDAR_POLICY_FILE`).
 - [`docs/AEGIS_APPLICATION_PROTOCOL.md`](docs/AEGIS_APPLICATION_PROTOCOL.md): Complete `AAP-1.0` Application Protocol specification (manifest schema, user-bound `aegis_at_*` grant tokens, RFC 8628 Device Code Flow, Ed25519 lease-gated governance, and CoW sandbox data bridge).
 - [`paper/`](paper): LaTeX preprint (`main.tex`, `references.bib`, `aegis_os_arxiv_preprint.pdf`) and automated arXiv submission packager (`build_arxiv.sh`, `arxiv_submission.tar.gz`).
+
+---
+
+## Telemetry & Privacy (`DO_NOT_TRACK=1`)
+
+To help us understand adoption across operating systems and coding clients (`agy`, `claude`, `codex`), `aegis-os` records a minimal, strictly anonymous ping during `aegis-os install` and at most once per UTC day on session start:
+
+- **What is sent**: A one-way irreversible 16-hex-character hash (`anon-<16hex>`), Aegis OS version (`0.4.5`), OS/architecture (`macos-aarch64`, `linux-x86_64`), and client type (`agy`, `claude-code`, `codex-cli`).
+- **What is NEVER sent**: No source code, file paths, repository names, environment variables, prompts, usernames, or hostnames are ever collected.
+- **Inspect or Opt Out Anytime**:
+  - View current telemetry & GitHub release stats in your terminal: `aegis-os stats`
+  - Disable telemetry completely via environment variable or marker file:
+    ```bash
+    export DO_NOT_TRACK=1
+    # or:
+    export AOS_TELEMETRY_DISABLED=1
+    # or:
+    touch ~/.gemini/aegis-telemetry-opt-out
+    ```
 
 ---
 
