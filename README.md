@@ -170,16 +170,21 @@ To coding agents (`agy`, `claude`, `codex`), **Local Mode** and **Cloud Mode** e
 
 ## Quick Start
 
-### 1. Zero-CLI Onboarding (`brew install` → Directly Launch `agy` / `claude` / `codex`)
+### 1. One-Command Onboarding (`brew install` + `aegis-os install` → Directly Launch `agy` / `claude` / `codex`)
 
-Users **never need to run `aegis-os` manually** after installation:
+Homebrew installs the binary; one Aegis command wires the clients:
 
 ```bash
-# Install via Homebrew (automatically wires AGY, Claude Code, and Codex CLI in 2 seconds)
+# Install via Homebrew
 brew tap heurion-org/aegis-os https://github.com/heurion-org/aegis-os.git
 brew trust heurion-org/aegis-os
 brew install aegis-os
+
+# Wire AGY, Claude Code, and Codex CLI (run once)
+aegis-os install
 ```
+
+Homebrew's post-install sandbox cannot update client configs in your home directory, so `aegis-os install` is explicit. After that, users **never need to run `aegis-os` manually**.
 
 1. **Open your coding agent directly** (`agy`, `claude`, or `codex`) in any project directory.
 2. **Automatic First-Run Subscription Check**: On first launch in a project, Aegis OS's `PreInvocation` hook instructs the coding agent to ask whether you have an **Aegis Cloud Subscription**:

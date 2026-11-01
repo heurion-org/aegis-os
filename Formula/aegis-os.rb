@@ -39,18 +39,14 @@ class AegisOs < Formula
     bin.install_symlink "aegis-os" => "aos"
   end
 
-  def post_install
-    # Automatically wire Aegis OS into Antigravity (`agy`), Claude Code (`claude`), and Codex (`codex`)
-    # so users never need to run `aegis-os` manually from the terminal after `brew install`.
-    system "#{bin}/aegis-os", "install"
-  end
-
   def caveats
     <<~EOS
-      Aegis OS has been automatically integrated into Antigravity (`agy`), Claude Code (`claude`), and Codex (`codex`).
+      Run this once to wire Aegis OS into Antigravity (`agy`), Claude Code (`claude`), and Codex (`codex`):
+        aegis-os install
 
-      Zero-CLI Quickstart:
-      - Simply launch `agy`, `claude`, or `codex` in ANY project directory (no need to run `aos` manually).
+      Homebrew's post-install sandbox cannot update your home-directory client configs, so this step is explicit.
+
+      After that, simply launch `agy`, `claude`, or `codex` in ANY project directory:
       - On first launch, your coding agent will automatically ask if you have an Aegis Cloud subscription:
         * With subscription: guides you to activate Zero-Local-Load Cloud Sandbox mode (`runtime_configure_mode(mode="cloud")`).
         * Without subscription: automatically activates Free Local CoW Sandbox mode (`runtime_configure_mode(mode="local")`).
