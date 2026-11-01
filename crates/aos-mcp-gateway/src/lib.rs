@@ -1164,11 +1164,47 @@ impl AegisRuntimeKernel {
                     .get("overwrite_binaries")
                     .and_then(|v| v.as_bool())
                     .unwrap_or(false);
-                let verify_cmd = args
-                    .get("verify_cmd")
-                    .and_then(|v| v.as_str())
-                    .map(|s| s.trim().to_string())
-                    .filter(|s| !s.is_empty());
+                let skip_verify = args
+                    .get("skip_verify")
+                    .and_then(|v| v.as_bool())
+                    .unwrap_or(false);
+                let host_verify_cfg: Option<serde_json::Value> = std::fs::read(
+                    env.workspace.host_source_root().join(".aegis/verify.json"),
+                )
+                .ok()
+                .and_then(|bytes| serde_json::from_slice(&bytes).ok());
+                let verify_cmd = if skip_verify {
+                    None
+                } else {
+                    args.get("verify_cmd")
+                        .and_then(|v| v.as_str())
+                        .map(|s| s.trim().to_string())
+                        .filter(|s| !s.is_empty())
+                        .or_else(|| {
+                            std::env::var("AOS_VERIFY_CMD")
+                                .ok()
+                                .map(|s| s.trim().to_string())
+                                .filter(|s| !s.is_empty())
+                        })
+                        .or_else(|| {
+                            host_verify_cfg
+                                .as_ref()
+                                .and_then(|cfg| cfg.get("verify_cmd"))
+                                .and_then(|v| v.as_str())
+                                .map(|s| s.trim().to_string())
+                                .filter(|s| !s.is_empty())
+                        })
+                };
+                let verify_timeout_ms = args
+                    .get("verify_timeout_ms")
+                    .and_then(|v| v.as_u64())
+                    .or_else(|| {
+                        host_verify_cfg
+                            .as_ref()
+                            .and_then(|cfg| cfg.get("timeout_ms"))
+                            .and_then(|v| v.as_u64())
+                    })
+                    .or(Some(30_000));
                 // Refresh from host first so untouched peer-modified files (including binaries) fast-forward cleanly.
                 let refresh = env.workspace.refresh_from_host().await?;
                 // Coordination guard: refuse to land files that a live peer has claimed.
@@ -1191,10 +1227,7 @@ impl AegisRuntimeKernel {
                                 args: vec!["-c".to_string(), cmd.clone()],
                                 cwd: Some(env.workspace.shadow_root().to_path_buf()),
                                 env: HashMap::new(),
-                                timeout_ms: args
-                                    .get("verify_timeout_ms")
-                                    .and_then(|v| v.as_u64())
-                                    .or(Some(30_000)),
+                                timeout_ms: verify_timeout_ms,
                                 background: false,
                             })
                             .await?;
@@ -2805,13 +2838,48 @@ impl AegisRuntimeKernel {
         }
     }
 
+    fn is_repo_root(dir: &Path) -> bool {
+        dir.join(".git").exists()
+            || dir.join("Cargo.toml").exists()
+            || dir.join("package.json").exists()
+            || dir.join("pyproject.toml").exists()
+            || dir.join("go.mod").exists()
+    }
+
+    /// If `dir` is an umbrella parent directory (containing one or more child repositories rather than
+    /// being a repository root itself), returns the most recently modified child repository root.
+    pub fn resolve_umbrella_child_repo(dir: &Path) -> Option<PathBuf> {
+        if Self::is_repo_root(dir) {
+            return None;
+        }
+        let entries = std::fs::read_dir(dir).ok()?;
+        let mut best: Option<(std::time::SystemTime, PathBuf)> = None;
+        for entry in entries.flatten() {
+            let p = entry.path();
+            if !p.is_dir() {
+                continue;
+            }
+            let name = entry.file_name();
+            let name_str = name.to_string_lossy();
+            if name_str.starts_with('.') {
+                continue;
+            }
+            if Self::is_repo_root(&p) {
+                let mtime = entry
+                    .metadata()
+                    .and_then(|m| m.modified())
+                    .unwrap_or(std::time::SystemTime::UNIX_EPOCH);
+                if best.as_ref().is_none_or(|(best_t, _)| mtime >= *best_t) {
+                    best = Some((mtime, p));
+                }
+            }
+        }
+        best.map(|(_, p)| std::fs::canonicalize(&p).unwrap_or(p))
+    }
+
     pub fn resolve_workspace_fallback(&self, current_ws: &Path) -> PathBuf {
         let s = current_ws.to_string_lossy();
-        let is_umbrella = !current_ws.join(".git").exists()
-            && !current_ws.join("Cargo.toml").exists()
-            && !current_ws.join("package.json").exists()
-            && !current_ws.join("pyproject.toml").exists()
-            && !current_ws.join("go.mod").exists();
+        let is_umbrella = !Self::is_repo_root(current_ws);
         if s.ends_with("/.gemini/config")
             || s.ends_with("/.agents")
             || s.ends_with("/.agent")
@@ -2820,20 +2888,31 @@ impl AegisRuntimeKernel {
             if let Ok(env_ws) = std::env::var("AOS_WORKSPACE") {
                 let p = PathBuf::from(env_ws.trim());
                 if p.exists() {
-                    return std::fs::canonicalize(&p).unwrap_or(p);
+                    let canon = std::fs::canonicalize(&p).unwrap_or(p);
+                    return Self::resolve_umbrella_child_repo(&canon).unwrap_or(canon);
                 }
             }
             let saved_file = self.runtime_data_root.join("active_workspace.txt");
             if let Ok(saved) = std::fs::read_to_string(&saved_file) {
                 let p = PathBuf::from(saved.trim());
                 if p.exists() {
-                    return std::fs::canonicalize(&p).unwrap_or(p);
+                    let canon = std::fs::canonicalize(&p).unwrap_or(p);
+                    if !is_umbrella || Self::is_repo_root(&canon) {
+                        return canon;
+                    }
+                    if let Some(child) = Self::resolve_umbrella_child_repo(&canon) {
+                        return child;
+                    }
                 }
             }
             if s.ends_with("/.agents") || s.ends_with("/.agent") {
                 if let Some(parent) = current_ws.parent() {
-                    return parent.to_path_buf();
+                    return Self::resolve_umbrella_child_repo(parent)
+                        .unwrap_or_else(|| parent.to_path_buf());
                 }
+            }
+            if let Some(child) = Self::resolve_umbrella_child_repo(current_ws) {
+                return child;
             }
         }
         current_ws.to_path_buf()

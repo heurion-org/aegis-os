@@ -64,15 +64,56 @@ struct ForegroundOutput {
 const TIMEOUT_TAIL_BYTES: usize = 4096;
 
 #[cfg(unix)]
-fn kill_process_group(pgid: u32) {
+fn signal_process_group(pgid: u32, sig: libc::c_int) {
     if pgid > 0 {
-        // A negative pid targets the whole process group.
-        unsafe { libc::kill(-(pgid as libc::pid_t), libc::SIGKILL) };
+        // Signal both the process group (-pgid) and the leader PID (in case bwrap --new-session moved children).
+        unsafe {
+            libc::kill(-(pgid as libc::pid_t), sig);
+            libc::kill(pgid as libc::pid_t, sig);
+        }
     }
+}
+
+#[cfg(unix)]
+fn kill_process_group(pgid: u32) {
+    signal_process_group(pgid, libc::SIGKILL);
 }
 
 #[cfg(not(unix))]
 fn kill_process_group(_pgid: u32) {}
+
+struct ActivePgidGuard {
+    pgid: u32,
+    registry: Option<Arc<Mutex<std::collections::HashSet<u32>>>>,
+}
+
+impl ActivePgidGuard {
+    fn register(
+        pgid: u32,
+        registry: Option<&Arc<Mutex<std::collections::HashSet<u32>>>>,
+    ) -> Self {
+        let reg = registry.cloned();
+        if pgid > 0 {
+            if let Some(ref r) = reg {
+                r.lock().unwrap().insert(pgid);
+            }
+        }
+        Self {
+            pgid,
+            registry: reg,
+        }
+    }
+}
+
+impl Drop for ActivePgidGuard {
+    fn drop(&mut self) {
+        if self.pgid > 0 {
+            if let Some(ref r) = self.registry {
+                r.lock().unwrap().remove(&self.pgid);
+            }
+        }
+    }
+}
 
 /// Reads a pipe into a shared buffer so partial output survives the reader being aborted.
 fn spawn_pipe_reader<R>(pipe: Option<R>) -> (Arc<Mutex<Vec<u8>>>, tokio::task::JoinHandle<()>)
@@ -107,10 +148,20 @@ fn tail_lossy(buf: &Mutex<Vec<u8>>) -> String {
 /// Runs `cmd` in its own process group and waits for the process itself rather than pipe EOF.
 /// On timeout, or when descendants still hold the pipes after the grace window, the whole group
 /// is killed so no orphaned worker can wedge the caller.
+#[cfg(test)]
 async fn run_foreground(
+    cmd: Command,
+    timeout: Duration,
+    timeout_hint: &str,
+) -> anyhow::Result<ForegroundOutput> {
+    run_foreground_tracked(cmd, timeout, timeout_hint, None).await
+}
+
+async fn run_foreground_tracked(
     mut cmd: Command,
     timeout: Duration,
     timeout_hint: &str,
+    active_pgids: Option<&Arc<Mutex<std::collections::HashSet<u32>>>>,
 ) -> anyhow::Result<ForegroundOutput> {
     // A non-foreground process group that reads a tty gets SIGTTIN-stopped, and under MCP stdio
     // the inherited stdin is the JSON-RPC stream; commands never get interactive input.
@@ -120,6 +171,7 @@ async fn run_foreground(
     cmd.kill_on_drop(true);
     let mut child = cmd.spawn()?;
     let pid = child.id().unwrap_or(0);
+    let _pgid_guard = ActivePgidGuard::register(pid, active_pgids);
     let (out_buf, mut out_task) = spawn_pipe_reader(child.stdout.take());
     let (err_buf, mut err_task) = spawn_pipe_reader(child.stderr.take());
 
@@ -212,6 +264,7 @@ pub struct NativeOsSandboxInstance {
     instance_id: String,
     config: SandboxConfig,
     paused: AtomicBool,
+    active_pgids: Arc<Mutex<std::collections::HashSet<u32>>>,
 }
 
 impl NativeOsSandboxInstance {
@@ -220,6 +273,7 @@ impl NativeOsSandboxInstance {
             instance_id: format!("sbx-native-{}", &Uuid::new_v4().to_string()[..8]),
             config,
             paused: AtomicBool::new(false),
+            active_pgids: Arc::new(Mutex::new(std::collections::HashSet::new())),
         }
     }
 
@@ -794,20 +848,29 @@ impl SandboxInstance for NativeOsSandboxInstance {
                 .stdout(Stdio::from(out_file))
                 .stderr(Stdio::from(err_file))
                 .kill_on_drop(false);
+            #[cfg(unix)]
+            cmd.process_group(0);
 
             let mut child = cmd.spawn()?;
             let pid = child.id().unwrap_or(0);
+            if pid > 0 {
+                self.active_pgids.lock().unwrap().insert(pid);
+            }
             let pid_out = bg_dir.join(format!("{}.stdout.log", pid));
             let pid_err = bg_dir.join(format!("{}.stderr.log", pid));
             let pid_exit = bg_dir.join(format!("{}.exit", pid));
             let _ = std::fs::rename(&tmp_out, &pid_out);
             let _ = std::fs::rename(&tmp_err, &pid_err);
 
+            let active_pgids = self.active_pgids.clone();
             tokio::spawn(async move {
                 let _keep_bridge = egress_bridge;
                 if let Ok(status) = child.wait().await {
                     let code = status.code().unwrap_or(-1);
                     let _ = tokio::fs::write(&pid_exit, code.to_string()).await;
+                }
+                if pid > 0 {
+                    active_pgids.lock().unwrap().remove(&pid);
                 }
             });
 
@@ -829,10 +892,11 @@ impl SandboxInstance for NativeOsSandboxInstance {
         }
 
         let timeout_dur = Duration::from_millis(spec.timeout_ms.unwrap_or(30_000));
-        let output = run_foreground(
+        let output = run_foreground_tracked(
             cmd,
             timeout_dur,
             " For long-running tasks (>2m, such as online LLM benchmarks), pass `\"background\": true` to `proc_exec` and poll with `\"poll_pid\": <pid>`.",
+            Some(&self.active_pgids),
         )
         .await?;
         let pid = output.pid;
@@ -885,7 +949,8 @@ impl SandboxInstance for NativeOsSandboxInstance {
             for (k, v) in &spec.env {
                 fallback.env(k, v);
             }
-            let fb_out = run_foreground(fallback, timeout_dur, "").await?;
+            let fb_out =
+                run_foreground_tracked(fallback, timeout_dur, "", Some(&self.active_pgids)).await?;
             return Ok(ExecOutput {
                 pid: fb_out.pid,
                 exit_code: fb_out.status.code(),
@@ -909,16 +974,34 @@ impl SandboxInstance for NativeOsSandboxInstance {
 
     async fn pause(&self) -> anyhow::Result<()> {
         self.paused.store(true, Ordering::SeqCst);
+        #[cfg(unix)]
+        {
+            let pgids: Vec<u32> = self.active_pgids.lock().unwrap().iter().copied().collect();
+            for pgid in pgids {
+                signal_process_group(pgid, libc::SIGSTOP);
+            }
+        }
         Ok(())
     }
 
     async fn resume(&self) -> anyhow::Result<()> {
         self.paused.store(false, Ordering::SeqCst);
+        #[cfg(unix)]
+        {
+            let pgids: Vec<u32> = self.active_pgids.lock().unwrap().iter().copied().collect();
+            for pgid in pgids {
+                signal_process_group(pgid, libc::SIGCONT);
+            }
+        }
         Ok(())
     }
 
     async fn destroy(&self) -> anyhow::Result<()> {
         self.paused.store(true, Ordering::SeqCst);
+        let pgids: Vec<u32> = self.active_pgids.lock().unwrap().drain().collect();
+        for pgid in pgids {
+            kill_process_group(pgid);
+        }
         Ok(())
     }
 }
@@ -951,16 +1034,14 @@ impl SandboxDriver for NativeOsSandboxDriver {
 
 pub struct MicroVmSandboxInstance {
     instance_id: String,
-    config: SandboxConfig,
-    paused: AtomicBool,
+    inner: NativeOsSandboxInstance,
 }
 
 impl MicroVmSandboxInstance {
     pub fn new(config: SandboxConfig) -> Self {
         Self {
             instance_id: format!("sbx-microvm-{}", &Uuid::new_v4().to_string()[..8]),
-            config,
-            paused: AtomicBool::new(false),
+            inner: NativeOsSandboxInstance::new(config),
         }
     }
 }
@@ -972,48 +1053,45 @@ impl SandboxInstance for MicroVmSandboxInstance {
     }
 
     fn config(&self) -> &SandboxConfig {
-        &self.config
+        self.inner.config()
     }
 
     fn confinement_profile(&self) -> String {
+        let cfg = self.inner.config();
         serde_json::json!({
             "engine": if cfg!(target_os = "macos") { "libkrun-hv" } else { "firecracker-kvm" },
-            "vcpu_count": (self.config.limits.cpu_millicores / 1000).max(1),
-            "mem_size_mib": self.config.limits.memory_mb,
+            "vcpu_count": (cfg.limits.cpu_millicores / 1000).max(1),
+            "mem_size_mib": cfg.limits.memory_mb,
             "virtio_fs_mounts": [
-                {"tag": "workspace", "host_path": self.config.workspace_dir, "mode": "rw_cow"},
-                {"tag": "agent_home", "host_path": self.config.agent_home_dir, "mode": "rw"},
-                {"tag": "org_shared_ro", "host_path": self.config.org_shared_ro_dir, "mode": "ro"},
-                {"tag": "org_agent_pub", "host_path": self.config.org_agent_pub_dir, "mode": "rw"}
+                {"tag": "workspace", "host_path": cfg.workspace_dir, "mode": "rw_cow"},
+                {"tag": "agent_home", "host_path": cfg.agent_home_dir, "mode": "rw"},
+                {"tag": "org_shared_ro", "host_path": cfg.org_shared_ro_dir, "mode": "ro"},
+                {"tag": "org_agent_pub", "host_path": cfg.org_agent_pub_dir, "mode": "rw"}
             ]
         })
         .to_string()
     }
 
     async fn exec(&self, spec: ExecSpec) -> anyhow::Result<ExecOutput> {
-        let native = NativeOsSandboxInstance::new(self.config.clone());
-        if self.paused.load(Ordering::SeqCst) {
+        if self.inner.paused.load(Ordering::SeqCst) {
             bail!("MicroVM '{}' is paused", self.instance_id);
         }
-        let mut out = native.exec(spec).await?;
+        let mut out = self.inner.exec(spec).await?;
         // No hypervisor is launched yet; report the confinement that actually ran.
         out.sandbox_profile_used = format!("microvm-emulated({})", out.sandbox_profile_used);
         Ok(out)
     }
 
     async fn pause(&self) -> anyhow::Result<()> {
-        self.paused.store(true, Ordering::SeqCst);
-        Ok(())
+        self.inner.pause().await
     }
 
     async fn resume(&self) -> anyhow::Result<()> {
-        self.paused.store(false, Ordering::SeqCst);
-        Ok(())
+        self.inner.resume().await
     }
 
     async fn destroy(&self) -> anyhow::Result<()> {
-        self.paused.store(true, Ordering::SeqCst);
-        Ok(())
+        self.inner.destroy().await
     }
 }
 
@@ -1252,6 +1330,23 @@ mod tests {
             })
             .await
             .is_ok());
+
+        // Spawn a background process and verify destroy() terminates its active process group
+        let bg = sbx
+            .exec(ExecSpec {
+                command: "sh".to_string(),
+                args: vec!["-c".to_string(), "sleep 30".to_string()],
+                cwd: None,
+                env: HashMap::new(),
+                timeout_ms: Some(5000),
+                background: true,
+            })
+            .await
+            .unwrap();
+        assert!(bg.pid > 0);
+        sbx.pause().await.unwrap();
+        sbx.resume().await.unwrap();
+        sbx.destroy().await.unwrap();
     }
 
     /// macOS forbids applying a Seatbelt profile from inside another one (`sandbox_apply: Operation not

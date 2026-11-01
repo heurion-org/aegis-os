@@ -363,6 +363,60 @@ impl AegisEgressGateway {
         })
     }
 
+    /// Extracts the origin-form path and query string (`/path?query`) from a proxy request target.
+    fn extract_origin_path_and_query(raw_target: &str) -> String {
+        let s = raw_target.trim();
+        if let Some(rest) = s
+            .strip_prefix("http://")
+            .or_else(|| s.strip_prefix("https://"))
+        {
+            match rest.find('/') {
+                Some(idx) => rest[idx..].to_string(),
+                None => "/".to_string(),
+            }
+        } else if s.starts_with('/') {
+            s.to_string()
+        } else {
+            format!("/{s}")
+        }
+    }
+
+    /// Extracts `host:port` authority from an `http://host[:port]/...` target or `Host` header.
+    fn resolve_upstream_addr(raw_target: &str, headers: &HashMap<String, String>) -> String {
+        if let Some(up) = headers
+            .get("X-Aegis-Upstream")
+            .or_else(|| headers.get("x-aegis-upstream"))
+        {
+            let trimmed = up.trim();
+            if !trimmed.is_empty() {
+                return if trimmed.contains(':') {
+                    trimmed.to_string()
+                } else {
+                    format!("{trimmed}:80")
+                };
+            }
+        }
+        if let Some(rest) = raw_target.trim().strip_prefix("http://") {
+            let authority = rest.split('/').next().unwrap_or("localhost:80");
+            return if authority.contains(':') {
+                authority.to_string()
+            } else {
+                format!("{authority}:80")
+            };
+        }
+        let host = headers
+            .get("Host")
+            .or_else(|| headers.get("host"))
+            .map(|h| h.trim())
+            .filter(|h| !h.is_empty())
+            .unwrap_or("localhost:80");
+        if host.contains(':') {
+            host.to_string()
+        } else {
+            format!("{host}:80")
+        }
+    }
+
     /// Starts a lightweight local HTTP Egress Proxy listener (`127.0.0.1:port`) that inspects
     /// outbound requests from Agent sandboxes, enforces domain allowlists, and injects boundary secrets.
     pub async fn start_local_proxy(
@@ -392,8 +446,7 @@ impl AegisEgressGateway {
                 let gw_conn = gw.clone();
                 let bound_id = pinned_identity.clone();
                 tokio::spawn(async move {
-                    let (read_half, mut write_half) = stream.split();
-                    let mut reader = BufReader::new(read_half);
+                    let mut reader = BufReader::new(&mut stream);
 
                     let mut request_line = String::new();
                     let Ok(n) = reader.read_line(&mut request_line).await else {
@@ -433,6 +486,8 @@ impl AegisEgressGateway {
                             req_body = String::from_utf8_lossy(&buf).into_owned();
                         }
                     }
+                    let buffered_tail = reader.buffer().to_vec();
+                    drop(reader);
 
                     let identity = if let Some(pinned) = bound_id {
                         pinned
@@ -447,6 +502,123 @@ impl AegisEgressGateway {
                             .unwrap_or_else(|| "sandbox-agent".to_string());
                         AgentIdentity::new(org_id, agent_id, "Sandboxed Process")
                     };
+
+                    // HTTPS CONNECT Tunneling support: validate target domain against org allowlist
+                    // and establish a bidirectional TCP tunnel when allowed.
+                    if method.eq_ignore_ascii_case("CONNECT") {
+                        let connect_domain = raw_target
+                            .split(':')
+                            .next()
+                            .filter(|s| !s.is_empty())
+                            .map(str::to_string)
+                            .unwrap_or_else(|| {
+                                headers
+                                    .get("Host")
+                                    .or_else(|| headers.get("host"))
+                                    .cloned()
+                                    .unwrap_or_else(|| "localhost".to_string())
+                                    .split(':')
+                                    .next()
+                                    .unwrap_or("localhost")
+                                    .to_string()
+                            });
+                        let connect_spec = OutboundRequestSpec {
+                            target_domain: connect_domain,
+                            method: "CONNECT".to_string(),
+                            path: "/".to_string(),
+                            headers: headers.clone(),
+                        };
+                        match gw_conn
+                            .inspect_and_inject_with_body(&identity, &connect_spec, None)
+                            .await
+                        {
+                            Ok(EgressVerdict::AllowedAndSanitized { .. }) => {
+                                let dial_addr = headers
+                                    .get("X-Aegis-Upstream")
+                                    .or_else(|| headers.get("x-aegis-upstream"))
+                                    .cloned()
+                                    .unwrap_or_else(|| {
+                                        if raw_target.contains(':') {
+                                            raw_target.clone()
+                                        } else {
+                                            format!("{raw_target}:443")
+                                        }
+                                    });
+                                match tokio::net::TcpStream::connect(&dial_addr).await {
+                                    Ok(mut upstream) => {
+                                        if stream
+                                            .write_all(
+                                                b"HTTP/1.1 200 Connection Established\r\n\r\n",
+                                            )
+                                            .await
+                                            .is_ok()
+                                        {
+                                            if !buffered_tail.is_empty() {
+                                                let _ = upstream.write_all(&buffered_tail).await;
+                                            }
+                                            let _ = tokio::io::copy_bidirectional(
+                                                &mut stream,
+                                                &mut upstream,
+                                            )
+                                            .await;
+                                        }
+                                    }
+                                    Err(err) => {
+                                        let body = json!({
+                                            "egress": "upstream_connect_error",
+                                            "target": dial_addr,
+                                            "error": err.to_string()
+                                        })
+                                        .to_string();
+                                        let resp = format!(
+                                            "HTTP/1.1 502 Bad Gateway\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                                            body.len()
+                                        );
+                                        let _ = stream.write_all(resp.as_bytes()).await;
+                                    }
+                                }
+                            }
+                            Ok(EgressVerdict::RequiresEscalation { domain, reason }) => {
+                                let body = json!({
+                                    "egress": "escalation_required",
+                                    "domain": domain,
+                                    "reason": reason
+                                })
+                                .to_string();
+                                let resp = format!(
+                                    "HTTP/1.1 403 Forbidden\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                                    body.len()
+                                );
+                                let _ = stream.write_all(resp.as_bytes()).await;
+                            }
+                            Ok(EgressVerdict::BlockedSecretExfiltration {
+                                placeholder,
+                                unauthorized_domain,
+                            }) => {
+                                let body = json!({
+                                    "egress": "blocked_exfiltration",
+                                    "placeholder": placeholder,
+                                    "unauthorized_domain": unauthorized_domain
+                                })
+                                .to_string();
+                                let resp = format!(
+                                    "HTTP/1.1 403 Forbidden\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                                    body.len()
+                                );
+                                let _ = stream.write_all(resp.as_bytes()).await;
+                            }
+                            Err(e) => {
+                                let body = json!({ "error": e.to_string() }).to_string();
+                                let resp = format!(
+                                    "HTTP/1.1 400 Bad Request\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                                    body.len()
+                                );
+                                let _ = stream.write_all(resp.as_bytes()).await;
+                            }
+                        }
+                        return;
+                    }
+
                     let target_domain = headers
                         .get("Host")
                         .or_else(|| headers.get("host"))
@@ -456,6 +628,13 @@ impl AegisEgressGateway {
                         .next()
                         .unwrap_or("localhost")
                         .to_string();
+                    let should_forward_upstream = headers.contains_key("X-Aegis-Upstream")
+                        || headers.contains_key("x-aegis-upstream")
+                        || headers
+                            .get("X-Aegis-Forward")
+                            .or_else(|| headers.get("x-aegis-forward"))
+                            .is_some_and(|v| v == "1" || v.eq_ignore_ascii_case("true"));
+                    let upstream_addr = Self::resolve_upstream_addr(&raw_target, &headers);
                     let spec = OutboundRequestSpec {
                         target_domain,
                         method,
@@ -476,19 +655,83 @@ impl AegisEgressGateway {
                             injected_headers,
                             secrets_injected,
                         }) => {
-                            let mut header_keys: Vec<&String> = injected_headers.keys().collect();
-                            header_keys.sort();
-                            (
-                                "HTTP/1.1 200 OK",
-                                json!({
-                                    "egress": "allowed",
-                                    "target_domain": spec.target_domain,
-                                    "normalized_path": Self::normalize_request_path(&spec.path),
-                                    "sanitized_header_keys": header_keys,
-                                    "secrets_injected": secrets_injected
-                                })
-                                .to_string(),
-                            )
+                            if should_forward_upstream {
+                                match tokio::net::TcpStream::connect(&upstream_addr).await {
+                                    Ok(mut upstream) => {
+                                        let origin_path =
+                                            Self::extract_origin_path_and_query(&spec.path);
+                                        let mut out_req =
+                                            format!("{} {} HTTP/1.1\r\n", spec.method, origin_path);
+                                        let mut has_host = false;
+                                        for (k, v) in &injected_headers {
+                                            if k.to_ascii_lowercase().starts_with("x-aegis-")
+                                                || k.eq_ignore_ascii_case("connection")
+                                                || k.eq_ignore_ascii_case("proxy-connection")
+                                            {
+                                                continue;
+                                            }
+                                            if k.eq_ignore_ascii_case("host") {
+                                                has_host = true;
+                                            }
+                                            out_req.push_str(&format!("{k}: {v}\r\n"));
+                                        }
+                                        if !has_host {
+                                            out_req.push_str(&format!(
+                                                "Host: {}\r\n",
+                                                spec.target_domain
+                                            ));
+                                        }
+                                        out_req.push_str("Connection: close\r\n\r\n");
+                                        if !req_body.is_empty() {
+                                            out_req.push_str(&req_body);
+                                        }
+                                        if upstream.write_all(out_req.as_bytes()).await.is_ok() {
+                                            let mut upstream_resp = Vec::new();
+                                            if upstream
+                                                .read_to_end(&mut upstream_resp)
+                                                .await
+                                                .is_ok()
+                                                && !upstream_resp.is_empty()
+                                            {
+                                                let _ = stream.write_all(&upstream_resp).await;
+                                                return;
+                                            }
+                                        }
+                                        (
+                                            "HTTP/1.1 502 Bad Gateway",
+                                            json!({
+                                                "egress": "upstream_io_error",
+                                                "upstream": upstream_addr
+                                            })
+                                            .to_string(),
+                                        )
+                                    }
+                                    Err(err) => (
+                                        "HTTP/1.1 502 Bad Gateway",
+                                        json!({
+                                            "egress": "upstream_connect_error",
+                                            "upstream": upstream_addr,
+                                            "error": err.to_string()
+                                        })
+                                        .to_string(),
+                                    ),
+                                }
+                            } else {
+                                let mut header_keys: Vec<&String> =
+                                    injected_headers.keys().collect();
+                                header_keys.sort();
+                                (
+                                    "HTTP/1.1 200 OK",
+                                    json!({
+                                        "egress": "allowed",
+                                        "target_domain": spec.target_domain,
+                                        "normalized_path": Self::normalize_request_path(&spec.path),
+                                        "sanitized_header_keys": header_keys,
+                                        "secrets_injected": secrets_injected
+                                    })
+                                    .to_string(),
+                                )
+                            }
                         }
                         Ok(EgressVerdict::RequiresEscalation { domain, reason }) => (
                             "HTTP/1.1 403 Forbidden",
@@ -521,7 +764,7 @@ impl AegisEgressGateway {
                         "{status_line}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
                         body.len()
                     );
-                    let _ = write_half.write_all(resp.as_bytes()).await;
+                    let _ = stream.write_all(resp.as_bytes()).await;
                 });
             }
         });
@@ -768,5 +1011,120 @@ mod tests {
             blocked_query_dlp,
             EgressVerdict::BlockedSecretExfiltration { .. }
         ));
+    }
+
+    #[tokio::test]
+    async fn test_local_proxy_http_forwarding_with_secret_injection_and_connect_tunnel() {
+        // 1. Spawn a mock upstream HTTP/TCP server on localhost
+        let upstream_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let upstream_addr = upstream_listener.local_addr().unwrap();
+
+        tokio::spawn(async move {
+            // Connection 1: HTTP request forwarded by proxy with injected secret
+            if let Ok((mut s, _)) = upstream_listener.accept().await {
+                let mut reader = BufReader::new(&mut s);
+                let mut captured = String::new();
+                loop {
+                    let mut line = String::new();
+                    if reader.read_line(&mut line).await.unwrap_or(0) == 0 || line.trim().is_empty()
+                    {
+                        break;
+                    }
+                    captured.push_str(&line);
+                }
+                drop(reader);
+                let body = json!({
+                    "upstream_received": captured
+                })
+                .to_string();
+                let resp = format!(
+                    "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                    body.len()
+                );
+                let _ = s.write_all(resp.as_bytes()).await;
+            }
+            // Connection 2: CONNECT tunnel echo
+            if let Ok((mut s, _)) = upstream_listener.accept().await {
+                let mut buf = [0u8; 64];
+                if let Ok(n) = s.read(&mut buf).await {
+                    let _ = s.write_all(&buf[..n]).await;
+                }
+            }
+        });
+
+        // 2. Configure Egress Gateway and start local proxy
+        let gw = Arc::new(AegisEgressGateway::new());
+        gw.allow_domains("acme", vec!["api.github.com".to_string()])
+            .await;
+        gw.register_secret(SecretVaultEntry {
+            org_id: "acme".to_string(),
+            placeholder: "$AOS_SECRET_GH".to_string(),
+            real_secret_value: "ghp_InjectedAtNetworkBoundary".to_string(),
+            allowed_domains: vec!["api.github.com".to_string()],
+        })
+        .await;
+
+        let agent = AgentIdentity::new("acme", "coder-1", "Engineer");
+        let proxy_addr = gw
+            .start_local_proxy_with_bound_identity("127.0.0.1:0", Some(agent))
+            .await
+            .unwrap();
+
+        // 3. Test real HTTP forwarding with boundary secret injection
+        let mut client = tokio::net::TcpStream::connect(proxy_addr).await.unwrap();
+        let req = format!(
+            "GET http://api.github.com/repos/acme/app HTTP/1.1\r\nHost: api.github.com\r\nAuthorization: Bearer $AOS_SECRET_GH\r\nX-Aegis-Upstream: {}\r\nConnection: close\r\n\r\n",
+            upstream_addr
+        );
+        client.write_all(req.as_bytes()).await.unwrap();
+        let mut resp_bytes = Vec::new();
+        client.read_to_end(&mut resp_bytes).await.unwrap();
+        let resp_str = String::from_utf8_lossy(&resp_bytes);
+        assert!(resp_str.contains("HTTP/1.1 200 OK"), "resp: {resp_str}");
+        assert!(
+            resp_str.contains("Bearer ghp_InjectedAtNetworkBoundary"),
+            "upstream should receive injected real secret: {resp_str}"
+        );
+        assert!(
+            !resp_str.contains("$AOS_SECRET_GH"),
+            "upstream should not see raw placeholder: {resp_str}"
+        );
+
+        // 4. Test HTTPS CONNECT tunnel to allowed domain
+        let mut tunnel_client = tokio::net::TcpStream::connect(proxy_addr).await.unwrap();
+        let connect_req = format!(
+            "CONNECT api.github.com:443 HTTP/1.1\r\nHost: api.github.com:443\r\nX-Aegis-Upstream: {}\r\n\r\n",
+            upstream_addr
+        );
+        tunnel_client
+            .write_all(connect_req.as_bytes())
+            .await
+            .unwrap();
+        let mut reader = BufReader::new(&mut tunnel_client);
+        let mut status_line = String::new();
+        reader.read_line(&mut status_line).await.unwrap();
+        assert!(
+            status_line.contains("200 Connection Established"),
+            "status: {status_line}"
+        );
+        let mut blank = String::new();
+        reader.read_line(&mut blank).await.unwrap();
+        drop(reader);
+
+        tunnel_client.write_all(b"TLS_CLIENT_HELLO").await.unwrap();
+        let mut echoed = [0u8; 16];
+        tunnel_client.read_exact(&mut echoed).await.unwrap();
+        assert_eq!(&echoed, b"TLS_CLIENT_HELLO");
+
+        // 5. Test HTTPS CONNECT to unauthorized domain is rejected with 403 Forbidden
+        let mut bad_tunnel = tokio::net::TcpStream::connect(proxy_addr).await.unwrap();
+        bad_tunnel
+            .write_all(b"CONNECT evil.example.com:443 HTTP/1.1\r\nHost: evil.example.com:443\r\n\r\n")
+            .await
+            .unwrap();
+        let mut bad_resp = Vec::new();
+        bad_tunnel.read_to_end(&mut bad_resp).await.unwrap();
+        let bad_str = String::from_utf8_lossy(&bad_resp);
+        assert!(bad_str.contains("403 Forbidden"), "bad_str: {bad_str}");
     }
 }

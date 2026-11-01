@@ -15,6 +15,201 @@ use std::sync::Arc;
 use tokio::sync::RwLock;
 use uuid::Uuid;
 
+/// Embedded baseline Cedar policy (`policy/default.cedar`).
+pub const DEFAULT_CEDAR_POLICY: &str = include_str!("../../../policy/default.cedar");
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CedarEffect {
+    Permit,
+    Forbid,
+}
+
+#[derive(Debug, Clone)]
+pub struct CedarRule {
+    pub id: String,
+    pub effect: CedarEffect,
+    /// Action names matched by this rule (`Action::"<name>"`). Empty means any action (`action`).
+    pub actions: Vec<String>,
+    /// Optional resource entity type (`resource is WorkspaceResource`, etc.).
+    pub resource_type: Option<String>,
+    /// Optional resource pattern (`resource == "..."` or `resource like "..."`).
+    pub resource_pattern: Option<String>,
+    /// `when { ... resource.org_id == principal.org_id ... }`
+    pub require_same_org: bool,
+    /// `when { ... principal.org_id != resource.org_id ... }`
+    pub require_diff_org: bool,
+}
+
+#[derive(Debug, Clone, Default)]
+pub struct CedarPolicySet {
+    pub rules: Vec<CedarRule>,
+}
+
+impl CedarPolicySet {
+    pub fn parse(src: &str) -> Self {
+        let mut rules = Vec::new();
+        let cleaned: String = src
+            .lines()
+            .map(|line| match line.find("//") {
+                Some(idx) => &line[..idx],
+                None => line,
+            })
+            .collect::<Vec<_>>()
+            .join("\n");
+
+        for (idx, raw_stmt) in cleaned.split(';').enumerate() {
+            let stmt = raw_stmt.trim();
+            if stmt.is_empty() {
+                continue;
+            }
+            let (effect, rest) = if let Some(r) = stmt.strip_prefix("permit") {
+                (CedarEffect::Permit, r.trim())
+            } else if let Some(r) = stmt.strip_prefix("forbid") {
+                (CedarEffect::Forbid, r.trim())
+            } else {
+                continue;
+            };
+
+            let Some(open_paren) = rest.find('(') else {
+                continue;
+            };
+            let Some(close_paren) = rest.rfind(')') else {
+                continue;
+            };
+            if close_paren <= open_paren {
+                continue;
+            }
+            let head = &rest[open_paren + 1..close_paren];
+            let tail = rest[close_paren + 1..].trim();
+
+            let mut actions = Vec::new();
+            let mut search = head;
+            while let Some(pos) = search.find("Action::\"") {
+                let after = &search[pos + "Action::\"".len()..];
+                if let Some(end_q) = after.find('"') {
+                    actions.push(after[..end_q].to_string());
+                    search = &after[end_q + 1..];
+                } else {
+                    break;
+                }
+            }
+
+            let mut resource_type = None;
+            let mut resource_pattern = None;
+            for clause in head.split(',') {
+                let c = clause.trim();
+                if let Some(rt) = c.strip_prefix("resource is ") {
+                    let token = rt
+                        .split_whitespace()
+                        .next()
+                        .unwrap_or("")
+                        .trim_matches(|ch: char| !ch.is_alphanumeric() && ch != '_');
+                    if !token.is_empty() {
+                        resource_type = Some(token.to_string());
+                    }
+                } else if let Some(rp) = c
+                    .strip_prefix("resource == ")
+                    .or_else(|| c.strip_prefix("resource like "))
+                {
+                    let pat = rp.trim().trim_matches('"');
+                    if !pat.is_empty() {
+                        resource_pattern = Some(pat.to_string());
+                    }
+                }
+            }
+
+            let when_body = if let Some(w) = tail.strip_prefix("when") {
+                w.trim().trim_start_matches('{').trim_end_matches('}').trim()
+            } else {
+                ""
+            };
+            let compact_when: String = when_body.chars().filter(|c| !c.is_whitespace()).collect();
+            let require_same_org = compact_when.contains("resource.org_id==principal.org_id")
+                || compact_when.contains("principal.org_id==resource.org_id");
+            let require_diff_org = compact_when.contains("principal.org_id!=resource.org_id")
+                || compact_when.contains("resource.org_id!=principal.org_id");
+            if resource_pattern.is_none() {
+                for marker in ["resource.pathlike\"", "resource.id==\""] {
+                    if let Some(pos) = compact_when.find(marker) {
+                        let after = &compact_when[pos + marker.len()..];
+                        if let Some(end_q) = after.find('"') {
+                            resource_pattern = Some(after[..end_q].to_string());
+                        }
+                    }
+                }
+            }
+
+            let id = match (effect, resource_type.as_deref()) {
+                (CedarEffect::Permit, Some("WorkspaceResource")) => {
+                    "cedar:default:cow_workspace_auto_allow".to_string()
+                }
+                (CedarEffect::Permit, Some("SandboxResource")) => {
+                    "cedar:default:sandbox_exec_auto_allow".to_string()
+                }
+                (CedarEffect::Permit, Some("OrgResource")) => {
+                    "cedar:default:intra_org_sharing_auto_allow".to_string()
+                }
+                (CedarEffect::Permit, Some("IpcResource")) => {
+                    "aegis:default:intra_org_ipc_auto_allow".to_string()
+                }
+                (CedarEffect::Forbid, _) => format!("cedar:forbid:rule_{}", idx + 1),
+                (CedarEffect::Permit, _) => format!("cedar:permit:rule_{}", idx + 1),
+            };
+
+            rules.push(CedarRule {
+                id,
+                effect,
+                actions,
+                resource_type,
+                resource_pattern,
+                require_same_org,
+                require_diff_org,
+            });
+        }
+
+        Self { rules }
+    }
+
+    pub fn extend_from_str(&mut self, extra_src: &str) {
+        let parsed = Self::parse(extra_src);
+        self.rules.extend(parsed.rules);
+    }
+
+    fn rule_matches(&self, rule: &CedarRule, ctx: &PolicyContext) -> bool {
+        if !rule.actions.is_empty() && !rule.actions.iter().any(|a| a == &ctx.action) {
+            return false;
+        }
+        if rule.require_same_org && ctx.principal.org_id != ctx.target_org_id {
+            return false;
+        }
+        if rule.require_diff_org && ctx.principal.org_id == ctx.target_org_id {
+            return false;
+        }
+        if let Some(ref pat) = rule.resource_pattern {
+            if !AegisPolicyKernel::matches_pattern(pat, &ctx.target_resource) {
+                return false;
+            }
+        }
+        true
+    }
+
+    /// Evaluates custom `forbid` rules (excluding the baseline cross-org rule which has A2A workstation peer handling).
+    pub fn find_custom_forbid(&self, ctx: &PolicyContext) -> Option<&CedarRule> {
+        self.rules.iter().find(|r| {
+            r.effect == CedarEffect::Forbid
+                && !r.require_diff_org
+                && self.rule_matches(r, ctx)
+        })
+    }
+
+    /// Evaluates `permit` rules loaded from `policy/default.cedar` (and any custom Cedar policy file).
+    pub fn find_permit(&self, ctx: &PolicyContext) -> Option<&CedarRule> {
+        self.rules
+            .iter()
+            .find(|r| r.effect == CedarEffect::Permit && self.rule_matches(r, ctx))
+    }
+}
+
 #[derive(Default, serde::Serialize, serde::Deserialize)]
 struct PersistedPolicyState {
     leases: Vec<LeaseGrant>,
@@ -26,6 +221,7 @@ pub struct AegisPolicyKernel {
     leases: Arc<RwLock<Vec<LeaseGrant>>>,
     escalations: Arc<RwLock<Vec<PendingEscalation>>>,
     forbidden_host_prefixes: Vec<String>,
+    cedar_policies: CedarPolicySet,
 }
 
 impl Default for AegisPolicyKernel {
@@ -52,6 +248,13 @@ impl AegisPolicyKernel {
             }
         }
 
+        let mut cedar_policies = CedarPolicySet::parse(DEFAULT_CEDAR_POLICY);
+        if let Ok(custom_path) = std::env::var("AOS_CEDAR_POLICY_FILE") {
+            if let Ok(custom_src) = std::fs::read_to_string(&custom_path) {
+                cedar_policies.extend_from_str(&custom_src);
+            }
+        }
+
         Self {
             state_file,
             leases: Arc::new(RwLock::new(initial_leases)),
@@ -64,7 +267,18 @@ impl AegisPolicyKernel {
                 "/etc/sudoers".to_string(),
                 "/System".to_string(),
             ],
+            cedar_policies,
         }
+    }
+
+    /// Appends additional declarative Cedar policy statements (`permit` / `forbid`) to this kernel.
+    pub fn add_cedar_policies(&mut self, cedar_src: &str) {
+        self.cedar_policies.extend_from_str(cedar_src);
+    }
+
+    /// Returns a reference to the loaded declarative Cedar policy set.
+    pub fn cedar_policies(&self) -> &CedarPolicySet {
+        &self.cedar_policies
     }
 
     async fn reload_from_disk(&self) {
@@ -116,6 +330,8 @@ impl AegisPolicyKernel {
             || norm.contains(".vscode/launch.json")
             || norm == ".agents/hooks.json"
             || norm.ends_with("/.agents/hooks.json")
+            || norm.starts_with(".aegis/")
+            || norm.contains("/.aegis/")
             || norm.starts_with(".claude/")
             || norm.contains("/.claude/")
             || norm == ".claude.json"
@@ -302,6 +518,16 @@ impl PolicyEngine for AegisPolicyKernel {
             });
         }
 
+        // 1b. Evaluate custom Cedar `forbid` rules (`forbid` always overrides `permit` and session leases):
+        if let Some(forbid_rule) = self.cedar_policies.find_custom_forbid(ctx) {
+            return Ok(PolicyDecision::Deny {
+                reason: format!(
+                    "Action '{}' on '{}' is forbidden by Cedar rule '{}'",
+                    ctx.action, ctx.target_resource, forbid_rule.id
+                ),
+            });
+        }
+
         // 2. Hard Red-Line Sensitive Host Resource Check:
         for forbidden in &self.forbidden_host_prefixes {
             if ctx.target_resource.starts_with(forbidden)
@@ -358,57 +584,42 @@ impl PolicyEngine for AegisPolicyKernel {
             });
         }
 
-        // 4. Evaluate Built-in Green-Zone (Zero-Prompt Auto-Allow) Rules:
-        match ctx.action.as_str() {
-            "fs_read" | "fs_write" | "fs_edit" | "fs_delete" | "fs_list" | "fs_glob"
-            | "fs_grep" | "workspace_status" | "workspace_snapshot" | "workspace_diff"
-            | "workspace_rollback" | "workspace_sync" => Ok(PolicyDecision::Allow {
-                matched_rule: "cedar:default:cow_workspace_auto_allow".to_string(),
-            }),
-
-            "proc_exec" | "proc_manage" => {
-                if let Some(cmd) = ctx.metadata.get("command").and_then(|v| v.as_str()) {
-                    let trimmed = cmd.trim();
-                    let invokes_privesc = trimmed
-                        .split([';', '|', '&', '\n'])
-                        .map(|seg| seg.trim())
-                        .any(|seg| {
-                            let first = seg.split_whitespace().next().unwrap_or("");
-                            let bin = first.rsplit('/').next().unwrap_or(first);
-                            matches!(bin, "sudo" | "doas" | "pkexec" | "su")
-                        });
-                    if invokes_privesc {
-                        return Ok(PolicyDecision::Deny {
-                            reason: "Privilege escalation ('sudo') is forbidden inside Aegis OS sandbox".to_string(),
-                        });
-                    }
-                    if trimmed.contains("/.ssh") || trimmed.contains("/.aws") || trimmed.contains("/.gnupg") {
-                        return Ok(PolicyDecision::Deny {
-                            reason: "Command attempts to access protected host credentials".to_string(),
-                        });
-                    }
+        // 4. Evaluate Declarative Cedar `permit` Rules (`policy/default.cedar` + custom Cedar policies):
+        if matches!(ctx.action.as_str(), "proc_exec" | "proc_manage") {
+            if let Some(cmd) = ctx.metadata.get("command").and_then(|v| v.as_str()) {
+                let trimmed = cmd.trim();
+                let invokes_privesc = trimmed
+                    .split([';', '|', '&', '\n'])
+                    .map(|seg| seg.trim())
+                    .any(|seg| {
+                        let first = seg.split_whitespace().next().unwrap_or("");
+                        let bin = first.rsplit('/').next().unwrap_or(first);
+                        matches!(bin, "sudo" | "doas" | "pkexec" | "su")
+                    });
+                if invokes_privesc {
+                    return Ok(PolicyDecision::Deny {
+                        reason: "Privilege escalation ('sudo') is forbidden inside Aegis OS sandbox"
+                            .to_string(),
+                    });
                 }
-                Ok(PolicyDecision::Allow {
-                    matched_rule: "cedar:default:sandbox_exec_auto_allow".to_string(),
-                })
+                if trimmed.contains("/.ssh")
+                    || trimmed.contains("/.aws")
+                    || trimmed.contains("/.gnupg")
+                {
+                    return Ok(PolicyDecision::Deny {
+                        reason: "Command attempts to access protected host credentials".to_string(),
+                    });
+                }
             }
+        }
+        if let Some(permit_rule) = self.cedar_policies.find_permit(ctx) {
+            return Ok(PolicyDecision::Allow {
+                matched_rule: permit_rule.id.clone(),
+            });
+        }
 
-            "org_artifact_publish" | "org_artifact_fetch" | "org_artifact_list" | "org_kv_get"
-            | "org_kv_put" => Ok(PolicyDecision::Allow {
-                matched_rule: "cedar:default:intra_org_sharing_auto_allow".to_string(),
-            }),
-
-            "ipc_register_peer" | "ipc_list_peers" | "ipc_send" | "ipc_request" | "ipc_reply"
-            | "ipc_recv" | "ipc_ack" | "ipc_publish" | "ipc_subscribe" | "egress_http_request"
-            | "coord_claim" | "coord_release" | "ipc_update_card" | "ipc_task_update"
-            | "ipc_task_get" | "ipc_task_list" | "app_catalog_search" | "app_mount_session"
-            | "app_call_tool" => {
-                Ok(PolicyDecision::Allow {
-                    matched_rule: "aegis:default:intra_org_ipc_auto_allow".to_string(),
-                })
-            }
-
-            // 5. Yellow-Zone Boundary Crossing Actions -> Record Escalation & Return Ask:
+        // 5. Yellow-Zone Boundary Crossing Actions -> Record Escalation & Return Ask:
+        match ctx.action.as_str() {
             "workspace_commit" => {
                 let files_desc = ctx
                     .metadata
@@ -471,6 +682,11 @@ impl PolicyEngine for AegisPolicyKernel {
             }
 
             other => {
+                if let Some(permit_rule) = self.cedar_policies.find_permit(ctx) {
+                    return Ok(PolicyDecision::Allow {
+                        matched_rule: permit_rule.id.clone(),
+                    });
+                }
                 self.record_escalation(
                     ctx,
                     format!("Boundary syscall '{}' requires explicit lease", other),
@@ -889,5 +1105,63 @@ mod tests {
             let approved = kernel.evaluate(&poisoned_ctx).await.unwrap();
             assert!(matches!(approved, PolicyDecision::Allow { .. }));
         }
+    }
+
+    #[tokio::test]
+    async fn test_cedar_policy_parser_and_evaluation() {
+        let mut kernel = AegisPolicyKernel::new();
+        assert!(
+            kernel.cedar_policies().rules.len() >= 5,
+            "default.cedar should parse all 5 baseline rules"
+        );
+
+        // Add custom Cedar `permit` and `forbid` rules
+        kernel.add_cedar_policies(
+            r#"
+            // Permit custom read-only telemetry action within same org
+            permit (
+                principal is Agent,
+                action in [Action::"telemetry_ping"],
+                resource is TelemetryResource
+            ) when {
+                resource.org_id == principal.org_id
+            };
+
+            // Explicitly forbid deleting production database migrations
+            forbid (
+                principal is Agent,
+                action in [Action::"fs_delete"],
+                resource like "/workspace/migrations/*"
+            );
+            "#,
+        );
+
+        let agent = AgentIdentity::new("acme", "coder-1", "Senior Engineer");
+
+        // Custom Cedar permit rule allows `telemetry_ping` without prompt
+        let ping_ctx = PolicyContext {
+            principal: agent.clone(),
+            action: "telemetry_ping".to_string(),
+            target_org_id: "acme".to_string(),
+            target_resource: "metrics:cpu".to_string(),
+            metadata: json!({}),
+        };
+        assert!(matches!(
+            kernel.evaluate(&ping_ctx).await.unwrap(),
+            PolicyDecision::Allow { matched_rule } if matched_rule.starts_with("cedar:permit:")
+        ));
+
+        // Custom Cedar forbid rule blocks `fs_delete` on `/workspace/migrations/*`
+        let del_migration = PolicyContext {
+            principal: agent.clone(),
+            action: "fs_delete".to_string(),
+            target_org_id: "acme".to_string(),
+            target_resource: "/workspace/migrations/001_init.sql".to_string(),
+            metadata: json!({}),
+        };
+        assert!(matches!(
+            kernel.evaluate(&del_migration).await.unwrap(),
+            PolicyDecision::Deny { .. }
+        ));
     }
 }

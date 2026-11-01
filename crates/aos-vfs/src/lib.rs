@@ -504,6 +504,14 @@ impl CoWWorkspace {
         Self::cow_clone_file_inner(src, dst, false, &mut true)
     }
 
+    fn max_eager_copy_file_bytes() -> u64 {
+        std::env::var("AOS_MAX_COW_FILE_MB")
+            .ok()
+            .and_then(|s| s.parse::<u64>().ok())
+            .map(|mb| mb.saturating_mul(1024 * 1024))
+            .unwrap_or(16 * 1024 * 1024)
+    }
+
     fn cow_clone_file_inner(
         src: &Path,
         dst: &Path,
@@ -596,6 +604,21 @@ impl CoWWorkspace {
                 }
             }
 
+            if !*allow_reflink && meta.len() > Self::max_eager_copy_file_bytes() {
+                drop(dst_file);
+                let _ = std::fs::remove_file(dst);
+                if let Ok(canon_src) = std::fs::canonicalize(src) {
+                    if std::os::unix::fs::symlink(&canon_src, dst).is_ok() {
+                        return Ok(());
+                    }
+                }
+                dst_file = std::fs::OpenOptions::new()
+                    .write(true)
+                    .create(true)
+                    .truncate(true)
+                    .open(dst)?;
+            }
+
             std::io::copy(&mut src_file, &mut dst_file)?;
             if let Ok(m) = meta.modified() {
                 let _ = dst_file.set_modified(m);
@@ -628,6 +651,14 @@ impl CoWWorkspace {
                 | ".venv"
                 | "venv"
                 | "__pycache__"
+                | ".pytest_cache"
+                | ".mypy_cache"
+                | ".ruff_cache"
+                | ".tox"
+                | "htmlcov"
+                | ".parcel-cache"
+                | ".svelte-kit"
+                | "out"
                 | ".dart_tool"
                 | "Pods"
                 | ".gradle"
@@ -1041,6 +1072,59 @@ impl CoWWorkspace {
         hunks
     }
 
+    /// Returns true if `line` is a single-line commutative import/module declaration (`use ...;`,
+    /// `pub mod ...;`, `import ...`, `from ... import ...`, `#include ...`) that can be safely union-merged
+    /// when two agents concurrently insert declarations at the same anchor.
+    fn is_commutative_declaration_line(line: &str) -> bool {
+        let t = line.trim();
+        if t.is_empty() || t.starts_with("//") || (t.starts_with('#') && !t.starts_with("#include"))
+        {
+            return false;
+        }
+        ((t.starts_with("use ") || t.starts_with("pub use ") || t.starts_with("pub(crate) use "))
+            && t.ends_with(';')
+            && !t.contains('{'))
+            || ((t.starts_with("mod ")
+                || t.starts_with("pub mod ")
+                || t.starts_with("pub(crate) mod "))
+                && t.ends_with(';')
+                && !t.contains('{'))
+            || (t.starts_with("import ") && !t.contains('{'))
+            || (t.starts_with("from ") && t.contains(" import ") && !t.contains('('))
+            || t.starts_with("#include ")
+    }
+
+    fn try_merge_commutative_hunk<'a>(
+        base_slice: &[&'a str],
+        theirs: &[&'a str],
+        ours: &[&'a str],
+    ) -> Option<Vec<&'a str>> {
+        if theirs.is_empty() || ours.is_empty() {
+            return None;
+        }
+        if !Self::is_subsequence(base_slice, theirs) || !Self::is_subsequence(base_slice, ours) {
+            return None;
+        }
+        let their_added_ok = theirs
+            .iter()
+            .filter(|l| !base_slice.contains(l))
+            .all(|l| Self::is_commutative_declaration_line(l));
+        let our_added_ok = ours
+            .iter()
+            .filter(|l| !base_slice.contains(l))
+            .all(|l| Self::is_commutative_declaration_line(l));
+        if !their_added_ok || !our_added_ok {
+            return None;
+        }
+        let mut combined: Vec<&'a str> = theirs.to_vec();
+        for &line in ours {
+            if !combined.contains(&line) {
+                combined.push(line);
+            }
+        }
+        Some(combined)
+    }
+
     /// Performs a general LCS/Diff3 3-Way Merge between:
     /// - `base`: The baseline file content when this Agent's CoW workspace was initialized
     /// - `theirs` (`host_current`): The current file content on the host (potentially modified by another Agent!)
@@ -1138,13 +1222,26 @@ impl CoWWorkspace {
                         ti += 1;
                         oi += 1;
                     } else {
-                        let conflict_line = th.0.min(oh.0) + 1;
-                        return Err(format!(
-                            "3-Way Merge Conflict at line {}: Host has `{}`, Agent Shadow has `{}`",
-                            conflict_line,
-                            th.2.join("\\n"),
-                            oh.2.join("\\n")
-                        ));
+                        let commutative_union = if th.0 == oh.0 && th.1 == oh.1 {
+                            Self::try_merge_commutative_hunk(&base_lines[th.0..th.1], &th.2, &oh.2)
+                        } else {
+                            None
+                        };
+                        if let Some(union_lines) = commutative_union {
+                            merged.extend_from_slice(&base_lines[b_pos..th.0]);
+                            merged.extend_from_slice(&union_lines);
+                            b_pos = th.1;
+                            ti += 1;
+                            oi += 1;
+                        } else {
+                            let conflict_line = th.0.min(oh.0) + 1;
+                            return Err(format!(
+                                "3-Way Merge Conflict at line {}: Host has `{}`, Agent Shadow has `{}`",
+                                conflict_line,
+                                th.2.join("\\n"),
+                                oh.2.join("\\n")
+                            ));
+                        }
                     }
                 }
                 (None, None) => break,
@@ -2109,5 +2206,19 @@ mod tests {
         let ws_reopened = CoWWorkspace::init(&host_dir, &cow_dir).await.unwrap();
         assert!(std::fs::symlink_metadata(&broken_link).is_err());
         assert!(ws_reopened.diff(None).await.unwrap().is_empty());
+    }
+
+    #[test]
+    fn test_commutative_import_and_use_declarations_auto_merge() {
+        let base = "use aos_core::AgentIdentity;\n\npub fn run() {}\n";
+        let theirs = "use aos_core::AgentIdentity;\nuse std::collections::HashMap;\npub mod installer;\n\npub fn run() {}\n";
+        let ours = "use aos_core::AgentIdentity;\nuse std::path::PathBuf;\npub mod hooks;\n\npub fn run() {}\n";
+
+        let merged = CoWWorkspace::three_way_merge_lines(base, theirs, ours).unwrap();
+        assert!(merged.contains("use std::collections::HashMap;"));
+        assert!(merged.contains("pub mod installer;"));
+        assert!(merged.contains("use std::path::PathBuf;"));
+        assert!(merged.contains("pub mod hooks;"));
+        assert!(merged.contains("pub fn run() {}"));
     }
 }

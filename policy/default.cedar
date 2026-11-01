@@ -6,10 +6,15 @@ permit (
         Action::"fs_read",
         Action::"fs_write",
         Action::"fs_edit",
+        Action::"fs_delete",
         Action::"fs_list",
+        Action::"fs_glob",
+        Action::"fs_grep",
+        Action::"workspace_status",
         Action::"workspace_snapshot",
         Action::"workspace_diff",
-        Action::"workspace_rollback"
+        Action::"workspace_rollback",
+        Action::"workspace_sync"
     ],
     resource is WorkspaceResource
 ) when {
@@ -33,6 +38,7 @@ permit (
     action in [
         Action::"org_artifact_publish",
         Action::"org_artifact_fetch",
+        Action::"org_artifact_list",
         Action::"org_kv_get",
         Action::"org_kv_put"
     ],
@@ -53,7 +59,17 @@ permit (
         Action::"ipc_recv",
         Action::"ipc_ack",
         Action::"ipc_publish",
-        Action::"ipc_subscribe"
+        Action::"ipc_subscribe",
+        Action::"egress_http_request",
+        Action::"coord_claim",
+        Action::"coord_release",
+        Action::"ipc_update_card",
+        Action::"ipc_task_update",
+        Action::"ipc_task_get",
+        Action::"ipc_task_list",
+        Action::"app_catalog_search",
+        Action::"app_mount_session",
+        Action::"app_call_tool"
     ],
     resource is IpcResource
 ) when {
