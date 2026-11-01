@@ -2639,10 +2639,8 @@ async fn main() -> anyhow::Result<()> {
 // One-Command Global Installer for AGY, Claude Code & Codex CLI (`aegis-os install`)
 // ============================================================================
 
-fn replace_or_append_aegis_block(existing: &str, block: &str) -> String {
-    const START: &str = "<!-- AEGIS-OS-RUNTIME-START -->";
-    const END: &str = "<!-- AEGIS-OS-RUNTIME-END -->";
-    if let (Some(s), Some(e)) = (existing.find(START), existing.find(END)) {
+fn replace_or_append_marked_block(existing: &str, block: &str, start: &str, end: &str) -> String {
+    if let (Some(s), Some(e)) = (existing.find(start), existing.find(end)) {
         if s <= e {
             let mut out = String::new();
             out.push_str(existing[..s].trim_end());
@@ -2651,7 +2649,7 @@ fn replace_or_append_aegis_block(existing: &str, block: &str) -> String {
             }
             out.push_str(block.trim());
             out.push('\n');
-            let tail = existing[e + END.len()..].trim_start();
+            let tail = existing[e + end.len()..].trim_start();
             if !tail.is_empty() {
                 out.push_str(tail);
                 out.push('\n');
@@ -2660,6 +2658,15 @@ fn replace_or_append_aegis_block(existing: &str, block: &str) -> String {
         }
     }
     format!("{}{}", existing, block)
+}
+
+fn replace_or_append_aegis_block(existing: &str, block: &str) -> String {
+    replace_or_append_marked_block(
+        existing,
+        block,
+        "<!-- AEGIS-OS-RUNTIME-START -->",
+        "<!-- AEGIS-OS-RUNTIME-END -->",
+    )
 }
 
 async fn merge_json_file(path: &Path, patch_fn: impl FnOnce(&mut Value), dry_run: bool) -> anyhow::Result<()> {
@@ -3090,9 +3097,13 @@ startup_timeout_sec = 30
     if !dry_run {
         tokio::fs::create_dir_all(&codex_dir).await?;
         let existing_toml = tokio::fs::read_to_string(&codex_toml_path).await.unwrap_or_default();
-        if !existing_toml.contains("AEGIS-OS-RUNTIME-START") {
-            tokio::fs::write(&codex_toml_path, format!("{}{}", existing_toml, codex_toml_block)).await?;
-        }
+        let updated_toml = replace_or_append_marked_block(
+            &existing_toml,
+            &codex_toml_block,
+            "# --- AEGIS-OS-RUNTIME-START ---",
+            "# --- AEGIS-OS-RUNTIME-END ---",
+        );
+        tokio::fs::write(&codex_toml_path, updated_toml).await?;
         let existing_agents = tokio::fs::read_to_string(&codex_agents_md).await.unwrap_or_default();
         let updated_agents = replace_or_append_aegis_block(&existing_agents, shared_agent_prompt);
         tokio::fs::write(&codex_agents_md, updated_agents).await?;
@@ -4355,4 +4366,24 @@ async fn run_end_to_end_multi_client_demo() -> anyhow::Result<()> {
     render_mission_control_top(&kernel, "payment-gateway", &project_repo).await?;
     println!("==================================================================================");
     Ok(())
+}
+
+#[cfg(test)]
+mod install_tests {
+    use super::replace_or_append_marked_block;
+
+    #[test]
+    fn install_replaces_existing_marked_block() {
+        let existing = "model = \"test\"\n\n# start\nold\n# end\n\n[other]\nx = 1\n";
+        let updated = replace_or_append_marked_block(
+            existing,
+            "# start\nnew\n# end\n",
+            "# start",
+            "# end",
+        );
+        assert_eq!(updated.matches("# start").count(), 1);
+        assert!(updated.contains("new"));
+        assert!(!updated.contains("old"));
+        assert!(updated.contains("[other]\nx = 1"));
+    }
 }
