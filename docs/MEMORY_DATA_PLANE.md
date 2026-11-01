@@ -16,7 +16,7 @@ Implemented:
 - Encrypted payload envelopes (`payloads`).
 - Native consent server (`aos-memory-server`) with sessions, Ed25519 JWT issuance, consent requests, revocation, and audit.
 
-The CLI entry point is `aegis-os memory ...`. `status`, `import`, `read`, `list`, `search`, `serve`, `setup`, `pending`, `approve`, `deny`, `connect`, `disconnect`, `sessions`, `revoke`, `audit`, `approvals`, `stop`, `staged`, `payload`, and `mcp` are all native. The archived `uomp-core` / `uomp-mvp` reference is not vendored or invoked.
+The CLI entry point is `aegis-os memory ...`. `status`, `import`, `read`, `list`, `search`, `serve`, `setup`, `ui`, `pending`, `approve`, `deny`, `connect`, `disconnect`, `sessions`, `revoke`, `audit`, `approvals`, `stop`, `staged`, `payload`, and `mcp` are all native. The archived `uomp-core` / `uomp-mvp` reference is not vendored or invoked.
 
 ## Why the schema is compatible
 

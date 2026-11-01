@@ -170,7 +170,7 @@ To coding agents (`agy`, `claude`, `codex`), **Local Mode** and **Cloud Mode** e
 
 ## Quick Start
 
-### 1. One-Command Onboarding (`brew install` + `aegis-os install` → Directly Launch `agy` / `claude` / `codex`)
+### 1. Homebrew Onboarding (`brew install` + `aegis-os install` → Directly Launch `agy` / `claude` / `codex`)
 
 Homebrew installs the binary; one Aegis command wires the clients:
 
