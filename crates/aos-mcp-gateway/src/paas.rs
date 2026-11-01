@@ -235,6 +235,38 @@ pub struct CloudWorkspaceRecord {
     pub cow_saved_bytes: u64,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct TelemetryPingPayload {
+    pub device_id: String,
+    #[serde(default)]
+    pub event: String,
+    #[serde(default)]
+    pub version: String,
+    #[serde(default)]
+    pub os: String,
+    #[serde(default)]
+    pub arch: String,
+    #[serde(default)]
+    pub client: String,
+    #[serde(default)]
+    pub mode: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct TelemetryDeviceRecord {
+    pub device_id: String,
+    pub first_seen_ms: i64,
+    pub last_seen_ms: i64,
+    pub first_seen_day: String,
+    pub install_count: u64,
+    pub active_days: std::collections::BTreeSet<String>,
+    pub last_version: String,
+    pub os: String,
+    pub arch: String,
+    pub clients_used: std::collections::BTreeSet<String>,
+    pub modes_used: std::collections::BTreeSet<String>,
+}
+
 #[derive(Debug, Default, Clone, Serialize, Deserialize)]
 struct PersistedPaasState {
     #[serde(default)]
@@ -251,6 +283,8 @@ struct PersistedPaasState {
     approvers: Vec<ApproverRecord>,
     #[serde(default)]
     approver_enrollments: Vec<ApproverEnrollmentRecord>,
+    #[serde(default)]
+    telemetry_devices: std::collections::BTreeMap<String, TelemetryDeviceRecord>,
 }
 
 /// The human who approves an org's Cloud escalations, holding the TOTP secret on their phone.
@@ -342,6 +376,12 @@ impl PaasControlPlane {
         let mut hasher = Sha256::new();
         hasher.update(input.as_bytes());
         hex::encode(hasher.finalize())
+    }
+
+    /// Derives a one-way irreversible 16-hex-char anonymous device token (`anon-<16hex>`).
+    pub fn anonymous_device_token(seed: &str) -> String {
+        let digest = Self::sha256_hex(&format!("aegis-os-anon-device-v1:{seed}"));
+        format!("anon-{}", &digest[..16])
     }
 
     /// Standard RFC 2104 HMAC-SHA256 in pure Rust (zero external crate dependencies).
@@ -2441,6 +2481,218 @@ impl PaasControlPlane {
             }
         }))
     }
+
+    const MAX_TELEMETRY_DEVICES: usize = 100_000;
+
+    fn sanitize_telemetry_token(raw: &str, fallback: &str, max_len: usize) -> String {
+        let cleaned: String = raw
+            .trim()
+            .chars()
+            .filter(|c| c.is_ascii_alphanumeric() || matches!(c, '-' | '_' | '.'))
+            .take(max_len)
+            .collect();
+        if cleaned.is_empty() {
+            fallback.to_string()
+        } else {
+            cleaned
+        }
+    }
+
+    /// Records an anonymous telemetry ping (`install` or `daily_active`) for product growth analytics.
+    pub async fn record_telemetry_ping(&self, payload: TelemetryPingPayload) -> anyhow::Result<Value> {
+        let device_id = Self::sanitize_telemetry_token(&payload.device_id, "", 64);
+        if device_id.len() < 6 {
+            bail!("Invalid telemetry device_id");
+        }
+        let event = Self::sanitize_telemetry_token(&payload.event, "daily_active", 24);
+        let version = Self::sanitize_telemetry_token(&payload.version, env!("CARGO_PKG_VERSION"), 24);
+        let os = Self::sanitize_telemetry_token(&payload.os, std::env::consts::OS, 24);
+        let arch = Self::sanitize_telemetry_token(&payload.arch, std::env::consts::ARCH, 24);
+        let client = Self::sanitize_telemetry_token(&payload.client, "unknown", 32);
+        let mode = Self::sanitize_telemetry_token(&payload.mode, "local_cow", 24);
+
+        self.reload().await;
+        let now_dt = Utc::now();
+        let now_ms = now_dt.timestamp_millis();
+        let today = now_dt.format("%Y-%m-%d").to_string();
+
+        {
+            let mut state = self.state.write().await;
+            if !state.telemetry_devices.contains_key(&device_id)
+                && state.telemetry_devices.len() >= Self::MAX_TELEMETRY_DEVICES
+            {
+                bail!("Telemetry device capacity reached");
+            }
+            let rec = state
+                .telemetry_devices
+                .entry(device_id.clone())
+                .or_insert_with(|| TelemetryDeviceRecord {
+                    device_id: device_id.clone(),
+                    first_seen_ms: now_ms,
+                    last_seen_ms: now_ms,
+                    first_seen_day: today.clone(),
+                    install_count: 0,
+                    active_days: std::collections::BTreeSet::new(),
+                    last_version: version.clone(),
+                    os: os.clone(),
+                    arch: arch.clone(),
+                    clients_used: std::collections::BTreeSet::new(),
+                    modes_used: std::collections::BTreeSet::new(),
+                });
+            rec.last_seen_ms = now_ms;
+            rec.last_version = version;
+            rec.os = os;
+            rec.arch = arch;
+            if event == "install" {
+                rec.install_count = rec.install_count.saturating_add(1);
+            }
+            rec.active_days.insert(today.clone());
+            while rec.active_days.len() > 90 {
+                if let Some(oldest) = rec.active_days.iter().next().cloned() {
+                    rec.active_days.remove(&oldest);
+                }
+            }
+            if client != "unknown" && client != "installer" {
+                rec.clients_used.insert(client);
+            }
+            rec.modes_used.insert(mode);
+        }
+        self.flush().await?;
+        Ok(json!({
+            "status": "recorded",
+            "device_id": device_id,
+            "date": today
+        }))
+    }
+
+    /// Computes live product adoption and retention metrics (Total Devices, DAU, WAU, MAU, Stickiness,
+    /// Client/OS/Version breakdowns, and 14-day daily trend).
+    pub async fn get_telemetry_stats(&self) -> Value {
+        self.reload().await;
+        let state = self.state.read().await;
+        let now_dt = Utc::now();
+        let today = now_dt.format("%Y-%m-%d").to_string();
+
+        let last_n_days = |n: i64| -> std::collections::BTreeSet<String> {
+            (0..n)
+                .map(|offset| {
+                    (now_dt - chrono::Duration::days(offset))
+                        .format("%Y-%m-%d")
+                        .to_string()
+                })
+                .collect()
+        };
+        let days_7 = last_n_days(7);
+        let days_30 = last_n_days(30);
+
+        let total_devices = state.telemetry_devices.len();
+        let mut total_install_events = 0u64;
+        let mut new_devices_today = 0usize;
+        let mut dau = 0usize;
+        let mut wau = 0usize;
+        let mut mau = 0usize;
+        let mut retained_2plus = 0usize;
+
+        let mut by_client: std::collections::BTreeMap<String, usize> =
+            std::collections::BTreeMap::new();
+        let mut by_os_arch: std::collections::BTreeMap<String, usize> =
+            std::collections::BTreeMap::new();
+        let mut by_version: std::collections::BTreeMap<String, usize> =
+            std::collections::BTreeMap::new();
+        let mut by_mode: std::collections::BTreeMap<String, usize> =
+            std::collections::BTreeMap::new();
+
+        for rec in state.telemetry_devices.values() {
+            total_install_events = total_install_events.saturating_add(rec.install_count.max(1));
+            if rec.first_seen_day == today {
+                new_devices_today += 1;
+            }
+            if rec.active_days.contains(&today) {
+                dau += 1;
+            }
+            if rec.active_days.iter().any(|d| days_7.contains(d)) {
+                wau += 1;
+            }
+            if rec.active_days.iter().any(|d| days_30.contains(d)) {
+                mau += 1;
+            }
+            if rec.active_days.len() >= 2 {
+                retained_2plus += 1;
+            }
+            let os_arch = format!("{}-{}", rec.os, rec.arch);
+            *by_os_arch.entry(os_arch).or_insert(0) += 1;
+            *by_version.entry(rec.last_version.clone()).or_insert(0) += 1;
+            if rec.clients_used.is_empty() {
+                *by_client.entry("cli-only".to_string()).or_insert(0) += 1;
+            } else {
+                for c in &rec.clients_used {
+                    *by_client.entry(c.clone()).or_insert(0) += 1;
+                }
+            }
+            for m in &rec.modes_used {
+                *by_mode.entry(m.clone()).or_insert(0) += 1;
+            }
+        }
+
+        let mut daily_trend_14d = Vec::with_capacity(14);
+        for offset in (0..14).rev() {
+            let day_str = (now_dt - chrono::Duration::days(offset))
+                .format("%Y-%m-%d")
+                .to_string();
+            let day_dau = state
+                .telemetry_devices
+                .values()
+                .filter(|r| r.active_days.contains(&day_str))
+                .count();
+            let day_new = state
+                .telemetry_devices
+                .values()
+                .filter(|r| r.first_seen_day == day_str)
+                .count();
+            daily_trend_14d.push(json!({
+                "date": day_str,
+                "dau": day_dau,
+                "new_devices": day_new
+            }));
+        }
+
+        let stickiness_pct = if mau > 0 {
+            ((dau as f64 / mau as f64) * 1000.0).round() / 10.0
+        } else {
+            0.0
+        };
+        let retention_pct = if total_devices > 0 {
+            ((retained_2plus as f64 / total_devices as f64) * 1000.0).round() / 10.0
+        } else {
+            0.0
+        };
+
+        let paid_subs = state
+            .subscriptions
+            .iter()
+            .filter(|s| s.status == "active")
+            .count();
+
+        json!({
+            "generated_at": now_dt.to_rfc3339(),
+            "total_unique_devices": total_devices,
+            "total_install_events": total_install_events,
+            "new_devices_today": new_devices_today,
+            "dau": dau,
+            "wau": wau,
+            "mau": mau,
+            "stickiness_dau_mau_pct": stickiness_pct,
+            "retained_2plus_days_devices": retained_2plus,
+            "retained_2plus_days_pct": retention_pct,
+            "cloud_tenants_count": state.tenants.len(),
+            "active_paid_subscriptions": paid_subs,
+            "by_client": by_client,
+            "by_os_arch": by_os_arch,
+            "by_version": by_version,
+            "by_mode": by_mode,
+            "daily_trend_14d": daily_trend_14d
+        })
+    }
 }
 
 /// Universal one-line installer script served at `GET /install.sh` (`https://heurion.org/aegis-cloud/install.sh`).
@@ -2450,19 +2702,16 @@ pub const INSTALL_SH: &str = include_str!("../../../scripts/install.sh");
 /// Displays clear, human-friendly operational controls in the visual language of `https://heurion.org`.
 pub const DASHBOARD_HTML: &str = include_str!("assets/dashboard.html");
 
-/// Serves the Mission Control HTML, hot-reloading from `crates/aos-mcp-gateway/src/paas.rs` if present on disk.
+/// Serves the Mission Control HTML, hot-reloading from `crates/aos-mcp-gateway/src/assets/dashboard.html` if present on disk.
 pub fn render_dashboard_html(workspace_root: &Path) -> String {
     load_dashboard_html(workspace_root).replace("{{AOS_VERSION}}", env!("CARGO_PKG_VERSION"))
 }
 
 fn load_dashboard_html(workspace_root: &Path) -> String {
-    let live_paas_rs = workspace_root.join("crates/aos-mcp-gateway/src/paas.rs");
-    if let Ok(raw) = std::fs::read_to_string(&live_paas_rs) {
-        if let Some(start_idx) = raw.find("pub const DASHBOARD_HTML: &str = r##\"") {
-            let html_start = start_idx + "pub const DASHBOARD_HTML: &str = r##\"".len();
-            if let Some(end_rel) = raw[html_start..].find("\"##;") {
-                return raw[html_start..html_start + end_rel].to_string();
-            }
+    let live_asset = workspace_root.join("crates/aos-mcp-gateway/src/assets/dashboard.html");
+    if let Ok(raw) = std::fs::read_to_string(&live_asset) {
+        if !raw.trim().is_empty() {
+            return raw;
         }
     }
     DASHBOARD_HTML.to_string()
@@ -2508,5 +2757,45 @@ mod tests {
         let mut stripe = HashMap::new();
         stripe.insert("stripe-signature".to_string(), format!("t=1700000000,v1={v1}"));
         assert!(PaasControlPlane::verify_webhook_signature("whsec", &stripe, body));
+    }
+
+    #[tokio::test]
+    async fn telemetry_ping_records_dau_mau_and_client_breakdown() {
+        let tmp = tempfile::tempdir().unwrap();
+        let paas = PaasControlPlane::new(tmp.path());
+
+        paas.record_telemetry_ping(TelemetryPingPayload {
+            device_id: "anon-1111222233334444".to_string(),
+            event: "install".to_string(),
+            version: "0.4.5".to_string(),
+            os: "macos".to_string(),
+            arch: "aarch64".to_string(),
+            client: "agy".to_string(),
+            mode: "local_cow".to_string(),
+        })
+        .await
+        .unwrap();
+
+        paas.record_telemetry_ping(TelemetryPingPayload {
+            device_id: "anon-5555666677778888".to_string(),
+            event: "daily_active".to_string(),
+            version: "0.4.5".to_string(),
+            os: "linux".to_string(),
+            arch: "x86_64".to_string(),
+            client: "claude-code".to_string(),
+            mode: "local_cow".to_string(),
+        })
+        .await
+        .unwrap();
+
+        let stats = paas.get_telemetry_stats().await;
+        assert_eq!(stats["total_unique_devices"], 2);
+        assert_eq!(stats["dau"], 2);
+        assert_eq!(stats["wau"], 2);
+        assert_eq!(stats["mau"], 2);
+        assert_eq!(stats["by_client"]["agy"], 1);
+        assert_eq!(stats["by_client"]["claude-code"], 1);
+        assert_eq!(stats["by_os_arch"]["macos-aarch64"], 1);
+        assert_eq!(stats["by_os_arch"]["linux-x86_64"], 1);
     }
 }

@@ -303,6 +303,13 @@ pub(crate) async fn handle_agy_hook(
 
     let effective_workspace =
         resolve_effective_hook_workspace(cli_workspace, &payload, &cli.runtime_dir);
+    crate::telemetry::emit_telemetry_ping(
+        &cli.runtime_dir,
+        "daily_active",
+        &cli.client,
+        "local_cow",
+    )
+    .await;
     let identity = resolve_identity(
         &cli.org,
         &cli.agent,

@@ -18,6 +18,7 @@ mod hooks;
 mod installer;
 mod memory_ui;
 mod routing;
+mod telemetry;
 
 use aos_core::{A2ATaskState, AgentIdentity, IpcBus, IsolationTier};
 use aos_mcp_gateway::AegisRuntimeKernel;
@@ -85,6 +86,23 @@ enum Commands {
     Doctor {
         #[arg(long)]
         home_dir: Option<PathBuf>,
+    },
+
+    /// View Product Growth & User Analytics (GitHub Release downloads, DAU / WAU / MAU, Retention & Client breakdown)
+    #[command(visible_alias = "telemetry")]
+    Stats {
+        /// Optional Aegis Cloud endpoint URL (e.g. `https://cloud.aegis-os.dev`); defaults to local runtime or `AOS_CLOUD_ENDPOINT`
+        #[arg(long)]
+        endpoint: Option<String>,
+        /// Optional operator/admin token for remote `/v1/telemetry/stats`
+        #[arg(long)]
+        admin_secret: Option<String>,
+        /// GitHub repository (`owner/repo`) for live Star/Fork and Release binary download metrics
+        #[arg(long, default_value = "heurion-org/aegis-os")]
+        repo: String,
+        /// Output raw JSON
+        #[arg(long, default_value_t = false)]
+        json: bool,
     },
 
     /// Initialize project-local `.agents/` files for AGY in a specific workspace
@@ -1987,6 +2005,10 @@ async fn main() -> anyhow::Result<()> {
                     .unwrap_or_else(|_| PathBuf::from("."))
             });
             installer::install_global_clients(&target_home, &cli.runtime_dir, dry_run).await?;
+            if !dry_run {
+                telemetry::emit_telemetry_ping(&cli.runtime_dir, "install", "installer", "local_cow")
+                    .await;
+            }
         }
 
         Commands::Doctor { home_dir } => {
@@ -1996,6 +2018,22 @@ async fn main() -> anyhow::Result<()> {
                     .unwrap_or_else(|_| PathBuf::from("."))
             });
             installer::run_doctor(&target_home).await?;
+        }
+
+        Commands::Stats {
+            endpoint,
+            admin_secret,
+            repo,
+            json,
+        } => {
+            telemetry::render_growth_analytics(
+                &cli.runtime_dir,
+                endpoint.as_deref(),
+                admin_secret.as_deref(),
+                &repo,
+                json,
+            )
+            .await?;
         }
 
         Commands::SetupAgy { strict_cow } => {

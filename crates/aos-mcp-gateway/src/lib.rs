@@ -178,9 +178,15 @@ fn is_public_route(method: &str, target: &str) -> bool {
             .iter()
             .any(|p| path.starts_with(p));
     // `/approver/enroll` authenticates with the one-time token from the mailed link.
-    let any_public = ["/v1/billing/checkout", "/v1/billing/webhook", "/v1/billing/claim", "/approver/enroll"]
-        .iter()
-        .any(|p| path.starts_with(p));
+    let any_public = [
+        "/v1/billing/checkout",
+        "/v1/billing/webhook",
+        "/v1/billing/claim",
+        "/v1/telemetry/ping",
+        "/approver/enroll",
+    ]
+    .iter()
+    .any(|p| path.starts_with(p));
     // Key signup: the route itself only lets anonymous callers mint an org's *first* key.
     let signup = method == "POST" && path.starts_with("/v1/tenants/keys");
     (method == "GET" && get_public) || any_public || signup
@@ -194,6 +200,7 @@ fn is_operator_only_route(method: &str, target: &str) -> bool {
     (path.starts_with("/v1/approvals/") && !path.starts_with("/v1/approvals/decide"))
         || (method == "DELETE" && path.starts_with("/v1/approver"))
         || path.starts_with("/v1/workspaces/gc-idle")
+        || path.starts_with("/v1/telemetry/stats")
         || ((path.starts_with("/api/status") || path.starts_with("/v1/status"))
             && requested_orgs(target, "").iter().any(|o| o == "*"))
 }
@@ -3409,6 +3416,11 @@ impl AegisRuntimeKernel {
                         } else {
                             k.egress.list_redacted_secrets(&effective_org).await
                         };
+                        let telemetry = if effective_org == "*" {
+                            Some(k.paas.get_telemetry_stats().await)
+                        } else {
+                            None
+                        };
                         (
                             "HTTP/1.1 200 OK",
                             json!({
@@ -3421,10 +3433,34 @@ impl AegisRuntimeKernel {
                                 "workspaces": workspaces,
                                 "api_keys": api_keys,
                                 "tenants": tenants,
-                                "secrets": secrets
+                                "secrets": secrets,
+                                "telemetry": telemetry
                             })
                             .to_string(),
                         )
+                    } else if method == "POST" && full_target.starts_with("/v1/telemetry/ping") {
+                        let Ok(payload) =
+                            serde_json::from_str::<paas::TelemetryPingPayload>(body_str.trim())
+                        else {
+                            let body = json!({ "error": "Invalid telemetry ping JSON payload" }).to_string();
+                            let resp = format!(
+                                "HTTP/1.1 400 Bad Request\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                                body.len(),
+                                body
+                            );
+                            let _ = stream.write_all(resp.as_bytes()).await;
+                            return;
+                        };
+                        match k.paas.record_telemetry_ping(payload).await {
+                            Ok(val) => ("HTTP/1.1 200 OK", val.to_string()),
+                            Err(e) => (
+                                "HTTP/1.1 400 Bad Request",
+                                json!({ "error": e.to_string() }).to_string(),
+                            ),
+                        }
+                    } else if method == "GET" && full_target.starts_with("/v1/telemetry/stats") {
+                        let stats = k.paas.get_telemetry_stats().await;
+                        ("HTTP/1.1 200 OK", stats.to_string())
                     } else if method == "POST" && full_target.starts_with("/v1/tenants/plan") {
                         let payload: Value = serde_json::from_str(body_str.trim()).unwrap_or_else(|_| json!({}));
                         let t_org = payload.get("org_id").and_then(|v| v.as_str()).unwrap_or(&org_id);
