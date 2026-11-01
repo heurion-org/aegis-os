@@ -1,27 +1,27 @@
 class AegisOs < Formula
   desc "Multi-tenant Agent OS Runtime & Cloud PaaS with CoW VFS, Sandbox & IPC for AGY, Claude Code, and Codex"
   homepage "https://github.com/heurion-org/aegis-os"
-  version "0.4.4"
+  version "0.4.5"
   license "Apache-2.0"
   head "https://github.com/heurion-org/aegis-os.git", branch: "main"
 
   on_macos do
     if Hardware::CPU.arm?
-      url "https://github.com/heurion-org/aegis-os/releases/download/v0.4.4/aegis-os-v0.4.4-aarch64-apple-darwin.tar.gz"
-      sha256 "5f90ac0247f2979cc744b000fa601558a0906ede41fd058f3c4f43b5af355795"
+      url "https://github.com/heurion-org/aegis-os/releases/download/v0.4.5/aegis-os-v0.4.5-aarch64-apple-darwin.tar.gz"
+      sha256 "3a07ff1d0f1773917ae75a4806ddf47969c4f934cc2317c27e92ff9687adddfe"
     else
-      url "https://github.com/heurion-org/aegis-os/releases/download/v0.4.4/aegis-os-v0.4.4-x86_64-apple-darwin.tar.gz"
-      sha256 "7f8c3c2621f6b70c9a6137cbcdbb5cbd3d422ea4027f4b506cef319a58fbdc9f"
+      url "https://github.com/heurion-org/aegis-os/releases/download/v0.4.5/aegis-os-v0.4.5-x86_64-apple-darwin.tar.gz"
+      sha256 "c6aeb6305236c4a5f62038e3f82c5c9193e8b98c5d29671d4aed2c6d6d955b14"
     end
   end
 
   on_linux do
     if Hardware::CPU.arm?
-      url "https://github.com/heurion-org/aegis-os/releases/download/v0.4.4/aegis-os-v0.4.4-aarch64-unknown-linux-gnu.tar.gz"
-      sha256 "00543f577c1a958a430219425f153db87d6bffd4f9ca96712ce0b901e468fa84"
+      url "https://github.com/heurion-org/aegis-os/releases/download/v0.4.5/aegis-os-v0.4.5-aarch64-unknown-linux-gnu.tar.gz"
+      sha256 "4ead8a6379f3a6d9657c1425688e12d13cb48229e6013c35b81238738d70b590"
     else
-      url "https://github.com/heurion-org/aegis-os/releases/download/v0.4.4/aegis-os-v0.4.4-x86_64-unknown-linux-gnu.tar.gz"
-      sha256 "8a18380f361c9d7a4602d222b39035feed028b9c6af1b7ab8fc581e672a051ed"
+      url "https://github.com/heurion-org/aegis-os/releases/download/v0.4.5/aegis-os-v0.4.5-x86_64-unknown-linux-gnu.tar.gz"
+      sha256 "3c8504734293276ccf7b5685bb7fd11fb8de07899edbe80ae7a2675b076fb4fa"
     end
   end
 
