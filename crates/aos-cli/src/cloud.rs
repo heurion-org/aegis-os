@@ -201,18 +201,43 @@ fn load_store(runtime_dir: &Path) -> CloudBindingsStore {
 
 fn save_store(runtime_dir: &Path, store: &CloudBindingsStore) -> anyhow::Result<()> {
     let p = store_path(runtime_dir);
-    if let Some(parent) = p.parent() {
-        std::fs::create_dir_all(parent)?;
+    aos_core::session::write_json_pretty_atomic_sync(&p, store)
+}
+
+fn local_workspace_path_for_write(root: &Path, rel: &str) -> anyhow::Result<(String, PathBuf)> {
+    use std::path::Component;
+    let mut rel_path = PathBuf::new();
+    for comp in Path::new(rel.trim_start_matches('/')).components() {
+        match comp {
+            Component::Normal(c) => rel_path.push(c),
+            Component::CurDir => {}
+            _ => bail!("Path traversal outside local workspace is forbidden: '{}'", rel),
+        }
     }
-    let bytes = serde_json::to_vec_pretty(store)?;
-    std::fs::write(&p, bytes)?;
-    // Holds API keys and claim tokens: owner-only.
-    #[cfg(unix)]
+    if rel_path.as_os_str().is_empty() {
+        bail!("Empty relative path is forbidden");
+    }
+    if rel_path
+        .components()
+        .next()
+        .is_some_and(|c| c.as_os_str() == ".git")
     {
-        use std::os::unix::fs::PermissionsExt;
-        std::fs::set_permissions(&p, std::fs::Permissions::from_mode(0o600))?;
+        bail!("Refusing to write inside .git directory");
     }
-    Ok(())
+    let mut cur = root.to_path_buf();
+    for comp in rel_path.components() {
+        cur.push(comp);
+        match std::fs::symlink_metadata(&cur) {
+            Ok(meta) if meta.file_type().is_symlink() => bail!(
+                "Refusing to write through symlink '{}' in local workspace",
+                cur.strip_prefix(root).unwrap_or(&cur).display()
+            ),
+            Ok(_) => {}
+            Err(_) => break,
+        }
+    }
+    let full = root.join(&rel_path);
+    Ok((rel_path.to_string_lossy().into_owned(), full))
 }
 
 /// Checks if `workspace` has an active Cloud Sandbox binding (or `AOS_CLOUD_ENDPOINT` override).
@@ -838,11 +863,11 @@ pub async fn handle_cloud_command(
             let mut applied = Vec::new();
             let mut deleted = Vec::new();
             for entry in changed_files {
-                let clean = entry.path.trim_start_matches('/').to_string();
-                if clean.is_empty() || clean.contains("..") || clean.starts_with(".git") {
+                let Ok((clean, local_dest)) =
+                    local_workspace_path_for_write(&canon, &entry.path)
+                else {
                     continue;
-                }
-                let local_dest = canon.join(&clean);
+                };
                 if entry.deleted {
                     if local_dest.exists() {
                         let _ = tokio::fs::remove_file(&local_dest).await;
@@ -1827,23 +1852,41 @@ pub async fn serve_unified_stdio(
                     if let Some(obj) = rpc_resp.as_object_mut() {
                         obj.insert("id".to_string(), id);
                     }
-                    if !pre_commit_files.is_empty()
-                        && rpc_resp.to_string().contains("committed_to_host")
-                    {
-                        for entry in pre_commit_files {
-                            let clean = entry.path.trim_start_matches('/').to_string();
-                            if clean.is_empty() || clean.contains("..") || clean.starts_with(".git")
+                    if method == "tools/call" && tool_name == "workspace_commit" {
+                        let parsed_tool_json = rpc_resp
+                            .get("result")
+                            .filter(|r| r.get("isError").and_then(|v| v.as_bool()) != Some(true))
+                            .and_then(|r| r.get("content"))
+                            .and_then(|c| c.as_array())
+                            .and_then(|arr| arr.first())
+                            .and_then(|item| item.get("text"))
+                            .and_then(|t| t.as_str())
+                            .and_then(|txt| serde_json::from_str::<Value>(txt).ok());
+                        if let Some(ref commit_payload) = parsed_tool_json {
+                            if commit_payload.get("status").and_then(|v| v.as_str())
+                                == Some("committed_to_host")
                             {
-                                continue;
-                            }
-                            let dest = active_workspace.join(&clean);
-                            if entry.deleted {
-                                let _ = tokio::fs::remove_file(&dest).await;
-                            } else {
-                                if let Some(parent) = dest.parent() {
-                                    let _ = tokio::fs::create_dir_all(parent).await;
+                                let files_to_sync: Vec<SourceFileEntry> = commit_payload
+                                    .get("committed_source_files")
+                                    .and_then(|v| serde_json::from_value(v.clone()).ok())
+                                    .unwrap_or(pre_commit_files);
+                                for entry in files_to_sync {
+                                    let Ok((_, dest)) = local_workspace_path_for_write(
+                                        &active_workspace,
+                                        &entry.path,
+                                    ) else {
+                                        continue;
+                                    };
+                                    if entry.deleted {
+                                        let _ = tokio::fs::remove_file(&dest).await;
+                                    } else {
+                                        if let Some(parent) = dest.parent() {
+                                            let _ = tokio::fs::create_dir_all(parent).await;
+                                        }
+                                        let _ =
+                                            tokio::fs::write(&dest, entry.content.as_bytes()).await;
+                                    }
                                 }
-                                let _ = tokio::fs::write(&dest, entry.content.as_bytes()).await;
                             }
                         }
                     }

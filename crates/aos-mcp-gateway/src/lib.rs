@@ -195,23 +195,37 @@ fn is_operator_only_route(method: &str, target: &str) -> bool {
         || (method == "DELETE" && path.starts_with("/v1/approver"))
         || path.starts_with("/v1/workspaces/gc-idle")
         || ((path.starts_with("/api/status") || path.starts_with("/v1/status"))
-            && requested_org(target, "").as_deref() == Some("*"))
+            && requested_orgs(target, "").iter().any(|o| o == "*"))
 }
 
-/// The org a request asks to act on, from the `org_id` query parameter or JSON body field.
+/// Every `org_id` a request asks to act on, from all `org_id` query parameters and the JSON body
+/// `org_id` field. Returning all values prevents HTTP Parameter Pollution (`?org_id=own&org_id=victim`)
+/// and query-vs-body discrepancies from bypassing tenant org confinement.
+fn requested_orgs(target: &str, body: &str) -> Vec<String> {
+    let mut out = Vec::new();
+    if let Some((_, qs)) = target.split_once('?') {
+        for pair in qs.split('&') {
+            if let Some(("org_id", v)) = pair.split_once('=') {
+                let decoded = v.trim().replace("%2A", "*").replace("%2a", "*");
+                if !decoded.is_empty() {
+                    out.push(decoded);
+                }
+            }
+        }
+    }
+    if let Ok(v) = serde_json::from_str::<Value>(body.trim()) {
+        if let Some(o) = v.get("org_id").and_then(|o| o.as_str()).map(str::trim) {
+            if !o.is_empty() {
+                out.push(o.to_string());
+            }
+        }
+    }
+    out
+}
+
+/// The primary org a request asks to act on, from the `org_id` query parameter or JSON body field.
 fn requested_org(target: &str, body: &str) -> Option<String> {
-    let from_query = target.split_once('?').and_then(|(_, qs)| {
-        qs.split('&').find_map(|pair| match pair.split_once('=') {
-            Some(("org_id", v)) if !v.is_empty() => Some(v.replace("%2A", "*").replace("%2a", "*")),
-            _ => None,
-        })
-    });
-    from_query.or_else(|| {
-        serde_json::from_str::<Value>(body.trim())
-            .ok()
-            .and_then(|v| v.get("org_id").and_then(|o| o.as_str()).map(|o| o.to_string()))
-            .filter(|o| !o.is_empty())
-    })
+    requested_orgs(target, body).into_iter().next()
 }
 
 /// HTTP daemon limits: the declared body size is trusted only up to this bound, and the whole
@@ -463,7 +477,7 @@ impl AegisRuntimeKernel {
 
             if tool_name == "coord_claim" {
                 for glob in &paths {
-                    let probe = glob.replace("**", "x").replace('*', "x").replace('?', "x");
+                    let probe = glob.replace("**", "x").replace(['*', '?'], "x");
                     let clash = table.iter().find(|(g, c)| {
                         c.owner != identity.agent_id
                             && live.contains(&c.owner)
@@ -592,7 +606,7 @@ impl AegisRuntimeKernel {
                         .workspace
                         .shadow_root()
                         .parent()
-                        .map_or(false, |p| p.join(".initialized").exists())
+                        .is_some_and(|p| p.join(".initialized").exists())
                     && existing.workspace.host_source_root() == host_project_source.as_ref())
             {
                 return Ok(existing.clone());
@@ -907,13 +921,13 @@ impl AegisRuntimeKernel {
                             }
                         }
                     }
-                } else if args.get("scope").and_then(|v| v.as_str()) == Some("global") {
-                    if is_verified_workstation_pair(&target_org, cleaned) {
-                        resolved_cross_org_peer =
-                            Some((target_org.clone(), cleaned.to_string()));
-                        if let Some(obj) = audit_metadata.as_object_mut() {
-                            obj.insert("workstation_peer_verified".to_string(), json!(true));
-                        }
+                } else if args.get("scope").and_then(|v| v.as_str()) == Some("global")
+                    && is_verified_workstation_pair(&target_org, cleaned)
+                {
+                    resolved_cross_org_peer =
+                        Some((target_org.clone(), cleaned.to_string()));
+                    if let Some(obj) = audit_metadata.as_object_mut() {
+                        obj.insert("workstation_peer_verified".to_string(), json!(true));
                     }
                 }
             }
@@ -1203,12 +1217,36 @@ impl AegisRuntimeKernel {
                     .workspace
                     .commit_to_host_with_options(filter_paths, overwrite_binaries)
                     .await?;
+                let host_root = env.workspace.host_source_root();
+                let mut committed_source_files = Vec::new();
+                for rel in &committed {
+                    let clean = rel.trim_start_matches('/').to_string();
+                    let full = host_root.join(&clean);
+                    if !full.exists() {
+                        committed_source_files.push(paas::SourceFileEntry {
+                            path: clean,
+                            content: String::new(),
+                            deleted: true,
+                        });
+                    } else if let Ok(raw) = tokio::fs::read(&full).await {
+                        if !raw.iter().take(8000).any(|&b| b == 0) {
+                            if let Ok(content) = String::from_utf8(raw) {
+                                committed_source_files.push(paas::SourceFileEntry {
+                                    path: clean,
+                                    content,
+                                    deleted: false,
+                                });
+                            }
+                        }
+                    }
+                }
                 Ok(json!({
                     "status": "committed_to_host",
-                    "host_root": env.workspace.host_source_root(),
+                    "host_root": host_root,
                     "auto_refresh": refresh,
                     "verification_passed": verify_cmd.is_some(),
-                    "committed_files": committed
+                    "committed_files": committed,
+                    "committed_source_files": committed_source_files
                 }))
             }
 
@@ -1409,7 +1447,7 @@ impl AegisRuntimeKernel {
                     .into_iter()
                     .filter(|p| p.online)
                     .filter(|p| {
-                        skill_tag.as_ref().map_or(true, |tag| {
+                        skill_tag.as_ref().is_none_or(|tag| {
                             p.capabilities.iter().any(|c| c.to_lowercase().contains(tag))
                                 || p.skills.iter().any(|s| {
                                     s.id.to_lowercase().contains(tag)
@@ -1418,7 +1456,7 @@ impl AegisRuntimeKernel {
                                 })
                                 || p.summary
                                     .as_ref()
-                                    .map_or(false, |sum| sum.to_lowercase().contains(tag))
+                                    .is_some_and(|sum| sum.to_lowercase().contains(tag))
                         })
                     })
                     .map(|p| {
@@ -3152,8 +3190,9 @@ impl AegisRuntimeKernel {
                         Some("This endpoint is reserved for the operator (Authorization: Bearer <operator token> or X-Aegis-Admin-Secret); tenant/agent API keys cannot use it.".to_string())
                     } else {
                         key_org.as_deref().and_then(|own| {
-                            requested_org(full_target, &body_str)
-                                .filter(|req| req != own)
+                            requested_orgs(full_target, &body_str)
+                                .into_iter()
+                                .find(|req| req != own)
                                 .map(|req| format!("API key for org '{}' cannot access org '{}'", own, req))
                         })
                     };
@@ -3595,7 +3634,9 @@ impl AegisRuntimeKernel {
                             ),
                         }
                     } else if method == "GET" && full_target == "/v1/workspaces" {
-                        let list = k.paas.list_workspaces(None).await;
+                        let scope = (auth_mode == DaemonAuth::Required && !is_operator)
+                            .then_some(org_id.as_str());
+                        let list = k.paas.list_workspaces(scope).await;
                         ("HTTP/1.1 200 OK", json!({ "workspaces": list }).to_string())
                     } else if method == "POST" && full_target.starts_with("/v1/workspaces/gc-idle") {
                         let payload: Value = serde_json::from_str(body_str.trim()).unwrap_or_else(|_| json!({}));

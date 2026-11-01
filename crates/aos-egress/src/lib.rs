@@ -472,14 +472,24 @@ impl AegisEgressGateway {
                         .inspect_and_inject_with_body(&identity, &spec, body_opt)
                         .await
                     {
-                        Ok(EgressVerdict::AllowedAndSanitized { secrets_injected, .. }) => (
-                            "HTTP/1.1 200 OK",
-                            json!({
-                                "egress": "allowed",
-                                "secrets_injected": secrets_injected
-                            })
-                            .to_string(),
-                        ),
+                        Ok(EgressVerdict::AllowedAndSanitized {
+                            injected_headers,
+                            secrets_injected,
+                        }) => {
+                            let mut header_keys: Vec<&String> = injected_headers.keys().collect();
+                            header_keys.sort();
+                            (
+                                "HTTP/1.1 200 OK",
+                                json!({
+                                    "egress": "allowed",
+                                    "target_domain": spec.target_domain,
+                                    "normalized_path": Self::normalize_request_path(&spec.path),
+                                    "sanitized_header_keys": header_keys,
+                                    "secrets_injected": secrets_injected
+                                })
+                                .to_string(),
+                            )
+                        }
                         Ok(EgressVerdict::RequiresEscalation { domain, reason }) => (
                             "HTTP/1.1 403 Forbidden",
                             json!({

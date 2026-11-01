@@ -96,12 +96,23 @@ fn api_error(status: StatusCode, code: &str, message: &str) -> (StatusCode, Json
     )
 }
 
+fn constant_time_eq(a: &str, b: &str) -> bool {
+    if a.is_empty() || b.is_empty() || a.len() != b.len() {
+        return false;
+    }
+    a.as_bytes()
+        .iter()
+        .zip(b.as_bytes().iter())
+        .fold(0u8, |acc, (&x, &y)| acc | (x ^ y))
+        == 0
+}
+
 fn check_admin(state: &AppState, headers: &HeaderMap) -> Result<(), (StatusCode, Json<Value>)> {
     let provided = headers
         .get("x-uomp-admin-token")
         .and_then(|value| value.to_str().ok())
         .unwrap_or("");
-    if provided == state.admin_token {
+    if constant_time_eq(provided, &state.admin_token) {
         Ok(())
     } else {
         Err(api_error(
@@ -117,7 +128,7 @@ fn check_bridge(state: &AppState, headers: &HeaderMap) -> Result<(), (StatusCode
         .get("x-uomp-bridge-token")
         .and_then(|value| value.to_str().ok())
         .unwrap_or("");
-    if provided == state.bridge_token {
+    if constant_time_eq(provided, &state.bridge_token) {
         Ok(())
     } else {
         Err(api_error(
@@ -147,6 +158,13 @@ fn claims_from_headers(
         .issuer
         .verify(token)
         .map_err(|_| api_error(StatusCode::UNAUTHORIZED, "INVALID_TOKEN", "invalid token"))?;
+    if claims.expires_at_ms <= Utc::now().timestamp_millis() {
+        return Err(api_error(
+            StatusCode::UNAUTHORIZED,
+            "TOKEN_EXPIRED",
+            "token has expired",
+        ));
+    }
     let active = state
         .auth
         .lock()
@@ -219,11 +237,12 @@ fn item_allowed(scope: &MemoryScope, item: &aos_memory_store::MemoryItem) -> boo
     if scope.deny_keys.iter().any(|key| key == &item.key) {
         return false;
     }
-    if item
-        .tags
-        .iter()
-        .any(|tag| scope.deny_tags.iter().any(|denied| denied == tag))
-    {
+    if item.tags.iter().any(|tag| {
+        scope
+            .deny_tags
+            .iter()
+            .any(|denied| aos_memory::tag_hierarchy_matches(denied, tag))
+    }) {
         return false;
     }
     if scope.keys.iter().any(|key| key == &item.key) {
@@ -232,9 +251,12 @@ fn item_allowed(scope: &MemoryScope, item: &aos_memory_store::MemoryItem) -> boo
     if item.sensitivity == aos_memory::Sensitivity::High {
         return false;
     }
-    item.tags
-        .iter()
-        .any(|tag| scope.tags.iter().any(|granted| granted == tag))
+    item.tags.iter().any(|tag| {
+        scope
+            .tags
+            .iter()
+            .any(|granted| aos_memory::tag_hierarchy_matches(granted, tag))
+    })
 }
 
 async fn create_session(
@@ -512,15 +534,17 @@ async fn validate_token(State(state): State<Arc<AppState>>, Json(body): Json<Val
         .and_then(|value| value.as_str())
         .unwrap_or("");
     let claims = state.issuer.verify(token).ok();
+    let now_ms = Utc::now().timestamp_millis();
     let valid = claims
         .as_ref()
         .map(|claims| {
-            state
-                .auth
-                .lock()
-                .unwrap_or_else(|value| value.into_inner())
-                .is_active(&claims.session_id)
-                .unwrap_or(false)
+            claims.expires_at_ms > now_ms
+                && state
+                    .auth
+                    .lock()
+                    .unwrap_or_else(|value| value.into_inner())
+                    .is_active(&claims.session_id)
+                    .unwrap_or(false)
         })
         .unwrap_or(false);
     Ok(Json(json!({
@@ -813,7 +837,7 @@ async fn get_memory(
         .store
         .lock()
         .unwrap_or_else(|value| value.into_inner());
-    let item = store
+    let mut item = store
         .get(&key)
         .map_err(|error| {
             api_error(
@@ -839,6 +863,7 @@ async fn get_memory(
             "key is outside the token scope",
         ));
     }
+    item.value = aos_memory::project_json_fields(&item.key, &item.value, &claims.scopes.read);
     log_audit(
         &state,
         &claims.session_id,
@@ -864,14 +889,19 @@ async fn list_memory(
             "tag is required",
         )
     })?;
-    if !claims.scopes.read.tags.iter().any(|granted| granted == tag)
-        && !claims
-            .scopes
-            .read
-            .tags
-            .iter()
-            .any(|granted| tag.starts_with(granted))
-    {
+    let tag_denied = claims
+        .scopes
+        .read
+        .deny_tags
+        .iter()
+        .any(|denied| aos_memory::tag_hierarchy_matches(denied, tag));
+    let tag_granted = claims
+        .scopes
+        .read
+        .tags
+        .iter()
+        .any(|granted| aos_memory::tag_hierarchy_matches(granted, tag));
+    if tag_denied || !tag_granted {
         log_audit(
             &state,
             &claims.session_id,
@@ -901,6 +931,11 @@ async fn list_memory(
     let visible: Vec<aos_memory_store::MemoryItem> = items
         .into_iter()
         .filter(|item| item_allowed(&claims.scopes.read, item))
+        .map(|mut item| {
+            item.value =
+                aos_memory::project_json_fields(&item.key, &item.value, &claims.scopes.read);
+            item
+        })
         .collect();
     log_audit(
         &state,
@@ -932,23 +967,52 @@ async fn stage_write(
         .get("tags")
         .and_then(|value| serde_json::from_value(value.clone()).ok())
         .unwrap_or_default();
-    let sensitivity = body
+    let sensitivity_raw = body
         .get("sensitivity")
         .and_then(|value| value.as_str())
-        .unwrap_or("medium");
-    if sensitivity == "high" {
+        .unwrap_or("medium")
+        .trim()
+        .to_ascii_lowercase();
+    let sensitivity = match sensitivity_raw.as_str() {
+        "low" => aos_memory::Sensitivity::Low,
+        "medium" => aos_memory::Sensitivity::Medium,
+        "high" => {
+            return Err(api_error(
+                StatusCode::FORBIDDEN,
+                "HIGH_SENSITIVITY_WRITE_DENIED",
+                "high-sensitivity writes are not allowed",
+            ));
+        }
+        _ => {
+            return Err(api_error(
+                StatusCode::BAD_REQUEST,
+                "INVALID_REQUEST",
+                "sensitivity must be 'low' or 'medium'",
+            ));
+        }
+    };
+    let scope = &claims.scopes.write;
+    if scope.deny_keys.iter().any(|denied| denied == &key)
+        || tags.iter().any(|tag| {
+            scope
+                .deny_tags
+                .iter()
+                .any(|denied| aos_memory::tag_hierarchy_matches(denied, tag))
+        })
+    {
         return Err(api_error(
             StatusCode::FORBIDDEN,
-            "HIGH_SENSITIVITY_WRITE_DENIED",
-            "high-sensitivity writes are not allowed",
+            "ACCESS_DENIED",
+            "write is denied by token scope",
         ));
     }
-    let scope = &claims.scopes.write;
-    let key_allowed = scope.keys.iter().any(|granted| granted == &key)
-        && !scope.deny_keys.iter().any(|denied| denied == &key);
-    let tag_allowed = tags
-        .iter()
-        .any(|tag| scope.tags.iter().any(|granted| granted == tag));
+    let key_allowed = scope.keys.iter().any(|granted| granted == &key);
+    let tag_allowed = tags.iter().any(|tag| {
+        scope
+            .tags
+            .iter()
+            .any(|granted| aos_memory::tag_hierarchy_matches(granted, tag))
+    });
     if !key_allowed && !tag_allowed {
         return Err(api_error(
             StatusCode::FORBIDDEN,
@@ -956,15 +1020,51 @@ async fn stage_write(
             "write is outside the token scope",
         ));
     }
-    let sensitivity = match sensitivity {
-        "low" => aos_memory::Sensitivity::Low,
-        "medium" => aos_memory::Sensitivity::Medium,
-        _ => aos_memory::Sensitivity::High,
-    };
     let store = state
         .store
         .lock()
         .unwrap_or_else(|value| value.into_inner());
+    if let Some(existing) = store.get(&key).map_err(|error| {
+        api_error(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "STORE_ERROR",
+            &error.to_string(),
+        )
+    })? {
+        if existing.sensitivity == aos_memory::Sensitivity::High {
+            return Err(api_error(
+                StatusCode::FORBIDDEN,
+                "HIGH_SENSITIVITY_WRITE_DENIED",
+                "high-sensitivity items cannot be overwritten via staged write",
+            ));
+        }
+        if existing.tags.iter().any(|tag| {
+            scope
+                .deny_tags
+                .iter()
+                .any(|denied| aos_memory::tag_hierarchy_matches(denied, tag))
+        }) {
+            return Err(api_error(
+                StatusCode::FORBIDDEN,
+                "ACCESS_DENIED",
+                "existing item has a denied tag",
+            ));
+        }
+        if !key_allowed
+            && !existing.tags.iter().any(|tag| {
+                scope
+                    .tags
+                    .iter()
+                    .any(|granted| aos_memory::tag_hierarchy_matches(granted, tag))
+            })
+        {
+            return Err(api_error(
+                StatusCode::FORBIDDEN,
+                "ACCESS_DENIED",
+                "existing item is outside the token tag scope",
+            ));
+        }
+    }
     let staged = store
         .stage_write(aos_memory_store::StageWriteInput {
             session_id: claims.session_id.clone(),
@@ -1177,11 +1277,10 @@ async fn get_payload(
         .get("session_id")
         .and_then(|value: &Value| value.as_str());
     if !admin
-        && claims
+        && !claims
             .as_ref()
             .map(|claims| Some(claims.session_id.as_str()) == owner)
             .unwrap_or(false)
-            == false
     {
         return Err(api_error(
             StatusCode::FORBIDDEN,

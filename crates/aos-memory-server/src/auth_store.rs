@@ -430,10 +430,13 @@ impl AuthStore {
         let Some(token) = token else {
             return Ok(None);
         };
-        self.conn.execute(
-            "UPDATE consent_requests SET token_delivered = 1 WHERE request_id = ?",
+        let updated = self.conn.execute(
+            "UPDATE consent_requests SET token_delivered = 1 WHERE request_id = ? AND status = 'approved' AND token_delivered = 0",
             params![request_id],
         )?;
+        if updated == 0 {
+            return Ok(None);
+        }
         Ok(Some(token))
     }
 }

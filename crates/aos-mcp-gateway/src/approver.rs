@@ -17,12 +17,11 @@ pub const TOTP_DIGITS: u32 = 6;
 /// Accept codes from one step before/after the current one (clock skew).
 const TOTP_SKEW_STEPS: i64 = 1;
 
-/// 20 random bytes (160 bits, the RFC 4226 recommendation).
+/// 20 random bytes (160 bits, the RFC 4226 recommendation) from OS CSPRNG.
 pub fn generate_secret() -> Vec<u8> {
-    let mut bytes = Vec::with_capacity(32);
-    bytes.extend_from_slice(uuid::Uuid::new_v4().as_bytes());
-    bytes.extend_from_slice(uuid::Uuid::new_v4().as_bytes());
-    bytes.truncate(20);
+    use rand::RngCore;
+    let mut bytes = vec![0u8; 20];
+    rand::rngs::OsRng.fill_bytes(&mut bytes);
     bytes
 }
 

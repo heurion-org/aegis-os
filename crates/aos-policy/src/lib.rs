@@ -80,15 +80,11 @@ impl AegisPolicyKernel {
 
     async fn flush_to_disk(&self) -> anyhow::Result<()> {
         if let Some(ref path) = self.state_file {
-            if let Some(parent) = path.parent() {
-                tokio::fs::create_dir_all(parent).await?;
-            }
             let state = PersistedPolicyState {
                 leases: self.leases.read().await.clone(),
                 escalations: self.escalations.read().await.clone(),
             };
-            let bytes = serde_json::to_vec_pretty(&state)?;
-            tokio::fs::write(path, bytes).await?;
+            aos_core::session::write_json_pretty_atomic(path, &state).await?;
         }
         Ok(())
     }
@@ -109,8 +105,8 @@ impl AegisPolicyKernel {
     pub fn is_commit_poisoning_path(p: &str) -> bool {
         let norm = p.trim_start_matches("./").trim_start_matches('/');
         let file_name = norm.rsplit('/').next().unwrap_or(norm);
-        norm.contains(".git/hooks")
-            || norm.contains(".git/config")
+        norm.starts_with(".git/")
+            || norm.contains("/.git/")
             || norm == ".gitmodules"
             || norm.ends_with(".envrc")
             || norm.contains(".github/workflows")
@@ -118,6 +114,18 @@ impl AegisPolicyKernel {
             || norm.contains(".cargo/config")
             || norm.contains(".vscode/tasks.json")
             || norm.contains(".vscode/launch.json")
+            || norm == ".agents/hooks.json"
+            || norm.ends_with("/.agents/hooks.json")
+            || norm.starts_with(".claude/")
+            || norm.contains("/.claude/")
+            || norm == ".claude.json"
+            || norm.starts_with(".cursor/")
+            || norm.contains("/.cursor/")
+            || norm == ".mcp.json"
+            || norm.starts_with(".gemini/")
+            || norm.contains("/.gemini/")
+            || norm.starts_with(".codex/")
+            || norm.contains("/.codex/")
             || file_name == "build.rs"
             || file_name == "Makefile"
             || file_name == "GNUmakefile"
@@ -135,6 +143,11 @@ impl AegisPolicyKernel {
             || file_name == "noxfile.py"
             || file_name == "tox.ini"
             || file_name == "Cargo.toml"
+            || file_name == "rust-toolchain.toml"
+            || file_name == "rust-toolchain"
+            || file_name == "build.gradle"
+            || file_name == "build.gradle.kts"
+            || file_name == "pom.xml"
             || file_name.eq_ignore_ascii_case("justfile")
             || file_name == "Rakefile"
             || file_name == ".npmrc"
@@ -356,12 +369,20 @@ impl PolicyEngine for AegisPolicyKernel {
             "proc_exec" | "proc_manage" => {
                 if let Some(cmd) = ctx.metadata.get("command").and_then(|v| v.as_str()) {
                     let trimmed = cmd.trim();
-                    if trimmed == "sudo" || trimmed.starts_with("sudo ") {
+                    let invokes_privesc = trimmed
+                        .split([';', '|', '&', '\n'])
+                        .map(|seg| seg.trim())
+                        .any(|seg| {
+                            let first = seg.split_whitespace().next().unwrap_or("");
+                            let bin = first.rsplit('/').next().unwrap_or(first);
+                            matches!(bin, "sudo" | "doas" | "pkexec" | "su")
+                        });
+                    if invokes_privesc {
                         return Ok(PolicyDecision::Deny {
                             reason: "Privilege escalation ('sudo') is forbidden inside Aegis OS sandbox".to_string(),
                         });
                     }
-                    if trimmed.contains("/.ssh") || trimmed.contains("/.aws") {
+                    if trimmed.contains("/.ssh") || trimmed.contains("/.aws") || trimmed.contains("/.gnupg") {
                         return Ok(PolicyDecision::Deny {
                             reason: "Command attempts to access protected host credentials".to_string(),
                         });
@@ -480,7 +501,7 @@ impl PolicyEngine for AegisPolicyKernel {
             .filter(|l| {
                 (org_id == "*" || l.org_id == org_id)
                     && (l.expires_at_ms > now_ms || l.expires_at_ms == -1)
-                    && agent_id.map_or(true, |a| l.agent_id == "*" || l.agent_id == a)
+                    && agent_id.is_none_or(|a| l.agent_id == "*" || l.agent_id == a)
             })
             .cloned()
             .collect())
@@ -847,6 +868,9 @@ mod tests {
             "Makefile",
             "package.json",
             ".cargo/config.toml",
+            ".agents/hooks.json",
+            ".claude/settings.json",
+            ".git/info/attributes",
         ] {
             let poisoned_ctx = PolicyContext {
                 principal: agent.clone(),

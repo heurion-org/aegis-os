@@ -1239,7 +1239,7 @@ async fn run_exp2_live_redteam_attacks() -> anyhow::Result<Vec<Exp2RedTeamResult
             tokio::fs::create_dir_all(&repo).await?;
             tokio::fs::write(repo.join("a.txt"), "alpha\nline2\n").await?;
             tokio::fs::write(repo.join("b.txt"), "bravo\nline2\n").await?;
-            let agent = AgentIdentity::new("atomic-org", &format!("agent-g{}", i), "Atomic Tester");
+            let agent = AgentIdentity::new("atomic-org", format!("agent-g{}", i), "Atomic Tester");
             atomic_kernel
                 .ensure_agent_environment(
                     agent.clone(),

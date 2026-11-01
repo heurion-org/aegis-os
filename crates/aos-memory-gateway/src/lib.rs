@@ -424,6 +424,18 @@ impl RateLimiter {
             .windows
             .lock()
             .unwrap_or_else(|error| error.into_inner());
+        if windows.len() > 1024 {
+            windows.retain(|_, w| {
+                while let Some(front) = w.front() {
+                    if now.duration_since(*front).as_secs() >= 60 {
+                        w.pop_front();
+                    } else {
+                        break;
+                    }
+                }
+                !w.is_empty()
+            });
+        }
         let window = windows.entry(key.to_string()).or_default();
         while let Some(front) = window.front() {
             if now.duration_since(*front).as_secs() >= 60 {
@@ -577,15 +589,29 @@ where
         }
     }
 
+    const MAX_BODY_BYTES: usize = 4 * 1024 * 1024;
+    if content_length > MAX_BODY_BYTES {
+        let body = serde_json::json!({ "error": "request body exceeds maximum allowed size" })
+            .to_string();
+        let response = format!(
+            "HTTP/1.1 413 Payload Too Large\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{body}",
+            body.len()
+        );
+        stream.write_all(response.as_bytes()).await?;
+        return Ok(());
+    }
+
     let body_start = header_end + 4;
     let mut body = buffer[body_start..].to_vec();
     while body.len() < content_length {
-        let read = stream.read(&mut chunk).await?;
+        let remaining = (content_length - body.len()).min(chunk.len());
+        let read = stream.read(&mut chunk[..remaining]).await?;
         if read == 0 {
             break;
         }
         body.extend_from_slice(&chunk[..read]);
     }
+    body.truncate(content_length);
 
     let request = GatewayRequest {
         method,
@@ -599,27 +625,6 @@ where
             .record("", "", &request.method, &request.path, "allow", 200)
             .await;
         return forward(stream, request, guard).await;
-    }
-
-    if config.check_session {
-        let token = request
-            .authorization
-            .as_deref()
-            .and_then(|value| value.strip_prefix("Bearer "));
-        if let Some(token) = token {
-            if !session_is_active(guard, token).await.unwrap_or(false) {
-                audit
-                    .record("", "", &request.method, &request.path, "deny", 401)
-                    .await;
-                let body = serde_json::json!({ "error": "session is not active" }).to_string();
-                let response = format!(
-                    "HTTP/1.1 401 Unauthorized\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{body}",
-                    body.len()
-                );
-                stream.write_all(response.as_bytes()).await?;
-                return Ok(());
-            }
-        }
     }
 
     match authorize_request(config, &request, false, now_ms()) {
@@ -642,6 +647,32 @@ where
                 );
                 stream.write_all(response.as_bytes()).await?;
                 return Ok(());
+            }
+            if config.check_session {
+                let token = request
+                    .authorization
+                    .as_deref()
+                    .and_then(|value| value.strip_prefix("Bearer "))
+                    .unwrap_or_default();
+                if !session_is_active(guard, token).await.unwrap_or(false) {
+                    audit
+                        .record(
+                            &authorized.claims.session_id,
+                            &authorized.claims.agent_id,
+                            &request.method,
+                            &request.path,
+                            "deny",
+                            401,
+                        )
+                        .await;
+                    let body = serde_json::json!({ "error": "session is not active" }).to_string();
+                    let response = format!(
+                        "HTTP/1.1 401 Unauthorized\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{body}",
+                        body.len()
+                    );
+                    stream.write_all(response.as_bytes()).await?;
+                    return Ok(());
+                }
             }
             audit
                 .record(
@@ -707,13 +738,19 @@ where
 {
     let mut upstream = TcpStream::connect((guard.host.as_str(), guard.port)).await?;
     let body = request.body;
+    let content_type_header = if body.is_empty() {
+        ""
+    } else {
+        "Content-Type: application/json\r\n"
+    };
     let request_head = format!(
-        "{} {} HTTP/1.1\r\nHost: {}:{}\r\nAuthorization: {}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+        "{} {} HTTP/1.1\r\nHost: {}:{}\r\nAuthorization: {}\r\n{}Content-Length: {}\r\nConnection: close\r\n\r\n",
         request.method,
         request.path,
         guard.host,
         guard.port,
         request.authorization.unwrap_or_default(),
+        content_type_header,
         body.len()
     );
     upstream.write_all(request_head.as_bytes()).await?;

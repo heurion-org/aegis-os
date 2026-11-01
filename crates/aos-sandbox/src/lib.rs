@@ -242,6 +242,7 @@ impl NativeOsSandboxInstance {
     /// - The Agent's CoW Shadow Workspace (`workspace_dir`)
     /// - The Agent's private persistent Home (`agent_home_dir`)
     /// - The Agent's organization publish directory (`org_agent_pub_dir`)
+    ///
     /// And explicitly denies reading sensitive host credential directories (`~/.ssh`, `~/.aws`, `~/.gnupg`,
     /// `~/.kube`, `~/.config/gh`, `~/.npmrc`, `~/.pypirc`, `~/Library/Keychains`).
     /// When `egress_proxy_addr` is set, also enforces `(deny network-outbound)` except to localhost proxy.
@@ -435,7 +436,8 @@ impl NativeOsSandboxInstance {
     }
 
     /// Safe read-only compiler/toolchain subdirectories re-exposed after masking a host `$HOME` with `--tmpfs`.
-    /// Note that `.cargo/credentials.toml` and `.cargo/credentials` are intentionally excluded.
+    /// Note that `.cargo/credentials.toml`, `.cargo/credentials`, and sensitive `.local/share` subtrees
+    /// (such as `keyrings`, `kwalletd`, shell histories) are intentionally excluded.
     const SAFE_TOOLCHAIN_SUBDIRS: &'static [&'static str] = &[
         ".rustup",
         ".cargo/bin",
@@ -443,7 +445,13 @@ impl NativeOsSandboxInstance {
         ".cargo/git",
         ".local/bin",
         ".local/lib",
-        ".local/share",
+        ".local/share/rustup",
+        ".local/share/uv",
+        ".local/share/pnpm",
+        ".local/share/mise",
+        ".local/share/fnm",
+        ".local/share/pyenv",
+        ".local/share/virtualenv",
     ];
 
     fn candidate_homes() -> Vec<PathBuf> {
@@ -522,6 +530,46 @@ impl NativeOsSandboxInstance {
                     }
                 }
             }
+        }
+
+        // Default-Deny Runtime State & Multi-Tenant Isolation on Linux (`tenant_gate`):
+        // When `runtime_root` lives outside `/tmp` and `$HOME` (e.g. `/mnt/btrfs/aegis-cloud` in Cloud PaaS),
+        // mask `<runtime_root>` with `--tmpfs` before selectively mounting only this agent's dirs and
+        // its own org's `pub` and `paas_workspaces/<org_id>` trees.
+        let mut extra_org_ro_mounts: Vec<String> = Vec::new();
+        if !aos_core::ablated("tenant_gate") {
+            let org_dir = self.config.org_shared_ro_dir.parent();
+            let orgs_root = org_dir.and_then(Path::parent);
+            if let (Some(org_dir), Some(orgs_root), Some(runtime_root)) =
+                (org_dir, orgs_root, orgs_root.and_then(Path::parent))
+            {
+                if orgs_root.file_name().and_then(|n| n.to_str()) == Some("orgs") {
+                    let masked_by_tmp = runtime_root.starts_with("/tmp")
+                        || runtime_root.starts_with("/private/tmp");
+                    let masked_by_home = !aos_core::ablated("cred_mask")
+                        && homes.iter().any(|h| runtime_root.starts_with(h));
+                    if !masked_by_tmp && !masked_by_home {
+                        args.extend([
+                            "--tmpfs".to_string(),
+                            runtime_root.to_string_lossy().into_owned(),
+                        ]);
+                    }
+                    let org_pub = org_dir.join("pub");
+                    if org_pub.is_dir() && org_pub != self.config.org_agent_pub_dir {
+                        extra_org_ro_mounts.push(org_pub.to_string_lossy().into_owned());
+                    }
+                    let org_paas = runtime_root
+                        .join("paas_workspaces")
+                        .join(&self.config.identity.org_id);
+                    if org_paas.is_dir() {
+                        extra_org_ro_mounts.push(org_paas.to_string_lossy().into_owned());
+                    }
+                }
+            }
+        }
+
+        for ro_dir in extra_org_ro_mounts {
+            args.extend(["--ro-bind".to_string(), ro_dir.clone(), ro_dir]);
         }
 
         args.extend([
@@ -756,6 +804,7 @@ impl SandboxInstance for NativeOsSandboxInstance {
             let _ = std::fs::rename(&tmp_err, &pid_err);
 
             tokio::spawn(async move {
+                let _keep_bridge = egress_bridge;
                 if let Ok(status) = child.wait().await {
                     let code = status.code().unwrap_or(-1);
                     let _ = tokio::fs::write(&pid_exit, code.to_string()).await;
@@ -1039,6 +1088,37 @@ mod tests {
         assert!(
             tmpfs_pos < ws_pos,
             "`--tmpfs /tmp` must precede the workspace bind or it hides workspaces under /tmp"
+        );
+    }
+
+    #[test]
+    fn bwrap_masks_custom_runtime_root_outside_tmp() {
+        let rt = PathBuf::from("/mnt/btrfs/aegis-cloud");
+        let org = rt.join("orgs/acme");
+        let me = org.join("agents/coder-1");
+        let driver_cfg = SandboxConfig {
+            identity: AgentIdentity::new("acme", "coder-1", "Engineer"),
+            tier: IsolationTier::NativeOsSandbox,
+            limits: ResourceLimits::default(),
+            workspace_dir: me.join("cow_workspace/ws"),
+            agent_home_dir: me.join("home"),
+            org_shared_ro_dir: org.join("shared_ro"),
+            org_agent_pub_dir: org.join("pub/coder-1"),
+            egress_proxy_addr: None,
+        };
+        let args = NativeOsSandboxInstance::new(driver_cfg).generate_linux_bwrap_args();
+        let rt_tmpfs_pos = args
+            .windows(2)
+            .position(|w| w == ["--tmpfs", "/mnt/btrfs/aegis-cloud"])
+            .expect("custom runtime_root must be masked with --tmpfs");
+        let ws_pos = args
+            .iter()
+            .position(|a| a.ends_with("/cow_workspace/ws"))
+            .expect("workspace bind present");
+        assert!(rt_tmpfs_pos < ws_pos);
+        assert!(
+            !NativeOsSandboxInstance::SAFE_TOOLCHAIN_SUBDIRS.contains(&".local/share"),
+            "full ~/.local/share must not be re-exposed in SAFE_TOOLCHAIN_SUBDIRS"
         );
     }
 

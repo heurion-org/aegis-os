@@ -317,49 +317,6 @@ async fn deny(
     Ok(Json(response))
 }
 
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    fn state() -> UiState {
-        UiState {
-            memory_url: "http://127.0.0.1:9374".to_string(),
-            admin_token: "admin".to_string(),
-            ui_token: "ui-token".to_string(),
-            opened_ids: Mutex::new(HashSet::new()),
-        }
-    }
-
-    #[test]
-    fn ui_token_is_required() {
-        let state = state();
-        let mut query = HashMap::new();
-        assert!(check_token(&state, &query).is_err());
-        query.insert("token".to_string(), "wrong".to_string());
-        assert!(check_token(&state, &query).is_err());
-        query.insert("token".to_string(), "ui-token".to_string());
-        assert!(check_token(&state, &query).is_ok());
-    }
-
-    #[test]
-    fn only_loopback_hosts_are_accepted() {
-        assert!(is_loopback_host("127.0.0.1:9375"));
-        assert!(is_loopback_host("localhost:9375"));
-        assert!(is_loopback_host("[::1]:9375"));
-        assert!(!is_loopback_host("evil.example:9375"));
-        assert!(!is_loopback_host("127.0.0.1.evil.example"));
-    }
-
-    #[test]
-    fn opened_ids_are_tracked_per_request() {
-        let state = state();
-        let requests = vec![json!({ "request_id": "a" })];
-        mark_opened(&state, &requests);
-        assert!(state.opened_ids.lock().unwrap().contains("a"));
-        assert!(!state.opened_ids.lock().unwrap().contains("b"));
-    }
-}
-
 const INDEX_HTML: &str = r##"<!doctype html>
 <html lang="zh-CN">
 <head>
@@ -691,3 +648,46 @@ window.setInterval(load, 2000);
 </script>
 </body>
 </html>"##;
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn state() -> UiState {
+        UiState {
+            memory_url: "http://127.0.0.1:9374".to_string(),
+            admin_token: "admin".to_string(),
+            ui_token: "ui-token".to_string(),
+            opened_ids: Mutex::new(HashSet::new()),
+        }
+    }
+
+    #[test]
+    fn ui_token_is_required() {
+        let state = state();
+        let mut query = HashMap::new();
+        assert!(check_token(&state, &query).is_err());
+        query.insert("token".to_string(), "wrong".to_string());
+        assert!(check_token(&state, &query).is_err());
+        query.insert("token".to_string(), "ui-token".to_string());
+        assert!(check_token(&state, &query).is_ok());
+    }
+
+    #[test]
+    fn only_loopback_hosts_are_accepted() {
+        assert!(is_loopback_host("127.0.0.1:9375"));
+        assert!(is_loopback_host("localhost:9375"));
+        assert!(is_loopback_host("[::1]:9375"));
+        assert!(!is_loopback_host("evil.example:9375"));
+        assert!(!is_loopback_host("127.0.0.1.evil.example"));
+    }
+
+    #[test]
+    fn opened_ids_are_tracked_per_request() {
+        let state = state();
+        let requests = vec![json!({ "request_id": "a" })];
+        mark_opened(&state, &requests);
+        assert!(state.opened_ids.lock().unwrap().contains("a"));
+        assert!(!state.opened_ids.lock().unwrap().contains("b"));
+    }
+}

@@ -53,7 +53,7 @@ pub const WRAPPER_COMMS: &[&str] = &[
 
 fn is_wrapper(comm: &str) -> bool {
     let base = comm.rsplit('/').next().unwrap_or(comm).trim_start_matches('-');
-    WRAPPER_COMMS.iter().any(|w| *w == base)
+    WRAPPER_COMMS.contains(&base)
 }
 
 /// Walks up from `start_pid` (inclusive) and returns the first non-wrapper process.
@@ -149,7 +149,7 @@ pub fn is_pid_alive(pid: u32, expected_start_time: Option<u64>) -> bool {
         return false;
     }
     match proc_info(pid) {
-        Some(info) => expected_start_time.map_or(true, |st| st == 0 || info.start_time == st),
+        Some(info) => expected_start_time.is_none_or(|st| st == 0 || info.start_time == st),
         None => false,
     }
 }
@@ -219,9 +219,102 @@ fn write_json_atomic(path: &Path, value: &impl Serialize) -> std::io::Result<()>
     if let Some(parent) = path.parent() {
         std::fs::create_dir_all(parent)?;
     }
-    let tmp = path.with_extension(format!("tmp-{}", std::process::id()));
+    let tmp = path.with_extension(format!("tmp-{}-{}", std::process::id(), uuid::Uuid::new_v4().simple()));
     std::fs::write(&tmp, serde_json::to_vec_pretty(value).unwrap_or_default())?;
     std::fs::rename(tmp, path)
+}
+
+/// Acquires an exclusive cross-process `flock` synchronously for a persisted JSON state file (`<path>.lock`).
+pub fn acquire_file_lock_sync(path: &Path) -> anyhow::Result<std::fs::File> {
+    let lock_path = path.with_extension("lock");
+    if let Some(parent) = lock_path.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
+    let file = std::fs::OpenOptions::new()
+        .create(true)
+        .truncate(false)
+        .read(true)
+        .write(true)
+        .open(&lock_path)?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::io::AsRawFd;
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
+        loop {
+            let rc = unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) };
+            if rc == 0 {
+                break;
+            }
+            let error = std::io::Error::last_os_error();
+            if error.kind() == std::io::ErrorKind::WouldBlock
+                && std::time::Instant::now() < deadline
+            {
+                std::thread::sleep(std::time::Duration::from_millis(15));
+                continue;
+            }
+            anyhow::bail!(
+                "timed out waiting for state lock '{}': {}",
+                lock_path.display(),
+                error
+            );
+        }
+    }
+    Ok(file)
+}
+
+/// Acquires an exclusive cross-process `flock` for a persisted JSON state file (`<path>.lock`).
+pub async fn acquire_file_lock(path: &Path) -> anyhow::Result<std::fs::File> {
+    let path = path.to_path_buf();
+    tokio::task::spawn_blocking(move || acquire_file_lock_sync(&path)).await?
+}
+
+/// Synchronously writes `value` as pretty-printed JSON (owner-only `0o600` on Unix) to a unique
+/// sibling temporary file and atomically renames it onto `path` while holding a cross-process file lock.
+pub fn write_json_pretty_atomic_sync<T: Serialize>(path: &Path, value: &T) -> anyhow::Result<()> {
+    let _lock = acquire_file_lock_sync(path)?;
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
+    let bytes = serde_json::to_vec_pretty(value)?;
+    let tmp = path.with_extension(format!(
+        "json.tmp-{}-{}",
+        std::process::id(),
+        uuid::Uuid::new_v4().simple()
+    ));
+    std::fs::write(&tmp, bytes)?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&tmp, std::fs::Permissions::from_mode(0o600))?;
+    }
+    std::fs::rename(&tmp, path)?;
+    Ok(())
+}
+
+/// Writes `value` as pretty-printed JSON to a unique sibling temporary file and atomically
+/// renames it onto `path` while holding a cross-process file lock.
+pub async fn write_json_pretty_atomic<T: Serialize + Sync>(
+    path: &Path,
+    value: &T,
+) -> anyhow::Result<()> {
+    let _lock = acquire_file_lock(path).await?;
+    if let Some(parent) = path.parent() {
+        tokio::fs::create_dir_all(parent).await?;
+    }
+    let bytes = serde_json::to_vec_pretty(value)?;
+    let tmp = path.with_extension(format!(
+        "json.tmp-{}-{}",
+        std::process::id(),
+        uuid::Uuid::new_v4().simple()
+    ));
+    tokio::fs::write(&tmp, bytes).await?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        tokio::fs::set_permissions(&tmp, std::fs::Permissions::from_mode(0o600)).await?;
+    }
+    tokio::fs::rename(&tmp, path).await?;
+    Ok(())
 }
 
 /// Resolve the agent id for `key` without side effects: hook-written binding first, else derived.

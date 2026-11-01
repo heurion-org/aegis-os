@@ -20,9 +20,10 @@ use crate::AegisRuntimeKernel;
 use anyhow::{bail, Context};
 use aos_core::{AgentIdentity, PolicyDecision};
 use chrono::Utc;
+use ed25519_dalek::SigningKey;
+use rand::RngCore;
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
-use sha2::{Digest, Sha256};
 use std::path::{Path, PathBuf};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::sync::RwLock;
@@ -95,6 +96,8 @@ struct PersistedAppStoreState {
     pub node_id: String,
     pub node_public_key: String,
     #[serde(default)]
+    pub node_private_key: Option<String>,
+    #[serde(default)]
     pub installed_apps: Vec<InstalledAppRecord>,
     #[serde(default)]
     pub credentials: Vec<AppCredentialRecord>,
@@ -105,12 +108,15 @@ struct PersistedAppStoreState {
 impl Default for PersistedAppStoreState {
     fn default() -> Self {
         let random_seed = Uuid::new_v4().to_string();
-        let mut hasher = Sha256::new();
-        hasher.update(random_seed.as_bytes());
-        let pub_hex = hex::encode(hasher.finalize());
+        let mut secret = [0u8; 32];
+        rand::rngs::OsRng.fill_bytes(&mut secret);
+        let signing_key = SigningKey::from_bytes(&secret);
+        let pub_hex = hex::encode(signing_key.verifying_key().to_bytes());
+        let priv_hex = hex::encode(signing_key.to_bytes());
         Self {
             node_id: format!("aegis-node-{}", &random_seed[..8]),
-            node_public_key: format!("ed25519:{}", &pub_hex[..32]),
+            node_public_key: format!("ed25519:{}", pub_hex),
+            node_private_key: Some(format!("ed25519-priv:{}", priv_hex)),
             installed_apps: Vec::new(),
             credentials: Vec::new(),
             mounted_sessions: Vec::new(),
@@ -145,12 +151,8 @@ impl AppStoreRegistry {
     }
 
     async fn flush(&self) -> anyhow::Result<()> {
-        if let Some(parent) = self.state_file.parent() {
-            tokio::fs::create_dir_all(parent).await?;
-        }
         let snapshot = self.state.read().await.clone();
-        let bytes = serde_json::to_vec_pretty(&snapshot)?;
-        tokio::fs::write(&self.state_file, bytes).await?;
+        aos_core::session::write_json_pretty_atomic(&self.state_file, &snapshot).await?;
         Ok(())
     }
 
@@ -537,9 +539,20 @@ impl AppStoreRegistry {
                         .get("id")
                         .or_else(|| sk.get("name"))
                         .and_then(|v| v.as_str())
+                        .map(str::trim)
                     else {
                         continue;
                     };
+                    if skill_id.is_empty()
+                        || skill_id.len() > 128
+                        || skill_id == "."
+                        || skill_id == ".."
+                        || !skill_id
+                            .chars()
+                            .all(|c| c.is_ascii_alphanumeric() || matches!(c, '-' | '_' | '.'))
+                    {
+                        continue;
+                    }
                     let skill_path = sk
                         .get("path")
                         .or_else(|| sk.get("url"))
@@ -970,7 +983,14 @@ impl AppStoreRegistry {
         self.flush().await?;
 
         // Best-effort query of `tools/list` from `POST <endpoint>/api/aegis/mcp`
-        let bearer = cred.as_ref().map(|c| c.access_token.as_str());
+        // Only send stored bearer token when endpoint matches the credential's bound endpoint.
+        let bearer = cred.as_ref().and_then(|c| {
+            if c.endpoint.trim_end_matches('/') == endpoint.trim_end_matches('/') {
+                Some(c.access_token.as_str())
+            } else {
+                None
+            }
+        });
         let live_tools = match Self::app_http_json(
             "POST",
             &endpoint,
@@ -1021,6 +1041,7 @@ impl AppStoreRegistry {
     /// 2. Automatic `X-Aegis-Agent-Id` & `X-Aegis-Session-Id` audit header injection
     /// 3. Pre-flight Policy Kernel lease check for `lease_gated` capabilities and automatic
     ///    `X-Aegis-Lease-Token` injection when an active lease is held by the Agent.
+    #[allow(clippy::too_many_arguments)]
     pub async fn call_app_tool(
         &self,
         kernel: &AegisRuntimeKernel,
@@ -1078,27 +1099,34 @@ impl AppStoreRegistry {
             )
         };
 
-        // Resolve active lease token from override or AegisPolicyKernel
-        let mut active_lease_token: Option<String> = lease_token_override
+        // Resolve active lease token from AegisPolicyKernel (and verify any lease_token_override against active leases)
+        let requested_override = lease_token_override
             .map(|s| s.trim().to_string())
             .filter(|s| !s.is_empty());
+        let mut active_lease_token: Option<String> = None;
 
-        if active_lease_token.is_none() {
-            if let Ok(leases) = kernel
-                .policy
-                .list_leases(&identity.org_id, Some(&identity.agent_id))
-                .await
-            {
-                let fq_action = format!("{}:{}", clean_app, clean_tool);
-                for l in leases {
-                    if l.action_pattern == "*"
-                        || l.action_pattern == fq_action
-                        || l.action_pattern == clean_tool
-                        || l.action_pattern == "app_call_tool"
-                    {
+        if let Ok(leases) = kernel
+            .policy
+            .list_leases(&identity.org_id, Some(&identity.agent_id))
+            .await
+        {
+            let fq_action = format!("{}:{}", clean_app, clean_tool);
+            for l in leases {
+                let action_matches = l.action_pattern == "*"
+                    || l.action_pattern == fq_action
+                    || l.action_pattern == clean_tool
+                    || l.action_pattern == "app_call_tool";
+                if !action_matches {
+                    continue;
+                }
+                if let Some(ref wanted_id) = requested_override {
+                    if &l.lease_id == wanted_id {
                         active_lease_token = Some(l.lease_id);
                         break;
                     }
+                } else {
+                    active_lease_token = Some(l.lease_id);
+                    break;
                 }
             }
         }
@@ -1156,7 +1184,7 @@ impl AppStoreRegistry {
             }
         }
 
-        // Resolve bearer token from stored credential or environment fallback
+        // Resolve bearer token from stored credential (only if endpoint matches) or environment fallback
         let env_key = format!("AEGIS_APP_TOKEN_{}", clean_app.to_uppercase().replace('-', "_"));
         let env_token = std::env::var(&env_key)
             .ok()
@@ -1169,6 +1197,7 @@ impl AppStoreRegistry {
             });
         let bearer_token = cred
             .as_ref()
+            .filter(|c| c.endpoint.trim_end_matches('/') == endpoint.trim_end_matches('/'))
             .map(|c| c.access_token.clone())
             .or(env_token);
 
@@ -1403,20 +1432,41 @@ impl AppStoreRegistry {
             .with_context(|| format!("Failed to connect to {}", full_url))?;
             let mut stream = stream;
 
+            let clean_path: String = target_path
+                .chars()
+                .filter(|c| !matches!(c, '\r' | '\n' | '\0'))
+                .collect();
+            let clean_host: String = host_port
+                .chars()
+                .filter(|c| !matches!(c, '\r' | '\n' | '\0'))
+                .collect();
             let mut req_str = format!(
                 "{} {} HTTP/1.1\r\nHost: {}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n",
                 method,
-                target_path,
-                host_port,
+                clean_path,
+                clean_host,
                 body_bytes.len()
             );
             if let Some(tok) = bearer_token {
-                if !tok.trim().is_empty() {
-                    req_str.push_str(&format!("Authorization: Bearer {}\r\n", tok.trim()));
+                let clean_tok: String = tok
+                    .trim()
+                    .chars()
+                    .filter(|c| !matches!(c, '\r' | '\n' | '\0'))
+                    .collect();
+                if !clean_tok.is_empty() {
+                    req_str.push_str(&format!("Authorization: Bearer {}\r\n", clean_tok));
                 }
             }
             for (hk, hv) in extra_headers {
-                req_str.push_str(&format!("{}: {}\r\n", hk, hv));
+                let ck: String = hk
+                    .chars()
+                    .filter(|c| !matches!(c, '\r' | '\n' | '\0' | ':'))
+                    .collect();
+                let cv: String = hv
+                    .chars()
+                    .filter(|c| !matches!(c, '\r' | '\n' | '\0'))
+                    .collect();
+                req_str.push_str(&format!("{}: {}\r\n", ck, cv));
             }
             req_str.push_str("\r\n");
 

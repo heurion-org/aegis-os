@@ -45,6 +45,10 @@ chmod +x /usr/local/bin/aegis-os
 ln -sf /usr/local/bin/aegis-os /usr/local/bin/aos
 
 echo "==> [4/6] Configuring systemd service (aegis-cloud.service on port ${PORT})..."
+if ! id -u aegis >/dev/null 2>&1; then
+  useradd --system --home-dir "${DATA_ROOT}" --shell /usr/sbin/nologin aegis
+fi
+chown -R aegis:aegis "${DATA_ROOT}"
 # Secrets live in a root-only EnvironmentFile, not in the world-readable unit. AOS_ADMIN_SECRET is the
 # operator token (approvals, plan changes, cross-org views); keep it out of agents' reach.
 install -d -m 0755 /etc/aegis-cloud
@@ -66,6 +70,8 @@ After=network.target
 
 [Service]
 Type=simple
+User=aegis
+Group=aegis
 WorkingDirectory=${DATA_ROOT}
 EnvironmentFile=/etc/aegis-cloud/env
 ExecStart=/usr/local/bin/aegis-os --runtime-dir ${DATA_ROOT} --workspace ${DATA_ROOT}/default_workspace daemon --listen 0.0.0.0:${PORT}

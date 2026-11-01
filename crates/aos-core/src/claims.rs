@@ -56,21 +56,61 @@ pub fn glob_match(pattern: &str, path: &str) -> bool {
 }
 
 fn match_segments(p: &[&str], s: &[&str]) -> bool {
-    match p.first() {
-        None => s.is_empty(),
-        Some(&"**") => (0..=s.len()).any(|i| match_segments(&p[1..], &s[i..])),
-        Some(seg) => !s.is_empty() && match_one(seg.as_bytes(), s[0].as_bytes()) && match_segments(&p[1..], &s[1..]),
+    let mut pi = 0usize;
+    let mut si = 0usize;
+    let mut star_pi: Option<usize> = None;
+    let mut star_si = 0usize;
+
+    while si < s.len() {
+        if pi < p.len() && p[pi] == "**" {
+            star_pi = Some(pi);
+            pi += 1;
+            star_si = si;
+        } else if pi < p.len() && match_one(p[pi].as_bytes(), s[si].as_bytes()) {
+            pi += 1;
+            si += 1;
+        } else if let Some(sp) = star_pi {
+            pi = sp + 1;
+            star_si += 1;
+            si = star_si;
+        } else {
+            return false;
+        }
     }
+
+    while pi < p.len() && p[pi] == "**" {
+        pi += 1;
+    }
+    pi == p.len()
 }
 
 fn match_one(p: &[u8], s: &[u8]) -> bool {
-    match (p.first(), s.first()) {
-        (None, None) => true,
-        (Some(b'*'), _) => match_one(&p[1..], s) || (!s.is_empty() && match_one(p, &s[1..])),
-        (Some(b'?'), Some(_)) => match_one(&p[1..], &s[1..]),
-        (Some(a), Some(b)) if a == b => match_one(&p[1..], &s[1..]),
-        _ => false,
+    let mut pi = 0usize;
+    let mut si = 0usize;
+    let mut star_pi: Option<usize> = None;
+    let mut star_si = 0usize;
+
+    while si < s.len() {
+        if pi < p.len() && p[pi] == b'*' {
+            star_pi = Some(pi);
+            pi += 1;
+            star_si = si;
+        } else if pi < p.len() && (p[pi] == b'?' || p[pi] == s[si]) {
+            pi += 1;
+            si += 1;
+        } else if let Some(sp) = star_pi {
+            pi = sp + 1;
+            star_si += 1;
+            si = star_si;
+        } else {
+            return false;
+        }
     }
+
+    while pi < p.len() && p[pi] == b'*' {
+        pi += 1;
+    }
+    pi == p.len()
 }
 
 /// Returns the first live claim on `rel_path` held by someone other than `me`.
@@ -146,5 +186,12 @@ mod tests {
     fn parses_string_encoded_tables() {
         let v = serde_json::Value::String(r#"{"a/**":{"owner":"o","expires_at_ms":9}}"#.to_string());
         assert_eq!(parse_claims(&v).len(), 1);
+    }
+
+    #[test]
+    fn glob_match_resists_exponential_backtracking() {
+        let pat = "**/*a*a*a*a*a*a*a*a*a*a*a*a*a*a*a*b";
+        let path = "a/a/a/a/a/aaaaaaaaaaaaaaaaaaaaaaaaaaaaaac";
+        assert!(!glob_match(pat, path));
     }
 }

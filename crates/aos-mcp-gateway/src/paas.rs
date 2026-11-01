@@ -21,19 +21,14 @@ use std::process::Command;
 use tokio::sync::RwLock;
 use uuid::Uuid;
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum PlanTier {
+    #[default]
     Community,
     Pro,
     Team,
     Enterprise,
-}
-
-impl Default for PlanTier {
-    fn default() -> Self {
-        Self::Community
-    }
 }
 
 impl PlanTier {
@@ -160,17 +155,12 @@ pub struct PendingClaimRecord {
     pub created_at_ms: i64,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum WorkspaceLifecycleState {
+    #[default]
     Active,
     Hibernated,
-}
-
-impl Default for WorkspaceLifecycleState {
-    fn default() -> Self {
-        Self::Active
-    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -466,21 +456,8 @@ impl PaasControlPlane {
     }
 
     async fn flush(&self) -> anyhow::Result<()> {
-        if let Some(parent) = self.state_file.parent() {
-            tokio::fs::create_dir_all(parent).await?;
-        }
         let snapshot = self.state.read().await.clone();
-        let bytes = serde_json::to_vec_pretty(&snapshot)?;
-        // Holds claimable keys and approver TOTP secrets: owner-only, replaced atomically.
-        let tmp = self.state_file.with_extension("json.tmp");
-        tokio::fs::write(&tmp, bytes).await?;
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::PermissionsExt;
-            tokio::fs::set_permissions(&tmp, std::fs::Permissions::from_mode(0o600)).await?;
-        }
-        tokio::fs::rename(&tmp, &self.state_file).await?;
-        Ok(())
+        aos_core::session::write_json_pretty_atomic(&self.state_file, &snapshot).await
     }
 
     /// Estimate directory size in bytes for CoW savings accounting.
@@ -805,8 +782,8 @@ impl PaasControlPlane {
             .find(|s| {
                 email_norm
                     .as_ref()
-                    .map_or(false, |em| s.customer_email.as_ref() == Some(em))
-                    || org_norm.as_ref().map_or(false, |og| &s.org_id == og)
+                    .is_some_and(|em| s.customer_email.as_ref() == Some(em))
+                    || org_norm.as_ref() == Some(&s.org_id)
             })
             .cloned();
 
@@ -857,7 +834,7 @@ impl PaasControlPlane {
             "customer_email": matched_sub.as_ref().and_then(|s| s.customer_email.clone()).or(email_norm),
             "plan_tier": tier.as_str(),
             "monthly_price_usd": tier.monthly_price_usd(),
-            "key_claim_ready": matched_sub.as_ref().map_or(false, |s| s.status == "active" && s.claimable_api_key.is_some()),
+            "key_claim_ready": matched_sub.as_ref().is_some_and(|s| s.status == "active" && s.claimable_api_key.is_some()),
             "quotas": {
                 "daily_syscalls_used": daily_sys,
                 "daily_syscalls_limit": tier.max_daily_syscalls(),
@@ -881,7 +858,7 @@ impl PaasControlPlane {
             .await
             .tenants
             .iter()
-            .filter(|t| org_id.map_or(true, |o| o == "*" || t.org_id == o))
+            .filter(|t| org_id.is_none_or(|o| o == "*" || t.org_id == o))
             .cloned()
             .collect()
     }
@@ -1574,7 +1551,7 @@ impl PaasControlPlane {
             .await
             .api_keys
             .iter()
-            .filter(|k| org_id.map_or(true, |o| o == "*" || k.org_id == o))
+            .filter(|k| org_id.is_none_or(|o| o == "*" || k.org_id == o))
             .map(|k| {
                 json!({
                     "key_id": k.key_id,
@@ -1597,7 +1574,7 @@ impl PaasControlPlane {
             .await
             .workspaces
             .iter()
-            .filter(|w| org_id.map_or(true, |o| o == "*" || w.org_id == o))
+            .filter(|w| org_id.is_none_or(|o| o == "*" || w.org_id == o))
             .cloned()
             .collect()
     }
@@ -1617,6 +1594,169 @@ impl PaasControlPlane {
             .cloned()
     }
 
+    fn validate_identifier(kind: &str, value: &str) -> anyhow::Result<()> {
+        let trimmed = value.trim();
+        if trimmed.is_empty()
+            || trimmed == "."
+            || trimmed == ".."
+            || trimmed.starts_with('-')
+            || trimmed.contains("..")
+            || !trimmed
+                .chars()
+                .all(|c| c.is_ascii_alphanumeric() || matches!(c, '-' | '_' | '.'))
+        {
+            bail!(
+                "Invalid {} '{}': only ASCII alphanumeric, '-', '_', and '.' are allowed",
+                kind,
+                value
+            );
+        }
+        Ok(())
+    }
+
+    fn validate_branch_name(branch: &str) -> anyhow::Result<()> {
+        let trimmed = branch.trim();
+        if trimmed.is_empty()
+            || trimmed.starts_with('-')
+            || trimmed.starts_with('/')
+            || trimmed.ends_with('/')
+            || trimmed.contains("..")
+            || trimmed.contains("//")
+            || !trimmed
+                .chars()
+                .all(|c| c.is_ascii_alphanumeric() || matches!(c, '-' | '_' | '.' | '/'))
+        {
+            bail!("Invalid git branch name '{}'", branch);
+        }
+        Ok(())
+    }
+
+    fn is_ssrf_or_internal_git_url(url: &str) -> bool {
+        let lower = url.trim().to_ascii_lowercase();
+        let Some(rest) = lower
+            .strip_prefix("http://")
+            .or_else(|| lower.strip_prefix("https://"))
+        else {
+            return false;
+        };
+        let authority = rest.split('/').next().unwrap_or("");
+        let host_port = authority.rsplit('@').next().unwrap_or(authority);
+        let host = if let Some(h) = host_port.strip_prefix('[') {
+            h.split(']').next().unwrap_or(h)
+        } else {
+            host_port.split(':').next().unwrap_or(host_port)
+        };
+        if host.is_empty()
+            || host == "localhost"
+            || host.ends_with(".localhost")
+            || host == "0.0.0.0"
+            || host == "::1"
+            || host == "metadata.google.internal"
+            || host.starts_with("127.")
+            || host.starts_with("10.")
+            || host.starts_with("192.168.")
+            || host.starts_with("169.254.")
+        {
+            return true;
+        }
+        if let Some(second) = host.strip_prefix("172.").and_then(|r| r.split('.').next()) {
+            if let Ok(octet) = second.parse::<u8>() {
+                if (16..=31).contains(&octet) {
+                    return true;
+                }
+            }
+        }
+        false
+    }
+
+    fn validate_local_source_dir(&self, src_path: &Path) -> anyhow::Result<PathBuf> {
+        let canon = std::fs::canonicalize(src_path)
+            .with_context(|| format!("Failed to resolve source directory '{}'", src_path.display()))?;
+        if let Some(rt_root) = self.state_file.parent() {
+            let canon_rt = std::fs::canonicalize(rt_root).unwrap_or_else(|_| rt_root.to_path_buf());
+            if canon.starts_with(&canon_rt) {
+                bail!(
+                    "Refusing to clone from inside Aegis runtime state directory '{}'",
+                    canon.display()
+                );
+            }
+        }
+        if let Ok(canon_ws_root) = std::fs::canonicalize(&self.workspaces_root) {
+            if canon.starts_with(&canon_ws_root) {
+                bail!(
+                    "Refusing to clone from another tenant workspace directory '{}'",
+                    canon.display()
+                );
+            }
+        }
+        let s = canon.to_string_lossy();
+        const FORBIDDEN_PREFIXES: &[&str] = &[
+            "/etc",
+            "/root",
+            "/proc",
+            "/sys",
+            "/dev",
+            "/boot",
+            "/var/run",
+            "/run",
+            "/usr",
+            "/bin",
+            "/sbin",
+            "/lib",
+        ];
+        if s == "/"
+            || FORBIDDEN_PREFIXES
+                .iter()
+                .any(|p| s == *p || s.starts_with(&format!("{p}/")))
+            || s.contains("/.ssh")
+            || s.contains("/.aws")
+            || s.contains("/.gnupg")
+            || s.contains("/.aegis-os")
+        {
+            bail!(
+                "Refusing to provision workspace from restricted host path '{}'",
+                canon.display()
+            );
+        }
+        Ok(canon)
+    }
+
+    fn host_repo_path_for_write(root: &Path, rel: &str) -> anyhow::Result<(String, PathBuf)> {
+        use std::path::Component;
+        let mut rel_path = PathBuf::new();
+        for comp in Path::new(rel.trim_start_matches('/')).components() {
+            match comp {
+                Component::Normal(c) => rel_path.push(c),
+                Component::CurDir => {}
+                _ => bail!("Path traversal outside workspace is forbidden: '{}'", rel),
+            }
+        }
+        if rel_path.as_os_str().is_empty() {
+            bail!("Empty relative path is forbidden");
+        }
+        if rel_path
+            .components()
+            .next()
+            .is_some_and(|c| c.as_os_str() == ".git")
+        {
+            bail!("Refusing to write inside .git directory");
+        }
+        let mut cur = root.to_path_buf();
+        for comp in rel_path.components() {
+            cur.push(comp);
+            match std::fs::symlink_metadata(&cur) {
+                Ok(meta) if meta.file_type().is_symlink() => bail!(
+                    "Refusing to write through symlink '{}' in cloud workspace",
+                    cur.strip_prefix(root).unwrap_or(&cur).display()
+                ),
+                Ok(_) => {}
+                Err(_) => break,
+            }
+        }
+        let full = root.join(&rel_path);
+        Ok((rel_path.to_string_lossy().into_owned(), full))
+    }
+
     /// Provision a Cloud Workspace from a local directory or remote Git URL, initialize a Git baseline,
     /// enforce tenant plan concurrency limits, and spawn isolated CoW shadow workspaces.
     pub async fn provision_workspace(
@@ -1629,17 +1769,44 @@ impl PaasControlPlane {
         agents: Vec<String>,
     ) -> anyhow::Result<CloudWorkspaceRecord> {
         self.reload().await;
+        let org_id = org_id.trim();
+        Self::validate_identifier("org_id", org_id)?;
         let ws_id = if workspace_id.trim().is_empty() {
             format!("ws-{}", &Uuid::new_v4().to_string()[..8])
         } else {
             workspace_id.trim().to_string()
         };
+        Self::validate_identifier("workspace_id", &ws_id)?;
+        let branch = if branch.trim().is_empty() {
+            "main"
+        } else {
+            branch.trim()
+        };
+        Self::validate_branch_name(branch)?;
+        let source_url_or_path = source_url_or_path.trim();
+        if source_url_or_path.starts_with('-')
+            || source_url_or_path.to_ascii_lowercase().starts_with("file://")
+        {
+            bail!(
+                "Unsupported or unsafe workspace source_url '{}'",
+                source_url_or_path
+            );
+        }
+        if Self::is_ssrf_or_internal_git_url(source_url_or_path) {
+            bail!(
+                "Refusing to clone internal or loopback git URL '{}'",
+                source_url_or_path
+            );
+        }
 
         let agent_list = if agents.is_empty() {
             vec!["cloud-coder-1".to_string()]
         } else {
             agents
         };
+        for ag in &agent_list {
+            Self::validate_identifier("agent_id", ag)?;
+        }
 
         // Check tenant plan workspace count and concurrency limits
         let (plan_tier, max_agents, other_ws_count) = {
@@ -1689,20 +1856,26 @@ impl PaasControlPlane {
         }
 
         let src_path = Path::new(source_url_or_path);
-        if src_path.exists() && src_path.is_dir() {
-            CoWWorkspace::cow_sync_dir(src_path, &host_repo).await?;
+        if source_url_or_path != "."
+            && source_url_or_path != "cloud-sync"
+            && src_path.exists()
+            && src_path.is_dir()
+        {
+            let safe_src = self.validate_local_source_dir(src_path)?;
+            CoWWorkspace::cow_sync_dir(&safe_src, &host_repo).await?;
         } else if source_url_or_path.starts_with("http://")
             || source_url_or_path.starts_with("https://")
             || source_url_or_path.starts_with("git@")
-            || source_url_or_path.starts_with("file://")
         {
             let status = Command::new("git")
+                .env("GIT_TERMINAL_PROMPT", "0")
                 .args([
                     "clone",
                     "--depth",
                     "1",
                     "--branch",
                     branch,
+                    "--",
                     source_url_or_path,
                     &host_repo.to_string_lossy(),
                 ])
@@ -1982,15 +2155,10 @@ impl PaasControlPlane {
         let mut deleted_paths = Vec::new();
 
         for entry in files {
-            let clean = entry.path.trim_start_matches('/').to_string();
-            if clean.is_empty()
-                || clean.contains("..")
-                || clean.starts_with(".git/")
-                || clean == ".git"
-            {
+            let Ok((clean, dest)) = Self::host_repo_path_for_write(&ws.host_repo_path, &entry.path)
+            else {
                 continue;
-            }
-            let dest = ws.host_repo_path.join(&clean);
+            };
             if entry.deleted {
                 if dest.exists() {
                     let _ = tokio::fs::remove_file(&dest).await;
@@ -2111,13 +2279,36 @@ impl PaasControlPlane {
             let old_text = tokio::fs::read_to_string(&host_file).await.unwrap_or_default();
 
             unified_diff.push_str(&format!("--- a/{rel}\n+++ b/{rel}\n"));
-            for line in old_text.lines().take(60) {
-                if !new_text.lines().any(|nl| nl == line) {
+            let old_lines: Vec<&str> = old_text.lines().collect();
+            let new_lines: Vec<&str> = new_text.lines().collect();
+            let mut prefix = 0usize;
+            while prefix < old_lines.len()
+                && prefix < new_lines.len()
+                && old_lines[prefix] == new_lines[prefix]
+            {
+                prefix += 1;
+            }
+            let mut old_end = old_lines.len();
+            let mut new_end = new_lines.len();
+            while old_end > prefix
+                && new_end > prefix
+                && old_lines[old_end - 1] == new_lines[new_end - 1]
+            {
+                old_end -= 1;
+                new_end -= 1;
+            }
+            if prefix < old_end || prefix < new_end {
+                unified_diff.push_str(&format!(
+                    "@@ -{},{} +{},{} @@\n",
+                    prefix + 1,
+                    old_end.saturating_sub(prefix),
+                    prefix + 1,
+                    new_end.saturating_sub(prefix)
+                ));
+                for line in &old_lines[prefix..old_end] {
                     unified_diff.push_str(&format!("-{line}\n"));
                 }
-            }
-            for line in new_text.lines().take(120) {
-                if !old_text.lines().any(|ol| ol == line) {
+                for line in &new_lines[prefix..new_end] {
                     unified_diff.push_str(&format!("+{line}\n"));
                 }
             }
@@ -3646,6 +3837,16 @@ pub const DASHBOARD_HTML: &str = r##"<!doctype html>
       updateCliSnippets();
     }
 
+    function escHtml(s) {
+      return String(s ?? '').replace(/[&<>"']/g, c => ({
+        '&': '&amp;',
+        '<': '&lt;',
+        '>': '&gt;',
+        '"': '&quot;',
+        "'": '&#39;'
+      }[c]));
+    }
+
     async function checkSubStatus() {
       const email = getEnteredEmail();
       const box = document.getElementById('sub-status-box');
@@ -3659,18 +3860,19 @@ pub const DASHBOARD_HTML: &str = r##"<!doctype html>
         const res = await fetch(`${apiBase}/v1/billing/status?email=${encodeURIComponent(email)}`);
         const data = await res.json();
         const q = data.quotas || {};
-        const tierUpper = (data.plan_tier || 'community').toUpperCase();
+        const tierUpper = escHtml((data.plan_tier || 'community').toUpperCase());
+        const safeOrgId = escHtml(data.org_id || 'aegis-os');
         const isPaid = data.plan_tier && data.plan_tier !== 'community';
         box.style.display = 'block';
         if (currentLang === 'en') {
-          box.innerHTML = `<strong>Plan: ${tierUpper}</strong> (${isPaid ? 'Active Subscription' : 'Free Tier'}) · Org: <code>${data.org_id}</code><br>` +
-            `Daily Syscalls: <code>${q.daily_syscalls_used || 0} / ${q.daily_syscalls_limit || 200}</code> · Parallel Agents: <code>${q.active_agents_count || 0} / ${q.max_concurrent_agents || 1}</code><br>` +
+          box.innerHTML = `<strong>Plan: ${tierUpper}</strong> (${isPaid ? 'Active Subscription' : 'Free Tier'}) · Org: <code>${safeOrgId}</code><br>` +
+            `Daily Syscalls: <code>${Number(q.daily_syscalls_used || 0)} / ${Number(q.daily_syscalls_limit || 200)}</code> · Parallel Agents: <code>${Number(q.active_agents_count || 0)} / ${Number(q.max_concurrent_agents || 1)}</code><br>` +
             (data.key_claim_ready
               ? `✓ <strong>Pro API Key ready to claim!</strong> Copy and run Step ② in your terminal below.`
               : (isPaid ? `✓ Pro quota active. Run Step ② in terminal on new machines.` : `→ Click ① Subscribe to Pro ($29/mo) above to unlock 8 parallel Agents & 20,000 daily syscalls.`));
         } else {
-          box.innerHTML = `<strong>当前档位：${tierUpper}</strong>（${isPaid ? 'Pro 订阅已生效' : '免费共享档'}）· 租户：<code>${data.org_id}</code><br>` +
-            `今日系统调用：<code>${q.daily_syscalls_used || 0} / ${q.daily_syscalls_limit || 200}</code> · 并发 Agent：<code>${q.active_agents_count || 0} / ${q.max_concurrent_agents || 1}</code><br>` +
+          box.innerHTML = `<strong>当前档位：${tierUpper}</strong>（${isPaid ? 'Pro 订阅已生效' : '免费共享档'}）· 租户：<code>${safeOrgId}</code><br>` +
+            `今日系统调用：<code>${Number(q.daily_syscalls_used || 0)} / ${Number(q.daily_syscalls_limit || 200)}</code> · 并发 Agent：<code>${Number(q.active_agents_count || 0)} / ${Number(q.max_concurrent_agents || 1)}</code><br>` +
             (data.key_claim_ready
               ? `✓ <strong>Pro 专属凭证已就绪！</strong>直接复制下方「② 终端命令」运行即可完成本机挂载。`
               : (isPaid ? `✓ Pro 独享运行时配额已激活。` : `→ 点击上方「① 立即订阅 Pro」即可解锁 8 个并发 Agent 与每日 20,000 次调用。`));

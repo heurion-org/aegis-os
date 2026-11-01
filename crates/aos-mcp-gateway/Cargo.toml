@@ -25,6 +25,8 @@ hmac.workspace = true
 sha1.workspace = true
 qrcode.workspace = true
 ureq.workspace = true
+rand.workspace = true
+ed25519-dalek.workspace = true
 
 [dev-dependencies]
 tempfile.workspace = true

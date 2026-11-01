@@ -3,6 +3,7 @@
 //! Streamlines user onboarding to two commands:
 //!   1. `brew install aegis-os`
 //!   2. `aegis-os install`
+//!
 //! After that, launching `agy`, `claude` (Claude Code), or `codex` (OpenAI Codex CLI) in ANY
 //! directory automatically attaches to Aegis OS with:
 //! - Auto-inferred Organization ID (by project/repo directory name)
@@ -2141,7 +2142,7 @@ async fn main() -> anyhow::Result<()> {
         }
 
         Commands::AgyHook { ref event, strict_cow } => {
-            handle_agy_hook(&event, strict_cow, &cli, &workspace).await?;
+            handle_agy_hook(event, strict_cow, &cli, &workspace).await?;
         }
 
         Commands::Workspace { action } => {
@@ -2320,14 +2321,6 @@ async fn main() -> anyhow::Result<()> {
 
         Commands::Policy { action } => {
             let kernel = AegisRuntimeKernel::new(&cli.runtime_dir).await?;
-            kernel
-                .ensure_agent_environment(
-                    identity.clone(),
-                    &workspace,
-                    IsolationTier::NativeOsSandbox,
-                    vec!["*".to_string()],
-                )
-                .await?;
 
             match action {
                 PolicyAction::Status => {
@@ -2364,6 +2357,14 @@ async fn main() -> anyhow::Result<()> {
                     ttl_secs,
                     task_id,
                 } => {
+                    kernel
+                        .ensure_agent_environment(
+                            identity.clone(),
+                            &workspace,
+                            IsolationTier::NativeOsSandbox,
+                            vec!["*".to_string()],
+                        )
+                        .await?;
                     let res = kernel
                         .call_tool(
                             &identity,
@@ -2404,8 +2405,8 @@ async fn main() -> anyhow::Result<()> {
                         println!("No A2A tasks.");
                     } else {
                         println!(
-                            "{:<30} {:<14} {:<34} {:<8} {:<8} {}",
-                            "TASK", "STATE", "FROM -> TO", "AGE", "FLAGS", "SUBJECT"
+                            "{:<30} {:<14} {:<34} {:<8} {:<8} SUBJECT",
+                            "TASK", "STATE", "FROM -> TO", "AGE", "FLAGS"
                         );
                         for task in tasks {
                             let age = now.saturating_sub(task.updated_at_ms) / 1000;

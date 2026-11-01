@@ -108,6 +108,7 @@ impl AegisIpcBus {
             }
             let file = std::fs::OpenOptions::new()
                 .create(true)
+                .truncate(false)
                 .read(true)
                 .write(true)
                 .open(&lock_path)?;
@@ -222,7 +223,7 @@ impl AegisIpcBus {
             let ok = uri.starts_with(&expected_prefix)
                 || sender_prefix
                     .as_ref()
-                    .map_or(false, |sp| uri.starts_with(sp));
+                    .is_some_and(|sp| uri.starts_with(sp));
             if !ok {
                 bail!(
                     "Invalid or cross-organization attachment URI '{}': must start with '{}'",
@@ -278,7 +279,7 @@ impl AegisIpcBus {
                     let lv = PeerLiveness::classify(p.last_seen_ms, now_ms);
                     p.liveness = Some(lv);
                     p.online = lv != PeerLiveness::Gone;
-                    if filter_org.map_or(true, |fo| fo == org) {
+                    if filter_org.is_none_or(|fo| fo == org) {
                         list.push(p.clone());
                     }
                 }
@@ -722,12 +723,12 @@ impl IpcBus for AegisIpcBus {
             .await
             .values()
             .filter(|t| {
-                let org_ok = org_id.map_or(true, |o| {
+                let org_ok = org_id.is_none_or(|o| {
                     t.org_id == o
                         || t.from_agent.starts_with(&format!("{}/", o))
                         || t.to_agent.starts_with(&format!("{}/", o))
                 });
-                let agent_ok = agent_id.map_or(true, |a| {
+                let agent_ok = agent_id.is_none_or(|a| {
                     t.from_agent == a
                         || t.to_agent == a
                         || t.from_agent.ends_with(&format!("/{}", a))
@@ -766,11 +767,11 @@ impl IpcBus for AegisIpcBus {
                     let sender_verified = peers
                         .get(sender_org)
                         .and_then(|m| m.get(sender_agent))
-                        .map_or(false, |p| p.pid.is_some());
+                        .is_some_and(|p| p.pid.is_some());
                     let target_verified = peers
                         .get(&envelope.org_id)
                         .and_then(|m| m.get(target_agent))
-                        .map_or(false, |p| p.pid.is_some());
+                        .is_some_and(|p| p.pid.is_some());
                     if !(sender_verified && target_verified) {
                         bail!(
                             "Cross-organization IPC delivery denied by broker tenant guard: '{}' -> '{}/{}'",
@@ -783,7 +784,7 @@ impl IpcBus for AegisIpcBus {
             } else {
                 let in_target_org = peers
                     .get(&envelope.org_id)
-                    .map_or(false, |m| m.contains_key(&envelope.from_agent));
+                    .is_some_and(|m| m.contains_key(&envelope.from_agent));
                 let in_other_org = peers.iter().any(|(org, m)| {
                     org != &envelope.org_id && m.contains_key(&envelope.from_agent)
                 });
@@ -993,7 +994,7 @@ impl IpcBus for AegisIpcBus {
                 .read()
                 .await
                 .get(&Self::mailbox_key(&responder.org_id, &responder.agent_id))
-                .map_or(false, |inbox| {
+                .is_some_and(|inbox| {
                     inbox
                         .iter()
                         .any(|m| m.msg_id == original_msg_id || m.msg_id == fanout_id)

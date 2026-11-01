@@ -204,6 +204,51 @@ pub fn pattern_matches(pattern: &str, value: &str) -> bool {
         .unwrap_or(false)
 }
 
+/// Hierarchical tag boundary check (`notes` matches `notes` and `notes/work`,
+/// `portfolio` matches `portfolio:holdings`, but `notes` does NOT match `notes_secret`).
+pub fn tag_hierarchy_matches(granted: &str, tag: &str) -> bool {
+    if granted.is_empty() {
+        return false;
+    }
+    if granted == "*" || granted == tag {
+        return true;
+    }
+    if let Some(prefix) = granted.strip_suffix('*') {
+        return tag.starts_with(prefix);
+    }
+    if let Some(rest) = tag.strip_prefix(granted) {
+        return granted.ends_with('/')
+            || granted.ends_with(':')
+            || rest.starts_with('/')
+            || rest.starts_with(':');
+    }
+    false
+}
+
+/// Project allowed JSON object fields according to a [`MemoryScope`].
+/// If `value` is not a JSON object or no field restriction is configured, returns `value.clone()`.
+pub fn project_json_fields(
+    key: &str,
+    value: &serde_json::Value,
+    scope: &MemoryScope,
+) -> serde_json::Value {
+    let allowed = scope
+        .fields
+        .get(key)
+        .filter(|fields| !fields.is_empty())
+        .map(Vec::as_slice)
+        .or((!scope.allowed_fields.is_empty()).then_some(scope.allowed_fields.as_slice()));
+    let (Some(allowed), Some(obj)) = (allowed, value.as_object()) else {
+        return value.clone();
+    };
+    let filtered: serde_json::Map<String, serde_json::Value> = obj
+        .iter()
+        .filter(|(field, _)| allowed.iter().any(|name| name == *field))
+        .map(|(k, v)| (k.clone(), v.clone()))
+        .collect();
+    serde_json::Value::Object(filtered)
+}
+
 /// Apply UOMP deny lists and field projection to one memory item.
 ///
 /// Returns `None` when the item is outside the granted scope or explicitly
@@ -212,11 +257,12 @@ pub fn filter_item(item: &MemoryItem, scope: &MemoryScope) -> Option<MemoryItem>
     if scope.deny_keys.iter().any(|key| key == &item.key) {
         return None;
     }
-    if item
-        .tags
-        .iter()
-        .any(|tag| scope.deny_tags.iter().any(|denied| denied == tag))
-    {
+    if item.tags.iter().any(|tag| {
+        scope
+            .deny_tags
+            .iter()
+            .any(|denied| tag_hierarchy_matches(denied, tag))
+    }) {
         return None;
     }
 
@@ -224,7 +270,7 @@ pub fn filter_item(item: &MemoryItem, scope: &MemoryScope) -> Option<MemoryItem>
     let tag_granted = item
         .tags
         .iter()
-        .any(|tag| scope.tags.iter().any(|granted| granted == tag));
+        .any(|tag| scope.tags.iter().any(|granted| tag_hierarchy_matches(granted, tag)));
     if !key_granted && !tag_granted {
         return None;
     }
@@ -386,6 +432,27 @@ pub fn scope_allows(scopes: &MemoryScopes, action: MemoryAction, resource: &str)
         MemoryAction::Read => &scopes.read,
         MemoryAction::Write | MemoryAction::Delete => &scopes.write,
     };
+    if let Some(key) = resource.strip_prefix("memory:key:") {
+        if scope.deny_keys.iter().any(|denied| denied == key) {
+            return false;
+        }
+    }
+    if let Some(tag) = resource.strip_prefix("memory:tag:") {
+        if scope
+            .deny_tags
+            .iter()
+            .any(|denied| tag_hierarchy_matches(denied, tag))
+        {
+            return false;
+        }
+        if scope
+            .tags
+            .iter()
+            .any(|granted| tag_hierarchy_matches(granted, tag))
+        {
+            return true;
+        }
+    }
     scope_resources(scope)
         .iter()
         .any(|pattern| pattern_matches(pattern, resource))

@@ -194,8 +194,7 @@ impl CoWWorkspace {
 
     async fn flush_snapshots(&self) -> anyhow::Result<()> {
         let list = self.snapshots.read().await.clone();
-        let bytes = serde_json::to_vec_pretty(&list)?;
-        tokio::fs::write(&self.snapshots_index_file, bytes).await?;
+        aos_core::session::write_json_pretty_atomic(&self.snapshots_index_file, &list).await?;
         Ok(())
     }
 
@@ -492,6 +491,7 @@ impl CoWWorkspace {
     /// Clones a single file using zero-copy OS copy-on-write syscalls:
     /// - macOS (APFS): `libc::clonefile(src, dst, 0)`
     /// - Linux (Btrfs / XFS / OCFS2): `libc::ioctl(dst_fd, FICLONE, src_fd)` (`0x40049409`)
+    ///
     /// Falls back transparently to `tokio::fs::copy` if across filesystems or on non-CoW mounts.
     pub async fn cow_clone_file(src: &Path, dst: &Path) -> anyhow::Result<()> {
         let (src, dst) = (src.to_path_buf(), dst.to_path_buf());
@@ -579,7 +579,9 @@ impl CoWWorkspace {
                         *allow_reflink = false;
                         if let (Ok(dmeta), Ok(mut guard)) = (dst_file.metadata(), NO_REFLINK.lock())
                         {
-                            if guard.insert((meta.dev(), dmeta.dev())) {
+                            if guard.insert((meta.dev(), dmeta.dev()))
+                                && std::env::var_os("AOS_VERBOSE_VFS").is_some()
+                            {
                                 eprintln!(
                                     "[aos-vfs] WARNING: reflink (FICLONE) unavailable between {} and {} \
                                      (errno {:?}); falling back to full file copies. Place the runtime \
@@ -598,7 +600,7 @@ impl CoWWorkspace {
             if let Ok(m) = meta.modified() {
                 let _ = dst_file.set_modified(m);
             }
-            return Ok(());
+            Ok(())
         }
         #[cfg(not(target_os = "linux"))]
         {
@@ -968,38 +970,70 @@ impl CoWWorkspace {
     ) -> Vec<(usize, usize, Vec<&'a str>)> {
         let n = base.len();
         let m = target.len();
-        let mut dp = vec![vec![0usize; m + 1]; n + 1];
-        for i in (0..n).rev() {
-            for j in (0..m).rev() {
-                if base[i] == target[j] {
-                    dp[i][j] = 1 + dp[i + 1][j + 1];
+
+        let mut prefix = 0usize;
+        while prefix < n && prefix < m && base[prefix] == target[prefix] {
+            prefix += 1;
+        }
+        let mut suffix = 0usize;
+        while suffix < (n - prefix)
+            && suffix < (m - prefix)
+            && base[n - 1 - suffix] == target[m - 1 - suffix]
+        {
+            suffix += 1;
+        }
+
+        let b_mid = &base[prefix..n - suffix];
+        let t_mid = &target[prefix..m - suffix];
+        let bn = b_mid.len();
+        let tm = t_mid.len();
+
+        if bn == 0 && tm == 0 {
+            return Vec::new();
+        }
+        if bn == 0 || tm == 0 || bn.saturating_mul(tm) > 4_000_000 {
+            return vec![(prefix, n - suffix, t_mid.to_vec())];
+        }
+
+        let stride = tm + 1;
+        let mut dp = vec![0u32; (bn + 1) * stride];
+        for i in (0..bn).rev() {
+            let row = i * stride;
+            let next_row = (i + 1) * stride;
+            for j in (0..tm).rev() {
+                dp[row + j] = if b_mid[i] == t_mid[j] {
+                    1 + dp[next_row + j + 1]
                 } else {
-                    dp[i][j] = dp[i + 1][j].max(dp[i][j + 1]);
-                }
+                    dp[next_row + j].max(dp[row + j + 1])
+                };
             }
         }
 
         let mut anchors = Vec::new();
         let (mut i, mut j) = (0usize, 0usize);
-        while i < n && j < m {
-            if base[i] == target[j] {
+        while i < bn && j < tm {
+            if b_mid[i] == t_mid[j] {
                 anchors.push((i, j));
                 i += 1;
                 j += 1;
-            } else if dp[i + 1][j] >= dp[i][j + 1] {
+            } else if dp[(i + 1) * stride + j] >= dp[i * stride + j + 1] {
                 i += 1;
             } else {
                 j += 1;
             }
         }
-        anchors.push((n, m));
+        anchors.push((bn, tm));
 
         let mut hunks = Vec::new();
         let mut prev_b = 0usize;
         let mut prev_t = 0usize;
         for (curr_b, curr_t) in anchors {
             if curr_b > prev_b || curr_t > prev_t {
-                hunks.push((prev_b, curr_b, target[prev_t..curr_t].to_vec()));
+                hunks.push((
+                    prefix + prev_b,
+                    prefix + curr_b,
+                    t_mid[prev_t..curr_t].to_vec(),
+                ));
             }
             prev_b = curr_b + 1;
             prev_t = curr_t + 1;
@@ -1273,7 +1307,7 @@ impl CoWWorkspace {
             }
         }
 
-        for (rel, _) in &base_files {
+        for rel in base_files.keys() {
             if !shadow_files.contains_key(rel) {
                 if let Some(ref allow_list) = filter_paths {
                     if !allow_list.iter().any(|p| p == rel) {
@@ -1509,8 +1543,7 @@ impl OrgCasAndKvStore {
             artifacts: self.artifacts.read().await.clone(),
             kv_store: self.kv_store.read().await.clone(),
         };
-        let bytes = serde_json::to_vec_pretty(&state)?;
-        tokio::fs::write(&self.index_file, bytes).await?;
+        aos_core::session::write_json_pretty_atomic(&self.index_file, &state).await?;
         Ok(())
     }
 

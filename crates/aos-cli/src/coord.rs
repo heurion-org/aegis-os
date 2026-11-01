@@ -292,7 +292,7 @@ fn should_emit_reminder(runtime_dir: &Path, agent_id: &str) -> bool {
         .unwrap_or(0)
         + 1;
     let _ = std::fs::write(&path, count.to_string());
-    count % 3 == 0
+    count.is_multiple_of(3)
 }
 
 /// Reset the stop-gating counter for `agent_id` whenever the agent makes progress.
