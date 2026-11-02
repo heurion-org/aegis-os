@@ -960,13 +960,40 @@ impl AegisRuntimeKernel {
                     reason,
                     suggested_lease_scope,
                 } => {
+                    if tool_name == "workspace_commit" {
+                        let base_dir = env
+                            .workspace
+                            .shadow_root()
+                            .parent()
+                            .map(|p| p.join("baseline_snapshot"))
+                            .filter(|p| p.exists())
+                            .unwrap_or_else(|| env.workspace.host_source_root().to_path_buf());
+                        let filter_paths: Option<Vec<String>> = args
+                            .get("paths")
+                            .and_then(|v| serde_json::from_value(v.clone()).ok());
+                        if let Ok(diffs) = CoWWorkspace::diff_dirs(
+                            &base_dir,
+                            env.workspace.shadow_root(),
+                            filter_paths.as_deref(),
+                        )
+                        .await
+                        {
+                            let diff_dir = self.runtime_data_root.join("escalation_diffs");
+                            let _ = tokio::fs::create_dir_all(&diff_dir).await;
+                            let _ = aos_core::session::write_json_pretty_atomic(
+                                &diff_dir.join(format!("{}.json", escalation_id)),
+                                &diffs,
+                            )
+                            .await;
+                        }
+                    }
                     return Ok(json!({
                         "status": "approval_required",
                         "escalation_id": escalation_id,
                         "reason": reason,
                         "suggested_lease_scope": suggested_lease_scope,
                         "hint": format!(
-                            "Ask the user to approve in a terminal: `aegis-os policy approve {0}` (in Claude Code: `! aegis-os policy approve {0}`). Agents cannot approve their own escalations.",
+                            "Ask the user to inspect (`aegis-os policy diff {0}`) and approve in a terminal: `aegis-os policy approve {0}` (in Claude Code: `! aegis-os policy approve {0}`). Agents cannot approve their own escalations.",
                             escalation_id
                         )
                     }));

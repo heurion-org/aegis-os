@@ -1430,6 +1430,217 @@ impl CoWWorkspace {
 
         Ok(staged_actions)
     }
+
+    /// Generates a Unified Diff (`--- a/...`, `+++ b/...`, `@@ -s,l +s,l @@`) between `old_str` and `new_str`
+    /// with `context_lines` of surrounding context, returning `(insertions, deletions, unified_diff_text)`.
+    pub fn unified_diff_str(
+        rel: &str,
+        old_str: &str,
+        new_str: &str,
+        context_lines: usize,
+    ) -> (usize, usize, String) {
+        let base: Vec<&str> = old_str.lines().collect();
+        let target: Vec<&str> = new_str.lines().collect();
+        let hunks = Self::compute_lcs_diff_hunks(&base, &target);
+        if hunks.is_empty() {
+            return (0, 0, String::new());
+        }
+
+        let insertions: usize = hunks.iter().map(|(_, _, r)| r.len()).sum();
+        let deletions: usize = hunks.iter().map(|(s, e, _)| e.saturating_sub(*s)).sum();
+
+        type AnnotatedHunk<'a> = (usize, usize, usize, usize, Vec<&'a str>);
+        let mut annotated: Vec<AnnotatedHunk<'_>> = Vec::with_capacity(hunks.len());
+        let mut prev_b = 0usize;
+        let mut prev_t = 0usize;
+        for (b_start, b_end, repl) in hunks {
+            let unchanged = b_start.saturating_sub(prev_b);
+            let t_start = prev_t + unchanged;
+            let t_end = t_start + repl.len();
+            annotated.push((b_start, b_end, t_start, t_end, repl));
+            prev_b = b_end;
+            prev_t = t_end;
+        }
+
+        let mut groups: Vec<Vec<AnnotatedHunk<'_>>> = Vec::new();
+        for h in annotated {
+            if let Some(last_group) = groups.last_mut() {
+                if let Some(prev) = last_group.last() {
+                    if h.0.saturating_sub(prev.1) <= context_lines.saturating_mul(2) {
+                        last_group.push(h);
+                        continue;
+                    }
+                }
+            }
+            groups.push(vec![h]);
+        }
+
+        let mut out = Vec::new();
+        if base.is_empty() && !target.is_empty() {
+            out.push("--- /dev/null".to_string());
+            out.push(format!("+++ b/{}", rel));
+        } else if !base.is_empty() && target.is_empty() {
+            out.push(format!("--- a/{}", rel));
+            out.push("+++ /dev/null".to_string());
+        } else {
+            out.push(format!("--- a/{}", rel));
+            out.push(format!("+++ b/{}", rel));
+        }
+
+        const MAX_DIFF_LINES: usize = 300;
+        let mut emitted = 0usize;
+        'outer: for group in groups {
+            let first = &group[0];
+            let last = &group[group.len() - 1];
+            let lead = first.0.min(context_lines);
+            let trail = base.len().saturating_sub(last.1).min(context_lines);
+            let g_b_start = first.0 - lead;
+            let g_b_end = last.1 + trail;
+            let g_t_start = first.2 - lead;
+            let g_t_end = last.3 + trail;
+            let old_len = g_b_end - g_b_start;
+            let new_len = g_t_end - g_t_start;
+            let old_pos = if old_len == 0 { g_b_start } else { g_b_start + 1 };
+            let new_pos = if new_len == 0 { g_t_start } else { g_t_start + 1 };
+            out.push(format!(
+                "@@ -{},{} +{},{} @@",
+                old_pos, old_len, new_pos, new_len
+            ));
+
+            let mut cur_b = g_b_start;
+            for h in &group {
+                for l in &base[cur_b..h.0] {
+                    out.push(format!(" {}", l));
+                    emitted += 1;
+                    if emitted >= MAX_DIFF_LINES {
+                        out.push("... (diff truncated for readability)".to_string());
+                        break 'outer;
+                    }
+                }
+                for l in &base[h.0..h.1] {
+                    out.push(format!("-{}", l));
+                    emitted += 1;
+                    if emitted >= MAX_DIFF_LINES {
+                        out.push("... (diff truncated for readability)".to_string());
+                        break 'outer;
+                    }
+                }
+                for l in &h.4 {
+                    out.push(format!("+{}", l));
+                    emitted += 1;
+                    if emitted >= MAX_DIFF_LINES {
+                        out.push("... (diff truncated for readability)".to_string());
+                        break 'outer;
+                    }
+                }
+                cur_b = h.1;
+            }
+            for l in &base[cur_b..g_b_end] {
+                out.push(format!(" {}", l));
+                emitted += 1;
+                if emitted >= MAX_DIFF_LINES {
+                    out.push("... (diff truncated for readability)".to_string());
+                    break 'outer;
+                }
+            }
+        }
+
+        (insertions, deletions, out.join("\n"))
+    }
+
+    /// Computes unified `FileDiffEntry` items between `base_dir` and `current_dir`, optionally filtered to `filter_paths`.
+    pub async fn diff_dirs(
+        base_dir: &Path,
+        current_dir: &Path,
+        filter_paths: Option<&[String]>,
+    ) -> anyhow::Result<Vec<FileDiffEntry>> {
+        let base_files: BTreeMap<String, PathBuf> =
+            Self::collect_files(base_dir).await?.into_iter().collect();
+        let current_files: BTreeMap<String, PathBuf> = Self::collect_files(current_dir)
+            .await?
+            .into_iter()
+            .collect();
+
+        let mut diffs = Vec::new();
+        let fast_meta_skip = current_files.len() > 500;
+
+        for (rel, cur_path) in &current_files {
+            if let Some(allow) = filter_paths {
+                if !allow.iter().any(|p| p == rel) {
+                    continue;
+                }
+            }
+            if let Some(base_path) = base_files.get(rel) {
+                if fast_meta_skip && Self::same_fingerprint(base_path, cur_path) {
+                    continue;
+                }
+            }
+            let cur_bytes = tokio::fs::read(cur_path).await?;
+            match base_files.get(rel) {
+                None => {
+                    let preview = String::from_utf8(cur_bytes.clone())
+                        .ok()
+                        .map(|new_str| Self::unified_diff_str(rel, "", &new_str, 3).2);
+                    diffs.push(FileDiffEntry {
+                        relative_path: rel.clone(),
+                        change_type: DiffChangeType::Added,
+                        old_size: None,
+                        new_size: Some(cur_bytes.len() as u64),
+                        preview_diff: preview,
+                    });
+                }
+                Some(base_path) => {
+                    let base_bytes = tokio::fs::read(base_path).await?;
+                    if Self::sha256_bytes(&base_bytes) != Self::sha256_bytes(&cur_bytes) {
+                        let preview = match (
+                            String::from_utf8(base_bytes.clone()),
+                            String::from_utf8(cur_bytes.clone()),
+                        ) {
+                            (Ok(old_str), Ok(new_str)) => {
+                                Some(Self::unified_diff_str(rel, &old_str, &new_str, 3).2)
+                            }
+                            _ => Some(format!(
+                                "--- a/{rel}\n+++ b/{rel}\nBinary files a/{rel} and b/{rel} differ ({} -> {} bytes)",
+                                base_bytes.len(),
+                                cur_bytes.len()
+                            )),
+                        };
+                        diffs.push(FileDiffEntry {
+                            relative_path: rel.clone(),
+                            change_type: DiffChangeType::Modified,
+                            old_size: Some(base_bytes.len() as u64),
+                            new_size: Some(cur_bytes.len() as u64),
+                            preview_diff: preview,
+                        });
+                    }
+                }
+            }
+        }
+
+        for (rel, base_path) in &base_files {
+            if let Some(allow) = filter_paths {
+                if !allow.iter().any(|p| p == rel) {
+                    continue;
+                }
+            }
+            if !current_files.contains_key(rel) {
+                let base_bytes = tokio::fs::read(base_path).await?;
+                let preview = String::from_utf8(base_bytes.clone())
+                    .ok()
+                    .map(|old_str| Self::unified_diff_str(rel, &old_str, "", 3).2)
+                    .or_else(|| Some(format!("--- a/{}\n+++ /dev/null\n(deleted binary file)", rel)));
+                diffs.push(FileDiffEntry {
+                    relative_path: rel.clone(),
+                    change_type: DiffChangeType::Deleted,
+                    old_size: Some(base_bytes.len() as u64),
+                    new_size: None,
+                    preview_diff: preview,
+                });
+            }
+        }
+
+        Ok(diffs)
+    }
 }
 
 #[async_trait]
@@ -1475,84 +1686,7 @@ impl TransactionalWorkspace for CoWWorkspace {
             self.host_source_root.clone()
         };
 
-        let base_files: BTreeMap<String, PathBuf> =
-            Self::collect_files(&base_dir).await?.into_iter().collect();
-        let current_files: BTreeMap<String, PathBuf> = Self::collect_files(&self.shadow_root)
-            .await?
-            .into_iter()
-            .collect();
-
-        let mut diffs = Vec::new();
-
-        let fast_meta_skip = current_files.len() > 500;
-        for (rel, cur_path) in &current_files {
-            if let Some(base_path) = base_files.get(rel) {
-                if fast_meta_skip && Self::same_fingerprint(base_path, cur_path) {
-                    continue;
-                }
-            }
-            let cur_bytes = tokio::fs::read(cur_path).await?;
-            match base_files.get(rel) {
-                None => {
-                    let preview = String::from_utf8(cur_bytes.clone()).ok().map(|s| {
-                        format!(
-                            "+++ {}\n{}",
-                            rel,
-                            s.lines()
-                                .take(20)
-                                .map(|l| format!("+ {}", l))
-                                .collect::<Vec<_>>()
-                                .join("\n")
-                        )
-                    });
-                    diffs.push(FileDiffEntry {
-                        relative_path: rel.clone(),
-                        change_type: DiffChangeType::Added,
-                        old_size: None,
-                        new_size: Some(cur_bytes.len() as u64),
-                        preview_diff: preview,
-                    });
-                }
-                Some(base_path) => {
-                    let base_bytes = tokio::fs::read(base_path).await?;
-                    if Self::sha256_bytes(&base_bytes) != Self::sha256_bytes(&cur_bytes) {
-                        let preview = match (
-                            String::from_utf8(base_bytes.clone()),
-                            String::from_utf8(cur_bytes.clone()),
-                        ) {
-                            (Ok(old_str), Ok(new_str)) => Some(format!(
-                                "--- a/{rel}\n+++ b/{rel}\n- {}\n+ {}",
-                                old_str.lines().next().unwrap_or(""),
-                                new_str.lines().next().unwrap_or("")
-                            )),
-                            _ => None,
-                        };
-                        diffs.push(FileDiffEntry {
-                            relative_path: rel.clone(),
-                            change_type: DiffChangeType::Modified,
-                            old_size: Some(base_bytes.len() as u64),
-                            new_size: Some(cur_bytes.len() as u64),
-                            preview_diff: preview,
-                        });
-                    }
-                }
-            }
-        }
-
-        for (rel, base_path) in &base_files {
-            if !current_files.contains_key(rel) {
-                let meta = tokio::fs::metadata(base_path).await?;
-                diffs.push(FileDiffEntry {
-                    relative_path: rel.clone(),
-                    change_type: DiffChangeType::Deleted,
-                    old_size: Some(meta.len()),
-                    new_size: None,
-                    preview_diff: Some(format!("--- a/{}\n(deleted)", rel)),
-                });
-            }
-        }
-
-        Ok(diffs)
+        Self::diff_dirs(&base_dir, &self.shadow_root, None).await
     }
 
     async fn rollback(&self, snapshot_id: &str) -> anyhow::Result<()> {

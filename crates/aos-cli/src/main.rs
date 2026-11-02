@@ -491,6 +491,15 @@ enum WorkspaceAction {
 #[derive(Subcommand)]
 enum PolicyAction {
     Status,
+    /// Inspect an escalation's metadata, changed files, and unified code diff before approving (aliases: show, inspect)
+    #[command(visible_aliases = ["show", "inspect"])]
+    Diff {
+        /// Escalation ID (e.g., esc-1f88d046). If omitted, inspects the most recent pending escalation.
+        escalation_id: Option<String>,
+        /// Output raw JSON instead of human-readable colored diff
+        #[arg(long, default_value_t = false)]
+        json: bool,
+    },
     Approve {
         escalation_id: String,
         #[arg(long, alias = "ttl", default_value_t = 3600)]
@@ -2374,6 +2383,19 @@ async fn main() -> anyhow::Result<()> {
                         }))?
                     );
                 }
+                PolicyAction::Diff {
+                    escalation_id,
+                    json,
+                } => {
+                    inspect_policy_escalation(
+                        &kernel,
+                        &cli.runtime_dir,
+                        &identity.org_id,
+                        escalation_id.as_deref(),
+                        json,
+                    )
+                    .await?;
+                }
                 PolicyAction::Approve {
                     escalation_id,
                     ttl_secs,
@@ -2994,4 +3016,349 @@ async fn run_end_to_end_multi_client_demo() -> anyhow::Result<()> {
     println!("==================================================================================");
     Ok(())
 }
+
+fn extract_host_and_files_from_reason(reason: &str) -> (Option<String>, Vec<String>) {
+    let host_dir = reason
+        .rsplit_once("back to host directory '")
+        .and_then(|(_, rest)| rest.strip_suffix('\''))
+        .map(str::to_string);
+
+    let mut files = Vec::new();
+    if let Some((_, after)) = reason.split_once("file(s): ") {
+        if let Some((list_part, _)) = after.split_once(')') {
+            for item in list_part.split(", ") {
+                let trimmed = item.trim();
+                if !trimmed.is_empty() && !trimmed.starts_with('+') {
+                    files.push(trimmed.to_string());
+                }
+            }
+        }
+    }
+    (host_dir, files)
+}
+
+fn count_diff_lines(preview: &str) -> (usize, usize) {
+    let mut ins = 0usize;
+    let mut del = 0usize;
+    for line in preview.lines() {
+        if line.starts_with("+++") || line.starts_with("---") || line.starts_with("@@") {
+            continue;
+        }
+        if line.starts_with('+') {
+            ins += 1;
+        } else if line.starts_with('-') {
+            del += 1;
+        }
+    }
+    (ins, del)
+}
+
+fn print_colored_unified_diff(diff_text: &str) {
+    for line in diff_text.lines() {
+        if line.starts_with("+++") || line.starts_with("---") {
+            println!("  \x1b[1m{}\x1b[0m", line);
+        } else if line.starts_with("@@") {
+            println!("  \x1b[36m{}\x1b[0m", line);
+        } else if line.starts_with('+') {
+            println!("  \x1b[32m{}\x1b[0m", line);
+        } else if line.starts_with('-') {
+            println!("  \x1b[31m{}\x1b[0m", line);
+        } else {
+            println!("  {}", line);
+        }
+    }
+}
+
+async fn inspect_policy_escalation(
+    kernel: &AegisRuntimeKernel,
+    runtime_dir: &Path,
+    current_org: &str,
+    escalation_id: Option<&str>,
+    as_json: bool,
+) -> anyhow::Result<()> {
+    use aos_core::{DiffChangeType, EscalationStatus, FileDiffEntry};
+    use aos_vfs::CoWWorkspace;
+
+    let all_escalations = kernel.policy.list_escalations("*").await?;
+    if all_escalations.is_empty() {
+        if as_json {
+            println!("{}", serde_json::to_string_pretty(&json!({ "escalations": [] }))?);
+        } else {
+            println!("No policy escalations recorded in '{}'.", runtime_dir.display());
+        }
+        return Ok(());
+    }
+
+    let esc = if let Some(target_id) = escalation_id {
+        all_escalations
+            .iter()
+            .find(|e| e.escalation_id == target_id)
+            .cloned()
+            .ok_or_else(|| {
+                let recent: Vec<String> = all_escalations
+                    .iter()
+                    .rev()
+                    .take(5)
+                    .map(|e| format!("{} ({:?}, org={})", e.escalation_id, e.status, e.org_id))
+                    .collect();
+                anyhow::anyhow!(
+                    "Escalation '{}' not found. Recent escalations: {}",
+                    target_id,
+                    recent.join(", ")
+                )
+            })?
+    } else {
+        all_escalations
+            .iter()
+            .filter(|e| e.org_id == current_org && e.status == EscalationStatus::Pending)
+            .max_by_key(|e| e.created_at_ms)
+            .or_else(|| {
+                all_escalations
+                    .iter()
+                    .filter(|e| e.status == EscalationStatus::Pending)
+                    .max_by_key(|e| e.created_at_ms)
+            })
+            .or_else(|| {
+                all_escalations
+                    .iter()
+                    .filter(|e| e.org_id == current_org)
+                    .max_by_key(|e| e.created_at_ms)
+            })
+            .or_else(|| all_escalations.iter().max_by_key(|e| e.created_at_ms))
+            .cloned()
+            .unwrap()
+    };
+
+    let mut diffs: Vec<FileDiffEntry> = Vec::new();
+    let mut diff_source = "none";
+
+    let saved_diff_path = runtime_dir
+        .join("escalation_diffs")
+        .join(format!("{}.json", esc.escalation_id));
+    let cow_base = runtime_dir
+        .join("orgs")
+        .join(&esc.org_id)
+        .join("agents")
+        .join(&esc.agent_id)
+        .join("cow_workspace");
+    let shadow_dir = cow_base.join("upper_workspace");
+    let baseline_dir = cow_base.join("baseline_snapshot");
+
+    let (parsed_host, mut parsed_files) = extract_host_and_files_from_reason(&esc.reason);
+    if esc.action == "workspace_commit_sensitive" && parsed_files.is_empty() {
+        parsed_files.push(esc.target_resource.clone());
+    }
+    let filter_paths: Option<Vec<String>> = if esc.action == "workspace_commit_sensitive" {
+        Some(vec![esc.target_resource.clone()])
+    } else if !parsed_files.is_empty() && !esc.reason.contains(" more)") {
+        Some(parsed_files.clone())
+    } else {
+        None
+    };
+
+    // 1. If Pending, prefer live CoW workspace diff (`baseline_snapshot` -> `upper_workspace`)
+    if esc.status == EscalationStatus::Pending && shadow_dir.exists() && baseline_dir.exists() {
+        if let Ok(live) =
+            CoWWorkspace::diff_dirs(&baseline_dir, &shadow_dir, filter_paths.as_deref()).await
+        {
+            if !live.is_empty() {
+                diffs = live;
+                diff_source = "cow_shadow_workspace";
+            }
+        }
+    }
+
+    // 2. Check saved escalation diff snapshot (`<runtime_dir>/escalation_diffs/<id>.json`)
+    if diffs.is_empty() && saved_diff_path.exists() {
+        if let Ok(bytes) = tokio::fs::read(&saved_diff_path).await {
+            if let Ok(saved) = serde_json::from_slice::<Vec<FileDiffEntry>>(&bytes) {
+                if !saved.is_empty() {
+                    diffs = saved;
+                    diff_source = "saved_escalation_snapshot";
+                }
+            }
+        }
+    }
+
+    // 3. If approved but not yet committed by the agent, check live shadow workspace filtered to the escalation's files
+    if diffs.is_empty() && shadow_dir.exists() && baseline_dir.exists() && filter_paths.is_some() {
+        if let Ok(live) =
+            CoWWorkspace::diff_dirs(&baseline_dir, &shadow_dir, filter_paths.as_deref()).await
+        {
+            if !live.is_empty() {
+                diffs = live;
+                diff_source = "cow_shadow_workspace";
+            }
+        }
+    }
+
+    // 4. Historical fallback: if already approved & committed before snapshot persistence, reconstruct from git commit
+    if diffs.is_empty() {
+        if let Some(ref host_str) = parsed_host {
+            let host_path = Path::new(host_str);
+            if host_path.join(".git").exists() && !parsed_files.is_empty() {
+                for rel in &parsed_files {
+                    let out = std::process::Command::new("git")
+                        .arg("-C")
+                        .arg(host_path)
+                        .args(["log", "-n", "1", "-p", "--pretty=format:", "--", rel])
+                        .output();
+                    if let Ok(o) = out {
+                        let patch = String::from_utf8_lossy(&o.stdout).trim().to_string();
+                        if !patch.is_empty() {
+                            let cleaned: String = patch
+                                .lines()
+                                .skip_while(|l| {
+                                    l.starts_with("diff --git")
+                                        || l.starts_with("index ")
+                                        || l.starts_with("new file mode")
+                                        || l.starts_with("deleted file mode")
+                                })
+                                .collect::<Vec<_>>()
+                                .join("\n");
+                            diffs.push(FileDiffEntry {
+                                relative_path: rel.clone(),
+                                change_type: DiffChangeType::Modified,
+                                old_size: None,
+                                new_size: None,
+                                preview_diff: Some(cleaned),
+                            });
+                        }
+                    }
+                }
+                if !diffs.is_empty() {
+                    diff_source = "host_git_history";
+                }
+            }
+        }
+    }
+
+    if as_json {
+        println!(
+            "{}",
+            serde_json::to_string_pretty(&json!({
+                "escalation": esc,
+                "diff_source": diff_source,
+                "changed_files_count": diffs.len(),
+                "diffs": diffs,
+                "approve_command": format!("aegis-os policy approve {}", esc.escalation_id),
+                "approve_oneshot_command": format!("aegis-os policy approve {} --ttl 0", esc.escalation_id),
+            }))?
+        );
+        return Ok(());
+    }
+
+    let status_badge = match esc.status {
+        EscalationStatus::Pending => "\x1b[1;33m[PENDING]\x1b[0m",
+        EscalationStatus::Approved => "\x1b[1;32m[APPROVED]\x1b[0m",
+        EscalationStatus::Denied => "\x1b[1;31m[DENIED]\x1b[0m",
+    };
+    let created_str = chrono::DateTime::from_timestamp_millis(esc.created_at_ms)
+        .map(|dt| dt.format("%Y-%m-%d %H:%M:%S UTC").to_string())
+        .unwrap_or_else(|| esc.created_at_ms.to_string());
+
+    println!("\x1b[1;36m╭─ Aegis OS Policy Escalation Inspector ──────────────────────────────────────\x1b[0m");
+    println!(
+        "\x1b[1;36m│\x1b[0m \x1b[1mEscalation ID\x1b[0m : \x1b[1;37m{}\x1b[0m  {}",
+        esc.escalation_id, status_badge
+    );
+    println!(
+        "\x1b[1;36m│\x1b[0m \x1b[1mOrganization\x1b[0m  : {}",
+        esc.org_id
+    );
+    println!(
+        "\x1b[1;36m│\x1b[0m \x1b[1mAgent ID\x1b[0m      : {}",
+        esc.agent_id
+    );
+    println!(
+        "\x1b[1;36m│\x1b[0m \x1b[1mAction\x1b[0m        : \x1b[1;35m{}\x1b[0m",
+        esc.action
+    );
+    println!(
+        "\x1b[1;36m│\x1b[0m \x1b[1mTarget\x1b[0m        : {}{}",
+        esc.target_resource,
+        parsed_host
+            .as_ref()
+            .map(|h| format!(" (Host: {})", h))
+            .unwrap_or_default()
+    );
+    println!(
+        "\x1b[1;36m│\x1b[0m \x1b[1mCreated At\x1b[0m    : {}",
+        created_str
+    );
+    println!(
+        "\x1b[1;36m│\x1b[0m \x1b[1mReason\x1b[0m        : {}",
+        esc.reason
+    );
+    println!(
+        "\x1b[1;36m│\x1b[0m \x1b[1mLease Scope\x1b[0m   : {}",
+        esc.suggested_lease_scope
+    );
+    println!("\x1b[1;36m╰─────────────────────────────────────────────────────────────────────────────\x1b[0m");
+
+    if !diffs.is_empty() {
+        let mut total_ins = 0usize;
+        let mut total_del = 0usize;
+        let mut file_stats = Vec::with_capacity(diffs.len());
+        for d in &diffs {
+            let (ins, del) = d
+                .preview_diff
+                .as_deref()
+                .map(count_diff_lines)
+                .unwrap_or((0, 0));
+            total_ins += ins;
+            total_del += del;
+            file_stats.push((d, ins, del));
+        }
+
+        println!(
+            "\n\x1b[1mChanged Files ({} file(s), \x1b[32m+{} insertions\x1b[0m\x1b[1m, \x1b[31m-{} deletions\x1b[0m\x1b[1m):\x1b[0m",
+            diffs.len(),
+            total_ins,
+            total_del
+        );
+        for (d, ins, del) in &file_stats {
+            let badge = match d.change_type {
+                DiffChangeType::Added => "\x1b[1;32m[ADDED]   \x1b[0m",
+                DiffChangeType::Modified => "\x1b[1;33m[MODIFIED]\x1b[0m",
+                DiffChangeType::Deleted => "\x1b[1;31m[DELETED] \x1b[0m",
+            };
+            println!(
+                "  {} {}  (\x1b[32m+{}\x1b[0m / \x1b[31m-{}\x1b[0m)",
+                badge, d.relative_path, ins, del
+            );
+        }
+
+        println!("\n\x1b[1mUnified Diff ({}):\x1b[0m", diff_source);
+        for d in &diffs {
+            println!("\x1b[90m──────────────────────────────────────────────────────────────────────────────\x1b[0m");
+            if let Some(ref preview) = d.preview_diff {
+                print_colored_unified_diff(preview);
+            }
+        }
+        println!("\x1b[90m──────────────────────────────────────────────────────────────────────────────\x1b[0m");
+    } else if matches!(
+        esc.action.as_str(),
+        "workspace_commit" | "workspace_commit_sensitive"
+    ) {
+        println!(
+            "\n\x1b[90mℹ No uncommitted file diffs remain in shadow workspace (escalation status: {:?}).\x1b[0m",
+            esc.status
+        );
+    }
+
+    if esc.status == EscalationStatus::Pending {
+        println!("\n\x1b[1;32mTo Approve:\x1b[0m");
+        println!(
+            "  • 1-hour lease : \x1b[1maegis-os policy approve {}\x1b[0m",
+            esc.escalation_id
+        );
+        println!(
+            "  • One-shot     : \x1b[1maegis-os policy approve {} --ttl 0\x1b[0m",
+            esc.escalation_id
+        );
+    }
+    Ok(())
+}
+
 
