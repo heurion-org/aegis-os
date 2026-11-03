@@ -499,13 +499,12 @@ pub const APPROVE_PAGE_HTML: &str = r##"<!doctype html>
         <a href="https://heurion.org/" class="nav-link">Heurion.org</a>
         <a href="https://heurion.org/aegis-os/" class="nav-link">Overview</a>
         <a href="https://heurion.org/aegis-os/tutorial/" class="nav-link">Tutorial</a>
-        <a id="dash-link" href="dashboard" class="nav-link">Cloud Console</a>
-        <a href="approve" class="nav-link nav-link-active">Approvals</a>
+        <a id="dash-link" href="dashboard" class="nav-link">Console &amp; Pricing</a>
         <a href="https://github.com/heurion-org/aegis-os" target="_blank" rel="noopener" class="nav-link">GitHub ↗</a>
       </nav>
       <div class="nav-right">
         <span class="badge" id="mode-badge">Connecting…</span>
-        <a id="dash-cta" class="nav-cta" href="dashboard">Cloud Console / Pro →</a>
+        <a id="dash-cta" class="nav-cta" href="dashboard">Console / Pro →</a>
       </div>
     </div>
   </header>
