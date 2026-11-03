@@ -980,6 +980,7 @@
 
       <nav class="nav-links" aria-label="Console Sections">
         <a href="https://heurion.org/" class="nav-link" data-i18n="nav_home">Heurion 主站 ↗</a>
+        <a href="approve" id="nav-approve-link" class="nav-link" data-i18n="nav_approve">边界审批台 ↗</a>
         <a href="https://github.com/heurion-org/aegis-os" target="_blank" rel="noopener" class="nav-link">GitHub ↗</a>
       </nav>
 
@@ -1066,16 +1067,16 @@
               <!-- Connector 2 -->
               <div class="arch-conn">
                 <span>↓</span>
-                <span data-i18n="arch_conn_2">Policy Kernel 边界校验（workspace_diff 预览 · 确认后提交）</span>
+                <span data-i18n="arch_conn_2">Policy Kernel 边界拦截（IDE 内置 1-Click 放行 / 自动弹出 /approve 网页审批）</span>
               </div>
 
               <!-- Stage 03: Verified Sync -->
               <div class="arch-stage arch-stage-commit">
                 <div class="arch-row-top">
-                  <span class="arch-step-id"><span class="dot-mint"></span><span data-i18n="svg_step3_t">03 / 边界受控同步回本机</span></span>
-                  <span style="font-family:var(--mono);font-size:0.62rem;color:#E3ECE7;" data-i18n="svg_step3_d">Policy Kernel 保护</span>
+                  <span class="arch-step-id"><span class="dot-mint"></span><span data-i18n="svg_step3_t">03 / 零切换审批与自动写回本机</span></span>
+                  <span style="font-family:var(--mono);font-size:0.62rem;color:#E3ECE7;" data-i18n="svg_step3_d">1-Click Allow · Auto-Resume</span>
                 </div>
-                <div class="arch-title" data-i18n="svg_step3_s">仅将通过校验的文件变更原子同步回你的本地工作区</div>
+                <div class="arch-title" data-i18n="svg_step3_s">点击批准后自动续跑并把源码变更原子拉回本机，无需切换第二终端</div>
               </div>
             </div>
 
@@ -1197,6 +1198,7 @@
     const DICT = {
       zh: {
         nav_home: 'Heurion 主站 ↗',
+        nav_approve: '边界审批台 ↗',
         nav_subscribe: '立即订阅 Pro ($29/月) →',
         hero_eyebrow: 'HEURION · AEGIS OS 线上安全 AGENT 运行时',
         hero_title: '给你的 AI Agent 接入安全的<em>线上 OS 运行时</em>，<br>本地<em>零负载</em>，原环境<em>零风险</em>。',
@@ -1216,10 +1218,10 @@
         svg_ai1: 'CoW 隔离文件系统',
         svg_ai2: '内核级进程沙箱',
         svg_ai3: '多 Agent 并行与 IPC',
-        arch_conn_2: 'Policy Kernel 边界校验（workspace_diff 预览 · 确认后提交）',
-        svg_step3_t: '03 / 边界受控同步回本机',
-        svg_step3_d: 'Policy Kernel 保护',
-        svg_step3_s: '仅将通过校验的文件变更原子同步回你的本地工作区',
+        arch_conn_2: 'Policy Kernel 边界拦截（IDE 内置 1-Click 放行 / 自动弹出 /approve 网页审批）',
+        svg_step3_t: '03 / 零切换审批与自动写回本机',
+        svg_step3_d: '1-Click Allow · Auto-Resume',
+        svg_step3_s: '点击批准后自动续跑并把源码变更原子拉回本机，无需切换第二终端',
         art_bot_l: 'CLAUDE · CURSOR · CODEX · AGY',
         art_bot_r: 'ONLINE AGENT OS & RUNTIME',
         sec3_title: '挂载线上 Runtime · <em>30 秒极速接入</em>',
@@ -1245,6 +1247,7 @@
       },
       en: {
         nav_home: 'Heurion.org ↗',
+        nav_approve: 'Approvals ↗',
         nav_subscribe: 'Subscribe to Pro ($29/mo) →',
         hero_eyebrow: 'HEURION · AEGIS OS — SECURE CLOUD RUNTIME FOR AI AGENTS',
         hero_title: 'Give your AI Agents a secure <em>Cloud OS Runtime</em> —<br><em>zero local load</em>, <em>zero host risk</em>.',
@@ -1264,10 +1267,10 @@
         svg_ai1: 'CoW Shadow VFS',
         svg_ai2: 'Kernel Sandbox Exec',
         svg_ai3: 'Multi-Agent IPC Bus',
-        arch_conn_2: 'Policy Kernel boundary guard (workspace_diff -> commit)',
-        svg_step3_t: '03 / GATED COMMIT TO HOST',
-        svg_step3_d: 'Policy Kernel Guard',
-        svg_step3_s: 'Atomically syncs verified state changes back to your local host',
+        arch_conn_2: 'Policy Kernel boundary guard (IDE 1-Click Allow / auto-popped /approve Web UI)',
+        svg_step3_t: '03 / ZERO-SWITCH APPROVAL & SYNC',
+        svg_step3_d: '1-Click Allow · Auto-Resume',
+        svg_step3_s: 'Approving automatically resumes the blocked call & pulls verified source changes back',
         art_bot_l: 'CLAUDE · CURSOR · CODEX · AGY',
         art_bot_r: 'ONLINE AGENT OS & RUNTIME',
         sec3_title: 'Mount Your Cloud Runtime · <em>30-Second Setup</em>',
@@ -1434,6 +1437,9 @@
 
     function updateCliSnippets() {
       const origin = window.location.origin;
+      const email = getEnteredEmail();
+      const emailFlag = email ? ` --email ${email}` : '';
+      const hasClaimToken = Boolean(claimToken());
       const claimArg = claimToken() || (currentLang === 'en' ? '<click ① Subscribe in this browser first>' : '<请先在本浏览器点击 ① 订阅>');
       const freeBox = document.getElementById('cli-snippet-free');
       const proBox = document.getElementById('cli-snippet-pro');
@@ -1441,23 +1447,37 @@
         freeBox.textContent = currentLang === 'en'
           ? `# 1. Install & auto-configure your AI Agent (Claude / Cursor / Codex / AGY)
 curl -fsSL ${origin}/aegis-cloud/install.sh | sh
-# 2. Enable Free Cloud Sandbox in your project directory
+# 2. Enable Free Cloud Sandbox in your project directory (or just launch agy/claude/codex for Free Local Mode)
 aegis-os cloud up`
           : `# 1. 安装并自动接入你的 AI Agent（Claude / Cursor / Codex / AGY）
 curl -fsSL ${origin}/aegis-cloud/install.sh | sh
-# 2. 在当前目录启用免费云端沙箱（之后直接在 AI 对话框正常使用即可）
+# 2. 在当前目录启用免费云端沙箱（若不运行 cloud up，直接打开 agy/claude/codex 默认使用免费本地沙箱）
 aegis-os cloud up`;
       }
       if (proBox) {
         proBox.textContent = currentLang === 'en'
-          ? `# 1. Install CLI if not already installed
+          ? (hasClaimToken
+            ? `# 1. Install CLI if not already installed
 curl -fsSL ${origin}/aegis-cloud/install.sh | sh
 # 2. Claim Pro key locally (~/.aegis-os) & enable Cloud Sandbox
-aegis-os cloud subscribe --claim --claim-token ${claimArg} && aegis-os cloud up`
-          : `# 1. 若首次使用，先运行一行安装命令（已安装可跳过）
+aegis-os cloud subscribe --claim --claim-token ${claimArg} && aegis-os cloud up
+# Tip: approve boundary commits anytime with \`aos approve\` (or the auto-opened /approve Web UI)`
+            : `# Option A (1-Command Checkout + Auto-Claim + Mount from Terminal):
+aegis-os cloud subscribe --plan pro${emailFlag} --wait
+
+# Option B (If you clicked ① Subscribe in this browser first):
+aegis-os cloud subscribe --claim --claim-token ${claimArg} && aegis-os cloud up`)
+          : (hasClaimToken
+            ? `# 1. 若首次使用，先运行一行安装命令（已安装可跳过）
 curl -fsSL ${origin}/aegis-cloud/install.sh | sh
 # 2. 用本浏览器保存的一次性认领凭证在本机认领 Pro 密钥并启用云端沙箱（密钥不经过 LLM）
-aegis-os cloud subscribe --claim --claim-token ${claimArg} && aegis-os cloud up`;
+aegis-os cloud subscribe --claim --claim-token ${claimArg} && aegis-os cloud up
+# 提示：遇到边界提交时会自动弹出 /approve 网页审批台，也可随时运行 \`aos approve\` 一键放行`
+            : `# 方式 A（推荐 · 终端一行命令自动打开结账、等待付款、认领密钥并挂载当前目录）：
+aegis-os cloud subscribe --plan pro${emailFlag} --wait
+
+# 方式 B（若已在上方点击「① 立即订阅 Pro」完成网页结账）：
+aegis-os cloud subscribe --claim --claim-token ${claimArg} && aegis-os cloud up`);
       }
     }
 
@@ -1479,6 +1499,11 @@ aegis-os cloud subscribe --claim --claim-token ${claimArg} && aegis-os cloud up`
       const emailInput = document.getElementById('sub-email-input');
       if (emailInput && qEmail) {
         emailInput.value = qEmail;
+      }
+      const approveLink = document.getElementById('nav-approve-link');
+      if (approveLink) {
+        const apiBase = window.location.pathname.startsWith('/aegis-cloud') ? '/aegis-cloud' : '';
+        approveLink.href = `${apiBase}/approve`;
       }
       applyLang(currentLang);
       onSubEmailChange();

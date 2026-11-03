@@ -73,11 +73,11 @@ pub enum CloudAction {
     /// List pending Human-in-the-Loop (HITL) boundary escalations in the Cloud Workspace
     Approvals,
 
-    /// Approve (or `--deny`) a pending Cloud escalation. Asks for the org approver's 6-digit
-    /// authenticator code; the operator can instead set `AOS_ADMIN_SECRET`.
+    /// Approve (or `--deny`) a pending Cloud escalation. If `escalation_id` is omitted, selects the
+    /// latest pending escalation automatically. Pass `--web` to approve in the browser console.
     Approve {
-        /// Escalation ID (e.g. `esc-...`)
-        escalation_id: String,
+        /// Escalation ID (e.g. `esc-...`); defaults to the latest pending escalation when omitted
+        escalation_id: Option<String>,
         #[arg(long, default_value_t = true)]
         grant_lease: bool,
         #[arg(long, default_value_t = 900)]
@@ -88,12 +88,27 @@ pub enum CloudAction {
         /// Approver's 6-digit authenticator code (prompted for when omitted)
         #[arg(long)]
         code: Option<String>,
+        /// Open the interactive Web Approval Console (`/approve`) in the default browser
+        #[arg(long, default_value_t = false)]
+        web: bool,
     },
 
     /// Manage this org's approver: the person whose authenticator code approves escalations
     Approver {
         #[command(subcommand)]
         action: ApproverAction,
+    },
+
+    /// Operator only: delete an org and all its keys, workspaces, billing and approver records
+    #[command(hide = true)]
+    DeleteOrg {
+        /// Org to delete
+        org_id: String,
+        /// Also delete an org that still has an active subscription
+        #[arg(long)]
+        force: bool,
+        #[arg(long)]
+        endpoint: Option<String>,
     },
 
     /// Export a GitHub/GitLab Pull Request bundle from the bound Cloud CoW Workspace
@@ -105,12 +120,13 @@ pub enum CloudAction {
     },
 
     /// Set or upgrade tenant subscription plan tier (`community` Free 1 Agent, or `pro` $29/mo 8 Agents)
+    #[command(hide = true)]
     Plan {
         /// Target plan tier (`community` or `pro`)
         tier: String,
     },
 
-    /// Open or generate a Polar.sh subscription checkout URL, or `--claim` your activated `ak_live_*` key
+    /// Open a Polar.sh subscription checkout in your browser, or `--claim` your activated `ak_live_*` key
     Subscribe {
         /// Target subscription plan (`pro` $29/mo)
         #[arg(long, default_value = "pro")]
@@ -121,6 +137,9 @@ pub enum CloudAction {
         /// Claim the `ak_live_*` API key minted by `/v1/billing/webhook` after completing checkout
         #[arg(long, default_value_t = false)]
         claim: bool,
+        /// Wait for checkout completion, automatically claim the `ak_live_*` key, and bind this workspace
+        #[arg(long, default_value_t = false)]
+        wait: bool,
         /// Claim token from the checkout (defaults to the one saved by the last `cloud subscribe`)
         #[arg(long)]
         claim_token: Option<String>,
@@ -136,9 +155,11 @@ pub enum CloudAction {
     },
 
     /// Transition the bound Cloud Workspace into Scale-to-Zero (`Hibernated`) state
+    #[command(hide = true)]
     Hibernate,
 
     /// Instantly wake the bound Cloud Workspace from `Hibernated` to `Active`
+    #[command(hide = true)]
     Wake,
 
     /// Show Aegis Cloud binding, tenant plan tier, usage metering, and remote workspace status
@@ -565,6 +586,166 @@ pub async fn collect_local_source_bundle(workspace: &Path) -> anyhow::Result<Vec
     Ok(entries)
 }
 
+/// Collects text source files from `workspace` whose modification time is strictly newer than `since_ms`.
+/// Used by `serve_unified_stdio` to transparently sync local IDE edits up to the Cloud Sandbox before tool execution.
+pub async fn collect_local_source_files_modified_since(
+    workspace: &Path,
+    since_ms: i64,
+) -> anyhow::Result<Vec<SourceFileEntry>> {
+    if since_ms <= 0 {
+        return Ok(Vec::new());
+    }
+    let mut entries = Vec::new();
+    let mut stack = vec![workspace.to_path_buf()];
+
+    while let Some(dir) = stack.pop() {
+        let Ok(mut rd) = tokio::fs::read_dir(&dir).await else {
+            continue;
+        };
+        while let Ok(Some(entry)) = rd.next_entry().await {
+            let path = entry.path();
+            let name = entry.file_name().to_string_lossy().to_string();
+            if name == ".git"
+                || name == "target"
+                || name == "dist"
+                || name == "build"
+                || name == ".next"
+                || name == ".venv"
+                || name == "venv"
+                || name == "__pycache__"
+                || name == "node_modules"
+                || name == ".agents"
+                || name == ".agent"
+                || name == ".aegis_baseline"
+                || name.starts_with(".DS_Store")
+            {
+                continue;
+            }
+            let Ok(ft) = entry.file_type().await else {
+                continue;
+            };
+            if ft.is_dir() {
+                stack.push(path);
+            } else if ft.is_file() {
+                let Ok(meta) = entry.metadata().await else {
+                    continue;
+                };
+                if meta.len() > 512 * 1024 {
+                    continue;
+                }
+                let mtime_ms = meta
+                    .modified()
+                    .ok()
+                    .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
+                    .map(|d| d.as_millis() as i64)
+                    .unwrap_or(0);
+                if mtime_ms <= since_ms {
+                    continue;
+                }
+                let Ok(raw) = tokio::fs::read(&path).await else {
+                    continue;
+                };
+                if raw.iter().take(4096).any(|&b| b == 0) {
+                    continue;
+                }
+                let Ok(content) = String::from_utf8(raw) else {
+                    continue;
+                };
+                if let Ok(rel) = path.strip_prefix(workspace) {
+                    entries.push(SourceFileEntry {
+                        path: rel.to_string_lossy().to_string(),
+                        content,
+                        deleted: false,
+                    });
+                }
+            }
+        }
+    }
+    entries.sort_by(|a, b| a.path.cmp(&b.path));
+    Ok(entries)
+}
+
+/// Returns `true` if a local GUI browser can be opened (false in tests, CI, headless SSH, or headless Linux).
+pub fn can_open_browser() -> bool {
+    if cfg!(test)
+        || std::env::var("AOS_NO_BROWSER").as_deref() == Ok("1")
+        || std::env::var("CI").as_deref() == Ok("true")
+        || std::env::var_os("SSH_CONNECTION").is_some()
+        || std::env::var_os("SSH_TTY").is_some()
+    {
+        return false;
+    }
+    if cfg!(target_os = "linux")
+        && std::env::var_os("DISPLAY").is_none()
+        && std::env::var_os("WAYLAND_DISPLAY").is_none()
+    {
+        return false;
+    }
+    cfg!(target_os = "macos") || cfg!(target_os = "linux")
+}
+
+/// Opens `url` in the system default browser unless running in tests, headless SSH (`SSH_CONNECTION` / `SSH_TTY`),
+/// headless Linux (no `DISPLAY` / `WAYLAND_DISPLAY`), or `AOS_NO_BROWSER=1`.
+pub fn open_url_in_browser(url: &str) -> bool {
+    if !can_open_browser() {
+        return false;
+    }
+    let prog = if cfg!(target_os = "macos") {
+        "open"
+    } else if cfg!(target_os = "linux") {
+        "xdg-open"
+    } else {
+        return false;
+    };
+    std::process::Command::new(prog)
+        .arg(url)
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .spawn()
+        .is_ok()
+}
+
+/// Records a short-lived (5-minute) pre-approval ticket when the IDE's `PreToolUse` hook intercepts
+/// `workspace_commit` and returns `{"decision": "ask"}` to the user in the IDE chat window.
+/// If the user clicks **Allow** in the IDE, `serve_unified_stdio` consumes this ticket and
+/// completes `workspace_commit` immediately without opening a browser or needing a second CLI session.
+pub fn record_hook_commit_ticket(runtime_dir: &Path, org_id: &str) {
+    let path = runtime_dir.join("hook_commit_tickets.json");
+    let mut map: std::collections::HashMap<String, i64> = std::fs::read(&path)
+        .ok()
+        .and_then(|b| serde_json::from_slice(&b).ok())
+        .unwrap_or_default();
+    let now_ms = Utc::now().timestamp_millis();
+    map.retain(|_, exp| *exp > now_ms);
+    map.insert(org_id.to_string(), now_ms + 300_000);
+    if let Some(parent) = path.parent() {
+        let _ = std::fs::create_dir_all(parent);
+    }
+    if let Ok(bytes) = serde_json::to_vec(&map) {
+        let _ = std::fs::write(&path, bytes);
+    }
+}
+
+/// Consumes a valid `PreToolUse` hook approval ticket for `org_id`, if present and unexpired.
+pub fn consume_hook_commit_ticket(runtime_dir: &Path, org_id: &str) -> bool {
+    let path = runtime_dir.join("hook_commit_tickets.json");
+    let mut map: std::collections::HashMap<String, i64> = match std::fs::read(&path)
+        .ok()
+        .and_then(|b| serde_json::from_slice(&b).ok())
+    {
+        Some(m) => m,
+        None => return false,
+    };
+    let now_ms = Utc::now().timestamp_millis();
+    map.retain(|_, exp| *exp > now_ms);
+    let matched = map.remove(org_id).is_some() || map.remove("*").is_some();
+    if let Ok(bytes) = serde_json::to_vec(&map) {
+        let _ = std::fs::write(&path, bytes);
+    }
+    matched
+}
+
 /// Cloud approvals need the daemon's operator token: agents hold the tenant key, so a tenant key
 /// that could approve would let an agent approve its own escalation.
 fn operator_token_from(env_value: Option<String>) -> anyhow::Result<String> {
@@ -572,7 +753,7 @@ fn operator_token_from(env_value: Option<String>) -> anyhow::Result<String> {
         .map(|v| v.trim().to_string())
         .filter(|v| !v.is_empty())
         .context(
-            "Cloud approvals are operator-only: set AOS_ADMIN_SECRET to the daemon's operator token \
+            "This Cloud command is operator-only: set AOS_ADMIN_SECRET to the daemon's operator token \
              (on the cloud node: /etc/aegis-cloud/env)",
         )
 }
@@ -980,6 +1161,7 @@ pub async fn handle_cloud_command(
             ttl_secs,
             deny,
             code,
+            web,
         } => {
             let active = resolve_active_cloud_binding(runtime_dir, &canon);
             let ep = active
@@ -991,9 +1173,60 @@ pub async fn handle_cloud_command(
                 .as_ref()
                 .map(|b| b.api_key.clone())
                 .or_else(|| store.auth.as_ref().map(|a| a.api_key.clone()));
+            let auth_for_status = operator_token_from(std::env::var("AOS_ADMIN_SECRET").ok())
+                .ok()
+                .or_else(|| key.clone());
+
+            let status_opt = cloud_http_json(
+                "GET",
+                &ep,
+                &format!("/v1/status?org_id={}", identity.org_id),
+                auth_for_status.as_deref(),
+                &[],
+                None,
+            )
+            .await
+            .ok();
+
+            let resolved_esc_id = match escalation_id.filter(|s| !s.trim().is_empty()) {
+                Some(id) => id,
+                None => status_opt
+                    .as_ref()
+                    .and_then(|s| s.get("pending_escalations"))
+                    .and_then(|v| v.as_array())
+                    .and_then(|list| list.last())
+                    .and_then(|e| e.get("escalation_id"))
+                    .and_then(|v| v.as_str())
+                    .map(|s| s.to_string())
+                    .context("No pending escalations in this Cloud org (`aegis-os cloud approvals`)")?,
+            };
+
+            if web {
+                let tok = auth_for_status.unwrap_or_default();
+                let url = format!(
+                    "{}/approve?id={}&org={}#key={}",
+                    api_base(&ep),
+                    resolved_esc_id,
+                    identity.org_id,
+                    tok
+                );
+                let opened = open_url_in_browser(&url);
+                println!(
+                    "{}",
+                    serde_json::to_string_pretty(&json!({
+                        "status": "web_approval_ready",
+                        "escalation_id": resolved_esc_id,
+                        "org_id": identity.org_id,
+                        "browser_opened": opened,
+                        "approve_url": format!("{}/approve?id={}&org={}", api_base(&ep), resolved_esc_id, identity.org_id),
+                    }))?
+                );
+                return Ok(());
+            }
+
             let decision = if deny { "deny" } else { "approve" };
             let mut body = json!({
-                "escalation_id": escalation_id,
+                "escalation_id": resolved_esc_id,
                 "decision": decision,
                 "grant_lease": grant_lease,
                 "ttl_secs": ttl_secs
@@ -1004,21 +1237,26 @@ pub async fn handle_cloud_command(
             } else {
                 let key = key.context("Not logged in to Aegis Cloud (`aegis-os cloud login`)")?;
                 // Show what is being approved before asking for the code.
-                let status = cloud_http_json(
-                    "GET",
-                    &ep,
-                    &format!("/v1/status?org_id={}", identity.org_id),
-                    Some(&key),
-                    &[],
-                    None,
-                )
-                .await?;
+                let status = match status_opt {
+                    Some(s) => s,
+                    None => {
+                        cloud_http_json(
+                            "GET",
+                            &ep,
+                            &format!("/v1/status?org_id={}", identity.org_id),
+                            Some(&key),
+                            &[],
+                            None,
+                        )
+                        .await?
+                    }
+                };
                 let esc = status
                     .get("pending_escalations")
                     .and_then(|v| v.as_array())
-                    .and_then(|list| list.iter().find(|e| e["escalation_id"] == escalation_id.as_str()).cloned())
-                    .with_context(|| format!("No pending escalation '{}' in this org (`aegis-os cloud approvals`)", escalation_id))?;
-                eprintln!("{} escalation {}", if deny { "Deny" } else { "Approve" }, escalation_id);
+                    .and_then(|list| list.iter().find(|e| e["escalation_id"] == resolved_esc_id.as_str()).cloned())
+                    .with_context(|| format!("No pending escalation '{}' in this org (`aegis-os cloud approvals`)", resolved_esc_id))?;
+                eprintln!("{} escalation {}", if deny { "Deny" } else { "Approve" }, resolved_esc_id);
                 for (label, field) in [("Agent", "agent_id"), ("Action", "action"), ("Target", "target_resource"), ("Reason", "reason"), ("Lease scope", "suggested_lease_scope")] {
                     if let Some(v) = esc.get(field).and_then(|v| v.as_str()) {
                         eprintln!("  {label:<12} {v}");
@@ -1031,6 +1269,24 @@ pub async fn handle_cloud_command(
                 body["totp"] = json!(code);
                 cloud_http_json("POST", &ep, "/v1/approvals/decide", Some(&key), &[], Some(&body)).await?
             };
+            println!("{}", serde_json::to_string_pretty(&resp)?);
+        }
+
+        CloudAction::DeleteOrg { org_id, force, endpoint } => {
+            let operator_token = operator_token_from(std::env::var("AOS_ADMIN_SECRET").ok())?;
+            let ep = endpoint
+                .or_else(|| store.auth.as_ref().map(|a| a.endpoint.clone()))
+                .unwrap_or_else(|| "https://heurion.org".to_string());
+            let path = if force { "/v1/orgs?force=true" } else { "/v1/orgs" };
+            let resp = cloud_http_json(
+                "DELETE",
+                &ep,
+                path,
+                Some(&operator_token),
+                &[],
+                Some(&json!({ "org_id": org_id })),
+            )
+            .await?;
             println!("{}", serde_json::to_string_pretty(&resp)?);
         }
 
@@ -1129,6 +1385,7 @@ pub async fn handle_cloud_command(
             plan,
             email,
             claim,
+            wait,
             claim_token,
             endpoint,
         } => {
@@ -1189,7 +1446,7 @@ pub async fn handle_cloud_command(
                         .map(|e| format!("&customer_email={}", e.trim()))
                         .unwrap_or_default()
                 );
-                let resp = cloud_http_json(
+                let mut resp = cloud_http_json(
                     "POST",
                     &ep,
                     "/v1/billing/checkout",
@@ -1214,11 +1471,67 @@ pub async fn handle_cloud_command(
                         "warning": "Endpoint unreachable: this offline checkout link has no claim token, so `--claim` will not work for it. Retry once the endpoint is reachable."
                     })
                 });
-                if let Some(token) = resp.get("claim_token").and_then(|v| v.as_str()) {
-                    store.pending_claim_token = Some(token.to_string());
+                let saved_token = resp
+                    .get("claim_token")
+                    .and_then(|v| v.as_str())
+                    .map(|s| s.to_string());
+                if let Some(ref token) = saved_token {
+                    store.pending_claim_token = Some(token.clone());
                     save_store(runtime_dir, &store)?;
                 }
+                if let Some(url) = resp.get("checkout_url").and_then(|v| v.as_str()).map(|s| s.to_string()) {
+                    let opened = open_url_in_browser(&url);
+                    if let Some(obj) = resp.as_object_mut() {
+                        obj.insert("browser_opened".to_string(), json!(opened));
+                    }
+                }
                 println!("{}", serde_json::to_string_pretty(&resp)?);
+
+                if wait {
+                    if let Some(token) = saved_token {
+                        eprintln!("Waiting for subscription payment confirmation...");
+                        for _ in 0..90 {
+                            tokio::time::sleep(std::time::Duration::from_secs(2)).await;
+                            if let Ok(claim_resp) = cloud_http_json(
+                                "POST",
+                                &ep,
+                                "/v1/billing/claim",
+                                None,
+                                &[],
+                                Some(&json!({ "claim_token": token })),
+                            )
+                            .await
+                            {
+                                if let Some(claimed_key) =
+                                    claim_resp.get("api_key").and_then(|v| v.as_str()).map(|s| s.to_string())
+                                {
+                                    store.auth = Some(CloudAuthConfig {
+                                        endpoint: ep.clone(),
+                                        api_key: claimed_key.clone(),
+                                        org_id: identity.org_id.clone(),
+                                        updated_at_ms: Utc::now().timestamp_millis(),
+                                    });
+                                    store.pending_claim_token = None;
+                                    save_store(runtime_dir, &store)?;
+                                    eprintln!("Subscription claimed! Automatically binding workspace (`cloud up`)...");
+                                    Box::pin(handle_cloud_command(
+                                        CloudAction::Up {
+                                            endpoint: Some(ep),
+                                            api_key: Some(claimed_key),
+                                            workspace_id: None,
+                                            agents: "agy-agent".to_string(),
+                                        },
+                                        identity,
+                                        workspace,
+                                        runtime_dir,
+                                    ))
+                                    .await?;
+                                    break;
+                                }
+                            }
+                        }
+                    }
+                }
             }
         }
 
@@ -1344,6 +1657,164 @@ pub async fn handle_cloud_command(
     }
 
     Ok(())
+}
+
+/// Unified top-level `aegis-os approve` (`aos approve`) handler:
+/// - Automatically detects whether the current workspace is bound to Aegis Cloud or running in Local Mode.
+/// - If `escalation_id` is omitted, automatically selects the latest pending escalation (checking the current
+///   org first, and falling back to any pending local escalation across all orgs in Local Mode).
+/// - If `--web` is passed, opens the interactive Web Approval Console (`/approve`) in the browser.
+pub async fn handle_unified_approve(
+    escalation_id: Option<String>,
+    grant_lease: bool,
+    ttl_secs: u64,
+    deny: bool,
+    code: Option<String>,
+    web: bool,
+    identity: &AgentIdentity,
+    workspace: &Path,
+    runtime_dir: &Path,
+) -> anyhow::Result<()> {
+    let canon = std::fs::canonicalize(workspace).unwrap_or_else(|_| workspace.to_path_buf());
+    if resolve_active_cloud_binding(runtime_dir, &canon).is_some() {
+        return handle_cloud_command(
+            CloudAction::Approve {
+                escalation_id,
+                grant_lease,
+                ttl_secs,
+                deny,
+                code,
+                web,
+            },
+            identity,
+            &canon,
+            runtime_dir,
+        )
+        .await;
+    }
+
+    // Local Community Mode approval path
+    let kernel = std::sync::Arc::new(AegisRuntimeKernel::new(runtime_dir).await?);
+    let mut escalations = kernel.policy.list_escalations(&identity.org_id).await?;
+    if escalations.is_empty() {
+        escalations = kernel.policy.list_escalations("*").await?;
+    }
+
+    let resolved_esc_id = match escalation_id.filter(|s| !s.trim().is_empty()) {
+        Some(id) => id,
+        None => escalations
+            .last()
+            .map(|e| e.escalation_id.clone())
+            .context("No pending escalations found (`aegis-os policy list`)")?,
+    };
+
+    if web {
+        let addr = kernel
+            .clone()
+            .start_http_daemon_with_auth(
+                "127.0.0.1:0",
+                canon.clone(),
+                aos_mcp_gateway::DaemonAuth::Disabled,
+            )
+            .await?;
+        let url = format!(
+            "http://{}/approve?id={}&org={}&mode=local",
+            addr, resolved_esc_id, identity.org_id
+        );
+        let opened = open_url_in_browser(&url);
+        println!(
+            "{}",
+            serde_json::to_string_pretty(&json!({
+                "status": "local_web_approval_ready",
+                "escalation_id": resolved_esc_id,
+                "browser_opened": opened,
+                "approve_url": url
+            }))?
+        );
+        // Wait up to 120s for the user to click Approve/Deny in the browser tab
+        for _ in 0..240 {
+            tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+            let pending = kernel.policy.list_escalations("*").await.unwrap_or_default();
+            if !pending.iter().any(|e| e.escalation_id == resolved_esc_id) {
+                break;
+            }
+        }
+        return Ok(());
+    }
+
+    if deny {
+        let esc = kernel
+            .policy
+            .deny_escalation(&resolved_esc_id, "cli-operator")
+            .await?;
+        println!(
+            "{}",
+            serde_json::to_string_pretty(&json!({
+                "status": "escalation_denied",
+                "mode": "local",
+                "escalation": esc
+            }))?
+        );
+    } else {
+        let lease_ttl = if grant_lease {
+            (ttl_secs as i64).max(60)
+        } else {
+            60
+        };
+        let lease = kernel
+            .policy
+            .approve_escalation(&resolved_esc_id, lease_ttl, "cli-operator")
+            .await?;
+        println!(
+            "{}",
+            serde_json::to_string_pretty(&json!({
+                "status": "escalation_approved",
+                "mode": "local",
+                "escalation_id": resolved_esc_id,
+                "lease_granted": lease
+            }))?
+        );
+    }
+    Ok(())
+}
+
+fn extract_escalation_id_from_rpc(rpc_resp: &Value) -> Option<String> {
+    let text = rpc_resp
+        .get("result")?
+        .get("content")?
+        .as_array()?
+        .first()?
+        .get("text")?
+        .as_str()?;
+    if !text.contains("\"approval_required\"") {
+        return None;
+    }
+    let parsed: Value = serde_json::from_str(text).ok()?;
+    if parsed.get("status").and_then(|v| v.as_str()) != Some("approval_required") {
+        return None;
+    }
+    parsed
+        .get("escalation_id")
+        .and_then(|v| v.as_str())
+        .map(|s| s.to_string())
+}
+
+fn approval_wait_timeout_secs() -> u64 {
+    if cfg!(test) || std::env::var("AOS_NO_APPROVAL_WAIT").as_deref() == Ok("1") {
+        return 0;
+    }
+    std::env::var("AOS_APPROVAL_WAIT_SECS")
+        .ok()
+        .and_then(|v| v.parse::<u64>().ok())
+        .unwrap_or(120)
+}
+
+/// Returns `true` only when interactive first-run mode prompting is explicitly requested via
+/// `AOS_PROMPT_MODE_ONBOARDING=1` and the workspace has not yet been configured.
+/// By default, new directories silently run in Local Community CoW Mode without interrupting the user.
+pub fn should_prompt_mode_onboarding(runtime_dir: &Path, workspace: &Path) -> bool {
+    std::env::var("AOS_PROMPT_MODE_ONBOARDING").as_deref() == Ok("1")
+        && !is_workspace_mode_configured(runtime_dir, workspace)
 }
 
 /// Returns `true` if the user (or agent) has explicitly chosen an execution mode (`"cloud"` or `"local"`)
@@ -1644,7 +2115,7 @@ pub async fn serve_unified_stdio(
     auto_org: bool,
     auto_agent_client: Option<String>,
 ) -> anyhow::Result<()> {
-    let kernel = AegisRuntimeKernel::new(&runtime_dir).await?;
+    let kernel = std::sync::Arc::new(AegisRuntimeKernel::new(&runtime_dir).await?);
     let session_key = auto_agent_client
         .as_ref()
         .and_then(|_| aos_core::session::client_session_key());
@@ -1652,6 +2123,7 @@ pub async fn serve_unified_stdio(
     let mut stdout = tokio::io::stdout();
     let mut reader = BufReader::new(stdin).lines();
     let mut active_workspace = kernel.resolve_workspace_fallback(&initial_workspace);
+    let mut last_local_sync_ms = Utc::now().timestamp_millis();
     if auto_org {
         if let Some(name) = active_workspace.file_name() {
             let name_str = name.to_string_lossy().to_string();
@@ -1804,6 +2276,27 @@ pub async fn serve_unified_stdio(
                     }
                 }
             };
+            // Transparently sync any local source files edited in the IDE since the last tool call
+            // so the user never needs to manually run `aegis-os cloud push`.
+            if method == "tools/call" && tool_name != "workspace_commit" {
+                if let Ok(modified) =
+                    collect_local_source_files_modified_since(&active_workspace, last_local_sync_ms)
+                        .await
+                {
+                    if !modified.is_empty() {
+                        let _ = sync_up_files_chunked(
+                            &binding.endpoint,
+                            &binding.api_key,
+                            &binding.org_id,
+                            &binding.workspace_id,
+                            &modified,
+                        )
+                        .await;
+                    }
+                    last_local_sync_ms = Utc::now().timestamp_millis();
+                }
+            }
+
             // If committing on Cloud Sandbox, pre-fetch pending source-only diff so we can apply it
             // to the local repository as soon as `workspace_commit` succeeds on the remote sandbox.
             let pre_commit_files: Vec<SourceFileEntry> =
@@ -1849,6 +2342,102 @@ pub async fn serve_unified_stdio(
             .await
             {
                 Ok(mut rpc_resp) => {
+                    // If the Cloud Sandbox returned `approval_required`, support:
+                    // (a) Inline CLI / SSH TOTP approval (`totp` passed in tool arguments from the human in chat), or
+                    // (b) Auto-opened Web Approval Console (`/approve?id=...&org=...#key=...`) when a local GUI browser is available.
+                    if let Some(esc_id) = extract_escalation_id_from_rpc(&rpc_resp) {
+                        let mut approved = false;
+                        if let Some(inline_totp) = tool_args
+                            .get("totp")
+                            .and_then(|v| v.as_str())
+                            .map(|s| s.trim())
+                            .filter(|s| !s.is_empty())
+                        {
+                            if let Ok(dec) = cloud_http_json(
+                                "POST",
+                                &binding.endpoint,
+                                "/v1/approvals/decide",
+                                Some(&binding.api_key),
+                                &[],
+                                Some(&json!({
+                                    "escalation_id": esc_id,
+                                    "decision": "approve",
+                                    "ttl_secs": 900,
+                                    "totp": inline_totp
+                                })),
+                            )
+                            .await
+                            {
+                                approved = dec.get("status").and_then(|v| v.as_str()) == Some("approved");
+                            }
+                        } else {
+                            let approve_url = format!(
+                                "{}/approve?id={}&org={}#key={}",
+                                api_base(&binding.endpoint),
+                                esc_id,
+                                binding.org_id,
+                                binding.api_key
+                            );
+                            let browser_opened = open_url_in_browser(&approve_url);
+                            let force_wait =
+                                std::env::var("AOS_FORCE_APPROVAL_WAIT").as_deref() == Ok("1");
+                            if browser_opened || force_wait {
+                                let wait_secs = approval_wait_timeout_secs();
+                                for _ in 0..wait_secs {
+                                    tokio::time::sleep(std::time::Duration::from_secs(1)).await;
+                                    if let Ok(st) = cloud_http_json(
+                                        "GET",
+                                        &binding.endpoint,
+                                        &format!("/v1/status?org_id={}", binding.org_id),
+                                        Some(&binding.api_key),
+                                        &[],
+                                        None,
+                                    )
+                                    .await
+                                    {
+                                        let still_pending = st
+                                            .get("pending_escalations")
+                                            .and_then(|v| v.as_array())
+                                            .map(|arr| {
+                                                arr.iter().any(|e| {
+                                                    e["escalation_id"] == esc_id.as_str()
+                                                })
+                                            })
+                                            .unwrap_or(false);
+                                        if !still_pending {
+                                            let has_lease = st
+                                                .get("active_leases")
+                                                .and_then(|v| v.as_array())
+                                                .map(|arr| !arr.is_empty())
+                                                .unwrap_or(false);
+                                            approved = has_lease;
+                                            break;
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                        if approved {
+                            if let Ok(retry_resp) = cloud_http_json(
+                                "POST",
+                                &binding.endpoint,
+                                "/v1/mcp",
+                                Some(&binding.api_key),
+                                &[
+                                    ("X-Aegis-Org", &binding.org_id),
+                                    ("X-Aegis-Agent", &cloud_agent_id),
+                                    ("X-Aegis-Role", &identity.role),
+                                    ("X-Aegis-Workspace", &binding.workspace_id),
+                                ],
+                                Some(&req),
+                            )
+                            .await
+                            {
+                                rpc_resp = retry_resp;
+                            }
+                        }
+                    }
+
                     if let Some(obj) = rpc_resp.as_object_mut() {
                         obj.insert("id".to_string(), id);
                     }
@@ -1889,6 +2478,7 @@ pub async fn serve_unified_stdio(
                                 }
                             }
                         }
+                        last_local_sync_ms = Utc::now().timestamp_millis() + 500;
                     }
                     rpc_resp
                 }
@@ -1950,8 +2540,81 @@ pub async fn serve_unified_stdio(
                 .await;
         }
 
-        let response = match kernel.handle_jsonrpc_message(&identity, req).await {
-            Ok(resp) => resp,
+        let response = match kernel.handle_jsonrpc_message(&identity, req.clone()).await {
+            Ok(mut resp) => {
+                if let Some(esc_id) = extract_escalation_id_from_rpc(&resp) {
+                    // 1. If the user already approved `workspace_commit` inside the IDE chat window
+                    //    via the `PreToolUse` hook (`decision: "ask"`), consume the ticket and complete immediately!
+                    if tool_name == "workspace_commit"
+                        && consume_hook_commit_ticket(&runtime_dir, &identity.org_id)
+                    {
+                        if kernel
+                            .policy
+                            .approve_escalation(&esc_id, 900, "ide-pretooluse-hook")
+                            .await
+                            .is_ok()
+                        {
+                            if let Ok(retry_resp) =
+                                kernel.handle_jsonrpc_message(&identity, req).await
+                            {
+                                resp = retry_resp;
+                            }
+                        }
+                    } else {
+                        // 2. Otherwise (e.g. Codex CLI or non-hook clients), spawn a local `/approve`
+                        //    web console in the browser when a GUI browser is available, wait for approval, and auto-retry!
+                        let wait_secs = approval_wait_timeout_secs();
+                        if wait_secs > 0 {
+                            let mut browser_opened = false;
+                            if let Ok(addr) = kernel
+                                .clone()
+                                .start_http_daemon_with_auth(
+                                    "127.0.0.1:0",
+                                    active_workspace.clone(),
+                                    aos_mcp_gateway::DaemonAuth::Disabled,
+                                )
+                                .await
+                            {
+                                let url = format!(
+                                    "http://{}/approve?id={}&org={}&mode=local",
+                                    addr, esc_id, identity.org_id
+                                );
+                                browser_opened = open_url_in_browser(&url);
+                            }
+                            let force_wait =
+                                std::env::var("AOS_FORCE_APPROVAL_WAIT").as_deref() == Ok("1");
+                            if browser_opened || force_wait {
+                                let mut approved = false;
+                                for _ in 0..(wait_secs * 2) {
+                                    tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+                                    let pending = kernel
+                                        .policy
+                                        .list_escalations(&identity.org_id)
+                                        .await
+                                        .unwrap_or_default();
+                                    if !pending.iter().any(|e| e.escalation_id == esc_id) {
+                                        let leases = kernel
+                                            .policy
+                                            .list_leases(&identity.org_id, Some(&identity.agent_id))
+                                            .await
+                                            .unwrap_or_default();
+                                        approved = !leases.is_empty();
+                                        break;
+                                    }
+                                }
+                                if approved {
+                                    if let Ok(retry_resp) =
+                                        kernel.handle_jsonrpc_message(&identity, req).await
+                                    {
+                                        resp = retry_resp;
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+                resp
+            }
             Err(err) => json!({
                 "jsonrpc": "2.0",
                 "id": id,
@@ -2193,5 +2856,426 @@ mod tests {
         assert!(resolve_active_cloud_binding(&local_rt, &local_repo).is_none());
         // Once configured as local, onboarding prompt is no longer emitted
         assert!(build_onboarding_prompt_if_needed(&local_rt, &local_repo, "conv-2").is_none());
+    }
+
+    #[tokio::test]
+    async fn test_unified_approve_and_hook_commit_ticket() {
+        let temp = tempfile::tempdir().unwrap();
+        let local_repo = temp.path().join("approve_project");
+        let local_rt = temp.path().join("local_rt");
+        tokio::fs::create_dir_all(&local_repo).await.unwrap();
+        tokio::fs::write(local_repo.join("app.rs"), "pub fn v() -> i32 { 1 }\n")
+            .await
+            .unwrap();
+
+        // 1. By default, new directories silently run in Local CoW mode without prompting
+        assert!(!should_prompt_mode_onboarding(&local_rt, &local_repo));
+
+        // 2. Hook commit ticket lifecycle (In-IDE PreToolUse 1-click commit approval)
+        assert!(!consume_hook_commit_ticket(&local_rt, "approve_project"));
+        record_hook_commit_ticket(&local_rt, "approve_project");
+        assert!(consume_hook_commit_ticket(&local_rt, "approve_project"));
+        assert!(!consume_hook_commit_ticket(&local_rt, "approve_project"));
+
+        // 3. Top-level `aegis-os approve` (`handle_unified_approve`) auto-selects latest pending escalation
+        let kernel = AegisRuntimeKernel::new(&local_rt).await.unwrap();
+        let identity = AgentIdentity::new("approve_project", "agy-agent", "Lead Agent");
+        kernel
+            .ensure_agent_environment(
+                identity.clone(),
+                &local_repo,
+                aos_core::IsolationTier::NativeOsSandbox,
+                vec!["*".to_string()],
+            )
+            .await
+            .unwrap();
+        let _ = kernel
+            .call_tool(
+                &identity,
+                "fs_write",
+                json!({ "path": "app.rs", "content": "pub fn v() -> i32 { 2 }\n" }),
+            )
+            .await
+            .unwrap();
+        let ask_res = kernel
+            .call_tool(&identity, "workspace_commit", json!({}))
+            .await
+            .unwrap();
+        assert_eq!(ask_res["status"], "approval_required");
+
+        // Approve without passing `escalation_id` -> automatically resolves and approves!
+        handle_unified_approve(
+            None,
+            true,
+            900,
+            false,
+            None,
+            false,
+            &identity,
+            &local_repo,
+            &local_rt,
+        )
+        .await
+        .unwrap();
+
+        let commit_res = kernel
+            .call_tool(&identity, "workspace_commit", json!({}))
+            .await
+            .unwrap();
+        assert_eq!(commit_res["status"], "committed_to_host");
+    }
+
+    #[tokio::test]
+    async fn test_cloud_e2e_web_approve_console_incremental_sync_and_unified_totp_approve() {
+        let temp = tempfile::tempdir().unwrap();
+        let local_repo = temp.path().join("cloud_e2e_org");
+        let local_rt = temp.path().join("local_rt");
+        let cloud_rt = temp.path().join("cloud_rt");
+        let cloud_default_ws = temp.path().join("cloud_default_ws");
+        let outbox = temp.path().join("mail_outbox");
+
+        tokio::fs::create_dir_all(&local_repo).await.unwrap();
+        tokio::fs::create_dir_all(&cloud_default_ws).await.unwrap();
+        tokio::fs::create_dir_all(&outbox).await.unwrap();
+        tokio::fs::write(
+            local_repo.join("lib.rs"),
+            "pub fn cloud_v2() -> i32 { 1 }\n",
+        )
+        .await
+        .unwrap();
+
+        // Start a real Aegis Cloud HTTP Daemon (`DaemonAuth::Required`) with a Directory mailer
+        let cloud_kernel = Arc::new(AegisRuntimeKernel::new(&cloud_rt).await.unwrap());
+        cloud_kernel.paas.set_mailer(
+            aos_mcp_gateway::approver::Mailer::Directory(outbox.clone()),
+            "https://heurion.org/aegis-cloud",
+        );
+        let webhook_secret = "whsec_cloud_e2e_secret";
+        cloud_kernel
+            .paas
+            .set_secrets("adm_cloud_e2e", webhook_secret);
+        let cloud_addr = cloud_kernel
+            .clone()
+            .start_http_daemon("127.0.0.1:0", cloud_default_ws)
+            .await
+            .unwrap();
+        let endpoint = format!("http://{}", cloud_addr);
+        let identity = AgentIdentity::new("cloud_e2e_org", "agy-agent", "Lead Agent");
+
+        // 1. Start checkout (`aegis-os cloud subscribe --plan pro --email founder@acme.dev`)
+        handle_cloud_command(
+            CloudAction::Subscribe {
+                plan: "pro".to_string(),
+                email: Some("founder@acme.dev".to_string()),
+                claim: false,
+                wait: false,
+                claim_token: None,
+                endpoint: Some(endpoint.clone()),
+            },
+            &identity,
+            &local_repo,
+            &local_rt,
+        )
+        .await
+        .unwrap();
+
+        let _saved_first_token = load_store(&local_rt)
+            .pending_claim_token
+            .expect("Expected pending_claim_token saved locally after subscribe");
+
+        // Fetch a checkout with both `claim_id` (for the Polar webhook) and `claim_token` (for `--claim`)
+        let checkout_info = cloud_http_json(
+            "GET",
+            &endpoint,
+            "/v1/billing/checkout?org_id=cloud_e2e_org&plan=pro&email=founder@acme.dev",
+            None,
+            &[],
+            None,
+        )
+        .await
+        .unwrap();
+        let claim_id = checkout_info["claim_id"].as_str().unwrap().to_string();
+        let claim_token = checkout_info["claim_token"].as_str().unwrap().to_string();
+        let mut st = load_store(&local_rt);
+        st.pending_claim_token = Some(claim_token.clone());
+        save_store(&local_rt, &st).unwrap();
+
+        let webhook_payload = json!({
+            "type": "subscription.created",
+            "data": {
+                "id": "sub_e2e_1",
+                "customer_email": "founder@acme.dev",
+                "metadata": {
+                    "org_id": "cloud_e2e_org",
+                    "plan_tier": "pro",
+                    "claim_id": claim_id
+                }
+            }
+        });
+        let sig = aos_mcp_gateway::paas::PaasControlPlane::hmac_sha256_hex(
+            webhook_secret.as_bytes(),
+            webhook_payload.to_string().as_bytes(),
+        );
+        let wh_resp = cloud_http_json(
+            "POST",
+            &endpoint,
+            "/v1/billing/webhook",
+            None,
+            &[("X-Polar-Signature", &format!("sha256={}", sig))],
+            Some(&webhook_payload),
+        )
+        .await
+        .unwrap();
+        assert_eq!(wh_resp["status"], "subscription_activated");
+
+        // Claim the minted `ak_live_*` key (`aegis-os cloud subscribe --claim`)
+        handle_cloud_command(
+            CloudAction::Subscribe {
+                plan: "pro".to_string(),
+                email: Some("founder@acme.dev".to_string()),
+                claim: true,
+                wait: false,
+                claim_token: None,
+                endpoint: Some(endpoint.clone()),
+            },
+            &identity,
+            &local_repo,
+            &local_rt,
+        )
+        .await
+        .unwrap();
+
+        let saved_auth = load_store(&local_rt)
+            .auth
+            .expect("Expected saved auth after subscribe --claim");
+        assert!(saved_auth.api_key.starts_with("ak_live_"));
+
+        // 2. Complete TOTP Approver Enrollment from the emailed link
+        let mail_path = std::fs::read_dir(&outbox)
+            .unwrap()
+            .next()
+            .unwrap()
+            .unwrap()
+            .path();
+        let mail_body = std::fs::read_to_string(mail_path).unwrap();
+        let enroll_token = mail_body
+            .split("token=")
+            .nth(1)
+            .unwrap()
+            .split_whitespace()
+            .next()
+            .unwrap()
+            .to_string();
+        let enrolled = cloud_http_json(
+            "POST",
+            &endpoint,
+            "/approver/enroll",
+            None,
+            &[],
+            Some(&json!({ "token": enroll_token })),
+        )
+        .await
+        .unwrap();
+        let secret_b32 = enrolled["secret"].as_str().unwrap().to_string();
+
+        // 3. Bind workspace with `aegis-os cloud up` (using the saved `ak_live_*` key automatically)
+        handle_cloud_command(
+            CloudAction::Up {
+                endpoint: None,
+                api_key: None,
+                workspace_id: Some("ws-e2e".to_string()),
+                agents: "agy-agent,claude-code".to_string(),
+            },
+            &identity,
+            &local_repo,
+            &local_rt,
+        )
+        .await
+        .unwrap();
+        let binding = resolve_active_cloud_binding(&local_rt, &local_repo)
+            .expect("Expected active cloud binding");
+
+        // 4. Incremental local-to-cloud sync without `cloud push`:
+        // Edit `lib.rs` locally and verify `collect_local_source_files_modified_since` + `sync_up_files_chunked`
+        // updates the Cloud Agent's CoW workspace automatically.
+        let since_ms = Utc::now().timestamp_millis() - 50;
+        tokio::fs::write(
+            local_repo.join("lib.rs"),
+            "pub fn cloud_v2() -> i32 { 777 }\n",
+        )
+        .await
+        .unwrap();
+        let modified = collect_local_source_files_modified_since(&local_repo, since_ms)
+            .await
+            .unwrap();
+        assert_eq!(modified.len(), 1);
+        assert_eq!(modified[0].path, "lib.rs");
+        sync_up_files_chunked(
+            &binding.endpoint,
+            &binding.api_key,
+            &binding.org_id,
+            &binding.workspace_id,
+            &modified,
+        )
+        .await
+        .unwrap();
+
+        let read_rpc = cloud_http_json(
+            "POST",
+            &binding.endpoint,
+            "/v1/mcp",
+            Some(&binding.api_key),
+            &[
+                ("X-Aegis-Org", &binding.org_id),
+                ("X-Aegis-Agent", &identity.agent_id),
+                ("X-Aegis-Workspace", &binding.workspace_id),
+            ],
+            Some(&json!({
+                "jsonrpc": "2.0",
+                "id": 20,
+                "method": "tools/call",
+                "params": {
+                    "name": "fs_read",
+                    "arguments": { "path": "lib.rs" }
+                }
+            })),
+        )
+        .await
+        .unwrap();
+        assert!(read_rpc.to_string().contains("777"));
+
+        // 5. Cloud Agent edits `lib.rs` (`777` -> `999`) and calls `workspace_commit` -> triggers HITL escalation
+        let _ = cloud_http_json(
+            "POST",
+            &binding.endpoint,
+            "/v1/mcp",
+            Some(&binding.api_key),
+            &[
+                ("X-Aegis-Org", &binding.org_id),
+                ("X-Aegis-Agent", &identity.agent_id),
+                ("X-Aegis-Workspace", &binding.workspace_id),
+            ],
+            Some(&json!({
+                "jsonrpc": "2.0",
+                "id": 21,
+                "method": "tools/call",
+                "params": {
+                    "name": "fs_edit",
+                    "arguments": {
+                        "path": "lib.rs",
+                        "target": "pub fn cloud_v2() -> i32 { 777 }",
+                        "replacement": "pub fn cloud_v2() -> i32 { 999 }"
+                    }
+                }
+            })),
+        )
+        .await
+        .unwrap();
+
+        let commit_ask = cloud_http_json(
+            "POST",
+            &binding.endpoint,
+            "/v1/mcp",
+            Some(&binding.api_key),
+            &[
+                ("X-Aegis-Org", &binding.org_id),
+                ("X-Aegis-Agent", &identity.agent_id),
+                ("X-Aegis-Workspace", &binding.workspace_id),
+            ],
+            Some(&json!({
+                "jsonrpc": "2.0",
+                "id": 22,
+                "method": "tools/call",
+                "params": {
+                    "name": "workspace_commit",
+                    "arguments": {}
+                }
+            })),
+        )
+        .await
+        .unwrap();
+        let esc_id = extract_escalation_id_from_rpc(&commit_ask)
+            .expect("Expected approval_required with escalation_id");
+
+        // Verify `GET /approve?id=<esc_id>&org=cloud_e2e_org` is publicly accessible (no Bearer header required
+        // to load the HTML shell under `DaemonAuth::Required`)
+        let mut stream = tokio::net::TcpStream::connect(cloud_addr).await.unwrap();
+        let get_req = format!(
+            "GET /approve?id={}&org=cloud_e2e_org HTTP/1.1\r\nHost: {}\r\n\r\n",
+            esc_id, cloud_addr
+        );
+        stream.write_all(get_req.as_bytes()).await.unwrap();
+        let mut buf = Vec::new();
+        tokio::io::AsyncReadExt::read_to_end(&mut stream, &mut buf)
+            .await
+            .unwrap();
+        let raw_approve_page = String::from_utf8_lossy(&buf);
+        assert!(raw_approve_page.contains("200 OK"));
+        assert!(raw_approve_page.contains("Aegis OS — Boundary Approval"));
+
+        // 6. Run top-level `aegis-os approve` (`handle_unified_approve`) with `escalation_id = None` and TOTP!
+        let mut bits = 0u32;
+        let mut acc = 0u32;
+        let mut secret_bytes = Vec::new();
+        for c in secret_b32.bytes() {
+            let v = b"ABCDEFGHIJKLMNOPQRSTUVWXYZ234567"
+                .iter()
+                .position(|x| *x == c)
+                .unwrap() as u32;
+            acc = (acc << 5) | v;
+            bits += 5;
+            if bits >= 8 {
+                secret_bytes.push((acc >> (bits - 8)) as u8);
+                bits -= 8;
+            }
+        }
+        let step = aos_mcp_gateway::approver::totp_step(Utc::now().timestamp());
+        let totp_code = format!(
+            "{:06}",
+            aos_mcp_gateway::approver::hotp(&secret_bytes, step as u64)
+        );
+
+        handle_unified_approve(
+            None, // Omitted! Must auto-select `esc_id` on the remote Cloud node
+            true,
+            900,
+            false,
+            Some(totp_code),
+            false,
+            &identity,
+            &local_repo,
+            &local_rt,
+        )
+        .await
+        .unwrap();
+
+        // Retry `workspace_commit` on the Cloud Sandbox -> now succeeds with `committed_to_host`!
+        let commit_ok = cloud_http_json(
+            "POST",
+            &binding.endpoint,
+            "/v1/mcp",
+            Some(&binding.api_key),
+            &[
+                ("X-Aegis-Org", &binding.org_id),
+                ("X-Aegis-Agent", &identity.agent_id),
+                ("X-Aegis-Workspace", &binding.workspace_id),
+            ],
+            Some(&json!({
+                "jsonrpc": "2.0",
+                "id": 23,
+                "method": "tools/call",
+                "params": {
+                    "name": "workspace_commit",
+                    "arguments": {}
+                }
+            })),
+        )
+        .await
+        .unwrap();
+        assert!(
+            commit_ok.to_string().contains("committed_to_host"),
+            "Expected committed_to_host after unified TOTP approval, got: {}",
+            commit_ok
+        );
     }
 }

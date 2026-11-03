@@ -174,6 +174,7 @@ fn route_path(target: &str) -> &str {
 fn is_public_route(method: &str, target: &str) -> bool {
     let path = route_path(target);
     let get_public = path == "/"
+        || path == "/approve"
         || ["/dashboard", "/ui", "/install.sh", "/health", "/.well-known/", "/releases/", "/v1/billing/status"]
             .iter()
             .any(|p| path.starts_with(p));
@@ -199,6 +200,7 @@ fn is_operator_only_route(method: &str, target: &str) -> bool {
     let path = route_path(target);
     (path.starts_with("/v1/approvals/") && !path.starts_with("/v1/approvals/decide"))
         || (method == "DELETE" && path.starts_with("/v1/approver"))
+        || path.starts_with("/v1/orgs")
         || path.starts_with("/v1/workspaces/gc-idle")
         || path.starts_with("/v1/telemetry/stats")
         || ((path.starts_with("/api/status") || path.starts_with("/v1/status"))
@@ -993,7 +995,7 @@ impl AegisRuntimeKernel {
                         "reason": reason,
                         "suggested_lease_scope": suggested_lease_scope,
                         "hint": format!(
-                            "Ask the user to inspect (`aegis-os policy diff {0}`) and approve in a terminal: `aegis-os policy approve {0}` (in Claude Code: `! aegis-os policy approve {0}`). Agents cannot approve their own escalations.",
+                            "Approve in the auto-opened browser console (/approve), or inspect (`aegis-os policy diff {0}`) and run `aegis-os approve {0}` (in Claude/Codex prompt: `!aegis-os approve`), or in Cloud Mode ask the user for their 6-digit TOTP code and pass `totp` on retry. Agents cannot self-approve without human action.",
                             escalation_id
                         )
                     }));
@@ -2149,6 +2151,10 @@ impl AegisRuntimeKernel {
                             "task_id": {
                                 "type": "string",
                                 "description": "Optional A2A task id. When set, approval binds the resulting lease to this task."
+                            },
+                            "totp": {
+                                "type": "string",
+                                "description": "Optional 6-digit TOTP authenticator code provided by the human user in chat to approve a Cloud boundary escalation inline (for pure CLI / SSH sessions)."
                             }
                         }
                     }
@@ -3348,6 +3354,9 @@ impl AegisRuntimeKernel {
                     {
                         content_type = "text/html; charset=utf-8";
                         ("HTTP/1.1 200 OK", paas::render_dashboard_html(&bound_ws_path))
+                    } else if method == "GET" && route_path(full_target) == "/approve" {
+                        content_type = "text/html; charset=utf-8";
+                        ("HTTP/1.1 200 OK", approver::APPROVE_PAGE_HTML.to_string())
                     } else if method == "GET" && full_target.starts_with("/install.sh") {
                         content_type = "text/x-shellscript; charset=utf-8";
                         ("HTTP/1.1 200 OK", paas::INSTALL_SH.to_string())
@@ -4013,6 +4022,16 @@ impl AegisRuntimeKernel {
                             },
                             _ => ("HTTP/1.1 404 Not Found", json!({ "error": "Unknown approver route" }).to_string()),
                         }
+                    } else if method == "DELETE" && route_path(full_target) == "/v1/orgs" {
+                        let force = full_target.contains("force=true");
+                        let orgs = requested_orgs(full_target, &body_str);
+                        match orgs.first() {
+                            None => ("HTTP/1.1 400 Bad Request", json!({ "error": "org_id is required" }).to_string()),
+                            Some(target_org) => match k.paas.delete_org(&k, target_org, force).await {
+                                Ok(v) => ("HTTP/1.1 200 OK", v.to_string()),
+                                Err(e) => ("HTTP/1.1 400 Bad Request", json!({ "error": e.to_string() }).to_string()),
+                            },
+                        }
                     } else if method == "POST" && full_target.starts_with("/v1/approvals/decide") {
                         let payload: Value = serde_json::from_str(body_str.trim()).unwrap_or_else(|_| json!({}));
                         let esc_id = payload
@@ -4483,6 +4502,19 @@ mod tests {
         assert!(head.contains("403"), "{head}");
         let (head, resp) = raw_http(addr, "DELETE", "/v1/approver?org_id=acme", Some(&op), None).await;
         assert!(head.contains("200 OK") && resp["removed"] == true, "{head} {resp}");
+
+        // Only the operator can delete an org; afterwards its keys no longer authenticate.
+        let (head, _) = raw_http(addr, "DELETE", "/v1/orgs?org_id=acme", Some(&acme_key), None).await;
+        assert!(head.contains("403"), "{head}");
+        let (head, resp) = raw_http(addr, "DELETE", "/v1/orgs?org_id=acme", Some(&op), None).await;
+        assert!(head.contains("200 OK") && resp["status"] == "deleted", "{head} {resp}");
+        assert_eq!(resp["removed"]["api_keys"], 1, "{resp}");
+        let (head, _) = raw_http(addr, "GET", "/v1/approver", Some(&acme_key), None).await;
+        assert!(head.contains("401"), "{head}");
+        let (_, resp) = raw_http(addr, "DELETE", "/v1/orgs?org_id=acme", Some(&op), None).await;
+        assert_eq!(resp["status"], "not_found", "{resp}");
+        let (head, _) = raw_http(addr, "DELETE", "/v1/orgs?org_id=*", Some(&op), None).await;
+        assert!(head.contains("400"), "{head}");
     }
 
     #[tokio::test]

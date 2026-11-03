@@ -766,7 +766,7 @@ impl PaasControlPlane {
                 .and_then(|v| v.as_str())
                 .unwrap_or(Self::DEFAULT_POLAR_PRO_CHECKOUT_URL);
             let notice = format!(
-                "[AEGIS CLOUD PAYWALL — {}]\n{}\n{}\n\n👉 立即升级 Aegis Cloud Pro ($29/mo · 16 Workspaces · 8 Parallel Agents · 64GB Online OS Runtime):\n   • Web Console: https://heurion.org/aegis-cloud/dashboard\n   • Direct Checkout: {}\n   • 付款后在终端一行命令激活 (密钥存本机，不经过大模型):\n     aegis-os cloud subscribe --plan pro  (先在终端发起结账，付款后再运行) aegis-os cloud subscribe --claim && aegis-os cloud up",
+                "[AEGIS CLOUD PAYWALL — {}]\n{}\n{}\n\n👉 立即升级 Aegis Cloud Pro ($29/mo · 16 Workspaces · 8 Parallel Agents · 64GB Online OS Runtime):\n   • Web Console: https://heurion.org/aegis-cloud/dashboard\n   • Direct Checkout: {}\n   • 在终端一行命令自动打开结账、等待付款、认领密钥并挂载当前工作区 (密钥存本机，不经过大模型):\n     aegis-os cloud subscribe --plan pro --wait",
                 code, reason_zh, reason_en, checkout_url
             );
             return Err(json!({
@@ -791,7 +791,7 @@ impl PaasControlPlane {
                     "monthly_price_usd": 29,
                     "checkout_url": checkout_url,
                     "dashboard_url": "https://heurion.org/aegis-cloud/dashboard",
-                    "cli_command": "aegis-os cloud subscribe --plan pro  # pay in browser, then: aegis-os cloud subscribe --claim && aegis-os cloud up"
+                    "cli_command": "aegis-os cloud subscribe --plan pro --wait"
                 },
                 "agent_notice": notice
             }));
@@ -2123,6 +2123,56 @@ impl PaasControlPlane {
             "org_id": removed.org_id,
             "workspace_id": removed.workspace_id
         }))
+    }
+
+    /// Remove every record of an org: keys, workspaces (and their files), usage, billing,
+    /// pending claims and approver. Refuses an org with an active subscription unless `force`.
+    pub async fn delete_org(
+        &self,
+        kernel: &AegisRuntimeKernel,
+        org_id: &str,
+        force: bool,
+    ) -> anyhow::Result<Value> {
+        if org_id.is_empty() || org_id == "*" || org_id.contains('/') || org_id.contains("..") {
+            bail!("Invalid org_id '{}'", org_id);
+        }
+        self.reload().await;
+        let (workspaces, counts) = {
+            let mut state = self.state.write().await;
+            if !force
+                && state
+                    .subscriptions
+                    .iter()
+                    .any(|s| s.org_id == org_id && s.status == "active")
+            {
+                bail!("Org '{}' has an active subscription; cancel it first or pass force", org_id);
+            }
+            let mut counts = serde_json::Map::new();
+            macro_rules! purge {
+                ($field:ident) => {{
+                    let before = state.$field.len();
+                    state.$field.retain(|r| r.org_id != org_id);
+                    counts.insert(stringify!($field).to_string(), json!(before - state.$field.len()));
+                }};
+            }
+            let workspaces: Vec<CloudWorkspaceRecord> =
+                state.workspaces.iter().filter(|w| w.org_id == org_id).cloned().collect();
+            purge!(api_keys);
+            purge!(workspaces);
+            purge!(tenants);
+            purge!(subscriptions);
+            purge!(pending_claims);
+            purge!(approvers);
+            purge!(approver_enrollments);
+            (workspaces, counts)
+        };
+        let found = counts.values().any(|n| n.as_u64() != Some(0));
+        for ws in &workspaces {
+            kernel.evict_agent_environments(&ws.org_id, &ws.agents).await;
+        }
+        let _ = tokio::fs::remove_dir_all(self.workspaces_root.join(org_id)).await;
+        self.flush().await?;
+        Ok(json!({ "status": if found { "deleted" } else { "not_found" }, "org_id": org_id, "removed": counts }))
     }
 
     /// Wake a `Hibernated` Cloud Workspace back to `Active` in milliseconds by re-attaching CoW directories.

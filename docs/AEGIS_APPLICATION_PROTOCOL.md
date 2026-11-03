@@ -63,10 +63,11 @@ crypto-strategy  1st-party    ○ Available             周期温度计、资产
 ustc-his         3rd-party    ○ Available (Intranet)  医院内网 HIS 检验与影像归档接口
 ──────────────────────────────────────────────────────────────────────────────────────────
 Commands:
-  aegis app info <app_id>      查看应用提供的工具域、安全分级（隐私营养标签）与服务端地址
-  aegis app login <app_id>     统一登录授权并绑定本地 aegis-os Ed25519 公钥
-  aegis app logout <app_id>    吊销服务端凭证并清理本地 Vault
-  aegis app add <https://url>  通过 /.well-known/aegis-app.json 接入任意第三方或私有部署应用
+  aegis-os app connect <app_id> 一键完成应用安装、RFC 8628 设备码登录授权与当前会话挂载（最简推荐）
+  aegis-os app info <app_id>    查看应用提供的工具域、安全分级（隐私营养标签）与服务端地址
+  aegis-os app login <app_id>   统一登录授权并绑定本地 aegis-os Ed25519 公钥（若尚未安装会自动先执行 install）
+  aegis-os app logout <app_id>  吊销服务端凭证并清理本地 Vault
+  aegis-os app add <https://url> 通过 /.well-known/aegis-app.json 接入任意第三方或私有部署应用
 ```
 
 ### 2.2 智能体视角：三级渐进式发现（防止 Context Window 爆炸）
@@ -76,7 +77,7 @@ Commands:
 1. **Level 1 — 系统提示词微型目录（~200 Tokens）**：
    `aegis-os` 启动 `agy` / `hermes` 时，仅在系统上下文中注入一张极简摘要表（每个应用仅占 1 行：`app_id` + 连接状态 `connected | available_not_connected` + 一句话能力标签）。
 2. **Level 2 — 未授权时的对话内主动引导**：
-   当用户的自然语言任务涉及某个尚未登录的应用（例如 `heurion` 状态为 `available_not_connected`）时，Agent 通过 Level 1 目录感知到该应用的存在，主动在 CLI 中引导用户完成授权（或提示执行 `aegis app login heurion`）。
+   当用户的自然语言任务涉及某个尚未登录的应用（例如 `heurion` 状态为 `available_not_connected`）时，Agent 通过 Level 1 目录感知到该应用的存在，主动在 CLI 中引导用户执行一行命令 `aegis-os app connect heurion` 完成授权与挂载（且 `app_mount_session` 与 `aegis-os app login` 在检测到应用未安装时会自动完成安装）。
 3. **Level 3 — 按需懒加载工具 Schema（Lazy MCP Mounting）**：
    应用下数十个工具的详细参数 Schema 缓存在本地 `<appDataDir>/mcp/<app_id>/` 目录中；仅当 Agent 在当前任务中实际需要使用该领域工具时，才按需读取对应工具的 Schema 并通过 `call_mcp_tool` 调用。
 
@@ -205,6 +206,7 @@ sequenceDiagram
     App-->>Agent: 6. 放行执行，审计日志记录 via="ai-confirmed", confirmed_by=user_id
 ```
 
+- **零终端切换审批与自动续跑（Auto-Open `/approve` + `aegis-os approve`）**：当 `mcp-stdio` 收到 `status == "approval_required"` 时，会自动在浏览器弹出 `/approve` 交互式审批台并轮询等待用户点击 **Approve Once** / **Approve for 1 Hour**（或在终端直接执行无需记忆子命令与 ID 的统一命令 `aegis-os approve` / `aos approve`），批准后自动携带租约重试被拦截的工具调用，无需手动要求 Agent 重跑。
 - **不可伪造性**：由于 Ed25519 私钥由 `aegis-os` 内核独占，Agent 无法自行签发合法的 `X-Aegis-Lease-Token`。任何伪造签名、篡改 `scope` 或已过期的租约都会在应用服务端被直接拒绝（`403 Forbidden`）。
 - **兼容服务端直接审批**：除校验 Ed25519 签名头外，应用服务端同时提供 `POST /api/aegis/leases/approve` 接口（要求人类用户会话或显式审批调用），在服务端落库一条短时效 `agent_leases` 记录，兼顾未开启硬件密钥对的轻量运行环境。
 

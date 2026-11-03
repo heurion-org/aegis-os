@@ -152,6 +152,19 @@ async fn build_boundary_approval_prompt(
 ) -> String {
     let host_dir = effective_workspace.display();
 
+    if sub_tool == "workspace_commit" {
+        let file_summary = summarize_file_list(changed_files, 6);
+        return format!(
+            "[Aegis OS Host Commit Approval]\n  • What this does: Merge and write {} modified file(s) from agent `{}/{}`'s isolated CoW shadow workspace into your live host repository (`{}`).\n  • Files in shadow workspace ({}): {}\n  • Approval scope: Clicking Allow grants a 15-minute commit lease and lands these changes immediately.",
+            changed_files.len(),
+            identity.org_id,
+            identity.agent_id,
+            host_dir,
+            changed_files.len(),
+            file_summary
+        );
+    }
+
     if sub_tool == "policy_approve_escalation" {
         let esc_id = inner_args
             .get("escalation_id")
@@ -398,12 +411,14 @@ pub(crate) async fn handle_agy_hook(
                 refresh.total_updates(),
                 refresh.conflicts.len()
             );
-            if let Some(onboarding) = cloud::build_onboarding_prompt_if_needed(
-                &cli.runtime_dir,
-                &effective_workspace,
-                conv_tag,
-            ) {
-                msg = format!("{}\n\n{}", msg, onboarding);
+            if cloud::should_prompt_mode_onboarding(&cli.runtime_dir, &effective_workspace) {
+                if let Some(onboarding) = cloud::build_onboarding_prompt_if_needed(
+                    &cli.runtime_dir,
+                    &effective_workspace,
+                    conv_tag,
+                ) {
+                    msg = format!("{}\n\n{}", msg, onboarding);
+                }
             }
             let out = json!({
                 "injectSteps": [
@@ -422,19 +437,21 @@ pub(crate) async fn handle_agy_hook(
                 return Ok(());
             }
             let mut out = coord::handle_pre_invocation(&cli.runtime_dir, &kernel, &identity).await;
-            if let Some(onboarding) = cloud::build_onboarding_prompt_if_needed(
-                &cli.runtime_dir,
-                &effective_workspace,
-                conv_tag,
-            ) {
-                if let Some(steps) = out.get_mut("injectSteps").and_then(|v| v.as_array_mut()) {
-                    steps.push(json!({ "systemMessage": onboarding }));
-                } else {
-                    out = json!({
-                        "injectSteps": [
-                            { "systemMessage": onboarding }
-                        ]
-                    });
+            if cloud::should_prompt_mode_onboarding(&cli.runtime_dir, &effective_workspace) {
+                if let Some(onboarding) = cloud::build_onboarding_prompt_if_needed(
+                    &cli.runtime_dir,
+                    &effective_workspace,
+                    conv_tag,
+                ) {
+                    if let Some(steps) = out.get_mut("injectSteps").and_then(|v| v.as_array_mut()) {
+                        steps.push(json!({ "systemMessage": onboarding }));
+                    } else {
+                        out = json!({
+                            "injectSteps": [
+                                { "systemMessage": onboarding }
+                            ]
+                        });
+                    }
                 }
             }
             println!("{}", serde_json::to_string(&out)?);
@@ -480,10 +497,12 @@ pub(crate) async fn handle_agy_hook(
                 .get("toolCall")
                 .and_then(|tc| tc.get("name"))
                 .and_then(|v| v.as_str())
+                .or_else(|| payload.get("tool_name").and_then(|v| v.as_str()))
                 .unwrap_or("");
             let tool_args = payload
                 .get("toolCall")
                 .and_then(|tc| tc.get("args"))
+                .or_else(|| payload.get("tool_input"))
                 .cloned()
                 .unwrap_or_else(|| json!({}));
 
@@ -523,6 +542,57 @@ pub(crate) async fn handle_agy_hook(
                                 );
                                 return Ok(());
                             }
+                        }
+                    }
+                    let use_inline_hook = !cloud::can_open_browser()
+                        || std::env::var("AOS_HOOK_INLINE_APPROVE").as_deref() == Ok("1");
+                    if sub_tool == "workspace_commit"
+                        && use_inline_hook
+                        && cloud::resolve_active_cloud_binding(&cli.runtime_dir, &effective_workspace)
+                            .is_none()
+                    {
+                        let has_lease = kernel
+                            .policy
+                            .list_leases(&identity.org_id, Some(&identity.agent_id))
+                            .await
+                            .unwrap_or_default()
+                            .iter()
+                            .any(|l| {
+                                l.action_pattern == "*" || l.action_pattern == "workspace_commit"
+                            });
+                        if !has_lease {
+                            cloud::record_hook_commit_ticket(&cli.runtime_dir, &identity.org_id);
+                            let inner_args = tool_args
+                                .get("Arguments")
+                                .cloned()
+                                .unwrap_or_else(|| json!({}));
+                            let changed_files = env
+                                .workspace
+                                .changed_since_baseline()
+                                .await
+                                .unwrap_or_default();
+                            let reason = build_boundary_approval_prompt(
+                                "workspace_commit",
+                                &inner_args,
+                                &identity,
+                                &effective_workspace,
+                                &kernel,
+                                &changed_files,
+                            )
+                            .await;
+                            println!(
+                                "{}",
+                                serde_json::to_string(&json!({
+                                    "decision": "ask",
+                                    "reason": reason,
+                                    "hookSpecificOutput": {
+                                        "hookEventName": "PreToolUse",
+                                        "permissionDecision": "ask",
+                                        "permissionDecisionReason": reason
+                                    }
+                                }))?
+                            );
+                            return Ok(());
                         }
                     }
                     if matches!(sub_tool, "policy_approve_escalation" | "policy_grant_lease") {
@@ -593,6 +663,53 @@ pub(crate) async fn handle_agy_hook(
                             );
                             return Ok(());
                         }
+                    }
+                }
+                let use_inline_hook = !cloud::can_open_browser()
+                    || std::env::var("AOS_HOOK_INLINE_APPROVE").as_deref() == Ok("1");
+                if short_name == "workspace_commit"
+                    && use_inline_hook
+                    && cloud::resolve_active_cloud_binding(&cli.runtime_dir, &effective_workspace)
+                        .is_none()
+                {
+                    let has_lease = kernel
+                        .policy
+                        .list_leases(&identity.org_id, Some(&identity.agent_id))
+                        .await
+                        .unwrap_or_default()
+                        .iter()
+                        .any(|l| {
+                            l.action_pattern == "*" || l.action_pattern == "workspace_commit"
+                        });
+                    if !has_lease {
+                        cloud::record_hook_commit_ticket(&cli.runtime_dir, &identity.org_id);
+                        let changed_files = env
+                            .workspace
+                            .changed_since_baseline()
+                            .await
+                            .unwrap_or_default();
+                        let reason = build_boundary_approval_prompt(
+                            "workspace_commit",
+                            &tool_args,
+                            &identity,
+                            &effective_workspace,
+                            &kernel,
+                            &changed_files,
+                        )
+                        .await;
+                        println!(
+                            "{}",
+                            serde_json::to_string(&json!({
+                                "decision": "ask",
+                                "reason": reason,
+                                "hookSpecificOutput": {
+                                    "hookEventName": "PreToolUse",
+                                    "permissionDecision": "ask",
+                                    "permissionDecisionReason": reason
+                                }
+                            }))?
+                        );
+                        return Ok(());
                     }
                 }
                 if matches!(short_name, "policy_approve_escalation" | "policy_grant_lease") {

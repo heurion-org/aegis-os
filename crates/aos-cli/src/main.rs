@@ -105,16 +105,38 @@ enum Commands {
         json: bool,
     },
 
+    /// Approve (or `--deny`) the latest pending boundary escalation (auto-detects Local vs. Cloud mode)
+    Approve {
+        /// Escalation ID (e.g. `esc-...`); defaults to the latest pending escalation when omitted
+        escalation_id: Option<String>,
+        #[arg(long, default_value_t = true)]
+        grant_lease: bool,
+        #[arg(long, alias = "ttl", default_value_t = 3600)]
+        ttl_secs: u64,
+        /// Reject the escalation instead of approving it
+        #[arg(long, default_value_t = false)]
+        deny: bool,
+        /// Approver's 6-digit authenticator code (Cloud mode only; prompted when omitted)
+        #[arg(long)]
+        code: Option<String>,
+        /// Open the interactive Web Approval Console (`/approve`) in the default browser
+        #[arg(long, default_value_t = false)]
+        web: bool,
+    },
+
     /// Initialize project-local `.agents/` files for AGY in a specific workspace
+    #[command(hide = true)]
     SetupAgy {
         #[arg(long, default_value_t = true)]
         strict_cow: bool,
     },
 
     /// Start Aegis OS as an MCP Server over Stdio (used automatically by `agy`, `claude`, and `codex`)
+    #[command(hide = true)]
     McpStdio,
 
     /// Native lifecycle hook handler for AGY & Claude Code (`SessionStart`, `PreToolUse`)
+    #[command(hide = true)]
     AgyHook {
         #[arg(long, default_value = "PreToolUse")]
         event: String,
@@ -501,7 +523,8 @@ enum PolicyAction {
         json: bool,
     },
     Approve {
-        escalation_id: String,
+        /// Escalation ID (defaults to the latest pending escalation when omitted)
+        escalation_id: Option<String>,
         #[arg(long, alias = "ttl", default_value_t = 3600)]
         ttl_secs: i64,
     },
@@ -641,6 +664,21 @@ enum AppAction {
         /// Optional endpoint URL override
         #[arg(long)]
         url: Option<String>,
+    },
+
+    /// One-step install + login + session mount for an AAP-1.0 application (e.g. `aegis-os app connect heurion`)
+    Connect {
+        /// Application ID (e.g. `heurion`)
+        app_id: String,
+        /// Optional endpoint URL override
+        #[arg(long)]
+        url: Option<String>,
+        /// Direct `aegis_at_<app_id>.*` token or web session token
+        #[arg(long)]
+        token: Option<String>,
+        /// Seconds to poll for Device Code approval
+        #[arg(long, default_value_t = 60)]
+        wait_secs: u64,
     },
 
     /// Invoke an MCP tool on an AAP-1.0 application over `POST /api/aegis/mcp` (`app_call_tool`)
@@ -2029,6 +2067,28 @@ async fn main() -> anyhow::Result<()> {
             installer::run_doctor(&target_home).await?;
         }
 
+        Commands::Approve {
+            escalation_id,
+            grant_lease,
+            ttl_secs,
+            deny,
+            code,
+            web,
+        } => {
+            cloud::handle_unified_approve(
+                escalation_id,
+                grant_lease,
+                ttl_secs,
+                deny,
+                code,
+                web,
+                &identity,
+                &workspace,
+                &cli.runtime_dir,
+            )
+            .await?;
+        }
+
         Commands::Stats {
             endpoint,
             admin_secret,
@@ -2162,6 +2222,42 @@ async fn main() -> anyhow::Result<()> {
                         .mount_session(&identity, &app_id, url.as_deref())
                         .await?;
                     println!("{}", serde_json::to_string_pretty(&res)?);
+                }
+                AppAction::Connect {
+                    app_id,
+                    url,
+                    token,
+                    wait_secs,
+                } => {
+                    let install_res = kernel
+                        .app_store
+                        .install_app(&app_id, url.as_deref(), Some(&workspace))
+                        .await?;
+                    let login_res = kernel
+                        .app_store
+                        .login_app_device_code(
+                            &app_id,
+                            url.as_deref(),
+                            Vec::new(),
+                            wait_secs,
+                            token.as_deref(),
+                        )
+                        .await?;
+                    let mount_res = kernel
+                        .app_store
+                        .mount_session(&identity, &app_id, url.as_deref())
+                        .await
+                        .unwrap_or_else(|e| json!({ "status": "pending_token", "detail": e.to_string() }));
+                    println!(
+                        "{}",
+                        serde_json::to_string_pretty(&json!({
+                            "status": "app_connected",
+                            "app_id": app_id,
+                            "install": install_res.get("status").cloned().unwrap_or(json!("installed")),
+                            "login": login_res,
+                            "session": mount_res
+                        }))?
+                    );
                 }
                 AppAction::Call {
                     app_id,
@@ -2400,15 +2496,27 @@ async fn main() -> anyhow::Result<()> {
                     escalation_id,
                     ttl_secs,
                 } => {
+                    let resolved_id = match escalation_id.filter(|s| !s.trim().is_empty()) {
+                        Some(id) => id,
+                        None => {
+                            let mut list = kernel.policy.list_escalations(&identity.org_id).await?;
+                            if list.is_empty() {
+                                list = kernel.policy.list_escalations("*").await?;
+                            }
+                            list.last()
+                                .map(|e| e.escalation_id.clone())
+                                .ok_or_else(|| anyhow::anyhow!("No pending escalations found"))?
+                        }
+                    };
                     let lease = kernel
                         .policy
-                        .approve_escalation(&escalation_id, ttl_secs, "cli_human_operator")
+                        .approve_escalation(&resolved_id, ttl_secs, "cli_human_operator")
                         .await?;
                     println!(
                         "{}",
                         serde_json::to_string_pretty(&json!({
                             "status": "escalation_approved",
-                            "escalation_id": escalation_id,
+                            "escalation_id": resolved_id,
                             "lease": lease
                         }))?
                     );

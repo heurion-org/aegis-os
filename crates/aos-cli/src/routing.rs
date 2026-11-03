@@ -285,23 +285,24 @@ pub fn invokes_approval_cli(cmd: &str) -> bool {
         .map(|w| w.to_string())
         .collect();
     words.iter().enumerate().any(|(i, w)| {
-        if basename(w) != "aegis-os" {
+        if !matches!(basename(w), "aegis-os" | "aos") {
             return false;
         }
         let rest: Vec<&str> = words[i + 1..].iter().map(|s| s.as_str()).filter(|w| !w.starts_with('-')).collect();
-        rest.windows(2).any(|pair| {
-            matches!(
-                pair,
-                ["policy", "approve"]
-                    | ["policy", "lease"]
-                    | ["cloud", "approve"]
-                    | ["cloud", "approver"]
-                    | ["memory", "approve"]
-                    | ["memory", "deny"]
-                    | ["memory", "ui"]
-                    | ["memory", "connect"]
-            )
-        })
+        rest.first().copied() == Some("approve")
+            || rest.windows(2).any(|pair| {
+                matches!(
+                    pair,
+                    ["policy", "approve"]
+                        | ["policy", "lease"]
+                        | ["cloud", "approve"]
+                        | ["cloud", "approver"]
+                        | ["memory", "approve"]
+                        | ["memory", "deny"]
+                        | ["memory", "ui"]
+                        | ["memory", "connect"]
+                )
+            })
     })
 }
 
@@ -504,6 +505,8 @@ mod tests {
     fn agents_cannot_run_approval_commands() {
         let root = Path::new("/tmp/none");
         for cmd in [
+            "aegis-os approve",
+            "aos approve esc-1",
             "aegis-os policy approve esc-1",
             "~/.local/bin/aegis-os --org acme policy lease --ttl-secs 60",
             "cd x && aegis-os cloud approve esc-1",

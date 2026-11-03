@@ -46,10 +46,13 @@ class AegisOs < Formula
 
       Homebrew's post-install sandbox cannot update your home-directory client configs, so this step is explicit.
 
-      After that, simply launch `agy`, `claude`, or `codex` in ANY project directory:
-      - On first launch, your coding agent will automatically ask if you have an Aegis Cloud subscription:
-        * With subscription: guides you to activate Zero-Local-Load Cloud Sandbox mode (`runtime_configure_mode(mode="cloud")`).
-        * Without subscription: automatically activates Free Local CoW Sandbox mode (`runtime_configure_mode(mode="local")`).
+      Zero-CLI Quickstart:
+      - Simply launch `agy`, `claude`, or `codex` in ANY project directory (starts silently in Free Local CoW Sandbox mode).
+      - Boundary commits (`workspace_commit`) auto-open the `/approve` web console (or prompt in-terminal on headless SSH) and auto-resume.
+      - Useful 1-line commands (`aos` is installed as a short alias for `aegis-os`):
+        * Approve latest boundary escalation from terminal: `aos approve` (or `aos approve --web`)
+        * Subscribe & mount 64GB Cloud Sandbox in 1 step: `aos cloud subscribe --plan pro --email you@company.com --wait`
+        * Connect a first-party AAP-1.0 app in 1 step:    `aos app connect heurion`
     EOS
   end
 

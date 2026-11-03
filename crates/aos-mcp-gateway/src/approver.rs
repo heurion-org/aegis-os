@@ -330,11 +330,307 @@ pub const ENROLL_PAGE_HTML: &str = r##"<!doctype html>
       const qr = document.createElement('div'); qr.className = 'qr'; qr.innerHTML = data.qr_svg; card.appendChild(qr);
       const p2 = document.createElement('p'); p2.append('Or enter this key manually: '); const c = document.createElement('code'); c.textContent = data.secret; p2.appendChild(c); card.appendChild(p2);
       const p3 = document.createElement('p'); const a = document.createElement('a'); a.href = data.otpauth_uri; a.textContent = 'Open in authenticator app (on this phone)'; p3.appendChild(a); card.appendChild(p3);
-      const p4 = document.createElement('p'); p4.textContent = 'This key is shown once. Approve escalations with: aegis-os cloud approve <escalation_id>'; card.appendChild(p4);
+      const p4 = document.createElement('p'); p4.textContent = 'This key is shown once. Approve escalations in your browser (/approve) or with: aegis-os approve'; card.appendChild(p4);
     } catch (e) {
       msg.className = 'err'; msg.textContent = 'Enrollment failed: ' + e.message; btn.disabled = false;
     }
   }
+</script>
+</body>
+</html>
+"##;
+
+/// Interactive Web Approval Console (`GET /approve`).
+/// Accepts `#key=<api_key_or_token>` in the URL fragment (stripped immediately via `history.replaceState`)
+/// so the CLI or MCP bridge can auto-open a browser tab when an escalation occurs, without needing a second CLI session.
+pub const APPROVE_PAGE_HTML: &str = r##"<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Aegis OS — Boundary Approval</title>
+<style>
+  :root { --bg:#f7f7f5; --fg:#1d1d1b; --muted:#6b6b66; --card:#fff; --line:#e4e4df; --accent:#1f6f50; --danger:#b83227; --code-bg:#f0f0ec; }
+  @media (prefers-color-scheme: dark) { :root { --bg:#151514; --fg:#ececea; --muted:#9a9a94; --card:#1e1e1c; --line:#2f2f2c; --accent:#5fbf95; --danger:#e05a4f; --code-bg:#252522; } }
+  * { box-sizing:border-box; }
+  body { margin:0; background:var(--bg); color:var(--fg); font:15px/1.55 system-ui, -apple-system, sans-serif; }
+  main { max-width:680px; margin:40px auto; padding:0 16px; }
+  header { display:flex; align-items:center; justify-content:space-between; margin-bottom:20px; }
+  .brand { font-weight:650; font-size:17px; letter-spacing:-0.01em; }
+  .badge { font-size:12px; padding:3px 9px; border-radius:99px; border:1px solid var(--line); color:var(--muted); background:var(--card); }
+  .card { background:var(--card); border:1px solid var(--line); border-radius:12px; padding:22px; margin-bottom:16px; }
+  h1 { font-size:19px; margin:0 0 6px; }
+  h2 { font-size:16px; margin:0 0 8px; }
+  p { color:var(--muted); margin:6px 0; }
+  code, pre { font-family:ui-monospace, SFMono-Regular, Menlo, monospace; font-size:13px; }
+  code { background:var(--code-bg); padding:2px 6px; border-radius:4px; word-break:break-all; }
+  pre { background:var(--code-bg); padding:12px; border-radius:8px; overflow-x:auto; margin:10px 0; color:var(--fg); }
+  .meta { display:grid; grid-template-columns:110px 1fr; gap:6px 12px; font-size:14px; margin:12px 0; padding:12px; background:var(--bg); border-radius:8px; }
+  .meta dt { color:var(--muted); font-weight:500; }
+  .meta dd { margin:0; font-family:ui-monospace, monospace; word-break:break-all; }
+  .row { display:flex; flex-wrap:wrap; gap:10px; align-items:center; margin-top:14px; }
+  input[type="text"], input[type="password"], input[type="email"] {
+    background:var(--bg); color:var(--fg); border:1px solid var(--line); border-radius:8px;
+    padding:9px 12px; font-size:14px; outline:none;
+  }
+  input.totp { width:160px; font-family:ui-monospace, monospace; font-size:16px; letter-spacing:0.15em; text-align:center; }
+  button { background:var(--accent); color:#fff; border:0; border-radius:8px; padding:9px 16px; font-size:14px; font-weight:500; cursor:pointer; }
+  button.secondary { background:transparent; color:var(--fg); border:1px solid var(--line); }
+  button.danger { background:var(--danger); color:#fff; }
+  button:disabled { opacity:.55; cursor:default; }
+  .ok { color:var(--accent); font-weight:500; }
+  .err { color:var(--danger); }
+</style>
+</head>
+<body>
+<main>
+  <header>
+    <div class="brand">Aegis OS · Boundary Approval</div>
+    <div style="display:flex;align-items:center;gap:12px;">
+      <a id="dash-link" href="dashboard" style="font-size:13px;color:var(--accent);text-decoration:none;font-weight:500;">Dashboard ↗</a>
+      <span class="badge" id="mode-badge">Connecting…</span>
+    </div>
+  </header>
+
+  <div class="card" id="auth-box" style="display:none">
+    <h2>Authentication</h2>
+    <p>Paste your Aegis API Key (<code>ak_live_…</code>) or Operator Token (<code>aop_…</code>):</p>
+    <div class="row">
+      <input type="password" id="api-key-input" placeholder="ak_live_... or aop_..." style="flex:1">
+      <button onclick="saveKey()">Connect</button>
+    </div>
+  </div>
+
+  <div class="card" id="enroll-box" style="display:none">
+    <h2>1-Time Approver Setup</h2>
+    <p>This Cloud org does not have a TOTP authenticator enrolled yet. Enter your email to receive a 1-click QR enrollment link:</p>
+    <div class="row">
+      <input type="email" id="enroll-email" placeholder="you@company.com" style="flex:1">
+      <button onclick="requestEmailEnroll()">Send Enrollment Link</button>
+    </div>
+    <p id="enroll-msg"></p>
+  </div>
+
+  <div id="escalations-root">
+    <div class="card"><p>Loading pending escalations…</p></div>
+  </div>
+</main>
+<script>
+  const qs = new URLSearchParams(location.search);
+  const hashParams = new URLSearchParams(location.hash.replace(/^#/, ''));
+  const targetId = qs.get('id') || '';
+  const targetOrg = qs.get('org') || '';
+  const mode = qs.get('mode') || 'cloud';
+  const apiBase = location.pathname.startsWith('/aegis-cloud') ? '/aegis-cloud' : '';
+  const dashLink = document.getElementById('dash-link');
+  if (dashLink) dashLink.href = apiBase + '/dashboard';
+  let authKey = hashParams.get('key') || sessionStorage.getItem('aegis_approve_key') || '';
+  if (hashParams.get('key')) {
+    sessionStorage.setItem('aegis_approve_key', authKey);
+    history.replaceState(null, '', location.pathname + location.search);
+  }
+
+  let requireTotp = false;
+
+  function headers() {
+    const h = { 'Content-Type': 'application/json' };
+    if (authKey) h['Authorization'] = 'Bearer ' + authKey;
+    return h;
+  }
+
+  function saveKey() {
+    authKey = document.getElementById('api-key-input').value.trim();
+    if (authKey) sessionStorage.setItem('aegis_approve_key', authKey);
+    loadState();
+  }
+
+  async function requestEmailEnroll() {
+    const email = document.getElementById('enroll-email').value.trim();
+    const msg = document.getElementById('enroll-msg');
+    if (!email) return;
+    try {
+      const res = await fetch(apiBase + '/v1/approver/email', {
+        method: 'POST',
+        headers: headers(),
+        body: JSON.stringify({ org_id: targetOrg || undefined, email })
+      });
+      const data = await res.json();
+      if (!res.ok) throw new Error(data.error || res.statusText);
+      msg.className = 'ok';
+      msg.textContent = 'Enrollment link sent to ' + email + '. Open it to scan your QR code, then return here.';
+    } catch (e) {
+      msg.className = 'err';
+      msg.textContent = e.message;
+    }
+  }
+
+  async function decide(escId, decision, ttlSecs) {
+    const totpInput = document.getElementById('totp-' + escId);
+    const msgEl = document.getElementById('msg-' + escId);
+    const totp = totpInput ? totpInput.value.trim() : '';
+    if (requireTotp && !totp) {
+      msgEl.className = 'err';
+      msgEl.textContent = 'Enter the 6-digit code from your authenticator app.';
+      if (totpInput) totpInput.focus();
+      return;
+    }
+    msgEl.className = '';
+    msgEl.textContent = 'Submitting decision…';
+    try {
+      const res = await fetch(apiBase + '/v1/approvals/decide', {
+        method: 'POST',
+        headers: headers(),
+        body: JSON.stringify({
+          escalation_id: escId,
+          decision,
+          ttl_secs: ttlSecs,
+          totp: totp || undefined,
+          approved_by: mode === 'local' ? 'local-web-console' : 'web-approval-console'
+        })
+      });
+      const data = await res.json();
+      if (!res.ok) throw new Error(data.error || res.statusText);
+      const card = document.getElementById('card-' + escId);
+      card.innerHTML = '';
+      const h = document.createElement('h1');
+      h.className = decision === 'deny' ? 'err' : 'ok';
+      h.textContent = decision === 'deny'
+        ? 'Escalation Denied (' + escId + ')'
+        : 'Approved (' + escId + ')';
+      const p = document.createElement('p');
+      p.textContent = decision === 'deny'
+        ? 'The blocked operation was rejected.'
+        : 'Lease granted. Your agent session will automatically resume and complete the operation — you can close this tab.';
+      card.appendChild(h);
+      card.appendChild(p);
+    } catch (e) {
+      msgEl.className = 'err';
+      msgEl.textContent = 'Error: ' + e.message;
+    }
+  }
+
+  function renderEscalation(esc) {
+    const card = document.createElement('div');
+    card.className = 'card';
+    card.id = 'card-' + esc.escalation_id;
+
+    const h = document.createElement('h1');
+    h.textContent = esc.action === 'workspace_commit'
+      ? 'Approve Host Workspace Commit'
+      : 'Approve Boundary Action: ' + esc.action;
+    card.appendChild(h);
+
+    const p = document.createElement('p');
+    p.textContent = esc.reason || 'Human approval required by Aegis OS policy kernel.';
+    card.appendChild(p);
+
+    const dl = document.createElement('dl');
+    dl.className = 'meta';
+    const fields = [
+      ['Escalation', esc.escalation_id],
+      ['Agent', (esc.org_id ? esc.org_id + '/' : '') + (esc.agent_id || 'agent')],
+      ['Action', esc.action],
+      ['Resource', esc.resource || '/workspace']
+    ];
+    if (esc.metadata && Array.isArray(esc.metadata.paths) && esc.metadata.paths.length > 0) {
+      fields.push(['Changed Files', esc.metadata.paths.join(', ')]);
+    }
+    if (esc.metadata && esc.metadata.host_root) {
+      fields.push(['Host Repo', esc.metadata.host_root]);
+    }
+    for (const [k, v] of fields) {
+      const dt = document.createElement('dt'); dt.textContent = k;
+      const dd = document.createElement('dd'); dd.textContent = v;
+      dl.appendChild(dt); dl.appendChild(dd);
+    }
+    card.appendChild(dl);
+
+    const row = document.createElement('div');
+    row.className = 'row';
+    if (requireTotp) {
+      const inp = document.createElement('input');
+      inp.type = 'text';
+      inp.className = 'totp';
+      inp.id = 'totp-' + esc.escalation_id;
+      inp.placeholder = '000000';
+      inp.maxLength = 6;
+      inp.autocomplete = 'one-time-code';
+      row.appendChild(inp);
+    }
+
+    const btnOnce = document.createElement('button');
+    btnOnce.textContent = 'Approve Once';
+    btnOnce.onclick = () => decide(esc.escalation_id, 'approve', 120);
+    row.appendChild(btnOnce);
+
+    const btnHour = document.createElement('button');
+    btnHour.className = 'secondary';
+    btnHour.textContent = 'Approve for 1 Hour';
+    btnHour.onclick = () => decide(esc.escalation_id, 'approve', 3600);
+    row.appendChild(btnHour);
+
+    const btnDeny = document.createElement('button');
+    btnDeny.className = 'danger';
+    btnDeny.textContent = 'Deny';
+    btnDeny.onclick = () => decide(esc.escalation_id, 'deny', 0);
+    row.appendChild(btnDeny);
+
+    card.appendChild(row);
+    const msg = document.createElement('p');
+    msg.id = 'msg-' + esc.escalation_id;
+    card.appendChild(msg);
+    return card;
+  }
+
+  async function loadState() {
+    const badge = document.getElementById('mode-badge');
+    badge.textContent = mode === 'local' ? 'Local Workstation' : (targetOrg ? 'Cloud · ' + targetOrg : 'Cloud');
+    const root = document.getElementById('escalations-root');
+    try {
+      const statusUrl = apiBase + '/v1/status' + (targetOrg ? '?org_id=' + encodeURIComponent(targetOrg) : '');
+      const res = await fetch(statusUrl, { headers: headers() });
+      if (res.status === 401 || res.status === 403) {
+        document.getElementById('auth-box').style.display = 'block';
+        root.innerHTML = '<div class="card"><p class="err">Authentication required to view and approve escalations.</p></div>';
+        return;
+      }
+      document.getElementById('auth-box').style.display = 'none';
+      const data = await res.json();
+
+      const isOperatorKey = authKey.startsWith('aop_');
+      if (mode !== 'local' && !isOperatorKey) {
+        const appRes = await fetch(apiBase + '/v1/approver' + (targetOrg ? '?org_id=' + encodeURIComponent(targetOrg) : ''), { headers: headers() });
+        if (appRes.ok) {
+          const appData = await appRes.json();
+          requireTotp = !!appData.enrolled;
+          document.getElementById('enroll-box').style.display = (!appData.enrolled && appData.email_delivery) ? 'block' : 'none';
+        }
+      } else {
+        requireTotp = false;
+      }
+
+      let list = Array.isArray(data.pending_escalations) ? data.pending_escalations : [];
+      if (targetId) {
+        const matching = list.filter(e => e.escalation_id === targetId);
+        if (matching.length > 0) list = matching;
+      }
+      root.innerHTML = '';
+      if (list.length === 0) {
+        const empty = document.createElement('div');
+        empty.className = 'card';
+        empty.innerHTML = '<h1 class="ok">All clear</h1><p>No pending boundary escalations require approval right now.</p>';
+        root.appendChild(empty);
+        return;
+      }
+      for (const esc of list) {
+        root.appendChild(renderEscalation(esc));
+      }
+    } catch (e) {
+      root.innerHTML = '<div class="card"><p class="err">Failed to load escalations: ' + e.message + '</p></div>';
+    }
+  }
+
+  loadState();
 </script>
 </body>
 </html>

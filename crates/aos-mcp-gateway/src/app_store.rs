@@ -623,6 +623,16 @@ impl AppStoreRegistry {
         }))
     }
 
+    async fn ensure_installed_if_needed(&self, app_id: &str, endpoint_override: Option<&str>) {
+        let already = {
+            let guard = self.state.read().await;
+            guard.installed_apps.iter().any(|a| a.app_id == app_id)
+        };
+        if !already {
+            let _ = self.install_app(app_id, endpoint_override, None).await;
+        }
+    }
+
     /// Authenticates and binds an `AAP-1.0` application user credential (`aegis_at_<app_id>.*`)
     /// via direct token, web session token exchange, or username/password exchange.
     pub async fn login_app(
@@ -636,6 +646,7 @@ impl AppStoreRegistry {
     ) -> anyhow::Result<Value> {
         self.reload().await;
         let clean_id = app_id.trim();
+        self.ensure_installed_if_needed(clean_id, endpoint_override).await;
         let endpoint = self.resolve_app_endpoint(clean_id, endpoint_override).await;
         let (node_id, node_public_key) = {
             let guard = self.state.read().await;
@@ -758,6 +769,7 @@ impl AppStoreRegistry {
     ) -> anyhow::Result<Value> {
         self.reload().await;
         let clean_id = app_id.trim();
+        self.ensure_installed_if_needed(clean_id, endpoint_override).await;
         let endpoint = self.resolve_app_endpoint(clean_id, endpoint_override).await;
         let (node_id, node_public_key) = {
             let guard = self.state.read().await;
@@ -952,6 +964,7 @@ impl AppStoreRegistry {
     ) -> anyhow::Result<Value> {
         self.reload().await;
         let clean_id = app_id.trim();
+        self.ensure_installed_if_needed(clean_id, endpoint_override).await;
         let endpoint = self.resolve_app_endpoint(clean_id, endpoint_override).await;
 
         let info = self.get_app_info(clean_id).await?;

@@ -38,7 +38,7 @@ Autonomous coding agents such as **Google Antigravity (`agy`)**, **Anthropic Cla
 │  • 38 MCP Tools + 7 Dynamic URI Resources (stdio, POST /mcp, POST /v1/mcp)             │
 │  • Google A2A Hub (GET /.well-known/agent.json, POST /a2a, POST /v1/a2a)               │
 │  • Cloud PaaS API (/v1/workspaces, /v1/workspaces/pr, /v1/tenants/keys, /v1/vault/*)   │
-│  • Embedded Vector Web Mission Control & HITL Approval Console (GET /dashboard)        │
+│  • Embedded Web Mission Control & 1-Click Approval UI (GET /dashboard, GET /approve)   │
 └───────────────────────────────────────────────┬────────────────────────────────────────┘
                                                 ▼
 ┌────────────────────────────────────────────────────────────────────────────────────────┐
@@ -136,7 +136,7 @@ After running `aegis-os install` once, you **never need to invoke `aegis-os` man
 
 - **Scoped Multi-Tenant API Keys (`ak_live_*`)**: Issues SHA-256 hashed Bearer tokens (`POST /v1/tenants/keys`) cryptographically bound to `(org_id, agent_id, role, workspace_id)`, authenticating remote agent swarms over `POST /v1/mcp` and `POST /v1/a2a` without trusting client-supplied identity headers.
 - **Cloud Git Workspace Provisioning & Automated PR Export**: `POST /v1/workspaces` provisions a base repository and forks parallel CoW agent environments in `<10ms`. When an agent finishes coding, `POST /v1/workspaces/pr` (or the `workspace_export_pr` MCP tool) reconciles changes via the 4-Tier LCS Diff3 Engine, commits onto a dedicated Git branch, and exports the commit SHA, `git format-patch` unified diff, and GitHub Pull Request payload.
-- **Embedded Vector Web Mission Control & HITL Approval Console (`GET /dashboard`)**: Single-binary, pure-SVG 4-view web console served at `http://127.0.0.1:7080/dashboard`:
+- **Embedded Vector Web Mission Control & 1-Click Approval Console (`GET /dashboard`, `GET /approve`)**: Single-binary web consoles served by `aegis-os daemon` (with `/approve` automatically opened in your browser and auto-resumed whenever a boundary escalation occurs):
   1. **Overview & HITL Approvals**: 3-step architectural mental model banner, clickable KPI cards, one-click boundary escalation queue (`Approve Once (ttl=0)`, `Grant 15m Lease`, `Grant 1h Lease`, `Deny`), interactive escalation simulator (`POST /v1/approvals/simulate`), and split Live Peer Radar + Google A2A Tasks tables.
   2. **CoW Workspaces & Git-to-PR**: Cloud workspace provisioner and slide-over Unified Diff Patch Inspector modal.
   3. **Zero-Trust Secret Vault & Active Leases**: Domain + path-prefix `$AOS_SECRET_*` binding and live lease TTL countdowns.
@@ -191,9 +191,9 @@ The protocol remains vendor-neutral and independently specified; Aegis OS is one
 | **Google A2A Protocol** (`aos-ipc`, 4 tools + HTTP)                  | `ipc_update_card`, `ipc_task_update`, `ipc_task_get`, `ipc_task_list` + `GET /.well-known/agent.json`, `POST /a2a`, `POST /v1/a2a`                                                                                                                                                                                    | **Auto-Allow Discovery & Task Lifecycle**: Dynamic `AgentCard` & stateful `A2ATask` RPC                                                                                     |
 | **Org CAS & KV** (`aos-vfs`, 4 tools)                                | `org_artifact_publish`, `org_artifact_fetch`, `org_kv_put`, `org_kv_get`                                                                                                                                                                                                                                              | **Auto-Allow Intra-Org**: Cross-org `artifact://` `FilePart` fetch gated by Rule R1                                                                                         |
 | **Zero-Trust Egress** (`aos-egress`, 1 tool)                         | `egress_http_request` + Pinned TCP Proxy (`127.0.0.1:<port>`)                                                                                                                                                                                                                                                         | **Allowlisted Domains + Path Prefixes Auto-Allow**: Injects `$AOS_SECRET_*` at boundary; blocks exfil (`403`)                                                               |
-| **Policy, Leases & Mode Switch** (`aos-policy` + `aos-cli`, 2 tools) | `policy_list_escalations`, `runtime_configure_mode` (approvals and leases are human-only: `aegis-os policy approve <id>`)                                                                                                                                                                                                                | Operator control plane for one-shot (`ttl=0`) or TTL-scoped session leases, plus live agent-driven switching between Local Community Mode and Cloud Sandbox Mode            |
-| **AAP-1.0 App Store & Proxy** (`aos-mcp-gateway`, 3 tools + CLI)     | `app_catalog_search`, `app_mount_session`, `app_call_tool` + `aegis-os app <list\|search\|info\|install\|login\|logout\|mount\|call>`                                                                                                                                                                                 | **3-Tier Ecosystem (`first_party`, `verified`, `community`)**: User-bound `aegis_at_*` tokens, RFC 8628 Device Code login, SOP skill installer, and lease-gated MCP proxy  |
-| **Cloud PaaS Control Plane** (`aos-mcp-gateway`)                     | `GET /dashboard`, `GET /api/status`, `POST /v1/workspaces`, `POST /v1/workspaces/sync-up`, `POST /v1/workspaces/diff`, `POST /v1/workspaces/hibernate`, `POST /v1/workspaces/wake`, `POST /v1/workspaces/pr`, `POST /v1/tenants/plan`, `POST /v1/tenants/keys`, `POST /v1/vault/secrets`, `POST /v1/approvals/decide` | Multi-tenant cloud workspace provisioning, Scale-to-Zero hibernation (`<10ms` wake), source-only sync, Git-to-PR export, `ak_live_*` auth, and minimalist developer console |
+| **Policy, Leases & Mode Switch** (`aos-policy` + `aos-cli`, 2 tools) | `policy_list_escalations`, `runtime_configure_mode` + `aegis-os approve` (`aos approve`) & `GET /approve` (approvals and leases are human-only)                                                                                                                                                                                                 | Zero-CLI-switch human approvals (auto-opened `/approve` Web UI with auto-resume, IDE prompt, or `aos approve`), TTL session leases, and live Local/Cloud mode switch |
+| **AAP-1.0 App Store & Proxy** (`aos-mcp-gateway`, 3 tools + CLI)     | `app_catalog_search`, `app_mount_session`, `app_call_tool` + `aegis-os app <connect\|list\|search\|info\|install\|login\|logout\|mount\|call>`                                                                                                                                                                           | **3-Tier Ecosystem (`first_party`, `verified`, `community`)**: 1-step `aegis-os app connect <app_id>`, user-bound `aegis_at_*` tokens, auto-install SOP skills, and MCP proxy |
+| **Cloud PaaS Control Plane** (`aos-mcp-gateway`)                     | `GET /dashboard`, `GET /approve`, `GET /api/status`, `POST /v1/workspaces`, `POST /v1/workspaces/sync-up`, `POST /v1/workspaces/diff`, `POST /v1/workspaces/hibernate`, `POST /v1/workspaces/wake`, `POST /v1/workspaces/pr`, `POST /v1/tenants/plan`, `POST /v1/tenants/keys`, `POST /v1/vault/secrets`, `POST /v1/approvals/decide` | Multi-tenant cloud workspace provisioning, Scale-to-Zero hibernation (`<10ms` wake), auto-incremental source sync, Git-to-PR export, `ak_live_*` auth, and `/approve` Web UI |
 | **Dynamic MCP URIs** (7 resources)                                   | `aegis://workspace/status`, `aegis://ipc/inbox`, `aegis://org/peers`, `aegis://global/peers`, `aegis://a2a/agent-cards`, `aegis://a2a/tasks`, `aegis://org/shared/catalog`                                                                                                                                            | Live introspection for IDE status bars, global peer topology, and A2A task tables                                                                                           |
 
 ---
@@ -232,15 +232,23 @@ To coding agents (`agy`, `claude`, `codex`), **Local Mode** and **Cloud Mode** e
 
 Anonymous callers can mint only the *first* key of an org that has none. `--insecure-no-auth` turns all of this off, for local debugging only.
 
-### Approving Cloud escalations
+### Approving Boundary Escalations (Zero Second-CLI-Session Needed)
 
-Agents hold the tenant key, so a tenant key alone never approves anything. Each org has one **approver**: a person with an authenticator app (TOTP, RFC 6238). Approving an escalation takes the tenant key **plus** the app's current 6-digit code, which the agent does not have.
+When an agent reaches a host boundary (such as `workspace_commit`), you **never need to open a separate terminal session** or manually tell the agent to retry:
 
-- **Enroll, paid plans**: `aegis-os cloud subscribe --claim` claims the key and, if the org has no approver yet, mails an enrollment link to the **billing email** (from the payment provider). The claim itself never returns the secret, because the claim token is stored on disk where an agent could read it.
-- **Enroll, any plan**: `aegis-os cloud approver enroll --email you@example.com` mails a one-time link (30 min). Open it in a browser and press the button to get the QR code. Once an org has a billing or approver email, links only go to that address. Opening the link alone changes nothing.
-- **Approve**: `aegis-os cloud approve <escalation_id>` shows the escalation and asks for the code (or `--code 123456`; `--deny` rejects). Codes are single-use, tenant leases are capped at 24h, and 5 wrong codes lock approvals for 5 minutes.
-- **Operator**: `AOS_ADMIN_SECRET=<operator token> aegis-os cloud approve <id>` still works; `DELETE /v1/approver?org_id=<org>` resets a lost device.
-- **Agents are blocked** from running `aegis-os policy approve|lease`, `cloud approve`, `cloud approver …`, and `memory approve|deny|ui|connect` by the PreToolUse hook. Locally, approve with `aegis-os policy approve <id>` in your terminal (in Claude Code: `! aegis-os policy approve <id>`); memory consent is approved in the trusted UI or, as a fallback, with `aegis-os memory approve <id>`.
+1. **Auto-Opened Web Approval Console (`/approve` & `/dashboard`) + Auto-Resume**: By default on desktop environments (`agy`, `claude`, `codex`), `aegis-os` automatically opens `/approve` in your browser (with a top-right link to `/dashboard`), waits for you to click **Approve Once** / **Approve for 1 Hour** (entering your 6-digit TOTP authenticator code in Cloud Mode), and **automatically resumes and completes the blocked tool call**.
+2. **Pure CLI / Headless SSH Support**: On headless SSH sessions where no browser can open, Local Mode prompts inline via the `PreToolUse` hook (or `!aegis-os approve` inside Claude/Codex), and Cloud Mode lets you type your 6-digit TOTP code directly in the agent chat (`workspace_commit(totp: "123456")`) or run `aegis-os approve --code 123456`.
+3. **Unified 1-Command CLI Approval (`aegis-os approve` / `aos approve`)**: Run `aegis-os approve` without arguments—it automatically detects Local vs. Cloud mode and selects the latest pending escalation (`--web` opens `/approve` in your browser; `--deny` rejects).
+
+#### Cloud TOTP Approver Details
+
+Agents hold the tenant key, so a tenant key alone never approves anything in Cloud Mode. Each Cloud org has one **approver**: a person with an authenticator app (TOTP, RFC 6238). Approving a Cloud escalation takes the tenant key **plus** the app's current 6-digit code, which the agent does not have.
+
+- **Enroll, paid plans**: `aegis-os cloud subscribe --claim` (or `--wait`) claims the key and, if the org has no approver yet, mails an enrollment link to the **billing email** (from the payment provider). The claim itself never returns the secret, because the claim token is stored on disk where an agent could read it.
+- **Enroll, any plan**: `aegis-os cloud approver enroll --email you@example.com` (or the inline enrollment form on `/approve`) mails a one-time link (30 min). Open it in a browser and press the button to get the QR code.
+- **Approve**: Use the auto-opened `/approve` web console, or run `aegis-os approve` (or `aegis-os cloud approve [escalation_id]`). Codes are single-use, tenant leases are capped at 24h, and 5 wrong codes lock approvals for 5 minutes.
+- **Operator**: `AOS_ADMIN_SECRET=<operator token> aegis-os approve [id]` still works; `DELETE /v1/approver?org_id=<org>` resets a lost device; `AOS_ADMIN_SECRET=<operator token> aegis-os cloud delete-org <org>` removes an org and all its data (`--force` if it still has an active subscription).
+- **Agents are blocked** from running `aegis-os approve`, `aegis-os policy approve|lease`, `cloud approve`, `cloud approver …`, and `memory approve|deny|ui|connect` by the PreToolUse hook.
 
 Mail delivery on the node follows Heurion's mailer: SMTP (`AOS_SMTP_HOST`, `AOS_SMTP_PORT` default 465, `AOS_SMTP_SECURE`, `AOS_SMTP_USER`, `AOS_SMTP_PASS`) first, else the Resend API (`AOS_RESEND_API_KEY`); sender `AOS_EMAIL_FROM` (default `Aegis Cloud <no-reply@heurion.org>`); `AOS_PUBLIC_URL` for the link (default `https://heurion.org/aegis-cloud`).
 
@@ -251,10 +259,13 @@ For developers who prefer explicit terminal control, 100% of Cloud PaaS operatio
 - **Subscribe to Aegis Cloud Pro ($29/mo)**: [https://buy.polar.sh/polar_cl_jCPpzbp4eOAyRbkDP4YzNIFVnYLddbvJZI5Fc27zL0x](https://buy.polar.sh/polar_cl_jCPpzbp4eOAyRbkDP4YzNIFVnYLddbvJZI5Fc27zL0x)
 
 ```bash
-# Subscribe to Aegis Cloud Pro ($29/mo) via Polar.sh & claim your `ak_live_*` key after checkout.
-# `subscribe` saves a one-time claim token locally; only that token can collect the paid key.
+# One-command subscribe: opens Polar.sh checkout in your browser, waits for payment,
+# claims your `ak_live_*` key, and binds the current workspace (`cloud up`) automatically:
+aegis-os cloud subscribe --plan pro --email you@example.com --wait
+
+# Or run checkout and claim as two separate steps:
 aegis-os cloud subscribe --plan pro --email you@example.com
-aegis-os cloud subscribe --claim
+aegis-os cloud subscribe --claim && aegis-os cloud up
 
 # Authenticate or bind current project to an Aegis Cloud Sandbox (0% local CPU/RAM load)
 aegis-os cloud login --endpoint https://heurion.org
@@ -290,26 +301,13 @@ aegis-os cloud down
 Users install first-party or third-party `AAP-1.0` applications (such as **Heurion 2.0 / 知衡 2.0 `heurion`**) and bind their personal account once:
 
 ```bash
-# 1. Browse or search the 3-tier AAP-1.0 application catalog (pre-registered with First-Party Heurion 2.0)
+# One-step connect (automatically installs manifest/skills, runs Device Code login, and mounts session):
+aegis-os app connect heurion
+
+# Or run individual commands (`app login` and `app mount` also auto-install if not yet installed):
 aegis-os app list
-aegis-os app search heurion
-aegis-os app info heurion
-
-# 2. Install the application:
-#    - Fetches /.well-known/aegis-app.json
-#    - Automatically downloads declared SOP skills into .agents/skills/<skill_id>/SKILL.md
-aegis-os app install heurion --url http://127.0.0.1:8787
-
-# 3. Bind your user account (choose any of the 3 methods below):
-#    Method A (Recommended — RFC 8628 Passwordless Device Code Flow):
-#    Displays an 8-character code (e.g. HEUR-7K9P); enter it in the Web UI Account Center to bind!
 aegis-os app login heurion --device-code
-
-#    Method B (Direct Grant Token from Web UI):
 aegis-os app login heurion --token aegis_at_heurion.<grant_id>.<secret>
-
-#    Method C (Username & Password Exchange):
-aegis-os app login heurion --username dr_zhang --password 'YourPassword'
 ```
 
 #### Stage 2: Daily Natural-Language Agent Workflow (Zero-Prompt & Progressive Disclosure)
