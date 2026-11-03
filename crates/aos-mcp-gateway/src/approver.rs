@@ -414,20 +414,20 @@ pub const APPROVE_PAGE_HTML: &str = r##"<!doctype html>
   }
   .nav-inner {
     max-width: 1220px; margin: 0 auto; padding: 1.2rem 3.5rem;
-    display: flex; align-items: center; justify-content: space-between; gap: 2rem; flex-wrap: wrap;
+    display: flex; align-items: center; justify-content: space-between; gap: 1.5rem;
   }
-  .brand-group { display: flex; align-items: center; gap: 0.85rem; }
-  .brand { display: inline-flex; align-items: center; gap: 0.7rem; color: var(--fg); }
+  .brand-group { display: flex; align-items: center; gap: 0.75rem; white-space: nowrap; flex-shrink: 0; }
+  .brand { display: inline-flex; align-items: center; gap: 0.7rem; color: var(--fg); white-space: nowrap; flex-shrink: 0; }
   .brand-mark { width: 24px; height: 22px; display: block; flex-shrink: 0; }
   .brand-word { font: 700 0.92rem var(--sans); letter-spacing: 0.22em; text-transform: uppercase; color: var(--fg); }
-  .brand-sep { color: var(--line); font-weight: 300; }
-  .brand-sub { font: 0.68rem var(--mono); letter-spacing: 0.12em; text-transform: uppercase; color: var(--accent); padding: 0.18rem 0.52rem; background: var(--accent-soft); border: 1px solid rgba(35, 62, 51, 0.2); }
-  .nav-links { display: flex; align-items: center; gap: 2rem; }
-  .nav-link { font-size: 0.875rem; letter-spacing: 0.02em; color: var(--muted); }
+  .brand-sep { color: var(--line); font-weight: 300; flex-shrink: 0; }
+  .brand-sub { font: 0.68rem var(--mono); letter-spacing: 0.12em; text-transform: uppercase; color: var(--accent); padding: 0.18rem 0.52rem; background: var(--accent-soft); border: 1px solid rgba(35, 62, 51, 0.2); white-space: nowrap; flex-shrink: 0; }
+  .nav-links { display: flex; align-items: center; gap: 1.65rem; flex-wrap: nowrap; }
+  .nav-link { font-size: 0.875rem; letter-spacing: 0.02em; color: var(--muted); white-space: nowrap; flex-shrink: 0; }
   .nav-link:hover, .nav-link-active { color: var(--fg); font-weight: 500; }
-  .nav-right { display: flex; align-items: center; gap: 0.85rem; flex-wrap: wrap; }
-  .badge { font: 0.68rem var(--mono); letter-spacing: 0.06em; padding: 0.24rem 0.65rem; border: 1px solid var(--line); color: var(--muted); background: var(--bg); }
-  .nav-cta { font-size: 0.8125rem; font-weight: 500; letter-spacing: 0.03em; padding: 0.52rem 1.15rem; border: 1px solid var(--fg); color: var(--fg); }
+  .nav-right { display: flex; align-items: center; gap: 0.85rem; white-space: nowrap; flex-shrink: 0; }
+  .badge { font: 0.68rem var(--mono); letter-spacing: 0.06em; padding: 0.24rem 0.65rem; border: 1px solid var(--line); color: var(--muted); background: var(--bg); white-space: nowrap; flex-shrink: 0; }
+  .nav-cta { font-size: 0.8125rem; font-weight: 500; letter-spacing: 0.03em; padding: 0.52rem 1.15rem; border: 1px solid var(--fg); color: var(--fg); white-space: nowrap; flex-shrink: 0; }
   .nav-cta:hover { background: var(--accent); border-color: var(--accent); color: #F4F1EA; }
   .sec-hero {
     padding: 3.25rem 0 2.75rem;
@@ -497,7 +497,7 @@ pub const APPROVE_PAGE_HTML: &str = r##"<!doctype html>
       </div>
       <nav class="nav-links" aria-label="Console Navigation">
         <a href="https://heurion.org/" class="nav-link">Heurion.org</a>
-        <a href="https://heurion.org/aegis-os/" class="nav-link">Aegis OS Overview</a>
+        <a href="https://heurion.org/aegis-os/" class="nav-link">Overview</a>
         <a href="https://heurion.org/aegis-os/tutorial/" class="nav-link">Tutorial</a>
         <a id="dash-link" href="dashboard" class="nav-link">Cloud Console</a>
         <a href="approve" class="nav-link nav-link-active">Approvals</a>
