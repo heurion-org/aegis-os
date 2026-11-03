@@ -161,7 +161,7 @@
     }
     .console-top-grid {
       display: grid;
-      grid-template-columns: 0.95fr 1.05fr;
+      grid-template-columns: minmax(0, 0.95fr) minmax(0, 1.05fr);
       gap: 1.75rem;
       align-items: end;
       margin-bottom: 1.35rem;
@@ -190,13 +190,14 @@
 
     .kpi-strip {
       display: grid;
-      grid-template-columns: repeat(4, 1fr);
+      grid-template-columns: repeat(4, minmax(0, 1fr));
       border: 1px solid var(--hairline);
       background: var(--bg-elevated);
     }
     .kpi-cell {
       padding: 0.9rem 1.15rem;
       border-right: 1px solid var(--hairline);
+      min-width: 0;
     }
     .kpi-cell:last-child { border-right: none; }
     .kpi-num {
@@ -226,7 +227,7 @@
     .sec-num { font-family: var(--font-mono); font-size: 0.75rem; letter-spacing: 0.14em; color: var(--ink-muted); text-transform: uppercase; }
     .sec-title { font-family: var(--font-serif); font-weight: 400; font-size: 1.32rem; color: var(--ink); margin: 0; }
 
-    .grid-2 { display: grid; grid-template-columns: repeat(2, 1fr); gap: 1.5rem; }
+    .grid-2 { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 1.5rem; }
     .card {
       background: var(--bg-elevated);
       border: 1px solid var(--hairline);
@@ -234,6 +235,8 @@
       display: flex;
       flex-direction: column;
       justify-content: space-between;
+      min-width: 0;
+      overflow: hidden;
     }
     .card-featured { border-color: var(--accent); border-width: 1.5px; }
     .card-title { font-family: var(--font-serif); font-size: 1.2rem; font-weight: 400; color: var(--ink); margin: 0 0 0.45rem; }
@@ -873,10 +876,11 @@
         return;
       }
 
+      const checkoutWin = window.open('about:blank', '_blank');
       btn.disabled = true;
       statusEl.style.display = 'block';
       statusEl.style.color = 'var(--ink-secondary)';
-      statusEl.textContent = currentLang === 'zh' ? '正在打开 Stripe 支付页面…' : 'Opening Stripe Checkout…';
+      statusEl.textContent = currentLang === 'zh' ? '正在创建 Pro ($29/月) 支付会话…' : 'Creating Pro ($29/mo) checkout session…';
 
       try {
         const res = await fetch(apiBase + '/v1/billing/checkout', {
@@ -887,11 +891,16 @@
         const data = await res.json();
         if (!res.ok) throw new Error(data.error || res.statusText);
         if (data.checkout_url) {
-          window.open(data.checkout_url, '_blank', 'noopener');
+          if (checkoutWin && !checkoutWin.closed) {
+            checkoutWin.location.replace(data.checkout_url);
+          } else {
+            window.location.href = data.checkout_url;
+          }
           statusEl.style.color = 'var(--accent)';
-          statusEl.textContent = currentLang === 'zh' ? '已在新窗口打开 Stripe 支付页面。' : 'Stripe Checkout opened in a new tab.';
+          statusEl.textContent = currentLang === 'zh' ? '已打开收银台完成支付。' : 'Checkout opened in a new tab.';
         }
       } catch (e) {
+        if (checkoutWin && !checkoutWin.closed) checkoutWin.close();
         statusEl.style.color = 'var(--danger)';
         statusEl.textContent = (currentLang === 'zh' ? '发起支付失败：' : 'Checkout failed: ') + e.message;
       } finally {

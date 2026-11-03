@@ -499,6 +499,42 @@ pub(crate) async fn run_doctor(home_dir: &Path) -> anyhow::Result<()> {
         let status = if path.exists() { "OK (Installed)" } else { "MISSING (Run `aegis-os install`)" };
         println!("  - {:<26} [{}] -> {}", name, status, path.display());
     }
+
+    if let Ok(path_env) = std::env::var("PATH") {
+        let mut seen = std::collections::BTreeSet::new();
+        println!("\nBinary Resolution on PATH:");
+        for dir in std::env::split_paths(&path_env) {
+            let cand = dir.join("aegis-os");
+            if cand.is_file() && seen.insert(cand.clone()) {
+                let ver = std::process::Command::new(&cand)
+                    .arg("--version")
+                    .output()
+                    .ok()
+                    .map(|o| String::from_utf8_lossy(&o.stdout).trim().to_string())
+                    .unwrap_or_else(|| "unknown".to_string());
+                println!("  - {} ({})", cand.display(), ver);
+            }
+        }
+    }
+    Ok(())
+}
+
+/// Self-upgrade `aegis-os` in-place via the verified OpenSSH-signed installer (`https://heurion.org/aegis-cloud/install.sh`).
+pub(crate) async fn run_upgrade() -> anyhow::Result<()> {
+    let endpoint = std::env::var("AEGIS_CLOUD_ENDPOINT")
+        .unwrap_or_else(|_| "https://heurion.org".to_string());
+    let script_url = format!("{}/aegis-cloud/install.sh", endpoint.trim_end_matches('/'));
+    println!(
+        "==> Upgrading Aegis OS via signed release installer ({}) ...",
+        script_url
+    );
+    let status = std::process::Command::new("sh")
+        .arg("-c")
+        .arg(format!("curl -fsSL '{}' | sh", script_url))
+        .status()?;
+    if !status.success() {
+        anyhow::bail!("`aegis-os upgrade` exited with status {}", status);
+    }
     Ok(())
 }
 

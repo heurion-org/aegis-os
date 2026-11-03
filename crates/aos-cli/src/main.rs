@@ -88,6 +88,10 @@ enum Commands {
         home_dir: Option<PathBuf>,
     },
 
+    /// Upgrade Aegis OS in-place to the latest signed release and refresh client integrations
+    #[command(visible_aliases = ["update", "self-update"])]
+    Upgrade,
+
     /// View Product Growth & User Analytics (GitHub Release downloads, DAU / WAU / MAU, Retention & Client breakdown)
     #[command(visible_alias = "telemetry")]
     Stats {
@@ -2065,6 +2069,10 @@ async fn main() -> anyhow::Result<()> {
                     .unwrap_or_else(|_| PathBuf::from("."))
             });
             installer::run_doctor(&target_home).await?;
+        }
+
+        Commands::Upgrade => {
+            installer::run_upgrade().await?;
         }
 
         Commands::Approve {

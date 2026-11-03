@@ -43,10 +43,36 @@ BIN_NAME="aegis-os-${OS}-${ARCH}"
 
 INSTALL_DIR="${AEGIS_INSTALL_DIR:-}"
 if [ -z "$INSTALL_DIR" ]; then
-  INSTALL_DIR="${HOME}/.local/bin"
-  if [ -w "/usr/local/bin" ]; then
-    INSTALL_DIR="/usr/local/bin"
+  # 1. If `aegis-os` is already on PATH (outside /tmp) and its directory is writable, upgrade it in-place
+  EXISTING_BIN="$(command -v aegis-os 2>/dev/null || true)"
+  if [ -n "$EXISTING_BIN" ]; then
+    EXISTING_DIR="$(dirname "$EXISTING_BIN")"
+    case "$EXISTING_DIR" in
+      /tmp/*|/private/tmp/*) ;;
+      *)
+        if [ -w "$EXISTING_DIR" ] && { [ ! -e "$EXISTING_BIN" ] || [ -w "$EXISTING_BIN" ]; }; then
+          INSTALL_DIR="$EXISTING_DIR"
+        fi
+        ;;
+    esac
   fi
+fi
+if [ -z "$INSTALL_DIR" ]; then
+  # 2. Prefer a writable directory that is ALREADY in the user's current PATH so `aegis-os` works immediately
+  case ":${PATH}:" in
+    *":${HOME}/.local/bin:"*)
+      INSTALL_DIR="${HOME}/.local/bin"
+      ;;
+    *":/opt/homebrew/bin:"*)
+      if [ -w "/opt/homebrew/bin" ]; then INSTALL_DIR="/opt/homebrew/bin"; fi
+      ;;
+    *":/usr/local/bin:"*)
+      if [ -w "/usr/local/bin" ]; then INSTALL_DIR="/usr/local/bin"; fi
+      ;;
+  esac
+fi
+if [ -z "$INSTALL_DIR" ]; then
+  INSTALL_DIR="${HOME}/.local/bin"
 fi
 mkdir -p "$INSTALL_DIR"
 TARGET_BIN="${INSTALL_DIR}/aegis-os"
@@ -86,20 +112,44 @@ cp "$WORK/$BIN_NAME" "${TARGET_BIN}.tmp"
 chmod +x "${TARGET_BIN}.tmp"
 mv -f "${TARGET_BIN}.tmp" "$TARGET_BIN"
 
+# When running a standard install (no custom AEGIS_INSTALL_DIR), also refresh any other writable
+# `aegis-os` binary already present on PATH (e.g. /opt/homebrew/bin/aegis-os or ~/.cargo/bin/aegis-os)
+# so an older binary earlier in PATH never shadows the newly installed release.
+if [ -z "${AEGIS_INSTALL_DIR:-}" ]; then
+  OLD_IFS="$IFS"
+  IFS=":"
+  for dir in $PATH /opt/homebrew/bin /usr/local/bin "${HOME}/.cargo/bin"; do
+    IFS="$OLD_IFS"
+    [ -n "$dir" ] || continue
+    cand="${dir}/aegis-os"
+    if [ "$cand" != "$TARGET_BIN" ] && [ -f "$cand" ] && [ -w "$cand" ] && [ -w "$dir" ]; then
+      cp "$WORK/$BIN_NAME" "${cand}.tmp" 2>/dev/null && chmod +x "${cand}.tmp" 2>/dev/null && mv -f "${cand}.tmp" "$cand" 2>/dev/null || rm -f "${cand}.tmp" 2>/dev/null
+    fi
+  done
+  IFS="$OLD_IFS"
+fi
+
 echo "==> Installed verified binary to: $TARGET_BIN"
 "$TARGET_BIN" --version || true
 
 echo "==> Configuring AI coding clients (Antigravity, Claude Code, Codex)..."
 "$TARGET_BIN" install
 
-case ":${PATH}:" in
-  *":${INSTALL_DIR}:"*) ;;
+case "$INSTALL_DIR" in
+  /tmp/*|/private/tmp/*)
+    # Never persist temporary test directories into user shell profiles
+    ;;
   *)
-    for rc in "${HOME}/.bashrc" "${HOME}/.zshrc" "${HOME}/.profile"; do
-      if [ -f "$rc" ] && ! grep -q "$INSTALL_DIR" "$rc" 2>/dev/null; then
-        printf '\nexport PATH="%s:$PATH"\n' "$INSTALL_DIR" >> "$rc"
-      fi
-    done
+    case ":${PATH}:" in
+      *":${INSTALL_DIR}:"*) ;;
+      *)
+        for rc in "${HOME}/.bashrc" "${HOME}/.zshrc" "${HOME}/.profile"; do
+          if [ -f "$rc" ] && ! grep -q "$INSTALL_DIR" "$rc" 2>/dev/null; then
+            printf '\nexport PATH="%s:$PATH"\n' "$INSTALL_DIR" >> "$rc"
+          fi
+        done
+        ;;
+    esac
     ;;
 esac
 
