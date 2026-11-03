@@ -4,7 +4,7 @@
   <meta charset="utf-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1" />
   <title>Aegis Cloud — Developer Console · Heurion Research</title>
-  <meta name="description" content="Aegis Cloud Developer Console & Pro Subscription — Live boundary approvals, TOTP authenticator setup, Pro subscription checkout, quota lookup, and cloud CoW workspace telemetry." />
+  <meta name="description" content="Aegis Cloud User Console — Manage your boundary approvals, TOTP authenticator, subscription status, and live quota usage." />
   <link rel="preconnect" href="https://fonts.googleapis.com">
   <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
   <link href="https://fonts.googleapis.com/css2?family=Inter:wght@300;400;500;600;700&family=JetBrains+Mono:wght@400;500&family=Newsreader:ital,opsz,wght@0,6..72,300;0,6..72,400;1,6..72,300;1,6..72,400&family=Noto+Serif+SC:wght@300;400;500&display=swap" rel="stylesheet">
@@ -44,16 +44,16 @@
     }
     a { color: inherit; text-decoration: none; transition: color 0.18s ease, border-color 0.18s ease, background 0.18s ease; }
     a:hover { color: var(--accent); }
-    p { margin: 0 0 0.75rem; color: var(--ink-secondary); }
+    p { margin: 0 0 0.7rem; color: var(--ink-secondary); }
     p:last-child { margin-bottom: 0; }
-    code, pre { font-family: var(--font-mono); }
+    code { font-family: var(--font-mono); }
 
     body[data-lang="zh"] [data-en] { display: none !important; }
     body[data-lang="en"] [data-zh] { display: none !important; }
 
     .container { max-width: var(--max-w); margin: 0 auto; padding: 0 3.5rem; }
 
-    /* Top Navigation (5 streamlined items, strict no-wrap) */
+    /* Top Navigation */
     .nav {
       position: sticky;
       top: 0;
@@ -96,7 +96,7 @@
       white-space: nowrap;
       flex-shrink: 0;
     }
-    .nav-links { display: flex; align-items: center; gap: 1.65rem; flex-wrap: nowrap; }
+    .nav-links { display: flex; align-items: center; gap: 1.5rem; flex-wrap: nowrap; }
     .nav-link { font-size: 0.875rem; letter-spacing: 0.02em; color: var(--ink-secondary); white-space: nowrap; flex-shrink: 0; }
     .nav-link:hover, .nav-link-active { color: var(--ink); font-weight: 500; }
     .nav-right { display: flex; align-items: center; gap: 0.75rem; white-space: nowrap; flex-shrink: 0; }
@@ -126,14 +126,14 @@
     }
     .nav-cta:hover { background: var(--ink); border-color: var(--ink); color: #F4F1EA; }
 
-    /* Badges & Typography */
+    /* Labels & Badges */
     .label-caps {
       font-family: var(--font-mono);
       font-size: 0.72rem;
       letter-spacing: 0.14em;
       text-transform: uppercase;
       color: var(--ink-muted);
-      margin-bottom: 0.45rem;
+      margin-bottom: 0.4rem;
     }
     .badge {
       display: inline-flex;
@@ -153,40 +153,41 @@
     .badge-warn { color: var(--warn); border-color: rgba(139, 94, 27, 0.35); background: var(--warn-soft); }
     .badge-err { color: var(--danger); border-color: rgba(158, 51, 46, 0.35); background: var(--danger-soft); }
 
-    /* Compact Console Top Bar (Workbench Header + Key Connect + 4 KPIs) */
+    /* Header & Account Identity Bar */
     .console-header {
-      padding: 2.25rem 0 1.85rem;
+      padding: 2.1rem 0 1.75rem;
       border-bottom: 1px solid var(--hairline);
       background: linear-gradient(180deg, rgba(239, 236, 228, 0.55) 0%, rgba(250, 248, 244, 0.95) 100%);
     }
     .console-top-grid {
       display: grid;
-      grid-template-columns: 1.1fr 1fr;
-      gap: 2rem;
+      grid-template-columns: 0.95fr 1.05fr;
+      gap: 1.75rem;
       align-items: end;
-      margin-bottom: 1.5rem;
+      margin-bottom: 1.35rem;
     }
     .console-title {
       font-family: var(--font-serif);
       font-weight: 300;
-      font-size: clamp(1.65rem, 2.4vw, 2.2rem);
+      font-size: clamp(1.65rem, 2.3vw, 2.15rem);
       line-height: 1.2;
       letter-spacing: -0.02em;
       color: var(--ink);
-      margin: 0 0 0.4rem;
+      margin: 0 0 0.35rem;
     }
     .console-title em { font-style: italic; font-weight: 400; color: var(--accent); }
-    .key-bar-box {
+    .auth-bar-box {
       background: var(--bg-elevated);
       border: 1px solid var(--hairline);
       padding: 0.95rem 1.15rem;
     }
-    .key-bar-row {
+    .auth-bar-row {
       display: flex;
-      gap: 0.5rem;
+      gap: 0.45rem;
       align-items: center;
       flex-wrap: wrap;
     }
+
     .kpi-strip {
       display: grid;
       grid-template-columns: repeat(4, 1fr);
@@ -194,13 +195,13 @@
       background: var(--bg-elevated);
     }
     .kpi-cell {
-      padding: 0.95rem 1.2rem;
+      padding: 0.9rem 1.15rem;
       border-right: 1px solid var(--hairline);
     }
     .kpi-cell:last-child { border-right: none; }
     .kpi-num {
       font-family: var(--font-serif);
-      font-size: 1.45rem;
+      font-size: 1.42rem;
       font-weight: 400;
       color: var(--ink);
       line-height: 1.2;
@@ -209,56 +210,48 @@
     .kpi-sub { font-family: var(--font-mono); font-size: 0.72rem; color: var(--ink-muted); }
 
     /* Sections & Cards */
-    .sec-block {
-      padding: 2.5rem 0;
-      border-bottom: 1px solid var(--hairline);
-    }
-    .sec-block-neutral {
-      padding: 2.5rem 0;
-      background: var(--bg-neutral);
-      border-bottom: 1px solid var(--hairline);
-    }
+    .sec-block { padding: 2.35rem 0; border-bottom: 1px solid var(--hairline); }
+    .sec-block-neutral { padding: 2.35rem 0; background: var(--bg-neutral); border-bottom: 1px solid var(--hairline); }
     .sec-head {
       display: flex;
       align-items: baseline;
       justify-content: space-between;
-      gap: 1.5rem;
-      padding-bottom: 0.9rem;
-      margin-bottom: 1.5rem;
+      gap: 1.25rem;
+      padding-bottom: 0.85rem;
+      margin-bottom: 1.35rem;
       border-bottom: 1px solid var(--hairline);
       flex-wrap: wrap;
     }
-    .sec-head-left { display: flex; align-items: baseline; gap: 1rem; flex-wrap: wrap; }
+    .sec-head-left { display: flex; align-items: baseline; gap: 0.9rem; flex-wrap: wrap; }
     .sec-num { font-family: var(--font-mono); font-size: 0.75rem; letter-spacing: 0.14em; color: var(--ink-muted); text-transform: uppercase; }
-    .sec-title { font-family: var(--font-serif); font-weight: 400; font-size: 1.35rem; color: var(--ink); margin: 0; }
+    .sec-title { font-family: var(--font-serif); font-weight: 400; font-size: 1.32rem; color: var(--ink); margin: 0; }
 
     .grid-2 { display: grid; grid-template-columns: repeat(2, 1fr); gap: 1.5rem; }
     .card {
       background: var(--bg-elevated);
       border: 1px solid var(--hairline);
-      padding: 1.6rem 1.75rem;
+      padding: 1.5rem 1.65rem;
       display: flex;
       flex-direction: column;
       justify-content: space-between;
     }
     .card-featured { border-color: var(--accent); border-width: 1.5px; }
-    .card-title { font-family: var(--font-serif); font-size: 1.22rem; font-weight: 400; color: var(--ink); margin: 0 0 0.45rem; }
+    .card-title { font-family: var(--font-serif); font-size: 1.2rem; font-weight: 400; color: var(--ink); margin: 0 0 0.45rem; }
 
-    /* Form Controls & Buttons */
+    /* Inputs & Buttons */
     .input {
       background: var(--bg-paper);
       color: var(--ink);
       border: 1px solid var(--hairline);
-      padding: 0.52rem 0.8rem;
+      padding: 0.5rem 0.78rem;
       font-family: var(--font-sans);
-      font-size: 0.84rem;
+      font-size: 0.83rem;
       outline: none;
-      transition: border-color 0.18s ease;
     }
     .input:focus { border-color: var(--accent); background: #fff; }
     .input-mono { font-family: var(--font-mono); font-size: 0.78rem; }
     .input-totp {
-      width: 148px;
+      width: 145px;
       font-family: var(--font-mono);
       font-size: 0.95rem;
       font-weight: 500;
@@ -270,8 +263,8 @@
       display: inline-flex;
       align-items: center;
       justify-content: center;
-      gap: 0.45rem;
-      padding: 0.54rem 1.05rem;
+      gap: 0.4rem;
+      padding: 0.5rem 0.98rem;
       font-family: var(--font-sans);
       font-size: 0.8125rem;
       font-weight: 500;
@@ -292,41 +285,13 @@
     .btn-danger:hover { background: var(--danger-soft); border-color: var(--danger); color: var(--danger); }
     .btn:disabled { opacity: 0.55; cursor: default; }
 
-    /* Terminal Copy Rows */
-    .cmd-list { display: flex; flex-direction: column; gap: 0.5rem; margin-top: 0.75rem; }
-    .cmd-box {
-      display: flex;
-      align-items: center;
-      justify-content: space-between;
-      gap: 0.65rem;
-      padding: 0.52rem 0.75rem;
-      background: #151C19;
-      color: #F4F1EA;
-      font-family: var(--font-mono);
-      font-size: 0.76rem;
-      overflow-x: auto;
-    }
-    .cmd-box code { color: #F4F1EA; white-space: nowrap; }
-    .cmd-label { font-family: var(--font-sans); font-size: 0.74rem; color: var(--ink-muted); margin-bottom: 0.15rem; }
-    .copy-btn {
-      background: rgba(255, 255, 255, 0.1);
-      color: #F4F1EA;
-      border: 1px solid rgba(255, 255, 255, 0.22);
-      padding: 0.18rem 0.52rem;
-      font-family: var(--font-mono);
-      font-size: 0.66rem;
-      cursor: pointer;
-      flex-shrink: 0;
-    }
-    .copy-btn:hover { background: rgba(255, 255, 255, 0.22); }
-
-    /* Escalation & Telemetry Items */
+    /* Approvals & Leases */
     .totp-bar {
       display: flex;
       align-items: center;
       justify-content: space-between;
       gap: 1rem;
-      padding: 0.9rem 1.2rem;
+      padding: 0.85rem 1.15rem;
       background: var(--bg-elevated);
       border: 1px solid var(--hairline);
       margin-bottom: 1.15rem;
@@ -336,39 +301,61 @@
       background: var(--bg-elevated);
       border: 1px solid var(--hairline);
       border-left: 3px solid var(--warn);
-      padding: 1.25rem 1.45rem;
-      margin-bottom: 0.9rem;
+      padding: 1.2rem 1.4rem;
+      margin-bottom: 0.85rem;
     }
     .esc-meta {
       display: grid;
-      grid-template-columns: 120px 1fr;
-      gap: 0.35rem 0.9rem;
+      grid-template-columns: 110px 1fr;
+      gap: 0.3rem 0.85rem;
       font-family: var(--font-mono);
       font-size: 0.76rem;
-      padding: 0.75rem 0.95rem;
+      padding: 0.7rem 0.9rem;
       background: var(--bg-paper);
       border: 1px solid var(--hairline);
-      margin: 0.75rem 0;
+      margin: 0.7rem 0;
     }
     .esc-meta dt { color: var(--ink-muted); text-transform: uppercase; font-size: 0.68rem; }
     .esc-meta dd { margin: 0; color: var(--ink); word-break: break-all; }
 
-    .spec-list { list-style: none; padding: 0; margin: 0.75rem 0 1rem; border-top: 1px solid var(--hairline); }
+    /* Quota Progress Bars & Spec Lists */
+    .spec-list { list-style: none; padding: 0; margin: 0.65rem 0 0.95rem; border-top: 1px solid var(--hairline); }
     .spec-list li {
       display: flex;
       justify-content: space-between;
-      padding: 0.45rem 0;
+      padding: 0.46rem 0;
       border-bottom: 1px solid var(--hairline);
-      font-size: 0.84rem;
+      font-size: 0.85rem;
     }
     .spec-list li span:first-child { color: var(--ink-secondary); }
-    .spec-list li span:last-child { font-family: var(--font-mono); font-size: 0.78rem; color: var(--ink); font-weight: 500; }
+    .spec-list li span:last-child { font-family: var(--font-mono); font-size: 0.79rem; color: var(--ink); font-weight: 500; }
+
+    .quota-meter { margin-bottom: 1rem; }
+    .quota-meter-head {
+      display: flex;
+      justify-content: space-between;
+      font-size: 0.83rem;
+      margin-bottom: 0.3rem;
+    }
+    .quota-meter-head span:last-child { font-family: var(--font-mono); font-size: 0.78rem; color: var(--ink); }
+    .quota-track {
+      height: 7px;
+      background: var(--bg-neutral);
+      border: 1px solid var(--hairline);
+      overflow: hidden;
+    }
+    .quota-fill {
+      height: 100%;
+      background: var(--accent);
+      width: 0%;
+      transition: width 0.25s ease;
+    }
 
     .item-row {
-      padding: 0.75rem 0.95rem;
+      padding: 0.7rem 0.9rem;
       border: 1px solid var(--hairline);
       background: var(--bg-paper);
-      margin-bottom: 0.55rem;
+      margin-bottom: 0.5rem;
       display: flex;
       align-items: center;
       justify-content: space-between;
@@ -376,8 +363,7 @@
       flex-wrap: wrap;
     }
 
-    /* Footer */
-    .foot { background: var(--bg-paper); border-top: 1px solid var(--hairline); padding: 2.2rem 0; }
+    .foot { background: var(--bg-paper); border-top: 1px solid var(--hairline); padding: 2rem 0; }
     .foot-bar { display: flex; align-items: center; justify-content: space-between; gap: 1.5rem; flex-wrap: wrap; }
     .foot-right { display: flex; flex-wrap: wrap; align-items: center; gap: 1.35rem; font-size: 0.78rem; color: var(--ink-muted); }
     .foot-link { font-family: var(--font-mono); font-size: 0.72rem; letter-spacing: 0.06em; color: var(--ink-secondary); }
@@ -392,7 +378,7 @@
 </head>
 <body data-lang="zh">
 
-  <!-- Top Navigation (5 items, unified across Heurion / Aegis OS) -->
+  <!-- Top Navigation -->
   <header class="nav" role="banner">
     <div class="nav-inner">
       <div class="brand-group">
@@ -406,343 +392,292 @@
           <span class="brand-word">HEURION</span>
         </a>
         <span class="brand-sep">/</span>
-        <a href="https://heurion.org/aegis-os/" class="brand-sub">AEGIS OS</a>
+        <a href="/aegis-os/" class="brand-sub">AEGIS OS</a>
       </div>
 
       <nav class="nav-links" aria-label="Primary Navigation">
-        <a href="https://heurion.org/" class="nav-link"><span data-zh>主站</span><span data-en>Heurion.org</span></a>
-        <a href="https://heurion.org/aegis-os/" class="nav-link"><span data-zh>概览</span><span data-en>Overview</span></a>
-        <a href="https://heurion.org/aegis-os/tutorial/" class="nav-link"><span data-zh>使用教程</span><span data-en>Tutorial</span></a>
-        <a href="/aegis-cloud/dashboard" class="nav-link nav-link-active"><span data-zh>控制台与订阅</span><span data-en>Console &amp; Pricing</span></a>
+        <a href="/" class="nav-link"><span data-zh>主站</span><span data-en>Heurion.org</span></a>
+        <a href="/aegis-os/" class="nav-link"><span data-zh>概览</span><span data-en>Overview</span></a>
+        <a href="/aegis-os/#pricing" class="nav-link"><span data-zh>方案与购买</span><span data-en>Plans &amp; Buy</span></a>
+        <a href="/aegis-os/tutorial/" class="nav-link"><span data-zh>使用教程</span><span data-en>Tutorial</span></a>
+        <a href="/aegis-cloud/dashboard" class="nav-link nav-link-active"><span data-zh>我的控制台</span><span data-en>My Console</span></a>
         <a href="https://github.com/heurion-org/aegis-os" target="_blank" rel="noopener" class="nav-link">GitHub ↗</a>
       </nav>
 
       <div class="nav-right">
-        <span id="conn-badge" class="badge"><span data-zh>未连接密钥</span><span data-en>No Key Connected</span></span>
+        <span id="conn-badge" class="badge"><span data-zh>未连接账户</span><span data-en>Not Connected</span></span>
         <button type="button" class="lang-switch" id="lang-toggle" onclick="toggleLang()">EN</button>
-        <a class="nav-cta" href="#pro-checkout-card"><span data-zh>立即订阅 Pro ($29/月) →</span><span data-en>Subscribe Pro ($29/mo) →</span></a>
+        <a class="nav-cta" href="/aegis-os/#pricing"><span data-zh>购买 Pro ($29/月) →</span><span data-en>Buy Pro ($29/mo) →</span></a>
       </div>
     </div>
   </header>
 
   <main>
-    <!-- Compact Workbench Header + Workspace Key Connect + 4 Live KPIs -->
+    <!-- Header & Account Bar -->
     <section class="console-header">
       <div class="container">
         <div class="console-top-grid">
           <div>
-            <p class="label-caps">AEGIS CLOUD · DEVELOPER CONSOLE &amp; BILLING WORKBENCH</p>
+            <p class="label-caps">AEGIS CLOUD · USER CONSOLE</p>
             <h1 class="console-title">
-              <span data-zh>Aegis Cloud — <em>控制台与订阅中心</em></span>
-              <span data-en>Aegis Cloud — <em>Developer Console &amp; Billing</em></span>
+              <span data-zh>Aegis Cloud — <em>我的审批与订阅</em></span>
+              <span data-en>Aegis Cloud — <em>My Approvals &amp; Subscription</em></span>
             </h1>
-            <p style="font-size:0.92rem; max-width:42rem;">
-              <span data-zh>一站式完成宿主边界越界审批（<code>workspace_commit</code> / TOTP）、Pro 专业版订阅与配额查询，以及线上 CoW 影子工作区实时观测。</span>
-              <span data-en>Approve host boundary escalations (<code>workspace_commit</code> / TOTP), manage your Pro subscription and quotas, and monitor live cloud CoW shadow workspaces in one place.</span>
+            <p style="font-size:0.9rem;">
+              <span data-zh>连接工作区密钥（<code>ak_live_...</code>）或输入购买邮箱，查看待审批的边界请求与您当前的订阅配额。</span>
+              <span data-en>Connect your workspace key (<code>ak_live_...</code>) or enter your billing email to manage boundary approvals and your subscription quotas.</span>
             </p>
           </div>
 
-          <div class="key-bar-box">
-            <div style="display:flex; justify-content:space-between; align-items:center; margin-bottom:0.45rem;">
+          <div class="auth-bar-box">
+            <div style="display:flex; justify-content:space-between; align-items:center; margin-bottom:0.4rem;">
               <span class="label-caps" style="margin:0;">
-                <span data-zh>工作区密钥连接 (API Key / Operator Token)</span>
-                <span data-en>WORKSPACE KEY CONNECTION (API KEY / TOKEN)</span>
+                <span data-zh>身份连接：输入密钥（审批与状态）或 购买邮箱（查订阅）</span>
+                <span data-en>ACCOUNT: ENTER API KEY (APPROVALS) OR BILLING EMAIL (SUBSCRIPTION)</span>
               </span>
               <span id="key-org-hint" style="font-family:var(--font-mono); font-size:0.72rem; color:var(--accent);"></span>
             </div>
-            <div class="key-bar-row">
-              <input id="api-key-input" type="password" class="input input-mono" style="flex:1; min-width:190px;" placeholder="ak_live_... / aop_..." autocomplete="off" />
-              <button type="button" class="btn btn-primary" onclick="connectKey()"><span data-zh>连接</span><span data-en>Connect</span></button>
-              <button type="button" class="btn btn-ghost" onclick="refreshAll()"><span data-zh>刷新</span><span data-en>Refresh</span></button>
-              <button type="button" class="btn btn-ghost" onclick="disconnectKey()"><span data-zh>断开</span><span data-en>Clear</span></button>
+            <div class="auth-bar-row">
+              <input id="api-key-input" type="password" class="input input-mono" style="flex:1.1; min-width:155px;" placeholder="ak_live_... / aop_..." autocomplete="off" />
+              <button type="button" class="btn btn-primary" onclick="connectKey()"><span data-zh>连接密钥</span><span data-en>Connect Key</span></button>
+              <input id="lookup-email-input" type="email" class="input" style="flex:1; min-width:150px;" placeholder="you@company.com" autocomplete="email" />
+              <button type="button" class="btn btn-ghost" onclick="lookupBillingStatus()"><span data-zh>查订阅</span><span data-en>Lookup</span></button>
+              <button type="button" class="btn btn-ghost" onclick="disconnectKey()"><span data-zh>清除</span><span data-en>Clear</span></button>
             </div>
+            <p id="lookup-status-msg" style="font-family:var(--font-mono); font-size:0.74rem; margin-top:0.45rem; display:none;"></p>
           </div>
         </div>
 
         <div class="kpi-strip">
           <div class="kpi-cell">
-            <div class="label-caps"><span data-zh>当前套餐 / 租户</span><span data-en>PLAN TIER / ORG</span></div>
+            <div class="label-caps"><span data-zh>我的当前套餐</span><span data-en>MY PLAN TIER</span></div>
             <div class="kpi-num" id="kpi-plan">Free ($0)</div>
-            <div class="kpi-sub" id="kpi-org"><span data-zh>连接密钥或下方输入邮箱查询</span><span data-en>Connect key or lookup by email below</span></div>
+            <div class="kpi-sub" id="kpi-org"><span data-zh>未绑定租户</span><span data-en>No tenant loaded</span></div>
           </div>
           <div class="kpi-cell">
-            <div class="label-caps"><span data-zh>待批越界请求</span><span data-en>PENDING APPROVALS</span></div>
+            <div class="label-caps"><span data-zh>待我审批请求</span><span data-en>PENDING APPROVALS</span></div>
             <div class="kpi-num" id="kpi-pending">0</div>
-            <div class="kpi-sub" id="kpi-totp-sub"><span data-zh>workspace_commit 与敏感动作</span><span data-en>workspace_commit &amp; boundary hooks</span></div>
+            <div class="kpi-sub" id="kpi-leases-sub"><span data-zh>生效租约：0</span><span data-en>Active leases: 0</span></div>
           </div>
           <div class="kpi-cell">
-            <div class="label-caps"><span data-zh>今日系统调用配额</span><span data-en>DAILY SYSCALL QUOTA</span></div>
+            <div class="label-caps"><span data-zh>今日系统调用 (已用 / 总额)</span><span data-en>DAILY SYSCALLS (USED / LIMIT)</span></div>
             <div class="kpi-num" id="kpi-syscalls">0 / 200</div>
-            <div class="kpi-sub" id="kpi-exec-ms"><span data-zh>沙箱算力：0s / 600s</span><span data-en>Exec compute: 0s / 600s</span></div>
+            <div class="kpi-sub" id="kpi-agents-sub"><span data-zh>并发 Agent：0 / 1</span><span data-en>Parallel agents: 0 / 1</span></div>
           </div>
           <div class="kpi-cell">
-            <div class="label-caps"><span data-zh>并发 Agent / 活跃工作区</span><span data-en>PARALLEL AGENTS / WORKSPACES</span></div>
-            <div class="kpi-num" id="kpi-agents">0 / 1</div>
-            <div class="kpi-sub" id="kpi-workspaces"><span data-zh>活跃云端工作区：0</span><span data-en>Active cloud workspaces: 0</span></div>
+            <div class="label-caps"><span data-zh>今日 64GB 算力 (已用 / 总额)</span><span data-en>DAILY 64GB COMPUTE</span></div>
+            <div class="kpi-num" id="kpi-compute">0s / 600s</div>
+            <div class="kpi-sub" id="kpi-workspaces"><span data-zh>活跃云端工作区：0</span><span data-en>Active workspaces: 0</span></div>
           </div>
         </div>
       </div>
     </section>
 
-    <!-- 01 / BOUNDARY APPROVALS & TOTP AUTHENTICATOR -->
+    <!-- 01 / MY BOUNDARY APPROVALS & TOTP -->
     <section id="approvals-panel" class="sec-block">
       <div class="container">
         <div class="sec-head">
           <div class="sec-head-left">
-            <span class="sec-num">01 / BOUNDARY APPROVALS &amp; TOTP</span>
+            <span class="sec-num">01 / MY APPROVALS</span>
             <h2 class="sec-title">
-              <span data-zh>实时宿主边界审批与 TOTP 验证器</span>
-              <span data-en>Live Boundary Approvals &amp; TOTP Authenticator</span>
+              <span data-zh>我的边界审批请求与授权租约</span>
+              <span data-en>My Boundary Approvals &amp; Active Leases</span>
             </h2>
           </div>
-          <div style="display:flex; gap:0.55rem; align-items:center; flex-wrap:wrap;">
-            <button type="button" class="btn btn-ghost" onclick="simulateEscalation()">
-              <span data-zh>+ 触发测试审批请求</span><span data-en>+ Simulate Escalation</span>
-            </button>
-            <a id="standalone-approve-link" href="/aegis-cloud/approve" class="btn btn-ghost">
-              <span data-zh>独立审批弹窗视图 ↗</span><span data-en>Standalone /approve View ↗</span>
-            </a>
-          </div>
+          <button type="button" class="btn btn-ghost" onclick="refreshAll()">
+            <span data-zh>刷新审批列表</span><span data-en>Refresh Approvals</span>
+          </button>
         </div>
 
-        <!-- TOTP Enrollment Bar -->
+        <!-- Phone TOTP Authenticator Status -->
         <div class="totp-bar">
           <div>
-            <div style="display:flex; align-items:center; gap:0.6rem; margin-bottom:0.2rem;">
-              <strong style="font-size:0.9rem; color:var(--ink);">
-                <span data-zh>RFC 6238 手机动态口令验证器 (Google Authenticator / 1Password)</span>
-                <span data-en>RFC 6238 Phone Authenticator (Google Authenticator / 1Password)</span>
+            <div style="display:flex; align-items:center; gap:0.6rem; margin-bottom:0.15rem;">
+              <strong style="font-size:0.88rem; color:var(--ink);">
+                <span data-zh>我的手机 TOTP 审批验证器 (RFC 6238)</span>
+                <span data-en>My Phone TOTP Authenticator (RFC 6238)</span>
               </strong>
               <span id="totp-status-badge" class="badge"><span data-zh>未检测</span><span data-en>Unchecked</span></span>
             </div>
-            <p style="font-size:0.82rem; margin:0;" id="totp-status-desc">
-              <span data-zh>云端工作区在批准越界写入时使用独立于 Agent 机器的 6 位手机动态码。若尚未绑定或需更换设备，可在右侧输入邮箱获取一键扫码绑定链接。</span>
-              <span data-en>Cloud boundary approvals require a 6-digit TOTP code on your phone so an agent cannot self-approve. Enter your email to receive a 1-click QR enrollment link.</span>
+            <p style="font-size:0.8rem; margin:0;">
+              <span data-zh>用于批准云端越界请求。若尚未绑定或需更换手机，请在右侧输入邮箱发送扫码绑定链接。</span>
+              <span data-en>Used to approve cloud boundary escalations. Enter your email on the right to receive a QR enrollment link.</span>
             </p>
           </div>
-          <div style="display:flex; gap:0.5rem; align-items:center; flex-wrap:wrap;">
-            <input id="totp-enroll-email" type="email" class="input" style="width:220px;" placeholder="you@company.com" />
+          <div style="display:flex; gap:0.45rem; align-items:center; flex-wrap:wrap;">
+            <input id="totp-enroll-email" type="email" class="input" style="width:210px;" placeholder="you@company.com" />
             <button type="button" class="btn btn-ghost" onclick="sendTotpEnrollEmail()">
-              <span data-zh>发送扫码绑定邮件</span><span data-en>Send QR Setup Email</span>
+              <span data-zh>发送绑定二维码邮件</span><span data-en>Send QR Setup Email</span>
             </button>
           </div>
         </div>
-        <p id="totp-enroll-msg" style="font-family:var(--font-mono); font-size:0.78rem; margin-bottom:1rem; display:none;"></p>
+        <p id="totp-enroll-msg" style="font-family:var(--font-mono); font-size:0.76rem; margin-bottom:1rem; display:none;"></p>
 
-        <!-- Pending Escalations Container -->
-        <div id="escalations-container">
-          <div class="card" style="padding:1.25rem 1.5rem;">
-            <div style="display:flex; align-items:center; justify-content:space-between; gap:1rem; flex-wrap:wrap;">
-              <div>
-                <strong style="color:var(--accent); font-size:0.95rem;">
-                  <span data-zh>当前无待审批的越界请求 (All Clear)</span>
-                  <span data-en>No Pending Boundary Escalations (All Clear)</span>
-                </strong>
-                <p style="font-size:0.84rem; margin:0.2rem 0 0;">
-                  <span data-zh>当 AI Agent 调用 <code>workspace_commit</code> 落盘代码或触发受控策略时，审批卡片会自动出现在此处，点击批准后 Agent 将自动继续执行。</span>
-                  <span data-en>When an agent calls <code>workspace_commit</code> or hits a gated policy, the approval card appears here automatically. Once approved, the agent resumes immediately.</span>
+        <div class="grid-2">
+          <!-- Left: Pending Escalations -->
+          <div>
+            <div class="label-caps" style="margin-bottom:0.55rem;">
+              <span data-zh>待审批越界请求 (PENDING ESCALATIONS)</span>
+              <span data-en>PENDING BOUNDARY ESCALATIONS</span>
+            </div>
+            <div id="escalations-container">
+              <div class="card" style="padding:1.25rem 1.4rem;">
+                <div style="display:flex; align-items:center; justify-content:space-between; gap:0.75rem;">
+                  <div>
+                    <strong style="color:var(--accent); font-size:0.92rem;">
+                      <span data-zh>当前无待审批的越界请求</span>
+                      <span data-en>No Pending Boundary Requests</span>
+                    </strong>
+                    <p style="font-size:0.82rem; margin:0.2rem 0 0;">
+                      <span data-zh>当您的 Agent 发起 <code>workspace_commit</code> 等越界操作时，审批项将在此处实时显示。</span>
+                      <span data-en>When your agent triggers <code>workspace_commit</code> or a gated action, it will appear here for approval.</span>
+                    </p>
+                  </div>
+                  <span class="badge badge-ok">0 PENDING</span>
+                </div>
+              </div>
+            </div>
+          </div>
+
+          <!-- Right: Active Session Leases -->
+          <div>
+            <div class="label-caps" style="margin-bottom:0.55rem;">
+              <span data-zh>我已授权的生效租约 (ACTIVE SESSION LEASES)</span>
+              <span data-en>MY ACTIVE SESSION LEASES</span>
+            </div>
+            <div class="card" style="padding:1.25rem 1.4rem;">
+              <div id="leases-list">
+                <p style="font-size:0.84rem; color:var(--ink-muted); margin:0;">
+                  <span data-zh>当前暂无生效中的会话租约。批准 1 小时租约后将在此处列出。</span>
+                  <span data-en>No active session leases right now. Approved 1-hour leases will be listed here.</span>
                 </p>
               </div>
-              <span class="badge badge-ok">0 PENDING</span>
             </div>
           </div>
         </div>
       </div>
     </section>
 
-    <!-- 02 / SUBSCRIPTION, QUOTA LOOKUP & CLI MOUNT -->
-    <section id="billing-panel" class="sec-block-neutral">
+    <!-- 02 / MY SUBSCRIPTION & QUOTA USAGE -->
+    <section id="subscription-panel" class="sec-block-neutral">
       <div class="container">
         <div class="sec-head">
           <div class="sec-head-left">
-            <span class="sec-num">02 / SUBSCRIPTION, QUOTA LOOKUP &amp; CLI MOUNT</span>
+            <span class="sec-num">02 / MY SUBSCRIPTION &amp; QUOTAS</span>
             <h2 class="sec-title">
-              <span data-zh>套餐订阅、邮箱配额查询与本机 CLI 挂载</span>
-              <span data-en>Pro Subscription, Email Quota Lookup &amp; CLI Mount</span>
+              <span data-zh>我的购买信息与配额使用详情</span>
+              <span data-en>My Subscription &amp; Quota Usage</span>
             </h2>
           </div>
-          <span class="badge badge-ok">STRIPE CHECKOUT · INSTANT KEY CLAIM</span>
+          <span id="sub-status-badge" class="badge"><span data-zh>套餐状态：Free</span><span data-en>Plan: Free</span></span>
         </div>
 
         <div class="grid-2">
-          <!-- Left Card: Pro Plan Checkout + Email Quota Lookup -->
-          <article id="pro-checkout-card" class="card card-featured">
+          <!-- Left: My Subscription Details & Upgrade -->
+          <article class="card card-featured">
             <div>
-              <div style="display:flex; justify-content:space-between; align-items:center; margin-bottom:0.5rem;">
-                <span class="label-caps" style="margin:0; color:var(--accent);">PRO PLAN · MULTI-AGENT CLOUD SANDBOX</span>
-                <span class="badge badge-ok"><span data-zh>主力推荐 · $29 / 月</span><span data-en>Recommended · $29 / mo</span></span>
+              <div style="display:flex; justify-content:space-between; align-items:center; margin-bottom:0.4rem;">
+                <span class="label-caps" style="margin:0; color:var(--accent);">MY SUBSCRIPTION DETAILS</span>
+                <span id="sub-tier-pill" class="badge badge-ok">FREE ($0/MO)</span>
               </div>
-              <h3 class="card-title">
-                <span data-zh>Pro 专业版 — $29 / 月</span>
-                <span data-en>Pro Plan — $29 / month</span>
+              <h3 class="card-title" id="sub-card-heading">
+                <span data-zh>当前订阅：Free 免费版 ($0 / 月)</span>
+                <span data-en>Current Plan: Free Tier ($0 / month)</span>
               </h3>
-              <p style="font-size:0.86rem;">
-                <span data-zh>面向日常多 Agent 并行研发。将重型编译、测试与多分支沙箱挂载至云端 64GB 高配节点，本机保持零风扇噪音。</span>
-                <span data-en>Built for multi-agent engineering. Offload heavy builds, test suites, and isolated branches to 64GB cloud workers while keeping your Mac silent.</span>
-              </p>
 
               <ul class="spec-list">
                 <li>
-                  <span><span data-zh>线上 CoW 独立工作区</span><span data-en>Cloud CoW Workspaces</span></span>
-                  <span>16 Workspaces</span>
+                  <span><span data-zh>绑定租户 / 组织 ID</span><span data-en>Tenant / Org ID</span></span>
+                  <span id="sub-org-val">—</span>
                 </li>
                 <li>
-                  <span><span data-zh>并行协同 Agent 数</span><span data-en>Concurrent Parallel Agents</span></span>
-                  <span>8 Agents (A2A Bus)</span>
+                  <span><span data-zh>订阅计费状态</span><span data-en>Billing Status</span></span>
+                  <span id="sub-active-val">Free Tier</span>
                 </li>
                 <li>
-                  <span><span data-zh>每日系统调用配额</span><span data-en>Daily Syscall Quota</span></span>
-                  <span>20,000 / day</span>
+                  <span><span data-zh>线上 CoW 工作区上限</span><span data-en>Cloud Workspaces Limit</span></span>
+                  <span id="sub-ws-limit">1 Workspace</span>
                 </li>
                 <li>
-                  <span><span data-zh>每日 64GB 云端沙箱算力</span><span data-en>Daily 64GB Compute Time</span></span>
-                  <span>10 hrs / day (36,000s)</span>
+                  <span><span data-zh>并发协同 Agent 上限</span><span data-en>Concurrent Agents Limit</span></span>
+                  <span id="sub-agent-limit">1 Agent</span>
+                </li>
+                <li>
+                  <span><span data-zh>每日系统调用上限</span><span data-en>Daily Syscalls Limit</span></span>
+                  <span id="sub-syscall-limit">200 / day</span>
+                </li>
+                <li>
+                  <span><span data-zh>每日 64GB 沙箱算力上限</span><span data-en>Daily 64GB Compute Limit</span></span>
+                  <span id="sub-compute-limit">600s (10 min / day)</span>
                 </li>
               </ul>
-
-              <!-- Email & Org Input for Direct Checkout OR Quota Lookup -->
-              <div style="background:var(--bg-paper); border:1px solid var(--hairline); padding:1rem 1.1rem; margin-bottom:0.9rem;">
-                <div class="label-caps" style="margin-bottom:0.45rem;">
-                  <span data-zh>输入工作邮箱：一键开通 Pro 订阅 或 查询已有配额</span>
-                  <span data-en>ENTER EMAIL: SUBSCRIBE TO PRO OR CHECK EXISTING QUOTA</span>
-                </div>
-                <div style="display:flex; gap:0.5rem; flex-wrap:wrap; margin-bottom:0.65rem;">
-                  <input id="pro-email-input" type="email" class="input" style="flex:1.3; min-width:180px;" placeholder="you@company.com" autocomplete="email" />
-                  <input id="pro-org-input" type="text" class="input input-mono" style="flex:0.8; min-width:120px;" placeholder="org_id (optional)" />
-                </div>
-                <div style="display:flex; gap:0.55rem; flex-wrap:wrap;">
-                  <button id="pro-checkout-btn" type="button" class="btn btn-primary" style="flex:1.2;" onclick="startWebProCheckout()">
-                    <span data-zh>① 立即订阅 Pro ($29/月) →</span>
-                    <span data-en>1. Subscribe to Pro ($29/mo) →</span>
-                  </button>
-                  <button type="button" class="btn btn-ghost" style="flex:0.8;" onclick="lookupBillingStatus()">
-                    <span data-zh>查询邮箱订阅与配额</span>
-                    <span data-en>Check Email Quota</span>
-                  </button>
-                </div>
-                <p id="pro-checkout-status" style="font-family:var(--font-mono); font-size:0.75rem; margin-top:0.55rem; display:none;"></p>
-              </div>
             </div>
 
-            <div>
-              <div class="cmd-label">
-                <span data-zh>或在终端直接发起订阅（支付完成后自动写入本机凭证）：</span>
-                <span data-en>Or subscribe directly from your terminal (auto-saves key on completion):</span>
+            <div style="background:var(--bg-paper); border:1px solid var(--hairline); padding:0.95rem 1.05rem;">
+              <div class="label-caps" style="margin-bottom:0.4rem;">
+                <span data-zh>升级或续订 Pro 专业版 ($29/月 · 16 工作区 / 8 Agent / 10h 算力)</span>
+                <span data-en>UPGRADE OR RENEW PRO ($29/MO · 16 WORKSPACES / 8 AGENTS / 10H COMPUTE)</span>
               </div>
-              <div class="cmd-box">
-                <code id="cmd-pro-cli">aegis-os cloud subscribe --plan pro --wait</code>
-                <button type="button" class="copy-btn" onclick="copyText('cmd-pro-cli', this)">Copy</button>
+              <div style="display:flex; gap:0.5rem; flex-wrap:wrap;">
+                <input id="pro-email-input" type="email" class="input" style="flex:1; min-width:170px;" placeholder="you@company.com" autocomplete="email" />
+                <button id="pro-checkout-btn" type="button" class="btn btn-primary" onclick="startWebProCheckout()">
+                  <span data-zh>升级 / 续订 Pro ($29/月) →</span>
+                  <span data-en>Upgrade / Renew Pro ($29/mo) →</span>
+                </button>
               </div>
+              <p id="pro-checkout-status" style="font-family:var(--font-mono); font-size:0.74rem; margin-top:0.45rem; display:none;"></p>
             </div>
           </article>
 
-          <!-- Right Card: Free Tier + Essential CLI Mount Commands -->
+          <!-- Right: Live Quota Meters & My Active Cloud Workspaces -->
           <article class="card">
             <div>
-              <div style="display:flex; justify-content:space-between; align-items:center; margin-bottom:0.5rem;">
-                <span class="label-caps" style="margin:0;">FREE TIER &amp; CLI WORKSPACE COMMANDS</span>
-                <span class="badge"><span data-zh>免费体验 · $0 / 月</span><span data-en>Free Tier · $0 / mo</span></span>
-              </div>
+              <span class="label-caps">MY REAL-TIME QUOTA USAGE</span>
               <h3 class="card-title">
-                <span data-zh>Free 免费版与本机挂载命令</span>
-                <span data-en>Free Tier &amp; Local CLI Mount Commands</span>
+                <span data-zh>今日配额消耗与我的云端工作区</span>
+                <span data-en>Today's Quota Usage &amp; My Cloud Workspaces</span>
               </h3>
-              <p style="font-size:0.86rem;">
-                <span data-zh>本机沙箱（Local Mode）永久免费且不限次数；云端免费版提供 1 个线上工作区（200 次调用/日 · 10 分钟算力/日）供快速验证。</span>
-                <span data-en>Local workstation mode is free and unlimited forever; the Cloud Free tier includes 1 cloud workspace (200 syscalls/day · 10 min compute/day).</span>
-              </p>
 
-              <ul class="spec-list">
-                <li>
-                  <span><span data-zh>免费云端工作区 / Agent</span><span data-en>Free Cloud Workspace / Agent</span></span>
-                  <span>1 Workspace · 1 Agent</span>
-                </li>
-                <li>
-                  <span><span data-zh>免费云端每日配额</span><span data-en>Free Cloud Daily Quota</span></span>
-                  <span>200 syscalls · 10 min/day</span>
-                </li>
-              </ul>
+              <div style="margin-top:0.85rem;">
+                <div class="quota-meter">
+                  <div class="quota-meter-head">
+                    <span><span data-zh>今日系统调用 (Daily Syscalls)</span><span data-en>Daily Syscalls</span></span>
+                    <span id="meter-syscalls-text">0 / 200 (0%)</span>
+                  </div>
+                  <div class="quota-track"><div id="meter-syscalls-bar" class="quota-fill"></div></div>
+                </div>
 
-              <div class="cmd-list">
-                <div>
-                  <div class="cmd-label"><span data-zh>1. 一键开启或切换至云端 64GB 工作区（零配置）：</span><span data-en>1. Launch or switch to your 64GB cloud workspace (zero-config):</span></div>
-                  <div class="cmd-box">
-                    <code id="cmd-cloud-up">aegis-os cloud up</code>
-                    <button type="button" class="copy-btn" onclick="copyText('cmd-cloud-up', this)">Copy</button>
+                <div class="quota-meter">
+                  <div class="quota-meter-head">
+                    <span><span data-zh>今日 64GB 沙箱算力时长 (Daily Compute)</span><span data-en>Daily 64GB Compute Time</span></span>
+                    <span id="meter-compute-text">0s / 600s (0%)</span>
                   </div>
+                  <div class="quota-track"><div id="meter-compute-bar" class="quota-fill"></div></div>
                 </div>
-                <div>
-                  <div class="cmd-label"><span data-zh>2. 在终端或浏览器审批 Agent 越界请求（含首次绑定 TOTP）：</span><span data-en>2. Approve boundary escalations from CLI or browser:</span></div>
-                  <div class="cmd-box">
-                    <code id="cmd-approve">aegis-os approve</code>
-                    <button type="button" class="copy-btn" onclick="copyText('cmd-approve', this)">Copy</button>
+
+                <div class="quota-meter">
+                  <div class="quota-meter-head">
+                    <span><span data-zh>并行协同 Agent 数 (Concurrent Agents)</span><span data-en>Concurrent Agents</span></span>
+                    <span id="meter-agents-text">0 / 1 (0%)</span>
                   </div>
-                </div>
-                <div>
-                  <div class="cmd-label"><span data-zh>3. 查看当前连接状态与配额 / 切回本机沙箱：</span><span data-en>3. Check cloud status &amp; quota / switch back to local mode:</span></div>
-                  <div class="cmd-box">
-                    <code id="cmd-status-down">aegis-os cloud status &amp;&amp; aegis-os cloud down</code>
-                    <button type="button" class="copy-btn" onclick="copyText('cmd-status-down', this)">Copy</button>
-                  </div>
+                  <div class="quota-track"><div id="meter-agents-bar" class="quota-fill"></div></div>
                 </div>
               </div>
-            </div>
 
-            <div id="quota-lookup-result" style="margin-top:1rem; padding:0.85rem 1rem; background:var(--bg-paper); border:1px solid var(--hairline); display:none;">
-              <div class="label-caps" style="color:var(--accent); margin-bottom:0.25rem;">LIVE BILLING &amp; QUOTA READOUT</div>
-              <div id="quota-lookup-body" style="font-family:var(--font-mono); font-size:0.78rem; color:var(--ink);"></div>
+              <div style="margin-top:1.25rem; padding-top:0.9rem; border-top:1px solid var(--hairline);">
+                <div class="label-caps" style="margin-bottom:0.5rem;">
+                  <span data-zh>我的活跃云端工作区 (MY ACTIVE CLOUD WORKSPACES)</span>
+                  <span data-en>MY ACTIVE CLOUD WORKSPACES</span>
+                </div>
+                <div id="workspaces-list">
+                  <p style="font-size:0.82rem; color:var(--ink-muted); margin:0;">
+                    <span data-zh>连接工作区密钥后将显示您名下正在运行的云端影子工作区。</span>
+                    <span data-en>Connect your workspace API key above to list your active cloud shadow workspaces.</span>
+                  </p>
+                </div>
+              </div>
             </div>
           </article>
-        </div>
-      </div>
-    </section>
-
-    <!-- 03 / ACTIVE WORKSPACES, PEERS & LEASES -->
-    <section id="telemetry-panel" class="sec-block">
-      <div class="container">
-        <div class="sec-head">
-          <div class="sec-head-left">
-            <span class="sec-num">03 / ACTIVE WORKSPACES, PEERS &amp; LEASES</span>
-            <h2 class="sec-title">
-              <span data-zh>活跃云端工作区、协同 Agent 与会话租约</span>
-              <span data-en>Active Cloud Workspaces, Peer Agents &amp; Session Leases</span>
-            </h2>
-          </div>
-          <span id="telemetry-org-badge" class="badge"><span data-zh>连接密钥后实时同步</span><span data-en>Live Sync When Key Connected</span></span>
-        </div>
-
-        <div class="grid-2">
-          <div class="card">
-            <div>
-              <p class="label-caps">CLOUD COW WORKSPACES &amp; ONLINE PEER AGENTS</p>
-              <h3 class="card-title">
-                <span data-zh>线上影子工作区与在线 Agent</span>
-                <span data-en>Cloud Shadow Workspaces &amp; Online Peers</span>
-              </h3>
-              <div id="workspaces-peers-list" style="margin-top:0.85rem;">
-                <p style="font-size:0.84rem; color:var(--ink-muted);">
-                  <span data-zh>尚未连接工作区密钥，或当前租户暂无活跃云端工作区。运行 <code>aegis-os cloud up</code> 后在此查看。</span>
-                  <span data-en>Connect your workspace API key above or run <code>aegis-os cloud up</code> to inspect active cloud CoW workspaces and peer agents.</span>
-                </p>
-              </div>
-            </div>
-          </div>
-
-          <div class="card">
-            <div>
-              <p class="label-caps">ACTIVE SESSION LEASES &amp; A2A TASKS</p>
-              <h3 class="card-title">
-                <span data-zh>已授权会话租约与跨 Agent 任务</span>
-                <span data-en>Granted Session Leases &amp; A2A Tasks</span>
-              </h3>
-              <div id="leases-tasks-list" style="margin-top:0.85rem;">
-                <p style="font-size:0.84rem; color:var(--ink-muted);">
-                  <span data-zh>当您批准 1 小时会话租约或 Agent 之间发起 A2A 任务委派时，活跃租约将在此处实时展示。</span>
-                  <span data-en>Approved session leases and multi-agent A2A tasks are displayed here in real time.</span>
-                </p>
-              </div>
-            </div>
-          </div>
         </div>
       </div>
     </section>
@@ -762,9 +697,9 @@
         </a>
         <div class="foot-right">
           <span>© 2026 Heurion Research · Aegis OS</span>
-          <a href="https://heurion.org/aegis-os/" class="foot-link"><span data-zh>概览</span><span data-en>Overview</span></a>
-          <a href="https://heurion.org/aegis-os/tutorial/" class="foot-link"><span data-zh>使用教程</span><span data-en>Tutorial</span></a>
-          <a href="/aegis-cloud/dashboard" class="foot-link"><span data-zh>控制台与订阅</span><span data-en>Console &amp; Pricing</span></a>
+          <a href="/aegis-os/" class="foot-link"><span data-zh>产品概览与购买</span><span data-en>Overview &amp; Pricing</span></a>
+          <a href="/aegis-os/tutorial/" class="foot-link"><span data-zh>使用教程</span><span data-en>Tutorial</span></a>
+          <a href="/aegis-cloud/dashboard" class="foot-link"><span data-zh>我的控制台</span><span data-en>My Console</span></a>
           <a href="https://github.com/heurion-org/aegis-os" target="_blank" rel="noopener" class="foot-link">GitHub</a>
         </div>
       </div>
@@ -775,10 +710,6 @@
     const apiBase = location.pathname.startsWith('/aegis-cloud') ? '/aegis-cloud' : '';
     const qs = new URLSearchParams(location.search);
     const hashParams = new URLSearchParams(location.hash.replace(/^#/, ''));
-
-    // Update relative links when mounted locally vs /aegis-cloud
-    const approveLinkEl = document.getElementById('standalone-approve-link');
-    if (approveLinkEl) approveLinkEl.href = (apiBase || '') + '/approve';
 
     let currentLang = localStorage.getItem('aegis_lang') || 'zh';
     function applyLang(lang) {
@@ -794,7 +725,6 @@
     }
     applyLang(currentLang);
 
-    // Load API key from URL #key=... or sessionStorage
     let authKey = hashParams.get('key') || sessionStorage.getItem('aegis_approve_key') || '';
     if (hashParams.get('key')) {
       sessionStorage.setItem('aegis_approve_key', authKey);
@@ -812,16 +742,6 @@
       return h;
     }
 
-    function copyText(codeId, btn) {
-      const el = document.getElementById(codeId);
-      if (!el) return;
-      navigator.clipboard.writeText(el.textContent.trim()).then(() => {
-        const prev = btn.textContent;
-        btn.textContent = currentLang === 'zh' ? '已复制' : 'Copied';
-        setTimeout(() => { btn.textContent = prev; }, 1400);
-      });
-    }
-
     function connectKey() {
       const val = document.getElementById('api-key-input').value.trim();
       if (!val) return;
@@ -834,102 +754,121 @@
       authKey = '';
       sessionStorage.removeItem('aegis_approve_key');
       document.getElementById('api-key-input').value = '';
+      document.getElementById('lookup-email-input').value = '';
       document.getElementById('key-org-hint').textContent = '';
       const badge = document.getElementById('conn-badge');
       badge.className = 'badge';
-      badge.innerHTML = '<span data-zh>未连接密钥</span><span data-en>No Key Connected</span>';
+      badge.innerHTML = '<span data-zh>未连接账户</span><span data-en>Not Connected</span>';
       applyLang(currentLang);
       refreshAll();
     }
 
-    function updateQuotaKpis(planTier, orgId, quotas) {
-      const planEl = document.getElementById('kpi-plan');
-      const orgEl = document.getElementById('kpi-org');
-      const sysEl = document.getElementById('kpi-syscalls');
-      const execEl = document.getElementById('kpi-exec-ms');
-      const agentsEl = document.getElementById('kpi-agents');
-
+    function updateSubscriptionAndQuotaUi(planTier, orgId, subscriptionActive, quotas) {
       const isPro = String(planTier || '').toLowerCase() === 'pro';
-      if (planEl) planEl.textContent = isPro ? 'Pro ($29/mo)' : 'Free ($0)';
-      if (orgEl && orgId) orgEl.textContent = 'Org: ' + orgId;
+      const tierLabel = isPro ? 'Pro ($29/mo)' : 'Free ($0)';
 
-      if (quotas) {
-        const usedSys = quotas.daily_syscalls_used ?? 0;
-        const limSys = quotas.daily_syscalls_limit ?? (isPro ? 20000 : 200);
-        if (sysEl) sysEl.textContent = usedSys + ' / ' + limSys;
+      document.getElementById('kpi-plan').textContent = tierLabel;
+      if (orgId) document.getElementById('kpi-org').textContent = 'Org: ' + orgId;
 
-        const usedSec = Math.round((quotas.daily_exec_ms_used ?? 0) / 1000);
-        const limSec = Math.round((quotas.daily_exec_ms_limit ?? (isPro ? 36000000 : 600000)) / 1000);
-        if (execEl) {
-          execEl.textContent = (currentLang === 'zh' ? '沙箱算力：' : 'Exec compute: ') + usedSec + 's / ' + limSec + 's';
-        }
-
-        const actAgents = quotas.active_agents_count ?? 0;
-        const maxAgents = quotas.max_concurrent_agents ?? (isPro ? 8 : 1);
-        if (agentsEl) agentsEl.textContent = actAgents + ' / ' + maxAgents;
+      const subBadge = document.getElementById('sub-status-badge');
+      if (subBadge) {
+        subBadge.className = isPro ? 'badge badge-ok' : 'badge';
+        subBadge.textContent = (currentLang === 'zh' ? '套餐状态：' : 'Plan: ') + tierLabel;
       }
+
+      const subPill = document.getElementById('sub-tier-pill');
+      if (subPill) subPill.textContent = isPro ? 'PRO ($29/MO)' : 'FREE ($0/MO)';
+
+      const headingEl = document.getElementById('sub-card-heading');
+      if (headingEl) {
+        headingEl.textContent = isPro
+          ? (currentLang === 'zh' ? '当前订阅：Pro 专业版 ($29 / 月)' : 'Current Plan: Pro Plan ($29 / month)')
+          : (currentLang === 'zh' ? '当前订阅：Free 免费版 ($0 / 月)' : 'Current Plan: Free Tier ($0 / month)');
+      }
+
+      document.getElementById('sub-org-val').textContent = orgId || '—';
+      document.getElementById('sub-active-val').textContent = isPro || subscriptionActive ? 'Active (Pro)' : 'Free Tier';
+      document.getElementById('sub-ws-limit').textContent = isPro ? '16 Workspaces' : '1 Workspace';
+      document.getElementById('sub-agent-limit').textContent = isPro ? '8 Agents' : '1 Agent';
+      document.getElementById('sub-syscall-limit').textContent = isPro ? '20,000 / day' : '200 / day';
+      document.getElementById('sub-compute-limit').textContent = isPro ? '36,000s (10 hrs / day)' : '600s (10 min / day)';
+
+      const q = quotas || {};
+      const usedSys = q.daily_syscalls_used ?? 0;
+      const limSys = q.daily_syscalls_limit ?? (isPro ? 20000 : 200);
+      const sysPct = Math.min(100, Math.round((usedSys / Math.max(1, limSys)) * 100));
+
+      const usedSec = Math.round((q.daily_exec_ms_used ?? 0) / 1000);
+      const limSec = Math.round((q.daily_exec_ms_limit ?? (isPro ? 36000000 : 600000)) / 1000);
+      const compPct = Math.min(100, Math.round((usedSec / Math.max(1, limSec)) * 100));
+
+      const actAgents = q.active_agents_count ?? 0;
+      const maxAgents = q.max_concurrent_agents ?? (isPro ? 8 : 1);
+      const agPct = Math.min(100, Math.round((actAgents / Math.max(1, maxAgents)) * 100));
+
+      document.getElementById('kpi-syscalls').textContent = usedSys + ' / ' + limSys;
+      document.getElementById('kpi-agents-sub').textContent = (currentLang === 'zh' ? '并发 Agent：' : 'Parallel agents: ') + actAgents + ' / ' + maxAgents;
+      document.getElementById('kpi-compute').textContent = usedSec + 's / ' + limSec + 's';
+
+      document.getElementById('meter-syscalls-text').textContent = usedSys + ' / ' + limSys + ' (' + sysPct + '%)';
+      document.getElementById('meter-syscalls-bar').style.width = sysPct + '%';
+
+      document.getElementById('meter-compute-text').textContent = usedSec + 's / ' + limSec + 's (' + compPct + '%)';
+      document.getElementById('meter-compute-bar').style.width = compPct + '%';
+
+      document.getElementById('meter-agents-text').textContent = actAgents + ' / ' + maxAgents + ' (' + agPct + '%)';
+      document.getElementById('meter-agents-bar').style.width = agPct + '%';
     }
 
     async function lookupBillingStatus() {
-      const email = document.getElementById('pro-email-input').value.trim();
-      const org = document.getElementById('pro-org-input').value.trim() || currentOrgId;
-      const statusEl = document.getElementById('pro-checkout-status');
-      const boxEl = document.getElementById('quota-lookup-result');
-      const bodyEl = document.getElementById('quota-lookup-body');
-
-      if (!email && !org) {
-        statusEl.style.display = 'block';
-        statusEl.style.color = 'var(--danger)';
-        statusEl.textContent = currentLang === 'zh'
-          ? '请输入工作邮箱或租户 org_id 进行查询。'
-          : 'Please enter your billing email or org_id to check quota.';
+      const email = (document.getElementById('lookup-email-input').value || document.getElementById('pro-email-input').value || '').trim();
+      const msgEl = document.getElementById('lookup-status-msg');
+      if (!email && !currentOrgId) {
+        msgEl.style.display = 'block';
+        msgEl.style.color = 'var(--danger)';
+        msgEl.textContent = currentLang === 'zh' ? '请输入购买邮箱进行查询。' : 'Please enter your billing email to lookup.';
         return;
       }
 
-      statusEl.style.display = 'block';
-      statusEl.style.color = 'var(--ink-secondary)';
-      statusEl.textContent = currentLang === 'zh' ? '正在查询订阅与配额状态…' : 'Checking subscription & quota status…';
+      msgEl.style.display = 'block';
+      msgEl.style.color = 'var(--ink-secondary)';
+      msgEl.textContent = currentLang === 'zh' ? '正在查询您的订阅与配额信息…' : 'Looking up your subscription & quotas…';
 
       try {
         const params = new URLSearchParams();
         if (email) params.set('email', email);
-        if (org) params.set('org_id', org);
+        if (currentOrgId) params.set('org_id', currentOrgId);
         const res = await fetch(apiBase + '/v1/billing/status?' + params.toString(), { headers: authHeaders() });
         const data = await res.json();
         if (!res.ok) throw new Error(data.error || res.statusText);
 
-        currentOrgId = data.org_id || org;
-        updateQuotaKpis(data.plan_tier, data.org_id, data.quotas);
+        currentOrgId = data.org_id || currentOrgId;
+        updateSubscriptionAndQuotaUi(data.plan_tier, data.org_id, data.subscription_active, data.quotas);
 
-        boxEl.style.display = 'block';
-        const q = data.quotas || {};
-        bodyEl.innerHTML =
-          '<div>Org: <strong>' + (data.org_id || '-') + '</strong> · Plan: <strong>' + String(data.plan_tier || 'free').toUpperCase() + '</strong></div>' +
-          '<div>Syscalls Today: ' + (q.daily_syscalls_used ?? 0) + ' / ' + (q.daily_syscalls_limit ?? 200) + '</div>' +
-          '<div>Parallel Agents: ' + (q.active_agents_count ?? 0) + ' / ' + (q.max_concurrent_agents ?? 1) + '</div>';
-
-        statusEl.style.color = 'var(--accent)';
-        statusEl.textContent = currentLang === 'zh'
-          ? '已同步租户 ' + (data.org_id || '') + ' 的最新套餐与配额。'
-          : 'Synced latest plan & quota for ' + (data.org_id || '') + '.';
+        const badge = document.getElementById('conn-badge');
+        if (badge && data.org_id) {
+          badge.className = 'badge badge-ok';
+          badge.textContent = (currentLang === 'zh' ? '已加载 · ' : 'Loaded · ') + data.org_id;
+        }
+        msgEl.style.color = 'var(--accent)';
+        msgEl.textContent = currentLang === 'zh'
+          ? '已同步租户 ' + (data.org_id || '') + ' 的订阅与配额状态。'
+          : 'Loaded subscription & quota status for ' + (data.org_id || '') + '.';
       } catch (e) {
-        statusEl.style.color = 'var(--danger)';
-        statusEl.textContent = (currentLang === 'zh' ? '查询失败：' : 'Lookup failed: ') + e.message;
+        msgEl.style.color = 'var(--danger)';
+        msgEl.textContent = (currentLang === 'zh' ? '查询失败：' : 'Lookup failed: ') + e.message;
       }
     }
 
     async function startWebProCheckout() {
-      const email = document.getElementById('pro-email-input').value.trim();
-      const org = document.getElementById('pro-org-input').value.trim() || currentOrgId || undefined;
+      const email = (document.getElementById('pro-email-input').value || document.getElementById('lookup-email-input').value || '').trim();
       const statusEl = document.getElementById('pro-checkout-status');
       const btn = document.getElementById('pro-checkout-btn');
 
       if (!email || !email.includes('@')) {
         statusEl.style.display = 'block';
         statusEl.style.color = 'var(--danger)';
-        statusEl.textContent = currentLang === 'zh'
-          ? '请先输入有效的工作邮箱（用于接收账单与绑定 TOTP 审批器）。'
-          : 'Please enter a valid work email first (used for Stripe receipt & TOTP setup).';
+        statusEl.textContent = currentLang === 'zh' ? '请输入您的工作邮箱。' : 'Please enter your work email.';
         document.getElementById('pro-email-input').focus();
         return;
       }
@@ -937,33 +876,24 @@
       btn.disabled = true;
       statusEl.style.display = 'block';
       statusEl.style.color = 'var(--ink-secondary)';
-      statusEl.textContent = currentLang === 'zh' ? '正在创建 Stripe Pro 订阅会话…' : 'Creating Stripe Pro checkout session…';
+      statusEl.textContent = currentLang === 'zh' ? '正在打开 Stripe 支付页面…' : 'Opening Stripe Checkout…';
 
       try {
         const res = await fetch(apiBase + '/v1/billing/checkout', {
           method: 'POST',
           headers: authHeaders(),
-          body: JSON.stringify({ plan_tier: 'pro', email, org_id: org })
+          body: JSON.stringify({ plan_tier: 'pro', email, org_id: currentOrgId || undefined })
         });
         const data = await res.json();
         if (!res.ok) throw new Error(data.error || res.statusText);
-
-        if (data.claim_token) {
-          const cliEl = document.getElementById('cmd-pro-cli');
-          if (cliEl) {
-            cliEl.textContent = 'aegis-os cloud subscribe --claim --claim-token ' + data.claim_token + ' && aegis-os cloud up';
-          }
-        }
         if (data.checkout_url) {
           window.open(data.checkout_url, '_blank', 'noopener');
           statusEl.style.color = 'var(--accent)';
-          statusEl.textContent = currentLang === 'zh'
-            ? '已在新标签页打开 Stripe 支付页面。支付完成后复制下方命令即可一键激活本机 Pro 密钥！'
-            : 'Stripe Checkout opened in a new tab. After payment, run the command below to claim your Pro key!';
+          statusEl.textContent = currentLang === 'zh' ? '已在新窗口打开 Stripe 支付页面。' : 'Stripe Checkout opened in a new tab.';
         }
       } catch (e) {
         statusEl.style.color = 'var(--danger)';
-        statusEl.textContent = (currentLang === 'zh' ? '创建订阅会话失败：' : 'Checkout failed: ') + e.message;
+        statusEl.textContent = (currentLang === 'zh' ? '发起支付失败：' : 'Checkout failed: ') + e.message;
       } finally {
         btn.disabled = false;
       }
@@ -975,7 +905,7 @@
       if (!email) return;
       msgEl.style.display = 'block';
       msgEl.style.color = 'var(--ink-secondary)';
-      msgEl.textContent = currentLang === 'zh' ? '正在发送 TOTP 扫码绑定链接…' : 'Sending TOTP QR setup email…';
+      msgEl.textContent = currentLang === 'zh' ? '正在发送绑定邮件…' : 'Sending QR setup email…';
       try {
         const res = await fetch(apiBase + '/v1/approver/email', {
           method: 'POST',
@@ -986,8 +916,8 @@
         if (!res.ok) throw new Error(data.error || res.statusText);
         msgEl.style.color = 'var(--accent)';
         msgEl.textContent = currentLang === 'zh'
-          ? '绑定链接已发送至 ' + email + '，请在手机或浏览器打开邮件中的链接完成扫码绑定。'
-          : 'Enrollment link sent to ' + email + '. Open it to scan your TOTP QR code.';
+          ? '绑定二维码链接已发送至 ' + email + '。'
+          : 'Enrollment link sent to ' + email + '.';
       } catch (e) {
         msgEl.style.color = 'var(--danger)';
         msgEl.textContent = (currentLang === 'zh' ? '发送失败：' : 'Failed: ') + e.message;
@@ -1008,7 +938,7 @@
       }
       if (msgEl) {
         msgEl.style.color = 'var(--ink-secondary)';
-        msgEl.textContent = currentLang === 'zh' ? '正在提交审批决定…' : 'Submitting decision…';
+        msgEl.textContent = currentLang === 'zh' ? '正在提交审批…' : 'Submitting decision…';
       }
       try {
         const res = await fetch(apiBase + '/v1/approvals/decide', {
@@ -1033,34 +963,22 @@
       }
     }
 
-    async function simulateEscalation() {
-      try {
-        await fetch(apiBase + '/v1/approvals/simulate', {
-          method: 'POST',
-          headers: authHeaders(),
-          body: JSON.stringify({ org_id: currentOrgId || 'org-demo', agent_id: 'agy-lead' })
-        });
-        await refreshAll();
-      } catch (_) {}
-    }
-
     function renderEscalations(list) {
       const root = document.getElementById('escalations-container');
-      const kpiPending = document.getElementById('kpi-pending');
-      if (kpiPending) kpiPending.textContent = String(list.length);
+      document.getElementById('kpi-pending').textContent = String(list.length);
 
       if (!list.length) {
         root.innerHTML =
-          '<div class="card" style="padding:1.25rem 1.5rem;">' +
-            '<div style="display:flex; align-items:center; justify-content:space-between; gap:1rem; flex-wrap:wrap;">' +
+          '<div class="card" style="padding:1.25rem 1.4rem;">' +
+            '<div style="display:flex; align-items:center; justify-content:space-between; gap:0.75rem;">' +
               '<div>' +
-                '<strong style="color:var(--accent); font-size:0.95rem;">' +
-                  (currentLang === 'zh' ? '当前无待审批的越界请求 (All Clear)' : 'No Pending Boundary Escalations (All Clear)') +
+                '<strong style="color:var(--accent); font-size:0.92rem;">' +
+                  (currentLang === 'zh' ? '当前无待审批的越界请求' : 'No Pending Boundary Requests') +
                 '</strong>' +
-                '<p style="font-size:0.84rem; margin:0.2rem 0 0;">' +
+                '<p style="font-size:0.82rem; margin:0.2rem 0 0;">' +
                   (currentLang === 'zh'
-                    ? '当 AI Agent 调用 <code>workspace_commit</code> 落盘代码或触发受控策略时，审批卡片会自动出现在此处。'
-                    : 'When an agent calls <code>workspace_commit</code> or triggers a gated action, the approval card appears here.') +
+                    ? '当您的 Agent 发起 <code>workspace_commit</code> 等越界操作时，审批项将在此处实时显示。'
+                    : 'When your agent triggers <code>workspace_commit</code> or a gated action, it will appear here for approval.') +
                 '</p>' +
               '</div>' +
               '<span class="badge badge-ok">0 PENDING</span>' +
@@ -1077,21 +995,20 @@
         const title = document.createElement('div');
         title.style.cssText = 'display:flex; justify-content:space-between; align-items:center; gap:0.75rem; flex-wrap:wrap;';
         title.innerHTML =
-          '<strong style="font-size:1rem; color:var(--ink);">' +
+          '<strong style="font-size:0.95rem; color:var(--ink);">' +
             (esc.action === 'workspace_commit'
               ? (currentLang === 'zh' ? '请求落盘合并至宿主机仓库 (workspace_commit)' : 'Approve Host Workspace Commit (workspace_commit)')
-              : (currentLang === 'zh' ? '请求执行受控边界动作：' : 'Approve Boundary Action: ') + (esc.action || 'syscall')) +
+              : (currentLang === 'zh' ? '请求执行受控动作：' : 'Approve Boundary Action: ') + (esc.action || 'syscall')) +
           '</strong>' +
-          '<span class="badge badge-warn">PENDING · ' + (esc.escalation_id || '') + '</span>';
+          '<span class="badge badge-warn">' + (esc.escalation_id || '') + '</span>';
         box.appendChild(title);
 
         const dl = document.createElement('dl');
         dl.className = 'esc-meta';
         const rows = [
-          ['Agent / Org', (esc.org_id ? esc.org_id + '/' : '') + (esc.agent_id || 'agent')],
+          ['Agent', (esc.org_id ? esc.org_id + '/' : '') + (esc.agent_id || 'agent')],
           ['Action', esc.action || 'workspace_commit'],
-          ['Resource', esc.resource || '/workspace'],
-          ['Reason', esc.reason || 'Human-in-the-loop boundary approval required']
+          ['Resource', esc.resource || '/workspace']
         ];
         if (esc.metadata && Array.isArray(esc.metadata.paths) && esc.metadata.paths.length) {
           rows.push(['Files', esc.metadata.paths.join(', ')]);
@@ -1104,7 +1021,7 @@
         box.appendChild(dl);
 
         const actions = document.createElement('div');
-        actions.style.cssText = 'display:flex; gap:0.55rem; align-items:center; flex-wrap:wrap; margin-top:0.65rem;';
+        actions.style.cssText = 'display:flex; gap:0.5rem; align-items:center; flex-wrap:wrap; margin-top:0.55rem;';
 
         if (requireTotp) {
           const inp = document.createElement('input');
@@ -1119,19 +1036,19 @@
 
         const bOnce = document.createElement('button');
         bOnce.className = 'btn btn-primary';
-        bOnce.textContent = currentLang === 'zh' ? '批准本次 (2m)' : 'Approve Once (2m)';
+        bOnce.textContent = currentLang === 'zh' ? '批准本次' : 'Approve Once';
         bOnce.onclick = () => decideEscalation(esc.escalation_id, 'approve', 120);
         actions.appendChild(bOnce);
 
         const bHour = document.createElement('button');
         bHour.className = 'btn btn-ghost';
-        bHour.textContent = currentLang === 'zh' ? '批准 1 小时租约' : 'Approve for 1 Hour';
+        bHour.textContent = currentLang === 'zh' ? '批准 1 小时' : 'Approve 1h';
         bHour.onclick = () => decideEscalation(esc.escalation_id, 'approve', 3600);
         actions.appendChild(bHour);
 
         const bDeny = document.createElement('button');
         bDeny.className = 'btn btn-danger';
-        bDeny.textContent = currentLang === 'zh' ? '拒绝 (Deny)' : 'Deny';
+        bDeny.textContent = currentLang === 'zh' ? '拒绝' : 'Deny';
         bDeny.onclick = () => decideEscalation(esc.escalation_id, 'deny', 0);
         actions.appendChild(bDeny);
 
@@ -1139,76 +1056,54 @@
 
         const msg = document.createElement('p');
         msg.id = 'esc-msg-' + esc.escalation_id;
-        msg.style.cssText = 'font-family:var(--font-mono); font-size:0.75rem; margin-top:0.45rem;';
+        msg.style.cssText = 'font-family:var(--font-mono); font-size:0.74rem; margin-top:0.4rem;';
         box.appendChild(msg);
 
         root.appendChild(box);
       }
     }
 
-    function renderTelemetry(data) {
-      const wpRoot = document.getElementById('workspaces-peers-list');
-      const ltRoot = document.getElementById('leases-tasks-list');
-      const wsCountEl = document.getElementById('kpi-workspaces');
+    function renderLeasesAndWorkspaces(data) {
+      const leasesRoot = document.getElementById('leases-list');
+      const wsRoot = document.getElementById('workspaces-list');
 
-      const workspaces = Array.isArray(data.cloud_workspaces) ? data.cloud_workspaces : [];
-      const peers = Array.isArray(data.peers) ? data.peers : [];
       const leases = Array.isArray(data.active_leases) ? data.active_leases : [];
-      const tasks = Array.isArray(data.a2a_tasks) ? data.a2a_tasks : [];
+      const workspaces = Array.isArray(data.workspaces) ? data.workspaces : (Array.isArray(data.cloud_workspaces) ? data.cloud_workspaces : []);
 
-      if (wsCountEl) {
-        wsCountEl.textContent = (currentLang === 'zh' ? '活跃云端工作区：' : 'Active cloud workspaces: ') + workspaces.length;
-      }
+      document.getElementById('kpi-leases-sub').textContent = (currentLang === 'zh' ? '生效租约：' : 'Active leases: ') + leases.length;
+      document.getElementById('kpi-workspaces').textContent = (currentLang === 'zh' ? '活跃云端工作区：' : 'Active workspaces: ') + workspaces.length;
 
-      if (!workspaces.length && !peers.length) {
-        wpRoot.innerHTML = '<p style="font-size:0.84rem; color:var(--ink-muted);">' +
-          (currentLang === 'zh' ? '当前暂无活跃云端工作区或在线 Peer Agent。' : 'No active cloud workspaces or online peer agents right now.') +
+      if (!leases.length) {
+        leasesRoot.innerHTML = '<p style="font-size:0.84rem; color:var(--ink-muted); margin:0;">' +
+          (currentLang === 'zh' ? '当前暂无生效中的会话租约。' : 'No active session leases right now.') +
           '</p>';
       } else {
-        wpRoot.innerHTML = '';
+        leasesRoot.innerHTML = '';
+        for (const l of leases) {
+          const row = document.createElement('div');
+          row.className = 'item-row';
+          row.innerHTML =
+            '<div><strong style="font-family:var(--font-mono); font-size:0.8rem;">' + (l.action_pattern || l.action || 'workspace_commit') + '</strong>' +
+            '<div style="font-size:0.75rem; color:var(--ink-muted);">Agent: ' + (l.agent_id || '*') + ' · Granted by: ' + (l.granted_by || l.approved_by || 'human') + '</div></div>' +
+            '<span class="badge badge-ok">ACTIVE LEASE</span>';
+          leasesRoot.appendChild(row);
+        }
+      }
+
+      if (!workspaces.length) {
+        wsRoot.innerHTML = '<p style="font-size:0.82rem; color:var(--ink-muted); margin:0;">' +
+          (currentLang === 'zh' ? '当前租户下暂无活跃的云端工作区。' : 'No active cloud workspaces under this tenant right now.') +
+          '</p>';
+      } else {
+        wsRoot.innerHTML = '';
         for (const ws of workspaces) {
           const row = document.createElement('div');
           row.className = 'item-row';
           row.innerHTML =
             '<div><strong style="font-family:var(--font-mono); font-size:0.8rem;">' + (ws.workspace_id || ws.agent_id || 'workspace') + '</strong>' +
-            '<div style="font-size:0.75rem; color:var(--ink-muted);">Files: ' + (ws.file_count ?? 0) + ' · Snapshots: ' + (ws.snapshot_count ?? 0) + '</div></div>' +
+            '<div style="font-size:0.75rem; color:var(--ink-muted);">State: ' + (ws.state || 'Active') + '</div></div>' +
             '<span class="badge badge-ok">CoW Shadow</span>';
-          wpRoot.appendChild(row);
-        }
-        for (const p of peers) {
-          const row = document.createElement('div');
-          row.className = 'item-row';
-          row.innerHTML =
-            '<div><strong style="font-family:var(--font-mono); font-size:0.8rem;">' + (p.agent_id || 'peer') + '</strong>' +
-            '<div style="font-size:0.75rem; color:var(--ink-muted);">Role: ' + (p.role || 'agent') + '</div></div>' +
-            '<span class="badge">' + (p.status || 'online') + '</span>';
-          wpRoot.appendChild(row);
-        }
-      }
-
-      if (!leases.length && !tasks.length) {
-        ltRoot.innerHTML = '<p style="font-size:0.84rem; color:var(--ink-muted);">' +
-          (currentLang === 'zh' ? '当前暂无活跃会话租约或跨 Agent 任务。' : 'No active session leases or A2A tasks right now.') +
-          '</p>';
-      } else {
-        ltRoot.innerHTML = '';
-        for (const l of leases) {
-          const row = document.createElement('div');
-          row.className = 'item-row';
-          row.innerHTML =
-            '<div><strong style="font-family:var(--font-mono); font-size:0.8rem;">' + (l.action || 'workspace_commit') + '</strong>' +
-            '<div style="font-size:0.75rem; color:var(--ink-muted);">Agent: ' + (l.agent_id || '*') + ' · Approved by: ' + (l.approved_by || 'human') + '</div></div>' +
-            '<span class="badge badge-ok">LEASE ACTIVE</span>';
-          ltRoot.appendChild(row);
-        }
-        for (const t of tasks) {
-          const row = document.createElement('div');
-          row.className = 'item-row';
-          row.innerHTML =
-            '<div><strong style="font-family:var(--font-mono); font-size:0.8rem;">' + (t.title || t.task_id || 'task') + '</strong>' +
-            '<div style="font-size:0.75rem; color:var(--ink-muted);">Owner: ' + (t.owner_agent || '-') + '</div></div>' +
-            '<span class="badge">' + (t.status || 'in_progress') + '</span>';
-          ltRoot.appendChild(row);
+          wsRoot.appendChild(row);
         }
       }
     }
@@ -1216,15 +1111,14 @@
     async function refreshAll() {
       const connBadge = document.getElementById('conn-badge');
       const totpBadge = document.getElementById('totp-status-badge');
-      const telBadge = document.getElementById('telemetry-org-badge');
 
       try {
         const statusUrl = apiBase + '/v1/status' + (currentOrgId ? '?org_id=' + encodeURIComponent(currentOrgId) : '');
         const res = await fetch(statusUrl, { headers: authHeaders() });
         if (res.status === 401 || res.status === 403) {
-          if (connBadge) {
+          if (connBadge && !currentOrgId) {
             connBadge.className = 'badge';
-            connBadge.textContent = currentLang === 'zh' ? '未连接密钥' : 'No Key Connected';
+            connBadge.textContent = currentLang === 'zh' ? '未连接账户' : 'Not Connected';
           }
           return;
         }
@@ -1235,18 +1129,17 @@
           connBadge.className = 'badge badge-ok';
           connBadge.textContent = (currentLang === 'zh' ? '已连接 · ' : 'Connected · ') + (currentOrgId || 'cloud');
         }
-        if (telBadge && currentOrgId) {
-          telBadge.className = 'badge badge-ok';
-          telBadge.textContent = 'ORG · ' + currentOrgId;
-        }
         const hintEl = document.getElementById('key-org-hint');
         if (hintEl && currentOrgId) hintEl.textContent = 'Org: ' + currentOrgId;
 
-        if (data.tenant_usage) {
-          updateQuotaKpis(data.tenant_usage.plan_tier, currentOrgId, data.tenant_usage);
+        if (currentOrgId) {
+          const bRes = await fetch(apiBase + '/v1/billing/status?org_id=' + encodeURIComponent(currentOrgId), { headers: authHeaders() });
+          if (bRes.ok) {
+            const bData = await bRes.json();
+            updateSubscriptionAndQuotaUi(bData.plan_tier, bData.org_id || currentOrgId, bData.subscription_active, bData.quotas);
+          }
         }
 
-        // Check TOTP enrollment status
         const isOperator = authKey.startsWith('aop_');
         if (!isOperator) {
           const appRes = await fetch(apiBase + '/v1/approver' + (currentOrgId ? '?org_id=' + encodeURIComponent(currentOrgId) : ''), { headers: authHeaders() });
@@ -1256,8 +1149,8 @@
             if (totpBadge) {
               totpBadge.className = appData.enrolled ? 'badge badge-ok' : 'badge badge-warn';
               totpBadge.textContent = appData.enrolled
-                ? (currentLang === 'zh' ? '已绑定 TOTP (' + (appData.email_masked || 'Authenticator') + ')' : 'TOTP Enrolled (' + (appData.email_masked || 'Authenticator') + ')')
-                : (currentLang === 'zh' ? '未绑定 TOTP' : 'TOTP Not Enrolled');
+                ? (currentLang === 'zh' ? '已绑定 (' + (appData.email_masked || 'TOTP') + ')' : 'Enrolled (' + (appData.email_masked || 'TOTP') + ')')
+                : (currentLang === 'zh' ? '未绑定 TOTP' : 'Not Enrolled');
             }
           }
         } else {
@@ -1265,7 +1158,7 @@
         }
 
         renderEscalations(Array.isArray(data.pending_escalations) ? data.pending_escalations : []);
-        renderTelemetry(data);
+        renderLeasesAndWorkspaces(data);
       } catch (_) {}
     }
 
