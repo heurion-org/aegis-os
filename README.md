@@ -1,6 +1,6 @@
 # Aegis OS (`aegis-os`)
 
-**[English](README.md) | [简体中文](README_CN.md)**
+**[English](README.md) | [简体中文](README_CN.md) | [Aegis OS Website](https://heurion.org/aegis-os/) | [Tutorial](https://heurion.org/aegis-os/tutorial/) | [Cloud Console & Pro Subscription ($29/mo)](https://heurion.org/aegis-cloud/dashboard) | [Approval Console](https://heurion.org/aegis-cloud/approve)**
 
 **A Transactional Multi-Tenant Operating System Runtime & Cloud PaaS for Eliminating Authorization Fatigue in Autonomous Coding Agents (`agy`, `claude`, `codex`)**
 

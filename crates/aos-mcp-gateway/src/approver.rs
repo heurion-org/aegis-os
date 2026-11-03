@@ -289,28 +289,57 @@ pub const ENROLL_PAGE_HTML: &str = r##"<!doctype html>
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
-<title>Aegis Cloud approver</title>
+<title>Aegis Cloud — Approver Enrollment · Heurion Research</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=Inter:wght@300;400;500;600;700&family=JetBrains+Mono:wght@400;500&family=Newsreader:ital,opsz,wght@0,6..72,300;0,6..72,400;1,6..72,300;1,6..72,400&display=swap" rel="stylesheet">
 <style>
-  :root { --bg:#f7f7f5; --fg:#1d1d1b; --muted:#6b6b66; --card:#fff; --line:#e4e4df; --accent:#1f6f50; }
-  @media (prefers-color-scheme: dark) { :root { --bg:#151514; --fg:#ececea; --muted:#9a9a94; --card:#1e1e1c; --line:#2f2f2c; --accent:#5fbf95; } }
-  body { margin:0; background:var(--bg); color:var(--fg); font:16px/1.5 system-ui, -apple-system, sans-serif; }
-  main { max-width:520px; margin:48px auto; padding:0 16px; }
-  .card { background:var(--card); border:1px solid var(--line); border-radius:12px; padding:24px; }
-  h1 { font-size:20px; margin:0 0 8px; }
-  p { color:var(--muted); margin:8px 0; }
-  button { background:var(--accent); color:#fff; border:0; border-radius:8px; padding:10px 18px; font-size:15px; cursor:pointer; }
-  button:disabled { opacity:.6; cursor:default; }
-  code { font-family:ui-monospace, monospace; word-break:break-all; background:var(--bg); padding:2px 6px; border-radius:4px; }
-  .qr { background:#fff; display:inline-block; padding:12px; border-radius:8px; margin:12px 0; }
-  .err { color:#c0392b; }
+  /* Heurion Research — Nordic / Scandinavian Editorial Design System (v6) */
+  :root {
+    --bg: #FAF8F4; --bg-elevated: #FDFCF9; --fg: #151C19; --muted: #4A534E; --line: #DFDAD0;
+    --accent: #233E33; --accent-soft: #E3ECE7; --mint: #00C472; --danger: #9E332E;
+    --serif: 'Newsreader', Georgia, serif;
+    --sans: 'Inter', -apple-system, BlinkMacSystemFont, sans-serif;
+    --mono: 'JetBrains Mono', ui-monospace, monospace;
+  }
+  * { box-sizing: border-box; }
+  body { margin: 0; background: var(--bg); color: var(--fg); font: 16px/1.65 var(--sans); -webkit-font-smoothing: antialiased; }
+  .nav { background: rgba(250, 248, 244, 0.92); border-bottom: 1px solid var(--line); padding: 1.1rem 2rem; display: flex; align-items: center; justify-content: space-between; }
+  .brand { display: inline-flex; align-items: center; gap: 0.65rem; color: var(--fg); text-decoration: none; font-weight: 700; font-size: 0.9rem; letter-spacing: 0.2em; }
+  .brand svg { width: 22px; height: 20px; }
+  main { max-width: 580px; margin: 48px auto; padding: 0 20px; }
+  .label-caps { font: 0.72rem/1.2 var(--mono); letter-spacing: 0.14em; text-transform: uppercase; color: #646D68; margin: 0 0 8px; }
+  .card { background: var(--bg-elevated); border: 1px solid var(--line); padding: 28px; }
+  h1 { font: 300 1.65rem/1.25 var(--serif); margin: 0 0 12px; color: var(--fg); }
+  p { color: var(--muted); margin: 10px 0; font-size: 0.95rem; }
+  button { background: var(--accent); color: #F4F1EA; border: 1px solid var(--accent); border-radius: 0; padding: 11px 22px; font: 500 0.85rem/1.3 var(--sans); letter-spacing: 0.02em; cursor: pointer; }
+  button:hover { background: var(--fg); border-color: var(--fg); }
+  button:disabled { opacity: .6; cursor: default; }
+  code { font: 0.82rem var(--mono); word-break: break-all; background: #EFECE4; padding: 3px 7px; border: 1px solid var(--line); }
+  .qr { background: #fff; border: 1px solid var(--line); display: inline-block; padding: 14px; margin: 14px 0; }
+  .err { color: var(--danger); }
+  a { color: var(--accent); }
 </style>
 </head>
 <body>
+<header class="nav">
+  <a class="brand" href="https://heurion.org/">
+    <svg viewBox="-2 6 96 88" aria-hidden="true">
+      <rect fill="#151C19" x="0" y="10" width="18" height="80" rx="9"/>
+      <rect fill="#151C19" x="62" y="30" width="18" height="60" rx="9"/>
+      <rect fill="#00C472" x="14" y="42" width="52" height="18" rx="9"/>
+      <circle fill="#00C472" cx="80" cy="20" r="11"/>
+    </svg>
+    <span>HEURION</span>
+  </a>
+  <a href="/aegis-cloud/dashboard" style="font:0.82rem var(--mono);text-decoration:none;color:var(--accent);">Aegis Cloud Console →</a>
+</header>
 <main><div class="card" id="card">
+  <p class="label-caps">AEGIS CLOUD · TOTP APPROVER ENROLLMENT</p>
   <h1>Become the approver for this Aegis Cloud org</h1>
   <p>You will add a code generator to your authenticator app (Google Authenticator, 1Password, …). Approving an agent's escalation will then require the 6-digit code from that app, on the command line or the web.</p>
   <p>Enrolling replaces any previous approver device for this org.</p>
-  <p><button id="go" onclick="enroll()">Enroll my authenticator</button></p>
+  <p style="margin-top:18px;"><button id="go" onclick="enroll()">Enroll my authenticator →</button></p>
   <p id="msg"></p>
 </div></main>
 <script>
@@ -325,6 +354,7 @@ pub const ENROLL_PAGE_HTML: &str = r##"<!doctype html>
       if (!res.ok) throw new Error(data.error || res.statusText);
       const card = document.getElementById('card');
       card.innerHTML = '';
+      const lbl = document.createElement('p'); lbl.className = 'label-caps'; lbl.textContent = 'ENROLLED · RFC 6238 TOTP'; card.appendChild(lbl);
       const h = document.createElement('h1'); h.textContent = 'Approver enrolled for ' + data.org_id; card.appendChild(h);
       const p1 = document.createElement('p'); p1.textContent = 'Scan this QR code with your authenticator app:'; card.appendChild(p1);
       const qr = document.createElement('div'); qr.className = 'qr'; qr.innerHTML = data.qr_svg; card.appendChild(qr);
@@ -348,73 +378,195 @@ pub const APPROVE_PAGE_HTML: &str = r##"<!doctype html>
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
-<title>Aegis OS — Boundary Approval</title>
+<title>Aegis OS — Boundary Approval · Heurion Research</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=Inter:wght@300;400;500;600;700&family=JetBrains+Mono:wght@400;500&family=Newsreader:ital,opsz,wght@0,6..72,300;0,6..72,400;1,6..72,300;1,6..72,400&family=Noto+Serif+SC:wght@300;400;500&display=swap" rel="stylesheet">
 <style>
-  :root { --bg:#f7f7f5; --fg:#1d1d1b; --muted:#6b6b66; --card:#fff; --line:#e4e4df; --accent:#1f6f50; --danger:#b83227; --code-bg:#f0f0ec; }
-  @media (prefers-color-scheme: dark) { :root { --bg:#151514; --fg:#ececea; --muted:#9a9a94; --card:#1e1e1c; --line:#2f2f2c; --accent:#5fbf95; --danger:#e05a4f; --code-bg:#252522; } }
-  * { box-sizing:border-box; }
-  body { margin:0; background:var(--bg); color:var(--fg); font:15px/1.55 system-ui, -apple-system, sans-serif; }
-  main { max-width:680px; margin:40px auto; padding:0 16px; }
-  header { display:flex; align-items:center; justify-content:space-between; margin-bottom:20px; }
-  .brand { font-weight:650; font-size:17px; letter-spacing:-0.01em; }
-  .badge { font-size:12px; padding:3px 9px; border-radius:99px; border:1px solid var(--line); color:var(--muted); background:var(--card); }
-  .card { background:var(--card); border:1px solid var(--line); border-radius:12px; padding:22px; margin-bottom:16px; }
-  h1 { font-size:19px; margin:0 0 6px; }
-  h2 { font-size:16px; margin:0 0 8px; }
-  p { color:var(--muted); margin:6px 0; }
-  code, pre { font-family:ui-monospace, SFMono-Regular, Menlo, monospace; font-size:13px; }
-  code { background:var(--code-bg); padding:2px 6px; border-radius:4px; word-break:break-all; }
-  pre { background:var(--code-bg); padding:12px; border-radius:8px; overflow-x:auto; margin:10px 0; color:var(--fg); }
-  .meta { display:grid; grid-template-columns:110px 1fr; gap:6px 12px; font-size:14px; margin:12px 0; padding:12px; background:var(--bg); border-radius:8px; }
-  .meta dt { color:var(--muted); font-weight:500; }
-  .meta dd { margin:0; font-family:ui-monospace, monospace; word-break:break-all; }
-  .row { display:flex; flex-wrap:wrap; gap:10px; align-items:center; margin-top:14px; }
-  input[type="text"], input[type="password"], input[type="email"] {
-    background:var(--bg); color:var(--fg); border:1px solid var(--line); border-radius:8px;
-    padding:9px 12px; font-size:14px; outline:none;
+  /* Heurion Research — Nordic / Scandinavian Editorial Design System (v6) */
+  :root {
+    --bg: #FAF8F4;
+    --bg-neutral: #EFECE4;
+    --card: #FDFCF9;
+    --fg: #151C19;
+    --muted: #4A534E;
+    --ink-muted: #646D68;
+    --line: #DFDAD0;
+    --accent: #233E33;
+    --accent-soft: #E3ECE7;
+    --mint: #00C472;
+    --danger: #9E332E;
+    --code-bg: #EFECE4;
+    --serif: 'Newsreader', 'Noto Serif SC', Georgia, serif;
+    --sans: 'Inter', -apple-system, BlinkMacSystemFont, 'PingFang SC', sans-serif;
+    --mono: 'JetBrains Mono', ui-monospace, SFMono-Regular, Menlo, monospace;
   }
-  input.totp { width:160px; font-family:ui-monospace, monospace; font-size:16px; letter-spacing:0.15em; text-align:center; }
-  button { background:var(--accent); color:#fff; border:0; border-radius:8px; padding:9px 16px; font-size:14px; font-weight:500; cursor:pointer; }
-  button.secondary { background:transparent; color:var(--fg); border:1px solid var(--line); }
-  button.danger { background:var(--danger); color:#fff; }
-  button:disabled { opacity:.55; cursor:default; }
-  .ok { color:var(--accent); font-weight:500; }
-  .err { color:var(--danger); }
+  *, *::before, *::after { box-sizing: border-box; }
+  body { margin: 0; background: var(--bg); color: var(--fg); font: 16px/1.68 var(--sans); -webkit-font-smoothing: antialiased; }
+  a { color: inherit; text-decoration: none; transition: color 0.18s ease, border-color 0.18s ease, background 0.18s ease; }
+  a:hover { color: var(--accent); }
+  .container { max-width: 1220px; margin: 0 auto; padding: 0 3.5rem; }
+  .nav {
+    position: sticky; top: 0; z-index: 50;
+    background: rgba(250, 248, 244, 0.92);
+    backdrop-filter: blur(12px); -webkit-backdrop-filter: blur(12px);
+    border-bottom: 1px solid var(--line);
+  }
+  .nav-inner {
+    max-width: 1220px; margin: 0 auto; padding: 1.2rem 3.5rem;
+    display: flex; align-items: center; justify-content: space-between; gap: 2rem; flex-wrap: wrap;
+  }
+  .brand-group { display: flex; align-items: center; gap: 0.85rem; }
+  .brand { display: inline-flex; align-items: center; gap: 0.7rem; color: var(--fg); }
+  .brand-mark { width: 24px; height: 22px; display: block; flex-shrink: 0; }
+  .brand-word { font: 700 0.92rem var(--sans); letter-spacing: 0.22em; text-transform: uppercase; color: var(--fg); }
+  .brand-sep { color: var(--line); font-weight: 300; }
+  .brand-sub { font: 0.68rem var(--mono); letter-spacing: 0.12em; text-transform: uppercase; color: var(--accent); padding: 0.18rem 0.52rem; background: var(--accent-soft); border: 1px solid rgba(35, 62, 51, 0.2); }
+  .nav-links { display: flex; align-items: center; gap: 2rem; }
+  .nav-link { font-size: 0.875rem; letter-spacing: 0.02em; color: var(--muted); }
+  .nav-link:hover, .nav-link-active { color: var(--fg); font-weight: 500; }
+  .nav-right { display: flex; align-items: center; gap: 0.85rem; flex-wrap: wrap; }
+  .badge { font: 0.68rem var(--mono); letter-spacing: 0.06em; padding: 0.24rem 0.65rem; border: 1px solid var(--line); color: var(--muted); background: var(--bg); }
+  .nav-cta { font-size: 0.8125rem; font-weight: 500; letter-spacing: 0.03em; padding: 0.52rem 1.15rem; border: 1px solid var(--fg); color: var(--fg); }
+  .nav-cta:hover { background: var(--accent); border-color: var(--accent); color: #F4F1EA; }
+  .sec-hero {
+    padding: 3.25rem 0 2.75rem;
+    background-color: var(--bg);
+    background-image:
+      linear-gradient(102deg, rgba(250, 248, 244, 0.95) 0%, rgba(250, 248, 244, 0.88) 55%, rgba(239, 236, 228, 0.76) 100%),
+      url('https://images.unsplash.com/photo-1542273917363-3b1817f69a2d?auto=format&fit=crop&w=2000&q=80');
+    background-size: cover; background-position: center 62%;
+    border-bottom: 1px solid var(--line);
+  }
+  .label-caps { font: 0.75rem var(--mono); letter-spacing: 0.14em; text-transform: uppercase; color: var(--ink-muted); margin: 0 0 0.65rem; }
+  .heading-1 { font: 300 clamp(1.85rem, 2.6vw, 2.45rem)/1.2 var(--serif); letter-spacing: -0.02em; color: var(--fg); margin: 0 0 0.6rem; }
+  .heading-1 em { font-style: italic; font-weight: 400; color: var(--accent); }
+  main.approve-main { max-width: 860px; margin: 2.75rem auto 4.5rem; padding: 0 2rem; }
+  .card { background: var(--card); border: 1px solid var(--line); border-radius: 0; padding: 1.75rem 2rem; margin-bottom: 1.25rem; }
+  h1 { font: 400 1.38rem/1.3 var(--serif); margin: 0 0 8px; color: var(--fg); }
+  h2 { font: 400 1.2rem/1.3 var(--serif); margin: 0 0 8px; color: var(--fg); }
+  p { color: var(--muted); margin: 6px 0; font-size: 0.9375rem; }
+  code, pre { font-family: var(--mono); font-size: 0.8rem; }
+  code { background: var(--code-bg); padding: 2px 6px; border: 1px solid var(--line); word-break: break-all; }
+  pre { background: #151C19; color: #F4F1EA; padding: 14px; border: 1px solid #151C19; overflow-x: auto; margin: 10px 0; }
+  .meta { display: grid; grid-template-columns: 130px 1fr; gap: 8px 14px; font-size: 0.85rem; margin: 14px 0; padding: 14px 16px; background: var(--bg); border: 1px solid var(--line); }
+  .meta dt { font-family: var(--mono); font-size: 0.72rem; letter-spacing: 0.08em; text-transform: uppercase; color: var(--ink-muted); }
+  .meta dd { margin: 0; font-family: var(--mono); font-size: 0.8rem; color: var(--fg); word-break: break-all; }
+  .row { display: flex; flex-wrap: wrap; gap: 10px; align-items: center; margin-top: 16px; }
+  input[type="text"], input[type="password"], input[type="email"] {
+    background: var(--bg); color: var(--fg); border: 1px solid var(--line); border-radius: 0;
+    padding: 0.52rem 0.85rem; font: 0.85rem var(--sans); outline: none;
+  }
+  input:focus { border-color: var(--accent); background: #fff; }
+  input.totp { width: 168px; font: 500 1rem var(--mono); letter-spacing: 0.18em; text-align: center; }
+  button { background: var(--accent); color: #F4F1EA; border: 1px solid var(--accent); border-radius: 0; padding: 0.52rem 1.15rem; font: 500 0.82rem/1.3 var(--sans); letter-spacing: 0.02em; cursor: pointer; transition: all 0.18s ease; }
+  button:hover { background: var(--fg); border-color: var(--fg); }
+  button.secondary { background: var(--card); color: var(--fg); border: 1px solid var(--line); }
+  button.secondary:hover { border-color: var(--accent); color: var(--accent); background: var(--bg); }
+  button.danger { background: transparent; color: var(--danger); border: 1px solid rgba(158, 51, 46, 0.4); }
+  button.danger:hover { background: rgba(158, 51, 46, 0.09); border-color: var(--danger); }
+  button:disabled { opacity: .55; cursor: default; }
+  .ok { color: var(--accent); font-weight: 500; }
+  .err { color: var(--danger); }
+  .foot { background: var(--bg); border-top: 1px solid var(--line); padding: 2rem 0; }
+  .foot-bar { display: flex; align-items: center; justify-content: space-between; gap: 1.5rem; flex-wrap: wrap; }
+  .foot-right { display: flex; flex-wrap: wrap; align-items: center; gap: 1.35rem; font-size: 0.78rem; color: var(--ink-muted); }
+  .foot-link { font: 0.72rem var(--mono); letter-spacing: 0.06em; color: var(--muted); }
+  @media (max-width: 900px) {
+    .container, .nav-inner { padding-left: 1.25rem; padding-right: 1.25rem; }
+    .nav-links { display: none; }
+    main.approve-main { padding: 0 1.25rem; }
+  }
 </style>
 </head>
 <body>
-<main>
-  <header>
-    <div class="brand">Aegis OS · Boundary Approval</div>
-    <div style="display:flex;align-items:center;gap:12px;">
-      <a id="dash-link" href="dashboard" style="font-size:13px;color:var(--accent);text-decoration:none;font-weight:500;">Dashboard ↗</a>
-      <span class="badge" id="mode-badge">Connecting…</span>
+  <header class="nav" role="banner">
+    <div class="nav-inner">
+      <div class="brand-group">
+        <a class="brand" href="https://heurion.org/" aria-label="Heurion Research">
+          <svg class="brand-mark" viewBox="-2 6 96 88" aria-hidden="true">
+            <rect fill="#151C19" x="0" y="10" width="18" height="80" rx="9"/>
+            <rect fill="#151C19" x="62" y="30" width="18" height="60" rx="9"/>
+            <rect fill="#00C472" x="14" y="42" width="52" height="18" rx="9"/>
+            <circle fill="#00C472" cx="80" cy="20" r="11"/>
+          </svg>
+          <span class="brand-word">HEURION</span>
+        </a>
+        <span class="brand-sep">/</span>
+        <span class="brand-sub">AEGIS OS</span>
+      </div>
+      <nav class="nav-links" aria-label="Console Navigation">
+        <a href="https://heurion.org/" class="nav-link">Heurion.org</a>
+        <a href="https://heurion.org/aegis-os/" class="nav-link">Aegis OS Overview</a>
+        <a href="https://heurion.org/aegis-os/tutorial/" class="nav-link">Tutorial</a>
+        <a id="dash-link" href="dashboard" class="nav-link">Cloud Console</a>
+        <a href="approve" class="nav-link nav-link-active">Approvals</a>
+        <a href="https://github.com/heurion-org/aegis-os" target="_blank" rel="noopener" class="nav-link">GitHub ↗</a>
+      </nav>
+      <div class="nav-right">
+        <span class="badge" id="mode-badge">Connecting…</span>
+        <a id="dash-cta" class="nav-cta" href="dashboard">Cloud Console / Pro →</a>
+      </div>
     </div>
   </header>
 
-  <div class="card" id="auth-box" style="display:none">
-    <h2>Authentication</h2>
-    <p>Paste your Aegis API Key (<code>ak_live_…</code>) or Operator Token (<code>aop_…</code>):</p>
-    <div class="row">
-      <input type="password" id="api-key-input" placeholder="ak_live_... or aop_..." style="flex:1">
-      <button onclick="saveKey()">Connect</button>
+  <section class="sec-hero">
+    <div class="container">
+      <p class="label-caps">AEGIS OS · POLICY KERNEL · HUMAN-IN-THE-LOOP</p>
+      <h1 class="heading-1">Aegis OS — <em>Boundary Approval</em></h1>
+      <p style="max-width:46rem;">Review and approve host boundary crossings (<code>workspace_commit</code>, sensitive hooks, or cross-tenant leases). Once approved, your coding agent automatically resumes and completes the operation without needing a second terminal.</p>
     </div>
-  </div>
+  </section>
 
-  <div class="card" id="enroll-box" style="display:none">
-    <h2>1-Time Approver Setup</h2>
-    <p>This Cloud org does not have a TOTP authenticator enrolled yet. Enter your email to receive a 1-click QR enrollment link:</p>
-    <div class="row">
-      <input type="email" id="enroll-email" placeholder="you@company.com" style="flex:1">
-      <button onclick="requestEmailEnroll()">Send Enrollment Link</button>
+  <main class="approve-main">
+    <div class="card" id="auth-box" style="display:none">
+      <p class="label-caps">AUTHENTICATION</p>
+      <h2>Connect Your Workspace Key</h2>
+      <p>Paste your Aegis API Key (<code>ak_live_…</code>) or Operator Token (<code>aop_…</code>):</p>
+      <div class="row">
+        <input type="password" id="api-key-input" placeholder="ak_live_... or aop_..." style="flex:1">
+        <button onclick="saveKey()">Connect</button>
+      </div>
     </div>
-    <p id="enroll-msg"></p>
-  </div>
 
-  <div id="escalations-root">
-    <div class="card"><p>Loading pending escalations…</p></div>
-  </div>
-</main>
+    <div class="card" id="enroll-box" style="display:none">
+      <p class="label-caps">RFC 6238 TOTP · 1-TIME SETUP</p>
+      <h2>1-Time Approver Setup</h2>
+      <p>This Cloud org does not have a TOTP authenticator enrolled yet. Enter your email to receive a 1-click QR enrollment link:</p>
+      <div class="row">
+        <input type="email" id="enroll-email" placeholder="you@company.com" style="flex:1">
+        <button onclick="requestEmailEnroll()">Send Enrollment Link</button>
+      </div>
+      <p id="enroll-msg"></p>
+    </div>
+
+    <div id="escalations-root">
+      <div class="card"><p>Loading pending escalations…</p></div>
+    </div>
+  </main>
+
+  <footer class="foot" role="contentinfo">
+    <div class="container">
+      <div class="foot-bar">
+        <a class="brand" href="https://heurion.org/" aria-label="Heurion Research">
+          <svg class="brand-mark" viewBox="-2 6 96 88" aria-hidden="true">
+            <rect fill="#151C19" x="0" y="10" width="18" height="80" rx="9"/>
+            <rect fill="#151C19" x="62" y="30" width="18" height="60" rx="9"/>
+            <rect fill="#00C472" x="14" y="42" width="52" height="18" rx="9"/>
+            <circle fill="#00C472" cx="80" cy="20" r="11"/>
+          </svg>
+          <span class="brand-word">HEURION</span>
+        </a>
+        <div class="foot-right">
+          <span>© 2026 Heurion Research · Aegis OS</span>
+          <a href="https://heurion.org/aegis-os/" class="foot-link">Aegis OS</a>
+          <a href="https://heurion.org/aegis-os/tutorial/" class="foot-link">Tutorial</a>
+          <a id="foot-dash-link" href="dashboard" class="foot-link">Cloud Console</a>
+          <a href="https://github.com/heurion-org/aegis-os" target="_blank" rel="noopener" class="foot-link">GitHub</a>
+        </div>
+      </div>
+    </div>
+  </footer>
 <script>
   const qs = new URLSearchParams(location.search);
   const hashParams = new URLSearchParams(location.hash.replace(/^#/, ''));
@@ -422,8 +574,10 @@ pub const APPROVE_PAGE_HTML: &str = r##"<!doctype html>
   const targetOrg = qs.get('org') || '';
   const mode = qs.get('mode') || 'cloud';
   const apiBase = location.pathname.startsWith('/aegis-cloud') ? '/aegis-cloud' : '';
-  const dashLink = document.getElementById('dash-link');
-  if (dashLink) dashLink.href = apiBase + '/dashboard';
+  ['dash-link', 'dash-cta', 'foot-dash-link'].forEach(id => {
+    const el = document.getElementById(id);
+    if (el) el.href = apiBase + '/dashboard';
+  });
   let authKey = hashParams.get('key') || sessionStorage.getItem('aegis_approve_key') || '';
   if (hashParams.get('key')) {
     sessionStorage.setItem('aegis_approve_key', authKey);

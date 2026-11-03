@@ -1,6 +1,6 @@
 # Aegis OS (`aegis-os`)
 
-**[English](README.md) | [简体中文](README_CN.md)**
+**[English](README.md) | [简体中文](README_CN.md) | [Aegis OS 官网概览](https://heurion.org/aegis-os/) | [使用教程](https://heurion.org/aegis-os/tutorial/) | [云端控制台与 Pro 订阅 ($29/月)](https://heurion.org/aegis-cloud/dashboard) | [边界审批台](https://heurion.org/aegis-cloud/approve)**
 
 **面向自主编程 Agent（`agy`、`claude`、`codex`）的事务型多租户操作系统运行时与云端沙箱 PaaS —— 彻底消除授权弹窗疲劳，兼顾零信任内核隔离与多 Agent 协同**
 
@@ -63,13 +63,16 @@ aegis-os install
 1. **直接进入任意项目目录启动你的编程 Agent**（运行 `agy`、`claude` 或 `codex`）。
 2. **全自动 CoW 影子工作区与内核沙箱守护**：
    - Agent 的所有文件读写（`fs_read`、`fs_write`、`fs_edit`）与命令执行（`proc_exec`）自动在毫秒级克隆的 CoW 影子工作区和内核沙箱中运行，宿主机 `~/.ssh`、`~/.aws` 等敏感凭证被内核强制屏蔽。
-   - 当你满意 Agent 的修改并准备落盘时，Agent 调用 `workspace_diff` -> `workspace_commit`，通过 4 层 LCS Diff3 三路合并引擎安全写回宿主机。
-3. **常用运维与状态命令**：
+   - 当你满意 Agent 的修改并准备落盘时，Agent 调用 `workspace_diff` -> `workspace_commit`，通过 4 层 LCS Diff3 三路合并引擎安全写回宿主机。桌面环境下会自动弹出网页审批台（`/approve`，点击批准后自动续跑），纯终端/SSH 下也可运行 `aegis-os approve`（或简写 `aos approve`）一键放行。
+3. **常用运维、审批与云端订阅命令**：
    ```bash
-   aegis-os doctor   # 检查 AGY / Claude Code / Codex 挂载状态
-   aegis-os top      # 终端实时查看多 Agent 协同雷达、A2A 任务与活跃租约
-   aegis-os stats    # 查看 GitHub 下载量与匿名活跃用户统计看板
+   aegis-os approve                                  # 一键批准当前最新待处理的边界提交（支持 --web 打开网页审批台）
+   aegis-os cloud subscribe --plan pro --wait        # 一条命令完成 Pro 订阅 ($29/月)、认领密钥并启用零负载云端沙箱
+   aegis-os doctor                                   # 检查 AGY / Claude Code / Codex 挂载状态
+   aegis-os top                                      # 终端实时查看多 Agent 协同雷达、A2A 任务与活跃租约
+   aegis-os stats                                    # 查看 GitHub 下载量与匿名活跃用户统计看板
    ```
+   - **Aegis Cloud 开发者控制台与在线订阅**：[https://heurion.org/aegis-cloud/dashboard](https://heurion.org/aegis-cloud/dashboard)
 
 ---
 
