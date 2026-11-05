@@ -105,8 +105,8 @@ enum Commands {
         /// Session mode (`implement` only in Phase 1)
         #[arg(long, default_value = "implement")]
         mode: String,
-        /// Workspace domain profile (`code`, `docs`, `data`, `binary`, `app_state`, `memory`, `mixed`)
-        #[arg(long, default_value = "code")]
+        /// Workspace domain profile (`auto`, `code`, `docs`, `data`, `binary`, `app_state`, `memory`, `mixed`)
+        #[arg(long, default_value = "auto")]
         profile: String,
         /// Enforcement level (`enforced` only in Phase 1)
         #[arg(long, default_value = "enforced")]

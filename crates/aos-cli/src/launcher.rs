@@ -1091,6 +1091,68 @@ async fn start_egress(
     Ok((EgressGuard { handle, sock }, proxy, token))
 }
 
+fn detect_profile(root: &Path) -> &'static str {
+    if root.join(".git").exists()
+        || root.join("Cargo.toml").exists()
+        || root.join("package.json").exists()
+        || root.join("pyproject.toml").exists()
+        || root.join("go.mod").exists()
+    {
+        return "code";
+    }
+
+    let mut docs = 0usize;
+    let mut data = 0usize;
+    let mut binary = 0usize;
+    fn walk(dir: &Path, depth: usize, docs: &mut usize, data: &mut usize, binary: &mut usize) {
+        if depth > 3 {
+            return;
+        }
+        let Ok(entries) = std::fs::read_dir(dir) else {
+            return;
+        };
+        for entry in entries.flatten() {
+            let path = entry.path();
+            let Ok(ft) = entry.file_type() else {
+                continue;
+            };
+            if ft.is_dir() {
+                if matches!(
+                    entry.file_name().to_string_lossy().as_ref(),
+                    "node_modules" | "target" | ".git" | ".venv" | "dist" | "build"
+                ) {
+                    continue;
+                }
+                walk(&path, depth + 1, docs, data, binary);
+                continue;
+            }
+            if !ft.is_file() {
+                continue;
+            }
+            match path
+                .extension()
+                .and_then(|s| s.to_str())
+                .unwrap_or("")
+                .to_ascii_lowercase()
+                .as_str()
+            {
+                "md" | "mdx" | "tex" | "bib" | "docx" | "pptx" => *docs += 1,
+                "csv" | "tsv" | "parquet" | "json" | "jsonl" | "sql" | "ipynb" => *data += 1,
+                "png" | "jpg" | "jpeg" | "tiff" | "pdf" | "psd" | "cad" | "svg" => *binary += 1,
+                _ => {}
+            }
+        }
+    }
+    walk(root, 0, &mut docs, &mut data, &mut binary);
+    match (docs > 0, data > 0, binary > 0) {
+        (true, false, false) => "docs",
+        (false, true, false) => "data",
+        (false, false, true) => "binary",
+        (false, false, false) => "code",
+        _ => "mixed",
+    }
+}
+
 fn bwrap_supports_bind_fd(path: &Path) -> bool {
     std::process::Command::new(path)
         .arg("--help")
@@ -1131,7 +1193,10 @@ async fn run_inner(
     if !matches!(mode.as_str(), "implement" | "observe") {
         bail!("aos run: mode '{mode}' is not implemented; use 'implement' or 'observe'");
     }
-    if !matches!(profile, "code" | "docs" | "data" | "binary" | "app_state" | "memory" | "mixed") {
+    if !matches!(
+        profile,
+        "auto" | "code" | "docs" | "data" | "binary" | "app_state" | "memory" | "mixed"
+    ) {
         bail!("aos run: unknown profile '{profile}'");
     }
     let enforcement = enforcement.to_ascii_lowercase();
@@ -1164,6 +1229,11 @@ async fn run_inner(
         bail!("aos run: workspace {} is not a directory", project.display());
     }
     validate_workspace_roots(&project, host_home, runtime_dir)?;
+    let profile = if profile.eq_ignore_ascii_case("auto") {
+        detect_profile(&project).to_string()
+    } else {
+        profile.to_ascii_lowercase()
+    };
     let host_name = project
         .file_name()
         .and_then(|s| s.to_str())
@@ -1290,7 +1360,7 @@ async fn run_inner(
         "session_id": session_id.clone(),
         "mode": mode.clone(),
         "enforcement": "enforced-fs",
-        "profile": profile,
+        "profile": profile.clone(),
         "org_id": identity.org_id.clone(),
         "agent_id": identity.agent_id.clone(),
         "workspace": project.display().to_string(),
