@@ -18,6 +18,10 @@ Phase 1 已在 `main` 落地以下能力：
 - 出站：私有 netns + identity-pinned CONNECT 代理 + Unix-socket bridge + 域名 allowlist；宿主 loopback 不可达。
 - 会话：`aos status` / `aos last` / `aos diff` / `aos commit` / `aos discard`；`aos agent list` / `aos agent doctor`。
 - `--mode observe`：项目只读；Agent home 可写。
+- `--profile auto`：按工作区内容检测 code / docs / data / binary / mixed。
+- `aos install --enforce`：为 claude / codex / agy / opencode / hermes 创建 `~/.aegis/bin` shim；`aos install` 同时写入 OpenCode MCP 配置。
+- `aos-core::effect`：EffectKind / ResourceScope / Reversibility / ArtifactKind 与稳定 action 映射，供 Phase 2 policy 使用。
+- `aos commit`：敏感路径默认拒绝，需 `--allow-sensitive`。
 - 已修复：大文件 CoW 自指 symlink、工具链凭据泄露、`workspace=$HOME` 复制敏感目录、TIOCSTI、bwrap 版本探测、resolv.conf、node_modules 自指、Ctrl-C、OAuth 写回、权限、Git shim、NixOS/Linuxbrew 兼容。
 
 **尚未完成**：L7 DLP / Base URL 反向代理 / opt-in MITM、OpenCode/Hermes 的 install-time plugin 配置、完整 policy broker/租约/审批 UI、macOS Seatbelt、DomainProfile 的 docs/data/binary 合并器、Phase 5 的 Office CRDT / CAS / AAP / UOMP。
@@ -1647,7 +1651,7 @@ aegis-os
 ├── uninstall [--shim-only]
 ├── doctor [--agent <id>]
 ├── status [--json]
-├── run [--mode observe|implement] [--profile code|docs|data|binary|app_state|memory|mixed] [--headless] [--enforcement ...] -- <agent> [...]
+├── run [--mode observe|implement] [--profile auto|code|docs|data|binary|app_state|memory|mixed] [--enforcement ...] -- <agent> [...]
 ├── last
 ├── diff [--session <id>] [--render]
 ├── verify [--session <id>]
