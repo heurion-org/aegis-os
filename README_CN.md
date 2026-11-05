@@ -61,6 +61,7 @@ aegis-os install
 基于 launcher 的 enforced 模式已可在 Linux 上试用：
 
 ```bash
+aegis-os install --enforce   # 可选：创建 ~/.aegis/bin/claude 等 shim
 aegis-os --workspace . run -- claude
 aegis-os status
 aegis-os diff

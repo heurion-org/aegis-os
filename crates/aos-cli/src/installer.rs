@@ -305,7 +305,7 @@ You are running inside the **Aegis OS Runtime (`aegis-os`)** with an isolated Co
         let updated_md = replace_or_append_aegis_block(&existing_md, shared_agent_prompt);
         tokio::fs::write(&agy_rules_path, updated_md).await?;
     }
-    println!("[1/3] AGY (Antigravity) configured:");
+    println!("[1/4] AGY (Antigravity) configured:");
     println!("      - MCP Server:  {}", agy_mcp_path.display());
     println!("      - Auto-Hooks:  {}", agy_hooks_path.display());
     println!("      - Auto-Allow:  {} (32 `mcp(aegis-os/*)` rules)", agy_cli_settings_path.display());
@@ -440,7 +440,7 @@ You are running inside the **Aegis OS Runtime (`aegis-os`)** with an isolated Co
         let updated_md = replace_or_append_aegis_block(&existing_md, shared_agent_prompt);
         tokio::fs::write(&claude_md_path, updated_md).await?;
     }
-    println!("\n[2/3] Claude Code (`claude`) configured:");
+    println!("\n[2/4] Claude Code (`claude`) configured:");
     println!("      - MCP Server:  {}", claude_mcp_path.display());
     println!("      - Auto-Allow:  {} (32 `mcp__aegis-os__*` rules)", claude_settings_path.display());
     println!("      - Global Rule: {}", claude_md_path.display());
@@ -478,11 +478,140 @@ startup_timeout_sec = 30
         let updated_agents = replace_or_append_aegis_block(&existing_agents, shared_agent_prompt);
         tokio::fs::write(&codex_agents_md, updated_agents).await?;
     }
-    println!("\n[3/3] OpenAI Codex (`codex`) configured:");
+    println!("\n[3/4] OpenAI Codex (`codex`) configured:");
     println!("      - MCP Server:  {}", codex_toml_path.display());
     println!("      - Global Rule: {}", codex_agents_md.display());
 
-    println!("\nDone! You can now directly run `agy`, `claude`, or `codex` in any project directory.");
+    // ------------------------------------------------------------------------
+    // 4. Configure OpenCode (`~/.config/opencode/opencode.json`)
+    // ------------------------------------------------------------------------
+    let opencode_dir = home_dir.join(".config").join("opencode");
+    let opencode_json = opencode_dir.join("opencode.json");
+    let opencode_jsonc = opencode_dir.join("opencode.jsonc");
+    let opencode_agents = opencode_dir.join("AGENTS.md");
+    if opencode_jsonc.exists() && !opencode_json.exists() {
+        println!(
+            "\n[4/4] OpenCode uses {}; Aegis left it untouched. Add the `aegis-os` MCP server \
+             manually or rename it to opencode.json.",
+            opencode_jsonc.display()
+        );
+    } else {
+        merge_json_file(
+            &opencode_json,
+            |root| {
+                let obj = root.as_object_mut().unwrap();
+                obj.insert(
+                    "$schema".to_string(),
+                    json!("https://opencode.ai/config.json"),
+                );
+                obj.insert("snapshots".to_string(), json!(false));
+                let mcp = obj
+                    .entry("mcp")
+                    .or_insert_with(|| json!({}));
+                if !mcp.is_object() {
+                    *mcp = json!({});
+                }
+                let servers = mcp
+                    .as_object_mut()
+                    .unwrap()
+                    .entry("servers")
+                    .or_insert_with(|| json!({}));
+                if !servers.is_object() {
+                    *servers = json!({});
+                }
+                servers.as_object_mut().unwrap().insert(
+                    "aegis-os".to_string(),
+                    json!({
+                        "type": "local",
+                        "command": [
+                            bin_str,
+                            "--client", "opencode",
+                            "--org", "auto",
+                            "--agent", "auto",
+                            "--runtime-dir", rt_str,
+                            "mcp-stdio"
+                        ],
+                        "codemode": false
+                    }),
+                );
+            },
+            dry_run,
+        )
+        .await?;
+        if !dry_run {
+            tokio::fs::create_dir_all(&opencode_dir).await?;
+            let existing = tokio::fs::read_to_string(&opencode_agents)
+                .await
+                .unwrap_or_default();
+            tokio::fs::write(
+                &opencode_agents,
+                replace_or_append_aegis_block(&existing, shared_agent_prompt),
+            )
+            .await?;
+        }
+        println!("\n[4/4] OpenCode (`opencode`) configured:");
+        println!("      - MCP Server:  {}", opencode_json.display());
+        println!("      - Global Rule: {}", opencode_agents.display());
+    }
+
+    println!(
+        "\nDone! You can now directly run `agy`, `claude`, `codex`, or `opencode` in any project directory."
+    );
+    Ok(())
+}
+
+pub(crate) fn install_enforced_shims(home_dir: &Path, dry_run: bool) -> anyhow::Result<()> {
+    let shim_dir = home_dir.join(".aegis").join("bin");
+    let aegis = std::env::current_exe().unwrap_or_else(|_| PathBuf::from("aegis-os"));
+    let mut agents = Vec::new();
+    for agent in ["claude", "codex", "agy", "opencode", "hermes"] {
+        let mut real = None;
+        if let Ok(path_env) = std::env::var("PATH") {
+            for dir in std::env::split_paths(&path_env) {
+                if dir == shim_dir {
+                    continue;
+                }
+                let candidate = dir.join(agent);
+                if candidate.is_file() {
+                    real = Some(candidate);
+                    break;
+                }
+            }
+        }
+        let Some(real) = real else {
+            continue;
+        };
+        let script = format!(
+            "#!/bin/sh\nexec \"{}\" --workspace \"$PWD\" run -- \"{}\" \"$@\"\n",
+            aegis.display(),
+            real.display()
+        );
+        let path = shim_dir.join(agent);
+        if dry_run {
+            println!("  - would write {} -> {}", path.display(), real.display());
+        } else {
+            std::fs::create_dir_all(&shim_dir)?;
+            std::fs::write(&path, script)?;
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::PermissionsExt;
+                std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755))?;
+            }
+        }
+        agents.push(agent);
+    }
+    println!("\n[enforce] Aegis launcher shims:");
+    if agents.is_empty() {
+        println!("  - no supported agents found on PATH");
+    } else {
+        for agent in &agents {
+            println!("  - {}", shim_dir.join(agent).display());
+        }
+        println!(
+            "  Add this to your shell profile: export PATH=\"{}:$PATH\"",
+            shim_dir.display()
+        );
+    }
     Ok(())
 }
 
@@ -495,6 +624,8 @@ pub(crate) async fn run_doctor(home_dir: &Path) -> anyhow::Result<()> {
         ("Claude Code MCP Config", home_dir.join(".claude.json")),
         ("Claude Code Permissions", home_dir.join(".claude/settings.json")),
         ("Codex CLI Config", home_dir.join(".codex/config.toml")),
+        ("OpenCode Config", home_dir.join(".config/opencode/opencode.json")),
+        ("OpenCode Rules", home_dir.join(".config/opencode/AGENTS.md")),
     ];
 
     println!("Aegis OS Integration Health Check (`aegis-os doctor`):");

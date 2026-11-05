@@ -95,6 +95,7 @@ aegis-os install
 The launcher-based enforced mode is available on Linux as a Phase 1 preview:
 
 ```bash
+aegis-os install --enforce   # optional: create ~/.aegis/bin/claude shims
 aegis-os --workspace . run -- claude
 aegis-os status
 aegis-os diff

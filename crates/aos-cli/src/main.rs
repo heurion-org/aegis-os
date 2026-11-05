@@ -89,6 +89,9 @@ enum Commands {
         /// Only print what would be configured without writing files
         #[arg(long, default_value_t = false)]
         dry_run: bool,
+        /// Create ~/.aegis/bin shims so `claude` / `opencode` / ... launch through `aos run`
+        #[arg(long, default_value_t = false)]
+        enforce: bool,
     },
 
     /// Check installation health for AGY, Claude Code, and Codex CLI integrations
@@ -2158,13 +2161,16 @@ async fn main() -> anyhow::Result<()> {
             std::process::exit(code);
         }
 
-        Commands::Install { home_dir, dry_run } => {
+        Commands::Install { home_dir, dry_run, enforce } => {
             let target_home = home_dir.unwrap_or_else(|| {
                 std::env::var("HOME")
                     .map(PathBuf::from)
                     .unwrap_or_else(|_| PathBuf::from("."))
             });
             installer::install_global_clients(&target_home, &cli.runtime_dir, dry_run).await?;
+            if enforce {
+                installer::install_enforced_shims(&target_home, dry_run)?;
+            }
             if !dry_run {
                 telemetry::emit_telemetry_ping(&cli.runtime_dir, "install", "installer", "local_cow")
                     .await;
