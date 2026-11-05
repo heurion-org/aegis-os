@@ -14,7 +14,12 @@ use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 
 pub mod claims;
+pub mod effect;
 pub mod session;
+
+pub use effect::{
+    ArtifactKind, Effect, EffectKind, EffectSource, Reversibility, ResourceScope, WorkspaceDomain,
+};
 
 // ============================================================================
 // 1. Multi-Tenant Identity & Capability Model
