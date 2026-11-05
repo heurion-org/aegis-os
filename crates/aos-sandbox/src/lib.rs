@@ -39,7 +39,7 @@ impl Drop for EgressBridge {
 
 /// Bubblewrap is looked up only at fixed system paths; resolving it through `PATH` would let
 /// whoever controls the server's environment substitute an unconfined `bwrap`.
-fn linux_bwrap_path() -> Option<&'static str> {
+pub fn linux_bwrap_path() -> Option<&'static str> {
     if !cfg!(target_os = "linux") {
         return None;
     }

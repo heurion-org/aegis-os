@@ -16,6 +16,7 @@ mod cloud;
 mod coord;
 mod hooks;
 mod installer;
+mod launcher;
 mod memory_ui;
 mod routing;
 mod telemetry;
@@ -86,6 +87,52 @@ enum Commands {
     Doctor {
         #[arg(long)]
         home_dir: Option<PathBuf>,
+    },
+
+    /// Launch an agent process tree inside the enforced runtime (Phase 1: Linux bwrap)
+    Run {
+        /// Session mode (`implement` only in Phase 1)
+        #[arg(long, default_value = "implement")]
+        mode: String,
+        /// Workspace domain profile (`code`, `docs`, `data`, `binary`, `app_state`, `memory`, `mixed`)
+        #[arg(long, default_value = "code")]
+        profile: String,
+        /// Enforcement level (`enforced` only in Phase 1)
+        #[arg(long, default_value = "enforced")]
+        enforcement: String,
+        /// Agent command and arguments, after `--`
+        #[arg(trailing_var_arg = true, allow_hyphen_values = true, required = true)]
+        cmd: Vec<String>,
+    },
+
+    /// Show the latest enforced session (Phase 1)
+    Status {
+        #[arg(long, default_value_t = false)]
+        json: bool,
+    },
+
+    /// Print the latest enforced session directory (Phase 1)
+    Last,
+
+    /// Diff the latest (or named) session shadow against the host workspace
+    Diff {
+        #[arg(long)]
+        session: Option<String>,
+    },
+
+    /// Commit the latest (or named) session shadow to the host workspace (human action)
+    Commit {
+        #[arg(long)]
+        session: Option<String>,
+        /// Optional path filter
+        #[arg(long = "path")]
+        paths: Vec<String>,
+    },
+
+    /// Discard the latest (or named) session shadow
+    Discard {
+        #[arg(long)]
+        session: Option<String>,
     },
 
     /// Upgrade Aegis OS in-place to the latest signed release and refresh client integrations
@@ -2047,8 +2094,44 @@ async fn main() -> anyhow::Result<()> {
         &workspace,
         &cli.runtime_dir,
     );
+    let runtime_dir = cli.runtime_dir.clone();
 
     match cli.command {
+        Commands::Status { json } => {
+            launcher::status(&runtime_dir, json)?;
+        }
+
+        Commands::Last => {
+            launcher::last(&runtime_dir)?;
+        }
+
+        Commands::Diff { session } => {
+            launcher::diff(&runtime_dir, session.as_deref()).await?;
+        }
+
+        Commands::Commit { session, paths } => {
+            let filter = if paths.is_empty() { None } else { Some(paths) };
+            launcher::commit(&runtime_dir, session.as_deref(), filter).await?;
+        }
+
+        Commands::Discard { session } => {
+            launcher::discard(&runtime_dir, session.as_deref())?;
+        }
+
+        Commands::Run { mode, profile, enforcement, cmd } => {
+            let code = launcher::run(
+                &workspace,
+                &identity,
+                &runtime_dir,
+                &mode,
+                &profile,
+                &enforcement,
+                &cmd,
+            )
+            .await?;
+            std::process::exit(code);
+        }
+
         Commands::Install { home_dir, dry_run } => {
             let target_home = home_dir.unwrap_or_else(|| {
                 std::env::var("HOME")

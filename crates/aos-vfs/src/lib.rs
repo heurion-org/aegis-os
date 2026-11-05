@@ -564,14 +564,6 @@ impl CoWWorkspace {
         Self::cow_clone_file_inner(src, dst, false, &mut true)
     }
 
-    fn max_eager_copy_file_bytes() -> u64 {
-        std::env::var("AOS_MAX_COW_FILE_MB")
-            .ok()
-            .and_then(|s| s.parse::<u64>().ok())
-            .map(|mb| mb.saturating_mul(1024 * 1024))
-            .unwrap_or(16 * 1024 * 1024)
-    }
-
     fn cow_clone_file_inner(
         src: &Path,
         dst: &Path,
@@ -662,21 +654,6 @@ impl CoWWorkspace {
                         }
                     }
                 }
-            }
-
-            if !*allow_reflink && meta.len() > Self::max_eager_copy_file_bytes() {
-                drop(dst_file);
-                let _ = std::fs::remove_file(dst);
-                if let Ok(canon_src) = std::fs::canonicalize(src) {
-                    if std::os::unix::fs::symlink(&canon_src, dst).is_ok() {
-                        return Ok(());
-                    }
-                }
-                dst_file = std::fs::OpenOptions::new()
-                    .write(true)
-                    .create(true)
-                    .truncate(true)
-                    .open(dst)?;
             }
 
             std::io::copy(&mut src_file, &mut dst_file)?;
@@ -2418,6 +2395,19 @@ mod tests {
         let ws_reopened = CoWWorkspace::init(&host_dir, &cow_dir).await.unwrap();
         assert!(std::fs::symlink_metadata(&broken_link).is_err());
         assert!(ws_reopened.diff(None).await.unwrap().is_empty());
+    }
+
+    #[test]
+    fn test_large_file_fallback_is_a_real_copy_not_a_symlink() {
+        let tmp = tempfile::tempdir().unwrap();
+        let src = tmp.path().join("large.bin");
+        let dst = tmp.path().join("large.copy");
+        let bytes = vec![0x5au8; 17 * 1024 * 1024];
+        std::fs::write(&src, &bytes).unwrap();
+        CoWWorkspace::cow_clone_file_blocking(&src, &dst).unwrap();
+        let meta = std::fs::symlink_metadata(&dst).unwrap();
+        assert!(meta.is_file(), "large-file fallback must be a regular file");
+        assert_eq!(meta.len(), bytes.len() as u64);
     }
 
     #[test]

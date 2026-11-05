@@ -53,7 +53,7 @@ Autonomous coding agents such as **Google Antigravity (`agy`)**, **Anthropic Cla
 │ • APFS clonefile  │  │ • macOS sandbox-exec  │  │ • Global Peer List   │  │ • HTTPS CONNECT &  │
 │ • Linux FICLONE   │  │ • Linux bwrap/MicroVM │  │ • A2A AgentCard/Task │  │   HTTP Proxy       │
 │ • 4-Tier LCS Diff3│  │ • PGID SIGSTOP/KILL   │  │ • Enforced Claims    │  │ • Domain + Path    │
-│ • Lazy-CoW Symlink│  │ • Separate cargo cache│  │ • artifact://sha256  │  │   $AOS_SECRET_*    │
+│ • O(1) CoW / Lazy Copy│  │ • Separate cargo cache│  │ • artifact://sha256  │  │   $AOS_SECRET_*    │
 └───────────────────┘  └───────────────────────┘  └──────────────────────┘  └────────────────────┘
 ```
 
@@ -106,7 +106,7 @@ After running `aegis-os install` once, you **never need to invoke `aegis-os` man
 
 ### 1. Transactional Copy-on-Write VFS & 4-Tier Auto-Rebase/Merge (`aos-vfs`)
 
-- **Millisecond Zero-Copy Shadow Forking & Cross-Mount Lazy-CoW**: Clones repositories into `<runtime_dir>/orgs/<org>/agents/<agent>/cow_workspace/upper_workspace/` via **macOS APFS `libc::clonefile`** (`0.71–6.28 ms` for 100–1,000 files) or **Linux Btrfs/XFS single-open 7-syscall `ioctl(FICLONE)` reflink** (`15.6 ms` on btrfs; plus optional kernel `BTRFS_IOC_SNAP_CREATE_V2` subvolume snapshots via `AOS_BTRFS_SUBVOL=1`), allocating physical disk blocks only for modified files. On cross-mount setups (`ext4 -> tmpfs`), oversized assets (`>16 MB`, configurable via `AOS_MAX_COW_FILE_MB`) automatically fall back to read-only symlinks and un-symlink on first write.
+- **Millisecond Zero-Copy Shadow Forking & Cross-Mount Lazy-CoW**: Clones repositories into `<runtime_dir>/orgs/<org>/agents/<agent>/cow_workspace/upper_workspace/` via **macOS APFS `libc::clonefile`** (`0.71–6.28 ms` for 100–1,000 files) or **Linux Btrfs/XFS single-open 7-syscall `ioctl(FICLONE)` reflink** (`15.6 ms` on btrfs; plus optional kernel `BTRFS_IOC_SNAP_CREATE_V2` subvolume snapshots via `AOS_BTRFS_SUBVOL=1`), allocating physical disk blocks only for modified files. On cross-mount setups (`ext4 -> tmpfs`), oversized assets fall back to full copies instead of symlinks: once the shadow is mounted at the original project path, a symlink back to that same path would be self-referential. OverlayFS/fuse-overlayfs is the planned O(1) fallback for ext4.
 - **Continuous Auto-Rebase & `mtime` Sync**: Automatically runs `refresh_from_host()` at every turn start (`PreInvocation`) and workspace tool boundary (`workspace_status`, `workspace_sync`, `workspace_diff`, `workspace_commit`), bumping file `mtime`s on fast-forwarded and merged files so incremental compilers (`cargo`) always recompile peer-updated dependencies.
 - **4-Tier Conflict Resolution Engine (`three_way_merge_lines`) & Pre-Commit Semantic Verification Gate (`verify_cmd`)**:
   1. **Tier 1 (Zero-Copy Fast-Forward)**: Untouched text and binary files updated on the host by peer agents are fast-forwarded into the shadow workspace and baseline snapshot automatically.

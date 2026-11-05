@@ -79,7 +79,7 @@ aegis-os install
 ## 五大核心技术支柱
 
 1. **事务型写时复制文件系统与 4 层自动三路合并 (`aos-vfs`)**：
-   - 基于 macOS APFS `clonefile`（1,000 文件仅需 `6.28 ms`）与 Linux Btrfs/XFS `ioctl(FICLONE)` reflink（`15.6 ms`）实现零拷贝分支；跨挂载点（如 `ext4 -> tmpfs`）下超大文件（`>16 MB`）自动回退为只读符号链接（`Lazy-CoW`），首次写入时自动解绑。
+   - 基于 macOS APFS `clonefile`（1,000 文件仅需 `6.28 ms`）与 Linux Btrfs/XFS `ioctl(FICLONE)` reflink（`15.6 ms`）实现零拷贝分支；跨挂载点（如 `ext4 -> tmpfs`）下超大文件回退为完整物理拷贝，而不是指向原路径的符号链接——当 shadow 挂到原项目路径后，该链接会变成自指。ext4 的 O(1) 回退（OverlayFS / fuse-overlayfs）在后续阶段实现。
    - 内置 **4 层 LCS Diff3 三路合并引擎**：支持未修改文件零拷贝快进、不同行并发修改自动拼接、同锚点 `use`/`import`/`mod` 声明自动去重并集，以及 `.aegis/verify.json` / `AOS_VERIFY_CMD` 预提交沙箱语义门禁。
 2. **双层 OS 内核沙箱与进程组生命周期控制 (`aos-sandbox`)**：
    - 基于 macOS Seatbelt (`/usr/bin/sandbox-exec`) 与 Linux Bubblewrap (`bwrap --unshare-all`) 强制执行只读根目录与 `$HOME` 默认拒绝（`--tmpfs` 遮蔽并只读回挂 `.rustup` / `.cargo` 工具链），支持 `pause()` / `resume()` / `destroy()` 真实进程组信号管控（`SIGSTOP` / `SIGCONT` / `SIGKILL`）。

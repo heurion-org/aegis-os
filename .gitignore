@@ -1,3 +1,6 @@
+# Local agent-team workspace
+/.agent/
+
 # Rust build artifacts
 /target/
 /dist/
