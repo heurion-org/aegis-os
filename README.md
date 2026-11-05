@@ -112,7 +112,7 @@ What it enforces today:
 Current Phase 1 limits (do not treat this as a full security boundary yet):
 
 - Linux only; requires bubblewrap **>= 0.10** (`--bind-fd` support). macOS is Phase 4.
-- Network is shared: the egress proxy / L7 DLP is not enforced, and host loopback services are reachable.
+- Egress is a CONNECT-only domain allowlist through the local proxy; host loopback is unreachable, but L7 DLP / secret injection is not implemented yet.
 - Approvals, leases, `--mode observe`, OpenCode/Hermes adapters and policy enforcement are later phases.
 
 ### Daily Usage (Zero Manual Commands Needed)

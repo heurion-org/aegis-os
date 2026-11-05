@@ -1964,7 +1964,7 @@ JSON：
 - `$HOME` tmpfs + Agent 状态目录分层（敏感配置 ro、会话/缓存 rw）。
 - Git 视图映射：宿主 `.git` ro、`GIT_INDEX_FILE` 可写副本、只读 git shim。
 - CoW backend：优先 OverlayFS / fuse-overlayfs；ext4 回退 lazy-copy，`doctor` 标注。
-- egress：CONNECT 域名/端口 allowlist + 失败关闭；L7 先不做。
+- egress：identity-pinned CONNECT 代理 + Unix-socket bridge + 域名 allowlist；宿主 loopback 不可达；L7 DLP / Base URL 反向代理留到 Phase 2。
 - PATH shim 安装 / 卸载。
 - `aos agent list` 能检测 `agy` / `claude` / `codex` / `opencode` / `hermes`，但只承诺 Claude Code 的端到端冒烟。
 - 红队测试：`~/.ssh`、宿主写、`curl` 任意域名、`git push`、子进程逃逸。

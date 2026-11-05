@@ -15,6 +15,7 @@
 //! or `/tmp` is replaced by tmpfs, a path source under those trees is no longer resolvable.
 
 use aos_core::{AgentIdentity, TransactionalWorkspace};
+use aos_egress::AegisEgressGateway;
 use aos_vfs::CoWWorkspace;
 use anyhow::{bail, Context};
 use serde_json::{json, Value};
@@ -22,6 +23,7 @@ use std::fs::File;
 use std::os::fd::AsRawFd;
 use std::path::{Path, PathBuf};
 use std::process::ExitStatus;
+use std::sync::Arc;
 use tokio::process::Command;
 
 const STAGE_ROOT: &str = "/run/aegis";
@@ -76,6 +78,18 @@ struct FdMount {
     file: File,
     dest: PathBuf,
     readonly: bool,
+}
+
+struct EgressGuard {
+    handle: tokio::task::JoinHandle<()>,
+    sock: PathBuf,
+}
+
+impl Drop for EgressGuard {
+    fn drop(&mut self) {
+        self.handle.abort();
+        let _ = std::fs::remove_file(&self.sock);
+    }
 }
 
 struct LauncherPlan {
@@ -293,7 +307,6 @@ impl LauncherPlan {
                 format!("{HOST_STAGE}/{}", self.host_name),
             ),
             ("AOS_GIT_VIEW".to_string(), self.git_view_enabled().to_string()),
-            ("AOS_EGRESS".to_string(), "not-enforced".to_string()),
             ("GIT_OPTIONAL_LOCKS".to_string(), "0".to_string()),
             ("GIT_CONFIG_NOSYSTEM".to_string(), "1".to_string()),
             ("GIT_CONFIG_GLOBAL".to_string(), "/dev/null".to_string()),
@@ -997,6 +1010,53 @@ fn agent_mounts(
     Ok((mounts, extra_path))
 }
 
+async fn start_egress(
+    identity: &AgentIdentity,
+    session_dir: &Path,
+) -> anyhow::Result<(EgressGuard, String, String)> {
+    let gateway = Arc::new(AegisEgressGateway::new());
+    let mut domains: Vec<String> = [
+        "api.anthropic.com",
+        "api.openai.com",
+        "generativelanguage.googleapis.com",
+        "api.github.com",
+        "github.com",
+        "raw.githubusercontent.com",
+        "objects.githubusercontent.com",
+        "registry.npmjs.org",
+        "pypi.org",
+        "files.pythonhosted.org",
+        "crates.io",
+        "static.crates.io",
+        "index.crates.io",
+    ]
+    .into_iter()
+    .map(str::to_string)
+    .collect();
+    if let Ok(extra) = std::env::var("AOS_EGRESS_ALLOW") {
+        domains.extend(
+            extra
+                .split(',')
+                .map(str::trim)
+                .filter(|domain| !domain.is_empty())
+                .map(str::to_string),
+        );
+    }
+    gateway.allow_domains(&identity.org_id, domains).await;
+    let proxy = gateway
+        .start_local_proxy_with_bound_identity("127.0.0.1:0", Some(identity.clone()))
+        .await?;
+    let proxy = proxy.to_string();
+    let egress_dir = session_dir.join("egress");
+    std::fs::create_dir_all(&egress_dir)?;
+    use std::os::unix::fs::PermissionsExt;
+    let _ = std::fs::set_permissions(&egress_dir, std::fs::Permissions::from_mode(0o700));
+    let sock = egress_dir.join("bridge.sock");
+    let token = aos_sandbox::bridge::new_token();
+    let handle = aos_sandbox::bridge::spawn_host_bridge(&sock, proxy.clone(), token.clone())?;
+    Ok((EgressGuard { handle, sock }, proxy, token))
+}
+
 fn bwrap_supports_bind_fd(path: &Path) -> bool {
     std::process::Command::new(path)
         .arg("--help")
@@ -1107,6 +1167,44 @@ async fn run_inner(
     fds.push(fd_mount(&shadow, project.clone(), false)?);
     fds.push(fd_mount(&agent_home, AGENT_STAGE, false)?);
 
+    // Phase 1 egress: a private netns plus the existing identity-pinned CONNECT proxy, relayed
+    // through a Unix-socket bridge. `curl --noproxy '*'` has no route out of the namespace.
+    // Skip the shim when `run_inner` is called from a test harness (current_exe is not the CLI).
+    let exe = std::env::current_exe().context("locating the aegis-os binary")?;
+    let egress_enabled = exe
+        .file_name()
+        .and_then(|s| s.to_str())
+        .map(|name| matches!(name, "aegis-os" | "aos" | "aegis-os.exe"))
+        .unwrap_or(false);
+    let (egress_guard, proxy, bridge_token, network_shared, command) = if egress_enabled {
+        let (guard, proxy, token) = start_egress(&identity, &session_dir).await?;
+        fds.push(fd_mount(
+            &session_dir.join("egress"),
+            "/run/aegis/egress",
+            true,
+        )?);
+        let exe_dir = exe.parent().context("aegis-os binary has no parent directory")?;
+        fds.push(fd_mount(exe_dir, "/run/aegis/bin", true)?);
+        let exe_name = exe
+            .file_name()
+            .and_then(|s| s.to_str())
+            .context("aegis-os binary name is not UTF-8")?;
+        let mut wrapped = vec![
+            format!("/run/aegis/bin/{exe_name}"),
+            "egress-shim".to_string(),
+            "--listen".to_string(),
+            proxy.clone(),
+            "--unix".to_string(),
+            "/run/aegis/egress/bridge.sock".to_string(),
+            "--".to_string(),
+        ];
+        wrapped.extend(command);
+        (Some(guard), Some(proxy), Some(token), false, wrapped)
+    } else {
+        (None, None, None, true, command)
+    };
+    let _egress_guard = egress_guard;
+
     let git = git_view(&project, &shadow, &agent_home)?;
     if git.is_none() {
         eprintln!(
@@ -1129,7 +1227,7 @@ async fn run_inner(
         project: project.clone(),
         host_name: host_name.clone(),
         fds,
-        network_shared: true,
+        network_shared,
         command,
         session_id: session_id.clone(),
         extra_path,
@@ -1147,7 +1245,7 @@ async fn run_inner(
         "agent_home": agent_home.display().to_string(),
         "cow_backend": "clone",
         "git_view": plan.git_view_enabled(),
-        "network": "shared",
+        "network": if network_shared { "shared" } else { "egress-allowlist" },
         "status": "running",
         "created_at_ms": chrono::Utc::now().timestamp_millis(),
     });
@@ -1171,7 +1269,11 @@ async fn run_inner(
             "unavailable"
         }
     );
-    eprintln!("  network: shared (host loopback + Internet reachable; egress proxy / L7 not enforced)");
+    if network_shared {
+        eprintln!("  network: shared (test harness / egress shim disabled)");
+    } else {
+        eprintln!("  network: egress allowlist (CONNECT-only; host loopback not reachable; L7 DLP not implemented)");
+    }
     eprintln!("  profile: {profile}");
 
     let mut cmd = Command::new(&plan.bwrap);
@@ -1181,6 +1283,15 @@ async fn run_inner(
     for (key, value) in plan.envs() {
         cmd.env(key, value);
     }
+    if let (Some(proxy), Some(bridge_token)) = (&proxy, &bridge_token) {
+        let proxy_url = format!("http://{proxy}");
+        cmd.env("HTTP_PROXY", &proxy_url)
+            .env("HTTPS_PROXY", &proxy_url)
+            .env("http_proxy", &proxy_url)
+            .env("https_proxy", &proxy_url)
+            .env("AOS_BRIDGE_TOKEN", bridge_token);
+    }
+    cmd.env("AOS_EGRESS", if network_shared { "not-enforced" } else { "connect-allowlist" });
     cmd.env("AOS_PROFILE", profile);
     cmd.env("AOS_MODE", "implement");
     cmd.env("AOS_ORG_ID", &identity.org_id);
@@ -1332,7 +1443,6 @@ mod tests {
             Some("/run/aegis/agent/.aegis-git-index")
         );
         assert_eq!(map.get("GIT_OPTIONAL_LOCKS").map(String::as_str), Some("0"));
-        assert_eq!(map.get("AOS_EGRESS").map(String::as_str), Some("not-enforced"));
     }
 
     #[test]
