@@ -1618,6 +1618,8 @@ mod tests {
         std::fs::create_dir_all(home.join(".cargo/bin")).unwrap();
         std::fs::create_dir_all(home.join(".local/bin")).unwrap();
         std::fs::create_dir_all(home.join(".local/share/keyrings")).unwrap();
+        std::fs::create_dir_all(home.join(".ssh")).unwrap();
+        std::fs::write(home.join(".ssh/id_rsa"), "PRIVATE\n").unwrap();
         std::fs::create_dir_all(project.join("node_modules/pkg")).unwrap();
         std::fs::write(home.join(".claude/settings.json"), "{}\n").unwrap();
         std::fs::write(home.join(".claude/.credentials.json"), "{\"token\":\"old\"}\n").unwrap();
@@ -1627,17 +1629,18 @@ mod tests {
         std::fs::write(project.join("node_modules/pkg/index.js"), "module.exports = 1\n").unwrap();
 
         let identity = AgentIdentity::new("test", "test-agent", "test");
-        let command = vec![
-            "/bin/sh".to_string(),
-            "-c".to_string(),
+        let host_key = home.join(".ssh/id_rsa");
+        let script = format!(
             "echo shadow > new.txt; \
-             echo '{\"token\":\"new\"}' > \"$HOME/.claude/.credentials.json\"; \
+             echo '{{\"token\":\"new\"}}' > \"$HOME/.claude/.credentials.json\"; \
              cat node_modules/pkg/index.js >/dev/null; \
              test ! -w node_modules/pkg/index.js; \
              test ! -e /run/aegis/toolchain/cargo/credentials.toml; \
-             test ! -e /run/aegis/toolchain/local/share/keyrings/secret"
-                .to_string(),
-        ];
+             test ! -e /run/aegis/toolchain/local/share/keyrings/secret; \
+             test ! -e '{}'",
+            host_key.display()
+        );
+        let command = vec!["/bin/sh".to_string(), "-c".to_string(), script];
         let code = run_inner(
             &project,
             &identity,
