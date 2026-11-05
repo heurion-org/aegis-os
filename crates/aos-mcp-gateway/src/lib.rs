@@ -138,6 +138,7 @@ pub const TOOL_ANNOTATIONS: &[(&str, bool, bool, bool, bool)] = &[
     ("ipc_publish", false, false, false, false),
     ("ipc_subscribe", false, false, true, false),
     ("ipc_ack", false, false, true, false),
+    ("ipc_wait", false, false, true, false),
     // Inspects and rewrites the request at the boundary; it does not forward it (yet).
     ("egress_http_request", true, false, true, false),
     ("coord_claim", false, false, true, false),
@@ -342,23 +343,176 @@ impl AegisRuntimeKernel {
             .collect()
     }
 
-    /// If the agent has exactly one active A2A task, treat that task as the trusted task context
-    /// for task-scoped leases. Multiple active tasks are ambiguous and therefore not injected.
+    /// If the agent has an unambiguous active A2A task where it is the **assignee** (`to_agent`),
+    /// treat that task as the trusted task context for task-scoped leases, claims, and child
+    /// task delegation (`parent_task_id`).
     async fn active_task_id(&self, identity: &AgentIdentity) -> Option<String> {
         let tasks = self
             .ipc
             .list_tasks(Some(&identity.org_id), Some(&identity.agent_id))
             .await
             .ok()?;
-        let active: Vec<_> = tasks
+        let active_assigned: Vec<_> = tasks
             .into_iter()
-            .filter(|task| !task.state.is_terminal() && !task.stale)
+            .filter(|task| {
+                task.is_assignee(&identity.org_id, &identity.agent_id)
+                    && !task.state.is_terminal()
+                    && !task.stale
+            })
             .collect();
-        if active.len() == 1 {
-            Some(active[0].id.clone())
-        } else {
-            None
+        if active_assigned.len() == 1 {
+            return Some(active_assigned[0].id.clone());
         }
+        let working: Vec<_> = active_assigned
+            .iter()
+            .filter(|task| task.state == A2ATaskState::Working)
+            .collect();
+        if working.len() == 1 {
+            return Some(working[0].id.clone());
+        }
+        None
+    }
+
+    /// Releases any claims bound to the specified `task_ids` and broadcasts a coordination release event.
+    async fn release_claims_for_tasks(
+        &self,
+        identity: &AgentIdentity,
+        task_ids: &[String],
+    ) -> Vec<String> {
+        if task_ids.is_empty() {
+            return Vec::new();
+        }
+        for _attempt in 0..5 {
+            let Ok((mut table, version)) = self.load_claims(&identity.org_id).await else {
+                return Vec::new();
+            };
+            let mut released_globs = Vec::new();
+            for tid in task_ids {
+                let rel = claims::release_claims_for_task(&mut table, tid);
+                if !rel.is_empty() {
+                    let globs: Vec<String> = rel.into_iter().map(|(g, _)| g).collect();
+                    let _ = self.ipc.record_task_claims(tid, &globs, true).await;
+                    released_globs.extend(globs);
+                }
+            }
+            if released_globs.is_empty() {
+                return Vec::new();
+            }
+            let Ok(value) = serde_json::to_value(&table) else {
+                return Vec::new();
+            };
+            match self
+                .org_storage
+                .kv_put(
+                    identity,
+                    claims::CLAIMS_NAMESPACE,
+                    claims::CLAIMS_KEY,
+                    value,
+                    version,
+                )
+                .await
+            {
+                Ok(_) => {
+                    self.announce_coordination(
+                        identity,
+                        format!(
+                            "[coord] {} auto-released {} (task completed/canceled)",
+                            identity.agent_id,
+                            released_globs.join(", ")
+                        ),
+                        json!({
+                            "event": "released",
+                            "owner": identity.agent_id,
+                            "paths": released_globs,
+                            "task_ids": task_ids
+                        }),
+                    )
+                    .await;
+                    return released_globs;
+                }
+                Err(e) if e.to_string().contains("version mismatch") => continue,
+                Err(_) => return Vec::new(),
+            }
+        }
+        Vec::new()
+    }
+
+    /// Releases claims owned by `identity.agent_id` that cover `committed_paths`.
+    async fn release_claims_matching_committed_paths(
+        &self,
+        identity: &AgentIdentity,
+        committed_paths: &[String],
+    ) -> Vec<String> {
+        if committed_paths.is_empty() {
+            return Vec::new();
+        }
+        for _attempt in 0..5 {
+            let Ok((mut table, version)) = self.load_claims(&identity.org_id).await else {
+                return Vec::new();
+            };
+            let released =
+                claims::release_claims_matching_paths(&mut table, &identity.agent_id, committed_paths);
+            if released.is_empty() {
+                return Vec::new();
+            }
+            let Ok(value) = serde_json::to_value(&table) else {
+                return Vec::new();
+            };
+            match self
+                .org_storage
+                .kv_put(
+                    identity,
+                    claims::CLAIMS_NAMESPACE,
+                    claims::CLAIMS_KEY,
+                    value,
+                    version,
+                )
+                .await
+            {
+                Ok(_) => {
+                    if let Some(tid) = self.active_task_id(identity).await {
+                        let _ = self.ipc.record_task_claims(&tid, &released, true).await;
+                    }
+                    self.announce_coordination(
+                        identity,
+                        format!(
+                            "[coord] {} auto-released {} on workspace_commit",
+                            identity.agent_id,
+                            released.join(", ")
+                        ),
+                        json!({
+                            "event": "released",
+                            "owner": identity.agent_id,
+                            "paths": released,
+                            "committed_paths": committed_paths
+                        }),
+                    )
+                    .await;
+                    return released;
+                }
+                Err(e) if e.to_string().contains("version mismatch") => continue,
+                Err(_) => return Vec::new(),
+            }
+        }
+        Vec::new()
+    }
+
+    /// Cleans up all resources (`TaskScoped` leases, UOMP memory sessions, and bound file claims)
+    /// for a terminal task and any of its subtasks that have also reached a terminal state.
+    async fn cleanup_terminal_task(&self, identity: &AgentIdentity, root_task_id: &str) {
+        let mut terminal_ids = vec![root_task_id.to_string()];
+        if let Ok(subtasks) = self.ipc.list_subtasks(root_task_id).await {
+            for sub in subtasks {
+                if sub.state.is_terminal() && !terminal_ids.contains(&sub.id) {
+                    terminal_ids.push(sub.id);
+                }
+            }
+        }
+        for tid in &terminal_ids {
+            let _ = self.policy.revoke_leases_for_task(tid).await;
+            self.revoke_memory_for_task(tid).await;
+        }
+        let _ = self.release_claims_for_tasks(identity, &terminal_ids).await;
     }
 
     /// Best-effort reverse propagation: when an A2A task reaches a terminal state, ask the local
@@ -474,8 +628,28 @@ impl AegisRuntimeKernel {
         if tool_name == "coord_claim" && paths.is_empty() {
             bail!("coord_claim requires a non-empty 'paths' array (globs relative to the repo root)");
         }
+        let bound_task_id: Option<String> = args
+            .get("task_id")
+            .and_then(|v| v.as_str())
+            .filter(|s| !s.is_empty())
+            .map(str::to_string)
+            .or(self.active_task_id(identity).await);
+        let workspace_files: Vec<String> = {
+            let key = Self::agent_key(&identity.org_id, &identity.agent_id);
+            let env_opt = self.agents.read().await.get(&key).cloned();
+            if let Some(env) = env_opt {
+                CoWWorkspace::collect_files(env.workspace.shadow_root())
+                    .await
+                    .unwrap_or_default()
+                    .into_iter()
+                    .map(|(rel, _)| rel)
+                    .collect()
+            } else {
+                Vec::new()
+            }
+        };
 
-        for _attempt in 0..5 {
+        for _attempt in 0..8 {
             let (mut table, version) = self.load_claims(&identity.org_id).await?;
             let now_ms = Utc::now().timestamp_millis();
             claims::prune_expired(&mut table, now_ms);
@@ -486,13 +660,10 @@ impl AegisRuntimeKernel {
 
             if tool_name == "coord_claim" {
                 for glob in &paths {
-                    let probe = glob.replace("**", "x").replace(['*', '?'], "x");
                     let clash = table.iter().find(|(g, c)| {
                         c.owner != identity.agent_id
                             && live.contains(&c.owner)
-                            && (*g == glob
-                                || claims::glob_match(g, &probe)
-                                || claims::glob_match(glob, &g.replace("**", "x").replace('*', "x")))
+                            && claims::globs_may_overlap(g, glob, &workspace_files)
                     });
                     match clash {
                         Some((g, c)) => rejected.push(json!({"path": glob, "held_by": c.owner, "pattern": g, "expires_at_ms": c.expires_at_ms})),
@@ -503,6 +674,7 @@ impl AegisRuntimeKernel {
                                     owner: identity.agent_id.clone(),
                                     expires_at_ms,
                                     note: note.clone(),
+                                    task_id: bound_task_id.clone(),
                                 },
                             );
                             changed.push(glob.clone());
@@ -529,6 +701,12 @@ impl AegisRuntimeKernel {
             {
                 Ok(entry) => {
                     if !changed.is_empty() {
+                        if let Some(ref tid) = bound_task_id {
+                            let _ = self
+                                .ipc
+                                .record_task_claims(tid, &changed, tool_name != "coord_claim")
+                                .await;
+                        }
                         let verb = if tool_name == "coord_claim" { "claimed" } else { "released" };
                         if tool_name == "coord_claim" {
                             let claim_summary = if note.is_empty() {
@@ -754,6 +932,9 @@ impl AegisRuntimeKernel {
                 policy_decision: decision_label,
                 snapshot_id: None,
                 details: metadata,
+                task_id: None,
+                prev_hash: None,
+                event_hash: None,
             })
             .await?;
 
@@ -1200,6 +1381,10 @@ impl AegisRuntimeKernel {
                     .get("overwrite_binaries")
                     .and_then(|v| v.as_bool())
                     .unwrap_or(false);
+                let release_claims = args
+                    .get("release_claims")
+                    .and_then(|v| v.as_bool())
+                    .unwrap_or(true);
                 let skip_verify = args
                     .get("skip_verify")
                     .and_then(|v| v.as_bool())
@@ -1241,8 +1426,9 @@ impl AegisRuntimeKernel {
                             .and_then(|v| v.as_u64())
                     })
                     .or(Some(30_000));
+                let pre_verify_epoch = env.workspace.read_host_commit_epoch();
                 // Refresh from host first so untouched peer-modified files (including binaries) fast-forward cleanly.
-                let refresh = env.workspace.refresh_from_host().await?;
+                let mut refresh = env.workspace.refresh_from_host().await?;
                 // Coordination guard: refuse to land files that a live peer has claimed.
                 let mut touched = env.workspace.changed_since_baseline().await?;
                 if let Some(ref allow) = filter_paths {
@@ -1282,10 +1468,75 @@ impl AegisRuntimeKernel {
                         }
                     }
                 }
+                // Serialize host commits across processes and re-verify if another agent committed while
+                // our pre-commit verification was running (Always-Green Trunk guarantee).
+                let _host_commit_lock = env.workspace.acquire_host_commit_lock().await?;
+                let mut epoch_reverified = false;
+                if env.workspace.read_host_commit_epoch() != pre_verify_epoch {
+                    let retry_refresh = env.workspace.refresh_from_host().await?;
+                    if !retry_refresh.conflicts.is_empty() {
+                        bail!(
+                            "3-Way Merge Conflict detected against concurrent peer commit on {:?}: {:?}",
+                            retry_refresh.conflicts,
+                            retry_refresh.conflict_details
+                        );
+                    }
+                    refresh.fast_forwarded.extend(retry_refresh.fast_forwarded);
+                    refresh.merged.extend(retry_refresh.merged);
+                    refresh.added_from_host.extend(retry_refresh.added_from_host);
+                    refresh
+                        .removed_from_host
+                        .extend(retry_refresh.removed_from_host);
+                    let mut retry_touched = env.workspace.changed_since_baseline().await?;
+                    if let Some(ref allow) = filter_paths {
+                        retry_touched.retain(|p| allow.contains(p));
+                    }
+                    if let Some(msg) = self
+                        .claim_conflict_for_paths(identity, &retry_touched)
+                        .await?
+                    {
+                        bail!("{}", msg);
+                    }
+                    if let Some(ref cmd) = verify_cmd {
+                        let verify_out = env
+                            .sandbox
+                            .exec(ExecSpec {
+                                command: "sh".to_string(),
+                                args: vec!["-c".to_string(), cmd.clone()],
+                                cwd: Some(env.workspace.shadow_root().to_path_buf()),
+                                env: HashMap::new(),
+                                timeout_ms: verify_timeout_ms,
+                                background: false,
+                            })
+                            .await?;
+                        if verify_out.exit_code != Some(0) {
+                            let diag = if !verify_out.stderr.trim().is_empty() {
+                                verify_out.stderr.trim()
+                            } else {
+                                verify_out.stdout.trim()
+                            };
+                            bail!(
+                                "Pre-commit verification gate '{}' failed after concurrent peer commit rebase (exit code {:?}; host repository untouched): {}",
+                                cmd,
+                                verify_out.exit_code,
+                                diag
+                            );
+                        }
+                        epoch_reverified = true;
+                    }
+                }
                 let committed = env
                     .workspace
                     .commit_to_host_with_options(filter_paths, overwrite_binaries)
                     .await?;
+                drop(_host_commit_lock);
+
+                let released_claims = if release_claims && !committed.is_empty() {
+                    self.release_claims_matching_committed_paths(identity, &committed)
+                        .await
+                } else {
+                    Vec::new()
+                };
                 let host_root = env.workspace.host_source_root();
                 let mut committed_source_files = Vec::new();
                 for rel in &committed {
@@ -1314,7 +1565,9 @@ impl AegisRuntimeKernel {
                     "host_root": host_root,
                     "auto_refresh": refresh,
                     "verification_passed": verify_cmd.is_some(),
+                    "epoch_reverified": epoch_reverified,
                     "committed_files": committed,
+                    "released_claims": released_claims,
                     "committed_source_files": committed_source_files
                 }))
             }
@@ -1419,7 +1672,19 @@ impl AegisRuntimeKernel {
                         background,
                     })
                     .await?;
-                Ok(serde_json::to_value(out)?)
+                let mut out_val = serde_json::to_value(out)?;
+                if !background {
+                    if let Ok(changed) = env.workspace.changed_since_baseline().await {
+                        if let Ok(Some(conflict_msg)) =
+                            self.claim_conflict_for_paths(identity, &changed).await
+                        {
+                            if let Some(obj) = out_val.as_object_mut() {
+                                obj.insert("coordination_warning".to_string(), json!(conflict_msg));
+                            }
+                        }
+                    }
+                }
+                Ok(out_val)
             }
 
             // ----------------------------------------------------------------
@@ -1610,13 +1875,19 @@ impl AegisRuntimeKernel {
                     .get("artifacts")
                     .and_then(|v| serde_json::from_value(v.clone()).ok())
                     .unwrap_or_default();
-                if let Some(active) = self.active_task_id(identity).await {
-                    if active != task_id {
-                        bail!(
-                            "A2A task '{}' is not the agent's active task '{}'",
-                            task_id,
-                            active
-                        );
+                let target_task = self.ipc.get_task(task_id).await?;
+                let caller_is_requester = target_task
+                    .as_ref()
+                    .is_some_and(|t| t.is_requester(&identity.org_id, &identity.agent_id));
+                if !caller_is_requester {
+                    if let Some(active) = self.active_task_id(identity).await {
+                        if active != task_id {
+                            bail!(
+                                "A2A task '{}' is not the agent's active task '{}'",
+                                task_id,
+                                active
+                            );
+                        }
                     }
                 }
                 let expected_revision = args
@@ -1634,8 +1905,7 @@ impl AegisRuntimeKernel {
                     )
                     .await?;
                 if task.state.is_terminal() {
-                    let _ = self.policy.revoke_leases_for_task(&task.id).await;
-                    self.revoke_memory_for_task(&task.id).await;
+                    self.cleanup_terminal_task(identity, &task.id).await;
                 }
                 Ok(serde_json::to_value(task)?)
             }
@@ -1646,13 +1916,44 @@ impl AegisRuntimeKernel {
                     .or_else(|| args.get("id"))
                     .and_then(|v| v.as_str())
                     .context("Missing 'task_id'")?;
+                let include_audit = args
+                    .get("include_audit_trace")
+                    .and_then(|v| v.as_bool())
+                    .unwrap_or(true);
                 let task = self
                     .ipc
                     .get_task(task_id)
                     .await?
                     .filter(|t| t.visible_to_org(&identity.org_id))
                     .with_context(|| format!("A2A task '{}' not found", task_id))?;
-                Ok(serde_json::to_value(task)?)
+                let mut out = serde_json::to_value(&task)?;
+                let subtasks = self.ipc.list_subtasks(task_id).await.unwrap_or_default();
+                if let Some(obj) = out.as_object_mut() {
+                    obj.insert("subtasks_count".to_string(), json!(subtasks.len()));
+                    obj.insert("subtasks".to_string(), json!(subtasks));
+                    if include_audit {
+                        let trace = self
+                            .recorder
+                            .trace_task(&identity.org_id, task_id)
+                            .await
+                            .unwrap_or_default();
+                        let chain_report = self
+                            .recorder
+                            .verify_chain(Some(&identity.org_id))
+                            .await
+                            .unwrap_or_else(|_| json!({ "verified": true }));
+                        obj.insert(
+                            "hash_chain_verified".to_string(),
+                            chain_report
+                                .get("verified")
+                                .cloned()
+                                .unwrap_or(json!(true)),
+                        );
+                        obj.insert("hash_chain_report".to_string(), chain_report);
+                        obj.insert("audit_trace".to_string(), json!(trace));
+                    }
+                }
+                Ok(out)
             }
 
             "ipc_task_list" => {
@@ -1671,9 +1972,16 @@ impl AegisRuntimeKernel {
                 let org_filter = Some(identity.org_id.as_str());
                 let agent_filter = args.get("agent_id").and_then(|v| v.as_str());
                 let tasks = self.ipc.list_tasks(org_filter, agent_filter).await?;
+                let chain_report = self
+                    .recorder
+                    .verify_chain(Some(&identity.org_id))
+                    .await
+                    .unwrap_or_else(|_| json!({ "verified": true }));
                 Ok(json!({
                     "tasks_count": tasks.len(),
-                    "tasks": tasks
+                    "tasks": tasks,
+                    "hash_chain_verified": chain_report.get("verified").cloned().unwrap_or(json!(true)),
+                    "audit_chain": chain_report
                 }))
             }
 
@@ -1695,7 +2003,32 @@ impl AegisRuntimeKernel {
                     .get("subject")
                     .and_then(|v| v.as_str())
                     .unwrap_or("(no subject)");
-                let payload = args.get("payload").cloned().unwrap_or_else(|| json!({}));
+                let mut payload = args.get("payload").cloned().unwrap_or_else(|| json!({}));
+                if tool_name == "ipc_request" {
+                    let active_tid = self.active_task_id(identity).await;
+                    if let Some(obj) = payload.as_object_mut() {
+                        if obj.get("parent_task_id").is_none() {
+                            if let Some(explicit_parent) =
+                                args.get("parent_task_id").and_then(|v| v.as_str())
+                            {
+                                obj.insert("parent_task_id".to_string(), json!(explicit_parent));
+                            } else if let Some(tid) = active_tid {
+                                obj.insert("parent_task_id".to_string(), json!(tid));
+                            }
+                        }
+                        if obj.get("depends_on").is_none() {
+                            if let Some(deps) = args.get("depends_on") {
+                                obj.insert("depends_on".to_string(), deps.clone());
+                            }
+                        }
+                        if obj.get("workspace_id").is_none() {
+                            obj.insert(
+                                "workspace_id".to_string(),
+                                json!(env.workspace.shadow_root().display().to_string()),
+                            );
+                        }
+                    }
+                }
                 let attachments: Vec<String> = args
                     .get("attachments")
                     .and_then(|v| serde_json::from_value(v.clone()).ok())
@@ -1801,12 +2134,171 @@ impl AegisRuntimeKernel {
                     .ipc
                     .reply(identity, original_msg_id, success, payload, attachments)
                     .await?;
-                let _ = self
-                    .policy
-                    .revoke_leases_for_task(original_msg_id)
-                    .await;
-                self.revoke_memory_for_task(original_msg_id).await;
+                self.cleanup_terminal_task(identity, original_msg_id).await;
                 Ok(serde_json::to_value(reply)?)
+            }
+
+            "ipc_wait" => {
+                let task_id = args
+                    .get("task_id")
+                    .and_then(|v| v.as_str())
+                    .filter(|s| !s.is_empty())
+                    .map(str::to_string);
+                let since_revision = args.get("since_revision").and_then(|v| v.as_u64());
+                let claim_paths: Vec<String> = args
+                    .get("claim_paths")
+                    .or_else(|| args.get("paths"))
+                    .and_then(|v| serde_json::from_value(v.clone()).ok())
+                    .unwrap_or_default();
+                let auto_claim = args
+                    .get("auto_claim")
+                    .and_then(|v| v.as_bool())
+                    .unwrap_or(true);
+                let wait_for_inbox = args
+                    .get("wait_for_inbox")
+                    .and_then(|v| v.as_bool())
+                    .unwrap_or_else(|| task_id.is_none() && claim_paths.is_empty());
+                let timeout_ms = args
+                    .get("timeout_ms")
+                    .and_then(|v| v.as_u64())
+                    .unwrap_or(15_000)
+                    .min(120_000);
+
+                let start = std::time::Instant::now();
+                let deadline = start + std::time::Duration::from_millis(timeout_ms);
+
+                let initial_task = if let Some(ref tid) = task_id {
+                    let t = self
+                        .ipc
+                        .get_task(tid)
+                        .await?
+                        .filter(|t| t.visible_to_org(&identity.org_id))
+                        .with_context(|| format!("A2A task '{}' not found", tid))?;
+                    Some((t.revision, t.state))
+                } else {
+                    None
+                };
+
+                loop {
+                    let elapsed_ms = start.elapsed().as_millis() as u64;
+
+                    // 1. Check file claims availability
+                    if !claim_paths.is_empty() {
+                        let (mut table, _) = self.load_claims(&identity.org_id).await?;
+                        let now_ms = Utc::now().timestamp_millis();
+                        claims::prune_expired(&mut table, now_ms);
+                        let live = self.live_peer_ids(&identity.org_id).await;
+                        let any_conflict = claim_paths.iter().any(|glob| {
+                            table.iter().any(|(g, c)| {
+                                c.owner != identity.agent_id
+                                    && live.contains(&c.owner)
+                                    && claims::globs_may_overlap(g, glob, &[])
+                            })
+                        });
+                        if !any_conflict {
+                            if auto_claim {
+                                let claim_res = self
+                                    .coord_claims_tool(
+                                        identity,
+                                        "coord_claim",
+                                        &json!({
+                                            "paths": claim_paths,
+                                            "note": "auto-claimed via ipc_wait"
+                                        }),
+                                    )
+                                    .await?;
+                                if claim_res
+                                    .get("rejected")
+                                    .and_then(|v| v.as_array())
+                                    .is_some_and(|r| r.is_empty())
+                                {
+                                    let refresh =
+                                        env.workspace.refresh_from_host().await.unwrap_or_default();
+                                    return Ok(json!({
+                                        "status": "ready",
+                                        "reason": "claims_available",
+                                        "claimed": claim_res,
+                                        "auto_refresh": refresh,
+                                        "waited_ms": elapsed_ms
+                                    }));
+                                }
+                            } else {
+                                let refresh =
+                                    env.workspace.refresh_from_host().await.unwrap_or_default();
+                                return Ok(json!({
+                                    "status": "ready",
+                                    "reason": "claims_available",
+                                    "auto_refresh": refresh,
+                                    "waited_ms": elapsed_ms
+                                }));
+                            }
+                        }
+                    }
+
+                    // 2. Check A2A task state transition
+                    if let Some(ref tid) = task_id {
+                        let task = self
+                            .ipc
+                            .get_task(tid)
+                            .await?
+                            .filter(|t| t.visible_to_org(&identity.org_id))
+                            .with_context(|| format!("A2A task '{}' not found", tid))?;
+                        let ready = match since_revision {
+                            Some(rev) => {
+                                task.revision > rev
+                                    || task.state.is_terminal()
+                                    || task.state == A2ATaskState::InputRequired
+                            }
+                            None => {
+                                task.state.is_terminal()
+                                    || task.state == A2ATaskState::InputRequired
+                                    || initial_task.is_some_and(|(init_rev, init_state)| {
+                                        task.revision > init_rev && task.state != init_state
+                                    })
+                            }
+                        };
+                        if ready {
+                            let refresh =
+                                env.workspace.refresh_from_host().await.unwrap_or_default();
+                            return Ok(json!({
+                                "status": "ready",
+                                "reason": "task_updated",
+                                "task": task,
+                                "auto_refresh": refresh,
+                                "waited_ms": elapsed_ms
+                            }));
+                        }
+                    }
+
+                    // 3. Check unread inbox messages
+                    if wait_for_inbox {
+                        let msgs = self
+                            .ipc
+                            .peek_inbox(&identity.org_id, &identity.agent_id, 20)
+                            .await
+                            .unwrap_or_default();
+                        if !msgs.is_empty() {
+                            let refresh =
+                                env.workspace.refresh_from_host().await.unwrap_or_default();
+                            return Ok(json!({
+                                "status": "ready",
+                                "reason": "inbox_messages",
+                                "messages_count": msgs.len(),
+                                "messages": msgs,
+                                "auto_refresh": refresh,
+                                "waited_ms": elapsed_ms
+                            }));
+                        }
+                    }
+
+                    if std::time::Instant::now() >= deadline {
+                        return Ok(json!({
+                            "status": "timeout",
+                            "waited_ms": start.elapsed().as_millis() as u64
+                        }));
+                    }
+                    tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+                }
             }
 
             "ipc_ack" => {
@@ -1905,6 +2397,9 @@ impl AegisRuntimeKernel {
                         task_id,
                     })
                     .await?;
+                if let Some(ref tid) = lease.task_id {
+                    let _ = self.ipc.record_task_lease(tid, &lease.lease_id).await;
+                }
                 Ok(serde_json::to_value(lease)?)
             }
 
@@ -1935,6 +2430,9 @@ impl AegisRuntimeKernel {
                     .policy
                     .approve_escalation(esc_id, ttl_secs, "user_owner")
                     .await?;
+                if let Some(ref tid) = lease.task_id {
+                    let _ = self.ipc.record_task_lease(tid, &lease.lease_id).await;
+                }
                 Ok(serde_json::to_value(lease)?)
             }
 
@@ -2152,6 +2650,10 @@ impl AegisRuntimeKernel {
                                 "type": "string",
                                 "description": "Optional A2A task id. When set, approval binds the resulting lease to this task."
                             },
+                            "release_claims": {
+                                "type": "boolean",
+                                "description": "If true (default), automatically release this Agent's file claims matching the committed paths and notify waiting peers."
+                            },
                             "totp": {
                                 "type": "string",
                                 "description": "Optional 6-digit TOTP authenticator code provided by the human user in chat to approve a Cloud boundary escalation inline (for pure CLI / SSH sessions)."
@@ -2297,21 +2799,61 @@ impl AegisRuntimeKernel {
                 },
                 {
                     "name": "ipc_task_get",
-                    "description": "[Zero-Prompt] Retrieve a stateful Google A2A `Task` by `task_id` (including `state`, `parts`, `artifacts`, and transition `history`).",
+                    "description": "[Zero-Prompt] Retrieve a stateful Google A2A `Task` by `task_id` (including `state`, `parts`, `artifacts`, transition `history`, child `subtasks`, and tamper-evident SHA-256 `audit_trace`).",
                     "inputSchema": {
                         "type": "object",
-                        "properties": { "task_id": { "type": "string" } },
+                        "properties": {
+                            "task_id": { "type": "string" },
+                            "include_audit_trace": {
+                                "type": "boolean",
+                                "description": "If true (default), include the task's Flight Recorder audit trail and SHA-256 hash chain verification."
+                            }
+                        },
                         "required": ["task_id"]
                     }
                 },
                 {
                     "name": "ipc_task_list",
-                    "description": "[Zero-Prompt] List stateful Google A2A `Task`s in the caller's Organization. Cross-org listing is operator-only.",
+                    "description": "[Zero-Prompt] List stateful Google A2A `Task`s (with parent/child hierarchy, claimed paths, and hash chain health) in the caller's Organization. Cross-org listing is operator-only.",
                     "inputSchema": {
                         "type": "object",
                         "properties": {
                             "scope": { "type": "string", "enum": ["org"], "default": "org" },
                             "agent_id": { "type": "string" }
+                        }
+                    }
+                },
+                {
+                    "name": "ipc_wait",
+                    "description": "[Zero-Prompt] Reactive synchronization primitive: wait without busy-polling until a delegated `task_id` changes state, new inbox messages arrive (`wait_for_inbox`), or peer-held `claim_paths` are released (optionally auto-claiming and auto-rebasing your CoW shadow workspace onto the peer's latest commit).",
+                    "inputSchema": {
+                        "type": "object",
+                        "properties": {
+                            "task_id": {
+                                "type": "string",
+                                "description": "Optional A2A task ID to watch for state transitions or completion."
+                            },
+                            "since_revision": {
+                                "type": "integer",
+                                "description": "Optional task revision baseline; returns immediately if the task's revision has already advanced past this number."
+                            },
+                            "claim_paths": {
+                                "type": "array",
+                                "items": { "type": "string" },
+                                "description": "Optional repo paths/globs to wait on until released by peers."
+                            },
+                            "auto_claim": {
+                                "type": "boolean",
+                                "description": "If true (default), automatically claim `claim_paths` and run `refresh_from_host` as soon as they are released."
+                            },
+                            "wait_for_inbox": {
+                                "type": "boolean",
+                                "description": "If true, wake up as soon as any unread message arrives in this Agent's inbox."
+                            },
+                            "timeout_ms": {
+                                "type": "integer",
+                                "description": "Maximum wait duration in milliseconds (default: 15000, max: 120000)."
+                            }
                         }
                     }
                 },
@@ -2760,8 +3302,7 @@ impl AegisRuntimeKernel {
                     .await
                 {
                     Ok(task) => {
-                        let _ = self.policy.revoke_leases_for_task(&task.id).await;
-                        self.revoke_memory_for_task(&task.id).await;
+                        self.cleanup_terminal_task(identity, &task.id).await;
                         json!({
                             "jsonrpc": "2.0",
                             "id": id,
@@ -6084,5 +6625,267 @@ mod tests {
             tokio::time::sleep(std::time::Duration::from_millis(50)).await;
         }
         panic!("Background job did not complete within expected window");
+    }
+
+    #[tokio::test]
+    async fn test_multi_agent_collaboration_task_tree_claims_ipc_wait_and_hash_chain() {
+        let temp = tempfile::tempdir().unwrap();
+        let runtime_dir = temp.path().join("runtime");
+        let host_project = temp.path().join("host_project");
+        tokio::fs::create_dir_all(host_project.join("crates/aos-vfs/src"))
+            .await
+            .unwrap();
+        tokio::fs::write(
+            host_project.join("crates/aos-vfs/src/lib.rs"),
+            "pub fn v1() -> u32 { 1 }\n",
+        )
+        .await
+        .unwrap();
+
+        let kernel = Arc::new(AegisRuntimeKernel::new(&runtime_dir).await.unwrap());
+        let user_client = AgentIdentity::new("acme", "user-lead", "Requester");
+        let lead_agent = AgentIdentity::new("acme", "agy-lead", "Lead Architect");
+        let worker_agent = AgentIdentity::new("acme", "claude-worker", "Worker");
+
+        for id in [&user_client, &lead_agent, &worker_agent] {
+            kernel
+                .ensure_agent_environment(
+                    id.clone(),
+                    &host_project,
+                    IsolationTier::NativeOsSandbox,
+                    vec!["*".to_string()],
+                )
+                .await
+                .unwrap();
+        }
+
+        // 1. User assigns parent task T1 to Lead Agent (`agy-lead`)
+        let t1_sent = kernel
+            .call_tool(
+                &user_client,
+                "ipc_request",
+                json!({
+                    "to_agent": "agy-lead",
+                    "subject": "Upgrade VFS collaboration engine",
+                    "payload": { "goal": "phase-abc" }
+                }),
+            )
+            .await
+            .unwrap();
+        let t1_id = t1_sent["msg_id"].as_str().unwrap().to_string();
+
+        // Grant a TaskScoped workspace_commit lease bound to T1 for Lead Agent
+        let lease_res = kernel
+            .call_tool(
+                &lead_agent,
+                "policy_grant_lease",
+                json!({
+                    "action_pattern": "workspace_commit",
+                    "resource_pattern": "*",
+                    "ttl_secs": 600,
+                    "task_id": t1_id
+                }),
+            )
+            .await
+            .unwrap();
+        let t1_lease_id = lease_res["lease_id"].as_str().unwrap().to_string();
+
+        // 2. While working on T1, Lead Agent delegates subtask T2 to Worker Agent (`claude-worker`).
+        //    Verify T2 automatically inherits `parent_task_id = T1`, and Lead Agent's `active_task_id`
+        //    remains T1 (no silent downgrade of TaskScoped lease!).
+        let t2_sent = kernel
+            .call_tool(
+                &lead_agent,
+                "ipc_request",
+                json!({
+                    "to_agent": "claude-worker",
+                    "subject": "Implement VFS helper",
+                    "payload": { "module": "vfs" }
+                }),
+            )
+            .await
+            .unwrap();
+        let t2_id = t2_sent["msg_id"].as_str().unwrap().to_string();
+        assert_eq!(
+            kernel.active_task_id(&lead_agent).await.as_deref(),
+            Some(t1_id.as_str()),
+            "Delegating subtask T2 must not clobber Lead Agent's active_task_id T1"
+        );
+
+        let t2_info = kernel
+            .call_tool(&lead_agent, "ipc_task_get", json!({ "task_id": t2_id }))
+            .await
+            .unwrap();
+        assert_eq!(t2_info["parent_task_id"], json!(t1_id));
+
+        // 3. Lead Agent claims `crates/aos-vfs/**` (auto-bound to T1).
+        //    Worker Agent attempts overlapping glob `crates/*/src/lib.rs` -> rejected by 2D NFA glob check!
+        let claim_lead = kernel
+            .call_tool(
+                &lead_agent,
+                "coord_claim",
+                json!({ "paths": ["crates/aos-vfs/**"], "note": "Lead editing VFS" }),
+            )
+            .await
+            .unwrap();
+        assert_eq!(claim_lead["status"], "ok");
+
+        let claim_worker_clash = kernel
+            .call_tool(
+                &worker_agent,
+                "coord_claim",
+                json!({ "paths": ["crates/*/src/lib.rs"] }),
+            )
+            .await
+            .unwrap();
+        assert_eq!(claim_worker_clash["status"], "partial");
+        assert_eq!(claim_worker_clash["rejected"].as_array().unwrap().len(), 1);
+
+        // 4. Worker Agent modifies `crates/aos-vfs/src/lib.rs` via `proc_exec` inside its shadow
+        //    -> `proc_exec` returns `coordination_warning` alerting that `agy-lead` holds the claim!
+        let exec_warn = kernel
+            .call_tool(
+                &worker_agent,
+                "proc_exec",
+                json!({
+                    "command": "sh",
+                    "args": ["-c", "echo '// worker edit' >> crates/aos-vfs/src/lib.rs"]
+                }),
+            )
+            .await
+            .unwrap();
+        assert!(
+            exec_warn["coordination_warning"]
+                .as_str()
+                .unwrap_or("")
+                .contains("agy-lead"),
+            "Expected coordination_warning on proc_exec touching peer-claimed path, got: {exec_warn}"
+        );
+        // Rollback worker's uncoordinated edit before waiting properly via `ipc_wait`
+        let snaps = kernel
+            .call_tool(&worker_agent, "workspace_status", json!({}))
+            .await
+            .unwrap();
+        let base_snap = snaps["snapshots"][0]["snapshot_id"].as_str().unwrap();
+        kernel
+            .call_tool(
+                &worker_agent,
+                "workspace_rollback",
+                json!({ "snapshot_id": base_snap }),
+            )
+            .await
+            .unwrap();
+
+        // 5. Worker Agent calls `ipc_wait(claim_paths=["crates/aos-vfs/src/lib.rs"], auto_claim=true)`
+        //    concurrently while Lead Agent edits and runs `workspace_commit` (which auto-releases its claim!).
+        let k_wait = kernel.clone();
+        let worker_clone = worker_agent.clone();
+        let wait_handle = tokio::spawn(async move {
+            k_wait
+                .call_tool(
+                    &worker_clone,
+                    "ipc_wait",
+                    json!({
+                        "claim_paths": ["crates/aos-vfs/src/lib.rs"],
+                        "auto_claim": true,
+                        "timeout_ms": 5000
+                    }),
+                )
+                .await
+                .unwrap()
+        });
+
+        tokio::time::sleep(std::time::Duration::from_millis(120)).await;
+        kernel
+            .call_tool(
+                &lead_agent,
+                "fs_write",
+                json!({
+                    "path": "crates/aos-vfs/src/lib.rs",
+                    "content": "pub fn v1() -> u32 { 1 }\npub fn v2_from_lead() -> u32 { 2 }\n"
+                }),
+            )
+            .await
+            .unwrap();
+        let commit_out = kernel
+            .call_tool(&lead_agent, "workspace_commit", json!({}))
+            .await
+            .unwrap();
+        assert_eq!(commit_out["status"], "committed_to_host");
+        assert_eq!(
+            commit_out["released_claims"],
+            json!(["crates/aos-vfs/**"]),
+            "workspace_commit should auto-release matching claims by default"
+        );
+
+        let wait_res = wait_handle.await.unwrap();
+        assert_eq!(wait_res["status"], "ready");
+        assert_eq!(wait_res["reason"], "claims_available");
+        assert_eq!(
+            wait_res["claimed"]["changed"],
+            json!(["crates/aos-vfs/src/lib.rs"])
+        );
+        // Verify Worker Agent's shadow workspace was automatically rebased onto Lead Agent's commit!
+        let worker_read = kernel
+            .call_tool(
+                &worker_agent,
+                "fs_read",
+                json!({ "path": "crates/aos-vfs/src/lib.rs" }),
+            )
+            .await
+            .unwrap();
+        assert!(
+            worker_read["content"]
+                .as_str()
+                .unwrap()
+                .contains("v2_from_lead"),
+            "ipc_wait should auto-rebase worker shadow workspace onto peer commit"
+        );
+
+        // 6. Verify Cascade Cancel on parent task T1 cancels child task T2, revokes T1's TaskScoped
+        //    lease, and auto-releases T2's bound file claim (`crates/aos-vfs/src/lib.rs`)!
+        kernel
+            .call_tool(
+                &user_client,
+                "ipc_task_update",
+                json!({
+                    "task_id": t1_id,
+                    "state": "canceled",
+                    "message": "Cancel parent epic"
+                }),
+            )
+            .await
+            .unwrap();
+
+        let t1_final = kernel
+            .call_tool(
+                &user_client,
+                "ipc_task_get",
+                json!({ "task_id": t1_id, "include_audit_trace": true }),
+            )
+            .await
+            .unwrap();
+        assert_eq!(t1_final["state"], "canceled");
+        assert_eq!(t1_final["subtasks_count"], 1);
+        assert_eq!(t1_final["subtasks"][0]["id"], t2_id);
+        assert_eq!(t1_final["subtasks"][0]["state"], "canceled");
+        assert_eq!(t1_final["hash_chain_verified"], true);
+        assert!(
+            !t1_final["audit_trace"].as_array().unwrap().is_empty(),
+            "ipc_task_get should return the task's Flight Recorder audit trace"
+        );
+        assert_eq!(t1_final["lease_ids"], json!([t1_lease_id]));
+
+        // Both T1's TaskScoped lease and T2's file claim must have been cleaned up automatically!
+        let (remaining_claims, _) = kernel.load_claims("acme").await.unwrap();
+        assert!(
+            remaining_claims.is_empty(),
+            "Cascade cancel must release child task T2's bound claims, found: {remaining_claims:?}"
+        );
+        let remaining_leases = kernel.policy.list_leases("acme", None).await.unwrap();
+        assert!(
+            remaining_leases.is_empty(),
+            "Terminal task cleanup must revoke TaskScoped leases"
+        );
     }
 }

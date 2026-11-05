@@ -110,6 +110,7 @@ pub async fn install_global_clients(
         "ipc_reply",
         "ipc_recv",
         "ipc_ack",
+        "ipc_wait",
         "ipc_publish",
         "org_artifact_publish",
         "org_artifact_fetch",
@@ -224,6 +225,7 @@ pub async fn install_global_clients(
         "mcp(aegis-os/ipc_reply)",
         "mcp(aegis-os/ipc_recv)",
         "mcp(aegis-os/ipc_ack)",
+        "mcp(aegis-os/ipc_wait)",
         "mcp(aegis-os/ipc_subscribe)",
         "mcp(aegis-os/ipc_publish)",
         "mcp(aegis-os/runtime_configure_mode)",
@@ -374,6 +376,7 @@ You are running inside the **Aegis OS Runtime (`aegis-os`)** with an isolated Co
         "ipc_reply",
         "ipc_recv",
         "ipc_ack",
+        "ipc_wait",
         "ipc_subscribe",
         "ipc_publish",
     ];

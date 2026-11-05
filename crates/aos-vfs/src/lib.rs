@@ -117,6 +117,69 @@ impl CoWWorkspace {
         Ok(ws)
     }
 
+    fn host_commit_state_path(&self) -> PathBuf {
+        let canonical = std::fs::canonicalize(&self.host_source_root)
+            .unwrap_or_else(|_| self.host_source_root.clone());
+        let hash = Self::sha256_bytes(canonical.to_string_lossy().as_bytes());
+        std::env::temp_dir()
+            .join("aegis-os-host-commits")
+            .join(format!("{}.epoch", &hash[..24]))
+    }
+
+    /// Acquires an exclusive cross-process file lock serializing commits to `host_source_root`.
+    pub async fn acquire_host_commit_lock(&self) -> anyhow::Result<std::fs::File> {
+        let path = self.host_commit_state_path();
+        aos_core::session::acquire_file_lock(&path).await
+    }
+
+    /// Reads the monotonic commit epoch for `host_source_root` (0 if no commit has occurred yet).
+    pub fn read_host_commit_epoch(&self) -> u64 {
+        let path = self.host_commit_state_path();
+        std::fs::read_to_string(&path)
+            .ok()
+            .and_then(|s| s.trim().parse::<u64>().ok())
+            .unwrap_or(0)
+    }
+
+    /// Increments and persists the monotonic commit epoch for `host_source_root`.
+    pub async fn bump_host_commit_epoch(&self) -> anyhow::Result<u64> {
+        let path = self.host_commit_state_path();
+        if let Some(parent) = path.parent() {
+            tokio::fs::create_dir_all(parent).await?;
+        }
+        let next = self.read_host_commit_epoch().saturating_add(1);
+        let tmp = path.with_extension(format!(
+            "tmp-{}-{}",
+            std::process::id(),
+            Uuid::new_v4().simple()
+        ));
+        tokio::fs::write(&tmp, next.to_string()).await?;
+        tokio::fs::rename(&tmp, &path).await?;
+        Ok(next)
+    }
+
+    async fn atomic_write_str(dst: &Path, content: &str) -> anyhow::Result<()> {
+        if let Some(parent) = dst.parent() {
+            tokio::fs::create_dir_all(parent).await?;
+        }
+        let file_name = dst
+            .file_name()
+            .and_then(|n| n.to_str())
+            .unwrap_or("merged");
+        let tmp = dst.with_file_name(format!(
+            ".{}.aegis-tmp-{}-{}",
+            file_name,
+            std::process::id(),
+            Uuid::new_v4().simple()
+        ));
+        tokio::fs::write(&tmp, content).await?;
+        tokio::fs::rename(&tmp, dst).await?;
+        if let Ok(f) = std::fs::OpenOptions::new().write(true).open(dst) {
+            let _ = f.set_modified(std::time::SystemTime::now());
+        }
+        Ok(())
+    }
+
     /// Applies the actions staged by Phase 1 of a commit to the host tree and the baseline.
     pub async fn apply_staged_actions(
         &self,
@@ -150,15 +213,9 @@ impl CoWWorkspace {
                 } => {
                     let host_dst = self.host_source_root.join(&rel);
                     let base_path = self.baseline_root.join(&rel);
-                    if let Some(parent) = host_dst.parent() {
-                        tokio::fs::create_dir_all(parent).await?;
-                    }
-                    if let Some(parent) = base_path.parent() {
-                        tokio::fs::create_dir_all(parent).await?;
-                    }
-                    tokio::fs::write(&host_dst, &merged_content).await?;
-                    tokio::fs::write(&base_path, &merged_content).await?;
-                    tokio::fs::write(&shadow_path, &merged_content).await?;
+                    Self::atomic_write_str(&host_dst, &merged_content).await?;
+                    Self::atomic_write_str(&base_path, &merged_content).await?;
+                    Self::atomic_write_str(&shadow_path, &merged_content).await?;
                     committed.push(rel);
                 }
                 StagedCommitAction::DeleteFile { rel } => {
@@ -173,6 +230,9 @@ impl CoWWorkspace {
                     committed.push(rel);
                 }
             }
+        }
+        if !committed.is_empty() {
+            let _ = self.bump_host_commit_epoch().await;
         }
 
         Ok(committed)
@@ -1707,6 +1767,18 @@ impl TransactionalWorkspace for CoWWorkspace {
         CoWWorkspace::refresh_from_host(self).await
     }
 
+    async fn acquire_host_commit_lock(&self) -> anyhow::Result<Option<std::fs::File>> {
+        Ok(Some(CoWWorkspace::acquire_host_commit_lock(self).await?))
+    }
+
+    fn read_host_commit_epoch(&self) -> u64 {
+        CoWWorkspace::read_host_commit_epoch(self)
+    }
+
+    async fn bump_host_commit_epoch(&self) -> anyhow::Result<u64> {
+        CoWWorkspace::bump_host_commit_epoch(self).await
+    }
+
     async fn commit_to_host(&self, filter_paths: Option<Vec<String>>) -> anyhow::Result<Vec<String>> {
         self.commit_to_host_with_options(filter_paths, false).await
     }
@@ -1735,6 +1807,7 @@ struct PersistedOrgStoreIndex {
 pub struct OrgCasAndKvStore {
     storage_root: PathBuf,
     index_file: PathBuf,
+    state_mutex: Arc<tokio::sync::Mutex<()>>,
     artifacts: Arc<RwLock<HashMap<String, Vec<ArtifactMeta>>>>,
     kv_store: Arc<RwLock<HashMap<String, OrgKvEntry>>>,
 }
@@ -1755,6 +1828,7 @@ impl OrgCasAndKvStore {
         Ok(Self {
             storage_root: root,
             index_file,
+            state_mutex: Arc::new(tokio::sync::Mutex::new(())),
             artifacts: Arc::new(RwLock::new(initial.artifacts)),
             kv_store: Arc::new(RwLock::new(initial.kv_store)),
         })
@@ -1769,12 +1843,12 @@ impl OrgCasAndKvStore {
         }
     }
 
-    async fn flush_to_disk(&self) -> anyhow::Result<()> {
+    async fn flush_to_disk_unlocked(&self) -> anyhow::Result<()> {
         let state = PersistedOrgStoreIndex {
             artifacts: self.artifacts.read().await.clone(),
             kv_store: self.kv_store.read().await.clone(),
         };
-        aos_core::session::write_json_pretty_atomic(&self.index_file, &state).await?;
+        aos_core::session::write_json_pretty_unlocked(&self.index_file, &state).await?;
         Ok(())
     }
 
@@ -1793,6 +1867,8 @@ impl OrgSharedStorage for OrgCasAndKvStore {
         content_type: &str,
         metadata: serde_json::Value,
     ) -> anyhow::Result<ArtifactMeta> {
+        let _guard = self.state_mutex.lock().await;
+        let _file_lock = aos_core::session::acquire_file_lock(&self.index_file).await?;
         self.reload_from_disk().await;
         let mut hasher = Sha256::new();
         hasher.update(content);
@@ -1825,7 +1901,7 @@ impl OrgSharedStorage for OrgCasAndKvStore {
             .or_default()
             .push(meta.clone());
 
-        self.flush_to_disk().await?;
+        self.flush_to_disk_unlocked().await?;
         Ok(meta)
     }
 
@@ -1888,6 +1964,8 @@ impl OrgSharedStorage for OrgCasAndKvStore {
         value: serde_json::Value,
         expected_version: Option<u64>,
     ) -> anyhow::Result<OrgKvEntry> {
+        let _guard = self.state_mutex.lock().await;
+        let _file_lock = aos_core::session::acquire_file_lock(&self.index_file).await?;
         self.reload_from_disk().await;
         let composite_key = format!("{}::{}::{}", identity.org_id, namespace, key);
         let entry = {
@@ -1934,7 +2012,7 @@ impl OrgSharedStorage for OrgCasAndKvStore {
             entry
         };
 
-        self.flush_to_disk().await?;
+        self.flush_to_disk_unlocked().await?;
         Ok(entry)
     }
 

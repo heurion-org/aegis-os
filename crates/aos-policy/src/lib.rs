@@ -218,6 +218,7 @@ struct PersistedPolicyState {
 
 pub struct AegisPolicyKernel {
     state_file: Option<PathBuf>,
+    state_mutex: Arc<tokio::sync::Mutex<()>>,
     leases: Arc<RwLock<Vec<LeaseGrant>>>,
     escalations: Arc<RwLock<Vec<PendingEscalation>>>,
     forbidden_host_prefixes: Vec<String>,
@@ -257,6 +258,7 @@ impl AegisPolicyKernel {
 
         Self {
             state_file,
+            state_mutex: Arc::new(tokio::sync::Mutex::new(())),
             leases: Arc::new(RwLock::new(initial_leases)),
             escalations: Arc::new(RwLock::new(initial_escalations)),
             forbidden_host_prefixes: vec![
@@ -281,6 +283,14 @@ impl AegisPolicyKernel {
         &self.cedar_policies
     }
 
+    async fn acquire_state_lock(&self) -> anyhow::Result<Option<std::fs::File>> {
+        if let Some(ref path) = self.state_file {
+            Ok(Some(aos_core::session::acquire_file_lock(path).await?))
+        } else {
+            Ok(None)
+        }
+    }
+
     async fn reload_from_disk(&self) {
         if let Some(ref path) = self.state_file {
             if let Ok(bytes) = tokio::fs::read(path).await {
@@ -292,13 +302,13 @@ impl AegisPolicyKernel {
         }
     }
 
-    async fn flush_to_disk(&self) -> anyhow::Result<()> {
+    async fn flush_to_disk_unlocked(&self) -> anyhow::Result<()> {
         if let Some(ref path) = self.state_file {
             let state = PersistedPolicyState {
                 leases: self.leases.read().await.clone(),
                 escalations: self.escalations.read().await.clone(),
             };
-            aos_core::session::write_json_pretty_atomic(path, &state).await?;
+            aos_core::session::write_json_pretty_unlocked(path, &state).await?;
         }
         Ok(())
     }
@@ -370,6 +380,8 @@ impl AegisPolicyKernel {
     }
 
     async fn check_active_lease(&self, ctx: &PolicyContext) -> Option<LeaseGrant> {
+        let _guard = self.state_mutex.lock().await;
+        let _file_lock = self.acquire_state_lock().await.ok().flatten();
         self.reload_from_disk().await;
         let now_ms = Utc::now().timestamp_millis();
         let ctx_task_id = ctx
@@ -417,7 +429,7 @@ impl AegisPolicyKernel {
             };
             if kind == LeaseKind::OneShot {
                 self.leases.write().await.remove(idx);
-                let _ = self.flush_to_disk().await;
+                let _ = self.flush_to_disk_unlocked().await;
             }
         }
         matched_lease
@@ -429,6 +441,9 @@ impl AegisPolicyKernel {
         reason: String,
         suggested_lease_scope: String,
     ) -> anyhow::Result<PolicyDecision> {
+        let _guard = self.state_mutex.lock().await;
+        let _file_lock = self.acquire_state_lock().await?;
+        self.reload_from_disk().await;
         let escalation_id = format!("esc-{}", &Uuid::new_v4().to_string()[..8]);
         let pending = PendingEscalation {
             escalation_id: escalation_id.clone(),
@@ -447,7 +462,7 @@ impl AegisPolicyKernel {
                 .map(str::to_string),
         };
         self.escalations.write().await.push(pending);
-        self.flush_to_disk().await?;
+        self.flush_to_disk_unlocked().await?;
 
         Ok(PolicyDecision::Ask {
             escalation_id,
@@ -485,6 +500,7 @@ impl PolicyEngine for AegisPolicyKernel {
                         | "ipc_task_update"
                         | "ipc_task_get"
                         | "ipc_task_list"
+                        | "ipc_wait"
                 ) {
                     return Ok(PolicyDecision::Allow {
                         matched_rule: "aegis:workstation:cross_org_ipc_auto_allow".to_string(),
@@ -698,9 +714,11 @@ impl PolicyEngine for AegisPolicyKernel {
     }
 
     async fn grant_lease(&self, lease: LeaseGrant) -> anyhow::Result<LeaseGrant> {
+        let _guard = self.state_mutex.lock().await;
+        let _file_lock = self.acquire_state_lock().await?;
         self.reload_from_disk().await;
         self.leases.write().await.push(lease.clone());
-        self.flush_to_disk().await?;
+        self.flush_to_disk_unlocked().await?;
         Ok(lease)
     }
 
@@ -739,6 +757,8 @@ impl PolicyEngine for AegisPolicyKernel {
         ttl_secs: i64,
         approved_by: &str,
     ) -> anyhow::Result<LeaseGrant> {
+        let _guard = self.state_mutex.lock().await;
+        let _file_lock = self.acquire_state_lock().await?;
         self.reload_from_disk().await;
         let target = {
             let mut list = self.escalations.write().await;
@@ -805,11 +825,13 @@ impl PolicyEngine for AegisPolicyKernel {
                 });
             }
         }
-        self.flush_to_disk().await?;
+        self.flush_to_disk_unlocked().await?;
         Ok(lease)
     }
 
     async fn revoke_leases_for_task(&self, task_id: &str) -> anyhow::Result<usize> {
+        let _guard = self.state_mutex.lock().await;
+        let _file_lock = self.acquire_state_lock().await?;
         self.reload_from_disk().await;
         let removed = {
             let mut leases = self.leases.write().await;
@@ -818,7 +840,7 @@ impl PolicyEngine for AegisPolicyKernel {
             before - leases.len()
         };
         if removed > 0 {
-            self.flush_to_disk().await?;
+            self.flush_to_disk_unlocked().await?;
         }
         Ok(removed)
     }
@@ -828,6 +850,8 @@ impl PolicyEngine for AegisPolicyKernel {
         escalation_id: &str,
         _denied_by: &str,
     ) -> anyhow::Result<PendingEscalation> {
+        let _guard = self.state_mutex.lock().await;
+        let _file_lock = self.acquire_state_lock().await?;
         self.reload_from_disk().await;
         let target = {
             let mut list = self.escalations.write().await;
@@ -838,7 +862,7 @@ impl PolicyEngine for AegisPolicyKernel {
             item.status = EscalationStatus::Denied;
             item.clone()
         };
-        self.flush_to_disk().await?;
+        self.flush_to_disk_unlocked().await?;
         Ok(target)
     }
 }

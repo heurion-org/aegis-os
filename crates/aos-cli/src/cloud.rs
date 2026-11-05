@@ -712,6 +712,7 @@ pub fn open_url_in_browser(url: &str) -> bool {
 /// completes `workspace_commit` immediately without opening a browser or needing a second CLI session.
 pub fn record_hook_commit_ticket(runtime_dir: &Path, org_id: &str) {
     let path = runtime_dir.join("hook_commit_tickets.json");
+    let _lock = aos_core::session::acquire_file_lock_sync(&path).ok();
     let mut map: std::collections::HashMap<String, i64> = std::fs::read(&path)
         .ok()
         .and_then(|b| serde_json::from_slice(&b).ok())
@@ -719,17 +720,13 @@ pub fn record_hook_commit_ticket(runtime_dir: &Path, org_id: &str) {
     let now_ms = Utc::now().timestamp_millis();
     map.retain(|_, exp| *exp > now_ms);
     map.insert(org_id.to_string(), now_ms + 300_000);
-    if let Some(parent) = path.parent() {
-        let _ = std::fs::create_dir_all(parent);
-    }
-    if let Ok(bytes) = serde_json::to_vec(&map) {
-        let _ = std::fs::write(&path, bytes);
-    }
+    let _ = aos_core::session::write_json_pretty_unlocked_sync(&path, &map);
 }
 
 /// Consumes a valid `PreToolUse` hook approval ticket for `org_id`, if present and unexpired.
 pub fn consume_hook_commit_ticket(runtime_dir: &Path, org_id: &str) -> bool {
     let path = runtime_dir.join("hook_commit_tickets.json");
+    let _lock = aos_core::session::acquire_file_lock_sync(&path).ok();
     let mut map: std::collections::HashMap<String, i64> = match std::fs::read(&path)
         .ok()
         .and_then(|b| serde_json::from_slice(&b).ok())
@@ -740,9 +737,7 @@ pub fn consume_hook_commit_ticket(runtime_dir: &Path, org_id: &str) -> bool {
     let now_ms = Utc::now().timestamp_millis();
     map.retain(|_, exp| *exp > now_ms);
     let matched = map.remove(org_id).is_some() || map.remove("*").is_some();
-    if let Ok(bytes) = serde_json::to_vec(&map) {
-        let _ = std::fs::write(&path, bytes);
-    }
+    let _ = aos_core::session::write_json_pretty_unlocked_sync(&path, &map);
     matched
 }
 
@@ -1703,7 +1698,9 @@ pub async fn handle_unified_approve(
     let resolved_esc_id = match escalation_id.filter(|s| !s.trim().is_empty()) {
         Some(id) => id,
         None => escalations
-            .last()
+            .iter()
+            .rfind(|e| e.status == aos_core::EscalationStatus::Pending)
+            .or_else(|| escalations.last())
             .map(|e| e.escalation_id.clone())
             .context("No pending escalations found (`aegis-os policy list`)")?,
     };
@@ -1735,7 +1732,10 @@ pub async fn handle_unified_approve(
         for _ in 0..240 {
             tokio::time::sleep(std::time::Duration::from_millis(500)).await;
             let pending = kernel.policy.list_escalations("*").await.unwrap_or_default();
-            if !pending.iter().any(|e| e.escalation_id == resolved_esc_id) {
+            if !pending.iter().any(|e| {
+                e.escalation_id == resolved_esc_id
+                    && e.status == aos_core::EscalationStatus::Pending
+            }) {
                 break;
             }
         }
@@ -2544,20 +2544,29 @@ pub async fn serve_unified_stdio(
             Ok(mut resp) => {
                 if let Some(esc_id) = extract_escalation_id_from_rpc(&resp) {
                     // 1. If the user already approved `workspace_commit` inside the IDE chat window
-                    //    via the `PreToolUse` hook (`decision: "ask"`), consume the ticket and complete immediately!
+                    //    via the `PreToolUse` hook (`decision: "ask"`), consume the ticket and complete
+                    //    all `workspace_commit_sensitive` + `workspace_commit` escalations in this batch!
                     if tool_name == "workspace_commit"
                         && consume_hook_commit_ticket(&runtime_dir, &identity.org_id)
                     {
-                        if kernel
-                            .policy
-                            .approve_escalation(&esc_id, 900, "ide-pretooluse-hook")
-                            .await
-                            .is_ok()
-                        {
-                            if let Ok(retry_resp) =
-                                kernel.handle_jsonrpc_message(&identity, req).await
+                        let mut cur_esc = Some(esc_id);
+                        for _ in 0..8 {
+                            let Some(eid) = cur_esc.take() else { break };
+                            if kernel
+                                .policy
+                                .approve_escalation(&eid, 900, "ide-pretooluse-hook")
+                                .await
+                                .is_err()
                             {
+                                break;
+                            }
+                            if let Ok(retry_resp) =
+                                kernel.handle_jsonrpc_message(&identity, req.clone()).await
+                            {
+                                cur_esc = extract_escalation_id_from_rpc(&retry_resp);
                                 resp = retry_resp;
+                            } else {
+                                break;
                             }
                         }
                     } else {
@@ -2592,7 +2601,10 @@ pub async fn serve_unified_stdio(
                                         .list_escalations(&identity.org_id)
                                         .await
                                         .unwrap_or_default();
-                                    if !pending.iter().any(|e| e.escalation_id == esc_id) {
+                                    if !pending.iter().any(|e| {
+                                        e.escalation_id == esc_id
+                                            && e.status == aos_core::EscalationStatus::Pending
+                                    }) {
                                         let leases = kernel
                                             .policy
                                             .list_leases(&identity.org_id, Some(&identity.agent_id))

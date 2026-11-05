@@ -374,7 +374,43 @@ impl AegisIpcBus {
                 message: message.clone(),
                 timestamp_ms: now_ms,
             });
-            t.clone()
+            let updated_root = t.clone();
+
+            if state == A2ATaskState::Canceled {
+                let mut queue = vec![task_id.to_string()];
+                while let Some(parent_id) = queue.pop() {
+                    let child_ids: Vec<String> = tasks
+                        .values()
+                        .filter(|c| {
+                            c.parent_task_id.as_deref() == Some(parent_id.as_str())
+                                && !c.state.is_terminal()
+                        })
+                        .map(|c| c.id.clone())
+                        .collect();
+                    for cid in child_ids {
+                        if let Some(child) = tasks.get_mut(&cid) {
+                            if child.state.can_transition_to(A2ATaskState::Canceled) {
+                                child.state = A2ATaskState::Canceled;
+                                child.stale = false;
+                                child.revision = child.revision.saturating_add(1);
+                                child.updated_at_ms = now_ms;
+                                child.history.push(A2ATaskStatusUpdate {
+                                    state: A2ATaskState::Canceled,
+                                    actor: actor_addr.clone(),
+                                    message: Some(format!(
+                                        "Canceled (cascade from parent task {})",
+                                        task_id
+                                    )),
+                                    timestamp_ms: now_ms,
+                                });
+                                queue.push(cid);
+                            }
+                        }
+                    }
+                }
+            }
+
+            updated_root
         };
 
         // When a task transitions to `input-required`, proactively push a high-priority notification
@@ -449,6 +485,85 @@ impl AegisIpcBus {
             self.flush_to_disk().await?;
         }
         Ok(changed)
+    }
+
+    /// Returns all direct and transitive subtasks (`parent_task_id`) of `root_task_id`.
+    pub async fn list_subtasks(&self, root_task_id: &str) -> anyhow::Result<Vec<A2ATask>> {
+        let _state = self.state_guard().await;
+        self.reload_from_disk().await;
+        let tasks = self.tasks.read().await;
+        let mut out = Vec::new();
+        let mut queue = vec![root_task_id.to_string()];
+        while let Some(pid) = queue.pop() {
+            for t in tasks.values() {
+                if t.parent_task_id.as_deref() == Some(pid.as_str())
+                    && !out.iter().any(|existing: &A2ATask| existing.id == t.id)
+                {
+                    queue.push(t.id.clone());
+                    out.push(t.clone());
+                }
+            }
+        }
+        out.sort_by(|a, b| a.created_at_ms.cmp(&b.created_at_ms));
+        Ok(out)
+    }
+
+    /// Records or removes file claim globs on `task_id`.
+    pub async fn record_task_claims(
+        &self,
+        task_id: &str,
+        globs: &[String],
+        remove: bool,
+    ) -> anyhow::Result<()> {
+        if globs.is_empty() {
+            return Ok(());
+        }
+        let _state = self.state_guard().await;
+        let _lock = self.state_lock().await?;
+        self.reload_from_disk().await;
+        let mut changed = false;
+        {
+            let mut tasks = self.tasks.write().await;
+            if let Some(task) = tasks.get_mut(task_id) {
+                if remove {
+                    let before = task.claimed_paths.len();
+                    task.claimed_paths.retain(|g| !globs.contains(g));
+                    changed = task.claimed_paths.len() != before;
+                } else {
+                    for g in globs {
+                        if !task.claimed_paths.contains(g) {
+                            task.claimed_paths.push(g.clone());
+                            changed = true;
+                        }
+                    }
+                }
+            }
+        }
+        if changed {
+            self.flush_to_disk().await?;
+        }
+        Ok(())
+    }
+
+    /// Records a granted `TaskScoped` lease ID on `task_id`.
+    pub async fn record_task_lease(&self, task_id: &str, lease_id: &str) -> anyhow::Result<()> {
+        let _state = self.state_guard().await;
+        let _lock = self.state_lock().await?;
+        self.reload_from_disk().await;
+        let mut changed = false;
+        {
+            let mut tasks = self.tasks.write().await;
+            if let Some(task) = tasks.get_mut(task_id) {
+                if !task.lease_ids.iter().any(|id| id == lease_id) {
+                    task.lease_ids.push(lease_id.to_string());
+                    changed = true;
+                }
+            }
+        }
+        if changed {
+            self.flush_to_disk().await?;
+        }
+        Ok(())
     }
 
     /// Mark non-terminal tasks whose assignee is no longer an active peer as `stale`. This is
@@ -742,6 +857,23 @@ impl IpcBus for AegisIpcBus {
         Ok(out)
     }
 
+    async fn list_subtasks(&self, root_task_id: &str) -> anyhow::Result<Vec<A2ATask>> {
+        AegisIpcBus::list_subtasks(self, root_task_id).await
+    }
+
+    async fn record_task_claims(
+        &self,
+        task_id: &str,
+        globs: &[String],
+        remove: bool,
+    ) -> anyhow::Result<()> {
+        AegisIpcBus::record_task_claims(self, task_id, globs, remove).await
+    }
+
+    async fn record_task_lease(&self, task_id: &str, lease_id: &str) -> anyhow::Result<()> {
+        AegisIpcBus::record_task_lease(self, task_id, lease_id).await
+    }
+
     async fn send(&self, mut envelope: IpcEnvelope) -> anyhow::Result<IpcEnvelope> {
         let _state = self.state_guard().await;
         let _lock = self.state_lock().await?;
@@ -851,6 +983,30 @@ impl IpcBus for AegisIpcBus {
                         format!("{}/{}", envelope.org_id, envelope.from_agent)
                     };
                     let to_canonical = format!("{}/{}", envelope.org_id, target_agent);
+                    let parent_task_id = envelope
+                        .payload
+                        .get("parent_task_id")
+                        .and_then(|v| v.as_str())
+                        .filter(|s| !s.is_empty())
+                        .map(str::to_string);
+                    let depends_on = envelope
+                        .payload
+                        .get("depends_on")
+                        .and_then(|v| v.as_array())
+                        .map(|arr| {
+                            arr.iter()
+                                .filter_map(|x| x.as_str())
+                                .filter(|s| !s.is_empty())
+                                .map(str::to_string)
+                                .collect::<Vec<_>>()
+                        })
+                        .unwrap_or_default();
+                    let workspace_id = envelope
+                        .payload
+                        .get("workspace_id")
+                        .and_then(|v| v.as_str())
+                        .filter(|s| !s.is_empty())
+                        .map(str::to_string);
                     let a2a_task = A2ATask {
                         id: envelope.msg_id.clone(),
                         context_id,
@@ -872,6 +1028,11 @@ impl IpcBus for AegisIpcBus {
                         failure_kind: None,
                         stale: false,
                         revision: 0,
+                        parent_task_id,
+                        depends_on,
+                        workspace_id,
+                        claimed_paths: Vec::new(),
+                        lease_ids: Vec::new(),
                     };
                     self.tasks
                         .write()
@@ -2297,5 +2458,79 @@ mod tests {
             .await;
         assert!(after_cancel.is_err());
         assert!(after_cancel.unwrap_err().to_string().contains("Illegal"));
+    }
+
+    #[tokio::test]
+    async fn parent_child_task_tree_and_cascade_cancel() {
+        let bus = AegisIpcBus::new();
+        let lead = AgentIdentity::new("acme", "lead", "Lead");
+        let mid = AgentIdentity::new("acme", "mid", "Mid");
+        let leaf = AgentIdentity::new("acme", "leaf", "Leaf");
+
+        let root_req = bus
+            .send(IpcEnvelope {
+                msg_id: "task-root".to_string(),
+                org_id: "acme".to_string(),
+                from_agent: "lead".to_string(),
+                to_target: "mid".to_string(),
+                kind: IpcKind::TaskRequest { timeout_secs: None },
+                subject: "Root epic".to_string(),
+                payload: json!({"workspace_id": "ws-mid"}),
+                attachments: vec![],
+                status: MessageDeliveryStatus::Unread,
+                created_at_ms: 0,
+            })
+            .await
+            .unwrap();
+
+        let child_req = bus
+            .send(IpcEnvelope {
+                msg_id: "task-child".to_string(),
+                org_id: "acme".to_string(),
+                from_agent: "mid".to_string(),
+                to_target: "leaf".to_string(),
+                kind: IpcKind::TaskRequest { timeout_secs: None },
+                subject: "Subtask".to_string(),
+                payload: json!({
+                    "parent_task_id": root_req.msg_id,
+                    "depends_on": ["task-setup"],
+                    "workspace_id": "ws-leaf"
+                }),
+                attachments: vec![],
+                status: MessageDeliveryStatus::Unread,
+                created_at_ms: 0,
+            })
+            .await
+            .unwrap();
+
+        bus.record_task_claims(&child_req.msg_id, &["src/leaf.rs".to_string()], false)
+            .await
+            .unwrap();
+        bus.record_task_lease(&child_req.msg_id, "lease-leaf-1")
+            .await
+            .unwrap();
+
+        let subtasks = bus.list_subtasks(&root_req.msg_id).await.unwrap();
+        assert_eq!(subtasks.len(), 1);
+        assert_eq!(subtasks[0].id, "task-child");
+        assert_eq!(subtasks[0].parent_task_id.as_deref(), Some("task-root"));
+        assert_eq!(subtasks[0].depends_on, vec!["task-setup".to_string()]);
+        assert_eq!(subtasks[0].claimed_paths, vec!["src/leaf.rs".to_string()]);
+        assert_eq!(subtasks[0].lease_ids, vec!["lease-leaf-1".to_string()]);
+
+        // Canceling the root task cascades to the child task
+        bus.update_task_state(
+            &lead,
+            &root_req.msg_id,
+            A2ATaskState::Canceled,
+            Some("abort epic".to_string()),
+            vec![],
+        )
+        .await
+        .unwrap();
+
+        let child_after = bus.get_task(&child_req.msg_id).await.unwrap().unwrap();
+        assert_eq!(child_after.state, A2ATaskState::Canceled);
+        let _ = (mid, leaf);
     }
 }

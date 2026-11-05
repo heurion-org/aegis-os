@@ -18,6 +18,8 @@ pub struct Claim {
     pub expires_at_ms: i64,
     #[serde(default)]
     pub note: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub task_id: Option<String>,
 }
 
 pub type ClaimTable = BTreeMap<String, Claim>;
@@ -132,7 +134,7 @@ pub fn conflict_message(glob: &str, claim: &Claim, rel_path: &str, now_ms: i64) 
     format!(
         "[Aegis OS coordination] `{rel_path}` is claimed by `{owner}` (pattern `{glob}`, expires in {mins} min{note}). \
          Coordinate first: mcp_aegis-os_ipc_send {{\"to_agent\":\"{owner}\",\"subject\":\"Request: release {glob}\",\"payload\":{{\"ack_required\":true}}}} \
-         and wait for the release instead of writing this file.",
+         or wait for release via mcp_aegis-os_ipc_wait {{\"claim_paths\":[\"{glob}\"],\"auto_claim\":true}} instead of writing this file.",
         owner = claim.owner,
         note = if claim.note.is_empty() { String::new() } else { format!(", note: {}", claim.note) }
     )
@@ -141,6 +143,146 @@ pub fn conflict_message(glob: &str, claim: &Claim, rel_path: &str, now_ms: i64) 
 /// Drops expired claims (housekeeping on every write to the table).
 pub fn prune_expired(table: &mut ClaimTable, now_ms: i64) {
     table.retain(|_, c| c.expires_at_ms > now_ms);
+}
+
+fn normalize_glob_segments(pattern: &str) -> Vec<String> {
+    let pattern = pattern.trim_start_matches("./");
+    let pattern = if let Some(stripped) = pattern.strip_suffix('/') {
+        format!("{stripped}/**")
+    } else {
+        pattern.to_string()
+    };
+    pattern
+        .split('/')
+        .filter(|s| !s.is_empty())
+        .map(|s| s.to_string())
+        .collect()
+}
+
+fn segment_patterns_may_overlap(a: &[u8], b: &[u8]) -> bool {
+    let m = a.len();
+    let n = b.len();
+    let mut dp = vec![vec![false; n + 1]; m + 1];
+    dp[0][0] = true;
+
+    for i in 0..=m {
+        for j in 0..=n {
+            if !dp[i][j] {
+                continue;
+            }
+            if i < m && a[i] == b'*' {
+                dp[i + 1][j] = true;
+                if j < n {
+                    dp[i][j + 1] = true;
+                }
+            }
+            if j < n && b[j] == b'*' {
+                dp[i][j + 1] = true;
+                if i < m {
+                    dp[i + 1][j] = true;
+                }
+            }
+            if i < m
+                && j < n
+                && a[i] != b'*'
+                && b[j] != b'*'
+                && (a[i] == b'?' || b[j] == b'?' || a[i] == b[j])
+            {
+                dp[i + 1][j + 1] = true;
+            }
+        }
+    }
+    dp[m][n]
+}
+
+fn segments_may_overlap(pa: &[String], pb: &[String]) -> bool {
+    let m = pa.len();
+    let n = pb.len();
+    let mut dp = vec![vec![false; n + 1]; m + 1];
+    dp[0][0] = true;
+
+    for i in 0..=m {
+        for j in 0..=n {
+            if !dp[i][j] {
+                continue;
+            }
+            if i < m && pa[i] == "**" {
+                dp[i + 1][j] = true;
+                if j < n {
+                    dp[i][j + 1] = true;
+                }
+            }
+            if j < n && pb[j] == "**" {
+                dp[i][j + 1] = true;
+                if i < m {
+                    dp[i + 1][j] = true;
+                }
+            }
+            if i < m
+                && j < n
+                && pa[i] != "**"
+                && pb[j] != "**"
+                && segment_patterns_may_overlap(pa[i].as_bytes(), pb[j].as_bytes())
+            {
+                dp[i + 1][j + 1] = true;
+            }
+        }
+    }
+    dp[m][n]
+}
+
+/// Checks whether two glob patterns `pat_a` and `pat_b` can match a common file path, either
+/// over concrete `workspace_files` or via exact segment-level NFA intersection.
+pub fn globs_may_overlap(pat_a: &str, pat_b: &str, workspace_files: &[String]) -> bool {
+    if workspace_files
+        .iter()
+        .any(|f| glob_match(pat_a, f) && glob_match(pat_b, f))
+    {
+        return true;
+    }
+    let pa = normalize_glob_segments(pat_a);
+    let pb = normalize_glob_segments(pat_b);
+    segments_may_overlap(&pa, &pb)
+}
+
+/// Releases all claims bound to `task_id`, returning `Vec<(glob, owner)>` of released entries.
+pub fn release_claims_for_task(table: &mut ClaimTable, task_id: &str) -> Vec<(String, String)> {
+    let mut released = Vec::new();
+    table.retain(|glob, claim| {
+        if claim.task_id.as_deref() == Some(task_id) {
+            released.push((glob.clone(), claim.owner.clone()));
+            false
+        } else {
+            true
+        }
+    });
+    released
+}
+
+/// Releases claims owned by `owner` that match or overlap any of `committed_paths`, returning the
+/// released glob patterns.
+pub fn release_claims_matching_paths(
+    table: &mut ClaimTable,
+    owner: &str,
+    committed_paths: &[String],
+) -> Vec<String> {
+    if committed_paths.is_empty() {
+        return Vec::new();
+    }
+    let mut released = Vec::new();
+    table.retain(|glob, claim| {
+        if claim.owner == owner
+            && committed_paths
+                .iter()
+                .any(|p| glob_match(glob, p) || globs_may_overlap(glob, p, committed_paths))
+        {
+            released.push(glob.clone());
+            false
+        } else {
+            true
+        }
+    });
+    released
 }
 
 #[cfg(test)]
@@ -193,5 +335,51 @@ mod tests {
         let pat = "**/*a*a*a*a*a*a*a*a*a*a*a*a*a*a*a*b";
         let path = "a/a/a/a/a/aaaaaaaaaaaaaaaaaaaaaaaaaaaaaac";
         assert!(!glob_match(pat, path));
+    }
+
+    #[test]
+    fn globs_may_overlap_detects_wildcard_and_subtree_intersections() {
+        assert!(globs_may_overlap(
+            "crates/*/src/lib.rs",
+            "crates/aos-vfs/**",
+            &[]
+        ));
+        assert!(globs_may_overlap(
+            "crates/aos-vfs/**",
+            "crates/*/src/lib.rs",
+            &[]
+        ));
+        assert!(!globs_may_overlap(
+            "crates/aos-vfs/**",
+            "crates/aos-ipc/**",
+            &[]
+        ));
+        assert!(!globs_may_overlap(
+            "crates/*/src/lib.rs",
+            "crates/*/src/main.rs",
+            &[]
+        ));
+        assert!(globs_may_overlap(
+            "**/*.rs",
+            "crates/aos-core/src/claims.rs",
+            &[]
+        ));
+    }
+
+    #[test]
+    fn task_and_commit_claim_auto_release() {
+        let mut table = parse_claims(&json!({
+            "crates/aos-vfs/**": {"owner": "agy-a", "expires_at_ms": 9_000, "task_id": "task-1"},
+            "crates/aos-ipc/src/lib.rs": {"owner": "agy-a", "expires_at_ms": 9_000, "task_id": "task-2"},
+            "crates/aos-core/**": {"owner": "agy-b", "expires_at_ms": 9_000, "task_id": "task-1"}
+        }));
+        let committed = vec!["crates/aos-ipc/src/lib.rs".to_string()];
+        let rel_commit = release_claims_matching_paths(&mut table, "agy-a", &committed);
+        assert_eq!(rel_commit, vec!["crates/aos-ipc/src/lib.rs".to_string()]);
+        assert_eq!(table.len(), 2);
+
+        let rel_task = release_claims_for_task(&mut table, "task-1");
+        assert_eq!(rel_task.len(), 2);
+        assert!(table.is_empty());
     }
 }

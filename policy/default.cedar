@@ -67,6 +67,7 @@ permit (
         Action::"ipc_task_update",
         Action::"ipc_task_get",
         Action::"ipc_task_list",
+        Action::"ipc_wait",
         Action::"app_catalog_search",
         Action::"app_mount_session",
         Action::"app_call_tool"

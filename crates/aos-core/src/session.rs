@@ -269,9 +269,9 @@ pub async fn acquire_file_lock(path: &Path) -> anyhow::Result<std::fs::File> {
 }
 
 /// Synchronously writes `value` as pretty-printed JSON (owner-only `0o600` on Unix) to a unique
-/// sibling temporary file and atomically renames it onto `path` while holding a cross-process file lock.
-pub fn write_json_pretty_atomic_sync<T: Serialize>(path: &Path, value: &T) -> anyhow::Result<()> {
-    let _lock = acquire_file_lock_sync(path)?;
+/// sibling temporary file and atomically renames it onto `path` when the caller ALREADY holds
+/// `acquire_file_lock_sync(path)`.
+pub fn write_json_pretty_unlocked_sync<T: Serialize>(path: &Path, value: &T) -> anyhow::Result<()> {
     if let Some(parent) = path.parent() {
         std::fs::create_dir_all(parent)?;
     }
@@ -291,13 +291,19 @@ pub fn write_json_pretty_atomic_sync<T: Serialize>(path: &Path, value: &T) -> an
     Ok(())
 }
 
+/// Synchronously writes `value` as pretty-printed JSON (owner-only `0o600` on Unix) to a unique
+/// sibling temporary file and atomically renames it onto `path` while holding a cross-process file lock.
+pub fn write_json_pretty_atomic_sync<T: Serialize>(path: &Path, value: &T) -> anyhow::Result<()> {
+    let _lock = acquire_file_lock_sync(path)?;
+    write_json_pretty_unlocked_sync(path, value)
+}
+
 /// Writes `value` as pretty-printed JSON to a unique sibling temporary file and atomically
-/// renames it onto `path` while holding a cross-process file lock.
-pub async fn write_json_pretty_atomic<T: Serialize + Sync>(
+/// renames it onto `path` when the caller ALREADY holds `acquire_file_lock(path)`.
+pub async fn write_json_pretty_unlocked<T: Serialize + Sync>(
     path: &Path,
     value: &T,
 ) -> anyhow::Result<()> {
-    let _lock = acquire_file_lock(path).await?;
     if let Some(parent) = path.parent() {
         tokio::fs::create_dir_all(parent).await?;
     }
@@ -315,6 +321,16 @@ pub async fn write_json_pretty_atomic<T: Serialize + Sync>(
     }
     tokio::fs::rename(&tmp, path).await?;
     Ok(())
+}
+
+/// Writes `value` as pretty-printed JSON to a unique sibling temporary file and atomically
+/// renames it onto `path` while holding a cross-process file lock.
+pub async fn write_json_pretty_atomic<T: Serialize + Sync>(
+    path: &Path,
+    value: &T,
+) -> anyhow::Result<()> {
+    let _lock = acquire_file_lock(path).await?;
+    write_json_pretty_unlocked(path, value).await
 }
 
 /// Resolve the agent id for `key` without side effects: hook-written binding first, else derived.

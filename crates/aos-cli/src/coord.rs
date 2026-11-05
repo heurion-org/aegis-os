@@ -56,12 +56,18 @@ async fn compute_radar_delta(
         .into_iter()
         .filter(|(_, c)| c.owner != identity.agent_id)
         .map(|(glob, c)| {
+            let task_tag = c
+                .task_id
+                .as_deref()
+                .filter(|t| !t.is_empty())
+                .map(|t| format!(" task={}", t))
+                .unwrap_or_default();
             let note_tag = if c.note.is_empty() {
                 String::new()
             } else {
                 format!(" ({})", c.note)
             };
-            format!("`{}` claimed by `{}`{}", glob, c.owner, note_tag)
+            format!("`{}` claimed by `{}`{}{}", glob, c.owner, task_tag, note_tag)
         })
         .collect();
     peer_claims.sort();
@@ -74,9 +80,20 @@ async fn compute_radar_delta(
         .into_iter()
         .filter(|t| !t.state.is_terminal())
         .map(|t| {
+            let parent_tag = t
+                .parent_task_id
+                .as_deref()
+                .filter(|p| !p.is_empty())
+                .map(|p| format!(" parent=`{}`", p))
+                .unwrap_or_default();
+            let claims_tag = if t.claimed_paths.is_empty() {
+                String::new()
+            } else {
+                format!(" claims=[{}]", t.claimed_paths.join(","))
+            };
             format!(
-                "`{}` [{:?}] `{}` -> `{}`: \"{}\"",
-                t.id, t.state, t.from_agent, t.to_agent, t.subject
+                "`{}` [{:?}]{}{} `{}` -> `{}`: \"{}\"",
+                t.id, t.state, parent_tag, claims_tag, t.from_agent, t.to_agent, t.subject
             )
         })
         .collect();

@@ -246,6 +246,21 @@ pub trait TransactionalWorkspace: Send + Sync {
     async fn refresh_from_host(&self) -> anyhow::Result<RefreshReport> {
         Ok(RefreshReport::default())
     }
+
+    /// Acquires an exclusive cross-process file lock serializing commits to `host_source_root`.
+    async fn acquire_host_commit_lock(&self) -> anyhow::Result<Option<std::fs::File>> {
+        Ok(None)
+    }
+
+    /// Reads the monotonic commit epoch for `host_source_root` (0 if no commit has occurred yet).
+    fn read_host_commit_epoch(&self) -> u64 {
+        0
+    }
+
+    /// Increments and persists the monotonic commit epoch for `host_source_root`.
+    async fn bump_host_commit_epoch(&self) -> anyhow::Result<u64> {
+        Ok(0)
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -536,6 +551,21 @@ pub struct A2ATask {
     /// Monotonic version for compare-and-swap task updates. Incremented on every real transition.
     #[serde(default)]
     pub revision: u64,
+    /// Optional parent task ID when this task is a delegated subtask of an active task.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub parent_task_id: Option<String>,
+    /// Upstream task IDs that must complete before this task should proceed.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub depends_on: Vec<String>,
+    /// Identifier/path of the CoW shadow workspace associated with the assignee.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub workspace_id: Option<String>,
+    /// Active or historical file globs claimed under this task.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub claimed_paths: Vec<String>,
+    /// Active or historical `TaskScoped` lease IDs granted under this task.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub lease_ids: Vec<String>,
 }
 
 impl A2ATask {
@@ -645,11 +675,13 @@ impl PeerInfo {
             url: format!("{}/a2a/{}/{}", base_url.trim_end_matches('/'), self.org_id, self.agent_id),
             version: "0.2.0".to_string(),
             capabilities: serde_json::json!({
-                "streaming": true,
-                "pushNotifications": true,
+                "streaming": false,
+                "pushNotifications": false,
                 "stateTransitionHistory": true,
                 "aegisCowWorkspace": true,
-                "aegisCasAttachments": true
+                "aegisCasAttachments": true,
+                "aegisIpcWait": true,
+                "aegisTaskGraph": true
             }),
             default_input_modes: vec![
                 "text/plain".to_string(),
@@ -749,6 +781,26 @@ pub trait IpcBus: Send + Sync {
         _agent_id: Option<&str>,
     ) -> anyhow::Result<Vec<A2ATask>> {
         Ok(Vec::new())
+    }
+
+    /// Returns all direct and transitive subtasks (`parent_task_id`) of `root_task_id`.
+    async fn list_subtasks(&self, _root_task_id: &str) -> anyhow::Result<Vec<A2ATask>> {
+        Ok(Vec::new())
+    }
+
+    /// Records or removes file claim globs on `task_id`.
+    async fn record_task_claims(
+        &self,
+        _task_id: &str,
+        _globs: &[String],
+        _remove: bool,
+    ) -> anyhow::Result<()> {
+        Ok(())
+    }
+
+    /// Records a granted `TaskScoped` lease ID on `task_id`.
+    async fn record_task_lease(&self, _task_id: &str, _lease_id: &str) -> anyhow::Result<()> {
+        Ok(())
     }
 
     /// Send a DirectMessage, TaskRequest, TaskResponse, or TopicBroadcast.
@@ -969,6 +1021,111 @@ pub struct AuditEvent {
     pub policy_decision: String,
     pub snapshot_id: Option<String>,
     pub details: serde_json::Value,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub task_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub prev_hash: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub event_hash: Option<String>,
+}
+
+impl AuditEvent {
+    pub const GENESIS_HASH: &'static str =
+        "0000000000000000000000000000000000000000000000000000000000000000";
+
+    /// Deterministically computes the SHA-256 tamper-evident hash chain digest for this event
+    /// given the previous event's hash (`prev_hash`).
+    pub fn compute_hash(&self, prev_hash: &str) -> String {
+        let canonical = serde_json::json!({
+            "prev_hash": prev_hash,
+            "event_id": self.event_id,
+            "timestamp_ms": self.timestamp_ms,
+            "org_id": self.org_id,
+            "agent_id": self.agent_id,
+            "action": self.action,
+            "resource": self.resource,
+            "policy_decision": self.policy_decision,
+            "snapshot_id": self.snapshot_id,
+            "task_id": self.task_id,
+            "details": self.details,
+        });
+        sha256_hex(canonical.to_string().as_bytes())
+    }
+}
+
+/// Pure-Rust FIPS 180-4 SHA-256 hex digest helper so `aos-core` needs no extra crate dependencies.
+pub fn sha256_hex(data: &[u8]) -> String {
+    const K: [u32; 64] = [
+        0x428a2f98, 0x71374491, 0xb5c0fbcf, 0xe9b5dba5, 0x3956c25b, 0x59f111f1, 0x923f82a4,
+        0xab1c5ed5, 0xd807aa98, 0x12835b01, 0x243185be, 0x550c7dc3, 0x72be5d74, 0x80deb1fe,
+        0x9bdc06a7, 0xc19bf174, 0xe49b69c1, 0xefbe4786, 0x0fc19dc6, 0x240ca1cc, 0x2de92c6f,
+        0x4a7484aa, 0x5cb0a9dc, 0x76f988da, 0x983e5152, 0xa831c66d, 0xb00327c8, 0xbf597fc7,
+        0xc6e00bf3, 0xd5a79147, 0x06ca6351, 0x14292967, 0x27b70a85, 0x2e1b2138, 0x4d2c6dfc,
+        0x53380d13, 0x650a7354, 0x766a0abb, 0x81c2c92e, 0x92722c85, 0xa2bfe8a1, 0xa81a664b,
+        0xc24b8b70, 0xc76c51a3, 0xd192e819, 0xd6990624, 0xf40e3585, 0x106aa070, 0x19a4c116,
+        0x1e376c08, 0x2748774c, 0x34b0bcb5, 0x391c0cb3, 0x4ed8aa4a, 0x5b9cca4f, 0x682e6ff3,
+        0x748f82ee, 0x78a5636f, 0x84c87814, 0x8cc70208, 0x90befffa, 0xa4506ceb, 0xbef9a3f7,
+        0xc67178f2,
+    ];
+    let mut h: [u32; 8] = [
+        0x6a09e667, 0xbb67ae85, 0x3c6ef372, 0xa54ff53a, 0x510e527f, 0x9b05688c, 0x1f83d9ab,
+        0x5be0cd19,
+    ];
+    let bit_len = (data.len() as u64).wrapping_mul(8);
+    let mut padded = data.to_vec();
+    padded.push(0x80);
+    while (padded.len() % 64) != 56 {
+        padded.push(0);
+    }
+    padded.extend_from_slice(&bit_len.to_be_bytes());
+
+    for chunk in padded.chunks_exact(64) {
+        let mut w = [0u32; 64];
+        for (i, word) in chunk.chunks_exact(4).enumerate() {
+            w[i] = u32::from_be_bytes([word[0], word[1], word[2], word[3]]);
+        }
+        for i in 16..64 {
+            let s0 = w[i - 15].rotate_right(7) ^ w[i - 15].rotate_right(18) ^ (w[i - 15] >> 3);
+            let s1 = w[i - 2].rotate_right(17) ^ w[i - 2].rotate_right(19) ^ (w[i - 2] >> 10);
+            w[i] = w[i - 16]
+                .wrapping_add(s0)
+                .wrapping_add(w[i - 7])
+                .wrapping_add(s1);
+        }
+        let [mut a, mut b, mut c, mut d, mut e, mut f, mut g, mut hh] = h;
+        for i in 0..64 {
+            let s1 = e.rotate_right(6) ^ e.rotate_right(11) ^ e.rotate_right(25);
+            let ch = (e & f) ^ ((!e) & g);
+            let temp1 = hh
+                .wrapping_add(s1)
+                .wrapping_add(ch)
+                .wrapping_add(K[i])
+                .wrapping_add(w[i]);
+            let s0 = a.rotate_right(2) ^ a.rotate_right(13) ^ a.rotate_right(22);
+            let maj = (a & b) ^ (a & c) ^ (b & c);
+            let temp2 = s0.wrapping_add(maj);
+            hh = g;
+            g = f;
+            f = e;
+            e = d.wrapping_add(temp1);
+            d = c;
+            c = b;
+            b = a;
+            a = temp1.wrapping_add(temp2);
+        }
+        h[0] = h[0].wrapping_add(a);
+        h[1] = h[1].wrapping_add(b);
+        h[2] = h[2].wrapping_add(c);
+        h[3] = h[3].wrapping_add(d);
+        h[4] = h[4].wrapping_add(e);
+        h[5] = h[5].wrapping_add(f);
+        h[6] = h[6].wrapping_add(g);
+        h[7] = h[7].wrapping_add(hh);
+    }
+    format!(
+        "{:08x}{:08x}{:08x}{:08x}{:08x}{:08x}{:08x}{:08x}",
+        h[0], h[1], h[2], h[3], h[4], h[5], h[6], h[7]
+    )
 }
 
 #[async_trait]
@@ -980,6 +1137,12 @@ pub trait FlightRecorder: Send + Sync {
         agent_id: Option<&str>,
         limit: usize,
     ) -> anyhow::Result<Vec<AuditEvent>>;
+    async fn verify_chain(&self, _org_id: Option<&str>) -> anyhow::Result<serde_json::Value> {
+        Ok(serde_json::json!({ "verified": true }))
+    }
+    async fn trace_task(&self, _org_id: &str, _task_id: &str) -> anyhow::Result<Vec<AuditEvent>> {
+        Ok(Vec::new())
+    }
 }
 
 /// Returns true when the named safety component has been switched off for an ablation experiment.

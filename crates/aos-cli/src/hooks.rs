@@ -544,8 +544,8 @@ pub(crate) async fn handle_agy_hook(
                             }
                         }
                     }
-                    let use_inline_hook = !cloud::can_open_browser()
-                        || std::env::var("AOS_HOOK_INLINE_APPROVE").as_deref() == Ok("1");
+                    let use_inline_hook =
+                        std::env::var("AOS_HOOK_INLINE_APPROVE").as_deref() != Ok("0");
                     if sub_tool == "workspace_commit"
                         && use_inline_hook
                         && cloud::resolve_active_cloud_binding(&cli.runtime_dir, &effective_workspace)
@@ -665,8 +665,8 @@ pub(crate) async fn handle_agy_hook(
                         }
                     }
                 }
-                let use_inline_hook = !cloud::can_open_browser()
-                    || std::env::var("AOS_HOOK_INLINE_APPROVE").as_deref() == Ok("1");
+                let use_inline_hook =
+                    std::env::var("AOS_HOOK_INLINE_APPROVE").as_deref() != Ok("0");
                 if short_name == "workspace_commit"
                     && use_inline_hook
                     && cloud::resolve_active_cloud_binding(&cli.runtime_dir, &effective_workspace)
