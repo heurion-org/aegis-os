@@ -48,10 +48,29 @@ const SEEDED_AGENT_DIRS: &[&str] = &[
     ".gemini",
     ".hermes",
     ".config/opencode",
-    ".local/share/opencode",
 ];
 
-const SEEDED_AGENT_FILES: &[&str] = &[".claude.json", ".rustup/settings.toml"];
+const SEEDED_AGENT_FILES: &[&str] = &[
+    ".claude.json",
+    ".rustup/settings.toml",
+    ".local/share/opencode/auth.json",
+];
+
+/// Session databases / logs can be multi-GB; do not copy them into every session.
+const SEED_SKIP_NAMES: &[&str] = &[
+    "projects",
+    "sessions",
+    "logs",
+    "log",
+    "brain",
+    "cache",
+    "tmp",
+    "opencode.db",
+    "opencode.db-wal",
+    "opencode.db-shm",
+];
+
+const MAX_SEED_FILE_BYTES: u64 = 8 * 1024 * 1024;
 
 struct FdMount {
     file: File,
@@ -67,6 +86,7 @@ struct LauncherPlan {
     network_shared: bool,
     command: Vec<String>,
     session_id: String,
+    extra_path: Option<String>,
 }
 
 fn push_dir_chain(args: &mut Vec<String>, path: &Path) {
@@ -231,8 +251,11 @@ impl LauncherPlan {
     }
 
     fn envs(&self) -> Vec<(String, String)> {
-        let mut path = vec![
-            format!("{AGENT_STAGE}/.aegis-bin"),
+        let mut path = vec![format!("{AGENT_STAGE}/.aegis-bin")];
+        if let Some(extra) = &self.extra_path {
+            path.push(extra.clone());
+        }
+        path.extend([
             format!("{TOOLCHAIN_STAGE}/local/bin"),
             format!("{TOOLCHAIN_STAGE}/cargo/bin"),
             format!("{TOOLCHAIN_STAGE}/bun/bin"),
@@ -247,7 +270,7 @@ impl LauncherPlan {
             "/bin".to_string(),
             "/usr/sbin".to_string(),
             "/sbin".to_string(),
-        ];
+        ]);
         path.dedup();
 
         let mut envs = vec![
@@ -336,9 +359,19 @@ fn copy_path(src: &Path, dst: &Path) -> anyhow::Result<()> {
             .with_context(|| format!("listing {}", src.display()))?
         {
             let entry = entry?;
-            copy_path(&entry.path(), &dst.join(entry.file_name()))?;
+            let name = entry.file_name();
+            if SEED_SKIP_NAMES
+                .iter()
+                .any(|skip| name.to_string_lossy() == *skip)
+            {
+                continue;
+            }
+            copy_path(&entry.path(), &dst.join(&name))?;
         }
     } else if meta.is_file() {
+        if meta.len() > MAX_SEED_FILE_BYTES {
+            return Ok(());
+        }
         if let Some(parent) = dst.parent() {
             std::fs::create_dir_all(parent)?;
         }
@@ -832,6 +865,138 @@ pub(crate) fn discard(runtime_dir: &Path, session_id: Option<&str>) -> anyhow::R
     Ok(())
 }
 
+fn find_in_path(bin: &str) -> Option<PathBuf> {
+    let path = std::env::var_os("PATH")?;
+    for dir in std::env::split_paths(&path) {
+        let candidate = dir.join(bin);
+        if candidate.is_file() {
+            return Some(candidate);
+        }
+    }
+    None
+}
+
+fn command_version(bin: &Path) -> Option<String> {
+    let out = std::process::Command::new(bin).arg("--version").output().ok()?;
+    let text = String::from_utf8_lossy(&out.stdout);
+    let line = text.lines().find(|l| !l.trim().is_empty())?;
+    Some(line.trim().to_string())
+}
+
+pub(crate) fn agent_list(host_home: &Path) -> anyhow::Result<()> {
+    let specs = [
+        ("agy", "agy", ".gemini"),
+        ("claude", "claude", ".claude"),
+        ("codex", "codex", ".codex"),
+        ("opencode", "opencode", ".config/opencode"),
+        ("hermes", "hermes", ".hermes"),
+        ("gemini", "gemini", ".gemini"),
+        ("aider", "aider", ".aider"),
+        ("goose", "goose", ".config/goose"),
+        ("amp", "amp", ".config/amp"),
+    ];
+    println!("{:<10} {:<9} {:<9} {:<7} VERSION", "AGENT", "BINARY", "CONFIG", "ENFORCED");
+    for (id, bin, config_rel) in specs {
+        let found = find_in_path(bin);
+        let config = host_home.join(config_rel).exists();
+        let version = found
+            .as_deref()
+            .and_then(command_version)
+            .unwrap_or_else(|| "-".to_string());
+        println!(
+            "{:<10} {:<9} {:<9} {:<7} {}",
+            id,
+            if found.is_some() { "found" } else { "missing" },
+            if config { "found" } else { "missing" },
+            if found.is_some() { "yes" } else { "-" },
+            version
+        );
+    }
+    println!("\nUse `aegis-os run -- <agent>` to launch under the Phase 1 Linux sandbox.");
+    Ok(())
+}
+
+pub(crate) fn agent_doctor(host_home: &Path, agent: &str, runtime_dir: &Path) -> anyhow::Result<()> {
+    println!("Aegis agent doctor: {agent}");
+    match agent {
+        "agy" | "claude" | "codex" | "opencode" | "hermes" | "gemini" | "aider" | "goose" | "amp" => {}
+        other => bail!("unknown agent '{other}'"),
+    }
+    match find_in_path(agent) {
+        Some(path) => {
+            println!("  binary: {}", path.display());
+            println!("  version: {}", command_version(&path).unwrap_or_else(|| "-".into()));
+        }
+        None => println!("  binary: missing"),
+    }
+    let bwrap = aos_sandbox::linux_bwrap_path();
+    match bwrap {
+        Some(path) => {
+            let version = std::process::Command::new(path)
+                .arg("--version")
+                .output()
+                .map(|o| String::from_utf8_lossy(&o.stdout).trim().to_string())
+                .unwrap_or_else(|_| "-".into());
+            println!("  bubblewrap: {path} ({version})");
+            println!("  bind-fd: {}", if bwrap_supports_bind_fd(Path::new(path)) { "yes" } else { "no" });
+        }
+        None => println!("  bubblewrap: missing"),
+    }
+    if let Some((dir, value)) = latest_session(runtime_dir)? {
+        println!(
+            "  latest session: {} ({})",
+            value.get("session_id").and_then(|v| v.as_str()).unwrap_or("-"),
+            value.get("status").and_then(|v| v.as_str()).unwrap_or("unknown")
+        );
+        println!("  session dir: {}", dir.display());
+    }
+    let _ = host_home;
+    Ok(())
+}
+
+fn agent_mounts(
+    host_home: &Path,
+    command: &mut [String],
+) -> anyhow::Result<(Vec<FdMount>, Option<String>)> {
+    let Some(program) = command.first().cloned() else {
+        bail!("aos run: no agent command given");
+    };
+    let found = if program.contains('/') {
+        Some(PathBuf::from(&program))
+    } else {
+        find_in_path(&program)
+    };
+    let Some(binary) = found else {
+        bail!("aos run: agent binary '{program}' was not found on the host PATH");
+    };
+    let canonical = std::fs::canonicalize(&binary).unwrap_or_else(|_| binary.clone());
+    let mut mounts = Vec::new();
+    let mut seen = std::collections::HashSet::new();
+    for path in [binary.parent(), canonical.parent()].into_iter().flatten() {
+        if !path.starts_with(host_home) || !path.is_dir() {
+            continue;
+        }
+        if path == host_home {
+            bail!(
+                "aos run: agent binary {} lives directly in the home directory; \
+                 install it in a subdirectory so Aegis can mount only that directory",
+                binary.display()
+            );
+        }
+        let path = path.to_path_buf();
+        if seen.insert(path.clone()) {
+            mounts.push(fd_mount(&path, path.clone(), true)?);
+        }
+    }
+    command[0] = binary.display().to_string();
+    let home_prefix = host_home.to_string_lossy().to_string();
+    let extra_path = binary
+        .parent()
+        .map(|p| p.display().to_string())
+        .filter(|p| p.starts_with(&home_prefix));
+    Ok((mounts, extra_path))
+}
+
 fn bwrap_supports_bind_fd(path: &Path) -> bool {
     std::process::Command::new(path)
         .arg("--help")
@@ -913,6 +1078,9 @@ async fn run_inner(
         .unwrap_or("workspace")
         .to_string();
 
+    let mut command = command.to_vec();
+    let (agent_bin_mounts, extra_path) = agent_mounts(host_home, &mut command)?;
+
     let session_id = format!("ses_{}", &uuid::Uuid::new_v4().simple().to_string()[..12]);
     let session_dir = runtime_dir.join("sessions").join(&session_id);
     let agent_home = session_dir.join("agent_home");
@@ -950,6 +1118,7 @@ async fn run_inner(
         fds.push(git_mount);
     }
     fds.extend(dependency_mounts(&project, &shadow)?);
+    fds.extend(agent_bin_mounts);
     fds.extend(collect_toolchains(host_home)?);
     fds.extend(collect_configs(host_home, &agent_home)?);
     fds.extend(resolv_conf_mounts()?);
@@ -961,8 +1130,9 @@ async fn run_inner(
         host_name: host_name.clone(),
         fds,
         network_shared: true,
-        command: command.to_vec(),
+        command,
         session_id: session_id.clone(),
+        extra_path,
     };
 
     let session_meta = json!({
@@ -1116,6 +1286,7 @@ mod tests {
             network_shared: true,
             command: vec!["claude".to_string(), "--resume".to_string()],
             session_id: "ses_1".to_string(),
+            extra_path: None,
         }
     }
 

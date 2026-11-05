@@ -72,6 +72,14 @@ pub(crate) struct Cli {
 }
 
 #[derive(Subcommand)]
+enum AgentAction {
+    /// List detected agents and Phase 1 enforcement availability
+    List,
+    /// Check one agent's binary, config and bubblewrap support
+    Doctor { id: String },
+}
+
+#[derive(Subcommand)]
 enum Commands {
     /// [One-Step Global Setup] Automatically configure AGY, Claude Code, and Codex CLI globally
     Install {
@@ -133,6 +141,12 @@ enum Commands {
     Discard {
         #[arg(long)]
         session: Option<String>,
+    },
+
+    /// Inspect Agent support and Phase 1 enforcement readiness
+    Agent {
+        #[command(subcommand)]
+        action: AgentAction,
     },
 
     /// Upgrade Aegis OS in-place to the latest signed release and refresh client integrations
@@ -2116,6 +2130,18 @@ async fn main() -> anyhow::Result<()> {
 
         Commands::Discard { session } => {
             launcher::discard(&runtime_dir, session.as_deref())?;
+        }
+
+        Commands::Agent { action } => {
+            let home = std::env::var_os("HOME")
+                .map(PathBuf::from)
+                .unwrap_or_else(|| PathBuf::from("."));
+            match action {
+                AgentAction::List => launcher::agent_list(&home)?,
+                AgentAction::Doctor { id } => {
+                    launcher::agent_doctor(&home, &id, &runtime_dir)?;
+                }
+            }
         }
 
         Commands::Run { mode, profile, enforcement, cmd } => {

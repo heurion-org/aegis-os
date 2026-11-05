@@ -56,6 +56,31 @@ cargo install --path crates/aos-cli
 aegis-os install
 ```
 
+### 强制隔离模式（Phase 1，Linux 预览）
+
+基于 launcher 的 enforced 模式已可在 Linux 上试用：
+
+```bash
+aegis-os --workspace . run -- claude
+aegis-os status
+aegis-os diff
+aegis-os commit          # 人类 CLI 操作；审批流在 Phase 2
+aegis-os discard
+```
+
+当前已经强制：
+
+- Agent 进程树运行在 `bwrap` 中；宿主项目只读，写入落在每会话独立的 CoW shadow。
+- `$HOME`、`/root`、`/run`、`/var`、`/tmp`、`/mnt`、`/media`、`/srv` 与宿主 SSH 私钥被遮蔽；Agent 敏感配置只读。
+- Git 视图：宿主 `.git` 只读 + 会话 index 可写，`git status` / `git diff` 可用。
+- Agent 状态目录复制进会话 home；OAuth 凭据在退出时原子写回。
+
+Phase 1 限制（暂不要把它当成完整安全边界）：
+
+- 仅 Linux；需要 bubblewrap **>= 0.10**（`--bind-fd`）。macOS 在 Phase 4。
+- 网络仍共享：egress proxy / L7 DLP 尚未强制，宿主 loopback 服务可达。
+- 审批、租约、`--mode observe`、OpenCode/Hermes adapter 与策略引擎在后续阶段。
+
 ### 日常使用方式（零感知自动挂载）
 
 执行过一次 `aegis-os install` 后，日常写代码**完全不需要手动输入 `aegis-os` 命令**：

@@ -90,6 +90,31 @@ cargo install --path crates/aos-cli
 aegis-os install
 ```
 
+### Enforced Runtime (Phase 1, Linux)
+
+The launcher-based enforced mode is available on Linux as a Phase 1 preview:
+
+```bash
+aegis-os --workspace . run -- claude
+aegis-os status
+aegis-os diff
+aegis-os commit          # human CLI action; approvals arrive in Phase 2
+aegis-os discard
+```
+
+What it enforces today:
+
+- The agent process tree runs under `bwrap`; the host project is read-only and writes land in a per-session CoW shadow.
+- `$HOME`, `/root`, `/run`, `/var`, `/tmp`, `/mnt`, `/media`, `/srv` and host SSH keys are masked; sensitive agent config files are read-only.
+- A Git view (host `.git` read-only + writable session index) keeps `git status` / `git diff` usable.
+- Agent state directories are seeded into the session home; OAuth credentials are written back atomically.
+
+Current Phase 1 limits (do not treat this as a full security boundary yet):
+
+- Linux only; requires bubblewrap **>= 0.10** (`--bind-fd` support). macOS is Phase 4.
+- Network is shared: the egress proxy / L7 DLP is not enforced, and host loopback services are reachable.
+- Approvals, leases, `--mode observe`, OpenCode/Hermes adapters and policy enforcement are later phases.
+
 ### Daily Usage (Zero Manual Commands Needed)
 
 After running `aegis-os install` once, you **never need to invoke `aegis-os` manually** during daily coding:
