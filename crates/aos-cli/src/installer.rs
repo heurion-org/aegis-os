@@ -519,6 +519,37 @@ pub(crate) async fn run_doctor(home_dir: &Path) -> anyhow::Result<()> {
             }
         }
     }
+
+    println!("\nEnforced Runtime (Phase 1):");
+    #[cfg(target_os = "linux")]
+    {
+        match aos_sandbox::linux_bwrap_path() {
+            Some(bwrap) => {
+                let help = std::process::Command::new(bwrap)
+                    .arg("--help")
+                    .output()
+                    .map(|o| {
+                        format!(
+                            "{}{}",
+                            String::from_utf8_lossy(&o.stdout),
+                            String::from_utf8_lossy(&o.stderr)
+                        )
+                    })
+                    .unwrap_or_default();
+                if help.contains("--bind-fd") && help.contains("--ro-bind-fd") {
+                    println!("  - status: READY (`{bwrap}` supports --bind-fd)");
+                    println!("  - launch: `aegis-os --workspace . run -- claude`");
+                } else {
+                    println!("  - status: BLOCKED (`{bwrap}` is too old; need >= 0.10 with --bind-fd)");
+                }
+            }
+            None => println!("  - status: BLOCKED (install bubblewrap >= 0.10)"),
+        }
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        println!("  - status: NOT AVAILABLE on this OS (macOS Seatbelt is Phase 4)");
+    }
     Ok(())
 }
 

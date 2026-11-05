@@ -10,6 +10,20 @@
 
 ---
 
+## 实施状态（2026-11-05）
+
+Phase 1 已在 `main` 落地以下能力：
+
+- `aos run -- <agent>`：Linux bwrap、每会话 CoW shadow、宿主项目只读、`$HOME`/系统目录遮蔽、Agent 状态目录分层、敏感配置只读、Git 视图、工具链挂载、Agent 二进制原路径挂载。
+- 出站：私有 netns + identity-pinned CONNECT 代理 + Unix-socket bridge + 域名 allowlist；宿主 loopback 不可达。
+- 会话：`aos status` / `aos last` / `aos diff` / `aos commit` / `aos discard`；`aos agent list` / `aos agent doctor`。
+- `--mode observe`：项目只读；Agent home 可写。
+- 已修复：大文件 CoW 自指 symlink、工具链凭据泄露、`workspace=$HOME` 复制敏感目录、TIOCSTI、bwrap 版本探测、resolv.conf、node_modules 自指、Ctrl-C、OAuth 写回、权限、Git shim、NixOS/Linuxbrew 兼容。
+
+**尚未完成**：L7 DLP / Base URL 反向代理 / opt-in MITM、OpenCode/Hermes 的 install-time plugin 配置、完整 policy broker/租约/审批 UI、macOS Seatbelt、DomainProfile 的 docs/data/binary 合并器、Phase 5 的 Office CRDT / CAS / AAP / UOMP。
+
+---
+
 ## 变更记录
 
 - **v0.3**：根据评审修正 7 个问题：

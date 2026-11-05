@@ -98,6 +98,7 @@ struct LauncherPlan {
     host_name: String,
     fds: Vec<FdMount>,
     network_shared: bool,
+    project_readonly: bool,
     command: Vec<String>,
     session_id: String,
     extra_path: Option<String>,
@@ -1094,10 +1095,8 @@ async fn run_inner(
     }
 
     let mode = mode.to_ascii_lowercase();
-    if mode != "implement" {
-        bail!(
-            "aos run: mode '{mode}' is not implemented in Phase 1; only 'implement' is available"
-        );
+    if !matches!(mode.as_str(), "implement" | "observe") {
+        bail!("aos run: mode '{mode}' is not implemented; use 'implement' or 'observe'");
     }
     if !matches!(profile, "code" | "docs" | "data" | "binary" | "app_state" | "memory" | "mixed") {
         bail!("aos run: unknown profile '{profile}'");
@@ -1140,6 +1139,26 @@ async fn run_inner(
 
     let mut command = command.to_vec();
     let (agent_bin_mounts, extra_path) = agent_mounts(host_home, &mut command)?;
+    if command
+        .first()
+        .and_then(|c| Path::new(c).file_name())
+        .and_then(|s| s.to_str())
+        .map(|name| name.contains("opencode"))
+        .unwrap_or(false)
+    {
+        if command.iter().any(|arg| arg == "--server") {
+            bail!(
+                "aos run: OpenCode --server can connect to the host's shared background service \
+                 and bypass the sandbox; use --standalone inside aos run"
+            );
+        }
+        let informational = command
+            .iter()
+            .any(|arg| matches!(arg.as_str(), "--version" | "--help" | "-V" | "-h"));
+        if !informational && !command.iter().any(|arg| arg == "--standalone") {
+            command.insert(1, "--standalone".to_string());
+        }
+    }
 
     let session_id = format!("ses_{}", &uuid::Uuid::new_v4().simple().to_string()[..12]);
     let session_dir = runtime_dir.join("sessions").join(&session_id);
@@ -1164,7 +1183,7 @@ async fn run_inner(
 
     let mut fds = Vec::new();
     fds.push(fd_mount(&project, format!("{HOST_STAGE}/{host_name}"), true)?);
-    fds.push(fd_mount(&shadow, project.clone(), false)?);
+    fds.push(fd_mount(&shadow, project.clone(), mode == "observe")?);
     fds.push(fd_mount(&agent_home, AGENT_STAGE, false)?);
 
     // Phase 1 egress: a private netns plus the existing identity-pinned CONNECT proxy, relayed
@@ -1228,6 +1247,7 @@ async fn run_inner(
         host_name: host_name.clone(),
         fds,
         network_shared,
+        project_readonly: mode == "observe",
         command,
         session_id: session_id.clone(),
         extra_path,
@@ -1235,7 +1255,7 @@ async fn run_inner(
 
     let session_meta = json!({
         "session_id": session_id.clone(),
-        "mode": "implement",
+        "mode": mode.clone(),
         "enforcement": "enforced-fs",
         "profile": profile,
         "org_id": identity.org_id.clone(),
@@ -1275,6 +1295,10 @@ async fn run_inner(
         eprintln!("  network: egress allowlist (CONNECT-only; host loopback not reachable; L7 DLP not implemented)");
     }
     eprintln!("  profile: {profile}");
+    eprintln!(
+        "  mode:    {mode}{}",
+        if plan.project_readonly { " (project read-only)" } else { "" }
+    );
 
     let mut cmd = Command::new(&plan.bwrap);
     cmd.args(plan.linux_args())
@@ -1293,7 +1317,7 @@ async fn run_inner(
     }
     cmd.env("AOS_EGRESS", if network_shared { "not-enforced" } else { "connect-allowlist" });
     cmd.env("AOS_PROFILE", profile);
-    cmd.env("AOS_MODE", "implement");
+    cmd.env("AOS_MODE", &mode);
     cmd.env("AOS_ORG_ID", &identity.org_id);
     cmd.env("AOS_AGENT_ID", &identity.agent_id);
     for key in [
@@ -1395,6 +1419,7 @@ mod tests {
             host_name: "payments".to_string(),
             fds,
             network_shared: true,
+            project_readonly: false,
             command: vec!["claude".to_string(), "--resume".to_string()],
             session_id: "ses_1".to_string(),
             extra_path: None,
