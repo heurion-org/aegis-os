@@ -65,15 +65,39 @@ impl Route {
     pub fn to_hook_decision(&self, mode: RoutingMode) -> serde_json::Value {
         use serde_json::json;
         match (self, mode) {
-            (Route::Deny { reason }, _) => json!({ "decision": "deny", "reason": reason }),
+            (Route::Deny { reason }, _) => json!({
+                "decision": "deny",
+                "reason": reason,
+                "hookSpecificOutput": {
+                    "hookEventName": "PreToolUse",
+                    "permissionDecision": "deny",
+                    "permissionDecisionReason": reason
+                }
+            }),
             (Route::HostBoundary { reason }, RoutingMode::Off) => {
                 let _ = reason;
                 json!({ "decision": "allow" })
             }
-            (Route::HostBoundary { reason }, _) => json!({ "decision": "ask", "reason": reason }),
+            (Route::HostBoundary { reason }, _) => json!({
+                "decision": "ask",
+                "reason": reason,
+                "hookSpecificOutput": {
+                    "hookEventName": "PreToolUse",
+                    "permissionDecision": "ask",
+                    "permissionDecisionReason": reason
+                }
+            }),
             (Route::RedirectToSandbox { reason }, RoutingMode::Enforce)
             | (Route::RedirectToMcpFs { reason }, RoutingMode::Enforce) => {
-                json!({ "decision": "deny", "reason": reason })
+                json!({
+                    "decision": "deny",
+                    "reason": reason,
+                    "hookSpecificOutput": {
+                        "hookEventName": "PreToolUse",
+                        "permissionDecision": "deny",
+                        "permissionDecisionReason": reason
+                    }
+                })
             }
             (Route::RedirectToSandbox { reason }, RoutingMode::Advise)
             | (Route::RedirectToMcpFs { reason }, RoutingMode::Advise) => {
@@ -200,12 +224,117 @@ const CREDENTIAL_MARKERS: &[&str] = &[
 const PROTECTED_CLIENT_CONFIG_MARKERS: &[&str] = &[
     "/.gemini/config/hooks.json",
     "/.gemini/config/mcp_config.json",
+    "/.gemini/settings.json",
     "/.gemini/antigravity-cli/settings.json",
     "/.claude/settings.json",
+    "/.claude/settings.local.json",
+    "/.claude/hooks",
     "/.claude.json",
     "/.codex/config.toml",
+    "/.codex/hooks",
     "/.agents/hooks.json",
+    "/.agent/hooks.json",
+    "/.git/hooks/",
+    "/.git/config",
+    "/.bashrc",
+    "/.zshrc",
+    "/.profile",
+    "/.zprofile",
 ];
+
+const RUNTIME_STATE_MARKERS: &[&str] = &[
+    "/aegis-os-runtime/policy.json",
+    "/aegis-os-runtime/paas_state.json",
+    "/aegis-os-runtime/ipc_state.json",
+    "/aegis-os-runtime/hook_commit_tickets.json",
+    "/aegis-os-runtime/session_bindings.json",
+    "/aegis-os-runtime/active_workspace.txt",
+    "/aegis-os-runtime/audit.jsonl",
+    "/aegis-os-runtime/routing_decisions.jsonl",
+    "/aegis-os-runtime/stop_budgets.json",
+];
+
+/// Disallow `AOS_HOST=1` from being used as a blanket sandbox bypass for shell interpreters
+/// or destructive file-mutation utilities.
+const DISALLOWED_HOST_OVERRIDE_BINS: &[&str] = &[
+    "sh", "bash", "zsh", "dash", "fish", "ksh", "csh", "tcsh",
+    "python", "python3", "node", "deno", "bun", "perl", "ruby", "php", "lua",
+    "rm", "mv", "cp", "dd", "tee", "chmod", "chown", "chgrp", "ln", "unlink",
+    "truncate", "sed", "awk", "perl", "find", "xargs", "eval", "source",
+];
+
+/// Extract command substitutions `$(...)` and backticks `` `...` `` (outside single quotes)
+/// so embedded subshells cannot smuggle Ring-0 or approval commands past top-level segment splitting.
+pub fn extract_subshell_segments(cmd: &str) -> Vec<String> {
+    let mut sub_cmds = Vec::new();
+    let chars: Vec<char> = cmd.chars().collect();
+    let mut i = 0;
+    let mut in_single = false;
+    while i < chars.len() {
+        let c = chars[i];
+        if c == '\\' && !in_single {
+            i += 2;
+            continue;
+        }
+        if c == '\'' {
+            in_single = !in_single;
+            i += 1;
+            continue;
+        }
+        if !in_single && c == '$' && i + 1 < chars.len() && chars[i + 1] == '(' {
+            let mut depth = 1;
+            let start = i + 2;
+            let mut j = start;
+            while j < chars.len() && depth > 0 {
+                if chars[j] == '\\' {
+                    j += 2;
+                    continue;
+                }
+                if chars[j] == '(' {
+                    depth += 1;
+                } else if chars[j] == ')' {
+                    depth -= 1;
+                    if depth == 0 {
+                        break;
+                    }
+                }
+                j += 1;
+            }
+            if j > start {
+                let inner: String = chars[start..j.min(chars.len())].iter().collect();
+                for s in split_segments(&inner) {
+                    sub_cmds.push(s);
+                }
+            }
+            i = j + 1;
+            continue;
+        }
+        if !in_single && c == '`' {
+            let start = i + 1;
+            let mut j = start;
+            while j < chars.len() {
+                if chars[j] == '\\' {
+                    j += 2;
+                    continue;
+                }
+                if chars[j] == '`' {
+                    break;
+                }
+                j += 1;
+            }
+            if j > start && j < chars.len() {
+                let inner: String = chars[start..j].iter().collect();
+                for s in split_segments(&inner) {
+                    sub_cmds.push(s);
+                }
+            }
+            i = j + 1;
+            continue;
+        }
+        i += 1;
+    }
+    sub_cmds
+}
 
 const GIT_HOST_SUBCOMMANDS: &[&str] = &[
     "commit", "push", "pull", "fetch", "tag", "reset", "checkout", "switch", "merge", "rebase",
@@ -268,7 +397,7 @@ pub fn sandbox_redirect_reason(cmd: &str, shadow_root: &Path, host_root: &Path) 
         String::new()
     };
     format!(
-        "[Aegis OS routing] Native shell is disabled for in-repo work in this workspace. Re-issue it via MCP (zero prompts, kernel-sandboxed):\n  mcp_aegis-os_proc_exec {{\"command\":\"sh\",\"args\":[\"-c\",{}]}}\ncwd = your CoW shadow workspace ({}); host files stay readable by absolute path; writes land in the shadow and reach the host only via workspace_commit. If this command truly must run on the host, prefix it with `AOS_HOST=1 ` and the user will be asked.{}",
+        "[Aegis OS routing] Native shell is disabled for in-repo work in this workspace. Re-issue it via MCP (zero prompts, kernel-sandboxed):\n  mcp_aegis-os_proc_exec {{\"command\":\"sh\",\"args\":[\"-c\",{}]}}\ncwd = your CoW shadow workspace ({}); host files stay readable by absolute path; writes land in the shadow and reach the host only via workspace_commit.{}",
         json_str(cmd),
         shadow_root.display(),
         git_hint
@@ -276,9 +405,17 @@ pub fn sandbox_redirect_reason(cmd: &str, shadow_root: &Path, host_root: &Path) 
 }
 
 /// Classify a native `run_command` invocation.
-/// `aegis-os … policy approve|lease`, `aegis-os … cloud approve`, `aegis-os … cloud approver enroll`
-/// anywhere in the command line (also through `sh -c`, `env`, `script`, … wrappers).
+/// `aegis-os … policy approve|lease`, `aegis-os … cloud approve`, `aegis-os … cloud approver enroll`,
+/// `aegis-os … workspace commit`, or direct calls to `/v1/approvals/decide` anywhere in the command line.
 pub fn invokes_approval_cli(cmd: &str) -> bool {
+    if cmd.contains("/v1/approvals/decide")
+        || cmd.contains("/v1/approvals/simulate")
+        || cmd.contains("policy_approve_escalation")
+        || cmd.contains("policy_grant_lease")
+        || cmd.contains("hook_commit_tickets.json")
+    {
+        return true;
+    }
     let words: Vec<String> = cmd
         .split(|c: char| c.is_whitespace() || matches!(c, '"' | '\'' | ';' | '&' | '|' | '(' | ')' | '`'))
         .filter(|w| !w.is_empty())
@@ -295,6 +432,7 @@ pub fn invokes_approval_cli(cmd: &str) -> bool {
                     pair,
                     ["policy", "approve"]
                         | ["policy", "lease"]
+                        | ["workspace", "commit"]
                         | ["cloud", "approve"]
                         | ["cloud", "approver"]
                         | ["memory", "approve"]
@@ -311,16 +449,17 @@ pub fn classify_run_command(cmd: &str, shadow_root: &Path, host_root: &Path) -> 
     if trimmed.is_empty() {
         return Route::Pass;
     }
-    let segments = split_segments(trimmed);
+    let mut segments = split_segments(trimmed);
+    segments.extend(extract_subshell_segments(trimmed));
 
-    // Approvals are for the human: an agent must not run the CLI that approves its own escalations.
+    // Approvals are for the human: an agent must not run the CLI or HTTP endpoint that approves its own escalations.
     if invokes_approval_cli(trimmed) {
         return Route::Deny {
-            reason: "Blocked by Aegis OS: approving memory consent, approving escalations, granting leases and enrolling approvers is done by a human in their own terminal or trusted UI, not by an agent. Ask the user to run it.".to_string(),
+            reason: "Blocked by Aegis OS: approving memory consent, approving escalations, granting leases, committing workspaces via CLI, and enrolling approvers is done by a human in their own terminal or trusted UI, not by an agent. Ask the user to approve in the Aegis Console.".to_string(),
         };
     }
 
-    // Ring-0 first: any segment.
+    // Ring-0 first: any segment or embedded command substitution.
     for seg in &segments {
         let (_, words) = leading_words(seg);
         if words.first().map(|w| basename(w) == "sudo").unwrap_or(false) {
@@ -334,12 +473,23 @@ pub fn classify_run_command(cmd: &str, shadow_root: &Path, host_root: &Path) -> 
             reason: "Blocked by Aegis OS Ring-0 policy: access to host credential stores (~/.ssh, ~/.aws, ~/.gnupg, ~/.kube, Keychains, ...) is forbidden.".to_string(),
         };
     }
+    if RUNTIME_STATE_MARKERS.iter().any(|m| trimmed.contains(m)) {
+        return Route::Deny {
+            reason: "Blocked by Aegis OS Ring-0 policy: direct shell access to Aegis OS runtime state files (`policy.json`, `paas_state.json`, `hook_commit_tickets.json`, ...) is forbidden.".to_string(),
+        };
+    }
 
     // Commands already targeting the agent's own shadow are fine to run natively? No: they would still
     // prompt. Explicit host opt-in or boundary commands -> ask; everything else -> proc_exec.
     for seg in &segments {
         let (env, words) = leading_words(seg);
         if env.iter().any(|e| e == "AOS_HOST=1") {
+            let bin = words.first().map(|w| basename(w.as_str())).unwrap_or("");
+            if DISALLOWED_HOST_OVERRIDE_BINS.contains(&bin) {
+                return Route::RedirectToSandbox {
+                    reason: sandbox_redirect_reason(trimmed, shadow_root, host_root),
+                };
+            }
             return Route::HostBoundary {
                 reason: format!(
                     "[Aegis OS Host Command Approval]\n  • What this does: Execute `{}` directly on your host workspace (`{}`).\n  • Why confirmation is required: Agent explicitly requested unsandboxed host execution via `AOS_HOST=1`.",
@@ -396,7 +546,26 @@ pub fn canonicalize_lossy(p: &Path) -> PathBuf {
 }
 
 /// Directory names inside a repo that native tools may still write (agent scratch / client state).
-const NATIVE_WRITE_ALLOWED_DIRS: &[&str] = &[".gemini", ".antigravity", "brain", "target", "node_modules"];
+/// Note: `target` and `node_modules` are intentionally excluded so native file writes cannot poison
+/// host build artifacts or executables outside the CoW shadow transaction.
+const NATIVE_WRITE_ALLOWED_DIRS: &[&str] = &[".gemini", ".antigravity", "brain"];
+
+fn is_protected_runtime_state_path(raw: &str, canonical: &str) -> bool {
+    if RUNTIME_STATE_MARKERS
+        .iter()
+        .any(|m| raw.contains(m) || canonical.contains(m))
+    {
+        return true;
+    }
+    for s in [raw, canonical] {
+        if let Some((_, after)) = s.split_once("/aegis-os-runtime/") {
+            if !after.contains('/') || after.starts_with("paas_workspaces/") {
+                return true;
+            }
+        }
+    }
+    false
+}
 
 /// Classify a native `read_file` / `view_file` / `Read` targeting `path`.
 pub fn classify_native_read(path: &Path, own_org_id: &str) -> Route {
@@ -412,6 +581,11 @@ pub fn classify_native_read(path: &Path, own_org_id: &str) -> Route {
     {
         return Route::Deny {
             reason: "Blocked by Aegis OS Ring-0 policy: reading host credential stores (~/.ssh, ~/.aws, ~/.gnupg, ~/.kube, Keychains, custom_vault, ...) via native file tools is forbidden.".to_string(),
+        };
+    }
+    if is_protected_runtime_state_path(&raw, &t) {
+        return Route::Deny {
+            reason: "Blocked by Aegis OS Ring-0 policy: reading Aegis OS kernel state files (`policy.json`, `paas_state.json`, `hook_commit_tickets.json`, ...) via native file tools is forbidden.".to_string(),
         };
     }
     if let Some((_, after)) = t.split_once("/orgs/") {
@@ -451,20 +625,26 @@ pub fn classify_native_write(path: &Path, repo_root: &Path) -> Route {
         .any(|m| raw.contains(m) || t.contains(m))
     {
         return Route::Deny {
-            reason: "Blocked by Aegis OS Ring-0 policy: modifying client lifecycle hooks or permission configurations (`hooks.json`, `settings.json`, `mcp_config.json`) is forbidden.".to_string(),
+            reason: "Blocked by Aegis OS Ring-0 policy: modifying client lifecycle hooks, git hooks, shell profiles, or permission configurations (`hooks.json`, `settings.json`, `mcp_config.json`, `.git/hooks`) is forbidden.".to_string(),
+        };
+    }
+    if is_protected_runtime_state_path(&raw, &t) {
+        return Route::Deny {
+            reason: "Blocked by Aegis OS Ring-0 policy: modifying Aegis OS runtime state files (`policy.json`, `paas_state.json`, `hook_commit_tickets.json`, ...) is forbidden.".to_string(),
         };
     }
 
     // Writes into the agent's CoW shadow workspace or client brain/artifact scratch directory are allowed.
-    // `/tmp` counts as scratch only outside the repo: a repo that itself lives under `/tmp` (common
-    // on Linux) must still have its writes redirected.
+    // `/tmp` counts as scratch only outside the repo and outside `/aegis-os-runtime`: a repo that itself
+    // lives under `/tmp` (common on Linux) must still have its writes redirected.
     let in_repo = target.starts_with(&root);
     if t.contains("/cow_workspace/")
         || t.contains("/upper_workspace/")
         || t.contains("/.gemini/antigravity-cli/brain/")
         || (!in_repo
             && (t.starts_with("/tmp/") || t.starts_with("/private/tmp/"))
-            && !t.contains("/orgs/"))
+            && !t.contains("/orgs/")
+            && !t.contains("/aegis-os-runtime/"))
     {
         return Route::Pass;
     }
@@ -608,19 +788,59 @@ mod tests {
         let Route::RedirectToSandbox { reason } = r else { panic!() };
         assert!(reason.contains("mcp_aegis-os_proc_exec"));
         assert!(reason.contains(r#"["-c","ls -la \"my dir\""]"#), "{reason}");
-        assert!(reason.contains("AOS_HOST=1"));
+        assert!(!reason.contains("AOS_HOST=1"), "must not instruct agent to bypass sandbox via AOS_HOST=1");
     }
 
     #[test]
     fn decisions_per_mode() {
         let redirect = classify_run_command("ls", &shadow(), Path::new("/repo"));
         assert_eq!(redirect.to_hook_decision(RoutingMode::Enforce)["decision"], "deny");
+        assert_eq!(
+            redirect.to_hook_decision(RoutingMode::Enforce)["hookSpecificOutput"]["permissionDecision"],
+            "deny"
+        );
         assert_eq!(redirect.to_hook_decision(RoutingMode::Advise)["decision"], "allow");
         assert_eq!(redirect.to_hook_decision(RoutingMode::Off)["decision"], "allow");
         let boundary = classify_run_command("git push", &shadow(), Path::new("/repo"));
         assert_eq!(boundary.to_hook_decision(RoutingMode::Enforce)["decision"], "ask");
+        assert_eq!(
+            boundary.to_hook_decision(RoutingMode::Enforce)["hookSpecificOutput"]["permissionDecision"],
+            "ask"
+        );
         let ring0 = classify_run_command("sudo ls", &shadow(), Path::new("/repo"));
         assert_eq!(ring0.to_hook_decision(RoutingMode::Off)["decision"], "deny");
+    }
+
+    #[test]
+    fn subshell_and_runtime_state_bypasses_are_blocked() {
+        let root = Path::new("/repo");
+        // Command substitution smuggling sudo / approval CLI / credentials inside HostBoundary commands
+        assert_eq!(kind("git push origin \"$(sudo rm -rf /)\""), "deny_ring0");
+        assert_eq!(kind("git commit -m \"`aegis-os approve esc-1`\""), "deny_ring0");
+        assert_eq!(kind("aegis-os workspace commit"), "deny_ring0");
+        assert_eq!(kind("curl -X POST http://127.0.0.1:7080/v1/approvals/decide"), "deny_ring0");
+        assert_eq!(kind("cat /private/tmp/aegis-os-runtime/policy.json"), "deny_ring0");
+        // AOS_HOST=1 cannot be used to run arbitrary shell interpreters or rm/python/sed on host
+        assert_eq!(kind("AOS_HOST=1 sh -c 'rm -rf /repo'"), "redirect_proc_exec");
+        assert_eq!(kind("AOS_HOST=1 python3 -c 'import os'"), "redirect_proc_exec");
+        assert_eq!(kind("AOS_HOST=1 rm -rf README.md"), "redirect_proc_exec");
+        // Native read/write to /tmp/aegis-os-runtime/policy.json or hook_commit_tickets.json is Ring-0 Denied
+        assert_eq!(
+            classify_native_write(Path::new("/private/tmp/aegis-os-runtime/policy.json"), root).kind(),
+            "deny_ring0"
+        );
+        assert_eq!(
+            classify_native_write(Path::new("/tmp/aegis-os-runtime/hook_commit_tickets.json"), root).kind(),
+            "deny_ring0"
+        );
+        assert_eq!(
+            classify_native_read(Path::new("/private/tmp/aegis-os-runtime/policy.json"), "aegis-os").kind(),
+            "deny_ring0"
+        );
+        assert_eq!(
+            classify_native_read(Path::new("/private/tmp/aegis-os-runtime/paas_state.json"), "aegis-os").kind(),
+            "deny_ring0"
+        );
     }
 
     #[test]
@@ -658,7 +878,9 @@ mod tests {
             "deny_ring0"
         );
         assert_eq!(classify_native_write(&root.join(".gemini/notes.md"), root).kind(), "pass");
-        assert_eq!(classify_native_write(&root.join("target/x"), root).kind(), "pass");
+        // target/ and node_modules/ inside repo must be redirected to MCP CoW shadow (no host binary poisoning)
+        assert_eq!(classify_native_write(&root.join("target/x"), root).kind(), "redirect_mcp_fs");
+        assert_eq!(classify_native_write(&root.join("node_modules/pkg/index.js"), root).kind(), "redirect_mcp_fs");
         assert_eq!(
             classify_native_write(
                 Path::new("/tmp/aegis-os-runtime/orgs/o/agents/a/cow_workspace/upper_workspace/src/a.rs"),

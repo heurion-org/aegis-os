@@ -545,7 +545,7 @@ pub(crate) async fn handle_agy_hook(
                         }
                     }
                     let use_inline_hook =
-                        std::env::var("AOS_HOOK_INLINE_APPROVE").as_deref() != Ok("0");
+                        std::env::var("AOS_HOOK_INLINE_APPROVE").as_deref() == Ok("1");
                     if sub_tool == "workspace_commit"
                         && use_inline_hook
                         && cloud::resolve_active_cloud_binding(&cli.runtime_dir, &effective_workspace)
@@ -666,7 +666,7 @@ pub(crate) async fn handle_agy_hook(
                     }
                 }
                 let use_inline_hook =
-                    std::env::var("AOS_HOOK_INLINE_APPROVE").as_deref() != Ok("0");
+                    std::env::var("AOS_HOOK_INLINE_APPROVE").as_deref() == Ok("1");
                 if short_name == "workspace_commit"
                     && use_inline_hook
                     && cloud::resolve_active_cloud_binding(&cli.runtime_dir, &effective_workspace)
@@ -776,7 +776,16 @@ pub(crate) async fn handle_agy_hook(
 
             if matches!(
                 tool_name,
-                "write_file" | "edit_file" | "Write" | "Edit" | "MultiEdit"
+                "write_file"
+                    | "edit_file"
+                    | "Write"
+                    | "Edit"
+                    | "MultiEdit"
+                    | "NotebookEdit"
+                    | "create_file"
+                    | "replace_file_content"
+                    | "multi_replace_file_content"
+                    | "delete_file"
             ) {
                 let target_path = tool_args
                     .get("Path")

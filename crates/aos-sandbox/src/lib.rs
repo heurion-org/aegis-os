@@ -345,6 +345,9 @@ impl NativeOsSandboxInstance {
     (regex #".*/\.cargo/credentials(\.toml)?$")
     (regex #".*/(custom_vault|\.secrets)(/.*)?$")
     (regex #".*/Library/Keychains(/.*)?$")
+    (regex #".*/com\.apple\.launchd\.[^/]+/Listeners$")
+    (regex #".*/var/run/docker\.sock$")
+    (regex #".*/(\.orbstack|\.colima|\.lima)(/.*)?$")
     (literal "/etc/shadow")
 )"#
         } else {
@@ -836,6 +839,29 @@ impl SandboxInstance for NativeOsSandboxInstance {
         }
 
         for (k, v) in &spec.env {
+            let ku = k.to_ascii_uppercase();
+            if matches!(
+                ku.as_str(),
+                "HOME"
+                    | "TMPDIR"
+                    | "AOS_SANDBOX_ID"
+                    | "AOS_ORG_ID"
+                    | "AOS_AGENT_ID"
+                    | "AOS_AGENT_ROLE"
+                    | "AOS_WORKSPACE"
+                    | "AOS_ORG_SHARED_RO"
+                    | "AOS_ORG_AGENT_PUB"
+                    | "AOS_ADMIN_SECRET"
+                    | "SSH_AUTH_SOCK"
+                    | "SSH_AGENT_PID"
+                    | "LD_PRELOAD"
+                    | "LD_LIBRARY_PATH"
+                    | "DYLD_INSERT_LIBRARIES"
+                    | "DYLD_LIBRARY_PATH"
+                    | "DYLD_FRAMEWORK_PATH"
+            ) {
+                continue;
+            }
             cmd.env(k, v);
         }
 

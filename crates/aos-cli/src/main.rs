@@ -2336,13 +2336,6 @@ async fn main() -> anyhow::Result<()> {
                     println!("{}", serde_json::to_string_pretty(&res)?);
                 }
                 WorkspaceAction::Commit => {
-                    kernel
-                        .call_tool(
-                            &identity,
-                            "policy_grant_lease",
-                            json!({ "action_pattern": "workspace_commit", "ttl_secs": 300 }),
-                        )
-                        .await?;
                     let res = kernel.call_tool(&identity, "workspace_commit", json!({})).await?;
                     println!("{}", serde_json::to_string_pretty(&res)?);
                 }
@@ -2628,6 +2621,15 @@ async fn main() -> anyhow::Result<()> {
                         println!("To        {}", task.to_agent);
                         println!("Context   {}", task.context_id);
                         println!("Subject   {}", task.subject);
+                        if let Some(parent_id) = &task.parent_task_id {
+                            println!("Parent    {}", parent_id);
+                        }
+                        if !task.depends_on.is_empty() {
+                            println!("DependsOn {}", task.depends_on.join(", "));
+                        }
+                        if !task.claimed_paths.is_empty() {
+                            println!("Claims    {}", task.claimed_paths.join(", "));
+                        }
                         println!("Revision  {}", task.revision);
                         println!("Stale     {}", task.stale);
                         if let Some(kind) = &task.failure_kind {
@@ -2937,11 +2939,16 @@ async fn render_mission_control_top(
         );
     }
 
-    println!("\n[4] Recent Flight Recorder Audit Trail (Last {} Events):", recent_events.len());
+    println!("\n[4] Recent Flight Recorder Audit Trail (Last {} Events, SHA-256 Hash-Chained):", recent_events.len());
     for ev in &recent_events {
+        let short_hash = ev
+            .event_hash
+            .as_deref()
+            .and_then(|h| h.get(..12))
+            .unwrap_or("-");
         println!(
-            "  • [{}] {:<12} -> {:<22} ({:<16}) => {}",
-            ev.event_id, ev.agent_id, ev.action, ev.resource, ev.policy_decision
+            "  • [{}] {:<12} -> {:<22} ({:<16}) => {} [sha256:{}]",
+            ev.event_id, ev.agent_id, ev.action, ev.resource, ev.policy_decision, short_hash
         );
     }
     Ok(())

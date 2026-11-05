@@ -87,8 +87,10 @@ aegis-os install
    - 沙箱内永远不落盘明文 API Key，仅持有 `$AOS_SECRET_*` 占位符。出站请求经由身份绑定的本地代理，校验目标域名、HTTP 方法与路径前缀后，在网络边界注入真实凭证，并通过 L7 DLP 拦截私钥与 Token 外泄。
 4. **声明式 Cedar 5 级策略引擎与提交投毒守卫 (`aos-policy`)**：
    - 原生解析 [`policy/default.cedar`](policy/default.cedar)（并支持 `AOS_CEDAR_POLICY_FILE` 扩展），即使在拥有活跃会话租约的情况下，任何触碰 `.git/hooks/*`、`Makefile`、`build.rs`、`Cargo.toml`、`package.json`、`.aegis/*` 的提交仍强制触发人工审批（R0b 守卫）。
-5. **Google A2A 多 Agent 跨窗口通信与云端沙箱 PaaS (`aos-ipc`, `aos-mcp-gateway`)**：
-   - 支持同机跨客户端（`agy` + `claude` + `codex`）实时发现、文件声明锁（`coord_claim`）与 Google A2A 任务流转，并提供一键切换至零本地算力消耗的 **Aegis Cloud Sandbox Mode**（`aegis-os cloud up`）。
+5. **Google A2A 多 Agent 协同基础设施与云端沙箱 PaaS (`aos-ipc`, `aos-mcp-gateway`, `aos-recorder`)**：
+   - **Agent-First 零命令协同**：用户始终直接用自然语言与 `agy`、`claude`、`codex` 对话，无需手动输入 CLI 子命令。Agent 自动通过 MCP 完成同伴发现（`ipc_list_peers`）、层级子任务拆解与依赖编排（`ipc_request` 支持 `parent_task_id` 与 `depends_on`，父任务取消时自动递归取消子任务树）、无 Hook 客户端免轮询阻塞等待（`ipc_wait`）以及状态流转。
+   - **任务级通配符文件锁 (`coord_claim`) 与并发落盘串行复核**：支持 2D NFA + 真实文件树双重 Glob 交集防撞（如拦截 `src/**` 与 `src/auth/*.rs` 冲突）、`proc_exec` 沙箱脚本越界写软告警（`coordination_warning`），并在 `workspace_commit` 或任务终态时**自动释放文件锁与任务租约**；并发提交由跨进程锁与 `host_commit_epoch` 串行化，若主干在预检期间被同伴更新则自动重跑三路合并与 `verify_cmd`。
+   - **SHA-256 防篡改哈希链审计账本**：每一次跨边界操作（锁申请、主干提交、A2A 任务、提权审批）均生成 `prev_hash -> event_hash` 哈希链记录，Agent 可直接调用 `ipc_task_get` / `ipc_task_list` 查验子任务树与 `hash_chain_verified: true` 审计轨迹；同时支持一键切换至零本地算力消耗的 **Aegis Cloud Sandbox Mode**（`aegis-os cloud up`）。
 
 ---
 
@@ -99,4 +101,4 @@ aegis-os install
 - **绝不包含**：任何源代码、文件路径、仓库名称、环境变量、Prompt 内容、用户名或主机名。
 - **随时关闭**：设置环境变量 `export DO_NOT_TRACK=1` 或 `export AOS_TELEMETRY_DISABLED=1`，或执行 `touch ~/.gemini/aegis-telemetry-opt-out` 即可完全静默。
 
-更多架构细节、38 个 MCP 工具完整列表、`AAP-1.0` 应用生态与论文基准测试报告请参阅英文主文档：[README.md](README.md)。
+更多架构细节、39 个 MCP 工具完整列表、`AAP-1.0` 应用生态与论文基准测试报告请参阅英文主文档：[README.md](README.md)。

@@ -293,7 +293,7 @@ You are running inside the **Aegis OS Runtime (`aegis-os`)** with an isolated Co
 | Build / test / lint / git status / scripts | `proc_exec` (`mcp_aegis-os_proc_exec`) | `run_command` (denied for in-repo work) |
 | Read / write / edit / delete repo files | `fs_read`, `fs_write`, `fs_edit`, `fs_delete`, `fs_glob` | `write_file` / `edit_file` (denied for repo files) |
 | Claim / release files when collaborating | `coord_claim`, `coord_release` | Uncoordinated overlapping edits |
-| Multi-agent messaging & task handoff | `ipc_list_peers`, `ipc_send`, `ipc_request`, `ipc_reply`, `ipc_recv`, `ipc_ack` | Manual user relay |
+| Multi-agent messaging & task handoff | `ipc_list_peers`, `ipc_send`, `ipc_request`, `ipc_reply`, `ipc_recv`, `ipc_ack`, `ipc_wait`, `ipc_task_get`, `ipc_task_list`, `ipc_task_update` | Manual user relay |
 | Land shadow changes onto host repo | `workspace_diff` -> `workspace_commit` | Direct host mutation |
 | Switch Cloud vs. Local execution mode | `runtime_configure_mode` (`mode: "cloud" \| "local"`) | Manual CLI configuration |
 <!-- AEGIS-OS-RUNTIME-END -->
@@ -308,7 +308,7 @@ You are running inside the **Aegis OS Runtime (`aegis-os`)** with an isolated Co
     println!("[1/3] AGY (Antigravity) configured:");
     println!("      - MCP Server:  {}", agy_mcp_path.display());
     println!("      - Auto-Hooks:  {}", agy_hooks_path.display());
-    println!("      - Auto-Allow:  {} (24 `mcp(aegis-os/*)` rules)", agy_cli_settings_path.display());
+    println!("      - Auto-Allow:  {} (32 `mcp(aegis-os/*)` rules)", agy_cli_settings_path.display());
     println!("      - Global Rule: {}", agy_rules_path.display());
 
     // ------------------------------------------------------------------------
@@ -442,7 +442,7 @@ You are running inside the **Aegis OS Runtime (`aegis-os`)** with an isolated Co
     }
     println!("\n[2/3] Claude Code (`claude`) configured:");
     println!("      - MCP Server:  {}", claude_mcp_path.display());
-    println!("      - Auto-Allow:  {} (25 `mcp__aegis-os__*` rules)", claude_settings_path.display());
+    println!("      - Auto-Allow:  {} (32 `mcp__aegis-os__*` rules)", claude_settings_path.display());
     println!("      - Global Rule: {}", claude_md_path.display());
 
     // ------------------------------------------------------------------------
@@ -621,7 +621,7 @@ You are operating inside **Aegis OS Runtime** (`{role}`) within Organization **`
 | Build / test / lint / git status / scripts | `proc_exec` (`mcp_aegis-os_proc_exec`) | `run_command` (denied for in-repo work) |
 | Read / write / edit / delete repo files | `fs_read`, `fs_write`, `fs_edit`, `fs_delete`, `fs_glob` | `write_file` / `edit_file` (denied for repo files) |
 | Claim / release files when collaborating | `coord_claim`, `coord_release` | Uncoordinated overlapping edits |
-| Multi-agent messaging & task handoff | `ipc_list_peers`, `ipc_send`, `ipc_request`, `ipc_reply`, `ipc_recv`, `ipc_ack` | Manual user relay |
+| Multi-agent messaging & task handoff | `ipc_list_peers`, `ipc_send`, `ipc_request`, `ipc_reply`, `ipc_recv`, `ipc_ack`, `ipc_wait`, `ipc_task_get`, `ipc_task_list`, `ipc_task_update` | Manual user relay |
 | Land shadow changes onto host repo | `workspace_diff` -> `workspace_commit` | Direct host mutation |
 "#
     );

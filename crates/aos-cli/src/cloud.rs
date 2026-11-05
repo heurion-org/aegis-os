@@ -2552,6 +2552,19 @@ pub async fn serve_unified_stdio(
                         let mut cur_esc = Some(esc_id);
                         for _ in 0..8 {
                             let Some(eid) = cur_esc.take() else { break };
+                            let is_sensitive = kernel
+                                .policy
+                                .list_escalations(&identity.org_id)
+                                .await
+                                .unwrap_or_default()
+                                .iter()
+                                .any(|e| {
+                                    e.escalation_id == eid
+                                        && e.action == "workspace_commit_sensitive"
+                                });
+                            if is_sensitive {
+                                break;
+                            }
                             if kernel
                                 .policy
                                 .approve_escalation(&eid, 900, "ide-pretooluse-hook")

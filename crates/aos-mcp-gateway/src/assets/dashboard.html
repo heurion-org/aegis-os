@@ -321,6 +321,60 @@
     .esc-meta dt { color: var(--ink-muted); text-transform: uppercase; font-size: 0.68rem; }
     .esc-meta dd { margin: 0; color: var(--ink); word-break: break-all; }
 
+    /* Column Header & Pagination Bar */
+    .col-head-row {
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      gap: 0.75rem;
+      margin-bottom: 0.55rem;
+    }
+    .pager-bar {
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      gap: 0.75rem;
+      padding: 0.6rem 0.85rem;
+      margin-top: 0.65rem;
+      background: var(--bg-elevated);
+      border: 1px solid var(--hairline);
+      font-family: var(--font-mono);
+      font-size: 0.73rem;
+      color: var(--ink-secondary);
+      flex-wrap: wrap;
+    }
+    .pager-controls {
+      display: inline-flex;
+      align-items: center;
+      gap: 0.32rem;
+      flex-wrap: wrap;
+    }
+    .pager-btn {
+      font-family: var(--font-mono);
+      font-size: 0.72rem;
+      padding: 0.24rem 0.58rem;
+      border: 1px solid var(--hairline);
+      background: var(--bg-paper);
+      color: var(--ink);
+      cursor: pointer;
+      transition: all 0.16s ease;
+    }
+    .pager-btn:hover:not(:disabled) {
+      border-color: var(--accent);
+      background: var(--accent);
+      color: #F4F1EA;
+    }
+    .pager-btn.active {
+      border-color: var(--accent);
+      background: var(--accent);
+      color: #F4F1EA;
+      font-weight: 500;
+    }
+    .pager-btn:disabled {
+      opacity: 0.42;
+      cursor: default;
+    }
+
     /* Quota Progress Bars & Spec Lists */
     .spec-list { list-style: none; padding: 0; margin: 0.65rem 0 0.95rem; border-top: 1px solid var(--hairline); }
     .spec-list li {
@@ -427,24 +481,22 @@
               <span data-en>Aegis Cloud — <em>My Approvals &amp; Subscription</em></span>
             </h1>
             <p style="font-size:0.9rem;">
-              <span data-zh>连接工作区密钥（<code>ak_live_...</code>）或输入购买邮箱，查看待审批的边界请求与您当前的订阅配额。</span>
-              <span data-en>Connect your workspace key (<code>ak_live_...</code>) or enter your billing email to manage boundary approvals and your subscription quotas.</span>
+              <span data-zh>输入您的工作或购买邮箱，即可查看待审批的边界请求、管理手机 TOTP 验证器与当前订阅配额。</span>
+              <span data-en>Enter your work or billing email to view pending boundary approvals, manage your phone TOTP authenticator, and check subscription quotas.</span>
             </p>
           </div>
 
           <div class="auth-bar-box">
             <div style="display:flex; justify-content:space-between; align-items:center; margin-bottom:0.4rem;">
               <span class="label-caps" style="margin:0;">
-                <span data-zh>身份连接：输入密钥（审批与状态）或 购买邮箱（查订阅）</span>
-                <span data-en>ACCOUNT: ENTER API KEY (APPROVALS) OR BILLING EMAIL (SUBSCRIPTION)</span>
+                <span data-zh>账户同步：输入您的邮箱（查看审批请求与订阅配额）</span>
+                <span data-en>ACCOUNT: ENTER YOUR EMAIL (APPROVALS &amp; SUBSCRIPTION QUOTAS)</span>
               </span>
               <span id="key-org-hint" style="font-family:var(--font-mono); font-size:0.72rem; color:var(--accent);"></span>
             </div>
             <div class="auth-bar-row">
-              <input id="api-key-input" type="password" class="input input-mono" style="flex:1.1; min-width:155px;" placeholder="ak_live_... / aop_..." autocomplete="off" />
-              <button type="button" class="btn btn-primary" onclick="connectKey()"><span data-zh>连接密钥</span><span data-en>Connect Key</span></button>
-              <input id="lookup-email-input" type="email" class="input" style="flex:1; min-width:150px;" placeholder="you@company.com" autocomplete="email" />
-              <button type="button" class="btn btn-ghost" onclick="lookupBillingStatus()"><span data-zh>查订阅</span><span data-en>Lookup</span></button>
+              <input id="lookup-email-input" type="email" class="input" style="flex:1; min-width:200px;" placeholder="you@company.com" autocomplete="email" onkeydown="if(event.key==='Enter')lookupBillingStatus()" />
+              <button type="button" class="btn btn-primary" onclick="lookupBillingStatus()"><span data-zh>查询账户</span><span data-en>Load Account</span></button>
               <button type="button" class="btn btn-ghost" onclick="disconnectKey()"><span data-zh>清除</span><span data-en>Clear</span></button>
             </div>
             <p id="lookup-status-msg" style="font-family:var(--font-mono); font-size:0.74rem; margin-top:0.45rem; display:none;"></p>
@@ -519,9 +571,12 @@
         <div class="grid-2">
           <!-- Left: Pending Escalations -->
           <div>
-            <div class="label-caps" style="margin-bottom:0.55rem;">
-              <span data-zh>待审批越界请求 (PENDING ESCALATIONS)</span>
-              <span data-en>PENDING BOUNDARY ESCALATIONS</span>
+            <div class="col-head-row">
+              <div class="label-caps" style="margin:0;">
+                <span data-zh>待审批越界请求 (PENDING ESCALATIONS)</span>
+                <span data-en>PENDING BOUNDARY ESCALATIONS</span>
+              </div>
+              <span id="esc-count-badge" class="badge badge-ok">0 PENDING</span>
             </div>
             <div id="escalations-container">
               <div class="card" style="padding:1.25rem 1.4rem;">
@@ -544,9 +599,12 @@
 
           <!-- Right: Active Session Leases -->
           <div>
-            <div class="label-caps" style="margin-bottom:0.55rem;">
-              <span data-zh>我已授权的生效租约 (ACTIVE SESSION LEASES)</span>
-              <span data-en>MY ACTIVE SESSION LEASES</span>
+            <div class="col-head-row">
+              <div class="label-caps" style="margin:0;">
+                <span data-zh>我已授权的生效租约 (ACTIVE SESSION LEASES)</span>
+                <span data-en>MY ACTIVE SESSION LEASES</span>
+              </div>
+              <span id="lease-count-badge" class="badge">0 ACTIVE</span>
             </div>
             <div class="card" style="padding:1.25rem 1.4rem;">
               <div id="leases-list">
@@ -674,8 +732,8 @@
                 </div>
                 <div id="workspaces-list">
                   <p style="font-size:0.82rem; color:var(--ink-muted); margin:0;">
-                    <span data-zh>连接工作区密钥后将显示您名下正在运行的云端影子工作区。</span>
-                    <span data-en>Connect your workspace API key above to list your active cloud shadow workspaces.</span>
+                    <span data-zh>输入邮箱同步账户后将显示您名下正在运行的云端影子工作区。</span>
+                    <span data-en>Enter your email above to list your active cloud shadow workspaces.</span>
                   </p>
                 </div>
               </div>
@@ -714,6 +772,13 @@
     const qs = new URLSearchParams(location.search);
     const hashParams = new URLSearchParams(location.hash.replace(/^#/, ''));
 
+    const ESC_PAGE_SIZE = 3;
+    const LEASE_PAGE_SIZE = 5;
+    let escCurrentPage = 1;
+    let leaseCurrentPage = 1;
+    let lastEscalations = [];
+    let lastLeasesData = {};
+
     let currentLang = localStorage.getItem('aegis_lang') || 'zh';
     function applyLang(lang) {
       currentLang = lang === 'en' ? 'en' : 'zh';
@@ -725,6 +790,8 @@
     }
     function toggleLang() {
       applyLang(currentLang === 'zh' ? 'en' : 'zh');
+      renderEscalations(lastEscalations);
+      renderLeasesAndWorkspaces(lastLeasesData);
     }
     applyLang(currentLang);
 
@@ -733,10 +800,12 @@
       sessionStorage.setItem('aegis_approve_key', authKey);
       history.replaceState(null, '', location.pathname + location.search);
     }
-    const keyInputEl = document.getElementById('api-key-input');
-    if (keyInputEl && authKey) keyInputEl.value = authKey;
 
-    let currentOrgId = qs.get('org') || '';
+    let currentOrgId = qs.get('org') || sessionStorage.getItem('aegis_org_id') || '';
+    const savedEmail = localStorage.getItem('aegis_user_email') || '';
+    if (savedEmail && document.getElementById('lookup-email-input')) {
+      document.getElementById('lookup-email-input').value = savedEmail;
+    }
     let requireTotp = false;
 
     function authHeaders() {
@@ -745,20 +814,17 @@
       return h;
     }
 
-    function connectKey() {
-      const val = document.getElementById('api-key-input').value.trim();
-      if (!val) return;
-      authKey = val;
-      sessionStorage.setItem('aegis_approve_key', authKey);
-      refreshAll();
-    }
-
     function disconnectKey() {
       authKey = '';
+      currentOrgId = '';
       sessionStorage.removeItem('aegis_approve_key');
-      document.getElementById('api-key-input').value = '';
-      document.getElementById('lookup-email-input').value = '';
+      sessionStorage.removeItem('aegis_org_id');
+      localStorage.removeItem('aegis_user_email');
+      const emailEl = document.getElementById('lookup-email-input');
+      if (emailEl) emailEl.value = '';
       document.getElementById('key-org-hint').textContent = '';
+      const msgEl = document.getElementById('lookup-status-msg');
+      if (msgEl) msgEl.style.display = 'none';
       const badge = document.getElementById('conn-badge');
       badge.className = 'badge';
       badge.innerHTML = '<span data-zh>未连接账户</span><span data-en>Not Connected</span>';
@@ -846,6 +912,8 @@
         if (!res.ok) throw new Error(data.error || res.statusText);
 
         currentOrgId = data.org_id || currentOrgId;
+        if (email) localStorage.setItem('aegis_user_email', email);
+        if (currentOrgId) sessionStorage.setItem('aegis_org_id', currentOrgId);
         updateSubscriptionAndQuotaUi(data.plan_tier, data.org_id, data.subscription_active, data.quotas);
 
         const badge = document.getElementById('conn-badge');
@@ -853,10 +921,13 @@
           badge.className = 'badge badge-ok';
           badge.textContent = (currentLang === 'zh' ? '已加载 · ' : 'Loaded · ') + data.org_id;
         }
+        const hintEl = document.getElementById('key-org-hint');
+        if (hintEl && currentOrgId) hintEl.textContent = 'Org: ' + currentOrgId;
         msgEl.style.color = 'var(--accent)';
         msgEl.textContent = currentLang === 'zh'
-          ? '已同步租户 ' + (data.org_id || '') + ' 的订阅与配额状态。'
-          : 'Loaded subscription & quota status for ' + (data.org_id || '') + '.';
+          ? '已同步账户 ' + (data.org_id || '') + ' 的审批与订阅配额状态。'
+          : 'Loaded approvals, subscription & quota status for ' + (data.org_id || '') + '.';
+        refreshAll();
       } catch (e) {
         msgEl.style.color = 'var(--danger)';
         msgEl.textContent = (currentLang === 'zh' ? '查询失败：' : 'Lookup failed: ') + e.message;
@@ -972,9 +1043,81 @@
       }
     }
 
-    function renderEscalations(list) {
+    function buildPagerBar(totalItems, pageSize, currentPage, onPageSelect) {
+      const totalPages = Math.max(1, Math.ceil(totalItems / pageSize));
+      if (totalItems <= pageSize) return null;
+
+      const startIdx = (currentPage - 1) * pageSize + 1;
+      const endIdx = Math.min(totalItems, currentPage * pageSize);
+
+      const bar = document.createElement('div');
+      bar.className = 'pager-bar';
+
+      const info = document.createElement('span');
+      info.textContent = currentLang === 'zh'
+        ? '显示 ' + startIdx + '–' + endIdx + ' / 共 ' + totalItems + ' 条 · 第 ' + currentPage + '/' + totalPages + ' 页'
+        : 'Showing ' + startIdx + '–' + endIdx + ' of ' + totalItems + ' · Page ' + currentPage + '/' + totalPages;
+      bar.appendChild(info);
+
+      const ctrls = document.createElement('div');
+      ctrls.className = 'pager-controls';
+
+      const prevBtn = document.createElement('button');
+      prevBtn.type = 'button';
+      prevBtn.className = 'pager-btn';
+      prevBtn.disabled = currentPage <= 1;
+      prevBtn.textContent = currentLang === 'zh' ? '← 上一页' : '← Prev';
+      prevBtn.onclick = () => onPageSelect(currentPage - 1);
+      ctrls.appendChild(prevBtn);
+
+      const maxBtns = 5;
+      let startPage = Math.max(1, currentPage - Math.floor(maxBtns / 2));
+      let endPage = Math.min(totalPages, startPage + maxBtns - 1);
+      if (endPage - startPage + 1 < maxBtns) {
+        startPage = Math.max(1, endPage - maxBtns + 1);
+      }
+      for (let p = startPage; p <= endPage; p++) {
+        const pBtn = document.createElement('button');
+        pBtn.type = 'button';
+        pBtn.className = 'pager-btn' + (p === currentPage ? ' active' : '');
+        pBtn.textContent = String(p);
+        pBtn.onclick = () => onPageSelect(p);
+        ctrls.appendChild(pBtn);
+      }
+
+      const nextBtn = document.createElement('button');
+      nextBtn.type = 'button';
+      nextBtn.className = 'pager-btn';
+      nextBtn.disabled = currentPage >= totalPages;
+      nextBtn.textContent = currentLang === 'zh' ? '下一页 →' : 'Next →';
+      nextBtn.onclick = () => onPageSelect(currentPage + 1);
+      ctrls.appendChild(nextBtn);
+
+      bar.appendChild(ctrls);
+      return bar;
+    }
+
+    function renderEscalations(rawList) {
+      lastEscalations = Array.isArray(rawList) ? rawList : [];
+      const list = lastEscalations
+        .filter(e => !e.status || e.status === 'pending')
+        .slice()
+        .sort((a, b) => (b.created_at_ms || 0) - (a.created_at_ms || 0));
+
       const root = document.getElementById('escalations-container');
       document.getElementById('kpi-pending').textContent = String(list.length);
+
+      const totalPages = Math.max(1, Math.ceil(list.length / ESC_PAGE_SIZE));
+      if (escCurrentPage > totalPages) escCurrentPage = totalPages;
+      if (escCurrentPage < 1) escCurrentPage = 1;
+
+      const countBadge = document.getElementById('esc-count-badge');
+      if (countBadge) {
+        countBadge.className = list.length ? 'badge badge-warn' : 'badge badge-ok';
+        countBadge.textContent = list.length > ESC_PAGE_SIZE
+          ? list.length + ' PENDING · ' + escCurrentPage + '/' + totalPages
+          : list.length + ' PENDING';
+      }
 
       if (!list.length) {
         root.innerHTML =
@@ -996,8 +1139,16 @@
         return;
       }
 
+      const savedTotpValues = {};
+      const focusedId = document.activeElement && document.activeElement.id ? document.activeElement.id : null;
+      root.querySelectorAll('.input-totp').forEach(inp => {
+        if (inp.id && inp.value) savedTotpValues[inp.id] = inp.value;
+      });
+
+      const pageItems = list.slice((escCurrentPage - 1) * ESC_PAGE_SIZE, escCurrentPage * ESC_PAGE_SIZE);
       root.innerHTML = '';
-      for (const esc of list) {
+
+      for (const esc of pageItems) {
         const box = document.createElement('div');
         box.className = 'esc-card';
 
@@ -1017,10 +1168,12 @@
         const rows = [
           ['Agent', (esc.org_id ? esc.org_id + '/' : '') + (esc.agent_id || 'agent')],
           ['Action', esc.action || 'workspace_commit'],
-          ['Resource', esc.resource || '/workspace']
+          ['Resource', esc.target_resource || esc.resource || '/workspace']
         ];
         if (esc.metadata && Array.isArray(esc.metadata.paths) && esc.metadata.paths.length) {
           rows.push(['Files', esc.metadata.paths.join(', ')]);
+        } else if (esc.reason) {
+          rows.push(['Reason', esc.reason]);
         }
         for (const [dtText, ddText] of rows) {
           const dt = document.createElement('dt'); dt.textContent = dtText;
@@ -1040,6 +1193,7 @@
           inp.placeholder = '6-digit TOTP';
           inp.maxLength = 6;
           inp.autocomplete = 'one-time-code';
+          if (savedTotpValues[inp.id]) inp.value = savedTotpValues[inp.id];
           actions.appendChild(inp);
         }
 
@@ -1070,25 +1224,52 @@
 
         root.appendChild(box);
       }
+
+      const pager = buildPagerBar(list.length, ESC_PAGE_SIZE, escCurrentPage, (newPage) => {
+        escCurrentPage = newPage;
+        renderEscalations(lastEscalations);
+      });
+      if (pager) root.appendChild(pager);
+
+      if (focusedId) {
+        const toFocus = document.getElementById(focusedId);
+        if (toFocus) toFocus.focus();
+      }
     }
 
     function renderLeasesAndWorkspaces(data) {
+      lastLeasesData = data || {};
       const leasesRoot = document.getElementById('leases-list');
       const wsRoot = document.getElementById('workspaces-list');
 
-      const leases = Array.isArray(data.active_leases) ? data.active_leases : [];
-      const workspaces = Array.isArray(data.workspaces) ? data.workspaces : (Array.isArray(data.cloud_workspaces) ? data.cloud_workspaces : []);
+      const leases = Array.isArray(lastLeasesData.active_leases) ? lastLeasesData.active_leases : [];
+      const workspaces = Array.isArray(lastLeasesData.workspaces)
+        ? lastLeasesData.workspaces
+        : (Array.isArray(lastLeasesData.cloud_workspaces) ? lastLeasesData.cloud_workspaces : []);
 
       document.getElementById('kpi-leases-sub').textContent = (currentLang === 'zh' ? '生效租约：' : 'Active leases: ') + leases.length;
       document.getElementById('kpi-workspaces').textContent = (currentLang === 'zh' ? '活跃云端工作区：' : 'Active workspaces: ') + workspaces.length;
 
+      const leaseTotalPages = Math.max(1, Math.ceil(leases.length / LEASE_PAGE_SIZE));
+      if (leaseCurrentPage > leaseTotalPages) leaseCurrentPage = leaseTotalPages;
+      if (leaseCurrentPage < 1) leaseCurrentPage = 1;
+
+      const leaseBadge = document.getElementById('lease-count-badge');
+      if (leaseBadge) {
+        leaseBadge.className = leases.length ? 'badge badge-ok' : 'badge';
+        leaseBadge.textContent = leases.length > LEASE_PAGE_SIZE
+          ? leases.length + ' ACTIVE · ' + leaseCurrentPage + '/' + leaseTotalPages
+          : leases.length + ' ACTIVE';
+      }
+
       if (!leases.length) {
         leasesRoot.innerHTML = '<p style="font-size:0.84rem; color:var(--ink-muted); margin:0;">' +
-          (currentLang === 'zh' ? '当前暂无生效中的会话租约。' : 'No active session leases right now.') +
+          (currentLang === 'zh' ? '当前暂无生效中的会话租约。批准 1 小时租约后将在此处列出。' : 'No active session leases right now. Approved 1-hour leases will be listed here.') +
           '</p>';
       } else {
         leasesRoot.innerHTML = '';
-        for (const l of leases) {
+        const leaseSlice = leases.slice((leaseCurrentPage - 1) * LEASE_PAGE_SIZE, leaseCurrentPage * LEASE_PAGE_SIZE);
+        for (const l of leaseSlice) {
           const row = document.createElement('div');
           row.className = 'item-row';
           row.innerHTML =
@@ -1097,6 +1278,11 @@
             '<span class="badge badge-ok">ACTIVE LEASE</span>';
           leasesRoot.appendChild(row);
         }
+        const leasePager = buildPagerBar(leases.length, LEASE_PAGE_SIZE, leaseCurrentPage, (newPage) => {
+          leaseCurrentPage = newPage;
+          renderLeasesAndWorkspaces(lastLeasesData);
+        });
+        if (leasePager) leasesRoot.appendChild(leasePager);
       }
 
       if (!workspaces.length) {
