@@ -138,6 +138,9 @@ enum Commands {
         /// Optional path filter
         #[arg(long = "path")]
         paths: Vec<String>,
+        /// Explicitly allow commit-poisoning paths (.git/hooks, build.rs, CI config, ...)
+        #[arg(long, default_value_t = false)]
+        allow_sensitive: bool,
     },
 
     /// Discard the latest (or named) session shadow
@@ -2126,9 +2129,9 @@ async fn main() -> anyhow::Result<()> {
             launcher::diff(&runtime_dir, session.as_deref()).await?;
         }
 
-        Commands::Commit { session, paths } => {
+        Commands::Commit { session, paths, allow_sensitive } => {
             let filter = if paths.is_empty() { None } else { Some(paths) };
-            launcher::commit(&runtime_dir, session.as_deref(), filter).await?;
+            launcher::commit(&runtime_dir, session.as_deref(), filter, allow_sensitive).await?;
         }
 
         Commands::Discard { session } => {

@@ -844,6 +844,7 @@ pub(crate) async fn commit(
     runtime_dir: &Path,
     session_id: Option<&str>,
     paths: Option<Vec<String>>,
+    allow_sensitive: bool,
 ) -> anyhow::Result<()> {
     let Some((dir, value)) = find_session(runtime_dir, session_id)? else {
         bail!("Aegis: no sessions under {}", runtime_dir.display());
@@ -856,6 +857,22 @@ pub(crate) async fn commit(
     let ws = CoWWorkspace::init(workspace, &base)
         .await
         .with_context(|| format!("opening session workspace {}", dir.display()))?;
+    let changed = ws.changed_since_baseline().await?;
+    let sensitive: Vec<&String> = changed
+        .iter()
+        .filter(|path| aos_policy::AegisPolicyKernel::is_commit_poisoning_path(path))
+        .collect();
+    if !sensitive.is_empty() && !allow_sensitive {
+        let list = sensitive
+            .iter()
+            .map(|path| path.as_str())
+            .collect::<Vec<_>>()
+            .join(", ");
+        bail!(
+            "aos commit: refusing to land sensitive path(s) without explicit approval: {list}. \
+             Review with `aos diff`, then rerun with `--allow-sensitive` if intended."
+        );
+    }
     let committed = ws.commit_to_host(paths).await?;
     if committed.is_empty() {
         println!("Nothing to commit in {}", dir.display());
