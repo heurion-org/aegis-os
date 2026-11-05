@@ -952,6 +952,7 @@ pub enum EscalationStatus {
     Pending,
     Approved,
     Denied,
+    Expired,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -967,6 +968,25 @@ pub struct PendingEscalation {
     pub created_at_ms: i64,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub task_id: Option<String>,
+    /// Optional agent-supplied rationale explaining why the boundary action is requested.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub rationale: Option<String>,
+    /// Deterministic SHA-256 hex digest of the pre-approval evidence payload (e.g. canonical Unified Diff).
+    /// Used by One-Shot (`ttl_secs == 0`) leases to prevent TOCTOU diff-swap / bait-and-switch attacks.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub evidence_hash: Option<String>,
+    /// Immutable structured evidence snapshot captured when the escalation ticket was minted.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub evidence: Option<serde_json::Value>,
+    /// Optional expiration timestamp (`created_at_ms + TTL`) after which the pending ticket auto-expires.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub expires_at_ms: Option<i64>,
+    /// Human operator or policy actor that approved or denied the escalation.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub decided_by: Option<String>,
+    /// Timestamp (ms since epoch) when the escalation reached a terminal state.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub decided_at_ms: Option<i64>,
 }
 
 #[async_trait]
@@ -1003,6 +1023,11 @@ pub trait PolicyEngine: Send + Sync {
     /// Revoke every lease bound to an A2A task. Called when the task reaches a terminal state.
     async fn revoke_leases_for_task(&self, _task_id: &str) -> anyhow::Result<usize> {
         Ok(0)
+    }
+
+    /// Explicitly revoke a single active session lease by ID (`lease-*`).
+    async fn revoke_lease(&self, _lease_id: &str) -> anyhow::Result<bool> {
+        Ok(false)
     }
 }
 

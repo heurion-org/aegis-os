@@ -323,6 +323,42 @@ impl AegisPolicyKernel {
         false
     }
 
+    /// Matches a lease `resource_pattern` against `target_resource` and, if the pattern includes a
+    /// cryptographic diff/evidence pin (`sha256:<hex>` or `<resource>#sha256:<hex>`), verifies that
+    /// `metadata.evidence_hash` matches the pinned SHA-256 digest (preventing TOCTOU diff-swap attacks).
+    fn matches_resource_and_evidence(
+        pattern: &str,
+        value: &str,
+        metadata: &serde_json::Value,
+    ) -> bool {
+        if let Some((base_pat, expected_hash)) = pattern.split_once("#sha256:") {
+            if !Self::matches_pattern(base_pat, value) {
+                return false;
+            }
+            return metadata.get("evidence_hash").and_then(|v| v.as_str()) == Some(expected_hash);
+        }
+        if let Some(expected_hash) = pattern.strip_prefix("sha256:") {
+            return metadata.get("evidence_hash").and_then(|v| v.as_str()) == Some(expected_hash);
+        }
+        Self::matches_pattern(pattern, value)
+    }
+
+    async fn expire_stale_escalations_unlocked(&self, now_ms: i64) -> bool {
+        let mut changed = false;
+        let mut list = self.escalations.write().await;
+        for item in list.iter_mut() {
+            if item.status == EscalationStatus::Pending
+                && item.expires_at_ms.is_some_and(|exp| exp <= now_ms)
+            {
+                item.status = EscalationStatus::Expired;
+                item.decided_by = Some("policy-ttl-watchdog".to_string());
+                item.decided_at_ms = Some(now_ms);
+                changed = true;
+            }
+        }
+        changed
+    }
+
     /// Returns true if a relative workspace path can trigger automatic code execution on the host
     /// during git operations, directory entry (`direnv`), CI runs, or build-system invocation
     /// (`build.rs`, `Makefile`, `package.json`, `.cargo/config.toml`, `.vscode/tasks.json`).
@@ -413,7 +449,11 @@ impl AegisPolicyKernel {
                     && lease.org_id == ctx.principal.org_id
                     && (lease.agent_id == "*" || lease.agent_id == ctx.principal.agent_id)
                     && Self::matches_pattern(&lease.action_pattern, &ctx.action)
-                    && Self::matches_pattern(&lease.resource_pattern, &ctx.target_resource)
+                    && Self::matches_resource_and_evidence(
+                        &lease.resource_pattern,
+                        &ctx.target_resource,
+                        &ctx.metadata,
+                    )
                 {
                     matched_idx = Some(idx);
                     matched_lease = Some(lease.clone());
@@ -444,7 +484,14 @@ impl AegisPolicyKernel {
         let _guard = self.state_mutex.lock().await;
         let _file_lock = self.acquire_state_lock().await?;
         self.reload_from_disk().await;
+        let now_ms = Utc::now().timestamp_millis();
+        let _ = self.expire_stale_escalations_unlocked(now_ms).await;
         let escalation_id = format!("esc-{}", &Uuid::new_v4().to_string()[..8]);
+        let ttl_ms = ctx
+            .metadata
+            .get("escalation_ttl_ms")
+            .and_then(|v| v.as_i64())
+            .unwrap_or(30 * 60 * 1000);
         let pending = PendingEscalation {
             escalation_id: escalation_id.clone(),
             org_id: ctx.principal.org_id.clone(),
@@ -454,12 +501,27 @@ impl AegisPolicyKernel {
             reason: reason.clone(),
             suggested_lease_scope: suggested_lease_scope.clone(),
             status: EscalationStatus::Pending,
-            created_at_ms: Utc::now().timestamp_millis(),
+            created_at_ms: now_ms,
             task_id: ctx
                 .metadata
                 .get("task_id")
                 .and_then(|value| value.as_str())
                 .map(str::to_string),
+            rationale: ctx
+                .metadata
+                .get("rationale")
+                .or_else(|| ctx.metadata.get("reason"))
+                .and_then(|v| v.as_str())
+                .map(str::to_string),
+            evidence_hash: ctx
+                .metadata
+                .get("evidence_hash")
+                .and_then(|v| v.as_str())
+                .map(str::to_string),
+            evidence: ctx.metadata.get("evidence").cloned(),
+            expires_at_ms: Some(now_ms + ttl_ms),
+            decided_by: None,
+            decided_at_ms: None,
         };
         self.escalations.write().await.push(pending);
         self.flush_to_disk_unlocked().await?;
@@ -561,10 +623,13 @@ impl PolicyEngine for AegisPolicyKernel {
             }
         }
 
-        // 2b. Commit-Time Poisoning Guard: Even if an active general session lease exists, committing
-        // modifications to git hooks, direnv, CI workflows, or build scripts (`build.rs`, `Makefile`,
-        // `package.json`, `.cargo/config.toml`) requires explicit human escalation (`workspace_commit_sensitive`).
+        // 2b. Commit-Time Poisoning & Integrity Guard: Even if an active general session lease exists,
+        // committing modifications to git hooks, direnv, CI workflows, or build scripts (`build.rs`,
+        // `Makefile`, `package.json`, `.cargo/config.toml`), OR passing `overwrite_binaries=true` /
+        // `skip_verify=true` (when a host verification gate is configured) requires explicit human
+        // escalation (`workspace_commit_sensitive`).
         if ctx.action == "workspace_commit" && !aos_core::ablated("commit_guard") {
+            let mut unleased_sensitive: Vec<String> = Vec::new();
             if let Some(paths) = ctx.metadata.get("paths").and_then(|v| v.as_array()) {
                 for p in paths.iter().filter_map(|x| x.as_str()) {
                     if Self::is_commit_poisoning_path(p) {
@@ -575,21 +640,80 @@ impl PolicyEngine for AegisPolicyKernel {
                             target_resource: p.to_string(),
                             metadata: ctx.metadata.clone(),
                         };
-                        if self.check_active_lease(&sensitive_ctx).await.is_some() {
-                            continue;
+                        if self.check_active_lease(&sensitive_ctx).await.is_none() {
+                            unleased_sensitive.push(p.to_string());
                         }
-                        return self
-                            .record_escalation(
-                                &sensitive_ctx,
-                                format!(
-                                    "Commit touches sensitive build/hook path '{}' (commit-time poisoning guard bypasses session lease)",
-                                    p
-                                ),
-                                format!("action=workspace_commit_sensitive, resource={}", p),
-                            )
-                            .await;
                     }
                 }
+            }
+            if ctx
+                .metadata
+                .get("overwrite_binaries")
+                .and_then(|v| v.as_bool())
+                == Some(true)
+            {
+                let bin_ctx = PolicyContext {
+                    principal: ctx.principal.clone(),
+                    action: "workspace_commit_sensitive".to_string(),
+                    target_org_id: ctx.target_org_id.clone(),
+                    target_resource: "flag:overwrite_binaries".to_string(),
+                    metadata: ctx.metadata.clone(),
+                };
+                if self.check_active_lease(&bin_ctx).await.is_none() {
+                    unleased_sensitive.push("flag:overwrite_binaries".to_string());
+                }
+            }
+            if ctx.metadata.get("skip_verify").and_then(|v| v.as_bool()) == Some(true)
+                && ctx
+                    .metadata
+                    .get("has_configured_verify_cmd")
+                    .and_then(|v| v.as_bool())
+                    == Some(true)
+            {
+                let skip_ctx = PolicyContext {
+                    principal: ctx.principal.clone(),
+                    action: "workspace_commit_sensitive".to_string(),
+                    target_org_id: ctx.target_org_id.clone(),
+                    target_resource: "flag:skip_verify".to_string(),
+                    metadata: ctx.metadata.clone(),
+                };
+                if self.check_active_lease(&skip_ctx).await.is_none() {
+                    unleased_sensitive.push("flag:skip_verify".to_string());
+                }
+            }
+            if !unleased_sensitive.is_empty() {
+                let combined_resource = unleased_sensitive.join(", ");
+                let batch_ctx = PolicyContext {
+                    principal: ctx.principal.clone(),
+                    action: "workspace_commit_sensitive".to_string(),
+                    target_org_id: ctx.target_org_id.clone(),
+                    target_resource: combined_resource.clone(),
+                    metadata: ctx.metadata.clone(),
+                };
+                let reason = if unleased_sensitive.len() == 1
+                    && unleased_sensitive[0] == "flag:overwrite_binaries"
+                {
+                    "Commit sets 'overwrite_binaries=true' to overwrite concurrently modified host binary assets (requires explicit human approval)".to_string()
+                } else if unleased_sensitive.len() == 1
+                    && unleased_sensitive[0] == "flag:skip_verify"
+                {
+                    "Commit sets 'skip_verify=true' to bypass the repository's configured pre-commit verification gate (requires explicit human approval)".to_string()
+                } else {
+                    format!(
+                        "Commit touches sensitive build/hook target(s) '{}' (commit-time poisoning guard bypasses general session lease)",
+                        combined_resource
+                    )
+                };
+                return self
+                    .record_escalation(
+                        &batch_ctx,
+                        reason,
+                        format!(
+                            "action=workspace_commit_sensitive, resource={}",
+                            combined_resource
+                        ),
+                    )
+                    .await;
             }
         }
 
@@ -742,7 +866,13 @@ impl PolicyEngine for AegisPolicyKernel {
     }
 
     async fn list_escalations(&self, org_id: &str) -> anyhow::Result<Vec<PendingEscalation>> {
+        let _guard = self.state_mutex.lock().await;
+        let _file_lock = self.acquire_state_lock().await.ok().flatten();
         self.reload_from_disk().await;
+        let now_ms = Utc::now().timestamp_millis();
+        if self.expire_stale_escalations_unlocked(now_ms).await {
+            let _ = self.flush_to_disk_unlocked().await;
+        }
         let esc = self.escalations.read().await;
         Ok(esc
             .iter()
@@ -760,32 +890,65 @@ impl PolicyEngine for AegisPolicyKernel {
         let _guard = self.state_mutex.lock().await;
         let _file_lock = self.acquire_state_lock().await?;
         self.reload_from_disk().await;
+        let now_ms = Utc::now().timestamp_millis();
+        let _ = self.expire_stale_escalations_unlocked(now_ms).await;
         let target = {
             let mut list = self.escalations.write().await;
             let item = list
                 .iter_mut()
                 .find(|e| e.escalation_id == escalation_id)
                 .with_context(|| format!("Escalation '{}' not found", escalation_id))?;
+            if item.status == EscalationStatus::Denied {
+                anyhow::bail!("Escalation '{}' has already been denied", escalation_id);
+            }
+            if item.status == EscalationStatus::Expired {
+                drop(list);
+                let _ = self.flush_to_disk_unlocked().await;
+                anyhow::bail!(
+                    "Escalation '{}' has expired and can no longer be approved",
+                    escalation_id
+                );
+            }
             item.status = EscalationStatus::Approved;
+            item.decided_by = Some(approved_by.to_string());
+            item.decided_at_ms = Some(now_ms);
             item.clone()
         };
 
-        let expires_at_ms = if ttl_secs <= 0 {
-            -1
+        let is_oneshot = ttl_secs <= 0;
+        let expires_at_ms = if is_oneshot {
+            now_ms + 900_000
         } else {
-            Utc::now().timestamp_millis() + (ttl_secs * 1000)
+            now_ms + (ttl_secs * 1000)
         };
-        let resource_pattern = if target.action == "workspace_commit_sensitive"
+        let base_resource_pattern = if target.action == "workspace_commit_sensitive"
+            || target.action == "egress_unlisted_domain"
+            || target.action == "mcp_mount_server"
+            || target.action == "org_artifact_fetch"
+            || target.action == "org_kv_get"
             || target.action.starts_with("memory.")
         {
             target.target_resource.clone()
         } else {
             "*".to_string()
         };
+        let resource_pattern = if is_oneshot {
+            if let Some(ref ev_hash) = target.evidence_hash {
+                if base_resource_pattern == "*" {
+                    format!("sha256:{}", ev_hash)
+                } else {
+                    format!("{}#sha256:{}", base_resource_pattern, ev_hash)
+                }
+            } else {
+                base_resource_pattern
+            }
+        } else {
+            base_resource_pattern
+        };
         let task_id = target.task_id.clone();
         let kind = if task_id.is_some() {
             LeaseKind::TaskScoped
-        } else if expires_at_ms == -1 {
+        } else if is_oneshot {
             LeaseKind::OneShot
         } else {
             LeaseKind::Ttl
@@ -805,16 +968,56 @@ impl PolicyEngine for AegisPolicyKernel {
         {
             let mut leases = self.leases.write().await;
             leases.push(lease.clone());
-            // When approving a sensitive commit path, also ensure a one-shot `workspace_commit`
-            // lease exists so the commit itself succeeds once the R0b guard clears.
+            // When approving a sensitive commit escalation (which may batch multiple sensitive files
+            // like `"Cargo.toml, package.json"`), ensure each individual sensitive target and a
+            // companion one-shot `workspace_commit` lease are granted in a single approval click!
             if target.action == "workspace_commit_sensitive" {
+                let parts: Vec<&str> = target
+                    .target_resource
+                    .split(',')
+                    .map(|s| s.trim())
+                    .filter(|s| !s.is_empty())
+                    .collect();
+                if parts.len() > 1 {
+                    for part in parts {
+                        let part_pattern = if is_oneshot {
+                            if let Some(ref ev_hash) = target.evidence_hash {
+                                format!("{}#sha256:{}", part, ev_hash)
+                            } else {
+                                part.to_string()
+                            }
+                        } else {
+                            part.to_string()
+                        };
+                        leases.push(LeaseGrant {
+                            lease_id: format!("lease-{}", &Uuid::new_v4().to_string()[..8]),
+                            org_id: target.org_id.clone(),
+                            agent_id: target.agent_id.clone(),
+                            action_pattern: "workspace_commit_sensitive".to_string(),
+                            resource_pattern: part_pattern,
+                            expires_at_ms,
+                            granted_by: approved_by.to_string(),
+                            kind,
+                            task_id: task_id.clone(),
+                        });
+                    }
+                }
+                let companion_resource = if is_oneshot {
+                    target
+                        .evidence_hash
+                        .as_ref()
+                        .map(|h| format!("sha256:{}", h))
+                        .unwrap_or_else(|| "*".to_string())
+                } else {
+                    "*".to_string()
+                };
                 leases.push(LeaseGrant {
                     lease_id: format!("lease-{}", &Uuid::new_v4().to_string()[..8]),
                     org_id: target.org_id,
                     agent_id: target.agent_id,
                     action_pattern: "workspace_commit".to_string(),
-                    resource_pattern: "*".to_string(),
-                    expires_at_ms: -1,
+                    resource_pattern: companion_resource,
+                    expires_at_ms: now_ms + 900_000,
                     granted_by: approved_by.to_string(),
                     kind: if task_id.is_some() {
                         LeaseKind::TaskScoped
@@ -845,14 +1048,32 @@ impl PolicyEngine for AegisPolicyKernel {
         Ok(removed)
     }
 
+    async fn revoke_lease(&self, lease_id: &str) -> anyhow::Result<bool> {
+        let _guard = self.state_mutex.lock().await;
+        let _file_lock = self.acquire_state_lock().await?;
+        self.reload_from_disk().await;
+        let removed = {
+            let mut leases = self.leases.write().await;
+            let before = leases.len();
+            leases.retain(|lease| lease.lease_id != lease_id);
+            before > leases.len()
+        };
+        if removed {
+            self.flush_to_disk_unlocked().await?;
+        }
+        Ok(removed)
+    }
+
     async fn deny_escalation(
         &self,
         escalation_id: &str,
-        _denied_by: &str,
+        denied_by: &str,
     ) -> anyhow::Result<PendingEscalation> {
         let _guard = self.state_mutex.lock().await;
         let _file_lock = self.acquire_state_lock().await?;
         self.reload_from_disk().await;
+        let now_ms = Utc::now().timestamp_millis();
+        let _ = self.expire_stale_escalations_unlocked(now_ms).await;
         let target = {
             let mut list = self.escalations.write().await;
             let item = list
@@ -860,6 +1081,8 @@ impl PolicyEngine for AegisPolicyKernel {
                 .find(|e| e.escalation_id == escalation_id)
                 .with_context(|| format!("Escalation '{}' not found", escalation_id))?;
             item.status = EscalationStatus::Denied;
+            item.decided_by = Some(denied_by.to_string());
+            item.decided_at_ms = Some(now_ms);
             item.clone()
         };
         self.flush_to_disk_unlocked().await?;
@@ -1187,5 +1410,178 @@ mod tests {
             kernel.evaluate(&del_migration).await.unwrap(),
             PolicyDecision::Deny { .. }
         ));
+    }
+
+    #[tokio::test]
+    async fn oneshot_commit_lease_pins_evidence_hash_against_toctou_diff_swap() {
+        let kernel = AegisPolicyKernel::new();
+        let agent = AgentIdentity::new("acme", "coder-1", "Senior Engineer");
+
+        let benign_ctx = PolicyContext {
+            principal: agent.clone(),
+            action: "workspace_commit".to_string(),
+            target_org_id: "acme".to_string(),
+            target_resource: "/workspace".to_string(),
+            metadata: json!({
+                "paths": ["docs/typo.md"],
+                "evidence_hash": "1111111111111111111111111111111111111111111111111111111111111111",
+                "rationale": "Fix documentation typo"
+            }),
+        };
+
+        let esc_id = match kernel.evaluate(&benign_ctx).await.unwrap() {
+            PolicyDecision::Ask { escalation_id, .. } => escalation_id,
+            other => panic!("Expected Ask, got {:?}", other),
+        };
+
+        let lease = kernel
+            .approve_escalation(&esc_id, 0, "dev-lead")
+            .await
+            .unwrap();
+        assert_eq!(
+            lease.resource_pattern,
+            "sha256:1111111111111111111111111111111111111111111111111111111111111111"
+        );
+
+        // Bait-and-switch attempt: agent mutates `src/payment_engine.rs` after approval, changing `evidence_hash`
+        let swapped_ctx = PolicyContext {
+            principal: agent.clone(),
+            action: "workspace_commit".to_string(),
+            target_org_id: "acme".to_string(),
+            target_resource: "/workspace".to_string(),
+            metadata: json!({
+                "paths": ["docs/typo.md", "src/payment_engine.rs"],
+                "evidence_hash": "2222222222222222222222222222222222222222222222222222222222222222"
+            }),
+        };
+        assert!(
+            matches!(
+                kernel.evaluate(&swapped_ctx).await.unwrap(),
+                PolicyDecision::Ask { .. }
+            ),
+            "Mutated diff must NOT consume or match the One-Shot lease pinned to the benign diff hash"
+        );
+
+        // Retrying the original unmodified diff succeeds and consumes the One-Shot lease
+        assert!(matches!(
+            kernel.evaluate(&benign_ctx).await.unwrap(),
+            PolicyDecision::Allow { .. }
+        ));
+    }
+
+    #[tokio::test]
+    async fn overwrite_binaries_and_skip_verify_escalate_even_with_general_commit_lease() {
+        let kernel = AegisPolicyKernel::new();
+        let agent = AgentIdentity::new("acme", "coder-1", "Senior Engineer");
+
+        kernel
+            .grant_lease(LeaseGrant {
+                lease_id: "lease-general".to_string(),
+                org_id: "acme".to_string(),
+                agent_id: "coder-1".to_string(),
+                action_pattern: "workspace_commit".to_string(),
+                resource_pattern: "*".to_string(),
+                expires_at_ms: Utc::now().timestamp_millis() + 3_600_000,
+                granted_by: "dev-lead".to_string(),
+                kind: LeaseKind::Ttl,
+                task_id: None,
+            })
+            .await
+            .unwrap();
+
+        // 1. `overwrite_binaries: true` escalates to `workspace_commit_sensitive`
+        let bin_ctx = PolicyContext {
+            principal: agent.clone(),
+            action: "workspace_commit".to_string(),
+            target_org_id: "acme".to_string(),
+            target_resource: "/workspace".to_string(),
+            metadata: json!({
+                "paths": ["assets/diagram.png"],
+                "overwrite_binaries": true
+            }),
+        };
+        let bin_esc = match kernel.evaluate(&bin_ctx).await.unwrap() {
+            PolicyDecision::Ask { escalation_id, .. } => escalation_id,
+            other => panic!("Expected Ask for overwrite_binaries=true, got {:?}", other),
+        };
+        kernel
+            .approve_escalation(&bin_esc, 0, "dev-lead")
+            .await
+            .unwrap();
+        assert!(matches!(
+            kernel.evaluate(&bin_ctx).await.unwrap(),
+            PolicyDecision::Allow { .. }
+        ));
+
+        // 2. `skip_verify: true` when `has_configured_verify_cmd: true` escalates to `workspace_commit_sensitive`
+        let skip_ctx = PolicyContext {
+            principal: agent.clone(),
+            action: "workspace_commit".to_string(),
+            target_org_id: "acme".to_string(),
+            target_resource: "/workspace".to_string(),
+            metadata: json!({
+                "paths": ["src/lib.rs"],
+                "skip_verify": true,
+                "has_configured_verify_cmd": true
+            }),
+        };
+        let skip_esc = match kernel.evaluate(&skip_ctx).await.unwrap() {
+            PolicyDecision::Ask { escalation_id, .. } => escalation_id,
+            other => panic!("Expected Ask for skip_verify=true, got {:?}", other),
+        };
+        kernel
+            .approve_escalation(&skip_esc, 0, "dev-lead")
+            .await
+            .unwrap();
+        assert!(matches!(
+            kernel.evaluate(&skip_ctx).await.unwrap(),
+            PolicyDecision::Allow { .. }
+        ));
+    }
+
+    #[tokio::test]
+    async fn egress_escalation_scopes_lease_to_specific_domain_and_expired_ticket_cannot_approve() {
+        let kernel = AegisPolicyKernel::new();
+        let agent = AgentIdentity::new("acme", "coder-1", "Senior Engineer");
+
+        let stripe_ctx = PolicyContext {
+            principal: agent.clone(),
+            action: "egress_unlisted_domain".to_string(),
+            target_org_id: "acme".to_string(),
+            target_resource: "api.stripe.com".to_string(),
+            metadata: json!({}),
+        };
+        let esc_id = match kernel.evaluate(&stripe_ctx).await.unwrap() {
+            PolicyDecision::Ask { escalation_id, .. } => escalation_id,
+            other => panic!("Expected Ask, got {:?}", other),
+        };
+        let lease = kernel
+            .approve_escalation(&esc_id, 900, "dev-lead")
+            .await
+            .unwrap();
+        assert_eq!(lease.resource_pattern, "api.stripe.com");
+
+        // `api.stripe.com` is now allowed, but `evil.example.com` still escalates!
+        assert!(matches!(
+            kernel.evaluate(&stripe_ctx).await.unwrap(),
+            PolicyDecision::Allow { .. }
+        ));
+        let evil_ctx = PolicyContext {
+            target_resource: "evil.example.com".to_string(),
+            metadata: json!({ "escalation_ttl_ms": -1000 }),
+            ..stripe_ctx
+        };
+        let expired_esc = match kernel.evaluate(&evil_ctx).await.unwrap() {
+            PolicyDecision::Ask { escalation_id, .. } => escalation_id,
+            other => panic!("Expected Ask, got {:?}", other),
+        };
+        // Attempting to approve an expired ticket fails and marks it Expired
+        assert!(kernel
+            .approve_escalation(&expired_esc, 900, "dev-lead")
+            .await
+            .is_err());
+        let list = kernel.list_escalations("acme").await.unwrap();
+        let item = list.iter().find(|e| e.escalation_id == expired_esc).unwrap();
+        assert_eq!(item.status, EscalationStatus::Expired);
     }
 }

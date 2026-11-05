@@ -337,7 +337,7 @@ pub const ENROLL_PAGE_HTML: &str = r##"<!doctype html>
 <main><div class="card" id="card">
   <p class="label-caps">AEGIS CLOUD · TOTP APPROVER ENROLLMENT</p>
   <h1>Become the approver for this Aegis Cloud org</h1>
-  <p>You will add a code generator to your authenticator app (Google Authenticator, 1Password, …). Approving an agent's escalation will then require the 6-digit code from that app, on the command line or the web.</p>
+  <p>You will add a code generator to your authenticator app (Google Authenticator, 1Password, …). Approving an agent's escalation will then require the 6-digit code from that app in your browser console or AI coding chat.</p>
   <p>Enrolling replaces any previous approver device for this org.</p>
   <p style="margin-top:18px;"><button id="go" onclick="enroll()">Enroll my authenticator →</button></p>
   <p id="msg"></p>
@@ -360,7 +360,7 @@ pub const ENROLL_PAGE_HTML: &str = r##"<!doctype html>
       const qr = document.createElement('div'); qr.className = 'qr'; qr.innerHTML = data.qr_svg; card.appendChild(qr);
       const p2 = document.createElement('p'); p2.append('Or enter this key manually: '); const c = document.createElement('code'); c.textContent = data.secret; p2.appendChild(c); card.appendChild(p2);
       const p3 = document.createElement('p'); const a = document.createElement('a'); a.href = data.otpauth_uri; a.textContent = 'Open in authenticator app (on this phone)'; p3.appendChild(a); card.appendChild(p3);
-      const p4 = document.createElement('p'); p4.textContent = 'This key is shown once. Approve escalations in your browser (/approve) or with: aegis-os approve'; card.appendChild(p4);
+      const p4 = document.createElement('p'); p4.textContent = 'This key is shown once. Approve escalations in your browser (/approve or /dashboard) or enter the 6-digit code in chat.'; card.appendChild(p4);
     } catch (e) {
       msg.className = 'err'; msg.textContent = 'Enrollment failed: ' + e.message; btn.disabled = false;
     }
@@ -468,6 +468,10 @@ pub const APPROVE_PAGE_HTML: &str = r##"<!doctype html>
   button:disabled { opacity: .55; cursor: default; }
   .ok { color: var(--accent); font-weight: 500; }
   .err { color: var(--danger); }
+  .diff-drawer { margin-top: 14px; border: 1px solid var(--line); background: #151C19; color: #F4F1EA; padding: 12px 14px; font: 0.76rem/1.5 var(--mono); overflow-x: auto; max-height: 360px; overflow-y: auto; display: none; }
+  .diff-line-add { color: #5CE6A0; }
+  .diff-line-del { color: #FF8B85; }
+  .diff-line-hunk { color: #8AB4F8; }
   .foot { background: var(--bg); border-top: 1px solid var(--line); padding: 2rem 0; }
   .foot-bar { display: flex; align-items: center; justify-content: space-between; gap: 1.5rem; flex-wrap: wrap; }
   .foot-right { display: flex; flex-wrap: wrap; align-items: center; gap: 1.35rem; font-size: 0.78rem; color: var(--ink-muted); }
@@ -513,19 +517,20 @@ pub const APPROVE_PAGE_HTML: &str = r##"<!doctype html>
     <div class="container">
       <p class="label-caps">AEGIS OS · POLICY KERNEL · HUMAN-IN-THE-LOOP</p>
       <h1 class="heading-1">Aegis OS — <em>Boundary Approval</em></h1>
-      <p style="max-width:46rem;">Review and approve host boundary crossings (<code>workspace_commit</code>, sensitive hooks, or cross-tenant leases). Once approved, your coding agent automatically resumes and completes the operation without needing a second terminal.</p>
+      <p style="max-width:46rem;">Review unified diffs, SHA-256 evidence hashes, and approve host boundary crossings (<code>workspace_commit</code>, sensitive files, or domain egress leases). Once approved, your coding agent automatically resumes and completes the operation without needing any CLI commands.</p>
     </div>
   </section>
 
   <main class="approve-main">
     <div class="card" id="auth-box" style="display:none">
-      <p class="label-caps">AUTHENTICATION</p>
-      <h2>Connect Your Workspace Key</h2>
-      <p>Paste your Aegis API Key (<code>ak_live_…</code>) or Operator Token (<code>aop_…</code>):</p>
+      <p class="label-caps">ACCOUNT SYNC</p>
+      <h2>Load Your Account by Email</h2>
+      <p>Enter your work or billing email to load pending boundary escalations for your organization:</p>
       <div class="row">
-        <input type="password" id="api-key-input" placeholder="ak_live_... or aop_..." style="flex:1">
-        <button onclick="saveKey()">Connect</button>
+        <input type="email" id="lookup-email-input" placeholder="you@company.com" style="flex:1" onkeydown="if(event.key==='Enter')lookupByEmail()">
+        <button onclick="lookupByEmail()">Load Account</button>
       </div>
+      <p id="lookup-msg"></p>
     </div>
 
     <div class="card" id="enroll-box" style="display:none">
@@ -570,7 +575,7 @@ pub const APPROVE_PAGE_HTML: &str = r##"<!doctype html>
   const qs = new URLSearchParams(location.search);
   const hashParams = new URLSearchParams(location.hash.replace(/^#/, ''));
   const targetId = qs.get('id') || '';
-  const targetOrg = qs.get('org') || '';
+  let targetOrg = qs.get('org') || sessionStorage.getItem('aegis_org_id') || '';
   const mode = qs.get('mode') || 'cloud';
   const apiBase = location.pathname.startsWith('/aegis-cloud') ? '/aegis-cloud' : '';
   ['dash-link', 'dash-cta', 'foot-dash-link'].forEach(id => {
@@ -591,10 +596,28 @@ pub const APPROVE_PAGE_HTML: &str = r##"<!doctype html>
     return h;
   }
 
-  function saveKey() {
-    authKey = document.getElementById('api-key-input').value.trim();
-    if (authKey) sessionStorage.setItem('aegis_approve_key', authKey);
-    loadState();
+  async function lookupByEmail() {
+    const email = (document.getElementById('lookup-email-input').value || '').trim();
+    const msg = document.getElementById('lookup-msg');
+    if (!email) return;
+    msg.className = '';
+    msg.textContent = 'Looking up organization…';
+    try {
+      const res = await fetch(apiBase + '/v1/billing/status?email=' + encodeURIComponent(email), { headers: headers() });
+      const data = await res.json();
+      if (!res.ok) throw new Error(data.error || res.statusText);
+      if (data.org_id) {
+        targetOrg = data.org_id;
+        sessionStorage.setItem('aegis_org_id', targetOrg);
+      }
+      localStorage.setItem('aegis_user_email', email);
+      msg.className = 'ok';
+      msg.textContent = 'Loaded organization: ' + (targetOrg || email);
+      loadState();
+    } catch (e) {
+      msg.className = 'err';
+      msg.textContent = e.message;
+    }
   }
 
   async function requestEmailEnroll() {
@@ -614,6 +637,42 @@ pub const APPROVE_PAGE_HTML: &str = r##"<!doctype html>
     } catch (e) {
       msg.className = 'err';
       msg.textContent = e.message;
+    }
+  }
+
+  async function toggleDiff(escId) {
+    const drawer = document.getElementById('diff-' + escId);
+    if (!drawer) return;
+    if (drawer.style.display === 'block') {
+      drawer.style.display = 'none';
+      return;
+    }
+    drawer.style.display = 'block';
+    drawer.textContent = 'Loading immutable evidence & unified diff…';
+    try {
+      const res = await fetch(apiBase + '/v1/approvals/diff?escalation_id=' + encodeURIComponent(escId), { headers: headers() });
+      const data = await res.json();
+      if (!res.ok) throw new Error(data.error || res.statusText);
+      drawer.innerHTML = '';
+      const diffObj = data.diff || {};
+      const udiff = diffObj.unified_diff || '';
+      if (udiff) {
+        const lines = String(udiff).split('\n');
+        for (const line of lines) {
+          const div = document.createElement('div');
+          if (line.startsWith('+') && !line.startsWith('+++')) div.className = 'diff-line-add';
+          else if (line.startsWith('-') && !line.startsWith('---')) div.className = 'diff-line-del';
+          else if (line.startsWith('@@')) div.className = 'diff-line-hunk';
+          div.textContent = line;
+          drawer.appendChild(div);
+        }
+      } else {
+        const pre = document.createElement('div');
+        pre.textContent = JSON.stringify(data.diff || data.evidence || data, null, 2);
+        drawer.appendChild(pre);
+      }
+    } catch (e) {
+      drawer.textContent = 'Failed to load diff: ' + e.message;
     }
   }
 
@@ -652,7 +711,7 @@ pub const APPROVE_PAGE_HTML: &str = r##"<!doctype html>
         : 'Approved (' + escId + ')';
       const p = document.createElement('p');
       p.textContent = decision === 'deny'
-        ? 'The blocked operation was rejected.'
+        ? 'The blocked operation was rejected and recorded in the SHA-256 audit chain.'
         : 'Lease granted. Your agent session will automatically resume and complete the operation — you can close this tab.';
       card.appendChild(h);
       card.appendChild(p);
@@ -683,13 +742,20 @@ pub const APPROVE_PAGE_HTML: &str = r##"<!doctype html>
       ['Escalation', esc.escalation_id],
       ['Agent', (esc.org_id ? esc.org_id + '/' : '') + (esc.agent_id || 'agent')],
       ['Action', esc.action],
-      ['Resource', esc.resource || '/workspace']
+      ['Resource', esc.target_resource || esc.resource || '/workspace']
     ];
-    if (esc.metadata && Array.isArray(esc.metadata.paths) && esc.metadata.paths.length > 0) {
-      fields.push(['Changed Files', esc.metadata.paths.join(', ')]);
+    if (esc.rationale) {
+      fields.push(['Agent Rationale', esc.rationale]);
     }
-    if (esc.metadata && esc.metadata.host_root) {
-      fields.push(['Host Repo', esc.metadata.host_root]);
+    if (esc.evidence_hash) {
+      fields.push(['Evidence SHA-256', esc.evidence_hash]);
+    }
+    const ev = esc.evidence || esc.metadata || {};
+    if (Array.isArray(ev.paths) && ev.paths.length > 0) {
+      fields.push(['Changed Files', ev.paths.join(', ')]);
+    }
+    if (ev.host_root) {
+      fields.push(['Host Repo', ev.host_root]);
     }
     for (const [k, v] of fields) {
       const dt = document.createElement('dt'); dt.textContent = k;
@@ -712,15 +778,27 @@ pub const APPROVE_PAGE_HTML: &str = r##"<!doctype html>
     }
 
     const btnOnce = document.createElement('button');
-    btnOnce.textContent = 'Approve Once';
-    btnOnce.onclick = () => decide(esc.escalation_id, 'approve', 120);
+    btnOnce.textContent = 'Approve Once (SHA-256 Pinned)';
+    btnOnce.onclick = () => decide(esc.escalation_id, 'approve', 0);
     row.appendChild(btnOnce);
+
+    const btn15m = document.createElement('button');
+    btn15m.className = 'secondary';
+    btn15m.textContent = 'Approve 15m';
+    btn15m.onclick = () => decide(esc.escalation_id, 'approve', 900);
+    row.appendChild(btn15m);
 
     const btnHour = document.createElement('button');
     btnHour.className = 'secondary';
-    btnHour.textContent = 'Approve for 1 Hour';
+    btnHour.textContent = 'Approve 1h';
     btnHour.onclick = () => decide(esc.escalation_id, 'approve', 3600);
     row.appendChild(btnHour);
+
+    const btnDiff = document.createElement('button');
+    btnDiff.className = 'secondary';
+    btnDiff.textContent = 'Inspect Diff';
+    btnDiff.onclick = () => toggleDiff(esc.escalation_id);
+    row.appendChild(btnDiff);
 
     const btnDeny = document.createElement('button');
     btnDeny.className = 'danger';
@@ -729,6 +807,12 @@ pub const APPROVE_PAGE_HTML: &str = r##"<!doctype html>
     row.appendChild(btnDeny);
 
     card.appendChild(row);
+
+    const diffDrawer = document.createElement('pre');
+    diffDrawer.className = 'diff-drawer';
+    diffDrawer.id = 'diff-' + esc.escalation_id;
+    card.appendChild(diffDrawer);
+
     const msg = document.createElement('p');
     msg.id = 'msg-' + esc.escalation_id;
     card.appendChild(msg);
@@ -744,7 +828,7 @@ pub const APPROVE_PAGE_HTML: &str = r##"<!doctype html>
       const res = await fetch(statusUrl, { headers: headers() });
       if (res.status === 401 || res.status === 403) {
         document.getElementById('auth-box').style.display = 'block';
-        root.innerHTML = '<div class="card"><p class="err">Authentication required to view and approve escalations.</p></div>';
+        root.innerHTML = '<div class="card"><p class="err">Enter your account email above to view and approve escalations.</p></div>';
         return;
       }
       document.getElementById('auth-box').style.display = 'none';
@@ -762,7 +846,8 @@ pub const APPROVE_PAGE_HTML: &str = r##"<!doctype html>
         requireTotp = false;
       }
 
-      let list = Array.isArray(data.pending_escalations) ? data.pending_escalations : [];
+      let list = (Array.isArray(data.pending_escalations) ? data.pending_escalations : [])
+        .filter(e => !e.status || e.status === 'pending');
       if (targetId) {
         const matching = list.filter(e => e.escalation_id === targetId);
         if (matching.length > 0) list = matching;

@@ -1747,6 +1747,27 @@ pub async fn handle_unified_approve(
             .policy
             .deny_escalation(&resolved_esc_id, "cli-operator")
             .await?;
+        let _ = kernel
+            .recorder
+            .record(aos_core::AuditEvent {
+                event_id: format!("evt-{}", &uuid::Uuid::new_v4().to_string()[..8]),
+                timestamp_ms: chrono::Utc::now().timestamp_millis(),
+                org_id: esc.org_id.clone(),
+                agent_id: esc.agent_id.clone(),
+                action: esc.action.clone(),
+                resource: esc.target_resource.clone(),
+                policy_decision: format!("denied:{}:cli-operator", esc.escalation_id),
+                snapshot_id: None,
+                details: json!({
+                    "escalation_id": esc.escalation_id,
+                    "denied_by": "cli-operator",
+                    "evidence_hash": esc.evidence_hash,
+                }),
+                task_id: esc.task_id.clone(),
+                prev_hash: None,
+                event_hash: None,
+            })
+            .await;
         println!(
             "{}",
             serde_json::to_string_pretty(&json!({
@@ -1765,6 +1786,28 @@ pub async fn handle_unified_approve(
             .policy
             .approve_escalation(&resolved_esc_id, lease_ttl, "cli-operator")
             .await?;
+        let _ = kernel
+            .recorder
+            .record(aos_core::AuditEvent {
+                event_id: format!("evt-{}", &uuid::Uuid::new_v4().to_string()[..8]),
+                timestamp_ms: chrono::Utc::now().timestamp_millis(),
+                org_id: lease.org_id.clone(),
+                agent_id: lease.agent_id.clone(),
+                action: lease.action_pattern.clone(),
+                resource: lease.resource_pattern.clone(),
+                policy_decision: format!("approved:{}:{}:cli-operator", resolved_esc_id, lease.lease_id),
+                snapshot_id: None,
+                details: json!({
+                    "escalation_id": resolved_esc_id,
+                    "lease_id": lease.lease_id,
+                    "approved_by": "cli-operator",
+                    "ttl_secs": lease_ttl,
+                }),
+                task_id: lease.task_id.clone(),
+                prev_hash: None,
+                event_hash: None,
+            })
+            .await;
         println!(
             "{}",
             serde_json::to_string_pretty(&json!({

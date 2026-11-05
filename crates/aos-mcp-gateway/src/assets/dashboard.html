@@ -320,6 +320,22 @@
     }
     .esc-meta dt { color: var(--ink-muted); text-transform: uppercase; font-size: 0.68rem; }
     .esc-meta dd { margin: 0; color: var(--ink); word-break: break-all; }
+    .diff-drawer {
+      margin-top: 0.65rem;
+      padding: 0.75rem 0.95rem;
+      background: #151C19;
+      color: #F4F1EA;
+      border: 1px solid #151C19;
+      font-family: var(--font-mono);
+      font-size: 0.74rem;
+      line-height: 1.48;
+      max-height: 320px;
+      overflow: auto;
+      white-space: pre;
+    }
+    .diff-line-add { color: #5CE6A0; }
+    .diff-line-del { color: #FF8B85; }
+    .diff-line-hunk { color: #8AB4F8; }
 
     /* Column Header & Pagination Bar */
     .col-head-row {
@@ -778,6 +794,71 @@
     let leaseCurrentPage = 1;
     let lastEscalations = [];
     let lastLeasesData = {};
+    const openDiffDrawers = {};
+
+    function populateDiffDrawer(drawer, data) {
+      drawer.innerHTML = '';
+      const diffObj = (data && data.diff) ? data.diff : {};
+      const udiff = diffObj.unified_diff || '';
+      if (udiff) {
+        const lines = String(udiff).split('\n');
+        for (const line of lines) {
+          const div = document.createElement('div');
+          if (line.startsWith('+') && !line.startsWith('+++')) div.className = 'diff-line-add';
+          else if (line.startsWith('-') && !line.startsWith('---')) div.className = 'diff-line-del';
+          else if (line.startsWith('@@')) div.className = 'diff-line-hunk';
+          div.textContent = line;
+          drawer.appendChild(div);
+        }
+      } else {
+        const pre = document.createElement('div');
+        pre.textContent = JSON.stringify(data.diff || data.evidence || data, null, 2);
+        drawer.appendChild(pre);
+      }
+    }
+
+    async function toggleEscalationDiff(escId) {
+      const drawer = document.getElementById('esc-diff-' + escId);
+      if (!drawer) return;
+      if (openDiffDrawers[escId] && openDiffDrawers[escId].open) {
+        openDiffDrawers[escId].open = false;
+        drawer.style.display = 'none';
+        return;
+      }
+      drawer.style.display = 'block';
+      if (openDiffDrawers[escId] && openDiffDrawers[escId].payload) {
+        openDiffDrawers[escId].open = true;
+        populateDiffDrawer(drawer, openDiffDrawers[escId].payload);
+        return;
+      }
+      openDiffDrawers[escId] = { open: true, payload: null };
+      drawer.textContent = currentLang === 'zh'
+        ? '正在加载不可篡改证据与 Unified Diff…'
+        : 'Loading immutable evidence & unified diff…';
+      try {
+        const res = await fetch(apiBase + '/v1/approvals/diff?escalation_id=' + encodeURIComponent(escId), { headers: authHeaders() });
+        const data = await res.json();
+        if (!res.ok) throw new Error(data.error || res.statusText);
+        openDiffDrawers[escId].payload = data;
+        populateDiffDrawer(drawer, data);
+      } catch (e) {
+        drawer.textContent = (currentLang === 'zh' ? '加载 Diff 失败：' : 'Failed to load diff: ') + e.message;
+      }
+    }
+
+    async function revokeLease(leaseId) {
+      if (!leaseId) return;
+      try {
+        const res = await fetch(apiBase + '/v1/leases/revoke', {
+          method: 'POST',
+          headers: authHeaders(),
+          body: JSON.stringify({ lease_id: leaseId })
+        });
+        const data = await res.json();
+        if (!res.ok) throw new Error(data.error || res.statusText);
+        await refreshAll();
+      } catch (_) {}
+    }
 
     let currentLang = localStorage.getItem('aegis_lang') || 'zh';
     function applyLang(lang) {
@@ -1021,17 +1102,27 @@
         msgEl.textContent = currentLang === 'zh' ? '正在提交审批…' : 'Submitting decision…';
       }
       try {
-        const res = await fetch(apiBase + '/v1/approvals/decide', {
+        const reqBody = JSON.stringify({
+          escalation_id: escId,
+          decision,
+          ttl_secs: ttlSecs,
+          totp: totp || undefined,
+          approved_by: 'web-developer-console'
+        });
+        let res = await fetch(apiBase + '/v1/approvals/decide', {
           method: 'POST',
           headers: authHeaders(),
-          body: JSON.stringify({
-            escalation_id: escId,
-            decision,
-            ttl_secs: ttlSecs,
-            totp: totp || undefined,
-            approved_by: 'web-developer-console'
-          })
+          body: reqBody
         });
+        if (res.status === 401 && authKey) {
+          authKey = '';
+          sessionStorage.removeItem('aegis_approve_key');
+          res = await fetch(apiBase + '/v1/approvals/decide', {
+            method: 'POST',
+            headers: authHeaders(),
+            body: reqBody
+          });
+        }
         const data = await res.json();
         if (!res.ok) throw new Error(data.error || res.statusText);
         await refreshAll();
@@ -1170,9 +1261,17 @@
           ['Action', esc.action || 'workspace_commit'],
           ['Resource', esc.target_resource || esc.resource || '/workspace']
         ];
-        if (esc.metadata && Array.isArray(esc.metadata.paths) && esc.metadata.paths.length) {
-          rows.push(['Files', esc.metadata.paths.join(', ')]);
-        } else if (esc.reason) {
+        if (esc.rationale) {
+          rows.push([currentLang === 'zh' ? '意图说明' : 'Rationale', esc.rationale]);
+        }
+        if (esc.evidence_hash) {
+          rows.push(['SHA-256', esc.evidence_hash]);
+        }
+        const ev = esc.evidence || esc.metadata || {};
+        if (Array.isArray(ev.paths) && ev.paths.length) {
+          rows.push(['Files', ev.paths.join(', ')]);
+        }
+        if (esc.reason) {
           rows.push(['Reason', esc.reason]);
         }
         for (const [dtText, ddText] of rows) {
@@ -1199,15 +1298,27 @@
 
         const bOnce = document.createElement('button');
         bOnce.className = 'btn btn-primary';
-        bOnce.textContent = currentLang === 'zh' ? '批准本次' : 'Approve Once';
-        bOnce.onclick = () => decideEscalation(esc.escalation_id, 'approve', 120);
+        bOnce.textContent = currentLang === 'zh' ? '批准本次 (SHA-256 锁定)' : 'Approve Once (Pinned)';
+        bOnce.onclick = () => decideEscalation(esc.escalation_id, 'approve', 0);
         actions.appendChild(bOnce);
+
+        const b15m = document.createElement('button');
+        b15m.className = 'btn btn-ghost';
+        b15m.textContent = currentLang === 'zh' ? '批准 15 分钟' : 'Approve 15m';
+        b15m.onclick = () => decideEscalation(esc.escalation_id, 'approve', 900);
+        actions.appendChild(b15m);
 
         const bHour = document.createElement('button');
         bHour.className = 'btn btn-ghost';
         bHour.textContent = currentLang === 'zh' ? '批准 1 小时' : 'Approve 1h';
         bHour.onclick = () => decideEscalation(esc.escalation_id, 'approve', 3600);
         actions.appendChild(bHour);
+
+        const bDiff = document.createElement('button');
+        bDiff.className = 'btn btn-ghost';
+        bDiff.textContent = currentLang === 'zh' ? '查看变更 Diff' : 'Inspect Diff';
+        bDiff.onclick = () => toggleEscalationDiff(esc.escalation_id);
+        actions.appendChild(bDiff);
 
         const bDeny = document.createElement('button');
         bDeny.className = 'btn btn-danger';
@@ -1216,6 +1327,19 @@
         actions.appendChild(bDeny);
 
         box.appendChild(actions);
+
+        const diffDrawer = document.createElement('div');
+        diffDrawer.className = 'diff-drawer';
+        diffDrawer.id = 'esc-diff-' + esc.escalation_id;
+        if (openDiffDrawers[esc.escalation_id] && openDiffDrawers[esc.escalation_id].open) {
+          diffDrawer.style.display = 'block';
+          if (openDiffDrawers[esc.escalation_id].payload) {
+            populateDiffDrawer(diffDrawer, openDiffDrawers[esc.escalation_id].payload);
+          }
+        } else {
+          diffDrawer.style.display = 'none';
+        }
+        box.appendChild(diffDrawer);
 
         const msg = document.createElement('p');
         msg.id = 'esc-msg-' + esc.escalation_id;
@@ -1264,18 +1388,57 @@
 
       if (!leases.length) {
         leasesRoot.innerHTML = '<p style="font-size:0.84rem; color:var(--ink-muted); margin:0;">' +
-          (currentLang === 'zh' ? '当前暂无生效中的会话租约。批准 1 小时租约后将在此处列出。' : 'No active session leases right now. Approved 1-hour leases will be listed here.') +
+          (currentLang === 'zh' ? '当前暂无生效中的会话租约。批准租约后将在此处列出，并支持随时一键撤销。' : 'No active session leases right now. Approved leases will be listed here and can be revoked anytime.') +
           '</p>';
       } else {
         leasesRoot.innerHTML = '';
         const leaseSlice = leases.slice((leaseCurrentPage - 1) * LEASE_PAGE_SIZE, leaseCurrentPage * LEASE_PAGE_SIZE);
+        const nowMs = Date.now();
         for (const l of leaseSlice) {
           const row = document.createElement('div');
           row.className = 'item-row';
-          row.innerHTML =
-            '<div><strong style="font-family:var(--font-mono); font-size:0.8rem;">' + (l.action_pattern || l.action || 'workspace_commit') + '</strong>' +
-            '<div style="font-size:0.75rem; color:var(--ink-muted);">Agent: ' + (l.agent_id || '*') + ' · Granted by: ' + (l.granted_by || l.approved_by || 'human') + '</div></div>' +
-            '<span class="badge badge-ok">ACTIVE LEASE</span>';
+          const resScope = l.resource_pattern || '*';
+          const shortScope = resScope.length > 36 ? resScope.slice(0, 32) + '…' : resScope;
+          const isOneShot = l.kind === 'one_shot' || l.expires_at_ms <= 0;
+          let ttlLabel = '';
+          if (isOneShot) {
+            ttlLabel = currentLang === 'zh' ? '单次 SHA-256 锁定' : 'One-Shot Pinned';
+          } else if (l.expires_at_ms > nowMs) {
+            const mins = Math.max(1, Math.ceil((l.expires_at_ms - nowMs) / 60000));
+            ttlLabel = currentLang === 'zh' ? ('剩余 ' + mins + ' 分钟') : (mins + 'm left');
+          } else {
+            ttlLabel = 'Active';
+          }
+
+          const infoDiv = document.createElement('div');
+          infoDiv.style.minWidth = '0';
+          infoDiv.innerHTML =
+            '<strong style="font-family:var(--font-mono); font-size:0.8rem;">' + (l.action_pattern || l.action || 'workspace_commit') + '</strong>' +
+            '<div style="font-size:0.74rem; color:var(--ink-muted); word-break:break-all;">' +
+              'Agent: ' + (l.agent_id || '*') +
+              ' · Scope: <code>' + shortScope + '</code>' +
+              ' · ' + ttlLabel +
+            '</div>';
+          row.appendChild(infoDiv);
+
+          const rightDiv = document.createElement('div');
+          rightDiv.style.cssText = 'display:flex; align-items:center; gap:0.45rem; flex-shrink:0;';
+          const badgeSpan = document.createElement('span');
+          badgeSpan.className = 'badge badge-ok';
+          badgeSpan.textContent = isOneShot ? 'ONE-SHOT' : 'ACTIVE LEASE';
+          rightDiv.appendChild(badgeSpan);
+
+          if (l.lease_id) {
+            const revBtn = document.createElement('button');
+            revBtn.type = 'button';
+            revBtn.className = 'btn btn-danger';
+            revBtn.style.cssText = 'padding:0.22rem 0.55rem; font-size:0.72rem;';
+            revBtn.textContent = currentLang === 'zh' ? '撤销' : 'Revoke';
+            revBtn.onclick = () => revokeLease(l.lease_id);
+            rightDiv.appendChild(revBtn);
+          }
+          row.appendChild(rightDiv);
+
           leasesRoot.appendChild(row);
         }
         const leasePager = buildPagerBar(leases.length, LEASE_PAGE_SIZE, leaseCurrentPage, (newPage) => {
@@ -1308,8 +1471,17 @@
       const totpBadge = document.getElementById('totp-status-badge');
 
       try {
+        if (currentOrgId === '*') {
+          currentOrgId = '';
+          sessionStorage.removeItem('aegis_org_id');
+        }
         const statusUrl = apiBase + '/v1/status' + (currentOrgId ? '?org_id=' + encodeURIComponent(currentOrgId) : '');
-        const res = await fetch(statusUrl, { headers: authHeaders() });
+        let res = await fetch(statusUrl, { headers: authHeaders() });
+        if (res.status === 401 && authKey) {
+          authKey = '';
+          sessionStorage.removeItem('aegis_approve_key');
+          res = await fetch(statusUrl, { headers: authHeaders() });
+        }
         if (res.status === 401 || res.status === 403) {
           if (connBadge && !currentOrgId) {
             connBadge.className = 'badge';
@@ -1318,38 +1490,47 @@
           return;
         }
         const data = await res.json();
-        if (data.org_id) currentOrgId = data.org_id;
+        if (data.org_id && data.org_id !== '*') {
+          currentOrgId = data.org_id;
+        }
+        const activeOrg = currentOrgId ||
+          (Array.isArray(data.pending_escalations) && data.pending_escalations[0] && data.pending_escalations[0].org_id) ||
+          (Array.isArray(data.peers) && data.peers[0] && data.peers[0].org_id) ||
+          (Array.isArray(data.workspaces) && data.workspaces[0] && data.workspaces[0].org_id) ||
+          'aegis-os';
 
         if (connBadge) {
           connBadge.className = 'badge badge-ok';
-          connBadge.textContent = (currentLang === 'zh' ? '已连接 · ' : 'Connected · ') + (currentOrgId || 'cloud');
+          connBadge.textContent = (currentLang === 'zh' ? '已连接 · ' : 'Connected · ') + activeOrg;
         }
         const hintEl = document.getElementById('key-org-hint');
-        if (hintEl && currentOrgId) hintEl.textContent = 'Org: ' + currentOrgId;
+        if (hintEl && activeOrg) hintEl.textContent = 'Org: ' + activeOrg;
 
-        if (currentOrgId) {
-          const bRes = await fetch(apiBase + '/v1/billing/status?org_id=' + encodeURIComponent(currentOrgId), { headers: authHeaders() });
+        if (activeOrg) {
+          const bRes = await fetch(apiBase + '/v1/billing/status?org_id=' + encodeURIComponent(activeOrg), { headers: authHeaders() });
           if (bRes.ok) {
             const bData = await bRes.json();
-            updateSubscriptionAndQuotaUi(bData.plan_tier, bData.org_id || currentOrgId, bData.subscription_active, bData.quotas);
+            updateSubscriptionAndQuotaUi(bData.plan_tier, bData.org_id || activeOrg, bData.subscription_active, bData.quotas);
           }
         }
 
         const isOperator = authKey.startsWith('aop_');
-        if (!isOperator) {
-          const appRes = await fetch(apiBase + '/v1/approver' + (currentOrgId ? '?org_id=' + encodeURIComponent(currentOrgId) : ''), { headers: authHeaders() });
-          if (appRes.ok) {
-            const appData = await appRes.json();
-            requireTotp = !!appData.enrolled;
-            if (totpBadge) {
-              totpBadge.className = appData.enrolled ? 'badge badge-ok' : 'badge badge-warn';
-              totpBadge.textContent = appData.enrolled
-                ? (currentLang === 'zh' ? '已绑定 (' + (appData.email_masked || 'TOTP') + ')' : 'Enrolled (' + (appData.email_masked || 'TOTP') + ')')
-                : (currentLang === 'zh' ? '未绑定 TOTP' : 'Not Enrolled');
-            }
+        const appRes = await fetch(apiBase + '/v1/approver' + (activeOrg ? '?org_id=' + encodeURIComponent(activeOrg) : ''), { headers: authHeaders() });
+        if (appRes.ok) {
+          const appData = await appRes.json();
+          const enrolled = !!appData.enrolled;
+          requireTotp = enrolled && !isOperator;
+          if (totpBadge) {
+            const masked = appData.email || appData.email_masked || 'TOTP';
+            totpBadge.className = enrolled ? 'badge badge-ok' : 'badge badge-warn';
+            totpBadge.textContent = enrolled
+              ? (currentLang === 'zh' ? '已绑定 (' + masked + ')' : 'Enrolled (' + masked + ')')
+              : (currentLang === 'zh' ? '未绑定 TOTP (本地直连可审批)' : 'Not Enrolled (Local Ready)');
           }
-        } else {
+        } else if (isOperator && totpBadge) {
           requireTotp = false;
+          totpBadge.className = 'badge badge-ok';
+          totpBadge.textContent = currentLang === 'zh' ? '本地直连已就绪' : 'Operator Ready';
         }
 
         renderEscalations(Array.isArray(data.pending_escalations) ? data.pending_escalations : []);

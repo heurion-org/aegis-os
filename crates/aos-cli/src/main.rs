@@ -2513,6 +2513,31 @@ async fn main() -> anyhow::Result<()> {
                         .policy
                         .approve_escalation(&resolved_id, ttl_secs, "cli_human_operator")
                         .await?;
+                    let _ = kernel
+                        .recorder
+                        .record(aos_core::AuditEvent {
+                            event_id: format!("evt-{}", &uuid::Uuid::new_v4().to_string()[..8]),
+                            timestamp_ms: chrono::Utc::now().timestamp_millis(),
+                            org_id: lease.org_id.clone(),
+                            agent_id: lease.agent_id.clone(),
+                            action: lease.action_pattern.clone(),
+                            resource: lease.resource_pattern.clone(),
+                            policy_decision: format!(
+                                "approved:{}:{}:cli_human_operator",
+                                resolved_id, lease.lease_id
+                            ),
+                            snapshot_id: None,
+                            details: json!({
+                                "escalation_id": resolved_id,
+                                "lease_id": lease.lease_id,
+                                "approved_by": "cli_human_operator",
+                                "ttl_secs": ttl_secs,
+                            }),
+                            task_id: lease.task_id.clone(),
+                            prev_hash: None,
+                            event_hash: None,
+                        })
+                        .await;
                     println!(
                         "{}",
                         serde_json::to_string_pretty(&json!({
@@ -3375,6 +3400,7 @@ async fn inspect_policy_escalation(
         EscalationStatus::Pending => "\x1b[1;33m[PENDING]\x1b[0m",
         EscalationStatus::Approved => "\x1b[1;32m[APPROVED]\x1b[0m",
         EscalationStatus::Denied => "\x1b[1;31m[DENIED]\x1b[0m",
+        EscalationStatus::Expired => "\x1b[1;90m[EXPIRED]\x1b[0m",
     };
     let created_str = chrono::DateTime::from_timestamp_millis(esc.created_at_ms)
         .map(|dt| dt.format("%Y-%m-%d %H:%M:%S UTC").to_string())
