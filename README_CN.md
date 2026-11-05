@@ -85,8 +85,8 @@ aegis-os install
    - 基于 macOS Seatbelt (`/usr/bin/sandbox-exec`) 与 Linux Bubblewrap (`bwrap --unshare-all`) 强制执行只读根目录与 `$HOME` 默认拒绝（`--tmpfs` 遮蔽并只读回挂 `.rustup` / `.cargo` 工具链），支持 `pause()` / `resume()` / `destroy()` 真实进程组信号管控（`SIGSTOP` / `SIGCONT` / `SIGKILL`）。
 3. **零信任出站代理、HTTPS `CONNECT` 隧道与边界密钥注入 (`aos-egress`)**：
    - 沙箱内永远不落盘明文 API Key，仅持有 `$AOS_SECRET_*` 占位符。出站请求经由身份绑定的本地代理，校验目标域名、HTTP 方法与路径前缀后，在网络边界注入真实凭证，并通过 L7 DLP 拦截私钥与 Token 外泄。
-4. **声明式 Cedar 5 级策略引擎与提交投毒守卫 (`aos-policy`)**：
-   - 原生解析 [`policy/default.cedar`](policy/default.cedar)（并支持 `AOS_CEDAR_POLICY_FILE` 扩展），即使在拥有活跃会话租约的情况下，任何触碰 `.git/hooks/*`、`Makefile`、`build.rs`、`Cargo.toml`、`package.json`、`.aegis/*` 的提交仍强制触发人工审批（R0b 守卫）。
+4. **声明式 Cedar 5 级策略引擎、防 TOCTOU 哈希锁定与提交投毒守卫 (`aos-policy`)**：
+   - 原生解析 [`policy/default.cedar`](policy/default.cedar)（并支持 `AOS_CEDAR_POLICY_FILE` 扩展），支持在免密钥网页审批台（`/approve` 与 `/aegis-cloud/dashboard`）内直接展开语法高亮 Unified Diff 预览（`GET /v1/approvals/diff`）；单次批准（`批准本次 · SHA-256 锁定`）将租约密码学锚定至审批时刻的规范化 Diff 摘要（`sha256:<evidence_hash>`），彻底阻断先审后改的 TOCTOU 调包攻击；即使在拥有 15 分钟 / 1 小时活跃会话租约的情况下，任何触碰 `.git/hooks/*`、`Makefile`、`build.rs`、`Cargo.toml`、`package.json`、`.aegis/*` 的提交仍强制合并生成一张 `workspace_commit_sensitive` 人工审批单（R0b 守卫），且所有已授权租约均可在网页端一键撤销（`POST /v1/leases/revoke`）。
 5. **Google A2A 多 Agent 协同基础设施与云端沙箱 PaaS (`aos-ipc`, `aos-mcp-gateway`, `aos-recorder`)**：
    - **Agent-First 零命令协同**：用户始终直接用自然语言与 `agy`、`claude`、`codex` 对话，无需手动输入 CLI 子命令。Agent 自动通过 MCP 完成同伴发现（`ipc_list_peers`）、层级子任务拆解与依赖编排（`ipc_request` 支持 `parent_task_id` 与 `depends_on`，父任务取消时自动递归取消子任务树）、无 Hook 客户端免轮询阻塞等待（`ipc_wait`）以及状态流转。
    - **任务级通配符文件锁 (`coord_claim`) 与并发落盘串行复核**：支持 2D NFA + 真实文件树双重 Glob 交集防撞（如拦截 `src/**` 与 `src/auth/*.rs` 冲突）、`proc_exec` 沙箱脚本越界写软告警（`coordination_warning`），并在 `workspace_commit` 或任务终态时**自动释放文件锁与任务租约**；并发提交由跨进程锁与 `host_commit_epoch` 串行化，若主干在预检期间被同伴更新则自动重跑三路合并与 `verify_cmd`。
