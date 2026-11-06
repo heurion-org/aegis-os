@@ -1,40 +1,75 @@
 # Aegis Enforced Runtime 产品设计文档
 
 > **副标题**：面向代码、文档、数据流水线与跨应用状态的通用 Agent 事务运行时  
-> **版本**：v0.3 Draft  
-> **日期**：2026-11-05  
-> **状态**：待评审 / 待拆分实施  
+> **版本**：v0.4 Draft  
+> **日期**：2026-11-06  
+> **状态**：实施中（Phase 1 完成，Phase 2/3 部分完成）  
 > **范围**：Aegis OS 从「Agent 加载的安全插件」升级为「启动 Agent 的安全运行时」  
-> **关联代码**：`crates/aos-cli/src/routing.rs`、`crates/aos-cli/src/hooks.rs`、`crates/aos-cli/src/installer.rs`、`crates/aos-sandbox/src/lib.rs`、`crates/aos-policy/src/lib.rs`、`crates/aos-mcp-gateway/src/lib.rs`、`crates/aos-vfs/src/lib.rs`  
+> **关联代码**：`crates/aos-cli/src/routing.rs`、`crates/aos-cli/src/hooks.rs`、`crates/aos-cli/src/installer.rs`、`crates/aos-cli/src/launcher.rs`、`crates/aos-sandbox/src/lib.rs`、`crates/aos-policy/src/lib.rs`、`crates/aos-mcp-gateway/src/lib.rs`、`crates/aos-vfs/src/lib.rs`、`crates/aos-core/src/effect.rs`  
 > **关联文档**：`README.md`、`docs/AEGIS_APPLICATION_PROTOCOL.md`、[《超越 Git 分支与共享目录》](https://heurion.org/blog/aegis-os-transactional-agent-kernel)
 
 ---
 
-## 实施状态（2026-11-05）
+## 实施状态与计划（2026-11-06）
 
-Phase 1 已在 `main` 落地以下能力：
+| Phase | 状态 | 已完成 | 下一步 |
+|---|---|---|---|
+| **Phase 0** 说真话与可观测性 | ✅ 完成 | README / 设计文档分级、`doctor` enforcement 检查、客户端矩阵、可移植 `.agents/hooks.json` | 持续维护兼容矩阵 |
+| **Phase 1** `aos run` Linux MVP | ✅ 完成 | bwrap 进程树、CoW shadow、宿主只读、`$HOME`/系统目录遮蔽、Git 视图、状态目录分层、工具链挂载、CONNECT egress allowlist、TUI 继承、Ctrl-C、bwrap 版本探测 | macOS Seatbelt（Phase 4） |
+| **Phase 2** Effect / 审批 / 租约 | 🟡 部分完成 | `aos-core::effect`、commit approval ticket、`evidence_hash` + TOCTOU、`aos approvals` CLI/Web、`workspace_commit` 租约、敏感路径守卫、audit/`aos why` | Base URL 反向代理 + L7 DLP、opt-in MITM、完整 policy broker UI |
+| **Phase 3** DomainProfile / 预检 / CAS | 🟡 部分完成 | `--profile auto`、文本 LCS、二进制排他锁+基线哈希、`aos verify` 沙箱预检门、`aos publish` / `artifacts list/fetch` CAS | docs/data 专用合并器、Schema/PHI 预置 profile、章节/分区 claim |
+| **Phase 4** macOS / 内核加固 | ⬜ 未开始 | — | Seatbelt 默认收紧、Landlock/seccomp、microVM 试点 |
+| **Phase 5** 高级领域 / IDE / 企业 | ⬜ 未开始 | — | Office CRDT、AAP-1.0、UOMP、IDE daemon、MDM |
 
-- `aos run -- <agent>`：Linux bwrap、每会话 CoW shadow、宿主项目只读、`$HOME`/系统目录遮蔽、Agent 状态目录分层、敏感配置只读、Git 视图、工具链挂载、Agent 二进制原路径挂载。
-- 出站：私有 netns + identity-pinned CONNECT 代理 + Unix-socket bridge + 域名 allowlist；宿主 loopback 不可达。
-- 会话：`aos status` / `aos last` / `aos diff` / `aos commit` / `aos discard`；`aos agent list` / `aos agent doctor`。
-- `--mode observe`：项目只读；Agent home 可写。
-- `--profile auto`：按工作区内容检测 code / docs / data / binary / mixed。
-- `aos install --enforce`：为 claude / codex / agy / opencode / hermes 创建 `~/.aegis/bin` shim；`aos install` 同时写入 OpenCode MCP 配置。
-- `aos-core::effect`：EffectKind / ResourceScope / Reversibility / ArtifactKind 与稳定 action 映射，供 Phase 2 policy 使用。
-- `aos commit`：敏感路径默认拒绝，需 `--allow-sensitive`；生成带 `evidence_hash` 的 approval ticket，交互确认或 `--yes`，提交前重算哈希做 TOCTOU 校验；`aos why` 查看审批与 audit tail。
-- `aos commit` 会读取 `policy_state.json` 中的活动租约：`aos policy lease --action-pattern workspace_commit --ttl-secs 60` 可覆盖交互确认；敏感路径仍需 `--allow-sensitive`。
-- `aos approvals list/show/approve/deny`：统一管理 launcher commit 审批单；非交互 commit 会打印 escalation id 并退出，批准后重跑 commit 即可落盘。
-- `aos approvals serve`：本地 Web 审批台（127.0.0.1 + 随机 token），展示 evidence hash、paths 与 approve/deny 表单。
-- `aos publish`：把 session shadow 中的变更文件发布到组织 SHA-256 CAS，写入 `published.json`，供下游按哈希接力。
-- `aos artifacts list/fetch`：列出组织 CAS 产物并按 URI / SHA-256 拉取到本地。
-- `aos verify`：在沙箱内执行 `.aegis/verify.json` 或 `AOS_VERIFY_CMD`；`aos commit` 也会先跑该预检门，失败则不生成审批单。
-- 已修复：大文件 CoW 自指 symlink、工具链凭据泄露、`workspace=$HOME` 复制敏感目录、TIOCSTI、bwrap 版本探测、resolv.conf、node_modules 自指、Ctrl-C、OAuth 写回、权限、Git shim、NixOS/Linuxbrew 兼容。
+**当前验证**
 
-**尚未完成**：L7 DLP / Base URL 反向代理 / opt-in MITM、审批 Web Console 对接、OpenCode/Hermes 的 install-time plugin 配置、macOS Seatbelt、docs/data/binary 的专用合并器（CAS 发布已可用）、Phase 5 的 Office CRDT / AAP-1.0 / UOMP / IDE 集成。
+```text
+cargo test -p aos-cli -p aos-core -p aos-vfs   # 52 passed
+cargo clippy -p aos-cli -p aos-core -p aos-vfs -- -D warnings
+```
+
+手工覆盖：`aos run` 宿主只读 / shadow 写入、Git 视图、Claude/OpenCode 启动、CONNECT allowlist、未授权域名 403、commit 审批/租约/TOCTOU、`aos approvals serve`、`aos verify`、`aos publish` / `aos artifacts fetch`。
+
+**近期计划（按优先级）**
+
+1. **P0：Base URL 反向代理 + L7 DLP**  
+   把 `ANTHROPIC_BASE_URL` / `OPENAI_BASE_URL` 指向本地反向代理，支持流式响应、请求体 DLP、边界密钥注入；完成后再做 opt-in MITM。  
+   完成标准：`api.anthropic.com` / `api.openai.com` 走 L7 模式，恶意 body 被拒绝，SSE 首 token 延迟不退化。
+
+2. **P1：OverlayFS / fuse-overlayfs CoW backend**  
+   在 ext4 上实现 O(1) shadow 创建，删除第二次 baseline 全量拷贝。  
+   完成标准：1 GB 数据集启动 P95 < 150 ms，`doctor` 显示 `cow_backend: overlay`。
+
+3. **P1：docs/data profile 深化**  
+   章节/段落 claim、Schema-aware data merge、PHI/schema verify、CAS + task DAG 接力。  
+   完成标准：多 Agent 改不同章节成功、同段落冲突、数据 Schema/PHI 失败不落盘、下游只读 CAS 哈希。
+
+4. **P2：macOS Seatbelt + isolated VM**  
+   Phase 4 平台工作，需要 macOS 实机验证。  
+   完成标准：`aos run -- claude` 在 macOS 上完成同样的文件/网络边界测试。
+
+5. **P2：OpenCode plugin / Hermes adapter**  
+   OpenCode 已有 MCP 配置与 `--standalone` 启动；补齐 install-time plugin 与 Hermes Adapter Protocol。  
+   完成标准：`aos agent test` 能验证 heartbeat、permission hook、MCP 工具调用。
+
+**已知限制**
+
+- Linux only；需要 bubblewrap **>= 0.10**（`--bind-fd`）。
+- Egress 是 CONNECT-only 域名 allowlist；L7 DLP / 密钥注入 / MITM 尚未实现。
+- 审批台是本地 CLI/Web，未接入云端 `/approve` 或 TUI 内嵌面板。
+- CoW 仍可能回退到 lazy-copy；OverlayFS 尚未落地。
+- macOS Seatbelt、Office CRDT、AAP-1.0、UOMP、IDE 集成未开始。
+- `.agents/hooks.json` 已改为可移植的 `aegis-os` + `--workspace ".."`，不再写死机器路径。
 
 ---
 
 ## 变更记录
+
+- **v0.4**（2026-11-06）：更新实施状态与计划：
+  - Phase 1 Linux 完成；Phase 2/3 部分完成；
+  - 新增 commit approval ticket / evidence hash / TOCTOU、租约、`aos approvals` CLI + Web、`aos verify` 预检门、`aos publish` / `artifacts` CAS；
+  - `.agents/hooks.json` 改为可移植 `aegis-os` + `--workspace ".."`；
+  - 明确剩余项：L7 DLP / Base URL / MITM、专用领域合并器、macOS、Phase 5。
 
 - **v0.3**：根据评审修正 7 个问题：
   1. HTTPS CONNECT 不做 MITM 时只能做 `net.connect`，L7 DLP / method 审计改为 opt-in MITM 或 base URL 反向代理；
@@ -1968,7 +2003,7 @@ JSON：
 
 ## 10. 实施计划
 
-### Phase 0：说真话与可观测性（1–2 周）
+### Phase 0：说真话与可观测性（✅ 已完成）
 
 **目标**：在改架构之前，先让用户和团队知道当前处于哪种模式。
 
@@ -1985,7 +2020,7 @@ JSON：
 - `doctor` 在 Hook 被禁用时明确显示 `advisory (hooks missing)`。
 - 文档中每个客户端的承诺与代码一致。
 
-### Phase 1：`aos run` Linux MVP（3–4 周）
+### Phase 1：`aos run` Linux MVP（✅ Linux 完成；macOS 见 Phase 4）
 
 **目标**：Agent 进程树进入 bwrap，宿主只读，shadow 可写，出口代理可用；先以 Claude Code 作为参考客户端，不追求一次接完所有 Agent。
 
@@ -2011,7 +2046,7 @@ JSON：
 - ext4 + overlay / fuse-overlayfs 启动 P95 < 150 ms；lazy-copy 明确标注降级。
 - OpenCode / Hermes 只做检测，不阻塞 Phase 1 交付。
 
-### Phase 2：Effect 模型与审批（3–4 周）
+### Phase 2：Effect 模型与审批（🟡 部分完成：effect/审批/租约/审计已完成，L7 未完成）
 
 **目标**：策略从工具名迁移到 effect；审批按能力聚合。
 
@@ -2034,7 +2069,7 @@ JSON：
 - one-shot 审批的 diff 哈希不一致时拒绝执行。
 - CONNECT 模式只记录 `net.connect`；Base URL 模式能正确记录 method / path 并做 DLP；MITM 未启用时不得声称 L7。
 
-### Phase 3：会话模式、DomainProfile 接口与五客户端（3–4 周）
+### Phase 3：会话模式、DomainProfile 接口与五客户端（🟡 部分完成：profile/verify/CAS 已完成，专用合并器未完成）
 
 **目标**：observe / implement 模式；read/write claim；只交付 `DomainProfile` 扩展接口和两类通用合并器；完成五个 Tier A 客户端适配。**不**在本阶段做 Schema-aware 数据合并、Office CRDT、PHI、CAS、AAP / UOMP。
 
@@ -2072,7 +2107,7 @@ JSON：
 - observe 会话无法写入宿主或 shadow（或写入后被丢弃）。
 - OpenCode 共享服务检测生效。
 
-### Phase 4：macOS 与内核加固（4–6 周）
+### Phase 4：macOS 与内核加固（⬜ 未开始）
 
 **目标**：macOS enforced 可用；Landlock / seccomp 落地；microVM 试点。
 
@@ -2091,7 +2126,7 @@ JSON：
 - Landlock 不可用时 `doctor` 明确显示降级。
 - 隔离模式首启 < 3 s，复用 < 500 ms。
 
-### Phase 5：高级领域、Office / 跨应用 / 记忆 / IDE / 企业（持续）
+### Phase 5：高级领域、Office / 跨应用 / 记忆 / IDE / 企业（⬜ 未开始）
 
 - `docs` 高级能力：章节 / 段落 claim、`.docx` / `.pptx` 双表面 CRDT 块级锁 + `patchParagraph`、更完整的渲染 diff。
 - `data` 高级能力：Schema-aware 自动合并、表 / 分区 / 行区间 claim、`scanPhi --strict`、行数 / 统计不变量、CAS 流水线（`org_artifact_publish` / `fetch`）与任务 DAG。
@@ -2106,13 +2141,13 @@ JSON：
 
 ### 10.1 里程碑与依赖
 
-| 里程碑 | 依赖 | 风险 |
-|---|---|---|
-| M1 `aos run` Linux | bwrap 版本、PTY 库、OpenCode `--standalone` 验证 | 客户端 TUI 兼容性 |
-| M2 Effect 策略 | Cedar 解析器扩展、审批 UI | 策略复杂度 / 误报 |
-| M3 DomainProfile 接口 + 五客户端 | DomainProfile、文本 LCS、排他锁/基线哈希、adapter API | 并发冲突、领域预检误报 |
-| M4 macOS | Seatbelt profile 调试、路径限制 | 工具兼容性 |
-| M5 高级领域 / 隔离 | Schema-aware、CRDT、PHI、CAS、AAP-1.0、UOMP、microVM / Cloud 绑定 | 性能、成本、应用覆盖 |
+| 里程碑 | 状态 | 依赖 | 风险 |
+|---|---|---|---|
+| M1 `aos run` Linux | ✅ 完成 | bwrap 版本、TUI 继承、OpenCode `--standalone` 验证 | 客户端 TUI 兼容性 |
+| M2 Effect 策略 / 审批 | 🟡 部分完成（L7 未完成） | Cedar 解析器扩展、审批 UI | 策略复杂度 / 误报 |
+| M3 DomainProfile 接口 + 五客户端 | 🟡 部分完成（专用合并器未完成） | DomainProfile、文本 LCS、排他锁/基线哈希、adapter API | 并发冲突、领域预检误报 |
+| M4 macOS | ⬜ 未开始 | Seatbelt profile 调试、路径限制 | 工具兼容性 |
+| M5 高级领域 / 隔离 | ⬜ 未开始 | Schema-aware、CRDT、PHI、CAS、AAP-1.0、UOMP、microVM / Cloud 绑定 | 性能、成本、应用覆盖 |
 
 ---
 
