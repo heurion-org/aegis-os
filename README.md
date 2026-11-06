@@ -99,6 +99,7 @@ aegis-os install --enforce   # optional: create ~/.aegis/bin/claude shims
 aegis-os --workspace . run -- claude
 aegis-os status
 aegis-os diff
+aegis-os verify          # run .aegis/verify.json / AOS_VERIFY_CMD in the sandbox
 aegis-os commit          # diff + evidence hash; --yes for non-interactive
 aegis-os why             # approval ticket + audit trail
 aegis-os discard

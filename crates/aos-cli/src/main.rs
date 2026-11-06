@@ -131,6 +131,15 @@ enum Commands {
         session: Option<String>,
     },
 
+    /// Run the domain verification gate for the latest (or named) session
+    Verify {
+        #[arg(long)]
+        session: Option<String>,
+        /// Override `.aegis/verify.json` / AOS_VERIFY_CMD
+        #[arg(long)]
+        cmd: Option<String>,
+    },
+
     /// Commit the latest (or named) session shadow to the host workspace (human action)
     Commit {
         #[arg(long)]
@@ -2136,6 +2145,10 @@ async fn main() -> anyhow::Result<()> {
 
         Commands::Diff { session } => {
             launcher::diff(&runtime_dir, session.as_deref()).await?;
+        }
+
+        Commands::Verify { session, cmd } => {
+            launcher::verify(&runtime_dir, session.as_deref(), cmd.as_deref()).await?;
         }
 
         Commands::Commit { session, paths, allow_sensitive, yes } => {

@@ -14,8 +14,12 @@
 //! `--ro-bind-fd`) because bwrap resolves *path* sources in the host namespace. Once `/home`
 //! or `/tmp` is replaced by tmpfs, a path source under those trees is no longer resolvable.
 
-use aos_core::{AgentIdentity, PolicyEngine, TransactionalWorkspace};
+use aos_core::{
+    AgentIdentity, ExecSpec, IsolationTier, PolicyEngine, ResourceLimits, SandboxConfig,
+    SandboxDriver, TransactionalWorkspace,
+};
 use aos_egress::AegisEgressGateway;
+use aos_sandbox::NativeOsSandboxDriver;
 use aos_vfs::CoWWorkspace;
 use anyhow::{bail, Context};
 use serde_json::{json, Value};
@@ -894,6 +898,19 @@ pub(crate) async fn commit(
         return Ok(());
     }
 
+    run_verify_for_session(runtime_dir, &value, None).await?;
+    // Verification can generate artifacts or touch caches; recompute the evidence afterwards.
+    let diffs = CoWWorkspace::diff_dirs(
+        Path::new(workspace),
+        ws.shadow_root(),
+        paths.as_deref(),
+    )
+    .await?;
+    if diffs.is_empty() {
+        println!("Nothing to commit in {}", dir.display());
+        return Ok(());
+    }
+
     let changed: Vec<String> = diffs.iter().map(|d| d.relative_path.clone()).collect();
     let sensitive: Vec<&String> = changed
         .iter()
@@ -1260,7 +1277,17 @@ fn detect_profile(root: &Path) -> &'static str {
             if ft.is_dir() {
                 if matches!(
                     entry.file_name().to_string_lossy().as_ref(),
-                    "node_modules" | "target" | ".git" | ".venv" | "dist" | "build"
+                    "node_modules"
+                        | "target"
+                        | ".git"
+                        | ".venv"
+                        | "dist"
+                        | "build"
+                        | ".aegis"
+                        | ".claude"
+                        | ".codex"
+                        | ".gemini"
+                        | ".opencode"
                 ) {
                     continue;
                 }
@@ -1356,6 +1383,118 @@ fn append_audit(session_dir: &Path, event: Value) {
     {
         let _ = writeln!(file, "{}", event);
     }
+}
+
+fn resolved_verify_command(host_project: &Path, override_cmd: Option<&str>) -> Option<(String, u64)> {
+    if let Some(cmd) = override_cmd.map(str::trim).filter(|c| !c.is_empty()) {
+        return Some((cmd.to_string(), 60_000));
+    }
+    if let Ok(cmd) = std::env::var("AOS_VERIFY_CMD") {
+        let cmd = cmd.trim();
+        if !cmd.is_empty() {
+            return Some((cmd.to_string(), 60_000));
+        }
+    }
+    let cfg = host_project.join(".aegis/verify.json");
+    let raw = std::fs::read_to_string(cfg).ok()?;
+    let value: Value = serde_json::from_str(&raw).ok()?;
+    let cmd = value
+        .get("verify_cmd")
+        .and_then(|v| v.as_str())
+        .map(str::trim)
+        .filter(|c| !c.is_empty())?
+        .to_string();
+    let timeout = value
+        .get("timeout_ms")
+        .and_then(|v| v.as_u64())
+        .unwrap_or(60_000);
+    Some((cmd, timeout))
+}
+
+async fn run_verify_for_session(
+    runtime_dir: &Path,
+    value: &Value,
+    override_cmd: Option<&str>,
+) -> anyhow::Result<()> {
+    let workspace = value
+        .get("workspace")
+        .and_then(|v| v.as_str())
+        .context("session is missing workspace")?;
+    let shadow = value
+        .get("shadow")
+        .and_then(|v| v.as_str())
+        .context("session is missing shadow")?;
+    let org_id = value
+        .get("org_id")
+        .and_then(|v| v.as_str())
+        .context("session is missing org_id")?;
+    let agent_id = value
+        .get("agent_id")
+        .and_then(|v| v.as_str())
+        .context("session is missing agent_id")?;
+    let agent_home = value
+        .get("agent_home")
+        .and_then(|v| v.as_str())
+        .context("session is missing agent_home")?;
+    let Some((cmd, timeout_ms)) = resolved_verify_command(Path::new(workspace), override_cmd) else {
+        println!("No verify_cmd configured; skipping domain verification gate.");
+        return Ok(());
+    };
+
+    println!("Running domain verify gate: {cmd}");
+    let org_shared = runtime_dir.join("orgs").join(org_id).join("shared_ro");
+    let org_pub = runtime_dir.join("orgs").join(org_id).join("pub").join(agent_id);
+    std::fs::create_dir_all(&org_shared)?;
+    std::fs::create_dir_all(&org_pub)?;
+    let driver = NativeOsSandboxDriver;
+    let sandbox = driver
+        .create_sandbox(SandboxConfig {
+            identity: AgentIdentity::new(org_id, agent_id, "verify"),
+            tier: IsolationTier::NativeOsSandbox,
+            limits: ResourceLimits::default(),
+            workspace_dir: PathBuf::from(shadow),
+            agent_home_dir: PathBuf::from(agent_home),
+            org_shared_ro_dir: org_shared,
+            org_agent_pub_dir: org_pub,
+            egress_proxy_addr: None,
+        })
+        .await?;
+    let out = sandbox
+        .exec(ExecSpec {
+            command: "sh".to_string(),
+            args: vec!["-c".to_string(), cmd.clone()],
+            cwd: Some(PathBuf::from(shadow)),
+            env: std::collections::HashMap::new(),
+            timeout_ms: Some(timeout_ms),
+            background: false,
+        })
+        .await?;
+    if !out.stdout.trim().is_empty() {
+        println!("{}", out.stdout.trim_end());
+    }
+    if !out.stderr.trim().is_empty() {
+        eprintln!("{}", out.stderr.trim_end());
+    }
+    if out.exit_code != Some(0) {
+        bail!(
+            "domain verification gate failed (exit {:?}): {}",
+            out.exit_code,
+            cmd
+        );
+    }
+    println!("Domain verification gate passed.");
+    Ok(())
+}
+
+pub(crate) async fn verify(
+    runtime_dir: &Path,
+    session_id: Option<&str>,
+    override_cmd: Option<&str>,
+) -> anyhow::Result<()> {
+    let Some((_dir, value)) = find_session(runtime_dir, session_id)? else {
+        bail!("Aegis: no sessions under {}", runtime_dir.display());
+    };
+    run_verify_for_session(runtime_dir, &value, override_cmd).await
 }
 
 fn bwrap_supports_bind_fd(path: &Path) -> bool {

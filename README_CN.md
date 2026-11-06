@@ -65,6 +65,7 @@ aegis-os install --enforce   # 可选：创建 ~/.aegis/bin/claude 等 shim
 aegis-os --workspace . run -- claude
 aegis-os status
 aegis-os diff
+aegis-os verify          # 在沙箱内跑 .aegis/verify.json / AOS_VERIFY_CMD
 aegis-os commit          # Diff + evidence hash；非交互用 --yes
 aegis-os why             # 查看审批单与审计链
 aegis-os discard
