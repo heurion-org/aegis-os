@@ -99,7 +99,8 @@ aegis-os install --enforce   # optional: create ~/.aegis/bin/claude shims
 aegis-os --workspace . run -- claude
 aegis-os status
 aegis-os diff
-aegis-os commit          # human CLI action; approvals arrive in Phase 2
+aegis-os commit          # diff + evidence hash; --yes for non-interactive
+aegis-os why             # approval ticket + audit trail
 aegis-os discard
 ```
 

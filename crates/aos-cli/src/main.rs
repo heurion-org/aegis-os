@@ -141,6 +141,9 @@ enum Commands {
         /// Explicitly allow commit-poisoning paths (.git/hooks, build.rs, CI config, ...)
         #[arg(long, default_value_t = false)]
         allow_sensitive: bool,
+        /// Skip the interactive confirmation (still requires --allow-sensitive for sensitive paths)
+        #[arg(long, default_value_t = false)]
+        yes: bool,
     },
 
     /// Discard the latest (or named) session shadow
@@ -153,6 +156,12 @@ enum Commands {
     Agent {
         #[command(subcommand)]
         action: AgentAction,
+    },
+
+    /// Explain the latest (or named) session's approval and audit trail
+    Why {
+        #[arg(long)]
+        session: Option<String>,
     },
 
     /// Upgrade Aegis OS in-place to the latest signed release and refresh client integrations
@@ -2129,13 +2138,17 @@ async fn main() -> anyhow::Result<()> {
             launcher::diff(&runtime_dir, session.as_deref()).await?;
         }
 
-        Commands::Commit { session, paths, allow_sensitive } => {
+        Commands::Commit { session, paths, allow_sensitive, yes } => {
             let filter = if paths.is_empty() { None } else { Some(paths) };
-            launcher::commit(&runtime_dir, session.as_deref(), filter, allow_sensitive).await?;
+            launcher::commit(&runtime_dir, session.as_deref(), filter, allow_sensitive, yes).await?;
         }
 
         Commands::Discard { session } => {
             launcher::discard(&runtime_dir, session.as_deref())?;
+        }
+
+        Commands::Why { session } => {
+            launcher::why(&runtime_dir, session.as_deref())?;
         }
 
         Commands::Agent { action } => {

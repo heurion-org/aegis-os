@@ -33,6 +33,8 @@ tracing.workspace = true
 tracing-subscriber.workspace = true
 tempfile.workspace = true
 libc.workspace = true
+sha2.workspace = true
+hex.workspace = true
 
 [features]
 # Test-only benchmark ablations (see `aos-core`). Never enable in release builds.

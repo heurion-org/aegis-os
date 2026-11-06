@@ -19,7 +19,9 @@ use aos_egress::AegisEgressGateway;
 use aos_vfs::CoWWorkspace;
 use anyhow::{bail, Context};
 use serde_json::{json, Value};
+use sha2::{Digest, Sha256};
 use std::fs::File;
+use std::io::{self, IsTerminal, Write};
 use std::os::fd::AsRawFd;
 use std::path::{Path, PathBuf};
 use std::process::ExitStatus;
@@ -845,6 +847,7 @@ pub(crate) async fn commit(
     session_id: Option<&str>,
     paths: Option<Vec<String>>,
     allow_sensitive: bool,
+    yes: bool,
 ) -> anyhow::Result<()> {
     let Some((dir, value)) = find_session(runtime_dir, session_id)? else {
         bail!("Aegis: no sessions under {}", runtime_dir.display());
@@ -857,7 +860,18 @@ pub(crate) async fn commit(
     let ws = CoWWorkspace::init(workspace, &base)
         .await
         .with_context(|| format!("opening session workspace {}", dir.display()))?;
-    let changed = ws.changed_since_baseline().await?;
+    let diffs = CoWWorkspace::diff_dirs(
+        Path::new(workspace),
+        ws.shadow_root(),
+        paths.as_deref(),
+    )
+    .await?;
+    if diffs.is_empty() {
+        println!("Nothing to commit in {}", dir.display());
+        return Ok(());
+    }
+
+    let changed: Vec<String> = diffs.iter().map(|d| d.relative_path.clone()).collect();
     let sensitive: Vec<&String> = changed
         .iter()
         .filter(|path| aos_policy::AegisPolicyKernel::is_commit_poisoning_path(path))
@@ -873,13 +887,78 @@ pub(crate) async fn commit(
              Review with `aos diff`, then rerun with `--allow-sensitive` if intended."
         );
     }
-    let committed = ws.commit_to_host(paths).await?;
-    if committed.is_empty() {
-        println!("Nothing to commit in {}", dir.display());
+
+    let (evidence, evidence_hash) = approval_evidence(&diffs)?;
+    let escalation_id = format!("esc-{}", &uuid::Uuid::new_v4().simple().to_string()[..10]);
+    let approval_path = dir.join("approval.json");
+    let approval = json!({
+        "escalation_id": escalation_id,
+        "action": "workspace.commit",
+        "paths": changed,
+        "sensitive": sensitive,
+        "evidence_hash": evidence_hash,
+        "evidence": evidence,
+        "status": "pending",
+        "created_at_ms": chrono::Utc::now().timestamp_millis(),
+    });
+    std::fs::write(
+        &approval_path,
+        serde_json::to_vec_pretty(&approval)?,
+    )?;
+
+    let approved = if yes {
+        true
     } else {
-        for path in committed {
-            println!("committed {path}");
-        }
+        approve_interactively(&diffs, &evidence_hash)?
+    };
+    if !approved {
+        let mut denied = approval.clone();
+        denied["status"] = json!("denied");
+        denied["decided_at_ms"] = json!(chrono::Utc::now().timestamp_millis());
+        let _ = std::fs::write(approval_path, serde_json::to_vec_pretty(&denied)?);
+        append_audit(
+            &dir,
+            json!({
+                "event": "workspace.commit",
+                "decision": "denied",
+                "evidence_hash": evidence_hash,
+                "timestamp_ms": chrono::Utc::now().timestamp_millis(),
+            }),
+        );
+        bail!("aos commit: cancelled by user");
+    }
+
+    // Recompute immediately before landing; a changed diff invalidates the approval.
+    let verify_diffs = CoWWorkspace::diff_dirs(
+        Path::new(workspace),
+        ws.shadow_root(),
+        paths.as_deref(),
+    )
+    .await?;
+    let (_, verify_hash) = approval_evidence(&verify_diffs)?;
+    if verify_hash != evidence_hash {
+        bail!(
+            "aos commit: evidence changed after approval (TOCTOU guard); review again with `aos diff`"
+        );
+    }
+
+    let committed = ws.commit_to_host(paths).await?;
+    let mut approved_record = approval;
+    approved_record["status"] = json!("approved");
+    approved_record["decided_at_ms"] = json!(chrono::Utc::now().timestamp_millis());
+    let _ = std::fs::write(approval_path, serde_json::to_vec_pretty(&approved_record)?);
+    append_audit(
+        &dir,
+        json!({
+            "event": "workspace.commit",
+            "decision": "approved",
+            "paths": committed,
+            "evidence_hash": evidence_hash,
+            "timestamp_ms": chrono::Utc::now().timestamp_millis(),
+        }),
+    );
+    for path in committed {
+        println!("committed {path}");
     }
     update_session_state(&dir, "committed", value.get("exit_code").and_then(|v| v.as_i64()).map(|v| v as i32));
     Ok(())
@@ -893,6 +972,35 @@ pub(crate) fn discard(runtime_dir: &Path, session_id: Option<&str>) -> anyhow::R
     std::fs::remove_dir_all(&dir)
         .with_context(|| format!("removing session {}", dir.display()))?;
     println!("discarded {}", dir.display());
+    Ok(())
+}
+
+pub(crate) fn why(runtime_dir: &Path, session_id: Option<&str>) -> anyhow::Result<()> {
+    let Some((dir, value)) = find_session(runtime_dir, session_id)? else {
+        eprintln!("Aegis: no sessions under {}", runtime_dir.display());
+        return Ok(());
+    };
+    println!("Session: {}", value.get("session_id").and_then(|v| v.as_str()).unwrap_or("-"));
+    println!("Status:  {}", value.get("status").and_then(|v| v.as_str()).unwrap_or("unknown"));
+    let approval = dir.join("approval.json");
+    if approval.is_file() {
+        let raw = std::fs::read_to_string(&approval)?;
+        let record: Value = serde_json::from_str(&raw)?;
+        println!("\nApproval:");
+        println!("{}", serde_json::to_string_pretty(&record)?);
+    } else {
+        println!("\nApproval: none (no commit requested)");
+    }
+    let audit = dir.join("audit.jsonl");
+    if let Ok(raw) = std::fs::read_to_string(&audit) {
+        let tail: Vec<&str> = raw.lines().rev().take(10).collect();
+        if !tail.is_empty() {
+            println!("\nAudit tail:");
+            for line in tail.into_iter().rev() {
+                println!("  {line}");
+            }
+        }
+    }
     Ok(())
 }
 
@@ -1150,6 +1258,70 @@ fn detect_profile(root: &Path) -> &'static str {
         (false, false, true) => "binary",
         (false, false, false) => "code",
         _ => "mixed",
+    }
+}
+
+fn sha256_hex(bytes: &[u8]) -> String {
+    format!("sha256:{}", hex::encode(Sha256::digest(bytes)))
+}
+
+fn diff_label(kind: &aos_core::DiffChangeType) -> &'static str {
+    match kind {
+        aos_core::DiffChangeType::Added => "A",
+        aos_core::DiffChangeType::Modified => "M",
+        aos_core::DiffChangeType::Deleted => "D",
+    }
+}
+
+fn approval_evidence(diffs: &[aos_core::FileDiffEntry]) -> anyhow::Result<(Value, String)> {
+    let payload = json!({
+        "diffs": diffs.iter().map(|d| json!({
+            "path": d.relative_path,
+            "change": diff_label(&d.change_type),
+            "old_size": d.old_size,
+            "new_size": d.new_size,
+            "preview": d.preview_diff,
+        })).collect::<Vec<_>>()
+    });
+    let hash = sha256_hex(&serde_json::to_vec(&payload)?);
+    Ok((payload, hash))
+}
+
+fn print_evidence(diffs: &[aos_core::FileDiffEntry]) {
+    for diff in diffs.iter().take(20) {
+        println!("{} {}", diff_label(&diff.change_type), diff.relative_path);
+        if let Some(preview) = &diff.preview_diff {
+            for line in preview.lines().take(40) {
+                println!("  {line}");
+            }
+        }
+    }
+    if diffs.len() > 20 {
+        println!("... {} more file(s)", diffs.len() - 20);
+    }
+}
+
+fn approve_interactively(diffs: &[aos_core::FileDiffEntry], evidence_hash: &str) -> anyhow::Result<bool> {
+    print_evidence(diffs);
+    println!("\nEvidence: {evidence_hash}");
+    if !io::stdin().is_terminal() {
+        bail!("aos commit: non-interactive session; rerun with `--yes` after reviewing `aos diff`");
+    }
+    print!("Approve commit? [y/N] ");
+    io::stdout().flush()?;
+    let mut answer = String::new();
+    io::stdin().read_line(&mut answer)?;
+    Ok(matches!(answer.trim().to_ascii_lowercase().as_str(), "y" | "yes"))
+}
+
+fn append_audit(session_dir: &Path, event: Value) {
+    let path = session_dir.join("audit.jsonl");
+    if let Ok(mut file) = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(path)
+    {
+        let _ = writeln!(file, "{}", event);
     }
 }
 
