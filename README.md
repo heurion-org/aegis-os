@@ -101,6 +101,8 @@ aegis-os status
 aegis-os diff
 aegis-os verify          # run .aegis/verify.json / AOS_VERIFY_CMD in the sandbox
 aegis-os commit          # diff + evidence hash; --yes for non-interactive
+aegis-os approvals list  # pending/approved commit tickets
+aegis-os approvals approve <esc-id>
 aegis-os why             # approval ticket + audit trail
 aegis-os discard
 ```

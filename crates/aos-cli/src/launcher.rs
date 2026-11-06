@@ -929,24 +929,48 @@ pub(crate) async fn commit(
     }
 
     let (evidence, evidence_hash) = approval_evidence(&diffs)?;
-    let escalation_id = format!("esc-{}", &uuid::Uuid::new_v4().simple().to_string()[..10]);
     let approval_path = dir.join("approval.json");
-    let approval = json!({
-        "escalation_id": escalation_id,
-        "action": "workspace.commit",
-        "paths": changed,
-        "sensitive": sensitive,
-        "evidence_hash": evidence_hash,
-        "evidence": evidence,
-        "status": "pending",
-        "created_at_ms": chrono::Utc::now().timestamp_millis(),
-    });
-    std::fs::write(
-        &approval_path,
-        serde_json::to_vec_pretty(&approval)?,
-    )?;
+    let existing_record: Option<Value> = std::fs::read_to_string(&approval_path)
+        .ok()
+        .and_then(|raw| serde_json::from_str(&raw).ok());
+    let existing_approved = existing_record
+        .as_ref()
+        .map(|ticket| {
+            ticket.get("status").and_then(|v| v.as_str()) == Some("approved")
+                && ticket.get("evidence_hash").and_then(|v| v.as_str())
+                    == Some(evidence_hash.as_str())
+        })
+        .unwrap_or(false);
+    let approval = if existing_approved {
+        existing_record.unwrap()
+    } else {
+        let escalation_id = format!("esc-{}", &uuid::Uuid::new_v4().simple().to_string()[..10]);
+        let approval = json!({
+            "escalation_id": escalation_id,
+            "action": "workspace.commit",
+            "paths": changed,
+            "sensitive": sensitive,
+            "evidence_hash": evidence_hash,
+            "evidence": evidence,
+            "status": "pending",
+            "created_at_ms": chrono::Utc::now().timestamp_millis(),
+        });
+        std::fs::write(
+            &approval_path,
+            serde_json::to_vec_pretty(&approval)?,
+        )?;
+        approval
+    };
 
+    let ticket_id = approval
+        .get("escalation_id")
+        .and_then(|v| v.as_str())
+        .unwrap_or("-")
+        .to_string();
     let approved = if yes {
+        true
+    } else if existing_approved {
+        println!("Approved by ticket {ticket_id}");
         true
     } else if let Some(lease) = &lease {
         println!(
@@ -959,7 +983,7 @@ pub(crate) async fn commit(
         );
         true
     } else {
-        approve_interactively(&diffs, &evidence_hash)?
+        approve_interactively(&diffs, &evidence_hash, &ticket_id)?
     };
     if !approved {
         let mut denied = approval.clone();
@@ -1321,6 +1345,89 @@ fn detect_profile(root: &Path) -> &'static str {
     }
 }
 
+pub(crate) fn approvals_list(runtime_dir: &Path) -> anyhow::Result<()> {
+    let sessions = runtime_dir.join("sessions");
+    let Ok(entries) = std::fs::read_dir(&sessions) else {
+        println!("No approval tickets.");
+        return Ok(());
+    };
+    let mut found = false;
+    println!("{:<16} {:<10} {:<10} {:<70} PATHS", "ESCALATION", "STATUS", "SESSION", "EVIDENCE");
+    for entry in entries.flatten() {
+        let path = entry.path().join("approval.json");
+        let Ok(raw) = std::fs::read_to_string(&path) else {
+            continue;
+        };
+        let Ok(ticket) = serde_json::from_str::<Value>(&raw) else {
+            continue;
+        };
+        found = true;
+        println!(
+            "{:<16} {:<10} {:<10} {:<70} {}",
+            ticket.get("escalation_id").and_then(|v| v.as_str()).unwrap_or("-"),
+            ticket.get("status").and_then(|v| v.as_str()).unwrap_or("-"),
+            entry.file_name().to_string_lossy(),
+            ticket.get("evidence_hash").and_then(|v| v.as_str()).unwrap_or("-"),
+            ticket.get("paths").and_then(|v| v.as_array()).map(|a| a.len()).unwrap_or(0)
+        );
+    }
+    if !found {
+        println!("No approval tickets.");
+    }
+    Ok(())
+}
+
+fn find_ticket(runtime_dir: &Path, id: &str) -> anyhow::Result<(PathBuf, Value)> {
+    let entries = std::fs::read_dir(runtime_dir.join("sessions"))?;
+    for entry in entries.flatten() {
+        let path = entry.path().join("approval.json");
+        let Ok(raw) = std::fs::read_to_string(&path) else {
+            continue;
+        };
+        let Ok(ticket) = serde_json::from_str::<Value>(&raw) else {
+            continue;
+        };
+        if ticket.get("escalation_id").and_then(|v| v.as_str()) == Some(id) {
+            return Ok((entry.path(), ticket));
+        }
+    }
+    bail!("Aegis: escalation '{id}' not found")
+}
+
+pub(crate) fn approval_show(runtime_dir: &Path, id: &str) -> anyhow::Result<()> {
+    let (_dir, ticket) = find_ticket(runtime_dir, id)?;
+    println!("{}", serde_json::to_string_pretty(&ticket)?);
+    Ok(())
+}
+
+pub(crate) fn approval_decide(runtime_dir: &Path, id: &str, approve: bool) -> anyhow::Result<()> {
+    let (dir, mut ticket) = find_ticket(runtime_dir, id)?;
+    ticket["status"] = json!(if approve { "approved" } else { "denied" });
+    ticket["decided_by"] = json!("cli-human");
+    ticket["decided_at_ms"] = json!(chrono::Utc::now().timestamp_millis());
+    std::fs::write(
+        dir.join("approval.json"),
+        serde_json::to_vec_pretty(&ticket)?,
+    )?;
+    append_audit(
+        &dir,
+        json!({
+            "event": "workspace.commit",
+            "decision": if approve { "approved" } else { "denied" },
+            "escalation_id": id,
+            "evidence_hash": ticket.get("evidence_hash"),
+            "decided_by": "cli-human",
+            "timestamp_ms": chrono::Utc::now().timestamp_millis(),
+        }),
+    );
+    println!(
+        "{} {}",
+        if approve { "approved" } else { "denied" },
+        id
+    );
+    Ok(())
+}
+
 fn sha256_hex(bytes: &[u8]) -> String {
     format!("sha256:{}", hex::encode(Sha256::digest(bytes)))
 }
@@ -1361,11 +1468,18 @@ fn print_evidence(diffs: &[aos_core::FileDiffEntry]) {
     }
 }
 
-fn approve_interactively(diffs: &[aos_core::FileDiffEntry], evidence_hash: &str) -> anyhow::Result<bool> {
+fn approve_interactively(
+    diffs: &[aos_core::FileDiffEntry],
+    evidence_hash: &str,
+    escalation_id: &str,
+) -> anyhow::Result<bool> {
     print_evidence(diffs);
     println!("\nEvidence: {evidence_hash}");
     if !io::stdin().is_terminal() {
-        bail!("aos commit: non-interactive session; rerun with `--yes` after reviewing `aos diff`");
+        bail!(
+            "aos commit: approval required ({escalation_id}); run `aegis-os approvals approve {escalation_id}` \
+             or rerun with `--yes` after reviewing `aos diff`"
+        );
     }
     print!("Approve commit? [y/N] ");
     io::stdout().flush()?;

@@ -80,6 +80,18 @@ enum AgentAction {
 }
 
 #[derive(Subcommand)]
+enum ApprovalAction {
+    /// List launcher commit approval tickets
+    List,
+    /// Show one approval ticket and its evidence
+    Show { id: String },
+    /// Approve a launcher commit ticket
+    Approve { id: String },
+    /// Deny a launcher commit ticket
+    Deny { id: String },
+}
+
+#[derive(Subcommand)]
 enum Commands {
     /// [One-Step Global Setup] Automatically configure AGY, Claude Code, and Codex CLI globally
     Install {
@@ -165,6 +177,12 @@ enum Commands {
     Agent {
         #[command(subcommand)]
         action: AgentAction,
+    },
+
+    /// Manage launcher commit approval tickets
+    Approvals {
+        #[command(subcommand)]
+        action: ApprovalAction,
     },
 
     /// Explain the latest (or named) session's approval and audit trail
@@ -2175,6 +2193,13 @@ async fn main() -> anyhow::Result<()> {
                 }
             }
         }
+
+        Commands::Approvals { action } => match action {
+            ApprovalAction::List => launcher::approvals_list(&runtime_dir)?,
+            ApprovalAction::Show { id } => launcher::approval_show(&runtime_dir, &id)?,
+            ApprovalAction::Approve { id } => launcher::approval_decide(&runtime_dir, &id, true)?,
+            ApprovalAction::Deny { id } => launcher::approval_decide(&runtime_dir, &id, false)?,
+        },
 
         Commands::Run { mode, profile, enforcement, cmd } => {
             let code = launcher::run(
