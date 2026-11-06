@@ -14,7 +14,7 @@
 //! `--ro-bind-fd`) because bwrap resolves *path* sources in the host namespace. Once `/home`
 //! or `/tmp` is replaced by tmpfs, a path source under those trees is no longer resolvable.
 
-use aos_core::{AgentIdentity, TransactionalWorkspace};
+use aos_core::{AgentIdentity, PolicyEngine, TransactionalWorkspace};
 use aos_egress::AegisEgressGateway;
 use aos_vfs::CoWWorkspace;
 use anyhow::{bail, Context};
@@ -856,6 +856,29 @@ pub(crate) async fn commit(
         .get("workspace")
         .and_then(|v| v.as_str())
         .context("session is missing workspace")?;
+    let org_id = value
+        .get("org_id")
+        .and_then(|v| v.as_str())
+        .context("session is missing org_id")?;
+    let agent_id = value
+        .get("agent_id")
+        .and_then(|v| v.as_str())
+        .context("session is missing agent_id")?;
+    let policy = aos_policy::AegisPolicyKernel::with_state_file(Some(
+        runtime_dir.join("policy_state.json"),
+    ));
+    let now_ms = chrono::Utc::now().timestamp_millis();
+    let lease = policy
+        .list_leases(org_id, Some(agent_id))
+        .await?
+        .into_iter()
+        .find(|lease| {
+            lease.expires_at_ms > now_ms
+                && matches!(
+                    lease.action_pattern.as_str(),
+                    "workspace_commit" | "workspace.commit" | "*"
+                )
+        });
     let base = dir.join("cow_workspace");
     let ws = CoWWorkspace::init(workspace, &base)
         .await
@@ -907,6 +930,16 @@ pub(crate) async fn commit(
     )?;
 
     let approved = if yes {
+        true
+    } else if let Some(lease) = &lease {
+        println!(
+            "Approved by active lease {} ({} until {})",
+            lease.lease_id,
+            lease.action_pattern,
+            chrono::DateTime::from_timestamp_millis(lease.expires_at_ms)
+                .map(|dt| dt.to_rfc3339())
+                .unwrap_or_else(|| lease.expires_at_ms.to_string())
+        );
         true
     } else {
         approve_interactively(&diffs, &evidence_hash)?

@@ -22,6 +22,7 @@ Phase 1 已在 `main` 落地以下能力：
 - `aos install --enforce`：为 claude / codex / agy / opencode / hermes 创建 `~/.aegis/bin` shim；`aos install` 同时写入 OpenCode MCP 配置。
 - `aos-core::effect`：EffectKind / ResourceScope / Reversibility / ArtifactKind 与稳定 action 映射，供 Phase 2 policy 使用。
 - `aos commit`：敏感路径默认拒绝，需 `--allow-sensitive`；生成带 `evidence_hash` 的 approval ticket，交互确认或 `--yes`，提交前重算哈希做 TOCTOU 校验；`aos why` 查看审批与 audit tail。
+- `aos commit` 会读取 `policy_state.json` 中的活动租约：`aos policy lease --action-pattern workspace_commit --ttl-secs 60` 可覆盖交互确认；敏感路径仍需 `--allow-sensitive`。
 - 已修复：大文件 CoW 自指 symlink、工具链凭据泄露、`workspace=$HOME` 复制敏感目录、TIOCSTI、bwrap 版本探测、resolv.conf、node_modules 自指、Ctrl-C、OAuth 写回、权限、Git shim、NixOS/Linuxbrew 兼容。
 
 **尚未完成**：L7 DLP / Base URL 反向代理 / opt-in MITM、OpenCode/Hermes 的 install-time plugin 配置、完整 policy broker/租约/审批 UI、macOS Seatbelt、DomainProfile 的 docs/data/binary 合并器、Phase 5 的 Office CRDT / CAS / AAP / UOMP。
