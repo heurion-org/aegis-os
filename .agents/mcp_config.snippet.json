@@ -8,13 +8,11 @@
         "auto",
         "--role",
         "Antigravity (AGY) Lead Agent",
-        "--workspace",
-        "/Users/huizhao/Downloads/workspace/aegis-os",
         "--runtime-dir",
         "/tmp/aegis-os-runtime",
         "mcp-stdio"
       ],
-      "command": "/Users/huizhao/Downloads/workspace/aegis-os/target/release/aegis-os",
+      "command": "aegis-os",
       "eager": true
     }
   }

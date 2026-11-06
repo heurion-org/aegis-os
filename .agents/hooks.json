@@ -2,7 +2,7 @@
   "aegis-os-runtime-guard": {
     "PreInvocation": [
       {
-        "command": "\"/Users/huizhao/Downloads/workspace/aegis-os/target/release/aegis-os\" --org \"aegis-os\" --agent auto --role \"Antigravity (AGY) Lead Agent\" --workspace \"/Users/huizhao/Downloads/workspace/aegis-os\" --runtime-dir \"/tmp/aegis-os-runtime\" agy-hook --event PreInvocation --strict-cow",
+        "command": "\"aegis-os\" --org \"aegis-os\" --agent auto --role \"Antigravity (AGY) Lead Agent\" --workspace \"..\" --runtime-dir \"/tmp/aegis-os-runtime\" agy-hook --event PreInvocation --strict-cow",
         "type": "command"
       }
     ],
@@ -10,22 +10,22 @@
       {
         "hooks": [
           {
-            "command": "\"/Users/huizhao/Downloads/workspace/aegis-os/target/release/aegis-os\" --org \"aegis-os\" --agent auto --role \"Antigravity (AGY) Lead Agent\" --workspace \"/Users/huizhao/Downloads/workspace/aegis-os\" --runtime-dir \"/tmp/aegis-os-runtime\" agy-hook --event PreToolUse --strict-cow",
+            "command": "\"aegis-os\" --org \"aegis-os\" --agent auto --role \"Antigravity (AGY) Lead Agent\" --workspace \"..\" --runtime-dir \"/tmp/aegis-os-runtime\" agy-hook --event PreToolUse --strict-cow",
             "type": "command"
           }
         ],
-        "matcher": "call_mcp_tool|mcp_aegis-os_.*|write_file|edit_file|run_command"
+        "matcher": "call_mcp_tool|mcp_aegis-os_.*|mcp__aegis-os__.*|write_file|edit_file|read_file|view_file|run_command|Write|Edit|MultiEdit|Read|Bash"
       }
     ],
     "SessionStart": [
       {
-        "command": "\"/Users/huizhao/Downloads/workspace/aegis-os/target/release/aegis-os\" --org \"aegis-os\" --agent auto --role \"Antigravity (AGY) Lead Agent\" --workspace \"/Users/huizhao/Downloads/workspace/aegis-os\" --runtime-dir \"/tmp/aegis-os-runtime\" agy-hook --event SessionStart --strict-cow",
+        "command": "\"aegis-os\" --org \"aegis-os\" --agent auto --role \"Antigravity (AGY) Lead Agent\" --workspace \"..\" --runtime-dir \"/tmp/aegis-os-runtime\" agy-hook --event SessionStart --strict-cow",
         "type": "command"
       }
     ],
     "Stop": [
       {
-        "command": "\"/Users/huizhao/Downloads/workspace/aegis-os/target/release/aegis-os\" --org \"aegis-os\" --agent auto --role \"Antigravity (AGY) Lead Agent\" --workspace \"/Users/huizhao/Downloads/workspace/aegis-os\" --runtime-dir \"/tmp/aegis-os-runtime\" agy-hook --event Stop --strict-cow",
+        "command": "\"aegis-os\" --org \"aegis-os\" --agent auto --role \"Antigravity (AGY) Lead Agent\" --workspace \"..\" --runtime-dir \"/tmp/aegis-os-runtime\" agy-hook --event Stop --strict-cow",
         "type": "command"
       }
     ],

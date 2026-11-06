@@ -717,9 +717,6 @@ pub(crate) async fn setup_agy_workspace(
     let rules_dir = agents_dir.join("rules");
     tokio::fs::create_dir_all(&rules_dir).await?;
 
-    let bin_path = std::env::current_exe().unwrap_or_else(|_| PathBuf::from("aegis-os"));
-    let bin_str = bin_path.to_string_lossy();
-    let ws_str = workspace.to_string_lossy();
     let rt_str = runtime_dir.to_string_lossy();
     let strict_flag = if strict_cow { "--strict-cow" } else { "" };
 
@@ -730,7 +727,7 @@ pub(crate) async fn setup_agy_workspace(
                 {
                     "type": "command",
                     "command": format!(
-                        "\"{bin_str}\" --org \"{org}\" --agent auto --role \"{role}\" --workspace \"{ws_str}\" --runtime-dir \"{rt_str}\" agy-hook --event SessionStart {strict_flag}"
+                        "\"aegis-os\" --org \"{org}\" --agent auto --role \"{role}\" --workspace \"..\" --runtime-dir \"{rt_str}\" agy-hook --event SessionStart {strict_flag}"
                     )
                 }
             ],
@@ -738,7 +735,7 @@ pub(crate) async fn setup_agy_workspace(
                 {
                     "type": "command",
                     "command": format!(
-                        "\"{bin_str}\" --org \"{org}\" --agent auto --role \"{role}\" --workspace \"{ws_str}\" --runtime-dir \"{rt_str}\" agy-hook --event PreInvocation {strict_flag}"
+                        "\"aegis-os\" --org \"{org}\" --agent auto --role \"{role}\" --workspace \"..\" --runtime-dir \"{rt_str}\" agy-hook --event PreInvocation {strict_flag}"
                     )
                 }
             ],
@@ -749,7 +746,7 @@ pub(crate) async fn setup_agy_workspace(
                         {
                             "type": "command",
                             "command": format!(
-                                "\"{bin_str}\" --org \"{org}\" --agent auto --role \"{role}\" --workspace \"{ws_str}\" --runtime-dir \"{rt_str}\" agy-hook --event PreToolUse {strict_flag}"
+                                "\"aegis-os\" --org \"{org}\" --agent auto --role \"{role}\" --workspace \"..\" --runtime-dir \"{rt_str}\" agy-hook --event PreToolUse {strict_flag}"
                             )
                         }
                     ]
@@ -759,7 +756,7 @@ pub(crate) async fn setup_agy_workspace(
                 {
                     "type": "command",
                     "command": format!(
-                        "\"{bin_str}\" --org \"{org}\" --agent auto --role \"{role}\" --workspace \"{ws_str}\" --runtime-dir \"{rt_str}\" agy-hook --event Stop {strict_flag}"
+                        "\"aegis-os\" --org \"{org}\" --agent auto --role \"{role}\" --workspace \"..\" --runtime-dir \"{rt_str}\" agy-hook --event Stop {strict_flag}"
                     )
                 }
             ]
@@ -793,12 +790,11 @@ You are operating inside **Aegis OS Runtime** (`{role}`) within Organization **`
     let mcp_snippet = json!({
         "mcpServers": {
             "aegis-os": {
-                "command": bin_str,
+                "command": "aegis-os",
                 "args": [
                     "--org", org,
                     "--agent", "auto",
                     "--role", role,
-                    "--workspace", ws_str,
                     "--runtime-dir", rt_str,
                     "mcp-stdio"
                 ],
