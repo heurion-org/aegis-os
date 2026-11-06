@@ -506,6 +506,72 @@ pub(crate) async fn handle_agy_hook(
                 .cloned()
                 .unwrap_or_else(|| json!({}));
 
+            // In an `aos run` session the live broker is authoritative for allow/ask/deny on
+            // native tools. A broker `deny`/`ask` short-circuits; `allow` still falls through to
+            // the existing boundary-command routing below so `git push` etc. remain gated.
+            let broker_covers_tool = matches!(
+                tool_name.to_ascii_lowercase().as_str(),
+                "read"
+                    | "read_file"
+                    | "view_file"
+                    | "view"
+                    | "glob"
+                    | "grep"
+                    | "ls"
+                    | "list"
+                    | "write"
+                    | "write_file"
+                    | "edit"
+                    | "edit_file"
+                    | "multiedit"
+                    | "notebookedit"
+                    | "apply_patch"
+                    | "delete"
+                    | "bash"
+                    | "shell"
+                    | "run_command"
+                    | "webfetch"
+                    | "web_fetch"
+                    | "websearch"
+                    | "fetch"
+                    | "http"
+            );
+            if broker_covers_tool
+                && std::env::var("AOS_CONTROL_SOCKET").is_ok_and(|socket| !socket.trim().is_empty())
+            {
+                let adapter_payload = json!({"tool": tool_name, "input": tool_args.clone()});
+                if let Ok(decision) = crate::session_broker::control_request(
+                    "POST",
+                    "/v1/adapter/evaluate",
+                    Some(&adapter_payload),
+                )
+                .await
+                {
+                    let effect = decision
+                        .get("effect")
+                        .and_then(|v| v.as_str())
+                        .unwrap_or("allow");
+                    if effect == "deny" || effect == "ask" {
+                        let reason = decision
+                            .get("reason")
+                            .or_else(|| decision.get("suggested_lease_scope"))
+                            .and_then(|v| v.as_str())
+                            .unwrap_or("Aegis policy denied this tool call");
+                        println!(
+                            "{}",
+                            serde_json::to_string(&json!({
+                                "hookSpecificOutput": {
+                                    "hookEventName": "PreToolUse",
+                                    "permissionDecision": effect,
+                                    "permissionDecisionReason": reason
+                                }
+                            }))?
+                        );
+                        return Ok(());
+                    }
+                }
+            }
+
             if tool_name == "call_mcp_tool" {
                 let server = tool_args
                     .get("ServerName")

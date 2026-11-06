@@ -3,6 +3,8 @@
 use serde_json::{json, Value};
 use std::path::{Path, PathBuf};
 
+const OPENCODE_AEGIS_PLUGIN: &str = include_str!("../../../plugins/opencode-aegis.js");
+
 // One-Command Global Installer for AGY, Claude Code & Codex CLI (`aegis-os install`)
 // ============================================================================
 
@@ -489,6 +491,13 @@ startup_timeout_sec = 30
     let opencode_json = opencode_dir.join("opencode.json");
     let opencode_jsonc = opencode_dir.join("opencode.jsonc");
     let opencode_agents = opencode_dir.join("AGENTS.md");
+    let opencode_plugin = opencode_dir.join("plugins").join("aegis-os.js");
+    if dry_run {
+        println!("\n  - would install OpenCode plugin {}", opencode_plugin.display());
+    } else {
+        tokio::fs::create_dir_all(opencode_dir.join("plugins")).await?;
+        tokio::fs::write(&opencode_plugin, OPENCODE_AEGIS_PLUGIN).await?;
+    }
     if opencode_jsonc.exists() && !opencode_json.exists() {
         println!(
             "\n[4/4] OpenCode uses {}; Aegis left it untouched. Add the `aegis-os` MCP server \
@@ -552,11 +561,132 @@ startup_timeout_sec = 30
         println!("\n[4/4] OpenCode (`opencode`) configured:");
         println!("      - MCP Server:  {}", opencode_json.display());
         println!("      - Global Rule: {}", opencode_agents.display());
+        println!("      - Aegis Plugin: {}", opencode_plugin.display());
     }
 
     println!(
         "\nDone! You can now directly run `agy`, `claude`, `codex`, or `opencode` in any project directory."
     );
+    Ok(())
+}
+
+const PATH_BLOCK_START: &str = "# >>> aegis-os PATH >>>";
+const PATH_BLOCK_END: &str = "# <<< aegis-os PATH <<<";
+
+fn install_shell_path_block(
+    home_dir: &Path,
+    shim_dir: &Path,
+    dry_run: bool,
+) -> anyhow::Result<bool> {
+    use std::fmt::Write as _;
+
+    let mut candidates: Vec<(PathBuf, String)> = Vec::new();
+    for name in [".zshrc", ".bashrc", ".profile"] {
+        let path = home_dir.join(name);
+        if path.is_file() {
+            candidates.push((
+                path,
+                format!(
+                    "{PATH_BLOCK_START}\nexport PATH=\"{}:$PATH\"\n{PATH_BLOCK_END}\n",
+                    shim_dir.display()
+                ),
+            ));
+        }
+    }
+    let fish = home_dir.join(".config/fish/config.fish");
+    if fish.is_file() {
+        candidates.push((
+            fish,
+            format!(
+                "{PATH_BLOCK_START}\nset -gx PATH \"{}\" $PATH\n{PATH_BLOCK_END}\n",
+                shim_dir.display()
+            ),
+        ));
+    }
+    if candidates.is_empty() {
+        return Ok(false);
+    }
+
+    let mut updated_any = false;
+    for (path, block) in candidates {
+        let existing = std::fs::read_to_string(&path).unwrap_or_default();
+        if existing.contains(PATH_BLOCK_START) {
+            updated_any = true;
+            continue;
+        }
+        if dry_run {
+            println!("  - would append PATH block to {}", path.display());
+            updated_any = true;
+            continue;
+        }
+        let mut updated = existing;
+        if !updated.ends_with('\n') && !updated.is_empty() {
+            updated.push('\n');
+        }
+        let _ = writeln!(updated, "{block}");
+        std::fs::write(&path, updated)?;
+        println!("  - appended PATH block to {}", path.display());
+        updated_any = true;
+    }
+    Ok(updated_any)
+}
+
+fn remove_shell_path_block(home_dir: &Path) -> anyhow::Result<()> {
+    for name in [
+        ".zshrc",
+        ".bashrc",
+        ".profile",
+        ".config/fish/config.fish",
+    ] {
+        let path = home_dir.join(name);
+        let Ok(existing) = std::fs::read_to_string(&path) else {
+            continue;
+        };
+        let Some(start) = existing.find(PATH_BLOCK_START) else {
+            continue;
+        };
+        let Some(end_rel) = existing[start..].find(PATH_BLOCK_END) else {
+            continue;
+        };
+        let end = start + end_rel + PATH_BLOCK_END.len();
+        let mut updated = String::new();
+        updated.push_str(existing[..start].trim_end());
+        let tail = existing[end..].trim_start_matches('\n');
+        if !updated.is_empty() && !tail.is_empty() {
+            updated.push('\n');
+        }
+        updated.push_str(tail);
+        if !updated.ends_with('\n') && !updated.is_empty() {
+            updated.push('\n');
+        }
+        std::fs::write(&path, updated)?;
+    }
+    Ok(())
+}
+
+pub(crate) fn uninstall_shims(home_dir: &Path, shim_only: bool) -> anyhow::Result<()> {
+    let shim_dir = home_dir.join(".aegis").join("bin");
+    for agent in ["claude", "codex", "agy", "opencode", "hermes"] {
+        let path = shim_dir.join(agent);
+        if path.exists() {
+            std::fs::remove_file(&path)?;
+            println!("removed {}", path.display());
+        }
+    }
+    let _ = std::fs::remove_dir(&shim_dir);
+    remove_shell_path_block(home_dir)?;
+    println!("removed Aegis PATH shims and shell PATH block");
+    if !shim_only {
+        let plugin = home_dir
+            .join(".config/opencode/plugins/aegis-os.js");
+        if plugin.exists() {
+            std::fs::remove_file(&plugin)?;
+            println!("removed {}", plugin.display());
+        }
+        println!(
+            "client MCP/Hook configuration blocks were left untouched; remove them manually or re-run `aegis-os install` after upgrading"
+        );
+    }
     Ok(())
 }
 
@@ -582,7 +712,12 @@ pub(crate) fn install_enforced_shims(home_dir: &Path, dry_run: bool) -> anyhow::
             continue;
         };
         let script = format!(
-            "#!/bin/sh\nexec \"{}\" --workspace \"$PWD\" run -- \"{}\" \"$@\"\n",
+            "#!/bin/sh\n\
+             if [ \"${{AOS_ENFORCEMENT:-}}\" = \"advisory\" ]; then\n\
+               exec \"{}\" \"$@\"\n\
+             fi\n\
+             exec \"{}\" --workspace \"$PWD\" run -- \"{}\" \"$@\"\n",
+            real.display(),
             aegis.display(),
             real.display()
         );
@@ -607,12 +742,27 @@ pub(crate) fn install_enforced_shims(home_dir: &Path, dry_run: bool) -> anyhow::
         for agent in &agents {
             println!("  - {}", shim_dir.join(agent).display());
         }
-        println!(
-            "  Add this to your shell profile: export PATH=\"{}:$PATH\"",
-            shim_dir.display()
-        );
+        if install_shell_path_block(home_dir, &shim_dir, dry_run)? {
+            if !dry_run {
+                println!(
+                    "  PATH block present; new shells will prefer {}",
+                    shim_dir.display()
+                );
+            }
+        } else {
+            println!(
+                "  Add this to your shell profile: export PATH=\"{}:$PATH\"",
+                shim_dir.display()
+            );
+        }
     }
     Ok(())
+}
+
+fn file_mentions_aegis(path: &Path) -> bool {
+    std::fs::read_to_string(path)
+        .map(|text| text.contains("aegis-os") || text.contains("Aegis OS"))
+        .unwrap_or(false)
 }
 
 pub(crate) async fn run_doctor(home_dir: &Path) -> anyhow::Result<()> {
@@ -626,13 +776,53 @@ pub(crate) async fn run_doctor(home_dir: &Path) -> anyhow::Result<()> {
         ("Codex CLI Config", home_dir.join(".codex/config.toml")),
         ("OpenCode Config", home_dir.join(".config/opencode/opencode.json")),
         ("OpenCode Rules", home_dir.join(".config/opencode/AGENTS.md")),
+        (
+            "OpenCode Aegis Plugin",
+            home_dir.join(".config/opencode/plugins/aegis-os.js"),
+        ),
     ];
 
     println!("Aegis OS Integration Health Check (`aegis-os doctor`):");
     for (name, path) in checks {
-        let status = if path.exists() { "OK (Installed)" } else { "MISSING (Run `aegis-os install`)" };
+        let status = if !path.exists() {
+            "MISSING (Run `aegis-os install`)".to_string()
+        } else if file_mentions_aegis(&path) {
+            "OK (Aegis entry found)".to_string()
+        } else {
+            "PRESENT (no Aegis entry found)".to_string()
+        };
         println!("  - {:<26} [{}] -> {}", name, status, path.display());
     }
+
+    let shim_dir = home_dir.join(".aegis").join("bin");
+    let shims: Vec<String> = ["claude", "codex", "agy", "opencode", "hermes"]
+        .into_iter()
+        .filter(|agent| shim_dir.join(agent).is_file())
+        .map(str::to_string)
+        .collect();
+    let shim_first = std::env::var_os("PATH")
+        .map(|path| std::env::split_paths(&path).next() == Some(shim_dir.clone()))
+        .unwrap_or(false);
+    println!("\nEnforcement:");
+    if shims.is_empty() {
+        println!("  - mode: advisory (no PATH shims; run `aegis-os install --enforce`)");
+    } else if shim_first {
+        println!(
+            "  - mode: enforced available via PATH shim ({})",
+            shims.join(", ")
+        );
+    } else {
+        println!(
+            "  - mode: shims installed ({}) but {} is not first in PATH",
+            shims.join(", "),
+            shim_dir.display()
+        );
+    }
+    println!("  - broker: not started by `aos run` yet; filesystem + egress only");
+    println!(
+        "  - l7: base-url routes available for Anthropic / OpenAI / Gemini / DeepSeek / Mistral / Groq / xAI / OpenRouter"
+    );
+    println!("  - generic https: CONNECT-only domain allowlist (no L7 without opt-in MITM)");
 
     if let Ok(path_env) = std::env::var("PATH") {
         let mut seen = std::collections::BTreeSet::new();
@@ -815,7 +1005,32 @@ You are operating inside **Aegis OS Runtime** (`{role}`) within Organization **`
 
 #[cfg(test)]
 mod install_tests {
-    use super::replace_or_append_marked_block;
+    use super::{install_shell_path_block, replace_or_append_marked_block, PATH_BLOCK_START};
+
+    #[test]
+    fn shell_path_block_is_idempotent() {
+        let home = tempfile::tempdir().unwrap();
+        std::fs::write(home.path().join(".zshrc"), "export EDITOR=vim\n").unwrap();
+        let shim = home.path().join(".aegis/bin");
+        assert!(install_shell_path_block(home.path(), &shim, false).unwrap());
+        assert!(install_shell_path_block(home.path(), &shim, false).unwrap());
+        let text = std::fs::read_to_string(home.path().join(".zshrc")).unwrap();
+        assert_eq!(text.matches(PATH_BLOCK_START).count(), 1);
+        assert!(text.contains("export EDITOR=vim"));
+        assert!(text.contains(&shim.display().to_string()));
+    }
+
+    #[test]
+    fn shell_path_block_can_be_removed() {
+        let home = tempfile::tempdir().unwrap();
+        std::fs::write(home.path().join(".zshrc"), "export EDITOR=vim\n").unwrap();
+        let shim = home.path().join(".aegis/bin");
+        install_shell_path_block(home.path(), &shim, false).unwrap();
+        super::remove_shell_path_block(home.path()).unwrap();
+        let text = std::fs::read_to_string(home.path().join(".zshrc")).unwrap();
+        assert!(!text.contains(PATH_BLOCK_START));
+        assert!(text.contains("export EDITOR=vim"));
+    }
 
     #[test]
     fn install_replaces_existing_marked_block() {

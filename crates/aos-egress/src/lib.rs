@@ -4,6 +4,11 @@
 //! Instead, sandboxes use virtual placeholders (e.g. `$AOS_SECRET_GITHUB`), and
 //! the Egress Gateway validates the destination domain against the Organization's
 //! allowlist and binds the real secret only at the outbound network boundary.
+//!
+//! Three outbound modes are supported: opaque HTTPS `CONNECT` tunnels, forward-proxy HTTP
+//! requests, and a Base URL reverse proxy for model APIs (`/__aegis/base/...`). The reverse proxy
+//! sees method/path/body, applies DLP and boundary secret injection, then re-encrypts to the real
+//! provider over TLS while streaming the provider response back to the agent.
 
 use aos_core::AgentIdentity;
 use anyhow::bail;
@@ -12,9 +17,14 @@ use serde_json::json;
 use std::collections::{HashMap, HashSet};
 use std::net::SocketAddr;
 use std::sync::Arc;
-use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader};
-use tokio::net::TcpListener;
+use tokio::io::{
+    AsyncBufReadExt, AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt, BufReader,
+};
+use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::RwLock;
+use tokio_rustls::rustls::pki_types::ServerName;
+use tokio_rustls::rustls::{ClientConfig, RootCertStore};
+use tokio_rustls::TlsConnector;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SecretVaultEntry {
@@ -49,6 +59,14 @@ pub enum EgressVerdict {
     },
 }
 
+/// Upper bound for buffered request bodies. Model prompts can be much larger than a typical
+/// forward-proxy request; keep a bounded buffer for DLP and reject oversized requests instead of
+/// silently truncating them.
+const MAX_PROXY_BODY_BYTES: usize = 16 * 1024 * 1024;
+
+trait ProxyStream: AsyncRead + AsyncWrite + Unpin + Send {}
+impl<T: AsyncRead + AsyncWrite + Unpin + Send> ProxyStream for T {}
+
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct SecretScopeRule {
     pub allowed_methods: Vec<String>,
@@ -59,6 +77,7 @@ pub struct AegisEgressGateway {
     org_allowed_domains: Arc<RwLock<HashMap<String, HashSet<String>>>>,
     vault: Arc<RwLock<HashMap<String, SecretVaultEntry>>>,
     scopes: Arc<RwLock<HashMap<String, SecretScopeRule>>>,
+    tls_config: Arc<ClientConfig>,
 }
 
 impl Default for AegisEgressGateway {
@@ -69,10 +88,23 @@ impl Default for AegisEgressGateway {
 
 impl AegisEgressGateway {
     pub fn new() -> Self {
+        // rustls 0.23 requires a process-level CryptoProvider when `ClientConfig::builder()` is
+        // used without an explicit provider. Install the AWS-LC provider once; subsequent calls
+        // are harmless and other components may already have installed one.
+        let _ = tokio_rustls::rustls::crypto::aws_lc_rs::default_provider()
+            .install_default();
+        let mut roots = RootCertStore::empty();
+        roots.extend(webpki_roots::TLS_SERVER_ROOTS.iter().cloned());
+        let tls_config = Arc::new(
+            ClientConfig::builder()
+                .with_root_certificates(roots)
+                .with_no_client_auth(),
+        );
         Self {
             org_allowed_domains: Arc::new(RwLock::new(HashMap::new())),
             vault: Arc::new(RwLock::new(HashMap::new())),
             scopes: Arc::new(RwLock::new(HashMap::new())),
+            tls_config,
         }
     }
 
@@ -255,7 +287,7 @@ impl AegisEgressGateway {
         // 1. First inspect all headers for `$AOS_SECRET_*` placeholders and enforce per-secret domain + method/path bindings
         // Sort by descending placeholder length so `$AOS_SECRET_GH_SCOPED` is matched before `$AOS_SECRET_GH`.
         let mut entries: Vec<(&String, &SecretVaultEntry)> = vault.iter().collect();
-        entries.sort_by(|a, b| b.1.placeholder.len().cmp(&a.1.placeholder.len()));
+        entries.sort_by_key(|(_, entry)| std::cmp::Reverse(entry.placeholder.len()));
 
         // 1b. Outbound L7 DLP inspection on URL query string and HTTP request body (prevents exfiltrating
         // secrets or private keys inside the body/query of an allowlisted endpoint such as POST /repos/acme/app/issues).
@@ -275,7 +307,7 @@ impl AegisEgressGateway {
             }
         }
 
-        for (_header_name, header_val) in out_headers.iter_mut() {
+        for header_val in out_headers.values_mut() {
             for &(vault_key, secret_entry) in &entries {
                 if !vault_key.starts_with(&format!("{}::", identity.org_id)) {
                     continue;
@@ -417,6 +449,98 @@ impl AegisEgressGateway {
         }
     }
 
+    /// Base-URL reverse-proxy routes. The agent receives a loopback HTTP base URL; the egress
+    /// proxy terminates that plaintext hop, performs L7 DLP / allowlist / secret injection, then
+    /// opens a TLS connection to the real provider. `CONNECT` is still used for everything else.
+    fn base_url_route(raw_target: &str) -> Option<(&'static str, String)> {
+        let origin = Self::extract_origin_path_and_query(raw_target);
+        for (prefix, domain) in [
+            ("/__aegis/base/anthropic", "api.anthropic.com"),
+            ("/__aegis/base/openai", "api.openai.com"),
+            ("/__aegis/base/deepseek", "api.deepseek.com"),
+            ("/__aegis/base/mistral", "api.mistral.ai"),
+            ("/__aegis/base/groq", "api.groq.com"),
+            ("/__aegis/base/xai", "api.x.ai"),
+            ("/__aegis/base/openrouter", "openrouter.ai"),
+            ("/__aegis/base/gemini", "generativelanguage.googleapis.com"),
+        ] {
+            if origin == prefix || origin.starts_with(&format!("{prefix}/")) {
+                let rest = &origin[prefix.len()..];
+                let path = if rest.is_empty() {
+                    "/".to_string()
+                } else if rest.starts_with('/') {
+                    rest.to_string()
+                } else {
+                    format!("/{rest}")
+                };
+                return Some((domain, path));
+            }
+        }
+        None
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    async fn forward_reverse_proxy(
+        &self,
+        client: &mut TcpStream,
+        upstream_addr: &str,
+        use_tls: bool,
+        server_name: &str,
+        domain: &str,
+        method: &str,
+        path: &str,
+        headers: &HashMap<String, String>,
+        body: &str,
+    ) -> anyhow::Result<()> {
+        let tcp = TcpStream::connect(upstream_addr).await?;
+        let mut upstream: Box<dyn ProxyStream> = if use_tls {
+            let name = ServerName::try_from(server_name.to_string())
+                .map_err(|err| anyhow::anyhow!("invalid TLS server name '{server_name}': {err}"))?;
+            let connector = TlsConnector::from(self.tls_config.clone());
+            Box::new(connector.connect(name, tcp).await?)
+        } else {
+            Box::new(tcp)
+        };
+
+        let mut request = format!("{method} {path} HTTP/1.1\r\n");
+        for (key, value) in headers {
+            let lower = key.to_ascii_lowercase();
+            if lower == "host"
+                || lower == "connection"
+                || lower == "proxy-connection"
+                || lower == "content-length"
+                || lower == "transfer-encoding"
+                || lower.starts_with("x-aegis-")
+            {
+                continue;
+            }
+            request.push_str(&format!("{key}: {value}\r\n"));
+        }
+        request.push_str(&format!("Host: {domain}\r\n"));
+        if !body.is_empty() {
+            request.push_str(&format!("Content-Length: {}\r\n", body.len()));
+        } else if !matches!(method, "GET" | "HEAD") {
+            request.push_str("Content-Length: 0\r\n");
+        }
+        // Keep the response streaming; SSE providers never finish before the last token, and
+        // buffering the response would destroy first-token latency.
+        request.push_str("Connection: close\r\n\r\n");
+        if !body.is_empty() {
+            request.push_str(body);
+        }
+        upstream.write_all(request.as_bytes()).await?;
+
+        let mut buf = [0u8; 8192];
+        loop {
+            let n = upstream.read(&mut buf).await?;
+            if n == 0 {
+                break;
+            }
+            client.write_all(&buf[..n]).await?;
+        }
+        Ok(())
+    }
+
     /// Starts a lightweight local HTTP Egress Proxy listener (`127.0.0.1:port`) that inspects
     /// outbound requests from Agent sandboxes, enforces domain allowlists, and injects boundary secrets.
     pub async fn start_local_proxy(
@@ -461,6 +585,7 @@ impl AegisEgressGateway {
 
                     let mut headers = HashMap::new();
                     let mut content_length: usize = 0;
+                    let mut body_too_large = false;
                     loop {
                         let mut line = String::new();
                         let Ok(read_n) = reader.read_line(&mut line).await else {
@@ -473,14 +598,97 @@ impl AegisEgressGateway {
                             let key = k.trim().to_string();
                             let val = v.trim().to_string();
                             if key.eq_ignore_ascii_case("content-length") {
-                                content_length = val.parse::<usize>().unwrap_or(0).min(65536);
+                                let declared = val.parse::<usize>().unwrap_or(0);
+                                if declared > MAX_PROXY_BODY_BYTES {
+                                    body_too_large = true;
+                                } else {
+                                    content_length = declared;
+                                }
                             }
                             headers.insert(key, val);
                         }
                     }
 
+                    if body_too_large {
+                        let body = json!({
+                            "egress": "request_too_large",
+                            "limit_bytes": MAX_PROXY_BODY_BYTES
+                        })
+                        .to_string();
+                        let resp = format!(
+                            "HTTP/1.1 413 Payload Too Large\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                            body.len()
+                        );
+                        let _ = reader.get_mut().write_all(resp.as_bytes()).await;
+                        return;
+                    }
+
+                    let chunked = headers.iter().any(|(k, v)| {
+                        k.eq_ignore_ascii_case("transfer-encoding")
+                            && v.to_ascii_lowercase().contains("chunked")
+                    });
+                    if headers.iter().any(|(k, v)| {
+                        k.eq_ignore_ascii_case("expect")
+                            && v.to_ascii_lowercase().contains("100-continue")
+                    }) {
+                        let _ = reader
+                            .get_mut()
+                            .write_all(b"HTTP/1.1 100 Continue\r\n\r\n")
+                            .await;
+                    }
+
                     let mut req_body = String::new();
-                    if content_length > 0 {
+                    if chunked {
+                        let mut raw = Vec::new();
+                        loop {
+                            let mut size_line = String::new();
+                            if reader.read_line(&mut size_line).await.is_err() {
+                                break;
+                            }
+                            let size = usize::from_str_radix(
+                                size_line.trim().split(';').next().unwrap_or(""),
+                                16,
+                            )
+                            .unwrap_or(0);
+                            if size == 0 {
+                                // Consume optional trailers.
+                                loop {
+                                    let mut trailer = String::new();
+                                    if reader.read_line(&mut trailer).await.is_err()
+                                        || trailer.trim().is_empty()
+                                    {
+                                        break;
+                                    }
+                                }
+                                break;
+                            }
+                            if raw.len().saturating_add(size) > MAX_PROXY_BODY_BYTES {
+                                body_too_large = true;
+                                break;
+                            }
+                            let mut buf = vec![0u8; size];
+                            if reader.read_exact(&mut buf).await.is_err() {
+                                break;
+                            }
+                            raw.extend_from_slice(&buf);
+                            let mut crlf = [0u8; 2];
+                            let _ = reader.read_exact(&mut crlf).await;
+                        }
+                        if body_too_large {
+                            let body = json!({
+                                "egress": "request_too_large",
+                                "limit_bytes": MAX_PROXY_BODY_BYTES
+                            })
+                            .to_string();
+                            let resp = format!(
+                                "HTTP/1.1 413 Payload Too Large\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                                body.len()
+                            );
+                            let _ = reader.get_mut().write_all(resp.as_bytes()).await;
+                            return;
+                        }
+                        req_body = String::from_utf8_lossy(&raw).into_owned();
+                    } else if content_length > 0 {
                         let mut buf = vec![0u8; content_length];
                         if reader.read_exact(&mut buf).await.is_ok() {
                             req_body = String::from_utf8_lossy(&buf).into_owned();
@@ -502,6 +710,97 @@ impl AegisEgressGateway {
                             .unwrap_or_else(|| "sandbox-agent".to_string());
                         AgentIdentity::new(org_id, agent_id, "Sandboxed Process")
                     };
+
+                    // Base-URL reverse proxy: the client speaks plain HTTP to loopback, and the
+                    // gateway performs L7 allowlist/DLP/secret injection before opening TLS to the
+                    // real provider. This is the path that produces `net.request` semantics.
+                    if let Some((domain, upstream_path)) = Self::base_url_route(&raw_target) {
+                        let mut route_headers = headers.clone();
+                        route_headers.remove("Host");
+                        route_headers.remove("host");
+                        let spec = OutboundRequestSpec {
+                            target_domain: domain.to_string(),
+                            method: method.clone(),
+                            path: upstream_path.clone(),
+                            headers: route_headers,
+                        };
+                        match gw_conn
+                            .inspect_and_inject_with_body(&identity, &spec, Some(req_body.as_str()))
+                            .await
+                        {
+                            Ok(EgressVerdict::AllowedAndSanitized {
+                                injected_headers,
+                                ..
+                            }) => {
+                                if let Err(err) = gw_conn
+                                    .forward_reverse_proxy(
+                                        &mut stream,
+                                        &format!("{domain}:443"),
+                                        true,
+                                        domain,
+                                        domain,
+                                        &method,
+                                        &upstream_path,
+                                        &injected_headers,
+                                        &req_body,
+                                    )
+                                    .await
+                                {
+                                    let body = json!({
+                                        "egress": "upstream_io_error",
+                                        "target": domain,
+                                        "error": err.to_string()
+                                    })
+                                    .to_string();
+                                    let resp = format!(
+                                        "HTTP/1.1 502 Bad Gateway\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                                        body.len()
+                                    );
+                                    let _ = stream.write_all(resp.as_bytes()).await;
+                                }
+                            }
+                            Ok(EgressVerdict::RequiresEscalation { domain, reason }) => {
+                                let body = json!({
+                                    "egress": "escalation_required",
+                                    "domain": domain,
+                                    "reason": reason
+                                })
+                                .to_string();
+                                let resp = format!(
+                                    "HTTP/1.1 403 Forbidden\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                                    body.len()
+                                );
+                                // `stream` was moved only on the success path; this branch still
+                                // owns it in the enclosing future.
+                                let _ = stream.write_all(resp.as_bytes()).await;
+                            }
+                            Ok(EgressVerdict::BlockedSecretExfiltration {
+                                placeholder,
+                                unauthorized_domain,
+                            }) => {
+                                let body = json!({
+                                    "egress": "blocked_exfiltration",
+                                    "placeholder": placeholder,
+                                    "unauthorized_domain": unauthorized_domain
+                                })
+                                .to_string();
+                                let resp = format!(
+                                    "HTTP/1.1 403 Forbidden\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                                    body.len()
+                                );
+                                let _ = stream.write_all(resp.as_bytes()).await;
+                            }
+                            Err(err) => {
+                                let body = json!({ "error": err.to_string() }).to_string();
+                                let resp = format!(
+                                    "HTTP/1.1 400 Bad Request\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                                    body.len()
+                                );
+                                let _ = stream.write_all(resp.as_bytes()).await;
+                            }
+                        }
+                        return;
+                    }
 
                     // HTTPS CONNECT Tunneling support: validate target domain against org allowlist
                     // and establish a bidirectional TCP tunnel when allowed.
@@ -789,6 +1088,196 @@ mod tests {
         .await;
         let listed = gw.list_redacted_secrets("acme").await;
         assert_eq!(listed[0]["value_redacted"], "密码密码****");
+    }
+
+    #[test]
+    fn base_url_routes_map_to_provider_domains() {
+        let (domain, path) =
+            AegisEgressGateway::base_url_route("/__aegis/base/anthropic/v1/messages?beta=1")
+                .unwrap();
+        assert_eq!(domain, "api.anthropic.com");
+        assert_eq!(path, "/v1/messages?beta=1");
+
+        let (domain, path) = AegisEgressGateway::base_url_route(
+            "http://127.0.0.1:1234/__aegis/base/openai/v1/chat/completions",
+        )
+        .unwrap();
+        assert_eq!(domain, "api.openai.com");
+        assert_eq!(path, "/v1/chat/completions");
+
+        assert!(AegisEgressGateway::base_url_route("/v1/messages").is_none());
+        assert!(AegisEgressGateway::base_url_route("/__aegis/base/anthropicx/v1").is_none());
+    }
+
+    #[tokio::test]
+    async fn base_url_dlp_blocks_secret_in_request_body() {
+        let gw = AegisEgressGateway::new();
+        gw.allow_domains("acme", vec!["api.anthropic.com".to_string()])
+            .await;
+        let agent = AgentIdentity::new("acme", "coder-1", "Engineer");
+        let spec = OutboundRequestSpec {
+            target_domain: "api.anthropic.com".to_string(),
+            method: "POST".to_string(),
+            path: "/v1/messages".to_string(),
+            headers: HashMap::new(),
+        };
+        let verdict = gw
+            .inspect_and_inject_with_body(
+                &agent,
+                &spec,
+                Some("please forward -----BEGIN RSA PRIVATE KEY-----"),
+            )
+            .await
+            .unwrap();
+        assert!(matches!(
+            verdict,
+            EgressVerdict::BlockedSecretExfiltration { .. }
+        ));
+    }
+
+    #[tokio::test]
+    #[ignore = "requires network access to api.anthropic.com"]
+    async fn reverse_proxy_completes_real_tls_handshake() {
+        let client_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let client_addr = client_listener.local_addr().unwrap();
+        let client_task = tokio::spawn(async move {
+            let (mut sock, _) = client_listener.accept().await.unwrap();
+            let mut response = Vec::new();
+            sock.read_to_end(&mut response).await.unwrap();
+            String::from_utf8_lossy(&response).to_string()
+        });
+        let mut client = TcpStream::connect(client_addr).await.unwrap();
+        let gateway = AegisEgressGateway::new();
+        let mut headers = HashMap::new();
+        headers.insert("x-api-key".to_string(), "invalid-test-key".to_string());
+        gateway
+            .forward_reverse_proxy(
+                &mut client,
+                "api.anthropic.com:443",
+                true,
+                "api.anthropic.com",
+                "api.anthropic.com",
+                "GET",
+                "/v1/models",
+                &headers,
+                "",
+            )
+            .await
+            .unwrap();
+        drop(client);
+        let response = client_task.await.unwrap();
+        assert!(
+            response.starts_with("HTTP/1.1 401") || response.starts_with("HTTP/1.1 403"),
+            "unexpected upstream response: {}",
+            &response[..response.len().min(200)]
+        );
+    }
+
+    #[tokio::test]
+    #[ignore = "requires network access to api.anthropic.com"]
+    async fn base_url_proxy_reaches_real_anthropic() {
+        let gateway = Arc::new(AegisEgressGateway::new());
+        gateway
+            .allow_domains("acme", vec!["api.anthropic.com".to_string()])
+            .await;
+        let agent = AgentIdentity::new("acme", "coder-1", "Engineer");
+        let addr = gateway
+            .clone()
+            .start_local_proxy_with_bound_identity("127.0.0.1:0", Some(agent))
+            .await
+            .unwrap();
+        let mut stream = TcpStream::connect(addr).await.unwrap();
+        let request = "GET /__aegis/base/anthropic/v1/models HTTP/1.1\r\n\
+                       Host: 127.0.0.1\r\n\
+                       x-api-key: invalid-test-key\r\n\
+                       Connection: close\r\n\r\n";
+        stream.write_all(request.as_bytes()).await.unwrap();
+        let mut response = Vec::new();
+        stream.read_to_end(&mut response).await.unwrap();
+        let text = String::from_utf8_lossy(&response);
+        assert!(
+            text.starts_with("HTTP/1.1 401") || text.starts_with("HTTP/1.1 403"),
+            "unexpected upstream response: {}",
+            &text[..text.len().min(200)]
+        );
+    }
+
+    #[tokio::test]
+    async fn base_url_proxy_blocks_dlp_before_upstream_connect() {
+        let gateway = Arc::new(AegisEgressGateway::new());
+        gateway
+            .allow_domains("acme", vec!["api.anthropic.com".to_string()])
+            .await;
+        let agent = AgentIdentity::new("acme", "coder-1", "Engineer");
+        let addr = gateway
+            .clone()
+            .start_local_proxy_with_bound_identity("127.0.0.1:0", Some(agent))
+            .await
+            .unwrap();
+        let mut stream = TcpStream::connect(addr).await.unwrap();
+        let body = "leaked -----BEGIN RSA PRIVATE KEY-----";
+        let request = format!(
+            "POST /__aegis/base/anthropic/v1/messages HTTP/1.1\r\nHost: 127.0.0.1\r\nContent-Length: {}\r\n\r\n{}",
+            body.len(),
+            body
+        );
+        stream.write_all(request.as_bytes()).await.unwrap();
+        let mut response = Vec::new();
+        stream.read_to_end(&mut response).await.unwrap();
+        let text = String::from_utf8_lossy(&response);
+        assert!(text.contains("403 Forbidden"), "{text}");
+        assert!(text.contains("blocked_exfiltration"), "{text}");
+    }
+
+    #[tokio::test]
+    async fn reverse_proxy_streams_plain_http_upstream() {
+        let upstream = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let upstream_addr = upstream.local_addr().unwrap().to_string();
+        let upstream_task = tokio::spawn(async move {
+            let (mut sock, _) = upstream.accept().await.unwrap();
+            let mut buf = vec![0u8; 8192];
+            let n = sock.read(&mut buf).await.unwrap();
+            let req = String::from_utf8_lossy(&buf[..n]);
+            assert!(req.starts_with("POST /v1/messages HTTP/1.1"));
+            assert!(req.contains("Host: api.anthropic.com"));
+            sock.write_all(
+                b"HTTP/1.1 200 OK\r\nContent-Length: 5\r\nConnection: close\r\n\r\nhello",
+            )
+            .await
+            .unwrap();
+        });
+
+        let client_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let client_addr = client_listener.local_addr().unwrap();
+        let client_task = tokio::spawn(async move {
+            let (mut sock, _) = client_listener.accept().await.unwrap();
+            let mut response = Vec::new();
+            sock.read_to_end(&mut response).await.unwrap();
+            String::from_utf8_lossy(&response).to_string()
+        });
+
+        let mut client = TcpStream::connect(client_addr).await.unwrap();
+        let gateway = AegisEgressGateway::new();
+        gateway
+            .forward_reverse_proxy(
+                &mut client,
+                &upstream_addr,
+                false,
+                "api.anthropic.com",
+                "api.anthropic.com",
+                "POST",
+                "/v1/messages",
+                &HashMap::new(),
+                "{}",
+            )
+            .await
+            .unwrap();
+        drop(client);
+
+        upstream_task.await.unwrap();
+        let response = client_task.await.unwrap();
+        assert!(response.starts_with("HTTP/1.1 200 OK"));
+        assert!(response.ends_with("hello"));
     }
 
     #[tokio::test]

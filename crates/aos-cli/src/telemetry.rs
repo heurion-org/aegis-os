@@ -348,7 +348,7 @@ pub async fn render_growth_analytics(
             .iter()
             .map(|(k, v)| (k, v.as_u64().unwrap_or(0)))
             .collect();
-        pairs.sort_by(|a, b| b.1.cmp(&a.1));
+        pairs.sort_by_key(|pair| std::cmp::Reverse(pair.1));
         let summary = if pairs.is_empty() {
             "none yet".to_string()
         } else {

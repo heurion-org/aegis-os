@@ -11,6 +11,7 @@
 //! - Isolated Copy-on-Write Shadow Workspace per Agent
 //! - Cross-Agent IPC across `agy`, `claude`, and `codex` within the same project!
 
+mod adapter_manifest;
 mod bench;
 mod cloud;
 mod coord;
@@ -19,6 +20,7 @@ mod installer;
 mod launcher;
 mod memory_ui;
 mod routing;
+mod session_broker;
 mod telemetry;
 
 use aos_core::{A2ATaskState, AgentIdentity, IpcBus, IsolationTier};
@@ -35,6 +37,23 @@ use chrono::Utc;
 use clap::{Parser, Subcommand};
 use serde_json::{json, Value};
 use std::path::{Path, PathBuf};
+
+fn parse_adapter_input(input: Option<String>) -> anyhow::Result<Value> {
+    match input {
+        Some(raw) if !raw.trim().is_empty() => Ok(serde_json::from_str(&raw)?),
+        _ => Ok(json!({})),
+    }
+}
+
+fn default_runtime_dir() -> PathBuf {
+    if let Some(path) = std::env::var_os("AOS_RUNTIME_DIR") {
+        return PathBuf::from(path);
+    }
+    std::env::var_os("HOME")
+        .map(PathBuf::from)
+        .map(|home| home.join(".aegis"))
+        .unwrap_or_else(|| PathBuf::from("/tmp/aegis-os-runtime"))
+}
 
 #[derive(Parser)]
 #[command(
@@ -63,8 +82,8 @@ pub(crate) struct Cli {
     #[arg(long, global = true, default_value = ".")]
     workspace: PathBuf,
 
-    /// Shared Aegis OS runtime state directory.
-    #[arg(long, global = true, default_value = "/tmp/aegis-os-runtime")]
+    /// Shared Aegis OS runtime state directory (`AOS_RUNTIME_DIR`, then `~/.aegis`).
+    #[arg(long, global = true, default_value_os_t = default_runtime_dir())]
     runtime_dir: PathBuf,
 
     #[command(subcommand)]
@@ -75,8 +94,47 @@ pub(crate) struct Cli {
 enum AgentAction {
     /// List detected agents and Phase 1 enforcement availability
     List,
+    /// Register a declarative third-party adapter manifest
+    Add { manifest: PathBuf },
     /// Check one agent's binary, config and bubblewrap support
     Doctor { id: String },
+    /// Test binary/config, or live adapter hello/heartbeat/MCP inside `aos run`
+    Test { id: String },
+}
+
+#[derive(Subcommand)]
+enum AdapterAction {
+    /// Announce client/version/capabilities to the live session broker
+    Hello {
+        #[arg(long, default_value = "unknown")]
+        client: String,
+        #[arg(long, default_value = "unknown")]
+        version: String,
+        /// JSON object, e.g. '{"read_only":true,"binary_write":false}'
+        #[arg(long)]
+        capabilities: Option<String>,
+    },
+    /// Read the last hello/capability announcement
+    Capabilities,
+    /// Evaluate a native tool call against the live session broker
+    Evaluate {
+        tool: String,
+        /// JSON object with tool input (path, command, url, ...)
+        #[arg(long)]
+        input: Option<String>,
+    },
+    /// Record an effect after a tool call
+    Effect {
+        tool: String,
+        #[arg(long)]
+        effect: String,
+        #[arg(long)]
+        input: Option<String>,
+    },
+    /// Send a session heartbeat
+    Heartbeat,
+    /// Query session metadata through the control socket
+    Session,
 }
 
 #[derive(Subcommand)]
@@ -126,13 +184,22 @@ enum Commands {
         enforce: bool,
     },
 
+    /// Remove Aegis PATH shims and the shell PATH block (client MCP/Hook blocks stay)
+    Uninstall {
+        /// Only remove shims; keep client configuration blocks (currently both modes do)
+        #[arg(long, default_value_t = false)]
+        shim_only: bool,
+        #[arg(long)]
+        home_dir: Option<PathBuf>,
+    },
+
     /// Check installation health for AGY, Claude Code, and Codex CLI integrations
     Doctor {
         #[arg(long)]
         home_dir: Option<PathBuf>,
     },
 
-    /// Launch an agent process tree inside the enforced runtime (Phase 1: Linux bwrap)
+    /// Launch an agent process tree inside the enforced runtime (Linux bwrap / macOS Seatbelt)
     Run {
         /// Session mode (`implement` only in Phase 1)
         #[arg(long, default_value = "implement")]
@@ -140,9 +207,15 @@ enum Commands {
         /// Workspace domain profile (`auto`, `code`, `docs`, `data`, `binary`, `app_state`, `memory`, `mixed`)
         #[arg(long, default_value = "auto")]
         profile: String,
-        /// Enforcement level (`enforced` only in Phase 1)
+        /// Alias for `--mode observe`
+        #[arg(long, default_value_t = false)]
+        read_only: bool,
+        /// Enforcement level (`advisory` or `enforced`)
         #[arg(long, default_value = "enforced")]
         enforcement: String,
+        /// Explicitly downgrade to advisory mode (recorded in the session metadata)
+        #[arg(long, default_value_t = false)]
+        no_enforce: bool,
         /// Agent command and arguments, after `--`
         #[arg(trailing_var_arg = true, allow_hyphen_values = true, required = true)]
         cmd: Vec<String>,
@@ -161,6 +234,9 @@ enum Commands {
     Diff {
         #[arg(long)]
         session: Option<String>,
+        /// Print unified-diff previews instead of only the changed path list
+        #[arg(long, default_value_t = false)]
+        render: bool,
     },
 
     /// Run the domain verification gate for the latest (or named) session
@@ -212,6 +288,12 @@ enum Commands {
     Agent {
         #[command(subcommand)]
         action: AgentAction,
+    },
+
+    /// Agent Adapter Protocol client (talk to the per-session broker)
+    Adapter {
+        #[command(subcommand)]
+        action: AdapterAction,
     },
 
     /// Manage launcher commit approval tickets
@@ -276,6 +358,10 @@ enum Commands {
     /// Start Aegis OS as an MCP Server over Stdio (used automatically by `agy`, `claude`, and `codex`)
     #[command(hide = true)]
     McpStdio,
+
+    /// [Internal] In-sandbox MCP stdio → session broker bridge
+    #[command(hide = true)]
+    McpBridge,
 
     /// Native lifecycle hook handler for AGY & Claude Code (`SessionStart`, `PreToolUse`)
     #[command(hide = true)]
@@ -649,6 +735,11 @@ enum WorkspaceAction {
         #[arg(long)]
         snapshot_id: String,
     },
+    /// Show or set the workspace domain profile (`code`, `docs`, `data`, `binary`, `mixed`, ...)
+    Profile {
+        /// Omit to inspect the current profile
+        profile: Option<String>,
+    },
     Commit,
 }
 
@@ -678,6 +769,11 @@ enum PolicyAction {
         /// Optional A2A task id; binds the lease to that task
         #[arg(long)]
         task_id: Option<String>,
+    },
+    /// Watch for new pending boundary escalations (run in a side terminal)
+    Watch {
+        #[arg(long, default_value_t = 2)]
+        interval_secs: u64,
     },
 }
 
@@ -2169,6 +2265,16 @@ async fn main() -> anyhow::Result<()> {
         let code = aos_sandbox::bridge::run_shim(listen, unix, cmd).await?;
         std::process::exit(code);
     }
+    if let Commands::McpBridge = &cli.command {
+        session_broker::serve_mcp_stdio().await?;
+        std::process::exit(0);
+    }
+    if let Commands::McpStdio = &cli.command {
+        if std::env::var("AOS_CONTROL_SOCKET").is_ok_and(|s| !s.trim().is_empty()) {
+            session_broker::serve_mcp_stdio().await?;
+            std::process::exit(0);
+        }
+    }
     if cli.workspace == Path::new(".") {
         if let Ok(env_ws) = std::env::var("AOS_WORKSPACE") {
             if !env_ws.trim().is_empty() {
@@ -2196,8 +2302,8 @@ async fn main() -> anyhow::Result<()> {
             launcher::last(&runtime_dir)?;
         }
 
-        Commands::Diff { session } => {
-            launcher::diff(&runtime_dir, session.as_deref()).await?;
+        Commands::Diff { session, render } => {
+            launcher::diff(&runtime_dir, session.as_deref(), render).await?;
         }
 
         Commands::Verify { session, cmd } => {
@@ -2233,9 +2339,96 @@ async fn main() -> anyhow::Result<()> {
                 .map(PathBuf::from)
                 .unwrap_or_else(|| PathBuf::from("."));
             match action {
-                AgentAction::List => launcher::agent_list(&home)?,
+                AgentAction::List => launcher::agent_list(&home, &runtime_dir)?,
+                AgentAction::Add { manifest } => {
+                    adapter_manifest::add_manifest(&runtime_dir, &manifest)?;
+                }
                 AgentAction::Doctor { id } => {
                     launcher::agent_doctor(&home, &id, &runtime_dir)?;
+                }
+                AgentAction::Test { id } => {
+                    adapter_manifest::test_agent(&runtime_dir, &home, &id).await?;
+                }
+            }
+        }
+
+        Commands::Adapter { action } => {
+            let print = |value: Value| -> anyhow::Result<()> {
+                println!("{}", serde_json::to_string_pretty(&value)?);
+                Ok(())
+            };
+            match action {
+                AdapterAction::Hello {
+                    client,
+                    version,
+                    capabilities,
+                } => {
+                    let capabilities = parse_adapter_input(capabilities)?;
+                    let payload = json!({
+                        "client": client,
+                        "version": version,
+                        "capabilities": capabilities,
+                    });
+                    print(
+                        session_broker::control_request(
+                            "POST",
+                            "/v1/adapter/hello",
+                            Some(&payload),
+                        )
+                        .await?,
+                    )?;
+                }
+                AdapterAction::Capabilities => {
+                    print(
+                        session_broker::control_request(
+                            "GET",
+                            "/v1/adapter/capabilities",
+                            None,
+                        )
+                        .await?,
+                    )?;
+                }
+                AdapterAction::Evaluate { tool, input } => {
+                    let payload = json!({
+                        "tool": tool,
+                        "input": parse_adapter_input(input)?,
+                    });
+                    print(
+                        session_broker::control_request(
+                            "POST",
+                            "/v1/adapter/evaluate",
+                            Some(&payload),
+                        )
+                        .await?,
+                    )?;
+                }
+                AdapterAction::Effect { tool, effect, input } => {
+                    let payload = json!({
+                        "tool": tool,
+                        "effect": effect,
+                        "input": parse_adapter_input(input)?,
+                    });
+                    print(
+                        session_broker::control_request(
+                            "POST",
+                            "/v1/adapter/effect",
+                            Some(&payload),
+                        )
+                        .await?,
+                    )?;
+                }
+                AdapterAction::Heartbeat => {
+                    print(
+                        session_broker::control_request(
+                            "POST",
+                            "/v1/adapter/heartbeat",
+                            Some(&json!({})),
+                        )
+                        .await?,
+                    )?;
+                }
+                AdapterAction::Session => {
+                    print(session_broker::control_request("GET", "/v1/session", None).await?)?;
                 }
             }
         }
@@ -2250,7 +2443,24 @@ async fn main() -> anyhow::Result<()> {
             }
         },
 
-        Commands::Run { mode, profile, enforcement, cmd } => {
+        Commands::Run {
+            mode,
+            profile,
+            read_only,
+            enforcement,
+            no_enforce,
+            cmd,
+        } => {
+            let mode = if read_only {
+                "observe".to_string()
+            } else {
+                mode
+            };
+            let enforcement = if no_enforce {
+                "advisory".to_string()
+            } else {
+                enforcement
+            };
             let code = launcher::run(
                 &workspace,
                 &identity,
@@ -2278,6 +2488,15 @@ async fn main() -> anyhow::Result<()> {
                 telemetry::emit_telemetry_ping(&cli.runtime_dir, "install", "installer", "local_cow")
                     .await;
             }
+        }
+
+        Commands::Uninstall { shim_only, home_dir } => {
+            let target_home = home_dir.unwrap_or_else(|| {
+                std::env::var("HOME")
+                    .map(PathBuf::from)
+                    .unwrap_or_else(|_| PathBuf::from("."))
+            });
+            installer::uninstall_shims(&target_home, shim_only)?;
         }
 
         Commands::Doctor { home_dir } => {
@@ -2553,6 +2772,33 @@ async fn main() -> anyhow::Result<()> {
                         .await?;
                     println!("{}", serde_json::to_string_pretty(&res)?);
                 }
+                WorkspaceAction::Profile { profile } => {
+                    let cfg = workspace.join(".aegis/workspace.json");
+                    if let Some(name) = profile {
+                        let parsed = aos_core::DomainProfile::for_name(&name)
+                            .ok_or_else(|| anyhow::anyhow!("unknown profile '{name}'"))?;
+                        let mut value: Value = std::fs::read_to_string(&cfg)
+                            .ok()
+                            .and_then(|raw| serde_json::from_str(&raw).ok())
+                            .unwrap_or_else(|| json!({}));
+                        if !value.is_object() {
+                            value = json!({});
+                        }
+                        value["profile"] = json!(parsed.domain.as_str());
+                        if let Some(parent) = cfg.parent() {
+                            std::fs::create_dir_all(parent)?;
+                        }
+                        std::fs::write(&cfg, serde_json::to_vec_pretty(&value)?)?;
+                        println!("workspace profile: {} ({})", parsed.domain.as_str(), cfg.display());
+                    } else {
+                        let current = std::fs::read_to_string(&cfg)
+                            .ok()
+                            .and_then(|raw| serde_json::from_str::<Value>(&raw).ok())
+                            .and_then(|value| value.get("profile").and_then(|v| v.as_str()).map(str::to_string))
+                            .unwrap_or_else(|| "auto".to_string());
+                        println!("workspace profile: {current}");
+                    }
+                }
                 WorkspaceAction::Commit => {
                     let res = kernel.call_tool(&identity, "workspace_commit", json!({})).await?;
                     println!("{}", serde_json::to_string_pretty(&res)?);
@@ -2764,6 +3010,41 @@ async fn main() -> anyhow::Result<()> {
                             "lease": lease
                         }))?
                     );
+                }
+                PolicyAction::Watch { interval_secs } => {
+                    let mut seen = std::collections::BTreeSet::new();
+                    eprintln!(
+                        "Watching for Aegis escalations in org '{}' (Ctrl-C to stop)...",
+                        identity.org_id
+                    );
+                    loop {
+                        let escalations = kernel
+                            .policy
+                            .list_escalations(&identity.org_id)
+                            .await?;
+                        for escalation in escalations {
+                            if escalation.status != aos_core::EscalationStatus::Pending
+                                || !seen.insert(escalation.escalation_id.clone())
+                            {
+                                continue;
+                            }
+                            println!(
+                                "{}",
+                                serde_json::to_string_pretty(&json!({
+                                    "escalation_id": escalation.escalation_id,
+                                    "agent_id": escalation.agent_id,
+                                    "action": escalation.action,
+                                    "resource": escalation.target_resource,
+                                    "reason": escalation.reason,
+                                    "approve": format!("aos policy approve {}", escalation.escalation_id),
+                                }))?
+                            );
+                        }
+                        tokio::select! {
+                            _ = tokio::time::sleep(std::time::Duration::from_secs(interval_secs.max(1))) => {}
+                            _ = tokio::signal::ctrl_c() => break,
+                        }
+                    }
                 }
                 PolicyAction::Lease {
                     action_pattern,
@@ -3041,7 +3322,7 @@ async fn main() -> anyhow::Result<()> {
 
         Commands::Top => {
             let kernel = AegisRuntimeKernel::new(&cli.runtime_dir).await?;
-            render_mission_control_top(&kernel, &identity.org_id, &workspace).await?;
+            render_mission_control_top(&kernel, &identity.org_id, &workspace, &cli.runtime_dir).await?;
         }
 
         Commands::Bench { report_out } => {
@@ -3053,16 +3334,44 @@ async fn main() -> anyhow::Result<()> {
         }
 
         Commands::EgressShim { .. } => unreachable!("handled before identity resolution"),
+        Commands::McpBridge => unreachable!("handled before identity resolution"),
     }
 
     Ok(())
 }
 
 // ============================================================================
+fn launcher_sessions(runtime_dir: &Path, org_id: &str) -> Vec<Value> {
+    let sessions = runtime_dir.join("sessions");
+    let Ok(entries) = std::fs::read_dir(sessions) else {
+        return Vec::new();
+    };
+    let mut out: Vec<Value> = entries
+        .flatten()
+        .filter_map(|entry| {
+            std::fs::read_to_string(entry.path().join("session.json"))
+                .ok()
+                .and_then(|raw| serde_json::from_str::<Value>(&raw).ok())
+        })
+        .filter(|value| value.get("org_id").and_then(|v| v.as_str()) == Some(org_id))
+        .collect();
+    out.sort_by_key(|value| {
+        std::cmp::Reverse(
+            value
+                .get("created_at_ms")
+                .and_then(|v| v.as_i64())
+                .unwrap_or(0),
+        )
+    });
+    out.truncate(10);
+    out
+}
+
 async fn render_mission_control_top(
     kernel: &AegisRuntimeKernel,
     org_id: &str,
     workspace: &Path,
+    runtime_dir: &Path,
 ) -> anyhow::Result<()> {
     let global_peers: Vec<_> = kernel
         .ipc
@@ -3088,6 +3397,45 @@ async fn render_mission_control_top(
         workspace.display().to_string()
     );
     println!("└──────────────────────────────────────────────────────────────────────────────────┘");
+
+    let sessions = launcher_sessions(runtime_dir, org_id);
+    println!("\n[Launcher Sessions] ({}):", sessions.len());
+    if sessions.is_empty() {
+        println!("  (none; run `aos run -- claude` to create one)");
+    }
+    for session in &sessions {
+        println!(
+            "  • {:<16} {:<10} {:<8} mode={:<9} profile={:<9} shadow={}",
+            session
+                .get("session_id")
+                .and_then(|v| v.as_str())
+                .unwrap_or("-"),
+            session.get("enforcement").and_then(|v| v.as_str()).unwrap_or("-"),
+            session.get("status").and_then(|v| v.as_str()).unwrap_or("-"),
+            session.get("mode").and_then(|v| v.as_str()).unwrap_or("-"),
+            session.get("profile").and_then(|v| v.as_str()).unwrap_or("-"),
+            session.get("shadow").and_then(|v| v.as_str()).unwrap_or("-"),
+        );
+    }
+
+    let claims = kernel.load_claims(org_id).await.map(|(table, _)| table).unwrap_or_default();
+    println!("\n[Coordination Claims] ({}):", claims.len());
+    if claims.is_empty() {
+        println!("  (none)");
+    }
+    for (key, claim) in &claims {
+        println!(
+            "  • {:<40} owner={:<20} mode={:<5} expires_in={}m task={}",
+            aos_core::claims::claim_glob(key),
+            claim.owner,
+            match claim.mode {
+                aos_core::claims::ClaimMode::Read => "read",
+                aos_core::claims::ClaimMode::Write => "write",
+            },
+            ((claim.expires_at_ms - chrono::Utc::now().timestamp_millis()) / 60_000).max(0),
+            claim.task_id.as_deref().unwrap_or("-")
+        );
+    }
 
     println!(
         "\n[0] Global Workstation Peers Across All Repositories ({}):",
@@ -3378,7 +3726,7 @@ async fn run_end_to_end_multi_client_demo() -> anyhow::Result<()> {
         .await?;
 
     println!();
-    render_mission_control_top(&kernel, "payment-gateway", &project_repo).await?;
+    render_mission_control_top(&kernel, "payment-gateway", &project_repo, &runtime_dir).await?;
     println!("==================================================================================");
     Ok(())
 }
@@ -3588,6 +3936,8 @@ async fn inspect_policy_escalation(
                                 old_size: None,
                                 new_size: None,
                                 preview_diff: Some(cleaned),
+                                old_sha256: None,
+                                new_sha256: None,
                             });
                         }
                     }

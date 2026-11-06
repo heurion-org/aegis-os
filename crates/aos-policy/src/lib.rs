@@ -388,6 +388,12 @@ impl AegisPolicyKernel {
             || norm.contains("/.gemini/")
             || norm.starts_with(".codex/")
             || norm.contains("/.codex/")
+            || norm == "opencode.json"
+            || norm == "opencode.jsonc"
+            || norm.ends_with("/opencode.json")
+            || norm.ends_with("/opencode.jsonc")
+            || norm.starts_with(".opencode/")
+            || norm.contains("/.opencode/")
             || file_name == "build.rs"
             || file_name == "Makefile"
             || file_name == "GNUmakefile"
@@ -413,6 +419,16 @@ impl AegisPolicyKernel {
             || file_name.eq_ignore_ascii_case("justfile")
             || file_name == "Rakefile"
             || file_name == ".npmrc"
+    }
+
+    /// Matches an already-built policy context against active leases using the same semantics as
+    /// `evaluate` (org/agent/action/resource/task/evidence pin). A matching OneShot lease is
+    /// consumed, which is the desired fail-closed behaviour for a one-shot approval.
+    ///
+    /// Callers that need the full policy decision (Cedar forbid, commit guard, cross-tenant gate)
+    /// must use `evaluate`; this helper only answers "is there an active lease for this effect?".
+    pub async fn match_active_lease(&self, ctx: &PolicyContext) -> Option<LeaseGrant> {
+        self.check_active_lease(ctx).await
     }
 
     async fn check_active_lease(&self, ctx: &PolicyContext) -> Option<LeaseGrant> {

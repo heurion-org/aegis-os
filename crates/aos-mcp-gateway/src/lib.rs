@@ -331,6 +331,14 @@ impl AegisRuntimeKernel {
         })
     }
 
+    /// Attach an already-created workspace/sandbox environment to this kernel. The launcher uses
+    /// this so MCP tools operate on the same CoW shadow as the agent's native tools instead of
+    /// creating a second shadow under `runtime/orgs/...`.
+    pub async fn attach_agent_environment(&self, identity: &AgentIdentity, env: AgentEnvironment) {
+        let key = Self::agent_key(&identity.org_id, &identity.agent_id);
+        self.agents.write().await.insert(key, Arc::new(env));
+    }
+
     pub async fn get_agent_environment(
         &self,
         identity: &AgentIdentity,
@@ -642,6 +650,15 @@ impl AegisRuntimeKernel {
             .unwrap_or(claims::DEFAULT_CLAIM_TTL_SECS)
             .min(24 * 3600);
         let note = args.get("note").and_then(|v| v.as_str()).unwrap_or("").to_string();
+        let claim_mode = args
+            .get("mode")
+            .and_then(|v| v.as_str())
+            .map(|mode| {
+                claims::ClaimMode::from_name(mode)
+                    .ok_or_else(|| anyhow::anyhow!("coord_claim mode must be 'read' or 'write'"))
+            })
+            .transpose()?
+            .unwrap_or(claims::ClaimMode::Write);
         if tool_name == "coord_claim" && paths.is_empty() {
             bail!("coord_claim requires a non-empty 'paths' array (globs relative to the repo root)");
         }
@@ -680,18 +697,28 @@ impl AegisRuntimeKernel {
                     let clash = table.iter().find(|(g, c)| {
                         c.owner != identity.agent_id
                             && live.contains(&c.owner)
+                            && (claim_mode == claims::ClaimMode::Write
+                                || c.mode == claims::ClaimMode::Write)
                             && claims::globs_may_overlap(g, glob, &workspace_files)
                     });
                     match clash {
-                        Some((g, c)) => rejected.push(json!({"path": glob, "held_by": c.owner, "pattern": g, "expires_at_ms": c.expires_at_ms})),
+                        Some((g, c)) => rejected.push(json!({
+                            "path": glob,
+                            "held_by": c.owner,
+                            "pattern": claims::claim_glob(g),
+                            "mode": c.mode,
+                            "expires_at_ms": c.expires_at_ms
+                        })),
                         None => {
+                            let key = claims::claim_key(glob, &identity.agent_id, claim_mode);
                             table.insert(
-                                glob.clone(),
+                                key,
                                 claims::Claim {
                                     owner: identity.agent_id.clone(),
                                     expires_at_ms,
                                     note: note.clone(),
                                     task_id: bound_task_id.clone(),
+                                    mode: claim_mode,
                                 },
                             );
                             changed.push(glob.clone());
@@ -701,7 +728,12 @@ impl AegisRuntimeKernel {
             } else {
                 let mine: Vec<String> = table
                     .iter()
-                    .filter(|(g, c)| c.owner == identity.agent_id && (paths.is_empty() || paths.contains(g)))
+                    .filter(|(g, c)| {
+                        c.owner == identity.agent_id
+                            && (paths.is_empty()
+                                || paths.contains(g)
+                                || paths.iter().any(|p| p == claims::claim_glob(g)))
+                    })
                     .map(|(g, _)| g.clone())
                     .collect();
                 for g in mine {
@@ -3147,13 +3179,18 @@ impl AegisRuntimeKernel {
                 },
                 {
                     "name": "coord_claim",
-                    "description": "[Zero-Prompt Intra-Org] Claim exclusive write ownership of repo paths/globs (e.g. `crates/aos-vfs/**`) for a TTL. Peers are notified automatically; their writes to claimed paths are blocked until you release or the claim expires.",
+                    "description": "[Zero-Prompt Intra-Org] Claim repo paths/globs (e.g. `crates/aos-vfs/**`) for a TTL. `mode: \"write\"` (default) is exclusive; `mode: \"read\"` may coexist with other read claims but conflicts with writes. Peers are notified automatically; writes to write-claimed paths are blocked until release or expiry.",
                     "inputSchema": {
                         "type": "object",
                         "properties": {
                             "paths": { "type": "array", "items": { "type": "string" } },
                             "ttl_secs": { "type": "integer" },
-                            "note": { "type": "string" }
+                            "note": { "type": "string" },
+                            "mode": {
+                                "type": "string",
+                                "enum": ["read", "write"],
+                                "description": "Claim mode; defaults to write."
+                            }
                         },
                         "required": ["paths"]
                     }

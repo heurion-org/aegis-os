@@ -1659,6 +1659,7 @@ pub async fn handle_cloud_command(
 /// - If `escalation_id` is omitted, automatically selects the latest pending escalation (checking the current
 ///   org first, and falling back to any pending local escalation across all orgs in Local Mode).
 /// - If `--web` is passed, opens the interactive Web Approval Console (`/approve`) in the browser.
+#[allow(clippy::too_many_arguments)]
 pub async fn handle_unified_approve(
     escalation_id: Option<String>,
     grant_lease: bool,

@@ -1624,11 +1624,18 @@ impl CoWWorkspace {
                         old_size: None,
                         new_size: Some(cur_bytes.len() as u64),
                         preview_diff: preview,
+                        old_sha256: None,
+                        new_sha256: Some(format!(
+                            "sha256:{}",
+                            Self::sha256_bytes(&cur_bytes)
+                        )),
                     });
                 }
                 Some(base_path) => {
                     let base_bytes = tokio::fs::read(base_path).await?;
-                    if Self::sha256_bytes(&base_bytes) != Self::sha256_bytes(&cur_bytes) {
+                    let base_hash = Self::sha256_bytes(&base_bytes);
+                    let cur_hash = Self::sha256_bytes(&cur_bytes);
+                    if base_hash != cur_hash {
                         let preview = match (
                             String::from_utf8(base_bytes.clone()),
                             String::from_utf8(cur_bytes.clone()),
@@ -1648,6 +1655,8 @@ impl CoWWorkspace {
                             old_size: Some(base_bytes.len() as u64),
                             new_size: Some(cur_bytes.len() as u64),
                             preview_diff: preview,
+                            old_sha256: Some(format!("sha256:{base_hash}")),
+                            new_sha256: Some(format!("sha256:{cur_hash}")),
                         });
                     }
                 }
@@ -1672,6 +1681,11 @@ impl CoWWorkspace {
                     old_size: Some(base_bytes.len() as u64),
                     new_size: None,
                     preview_diff: preview,
+                    old_sha256: Some(format!(
+                        "sha256:{}",
+                        Self::sha256_bytes(&base_bytes)
+                    )),
+                    new_sha256: None,
                 });
             }
         }

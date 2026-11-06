@@ -15,10 +15,15 @@ use std::path::{Path, PathBuf};
 
 pub mod claims;
 pub mod effect;
+pub mod profile;
 pub mod session;
 
 pub use effect::{
     ArtifactKind, Effect, EffectKind, EffectSource, Reversibility, ResourceScope, WorkspaceDomain,
+};
+pub use profile::{
+    CasPolicy, ClaimGranularity, DomainProfile, EvidenceFormat, MergeStrategy, OverwritePolicy,
+    VerifyGate,
 };
 
 // ============================================================================
@@ -172,6 +177,13 @@ pub struct FileDiffEntry {
     pub old_size: Option<u64>,
     pub new_size: Option<u64>,
     pub preview_diff: Option<String>,
+    /// SHA-256 of the full base content. `preview_diff` is intentionally truncated for display,
+    /// so approval/TOCTOU checks must anchor the complete bytes through these digests.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub old_sha256: Option<String>,
+    /// SHA-256 of the full shadow content.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub new_sha256: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -1084,6 +1096,7 @@ impl AuditEvent {
 }
 
 /// Pure-Rust FIPS 180-4 SHA-256 hex digest helper so `aos-core` needs no extra crate dependencies.
+#[allow(clippy::chunks_exact_to_as_chunks)]
 pub fn sha256_hex(data: &[u8]) -> String {
     const K: [u32; 64] = [
         0x428a2f98, 0x71374491, 0xb5c0fbcf, 0xe9b5dba5, 0x3956c25b, 0x59f111f1, 0x923f82a4,

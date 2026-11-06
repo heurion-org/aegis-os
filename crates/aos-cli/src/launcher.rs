@@ -15,10 +15,10 @@
 //! or `/tmp` is replaced by tmpfs, a path source under those trees is no longer resolvable.
 
 use aos_core::{
-    AgentIdentity, ExecSpec, IsolationTier, PolicyEngine, ResourceLimits, SandboxConfig,
-    SandboxDriver, TransactionalWorkspace,
+    AgentIdentity, ExecSpec, IsolationTier, ResourceLimits, SandboxConfig, SandboxDriver,
+    TransactionalWorkspace,
 };
-use aos_egress::AegisEgressGateway;
+use aos_egress::{AegisEgressGateway, SecretVaultEntry};
 use aos_mcp_gateway::AegisRuntimeKernel;
 use aos_sandbox::NativeOsSandboxDriver;
 use axum::{
@@ -34,9 +34,10 @@ use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
 use std::fs::File;
 use std::io::{self, IsTerminal, Write};
-use std::os::fd::AsRawFd;
+use std::os::fd::{AsRawFd, FromRawFd};
+use std::os::unix::process::CommandExt;
 use std::path::{Path, PathBuf};
-use std::process::ExitStatus;
+use std::process::{ExitStatus, Stdio};
 use std::sync::Arc;
 use tokio::process::Command;
 
@@ -70,6 +71,18 @@ const SEEDED_AGENT_FILES: &[&str] = &[
     ".claude.json",
     ".rustup/settings.toml",
     ".local/share/opencode/auth.json",
+];
+
+/// Runtime state that must survive across sessions (conversation history, todos, SQLite DBs).
+/// These are bind-mounted read-write from the host after the session home is assembled. Sensitive
+/// configuration files are still over-mounted read-only afterwards.
+const PERSISTED_AGENT_STATE_DIRS: &[&str] = &[
+    ".claude/projects",
+    ".claude/todos",
+    ".claude/shell-snapshots",
+    ".codex/sessions",
+    ".codex/log",
+    ".local/share/opencode",
 ];
 
 /// Session databases / logs can be multi-GB; do not copy them into every session.
@@ -280,7 +293,10 @@ impl LauncherPlan {
     }
 
     fn envs(&self) -> Vec<(String, String)> {
-        let mut path = vec![format!("{AGENT_STAGE}/.aegis-bin")];
+        let mut path = vec![
+            format!("{AGENT_STAGE}/.aegis-bin"),
+            format!("{STAGE_ROOT}/bin"),
+        ];
         if let Some(extra) = &self.extra_path {
             path.push(extra.clone());
         }
@@ -438,6 +454,20 @@ fn collect_configs(host_home: &Path, agent_home: &Path) -> anyhow::Result<Vec<Fd
                 true,
             )?);
         }
+    }
+    Ok(mounts)
+}
+
+fn collect_state_dirs(host_home: &Path) -> anyhow::Result<Vec<FdMount>> {
+    let mut mounts = Vec::new();
+    for rel in PERSISTED_AGENT_STATE_DIRS {
+        let host = host_home.join(rel);
+        if !host.is_dir() {
+            // Only persist directories the client already created; do not manufacture state for
+            // agents that are not used on this host.
+            continue;
+        }
+        mounts.push(fd_mount(&host, format!("{AGENT_STAGE}/{rel}"), false)?);
     }
     Ok(mounts)
 }
@@ -782,6 +812,15 @@ pub(crate) fn status(runtime_dir: &Path, as_json: bool) -> anyhow::Result<()> {
     }
     println!("Session:   {}", value.get("session_id").and_then(|v| v.as_str()).unwrap_or("-"));
     println!("Status:    {}", value.get("status").and_then(|v| v.as_str()).unwrap_or("unknown"));
+    println!(
+        "Enforce:   {}{}",
+        value.get("enforcement").and_then(|v| v.as_str()).unwrap_or("-"),
+        value
+            .get("enforcement_scope")
+            .and_then(|v| v.as_str())
+            .map(|scope| format!(" ({scope})"))
+            .unwrap_or_default()
+    );
     println!("Mode:      {}", value.get("mode").and_then(|v| v.as_str()).unwrap_or("-"));
     println!("Profile:   {}", value.get("profile").and_then(|v| v.as_str()).unwrap_or("-"));
     println!(
@@ -791,8 +830,40 @@ pub(crate) fn status(runtime_dir: &Path, as_json: bool) -> anyhow::Result<()> {
     );
     println!("Workspace: {}", value.get("workspace").and_then(|v| v.as_str()).unwrap_or("-"));
     println!("Shadow:    {}", value.get("shadow").and_then(|v| v.as_str()).unwrap_or("-"));
-    println!("Git view:  {}", value.get("git_view").and_then(|v| v.as_bool()).unwrap_or(false));
+    println!(
+        "CoW:       {}",
+        value.get("cow_backend").and_then(|v| v.as_str()).unwrap_or("-")
+    );
+    println!(
+        "Git view:  {}",
+        if value.get("git_view").and_then(|v| v.as_bool()).unwrap_or(false) {
+            "host .git ro + session index"
+        } else {
+            "unavailable"
+        }
+    );
     println!("Network:   {}", value.get("network").and_then(|v| v.as_str()).unwrap_or("unknown"));
+    println!(
+        "Broker:    {}",
+        if value.get("broker").and_then(|v| v.as_bool()).unwrap_or(false) {
+            "session control socket (adapter.evaluate/effect/heartbeat)"
+        } else {
+            "none"
+        }
+    );
+    let approval_path = dir.join("approval.json");
+    if let Ok(raw) = std::fs::read_to_string(&approval_path) {
+        if let Ok(ticket) = serde_json::from_str::<Value>(&raw) {
+            println!(
+                "Approval:  {} ({})",
+                ticket.get("status").and_then(|v| v.as_str()).unwrap_or("unknown"),
+                ticket
+                    .get("escalation_id")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("-")
+            );
+        }
+    }
     if let Some(code) = value.get("exit_code").and_then(|v| v.as_i64()) {
         println!("Exit:      {code}");
     }
@@ -825,7 +896,11 @@ fn find_session(runtime_dir: &Path, session_id: Option<&str>) -> anyhow::Result<
     latest_session(runtime_dir)
 }
 
-pub(crate) async fn diff(runtime_dir: &Path, session_id: Option<&str>) -> anyhow::Result<()> {
+pub(crate) async fn diff(
+    runtime_dir: &Path,
+    session_id: Option<&str>,
+    render: bool,
+) -> anyhow::Result<()> {
     let Some((dir, value)) = find_session(runtime_dir, session_id)? else {
         eprintln!("Aegis: no sessions under {}", runtime_dir.display());
         return Ok(());
@@ -841,6 +916,11 @@ pub(crate) async fn diff(runtime_dir: &Path, session_id: Option<&str>) -> anyhow
     let changes = CoWWorkspace::diff_dirs(Path::new(workspace), Path::new(shadow), None).await?;
     if changes.is_empty() {
         println!("No changes in {}", dir.display());
+        return Ok(());
+    }
+    if render {
+        // Text preview only; PDF/Office rendering remains a DomainProfile/Phase 5 feature.
+        print_evidence(&changes);
         return Ok(());
     }
     for change in changes {
@@ -876,21 +956,20 @@ pub(crate) async fn commit(
         .get("agent_id")
         .and_then(|v| v.as_str())
         .context("session is missing agent_id")?;
+    let mode = value
+        .get("mode")
+        .and_then(|v| v.as_str())
+        .unwrap_or("implement");
+    if mode == "observe" {
+        bail!(
+            "aos commit: session {} is in observe mode; observe sessions never write to the host. \
+             Restart with `aos run --mode implement` to land changes.",
+            value.get("session_id").and_then(|v| v.as_str()).unwrap_or("-")
+        );
+    }
     let policy = aos_policy::AegisPolicyKernel::with_state_file(Some(
         runtime_dir.join("policy_state.json"),
     ));
-    let now_ms = chrono::Utc::now().timestamp_millis();
-    let lease = policy
-        .list_leases(org_id, Some(agent_id))
-        .await?
-        .into_iter()
-        .find(|lease| {
-            lease.expires_at_ms > now_ms
-                && matches!(
-                    lease.action_pattern.as_str(),
-                    "workspace_commit" | "workspace.commit" | "*"
-                )
-        });
     let base = dir.join("cow_workspace");
     let ws = CoWWorkspace::init(workspace, &base)
         .await
@@ -920,6 +999,18 @@ pub(crate) async fn commit(
     }
 
     let changed: Vec<String> = diffs.iter().map(|d| d.relative_path.clone()).collect();
+
+    // A peer may hold a write claim for one of these paths. The launcher must honour the same
+    // claim table as the MCP gateway instead of silently landing over another agent.
+    let commit_identity = AgentIdentity::new(org_id, agent_id, "cli-commit");
+    let kernel = AegisRuntimeKernel::new(runtime_dir).await?;
+    if let Some(conflict) = kernel
+        .claim_conflict_for_paths(&commit_identity, &changed)
+        .await?
+    {
+        bail!("aos commit: {conflict}");
+    }
+
     let sensitive: Vec<&String> = changed
         .iter()
         .filter(|path| aos_policy::AegisPolicyKernel::is_commit_poisoning_path(path))
@@ -937,6 +1028,31 @@ pub(crate) async fn commit(
     }
 
     let (evidence, evidence_hash) = approval_evidence(&diffs)?;
+
+    // Use the policy kernel's lease matcher rather than a hand-rolled action/expiry check. This
+    // enforces agent/org, action, task scope and any `sha256:<evidence_hash>` pin; a matching
+    // OneShot lease is consumed and cannot be replayed.
+    let domain = value
+        .get("profile")
+        .and_then(|v| v.as_str())
+        .and_then(aos_core::WorkspaceDomain::from_name)
+        .unwrap_or(aos_core::WorkspaceDomain::Mixed);
+    let mut commit_effect = aos_core::Effect::new(
+        aos_core::EffectKind::WorkspaceCommit,
+        domain,
+        aos_core::ResourceScope::Shadow,
+        "*",
+        aos_core::ArtifactKind::Text,
+        aos_core::Reversibility::Irreversible,
+        aos_core::EffectSource::Commit,
+    );
+    commit_effect.metadata = json!({
+        "paths": changed.clone(),
+        "evidence_hash": evidence_hash.clone(),
+    });
+    let lease_ctx = commit_effect.to_policy_context(commit_identity, org_id);
+    let lease = policy.match_active_lease(&lease_ctx).await;
+
     let approval_path = dir.join("approval.json");
     let existing_record: Option<Value> = std::fs::read_to_string(&approval_path)
         .ok()
@@ -1077,13 +1193,52 @@ pub(crate) fn why(runtime_dir: &Path, session_id: Option<&str>) -> anyhow::Resul
     if let Ok(raw) = std::fs::read_to_string(&audit) {
         let tail: Vec<&str> = raw.lines().rev().take(10).collect();
         if !tail.is_empty() {
-            println!("\nAudit tail:");
+            println!("\nAudit chain: {}", if audit_chain_valid(&raw) { "valid" } else { "INVALID" });
+            println!("Audit tail:");
             for line in tail.into_iter().rev() {
                 println!("  {line}");
             }
         }
     }
     Ok(())
+}
+
+fn audit_chain_valid(raw: &str) -> bool {
+    const GENESIS: &str =
+        "0000000000000000000000000000000000000000000000000000000000000000";
+    let mut prev = GENESIS.to_string();
+    for line in raw.lines().filter(|line| !line.trim().is_empty()) {
+        let Ok(mut event) = serde_json::from_str::<Value>(line) else {
+            return false;
+        };
+        let recorded_prev = event
+            .get("prev_hash")
+            .and_then(|v| v.as_str())
+            .unwrap_or_default()
+            .to_string();
+        if recorded_prev != prev {
+            return false;
+        }
+        let recorded_hash = event
+            .get("event_hash")
+            .and_then(|v| v.as_str())
+            .unwrap_or_default()
+            .to_string();
+        if let Some(obj) = event.as_object_mut() {
+            obj.remove("prev_hash");
+            obj.remove("event_hash");
+        }
+        let canonical = json!({ "prev_hash": prev, "event": event });
+        let Ok(bytes) = serde_json::to_vec(&canonical) else {
+            return false;
+        };
+        let expected = sha256_hex(&bytes);
+        if recorded_hash != expected {
+            return false;
+        }
+        prev = recorded_hash;
+    }
+    true
 }
 
 #[derive(Clone)]
@@ -1243,7 +1398,7 @@ fn command_version(bin: &Path) -> Option<String> {
     Some(line.trim().to_string())
 }
 
-pub(crate) fn agent_list(host_home: &Path) -> anyhow::Result<()> {
+pub(crate) fn agent_list(host_home: &Path, runtime_dir: &Path) -> anyhow::Result<()> {
     let specs = [
         ("agy", "agy", ".gemini"),
         ("claude", "claude", ".claude"),
@@ -1271,6 +1426,18 @@ pub(crate) fn agent_list(host_home: &Path) -> anyhow::Result<()> {
             if found.is_some() { "yes" } else { "-" },
             version
         );
+    }
+    let manifests = crate::adapter_manifest::list_manifests(runtime_dir);
+    if !manifests.is_empty() {
+        println!("\nCustom adapter manifests:");
+        for manifest in manifests {
+            println!(
+                "  {:<12} {:<24} bin={}",
+                manifest.id,
+                manifest.display_name,
+                manifest.bin.join(",")
+            );
+        }
     }
     println!("\nUse `aegis-os run -- <agent>` to launch under the Phase 1 Linux sandbox.");
     Ok(())
@@ -1357,6 +1524,56 @@ fn agent_mounts(
     Ok((mounts, extra_path))
 }
 
+fn boundary_secret_placeholder(env_key: &str) -> Option<&'static str> {
+    match env_key {
+        "ANTHROPIC_API_KEY" => Some("$AOS_SECRET_ANTHROPIC_API_KEY"),
+        "ANTHROPIC_AUTH_TOKEN" => Some("$AOS_SECRET_ANTHROPIC_AUTH_TOKEN"),
+        "OPENAI_API_KEY" => Some("$AOS_SECRET_OPENAI_API_KEY"),
+        _ => None,
+    }
+}
+
+async fn register_boundary_secrets(gateway: &AegisEgressGateway, identity: &AgentIdentity) {
+    for (env_key, placeholder, domain) in [
+        (
+            "ANTHROPIC_API_KEY",
+            "$AOS_SECRET_ANTHROPIC_API_KEY",
+            "api.anthropic.com",
+        ),
+        (
+            "ANTHROPIC_AUTH_TOKEN",
+            "$AOS_SECRET_ANTHROPIC_AUTH_TOKEN",
+            "api.anthropic.com",
+        ),
+        ("OPENAI_API_KEY", "$AOS_SECRET_OPENAI_API_KEY", "api.openai.com"),
+    ] {
+        let Ok(value) = std::env::var(env_key) else {
+            continue;
+        };
+        if value.trim().is_empty() {
+            continue;
+        }
+        gateway
+            .register_scoped_secret(
+                SecretVaultEntry {
+                    org_id: identity.org_id.clone(),
+                    placeholder: placeholder.to_string(),
+                    real_secret_value: value,
+                    allowed_domains: vec![domain.to_string()],
+                },
+                vec![
+                    "GET".to_string(),
+                    "POST".to_string(),
+                    "PUT".to_string(),
+                    "PATCH".to_string(),
+                    "DELETE".to_string(),
+                ],
+                vec!["/v1/".to_string()],
+            )
+            .await;
+    }
+}
+
 async fn start_egress(
     identity: &AgentIdentity,
     session_dir: &Path,
@@ -1406,6 +1623,7 @@ async fn start_egress(
         );
     }
     gateway.allow_domains(&identity.org_id, domains).await;
+    register_boundary_secrets(&gateway, identity).await;
     let proxy = gateway
         .start_local_proxy_with_bound_identity("127.0.0.1:0", Some(identity.clone()))
         .await?;
@@ -1418,6 +1636,24 @@ async fn start_egress(
     let token = aos_sandbox::bridge::new_token();
     let handle = aos_sandbox::bridge::spawn_host_bridge(&sock, proxy.clone(), token.clone())?;
     Ok((EgressGuard { handle, sock }, proxy, token))
+}
+
+fn l7_base_url_envs(proxy: &str) -> Vec<(&'static str, String)> {
+    let base = format!("http://{proxy}/__aegis/base");
+    vec![
+        ("ANTHROPIC_BASE_URL", format!("{base}/anthropic")),
+        ("OPENAI_BASE_URL", format!("{base}/openai")),
+        ("OPENAI_API_BASE", format!("{base}/openai")),
+        ("GOOGLE_GEMINI_BASE_URL", format!("{base}/gemini")),
+    ]
+}
+
+fn workspace_profile_name(root: &Path) -> Option<String> {
+    let raw = std::fs::read_to_string(root.join(".aegis/workspace.json")).ok()?;
+    let value: Value = serde_json::from_str(&raw).ok()?;
+    let name = value.get("profile")?.as_str()?;
+    let profile = aos_core::DomainProfile::for_name(name)?;
+    Some(profile.domain.as_str().to_string())
 }
 
 fn detect_profile(root: &Path) -> &'static str {
@@ -1601,6 +1837,10 @@ fn approval_evidence(diffs: &[aos_core::FileDiffEntry]) -> anyhow::Result<(Value
             "change": diff_label(&d.change_type),
             "old_size": d.old_size,
             "new_size": d.new_size,
+            // The preview is truncated for human display; the SHA-256 digests are what make the
+            // evidence hash a cryptographic commitment to the complete old/new bytes.
+            "old_sha256": d.old_sha256,
+            "new_sha256": d.new_sha256,
             "preview": d.preview_diff,
         })).collect::<Vec<_>>()
     });
@@ -1642,8 +1882,38 @@ fn approve_interactively(
     Ok(matches!(answer.trim().to_ascii_lowercase().as_str(), "y" | "yes"))
 }
 
-fn append_audit(session_dir: &Path, event: Value) {
+fn append_audit(session_dir: &Path, mut event: Value) {
+    const GENESIS: &str =
+        "0000000000000000000000000000000000000000000000000000000000000000";
     let path = session_dir.join("audit.jsonl");
+    let prev_hash = std::fs::read_to_string(&path)
+        .ok()
+        .and_then(|raw| {
+            raw.lines()
+                .rev()
+                .find(|line| !line.trim().is_empty())
+                .and_then(|line| serde_json::from_str::<Value>(line).ok())
+                .and_then(|value| {
+                    value
+                        .get("event_hash")
+                        .and_then(|v| v.as_str())
+                        .map(str::to_string)
+                })
+        })
+        .unwrap_or_else(|| GENESIS.to_string());
+
+    let canonical = json!({
+        "prev_hash": prev_hash,
+        "event": event.clone(),
+    });
+    let event_hash = serde_json::to_vec(&canonical)
+        .ok()
+        .map(|bytes| sha256_hex(&bytes));
+    if let Some(hash) = event_hash {
+        event["prev_hash"] = json!(prev_hash);
+        event["event_hash"] = json!(hash);
+    }
+
     if let Ok(mut file) = std::fs::OpenOptions::new()
         .create(true)
         .append(true)
@@ -1661,6 +1931,24 @@ fn resolved_verify_command(host_project: &Path, override_cmd: Option<&str>) -> O
         let cmd = cmd.trim();
         if !cmd.is_empty() {
             return Some((cmd.to_string(), 60_000));
+        }
+    }
+    // `workspace.json` is the domain-profile configuration; `verify.json` is the legacy
+    // single-gate file kept for existing projects.
+    if let Ok(raw) = std::fs::read_to_string(host_project.join(".aegis/workspace.json")) {
+        if let Ok(value) = serde_json::from_str::<Value>(&raw) {
+            if let Some(cmd) = value
+                .pointer("/verify/cmd")
+                .and_then(|v| v.as_str())
+                .map(str::trim)
+                .filter(|c| !c.is_empty())
+            {
+                let timeout = value
+                    .pointer("/verify/timeout_ms")
+                    .and_then(|v| v.as_u64())
+                    .unwrap_or(60_000);
+                return Some((cmd.to_string(), timeout));
+            }
         }
     }
     let cfg = host_project.join(".aegis/verify.json");
@@ -1765,6 +2053,24 @@ pub(crate) async fn verify(
     run_verify_for_session(runtime_dir, &value, override_cmd).await
 }
 
+/// Resolve an artifact path strictly inside the session shadow. `canonicalize` also rejects
+/// symlinks that escape the shadow (e.g. a committed `figures/out -> ~/.ssh` link).
+fn shadow_artifact_path(shadow: &Path, rel: &str) -> anyhow::Result<Option<PathBuf>> {
+    let canonical_shadow = std::fs::canonicalize(shadow)
+        .with_context(|| format!("canonicalizing shadow {}", shadow.display()))?;
+    let candidate = shadow.join(rel.trim_start_matches('/'));
+    let Ok(canonical) = std::fs::canonicalize(&candidate) else {
+        return Ok(None);
+    };
+    if !canonical.starts_with(&canonical_shadow) {
+        bail!(
+            "aos publish: refusing '{}' because it resolves outside the session shadow",
+            rel
+        );
+    }
+    Ok(Some(canonical))
+}
+
 fn content_type(path: &Path) -> &'static str {
     match path
         .extension()
@@ -1814,6 +2120,10 @@ pub(crate) async fn publish(
         .and_then(|v| v.as_str())
         .context("session is missing agent_id")?;
 
+    // Publishing to the organization CAS is a boundary action; run the configured domain gate
+    // first so a failed schema/PHI/render check cannot be bypassed by publishing directly.
+    run_verify_for_session(runtime_dir, &value, None).await?;
+
     let paths = if requested_paths.is_empty() {
         CoWWorkspace::diff_dirs(Path::new(workspace), Path::new(shadow), None)
             .await?
@@ -1833,7 +2143,10 @@ pub(crate) async fn publish(
     let mut published = Vec::new();
     for rel in paths {
         let rel = rel.trim_start_matches('/').to_string();
-        let path = Path::new(shadow).join(&rel);
+        let Some(path) = shadow_artifact_path(Path::new(shadow), &rel)? else {
+            println!("skip {rel} (not a regular file)");
+            continue;
+        };
         if !path.is_file() {
             println!("skip {rel} (not a regular file)");
             continue;
@@ -1922,6 +2235,40 @@ pub(crate) async fn artifacts_fetch(
     Ok(())
 }
 
+async fn print_exit_summary(session_dir: &Path, project: &Path, shadow: &Path) -> usize {
+    let changes = match CoWWorkspace::diff_dirs(project, shadow, None).await {
+        Ok(changes) => changes,
+        Err(err) => {
+            eprintln!("\nAgent exited; could not summarize shadow changes: {err}");
+            return 0;
+        }
+    };
+    if changes.is_empty() {
+        eprintln!("\nAgent exited. No shadow changes.");
+        return 0;
+    }
+
+    eprintln!(
+        "\nAgent exited. {} artifact(s) changed in shadow:",
+        changes.len()
+    );
+    for change in changes.iter().take(20) {
+        eprintln!(
+            "  {} {}",
+            diff_label(&change.change_type),
+            change.relative_path
+        );
+    }
+    if changes.len() > 20 {
+        eprintln!("  ... {} more", changes.len() - 20);
+    }
+    eprintln!("  session: {}", session_dir.display());
+    eprintln!("  aegis-os diff      inspect");
+    eprintln!("  aegis-os commit    land (approval required)");
+    eprintln!("  aegis-os discard   drop this shadow");
+    changes.len()
+}
+
 fn bwrap_supports_bind_fd(path: &Path) -> bool {
     std::process::Command::new(path)
         .arg("--help")
@@ -1938,6 +2285,10 @@ fn bwrap_supports_bind_fd(path: &Path) -> bool {
 }
 
 #[allow(clippy::too_many_arguments)]
+#[cfg_attr(
+    not(target_os = "linux"),
+    allow(unreachable_code, unused_variables)
+)]
 async fn run_inner(
     workspace: &Path,
     identity: &AgentIdentity,
@@ -1969,17 +2320,81 @@ async fn run_inner(
         bail!("aos run: unknown profile '{profile}'");
     }
     let enforcement = enforcement.to_ascii_lowercase();
-    if enforcement != "enforced" {
+    if !matches!(enforcement.as_str(), "advisory" | "enforced") {
         bail!(
-            "aos run: only 'enforced' is implemented in Phase 1; got '{enforcement}'. \
-             Use `aegis-os run --enforcement enforced -- <agent>`."
+            "aos run: enforcement '{enforcement}' is not implemented; use 'advisory' or 'enforced'"
         );
     }
 
     let identity = infer_identity(identity, command);
+    let project = std::fs::canonicalize(workspace)
+        .with_context(|| format!("canonicalizing workspace {}", workspace.display()))?;
+    if !project.is_dir() {
+        bail!("aos run: workspace {} is not a directory", project.display());
+    }
+    let profile = if profile.eq_ignore_ascii_case("auto") {
+        workspace_profile_name(&project).unwrap_or_else(|| detect_profile(&project).to_string())
+    } else {
+        profile.to_ascii_lowercase()
+    };
 
-    #[cfg(not(target_os = "linux"))]
-    bail!("aos run: enforced mode is Linux-only in Phase 1 (macOS Seatbelt is Phase 4)");
+    if enforcement == "advisory" {
+        let audit_dir = runtime_dir.join("audit");
+        let _ = std::fs::create_dir_all(&audit_dir);
+        let _ = std::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(audit_dir.join("advisory.jsonl"))
+            .and_then(|mut file| {
+                writeln!(
+                    file,
+                    "{}",
+                    json!({
+                        "event": "session.start",
+                        "enforcement": "advisory",
+                        "org_id": identity.org_id.clone(),
+                        "agent_id": identity.agent_id.clone(),
+                        "workspace": project.display().to_string(),
+                        "pid": std::process::id(),
+                        "timestamp_ms": chrono::Utc::now().timestamp_millis(),
+                    })
+                )
+            });
+        eprintln!(
+            "Aegis · advisory · {}/{} (NOT a security boundary; hooks/MCP only)",
+            identity.org_id, identity.agent_id
+        );
+        eprintln!("  project: {}", project.display());
+        eprintln!("  profile: {profile}");
+        let mut cmd = Command::new(&command[0]);
+        cmd.args(&command[1..])
+            .current_dir(&project)
+            .env("AOS_ENFORCEMENT", "advisory")
+            .env("AOS_MODE", &mode)
+            .env("AOS_PROFILE", &profile)
+            .env("AOS_ORG_ID", &identity.org_id)
+            .env("AOS_AGENT_ID", &identity.agent_id);
+        let mut child = cmd.spawn()?;
+        let status = child.wait().await?;
+        return Ok(exit_code(status));
+    }
+
+    #[cfg(target_os = "macos")]
+    {
+        return run_macos_inner(
+            &project,
+            &identity,
+            runtime_dir,
+            &mode,
+            &profile,
+            command,
+            host_home,
+        )
+        .await;
+    }
+
+    #[cfg(all(not(target_os = "linux"), not(target_os = "macos")))]
+    bail!("aos run: enforced mode is not implemented on this OS");
 
     let bwrap = aos_sandbox::linux_bwrap_path()
         .context("aos run: bubblewrap not found at /usr/bin/bwrap, /usr/local/bin/bwrap or /bin/bwrap; install bubblewrap")?;
@@ -1992,17 +2407,7 @@ async fn run_inner(
         );
     }
 
-    let project = std::fs::canonicalize(workspace)
-        .with_context(|| format!("canonicalizing workspace {}", workspace.display()))?;
-    if !project.is_dir() {
-        bail!("aos run: workspace {} is not a directory", project.display());
-    }
     validate_workspace_roots(&project, host_home, runtime_dir)?;
-    let profile = if profile.eq_ignore_ascii_case("auto") {
-        detect_profile(&project).to_string()
-    } else {
-        profile.to_ascii_lowercase()
-    };
     let host_name = project
         .file_name()
         .and_then(|s| s.to_str())
@@ -2037,6 +2442,7 @@ async fn run_inner(
     let agent_home = session_dir.join("agent_home");
     std::fs::create_dir_all(&agent_home)?;
     use std::os::unix::fs::PermissionsExt;
+    let _ = std::fs::set_permissions(runtime_dir, std::fs::Permissions::from_mode(0o700));
     let _ = std::fs::set_permissions(&session_dir, std::fs::Permissions::from_mode(0o700));
     let _ = std::fs::set_permissions(&agent_home, std::fs::Permissions::from_mode(0o700));
     seed_agent_home(host_home, &agent_home)?;
@@ -2053,11 +2459,6 @@ async fn run_inner(
         .with_context(|| format!("creating CoW workspace for {}", project.display()))?;
     let shadow = cow.shadow_root().to_path_buf();
 
-    let mut fds = Vec::new();
-    fds.push(fd_mount(&project, format!("{HOST_STAGE}/{host_name}"), true)?);
-    fds.push(fd_mount(&shadow, project.clone(), mode == "observe")?);
-    fds.push(fd_mount(&agent_home, AGENT_STAGE, false)?);
-
     // Phase 1 egress: a private netns plus the existing identity-pinned CONNECT proxy, relayed
     // through a Unix-socket bridge. `curl --noproxy '*'` has no route out of the namespace.
     // Skip the shim when `run_inner` is called from a test harness (current_exe is not the CLI).
@@ -2069,13 +2470,6 @@ async fn run_inner(
         .unwrap_or(false);
     let (egress_guard, proxy, bridge_token, network_shared, command) = if egress_enabled {
         let (guard, proxy, token) = start_egress(&identity, &session_dir).await?;
-        fds.push(fd_mount(
-            &session_dir.join("egress"),
-            "/run/aegis/egress",
-            true,
-        )?);
-        let exe_dir = exe.parent().context("aegis-os binary has no parent directory")?;
-        fds.push(fd_mount(exe_dir, "/run/aegis/bin", true)?);
         let exe_name = exe
             .file_name()
             .and_then(|s| s.to_str())
@@ -2096,6 +2490,50 @@ async fn run_inner(
     };
     let _egress_guard = egress_guard;
 
+    // Per-session broker: the agent gets a token and a Unix control socket. The broker runs on
+    // the host side, uses the same policy_state as `aos policy`, and exposes adapter.evaluate /
+    // effect / heartbeat plus human-only escalation and lease routes. MCP `proc_exec` receives
+    // the same egress proxy so it cannot bypass the launcher's network policy.
+    let broker = crate::session_broker::SessionBroker::start(
+        runtime_dir,
+        &session_dir,
+        session_dir.join("control"),
+        crate::session_broker::BrokerSession {
+            session_id: session_id.clone(),
+            mode: mode.clone(),
+            enforcement: "enforced".to_string(),
+            workspace: project.display().to_string(),
+            shadow: shadow.display().to_string(),
+            agent_home: agent_home.display().to_string(),
+        },
+        identity.clone(),
+        proxy.clone(),
+        false,
+    )
+    .await?;
+
+    let mut fds = Vec::new();
+    fds.push(fd_mount(&project, format!("{HOST_STAGE}/{host_name}"), true)?);
+    fds.push(fd_mount(&shadow, project.clone(), mode == "observe")?);
+    fds.push(fd_mount(&agent_home, AGENT_STAGE, false)?);
+    fds.push(fd_mount(
+        &broker.control_dir,
+        crate::session_broker::CONTROL_DIR_IN_SANDBOX,
+        true,
+    )?);
+    if proxy.is_some() {
+        fds.push(fd_mount(
+            &session_dir.join("egress"),
+            "/run/aegis/egress",
+            true,
+        )?);
+        let exe_dir = exe.parent().context("aegis-os binary has no parent directory")?;
+        fds.push(fd_mount(exe_dir, "/run/aegis/bin", true)?);
+        // Existing client configs often embed the absolute host binary path. Re-expose the same
+        // file read-only at that path so MCP/hook entries created before `aos run` still resolve.
+        fds.push(fd_mount(&exe, exe.clone(), true)?);
+    }
+
     let git = git_view(&project, &shadow, &agent_home)?;
     if git.is_none() {
         eprintln!(
@@ -2109,6 +2547,7 @@ async fn run_inner(
     fds.extend(dependency_mounts(&project, &shadow)?);
     fds.extend(agent_bin_mounts);
     fds.extend(collect_toolchains(host_home)?);
+    fds.extend(collect_state_dirs(host_home)?);
     fds.extend(collect_configs(host_home, &agent_home)?);
     fds.extend(resolv_conf_mounts()?);
     fds.extend(nixos_mounts()?);
@@ -2128,16 +2567,23 @@ async fn run_inner(
     let session_meta = json!({
         "session_id": session_id.clone(),
         "mode": mode.clone(),
-        "enforcement": "enforced-fs",
+        "enforcement": "enforced",
+        "enforcement_scope": "filesystem+egress (no broker/effect approval yet)",
         "profile": profile.clone(),
         "org_id": identity.org_id.clone(),
         "agent_id": identity.agent_id.clone(),
         "workspace": project.display().to_string(),
         "shadow": shadow.display().to_string(),
         "agent_home": agent_home.display().to_string(),
-        "cow_backend": "clone",
+        "cow_backend": "reflink-or-copy",
+        "broker": true,
+        "control_socket": crate::session_broker::CONTROL_SOCKET_IN_SANDBOX,
         "git_view": plan.git_view_enabled(),
-        "network": if network_shared { "shared" } else { "egress-allowlist" },
+        "network": if network_shared {
+            "shared"
+        } else {
+            "egress-allowlist+l7-base-url"
+        },
         "status": "running",
         "created_at_ms": chrono::Utc::now().timestamp_millis(),
     });
@@ -2164,34 +2610,52 @@ async fn run_inner(
     if network_shared {
         eprintln!("  network: shared (test harness / egress shim disabled)");
     } else {
-        eprintln!("  network: egress allowlist (CONNECT-only; host loopback not reachable; L7 DLP not implemented)");
+        eprintln!("  network: egress allowlist (CONNECT for general traffic; model API Base URL L7 DLP)");
     }
     eprintln!("  profile: {profile}");
     eprintln!(
         "  mode:    {mode}{}",
         if plan.project_readonly { " (project read-only)" } else { "" }
     );
+    eprintln!("  broker:  session control socket (adapter.evaluate / effect / heartbeat)");
+    eprintln!("  approvals: commit-time tickets + live policy escalations");
 
-    let mut cmd = Command::new(&plan.bwrap);
-    cmd.args(plan.linux_args())
-        .current_dir(&project)
-        .env_clear();
-    for (key, value) in plan.envs() {
-        cmd.env(key, value);
-    }
+    let mut envs: Vec<(String, String)> = plan.envs();
     if let (Some(proxy), Some(bridge_token)) = (&proxy, &bridge_token) {
         let proxy_url = format!("http://{proxy}");
-        cmd.env("HTTP_PROXY", &proxy_url)
-            .env("HTTPS_PROXY", &proxy_url)
-            .env("http_proxy", &proxy_url)
-            .env("https_proxy", &proxy_url)
-            .env("AOS_BRIDGE_TOKEN", bridge_token);
+        envs.push(("HTTP_PROXY".to_string(), proxy_url.clone()));
+        envs.push(("HTTPS_PROXY".to_string(), proxy_url.clone()));
+        envs.push(("http_proxy".to_string(), proxy_url.clone()));
+        envs.push(("https_proxy".to_string(), proxy_url.clone()));
+        envs.push(("AOS_BRIDGE_TOKEN".to_string(), bridge_token.clone()));
+
+        // Model APIs use the Base URL reverse-proxy path so the gateway sees method/path/body
+        // (L7 DLP + boundary secret injection) instead of an opaque CONNECT tunnel. Everything
+        // else keeps using CONNECT.
+        for (key, value) in l7_base_url_envs(proxy) {
+            envs.push((key.to_string(), value));
+        }
     }
-    cmd.env("AOS_EGRESS", if network_shared { "not-enforced" } else { "connect-allowlist" });
-    cmd.env("AOS_PROFILE", profile);
-    cmd.env("AOS_MODE", &mode);
-    cmd.env("AOS_ORG_ID", &identity.org_id);
-    cmd.env("AOS_AGENT_ID", &identity.agent_id);
+    envs.push((
+        "AOS_EGRESS".to_string(),
+        if network_shared {
+            "not-enforced"
+        } else if proxy.is_some() {
+            "connect-allowlist+l7-base-url"
+        } else {
+            "connect-allowlist"
+        }
+        .to_string(),
+    ));
+    envs.push(("AOS_PROFILE".to_string(), profile.clone()));
+    envs.push(("AOS_MODE".to_string(), mode.clone()));
+    envs.push(("AOS_ORG_ID".to_string(), identity.org_id.clone()));
+    envs.push(("AOS_AGENT_ID".to_string(), identity.agent_id.clone()));
+    envs.push(("AOS_SESSION_TOKEN".to_string(), broker.agent_token.clone()));
+    envs.push((
+        "AOS_CONTROL_SOCKET".to_string(),
+        crate::session_broker::CONTROL_SOCKET_IN_SANDBOX.to_string(),
+    ));
     for key in [
         "ANTHROPIC_API_KEY",
         "ANTHROPIC_AUTH_TOKEN",
@@ -2206,9 +2670,45 @@ async fn run_inner(
         "REQUESTS_CA_BUNDLE",
         "CURL_CA_BUNDLE",
     ] {
-        if let Ok(value) = std::env::var(key) {
-            cmd.env(key, value);
+        // With the L7 path active, Anthropic/OpenAI credentials stay in the boundary vault and
+        // the Agent only sees a placeholder. The egress proxy replaces it on the loopback hop.
+        if proxy.is_some() {
+            if let Some(placeholder) = boundary_secret_placeholder(key) {
+                if std::env::var(key).is_ok_and(|value| !value.trim().is_empty()) {
+                    envs.push((key.to_string(), placeholder.to_string()));
+                    continue;
+                }
+            }
         }
+        if let Ok(value) = std::env::var(key) {
+            envs.push((key.to_string(), value));
+        }
+    }
+
+    // Real terminals get a PTY so TUI clients keep raw mode, mouse input and window resizing.
+    // Pipes / CI keep the inherited-stdio path to avoid injecting terminal control sequences.
+    if std::io::stdin().is_terminal() && std::io::stdout().is_terminal() {
+        let args = plan.linux_args();
+        return run_pty_command(
+            &plan.bwrap.to_string_lossy(),
+            &args,
+            &project,
+            &envs,
+            &session_dir,
+            &agent_home,
+            host_home,
+            &project,
+            &shadow,
+        )
+        .await;
+    }
+
+    let mut cmd = Command::new(&plan.bwrap);
+    cmd.args(plan.linux_args())
+        .current_dir(&project)
+        .env_clear();
+    for (key, value) in &envs {
+        cmd.env(key, value);
     }
     cmd.kill_on_drop(true);
 
@@ -2223,21 +2723,31 @@ async fn run_inner(
     let pid = child.id().unwrap_or(0);
     let mut wait = Box::pin(child.wait());
     let mut first_interrupt = true;
+    let mut sigwinch = tokio::signal::unix::signal(
+        tokio::signal::unix::SignalKind::window_change(),
+    )?;
+    let mut sigterm = tokio::signal::unix::signal(
+        tokio::signal::unix::SignalKind::terminate(),
+    )?;
     loop {
         tokio::select! {
             status = &mut wait => {
                 let code = exit_code(status?);
                 sync_credentials(&agent_home, host_home);
-                update_session_state(&session_dir, "exited", Some(code));
-                return Ok(code);
+                let pending = print_exit_summary(&session_dir, &project, &shadow).await;
+                let effective = if code == 0 && pending > 0 { 10 } else { code };
+                update_session_state(&session_dir, "exited", Some(effective));
+                return Ok(effective);
             }
             signal = tokio::signal::ctrl_c() => {
                 if signal.is_err() {
                     let status = wait.await?;
                     let code = exit_code(status);
                     sync_credentials(&agent_home, host_home);
-                    update_session_state(&session_dir, "exited", Some(code));
-                    return Ok(code);
+                    let pending = print_exit_summary(&session_dir, &project, &shadow).await;
+                    let effective = if code == 0 && pending > 0 { 10 } else { code };
+                    update_session_state(&session_dir, "exited", Some(effective));
+                    return Ok(effective);
                 }
                 if pid > 0 {
                     let sig = if first_interrupt { libc::SIGINT } else { libc::SIGKILL };
@@ -2246,6 +2756,463 @@ async fn run_inner(
                     // cancel a turn. A second Ctrl-C force-kills the session.
                     unsafe {
                         libc::kill(pid as libc::pid_t, sig);
+                    }
+                }
+            }
+            _ = sigwinch.recv() => {
+                // bwrap runs in a new session, so the kernel does not deliver terminal resize
+                // events to the agent's process group. Forward them explicitly.
+                if pid > 0 {
+                    unsafe {
+                        libc::kill(pid as libc::pid_t, libc::SIGWINCH);
+                    }
+                }
+            }
+            _ = sigterm.recv() => {
+                if pid > 0 {
+                    unsafe {
+                        libc::kill(pid as libc::pid_t, libc::SIGTERM);
+                    }
+                }
+            }
+        }
+    }
+}
+
+fn terminal_size() -> libc::winsize {
+    let mut ws: libc::winsize = unsafe { std::mem::zeroed() };
+    let ok = unsafe {
+        libc::ioctl(
+            libc::STDIN_FILENO,
+            libc::TIOCGWINSZ as libc::c_ulong,
+            &mut ws,
+        )
+    } == 0;
+    if !ok || ws.ws_col == 0 || ws.ws_row == 0 {
+        ws.ws_col = 80;
+        ws.ws_row = 24;
+    }
+    ws
+}
+
+#[cfg(target_os = "macos")]
+#[allow(clippy::too_many_arguments)]
+async fn run_macos_inner(
+    project: &Path,
+    identity: &AgentIdentity,
+    runtime_dir: &Path,
+    mode: &str,
+    profile: &str,
+    command: &[String],
+    host_home: &Path,
+) -> anyhow::Result<i32> {
+    let session_id = format!("ses_{}", &uuid::Uuid::new_v4().simple().to_string()[..12]);
+    let session_dir = runtime_dir.join("sessions").join(&session_id);
+    let agent_home = session_dir.join("agent_home");
+    std::fs::create_dir_all(&agent_home)?;
+    use std::os::unix::fs::PermissionsExt;
+    let _ = std::fs::set_permissions(runtime_dir, std::fs::Permissions::from_mode(0o700));
+    let _ = std::fs::set_permissions(&session_dir, std::fs::Permissions::from_mode(0o700));
+    let _ = std::fs::set_permissions(&agent_home, std::fs::Permissions::from_mode(0o700));
+    seed_agent_home(host_home, &agent_home)?;
+    for rel in [".run", ".cache", ".local/share", "tmp"] {
+        std::fs::create_dir_all(agent_home.join(rel))?;
+    }
+
+    let cow_base = session_dir.join("cow_workspace");
+    std::fs::create_dir_all(&cow_base)?;
+    let cow = CoWWorkspace::init(project, &cow_base)
+        .await
+        .with_context(|| format!("creating CoW workspace for {}", project.display()))?;
+    let shadow = cow.shadow_root().to_path_buf();
+
+    // macOS has no mount namespace; keep the agent cwd in the shadow and use GIT_DIR for
+    // read-only host Git metadata. The Git index is written inside agent_home.
+    let host_git = project.join(".git");
+    let session_index = agent_home.join(".aegis-git-index");
+    if let Ok(index) = std::fs::read(host_git.join("index")) {
+        let _ = std::fs::write(&session_index, index);
+    }
+
+    let (_egress_guard, proxy, _bridge_token) = start_egress(identity, &session_dir).await?;
+    let broker = crate::session_broker::SessionBroker::start(
+        runtime_dir,
+        &session_dir,
+        agent_home.join("control"),
+        crate::session_broker::BrokerSession {
+            session_id: session_id.clone(),
+            mode: mode.to_string(),
+            enforcement: "enforced".to_string(),
+            workspace: project.display().to_string(),
+            shadow: shadow.display().to_string(),
+            agent_home: agent_home.display().to_string(),
+        },
+        identity.clone(),
+        Some(proxy.clone()),
+        true,
+    )
+    .await?;
+
+    let org_shared = runtime_dir
+        .join("orgs")
+        .join(&identity.org_id)
+        .join("shared_ro");
+    let org_pub = runtime_dir
+        .join("orgs")
+        .join(&identity.org_id)
+        .join("pub")
+        .join(&identity.agent_id);
+    std::fs::create_dir_all(&org_shared)?;
+    std::fs::create_dir_all(&org_pub)?;
+    let sandbox = NativeOsSandboxDriver
+        .create_sandbox(SandboxConfig {
+            identity: identity.clone(),
+            tier: IsolationTier::NativeOsSandbox,
+            limits: ResourceLimits::default(),
+            workspace_dir: shadow.clone(),
+            agent_home_dir: agent_home.clone(),
+            org_shared_ro_dir: org_shared,
+            org_agent_pub_dir: org_pub,
+            egress_proxy_addr: Some(proxy.clone()),
+        })
+        .await?;
+    let mut seatbelt = sandbox.confinement_profile();
+    if let Some(addr) = broker.tcp_addr {
+        seatbelt.push_str(&format!(
+            "\n(allow network-outbound (remote ip \"localhost:{}\"))\n",
+            addr.port()
+        ));
+    }
+
+    let mut envs: Vec<(String, String)> = Vec::new();
+    let push = |envs: &mut Vec<(String, String)>, key: &str, value: String| {
+        envs.push((key.to_string(), value));
+    };
+    push(&mut envs, "HOME", agent_home.display().to_string());
+    push(&mut envs, "TMPDIR", agent_home.join("tmp").display().to_string());
+    push(&mut envs, "XDG_CONFIG_HOME", agent_home.join(".config").display().to_string());
+    push(&mut envs, "XDG_DATA_HOME", agent_home.join(".local/share").display().to_string());
+    push(&mut envs, "XDG_CACHE_HOME", agent_home.join(".cache").display().to_string());
+    let mut path = std::env::var("PATH").unwrap_or_default();
+    if let Ok(exe) = std::env::current_exe() {
+        if let Some(parent) = exe.parent() {
+            path = format!("{}:{path}", parent.display());
+        }
+    }
+    push(&mut envs, "PATH", path);
+    for key in ["TERM", "LANG", "LC_ALL", "SHELL", "USER", "LOGNAME"] {
+        if let Ok(value) = std::env::var(key) {
+            push(&mut envs, key, value);
+        }
+    }
+    push(&mut envs, "AOS_SESSION_ID", session_id.clone());
+    push(&mut envs, "AOS_SESSION_TOKEN", broker.agent_token.clone());
+    push(&mut envs, "AOS_CONTROL_SOCKET", broker.control_endpoint());
+    push(&mut envs, "AOS_ENFORCEMENT", "enforced".to_string());
+    push(&mut envs, "AOS_MODE", mode.to_string());
+    push(&mut envs, "AOS_PROFILE", profile.to_string());
+    push(&mut envs, "AOS_ORG_ID", identity.org_id.clone());
+    push(&mut envs, "AOS_AGENT_ID", identity.agent_id.clone());
+    push(&mut envs, "AOS_WORKSPACE", shadow.display().to_string());
+    push(&mut envs, "AOS_HOST_ROOT", project.display().to_string());
+    push(
+        &mut envs,
+        "AOS_EGRESS",
+        "connect-allowlist+l7-base-url".to_string(),
+    );
+    push(&mut envs, "AOS_GIT_VIEW", host_git.is_dir().to_string());
+    push(&mut envs, "GIT_OPTIONAL_LOCKS", "0".to_string());
+    push(&mut envs, "GIT_CONFIG_NOSYSTEM", "1".to_string());
+    push(&mut envs, "GIT_CONFIG_GLOBAL", "/dev/null".to_string());
+    push(&mut envs, "GIT_INDEX_FILE", session_index.display().to_string());
+    if host_git.is_dir() {
+        push(&mut envs, "GIT_DIR", host_git.display().to_string());
+        push(&mut envs, "GIT_WORK_TREE", shadow.display().to_string());
+    }
+    let proxy_url = format!("http://{proxy}");
+    for key in ["HTTP_PROXY", "HTTPS_PROXY", "http_proxy", "https_proxy"] {
+        push(&mut envs, key, proxy_url.clone());
+    }
+    for (key, value) in l7_base_url_envs(&proxy) {
+        push(&mut envs, key, value);
+    }
+    for key in [
+        "ANTHROPIC_API_KEY",
+        "ANTHROPIC_AUTH_TOKEN",
+        "OPENAI_API_KEY",
+        "OPENAI_ORG_ID",
+        "GEMINI_API_KEY",
+        "GOOGLE_API_KEY",
+        "OPENCODE_API_KEY",
+        "HERMES_API_KEY",
+        "NODE_EXTRA_CA_CERTS",
+        "SSL_CERT_FILE",
+        "REQUESTS_CA_BUNDLE",
+        "CURL_CA_BUNDLE",
+    ] {
+        if let Some(placeholder) = boundary_secret_placeholder(key) {
+            if std::env::var(key).is_ok_and(|value| !value.trim().is_empty()) {
+                push(&mut envs, key, placeholder.to_string());
+                continue;
+            }
+        }
+        if let Ok(value) = std::env::var(key) {
+            push(&mut envs, key, value);
+        }
+    }
+
+    let meta = json!({
+        "session_id": session_id,
+        "mode": mode,
+        "enforcement": "enforced",
+        "enforcement_scope": "macos-seatbelt (shadow cwd; no path remap)",
+        "profile": profile,
+        "org_id": identity.org_id,
+        "agent_id": identity.agent_id,
+        "workspace": project.display().to_string(),
+        "shadow": shadow.display().to_string(),
+        "agent_home": agent_home.display().to_string(),
+        "cow_backend": "apfs-clone-or-copy",
+        "broker": true,
+        "control_socket": broker.control_endpoint(),
+        "git_view": host_git.is_dir(),
+        "network": "egress-allowlist+l7-base-url",
+        "sandbox": "seatbelt",
+        "status": "running",
+        "created_at_ms": chrono::Utc::now().timestamp_millis(),
+    });
+    std::fs::write(session_dir.join("session.json"), serde_json::to_vec_pretty(&meta)?)?;
+
+    eprintln!(
+        "Aegis · enforced (macOS Seatbelt) · {}/{}",
+        identity.org_id, identity.agent_id
+    );
+    eprintln!("  session: {session_id}");
+    eprintln!("  shadow:  {}", shadow.display());
+    eprintln!("  host:    {} (read-only; use AOS_HOST_ROOT)", project.display());
+    eprintln!("  git:     {}", if host_git.is_dir() { "host .git read-only + session index" } else { "unavailable" });
+    eprintln!("  network: egress allowlist (CONNECT + model API Base URL L7)");
+    eprintln!("  broker:  {}", broker.control_endpoint());
+    eprintln!("  warning: macOS v1 uses the shadow as cwd (no path remapping)");
+
+    let mut args = vec!["-p".to_string(), seatbelt];
+    args.extend(command.iter().cloned());
+    if std::io::stdin().is_terminal() && std::io::stdout().is_terminal() {
+        run_pty_command(
+            "/usr/bin/sandbox-exec",
+            &args,
+            &shadow,
+            &envs,
+            &session_dir,
+            &agent_home,
+            host_home,
+            project,
+            &shadow,
+        )
+        .await
+    } else {
+        run_plain_command(
+            "/usr/bin/sandbox-exec",
+            &args,
+            &shadow,
+            &envs,
+            &session_dir,
+            &agent_home,
+            host_home,
+            project,
+        )
+        .await
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn run_plain_command(
+    program: &str,
+    args: &[String],
+    cwd: &Path,
+    envs: &[(String, String)],
+    session_dir: &Path,
+    agent_home: &Path,
+    host_home: &Path,
+    project: &Path,
+) -> anyhow::Result<i32> {
+    let mut cmd = Command::new(program);
+    cmd.args(args).current_dir(cwd).env_clear().kill_on_drop(true);
+    for (key, value) in envs {
+        cmd.env(key, value);
+    }
+    let mut child = cmd.spawn()?;
+    let pid = child.id().unwrap_or(0);
+    let mut wait = Box::pin(child.wait());
+    loop {
+        tokio::select! {
+            status = &mut wait => {
+                let code = exit_code(status?);
+                sync_credentials(agent_home, host_home);
+                let pending = print_exit_summary(session_dir, project, cwd).await;
+                let effective = if code == 0 && pending > 0 { 10 } else { code };
+                update_session_state(session_dir, "exited", Some(effective));
+                return Ok(effective);
+            }
+            signal = tokio::signal::ctrl_c() => {
+                if signal.is_err() {
+                    break;
+                }
+                if pid > 0 {
+                    unsafe { libc::kill(pid as libc::pid_t, libc::SIGINT); }
+                }
+            }
+        }
+    }
+    let status = wait.await?;
+    let code = exit_code(status);
+    sync_credentials(agent_home, host_home);
+    let pending = print_exit_summary(session_dir, project, cwd).await;
+    let effective = if code == 0 && pending > 0 { 10 } else { code };
+    update_session_state(session_dir, "exited", Some(effective));
+    Ok(effective)
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn run_pty_command(
+    program: &str,
+    args: &[String],
+    cwd: &Path,
+    envs: &[(String, String)],
+    session_dir: &Path,
+    agent_home: &Path,
+    host_home: &Path,
+    host_project: &Path,
+    shadow: &Path,
+) -> anyhow::Result<i32> {
+    let mut master: libc::c_int = -1;
+    let mut slave: libc::c_int = -1;
+    let mut winsize = terminal_size();
+    if unsafe {
+        libc::openpty(
+            &mut master,
+            &mut slave,
+            std::ptr::null_mut(),
+            std::ptr::null_mut(),
+            &mut winsize,
+        )
+    } != 0
+    {
+        return Err(std::io::Error::last_os_error()).context("allocating a PTY");
+    }
+
+    // Preserve the caller's raw-mode termios so TUI clients see the same input semantics.
+    let mut term: libc::termios = unsafe { std::mem::zeroed() };
+    if unsafe { libc::tcgetattr(libc::STDIN_FILENO, &mut term) } == 0 {
+        let _ = unsafe { libc::tcsetattr(slave, libc::TCSANOW, &term) };
+    }
+
+    let master_file = unsafe { File::from_raw_fd(master) };
+    let slave_file = unsafe { File::from_raw_fd(slave) };
+    let stdin = slave_file.try_clone()?;
+    let stdout = slave_file.try_clone()?;
+    let stderr = slave_file.try_clone()?;
+
+    let mut cmd = std::process::Command::new(program);
+    cmd.args(args)
+        .current_dir(cwd)
+        .env_clear()
+        .stdin(Stdio::from(stdin))
+        .stdout(Stdio::from(stdout))
+        .stderr(Stdio::from(stderr));
+    for (key, value) in envs {
+        cmd.env(key, value);
+    }
+    unsafe {
+        cmd.pre_exec(|| {
+            if libc::setsid() == -1 {
+                return Err(std::io::Error::last_os_error());
+            }
+            if libc::ioctl(0, libc::TIOCSCTTY as libc::c_ulong, 0) == -1 {
+                return Err(std::io::Error::last_os_error());
+            }
+            for sig in [
+                libc::SIGCHLD,
+                libc::SIGHUP,
+                libc::SIGINT,
+                libc::SIGQUIT,
+                libc::SIGTERM,
+                libc::SIGALRM,
+            ] {
+                libc::signal(sig, libc::SIG_DFL);
+            }
+            Ok(())
+        });
+    }
+    let mut child = cmd.spawn().context("spawning bwrap under a PTY")?;
+    drop(slave_file);
+
+    let mut reader = master_file.try_clone()?;
+    let mut writer = master_file.try_clone()?;
+    std::thread::spawn(move || {
+        let mut out = std::io::stdout().lock();
+        let _ = std::io::copy(&mut reader, &mut out);
+    });
+    std::thread::spawn(move || {
+        let mut input = std::io::stdin().lock();
+        let _ = std::io::copy(&mut input, &mut writer);
+    });
+
+    let pid = child.id();
+    let mut wait = tokio::task::spawn_blocking(move || child.wait());
+    let mut first_interrupt = true;
+    let mut sigwinch =
+        tokio::signal::unix::signal(tokio::signal::unix::SignalKind::window_change())?;
+    let mut sigterm = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())?;
+
+    loop {
+        tokio::select! {
+            status = &mut wait => {
+                let status = status??;
+                let code = exit_code(status);
+                sync_credentials(agent_home, host_home);
+                let pending = print_exit_summary(session_dir, host_project, shadow).await;
+                let effective = if code == 0 && pending > 0 { 10 } else { code };
+                update_session_state(session_dir, "exited", Some(effective));
+                return Ok(effective);
+            }
+            signal = tokio::signal::ctrl_c() => {
+                if signal.is_err() {
+                    let status = wait.await??;
+                    let code = exit_code(status);
+                    sync_credentials(agent_home, host_home);
+                    let pending = print_exit_summary(session_dir, host_project, shadow).await;
+                    let effective = if code == 0 && pending > 0 { 10 } else { code };
+                    update_session_state(session_dir, "exited", Some(effective));
+                    return Ok(effective);
+                }
+                if pid > 0 {
+                    let sig = if first_interrupt { libc::SIGINT } else { libc::SIGKILL };
+                    first_interrupt = false;
+                    unsafe {
+                        libc::kill(pid as libc::pid_t, sig);
+                    }
+                }
+            }
+            _ = sigwinch.recv() => {
+                let ws = terminal_size();
+                let _ = unsafe {
+                    libc::ioctl(
+                        master_file.as_raw_fd(),
+                        libc::TIOCSWINSZ as libc::c_ulong,
+                        &ws,
+                    )
+                };
+                if pid > 0 {
+                    unsafe {
+                        libc::kill(pid as libc::pid_t, libc::SIGWINCH);
+                    }
+                }
+            }
+            _ = sigterm.recv() => {
+                if pid > 0 {
+                    unsafe {
+                        libc::kill(pid as libc::pid_t, libc::SIGTERM);
                     }
                 }
             }
@@ -2298,6 +3265,7 @@ mod tests {
         }
     }
 
+    #[cfg(target_os = "linux")]
     #[test]
     fn user_data_is_masked_before_fd_binds() {
         let args = plan().linux_args();
@@ -2368,6 +3336,117 @@ mod tests {
             Path::new("/tmp/rt")
         )
         .is_ok());
+    }
+
+    #[test]
+    fn approval_evidence_binds_full_content_hashes_not_just_preview() {
+        let entry = |new_sha256: &str| aos_core::FileDiffEntry {
+            relative_path: "assets/logo.png".to_string(),
+            change_type: aos_core::DiffChangeType::Modified,
+            old_size: Some(4),
+            new_size: Some(4),
+            preview_diff: Some("Binary files ... differ (4 -> 4 bytes)".to_string()),
+            old_sha256: Some("sha256:aaaa".to_string()),
+            new_sha256: Some(new_sha256.to_string()),
+        };
+        let (_, good_hash) = approval_evidence(&[entry("sha256:bbbb")]).unwrap();
+        let (_, swapped_hash) = approval_evidence(&[entry("sha256:cccc")]).unwrap();
+        assert_ne!(
+            good_hash, swapped_hash,
+            "same-size binary content with the same preview must not share an evidence hash"
+        );
+    }
+
+    #[test]
+    fn l7_secret_placeholders_are_provider_scoped() {
+        assert_eq!(
+            boundary_secret_placeholder("ANTHROPIC_API_KEY"),
+            Some("$AOS_SECRET_ANTHROPIC_API_KEY")
+        );
+        assert_eq!(
+            boundary_secret_placeholder("OPENAI_API_KEY"),
+            Some("$AOS_SECRET_OPENAI_API_KEY")
+        );
+        assert_eq!(boundary_secret_placeholder("GEMINI_API_KEY"), None);
+    }
+
+    #[test]
+    fn l7_base_urls_point_at_the_egress_proxy() {
+        let envs: std::collections::HashMap<_, _> =
+            l7_base_url_envs("127.0.0.1:54123").into_iter().collect();
+        assert_eq!(
+            envs.get("ANTHROPIC_BASE_URL").map(String::as_str),
+            Some("http://127.0.0.1:54123/__aegis/base/anthropic")
+        );
+        assert_eq!(
+            envs.get("OPENAI_BASE_URL").map(String::as_str),
+            Some("http://127.0.0.1:54123/__aegis/base/openai")
+        );
+        assert_eq!(
+            envs.get("GOOGLE_GEMINI_BASE_URL").map(String::as_str),
+            Some("http://127.0.0.1:54123/__aegis/base/gemini")
+        );
+    }
+
+    #[test]
+    fn workspace_profile_and_verify_config_are_honored() {
+        let tmp = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(tmp.path().join(".aegis")).unwrap();
+        std::fs::write(
+            tmp.path().join(".aegis/workspace.json"),
+            r#"{"profile":"docs","verify":{"cmd":"latexmk -pdf main.tex","timeout_ms":120000}}"#,
+        )
+        .unwrap();
+        assert_eq!(
+            workspace_profile_name(tmp.path()).as_deref(),
+            Some("docs")
+        );
+        let (cmd, timeout) = resolved_verify_command(tmp.path(), None).unwrap();
+        assert_eq!(cmd, "latexmk -pdf main.tex");
+        assert_eq!(timeout, 120_000);
+    }
+
+    #[test]
+    fn audit_log_is_hash_chained() {
+        let dir = tempfile::tempdir().unwrap();
+        append_audit(dir.path(), json!({"event": "first"}));
+        append_audit(dir.path(), json!({"event": "second"}));
+        let raw = std::fs::read_to_string(dir.path().join("audit.jsonl")).unwrap();
+        let lines: Vec<Value> = raw
+            .lines()
+            .map(|line| serde_json::from_str(line).unwrap())
+            .collect();
+        assert_eq!(lines.len(), 2);
+        assert_eq!(
+            lines[1].get("prev_hash").and_then(|v| v.as_str()),
+            lines[0].get("event_hash").and_then(|v| v.as_str())
+        );
+        assert!(lines[0]
+            .get("event_hash")
+            .and_then(|v| v.as_str())
+            .unwrap()
+            .starts_with("sha256:"));
+        assert!(audit_chain_valid(&raw));
+        assert!(!audit_chain_valid(&raw.replacen("\"first\"", "\"tampered\"", 1)));
+    }
+
+    #[test]
+    fn publish_paths_cannot_escape_the_shadow() {
+        let tmp = tempfile::tempdir().unwrap();
+        let shadow = tmp.path().join("shadow");
+        let outside = tmp.path().join("outside.txt");
+        std::fs::create_dir_all(&shadow).unwrap();
+        std::fs::write(shadow.join("inside.txt"), "inside").unwrap();
+        std::fs::write(&outside, "secret").unwrap();
+
+        assert!(shadow_artifact_path(&shadow, "inside.txt").unwrap().is_some());
+        assert!(shadow_artifact_path(&shadow, "../outside.txt").is_err());
+
+        #[cfg(unix)]
+        {
+            std::os::unix::fs::symlink(&outside, shadow.join("escape.txt")).unwrap();
+            assert!(shadow_artifact_path(&shadow, "escape.txt").is_err());
+        }
     }
 
     #[cfg(target_os = "linux")]

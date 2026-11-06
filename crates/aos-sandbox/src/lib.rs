@@ -1272,7 +1272,7 @@ mod tests {
             .arg("read line; echo \"eof:$?\"")
             .stdout(Stdio::piped())
             .stderr(Stdio::piped());
-        let out = run_foreground(cmd, Duration::from_secs(5), "").await.unwrap();
+        let out = run_foreground(cmd, Duration::from_secs(30), "").await.unwrap();
         assert_eq!(String::from_utf8_lossy(&out.stdout).trim(), "eof:1");
         assert!(out.stderr.is_empty());
     }

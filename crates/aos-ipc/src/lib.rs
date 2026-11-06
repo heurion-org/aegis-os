@@ -504,7 +504,7 @@ impl AegisIpcBus {
                 }
             }
         }
-        out.sort_by(|a, b| a.created_at_ms.cmp(&b.created_at_ms));
+        out.sort_by_key(|a| a.created_at_ms);
         Ok(out)
     }
 
@@ -853,7 +853,7 @@ impl IpcBus for AegisIpcBus {
             })
             .cloned()
             .collect();
-        out.sort_by(|a, b| b.updated_at_ms.cmp(&a.updated_at_ms));
+        out.sort_by_key(|a| std::cmp::Reverse(a.updated_at_ms));
         Ok(out)
     }
 
@@ -958,7 +958,7 @@ impl IpcBus for AegisIpcBus {
 
                 for sub_agent in subscribers {
                     let mut fanout_copy = envelope.clone();
-                    fanout_copy.msg_id = format!("{}-{}", envelope.msg_id, &sub_agent);
+                    fanout_copy.msg_id = format!("{}-{}", envelope.msg_id, sub_agent);
                     self.deliver_to_agent(&envelope.org_id, &sub_agent, fanout_copy)
                         .await;
                 }
@@ -976,7 +976,7 @@ impl IpcBus for AegisIpcBus {
                         .get("context_id")
                         .and_then(|v| v.as_str())
                         .map(|s| s.to_string())
-                        .unwrap_or_else(|| format!("ctx-{}", &envelope.msg_id));
+                        .unwrap_or_else(|| format!("ctx-{}", envelope.msg_id));
                     let from_canonical = if envelope.from_agent.contains('/') {
                         envelope.from_agent.clone()
                     } else {

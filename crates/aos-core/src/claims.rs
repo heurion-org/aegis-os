@@ -12,6 +12,24 @@ pub const CLAIMS_KEY: &str = "claims";
 /// Default claim lifetime when the caller does not specify one.
 pub const DEFAULT_CLAIM_TTL_SECS: i64 = 2 * 60 * 60;
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum ClaimMode {
+    Read,
+    #[default]
+    Write,
+}
+
+impl ClaimMode {
+    pub fn from_name(name: &str) -> Option<Self> {
+        match name.to_ascii_lowercase().as_str() {
+            "read" => Some(Self::Read),
+            "write" => Some(Self::Write),
+            _ => None,
+        }
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Claim {
     pub owner: String,
@@ -20,9 +38,27 @@ pub struct Claim {
     pub note: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub task_id: Option<String>,
+    /// Read claims may coexist with other read claims; write claims are exclusive.
+    #[serde(default)]
+    pub mode: ClaimMode,
 }
 
 pub type ClaimTable = BTreeMap<String, Claim>;
+
+const CLAIM_KEY_SEP: char = '\u{1f}';
+
+/// Read claims need to coexist with other read claims on the same glob. The KV table is keyed by
+/// a single string, so read claims get an owner suffix; `claim_glob` strips it for matching.
+pub fn claim_key(glob: &str, owner: &str, mode: ClaimMode) -> String {
+    match mode {
+        ClaimMode::Read => format!("{glob}{CLAIM_KEY_SEP}{owner}"),
+        ClaimMode::Write => glob.to_string(),
+    }
+}
+
+pub fn claim_glob(key: &str) -> &str {
+    key.split(CLAIM_KEY_SEP).next().unwrap_or(key)
+}
 
 /// Parses the KV value, tolerating values that were stored as a JSON-encoded string and
 /// silently skipping malformed entries (legacy free-form notes).
@@ -117,6 +153,7 @@ fn match_one(p: &[u8], s: &[u8]) -> bool {
 
 /// Returns the first live claim on `rel_path` held by someone other than `me`.
 /// `owner_is_live(owner)` lets callers drop claims whose owner has disappeared (heartbeat `Gone`).
+/// The default requester mode is `Write`, so every existing caller keeps exclusive semantics.
 pub fn find_conflict<'a>(
     table: &'a ClaimTable,
     rel_path: &str,
@@ -124,12 +161,36 @@ pub fn find_conflict<'a>(
     now_ms: i64,
     owner_is_live: impl Fn(&str) -> bool,
 ) -> Option<(&'a String, &'a Claim)> {
+    find_conflict_for(
+        table,
+        rel_path,
+        me,
+        now_ms,
+        owner_is_live,
+        ClaimMode::Write,
+    )
+}
+
+/// Mode-aware conflict lookup: read/read is compatible; anything involving a write conflicts.
+pub fn find_conflict_for<'a>(
+    table: &'a ClaimTable,
+    rel_path: &str,
+    me: &str,
+    now_ms: i64,
+    owner_is_live: impl Fn(&str) -> bool,
+    requester_mode: ClaimMode,
+) -> Option<(&'a String, &'a Claim)> {
     table.iter().find(|(glob, c)| {
-        c.owner != me && c.expires_at_ms > now_ms && owner_is_live(&c.owner) && glob_match(glob, rel_path)
+        c.owner != me
+            && c.expires_at_ms > now_ms
+            && owner_is_live(&c.owner)
+            && (requester_mode == ClaimMode::Write || c.mode == ClaimMode::Write)
+            && glob_match(claim_glob(glob), rel_path)
     })
 }
 
 pub fn conflict_message(glob: &str, claim: &Claim, rel_path: &str, now_ms: i64) -> String {
+    let glob = claim_glob(glob);
     let mins = ((claim.expires_at_ms - now_ms) / 60_000).max(0);
     format!(
         "[Aegis OS coordination] `{rel_path}` is claimed by `{owner}` (pattern `{glob}`, expires in {mins} min{note}). \
@@ -234,6 +295,8 @@ fn segments_may_overlap(pa: &[String], pb: &[String]) -> bool {
 /// Checks whether two glob patterns `pat_a` and `pat_b` can match a common file path, either
 /// over concrete `workspace_files` or via exact segment-level NFA intersection.
 pub fn globs_may_overlap(pat_a: &str, pat_b: &str, workspace_files: &[String]) -> bool {
+    let pat_a = claim_glob(pat_a);
+    let pat_b = claim_glob(pat_b);
     if workspace_files
         .iter()
         .any(|f| glob_match(pat_a, f) && glob_match(pat_b, f))
@@ -274,7 +337,7 @@ pub fn release_claims_matching_paths(
         if claim.owner == owner
             && committed_paths
                 .iter()
-                .any(|p| glob_match(glob, p) || globs_may_overlap(glob, p, committed_paths))
+                .any(|p| glob_match(claim_glob(glob), p) || globs_may_overlap(glob, p, committed_paths))
         {
             released.push(glob.clone());
             false
@@ -322,6 +385,67 @@ mod tests {
         let (g, c) = find_conflict(&t, "crates/aos-vfs/src/lib.rs", "x", 1_000, live).unwrap();
         let msg = conflict_message(g, c, "crates/aos-vfs/src/lib.rs", 1_000);
         assert!(msg.contains("agy-aaaaaa") && msg.contains("ipc_send"), "{msg}");
+    }
+
+    #[test]
+    fn read_claim_keys_preserve_the_underlying_glob() {
+        let key = claim_key("paper/**", "reader-a", ClaimMode::Read);
+        assert_eq!(claim_glob(&key), "paper/**");
+        assert_eq!(claim_key("paper/**", "reader-a", ClaimMode::Write), "paper/**");
+    }
+
+    #[test]
+    fn read_claims_coexist_but_writes_conflict() {
+        let mut table = ClaimTable::new();
+        table.insert(
+            "paper/**".to_string(),
+            Claim {
+                owner: "reader-a".to_string(),
+                expires_at_ms: 2_000,
+                note: String::new(),
+                task_id: None,
+                mode: ClaimMode::Read,
+            },
+        );
+        let live = |_: &str| true;
+        assert!(find_conflict_for(
+            &table,
+            "paper/main.tex",
+            "reader-b",
+            1_000,
+            live,
+            ClaimMode::Read
+        )
+        .is_none());
+        assert!(find_conflict_for(
+            &table,
+            "paper/main.tex",
+            "writer-b",
+            1_000,
+            live,
+            ClaimMode::Write
+        )
+        .is_some());
+
+        table.insert(
+            "code/**".to_string(),
+            Claim {
+                owner: "writer-a".to_string(),
+                expires_at_ms: 2_000,
+                note: String::new(),
+                task_id: None,
+                mode: ClaimMode::Write,
+            },
+        );
+        assert!(find_conflict_for(
+            &table,
+            "code/lib.rs",
+            "reader-b",
+            1_000,
+            live,
+            ClaimMode::Read
+        )
+        .is_some());
     }
 
     #[test]
