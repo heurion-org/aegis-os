@@ -80,6 +80,18 @@ enum AgentAction {
 }
 
 #[derive(Subcommand)]
+enum ArtifactAction {
+    /// List organization CAS artifacts
+    List,
+    /// Fetch one artifact by URI or SHA-256
+    Fetch {
+        uri: String,
+        #[arg(long)]
+        out: Option<PathBuf>,
+    },
+}
+
+#[derive(Subcommand)]
 enum ApprovalAction {
     /// List launcher commit approval tickets
     List,
@@ -167,6 +179,12 @@ enum Commands {
         /// File or directory (relative to the shadow); defaults to changed files
         #[arg(long = "path")]
         paths: Vec<String>,
+    },
+
+    /// Inspect or fetch organization CAS artifacts
+    Artifacts {
+        #[command(subcommand)]
+        action: ArtifactAction,
     },
 
     /// Commit the latest (or named) session shadow to the host workspace (human action)
@@ -2189,6 +2207,13 @@ async fn main() -> anyhow::Result<()> {
         Commands::Publish { session, paths } => {
             launcher::publish(&runtime_dir, session.as_deref(), paths).await?;
         }
+
+        Commands::Artifacts { action } => match action {
+            ArtifactAction::List => launcher::artifacts_list(&runtime_dir, &identity).await?,
+            ArtifactAction::Fetch { uri, out } => {
+                launcher::artifacts_fetch(&runtime_dir, &identity, &uri, out).await?
+            }
+        },
 
         Commands::Commit { session, paths, allow_sensitive, yes } => {
             let filter = if paths.is_empty() { None } else { Some(paths) };

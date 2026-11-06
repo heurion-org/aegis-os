@@ -26,6 +26,7 @@ Phase 1 已在 `main` 落地以下能力：
 - `aos approvals list/show/approve/deny`：统一管理 launcher commit 审批单；非交互 commit 会打印 escalation id 并退出，批准后重跑 commit 即可落盘。
 - `aos approvals serve`：本地 Web 审批台（127.0.0.1 + 随机 token），展示 evidence hash、paths 与 approve/deny 表单。
 - `aos publish`：把 session shadow 中的变更文件发布到组织 SHA-256 CAS，写入 `published.json`，供下游按哈希接力。
+- `aos artifacts list/fetch`：列出组织 CAS 产物并按 URI / SHA-256 拉取到本地。
 - `aos verify`：在沙箱内执行 `.aegis/verify.json` 或 `AOS_VERIFY_CMD`；`aos commit` 也会先跑该预检门，失败则不生成审批单。
 - 已修复：大文件 CoW 自指 symlink、工具链凭据泄露、`workspace=$HOME` 复制敏感目录、TIOCSTI、bwrap 版本探测、resolv.conf、node_modules 自指、Ctrl-C、OAuth 写回、权限、Git shim、NixOS/Linuxbrew 兼容。
 
@@ -1663,6 +1664,9 @@ aegis-os
 ├── commit [--session <id>] [--paths ...] [--allow-sensitive] [--yes]
 ├── why [--session <id>]
 ├── publish [--session <id>] [--path ...]      # 发布到 SHA-256 CAS
+├── artifacts
+│   ├── list
+│   └── fetch <uri> [--out <file>]
 ├── discard [--session <id>]
 ├── approve [<escalation-id>] [--ttl 15m]
 ├── deny [<escalation-id>]

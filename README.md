@@ -105,6 +105,8 @@ aegis-os approvals list  # pending/approved commit tickets
 aegis-os approvals approve <esc-id>
 aegis-os approvals serve # local web approval console (random token)
 aegis-os publish         # publish changed artifacts to SHA-256 CAS
+aegis-os artifacts list  # list CAS artifacts
+aegis-os artifacts fetch <uri> --out <file>
 aegis-os why             # approval ticket + audit trail
 aegis-os discard
 ```

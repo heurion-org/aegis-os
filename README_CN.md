@@ -71,6 +71,8 @@ aegis-os approvals list  # 查看待批/已批提交单
 aegis-os approvals approve <esc-id>
 aegis-os approvals serve # 本地 Web 审批台（随机 token）
 aegis-os publish         # 将变更产物发布到 SHA-256 CAS
+aegis-os artifacts list  # 列出 CAS 产物
+aegis-os artifacts fetch <uri> --out <file>
 aegis-os why             # 查看审批单与审计链
 aegis-os discard
 ```

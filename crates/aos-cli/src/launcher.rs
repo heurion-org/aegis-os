@@ -1874,6 +1874,54 @@ pub(crate) async fn publish(
     Ok(())
 }
 
+pub(crate) async fn artifacts_list(runtime_dir: &Path, identity: &AgentIdentity) -> anyhow::Result<()> {
+    let kernel = AegisRuntimeKernel::new(runtime_dir).await?;
+    let artifacts = kernel.org_storage.list_artifacts(&identity.org_id).await?;
+    if artifacts.is_empty() {
+        println!("No artifacts in org '{}'.", identity.org_id);
+        return Ok(());
+    }
+    println!("{:<70} {:<12} NAME", "URI", "SIZE");
+    for artifact in artifacts {
+        println!(
+            "{:<70} {:<12} {}",
+            artifact.uri, artifact.size_bytes, artifact.name
+        );
+    }
+    Ok(())
+}
+
+pub(crate) async fn artifacts_fetch(
+    runtime_dir: &Path,
+    identity: &AgentIdentity,
+    uri: &str,
+    out: Option<PathBuf>,
+) -> anyhow::Result<()> {
+    let kernel = AegisRuntimeKernel::new(runtime_dir).await?;
+    let (meta, bytes) = kernel.org_storage.fetch_artifact(identity, uri).await?;
+    let target = out.unwrap_or_else(|| {
+        PathBuf::from(
+            meta.name
+                .rsplit('/')
+                .next()
+                .filter(|name| !name.is_empty())
+                .unwrap_or("artifact.bin"),
+        )
+    });
+    if let Some(parent) = target.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
+    std::fs::write(&target, &bytes)?;
+    println!(
+        "{} -> {} ({} bytes, sha256:{})",
+        meta.uri,
+        target.display(),
+        bytes.len(),
+        meta.sha256
+    );
+    Ok(())
+}
+
 fn bwrap_supports_bind_fd(path: &Path) -> bool {
     std::process::Command::new(path)
         .arg("--help")
