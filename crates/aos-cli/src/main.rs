@@ -89,6 +89,14 @@ enum ApprovalAction {
     Approve { id: String },
     /// Deny a launcher commit ticket
     Deny { id: String },
+    /// Serve a local web approval console
+    Serve {
+        #[arg(long, default_value_t = 7817)]
+        port: u16,
+        /// Optional fixed token; defaults to a random token
+        #[arg(long)]
+        token: Option<String>,
+    },
 }
 
 #[derive(Subcommand)]
@@ -2212,6 +2220,9 @@ async fn main() -> anyhow::Result<()> {
             ApprovalAction::Show { id } => launcher::approval_show(&runtime_dir, &id)?,
             ApprovalAction::Approve { id } => launcher::approval_decide(&runtime_dir, &id, true)?,
             ApprovalAction::Deny { id } => launcher::approval_decide(&runtime_dir, &id, false)?,
+            ApprovalAction::Serve { port, token } => {
+                launcher::approvals_serve(&runtime_dir, port, token).await?
+            }
         },
 
         Commands::Run { mode, profile, enforcement, cmd } => {

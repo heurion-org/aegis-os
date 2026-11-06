@@ -69,6 +69,7 @@ aegis-os verify          # 在沙箱内跑 .aegis/verify.json / AOS_VERIFY_CMD
 aegis-os commit          # Diff + evidence hash；非交互用 --yes
 aegis-os approvals list  # 查看待批/已批提交单
 aegis-os approvals approve <esc-id>
+aegis-os approvals serve # 本地 Web 审批台（随机 token）
 aegis-os publish         # 将变更产物发布到 SHA-256 CAS
 aegis-os why             # 查看审批单与审计链
 aegis-os discard

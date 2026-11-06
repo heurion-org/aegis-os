@@ -21,6 +21,13 @@ use aos_core::{
 use aos_egress::AegisEgressGateway;
 use aos_mcp_gateway::AegisRuntimeKernel;
 use aos_sandbox::NativeOsSandboxDriver;
+use axum::{
+    extract::{Path as AxumPath, Query, State},
+    response::Html,
+    routing::{get, post},
+    Form, Router,
+};
+use serde::Deserialize;
 use aos_vfs::CoWWorkspace;
 use anyhow::{bail, Context};
 use serde_json::{json, Value};
@@ -1079,6 +1086,145 @@ pub(crate) fn why(runtime_dir: &Path, session_id: Option<&str>) -> anyhow::Resul
     Ok(())
 }
 
+#[derive(Clone)]
+struct ApprovalState {
+    runtime_dir: PathBuf,
+    token: String,
+}
+
+#[derive(Deserialize)]
+struct TokenQuery {
+    token: Option<String>,
+}
+
+#[derive(Deserialize)]
+struct DecisionForm {
+    token: String,
+}
+
+fn html_escape(value: &str) -> String {
+    value
+        .replace('&', "&amp;")
+        .replace('<', "&lt;")
+        .replace('>', "&gt;")
+        .replace('"', "&quot;")
+}
+
+async fn approvals_index(
+    State(state): State<ApprovalState>,
+    Query(query): Query<TokenQuery>,
+) -> Html<String> {
+    if query.token.as_deref() != Some(state.token.as_str()) {
+        return Html("<h1>401 Unauthorized</h1>".to_string());
+    }
+    let mut rows = String::new();
+    for (_dir, ticket) in collect_approvals(&state.runtime_dir) {
+        let id = ticket.get("escalation_id").and_then(|v| v.as_str()).unwrap_or("-");
+        let status = ticket.get("status").and_then(|v| v.as_str()).unwrap_or("-");
+        let hash = ticket.get("evidence_hash").and_then(|v| v.as_str()).unwrap_or("-");
+        let paths = ticket
+            .get("paths")
+            .and_then(|v| v.as_array())
+            .map(|a| {
+                a.iter()
+                    .filter_map(|p| p.as_str())
+                    .map(html_escape)
+                    .collect::<Vec<_>>()
+                    .join("<br>")
+            })
+            .unwrap_or_default();
+        let actions = if status == "pending" {
+            format!(
+                "<form method=post action='/approve/{id}'><input type=hidden name=token value='{}'><button>Approve</button></form>\
+                 <form method=post action='/deny/{id}'><input type=hidden name=token value='{}'><button>Deny</button></form>",
+                html_escape(&state.token),
+                html_escape(&state.token)
+            )
+        } else {
+            String::new()
+        };
+        rows.push_str(&format!(
+            "<tr><td>{}</td><td>{}</td><td><code>{}</code></td><td>{}</td><td>{}</td></tr>",
+            html_escape(id),
+            html_escape(status),
+            html_escape(hash),
+            paths,
+            actions
+        ));
+    }
+    if rows.is_empty() {
+        rows.push_str("<tr><td colspan=5>No approval tickets.</td></tr>");
+    }
+    Html(format!(
+        "<!doctype html><meta charset=utf-8><title>Aegis Approvals</title>\
+         <style>body{{font-family:system-ui;margin:2rem}}table{{border-collapse:collapse}}td,th{{border:1px solid #ccc;padding:.4rem;vertical-align:top}}button{{margin:.1rem}}</style>\
+         <h1>Aegis Approval Console</h1><p>Local launcher commit tickets.</p>\
+         <table><tr><th>Escalation</th><th>Status</th><th>Evidence</th><th>Paths</th><th>Actions</th></tr>{rows}</table>"
+    ))
+}
+
+async fn approvals_web_approve(
+    State(state): State<ApprovalState>,
+    AxumPath(id): AxumPath<String>,
+    Form(form): Form<DecisionForm>,
+) -> Html<String> {
+    if form.token != state.token {
+        return Html("<h1>401 Unauthorized</h1>".to_string());
+    }
+    let message = match approval_decide(&state.runtime_dir, &id, true) {
+        Ok(()) => format!("approved {id}"),
+        Err(err) => format!("error: {err}"),
+    };
+    Html(format!(
+        "<p>{}</p><p><a href='/?token={}'>Back</a></p>",
+        html_escape(&message),
+        html_escape(&state.token)
+    ))
+}
+
+async fn approvals_web_deny(
+    State(state): State<ApprovalState>,
+    AxumPath(id): AxumPath<String>,
+    Form(form): Form<DecisionForm>,
+) -> Html<String> {
+    if form.token != state.token {
+        return Html("<h1>401 Unauthorized</h1>".to_string());
+    }
+    let message = match approval_decide(&state.runtime_dir, &id, false) {
+        Ok(()) => format!("denied {id}"),
+        Err(err) => format!("error: {err}"),
+    };
+    Html(format!(
+        "<p>{}</p><p><a href='/?token={}'>Back</a></p>",
+        html_escape(&message),
+        html_escape(&state.token)
+    ))
+}
+
+pub(crate) async fn approvals_serve(
+    runtime_dir: &Path,
+    port: u16,
+    token: Option<String>,
+) -> anyhow::Result<()> {
+    let token = token.unwrap_or_else(|| uuid::Uuid::new_v4().simple().to_string());
+    let state = ApprovalState {
+        runtime_dir: runtime_dir.to_path_buf(),
+        token: token.clone(),
+    };
+    let app = Router::new()
+        .route("/", get(approvals_index))
+        .route("/approve/:id", post(approvals_web_approve))
+        .route("/deny/:id", post(approvals_web_deny))
+        .with_state(state);
+    let listener = tokio::net::TcpListener::bind(("127.0.0.1", port)).await?;
+    let addr = listener.local_addr()?;
+    println!(
+        "Aegis approval console: http://{addr}/?token={token} (Ctrl-C to stop)"
+    );
+    axum::serve(listener, app).await?;
+    Ok(())
+}
+
 fn find_in_path(bin: &str) -> Option<PathBuf> {
     let path = std::env::var_os("PATH")?;
     for dir in std::env::split_paths(&path) {
@@ -1346,14 +1492,12 @@ fn detect_profile(root: &Path) -> &'static str {
     }
 }
 
-pub(crate) fn approvals_list(runtime_dir: &Path) -> anyhow::Result<()> {
+fn collect_approvals(runtime_dir: &Path) -> Vec<(PathBuf, Value)> {
     let sessions = runtime_dir.join("sessions");
     let Ok(entries) = std::fs::read_dir(&sessions) else {
-        println!("No approval tickets.");
-        return Ok(());
+        return Vec::new();
     };
-    let mut found = false;
-    println!("{:<16} {:<10} {:<10} {:<70} PATHS", "ESCALATION", "STATUS", "SESSION", "EVIDENCE");
+    let mut tickets = Vec::new();
     for entry in entries.flatten() {
         let path = entry.path().join("approval.json");
         let Ok(raw) = std::fs::read_to_string(&path) else {
@@ -1362,18 +1506,27 @@ pub(crate) fn approvals_list(runtime_dir: &Path) -> anyhow::Result<()> {
         let Ok(ticket) = serde_json::from_str::<Value>(&raw) else {
             continue;
         };
-        found = true;
+        tickets.push((entry.path(), ticket));
+    }
+    tickets
+}
+
+pub(crate) fn approvals_list(runtime_dir: &Path) -> anyhow::Result<()> {
+    let tickets = collect_approvals(runtime_dir);
+    if tickets.is_empty() {
+        println!("No approval tickets.");
+        return Ok(());
+    }
+    println!("{:<16} {:<10} {:<12} {:<70} PATHS", "ESCALATION", "STATUS", "SESSION", "EVIDENCE");
+    for (dir, ticket) in tickets {
         println!(
-            "{:<16} {:<10} {:<10} {:<70} {}",
+            "{:<16} {:<10} {:<12} {:<70} {}",
             ticket.get("escalation_id").and_then(|v| v.as_str()).unwrap_or("-"),
             ticket.get("status").and_then(|v| v.as_str()).unwrap_or("-"),
-            entry.file_name().to_string_lossy(),
+            dir.file_name().unwrap_or_default().to_string_lossy(),
             ticket.get("evidence_hash").and_then(|v| v.as_str()).unwrap_or("-"),
             ticket.get("paths").and_then(|v| v.as_array()).map(|a| a.len()).unwrap_or(0)
         );
-    }
-    if !found {
-        println!("No approval tickets.");
     }
     Ok(())
 }
