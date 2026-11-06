@@ -104,7 +104,7 @@ aegis-os install
 ## 文档
 
 - **Enforced Runtime 设计** — advisory / enforced / isolated 威胁模型、Effect 模型、阶段计划：[`docs/AEGIS_ENFORCED_RUNTIME_DESIGN.md`](docs/AEGIS_ENFORCED_RUNTIME_DESIGN.md)
-- **详细架构** — 五大支柱、MCP 工具矩阵、Cloud Mode、AAP-1.0、完整基准、路线图：[`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md)
+- **详细架构** — 信任边界、核心 crate、工作区与合并模型、MCP/A2A 接口、领域 profile、云端 PaaS、基准与实施状态：[`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md)
 - **基准报告** — [`BENCHMARK_REPORT.md`](BENCHMARK_REPORT.md)
 - **论文** — [`paper/aegis_os_arxiv_preprint.pdf`](paper/aegis_os_arxiv_preprint.pdf)
 - **AAP-1.0 应用协议** — [`docs/AEGIS_APPLICATION_PROTOCOL.md`](docs/AEGIS_APPLICATION_PROTOCOL.md)

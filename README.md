@@ -105,7 +105,7 @@ aegis-os install
 ## Documentation
 
 - **Enforced runtime design** — advisory/enforced/isolated threat model, effect model, phase plan: [`docs/AEGIS_ENFORCED_RUNTIME_DESIGN.md`](docs/AEGIS_ENFORCED_RUNTIME_DESIGN.md)
-- **Detailed architecture** — core pillars, MCP tool matrix, cloud mode, AAP-1.0, full benchmarks, roadmap: [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md)
+- **Detailed architecture** — trust boundary, core crates, workspace/merge model, MCP/A2A surface, domain profiles, cloud PaaS, benchmarks, status: [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md)
 - **Benchmark report** — [`BENCHMARK_REPORT.md`](BENCHMARK_REPORT.md)
 - **Paper** — [`paper/aegis_os_arxiv_preprint.pdf`](paper/aegis_os_arxiv_preprint.pdf)
 - **AAP-1.0 application protocol** — [`docs/AEGIS_APPLICATION_PROTOCOL.md`](docs/AEGIS_APPLICATION_PROTOCOL.md)
