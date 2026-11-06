@@ -82,7 +82,7 @@ Phase 1 限制（暂不要把它当成完整安全边界）：
 
 - 仅 Linux；需要 bubblewrap **>= 0.10**（`--bind-fd`）。macOS 在 Phase 4。
 - 出站是 CONNECT-only 域名 allowlist（经本地代理）；宿主 loopback 不可达，但 L7 DLP / 密钥注入尚未实现。
-- 审批、租约、`--mode observe`、OpenCode/Hermes adapter 与策略引擎在后续阶段。
+- 提交审批、证据哈希与 `workspace_commit` 租约已实现；剩余：L7 DLP / Base URL 反向代理、完整 policy broker UI、DomainProfile 合并器与 macOS Seatbelt。
 
 ### 日常使用方式（零感知自动挂载）
 
