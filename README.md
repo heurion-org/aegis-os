@@ -1,6 +1,6 @@
 # Aegis OS (`aegis-os`)
 
-**[English](README.md) | [简体中文](README_CN.md) | [Aegis OS Website](https://heurion.org/aegis-os/) | [Tutorial](https://heurion.org/aegis-os/tutorial/) | [Cloud Console & Pro Subscription ($29/mo)](https://heurion.org/aegis-cloud/dashboard) | [Approval Console](https://heurion.org/aegis-cloud/approve)**
+**[English](README.md) | [简体中文](README_CN.md) | [Aegis OS Website](https://heurion.org/aegis-os/) | [Tutorial](https://heurion.org/aegis-os/tutorial/) | [Technical Blog](https://heurion.org/en/blog) | [Cloud Console & Pro Subscription ($29/mo)](https://heurion.org/aegis-cloud/dashboard) | [Approval Console](https://heurion.org/aegis-cloud/approve)**
 
 **A Transactional Multi-Tenant Operating System Runtime & Cloud PaaS for Eliminating Authorization Fatigue in Autonomous Coding Agents (`agy`, `claude`, `codex`)**
 
@@ -12,6 +12,8 @@
 
 ![Paper](https://img.shields.io/badge/Paper-arXiv%20Preprint-b31b1b.svg)
 
+[![Blog](https://img.shields.io/badge/Blog-heurion.org%2Fen%2Fblog-0A7D52.svg)](https://heurion.org/en/blog)
+
 [![M8ven Score](https://m8ven.ai/badge/mcp/heurion-org/aegis-os)](https://m8ven.ai/mcp/heurion-org/aegis-os?s=readme)
 
 ---
@@ -22,7 +24,7 @@ Autonomous coding agents such as **Google Antigravity (`agy`)**, **Anthropic Cla
 
 1. **Severe Authorization Fatigue**: Action-level Human-in-the-Loop (HITL) confirmation prompts interrupt developers on **45%–57%** of tool calls across multi-step software engineering trajectories, fragmenting autonomous execution to streaks of 4–7 steps.
 2. **Unconfined Execution & In-Place Mutation Risks**: Bypassing prompts (`--yolo` / `--dangerously-skip-permissions`) exposes host files, SSH/cloud credentials (`~/.ssh/id_rsa`, `~/.aws/credentials`, `~/.kube/config`), and raw API tokens (`$GITHUB_TOKEN`) to indirect prompt injection and hallucinated corruption.
-3. **Multi-Agent Workspace Collisions & Context Bloat**: Running multiple agents in parallel over a shared working tree causes silent lost updates, binary build artifact conflicts, and stale incremental compiler caches (`mtime` skew), while passing large specifications inline bloats LLM context windows.
+3. **Multi-Agent Workspace Collisions & Context Bloat**: Running multiple agents in parallel over a shared working tree causes silent lost updates (**41.2%** of concurrent writes lost or corrupted in uncoordinated shared-folder benchmarks), binary build artifact conflicts, and stale incremental compiler caches (`mtime` skew), while passing large specifications inline bloats LLM context windows.
 
 **Aegis OS (`aegis-os`)** resolves this dilemma by shifting the authorization boundary from individual tool calls to **transactional workspace boundaries**, operating seamlessly both as a **local workstation runtime** and as a **Multi-Tenant Cloud Agent Runtime PaaS (`aegis-cloud`)**:
 
@@ -147,6 +149,7 @@ After running `aegis-os install` once, you **never need to invoke `aegis-os` man
   2. **Tier 2 (2-Phase LCS Diff3, Superset & Commutative Declaration Merge)**: Concurrent edits to different lines, identical changes (`th == oh`), superset line additions (`is_subsequence`), or concurrent commutative import/module declarations (`use ...;`, `pub mod ...;`, `import ...`) at the same anchor line are merged automatically without false conflicts.
   3. **Tier 3 (Non-Destructive Conflict Isolation & Sandboxed Semantic Gate)**: True overlapping same-line conflicts never corrupt shadow source files with `<<<<<<<` markers; instead, `RefreshReport.conflict_details` records the exact file, line number, and both versions, pushing an `[Aegis-OS Merge Conflict Alert]` to the agent at `PreInvocation`. In addition, `workspace_commit` supports an optional sandboxed `verify_cmd` (explicitly passed, via `AOS_VERIFY_CMD`, or configured in `<repo>/.aegis/verify.json`) that catches disjoint-line semantic regressions before any host file is modified.
   4. **Tier 4 (Binary Artifact Guard)**: Prevents accidental overwrite of concurrently generated binary artifacts (`.pdf`, `.tar.gz`), supporting scoped `paths` commits or explicit `overwrite_binaries: true`.
+- **Measured Auto-Merge Rate**: In the [Monograph 03](https://heurion.org/en/blog/aegis-os-transactional-agent-kernel) multi-agent workload, this 4-tier engine auto-merges **98.7%** of concurrent edits without human intervention; the remaining **1.3%** are isolated and routed to domain verification gates (compilers, LaTeX, schema validators, PHI scanners).
 
 ### 2. Dual-Tier Kernel Sandbox & Confused-Deputy-Safe Egress Proxy (`aos-sandbox`, `aos-egress`)
 
@@ -404,6 +407,8 @@ cargo build --release -p aos-cli --features ablation && python3 scripts/e5_ablat
 
 ### Summary of Empirical Results (`macos-aarch64` APFS & `linux-aarch64` Ubuntu 24.04 btrfs/XFS/ext4)
 
+> **Benchmark scope**: Monograph 03's `0.42 ms` figure is the trunk-anchored metadata fork; the `6.28 ms` / `15.6 ms` figures below measure full provisioning of a 1,000-file (78.1 MB) workspace. The two numbers measure different scopes; see [`BENCHMARK_REPORT.md`](BENCHMARK_REPORT.md) for the exact setup.
+
 | Experiment                                                                                  | Key Empirical Finding                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                      |
 | :------------------------------------------------------------------------------------------ | :--------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
 | **EXP 1 & 1B: Authorization Friction (1,500 Controlled Calls + 28,087 Real Session Calls)** | Reduces human confirmation prompts by **94.19%–99.88%** across 50 controlled trajectories (from **57.33%** `Host-Interactive` / **45.33%** `Host-Static-Allowlist` to **3.33%** `Per-Task Commit Gate` and **0.07%** `1h Session Lease`), and by **90.7%–97.9%** across **52 real production coding-agent session logs (28,087 tool calls)**, lowering aggregate IPR from **53.31%** (`Ask-Every-Mutation`) and **28.54%** (`Path+Prefix Allowlist`) to **1.12%** (`Aegis OS`).                                                                                                                                                                                                                                                                                                                                                                                                                                                                            |
@@ -411,6 +416,17 @@ cargo build --release -p aos-cli --features ablation && python3 scripts/e5_ablat
 | **EXP 3A, 3B & 3C: CoW Provisioning, Real-Tool Baselines & Micro-Latency**                  | Clones a 1,000-file (78.1 MB) repo in **`6.28 ± 0.65 ms` on macOS APFS** (**16× faster** than `cp -cR` at `99 ms` and **20× faster** than `git worktree add` at `125 ms`) and **`15.6 ms` on Linux btrfs** via our 7-syscall single-open `FICLONE` path (`35.1 ms` on ext4 `copy_file_range`), with **94.0%–97.5% disk savings** across 10 concurrent agents; `PolicyKernel::evaluate` is **`0.31 µs`** (`2.96M ops/s`), `IpcBus::send+recv` is **`1.06 µs`**, local `POST /mcp` is **`177.11 µs`**, cross-OS macOS-to-Linux `POST /v1/mcp` is **`0.80 ms`** (`P50 = 0.78 ms`, `P99 = 0.99 ms`), and 2-Phase LCS Diff3 `commit_to_host` is **`424.02 µs`**.                                                                                                                                                                                                                                                                                                |
 | **EXP 4A, 4B & 4C: 3-Agent Concurrent Rust Build, Syntactic & Semantic Conflict Detection** | Preserves **3/3 (100%)** concurrent structural & function edits across `agy` + `claude` + `codex` (vs. 1/3 in shared host mode), detects **10/10 (100%)** overlapping line conflicts in Phase 1, intercepts **10/10 (100%)** disjoint-line semantic regressions via sandboxed pre-commit `verify_cmd` (`rustc --emit=metadata`), passes `cargo test --offline` (`exit code 0`), and achieves **99.85% in-transit IPC token reduction** via CAS `FilePart` URIs.                                                                                                                                                                                                                                                                                                                                                                                                                                                                                            |
 | **EXP 5: Multi-File Corruption Time-Travel Rollback**                                       | Atomically rolls back 10, 50, and 200 corrupted Rust modules (up to 12.8 MB) in **`0.75 ± 0.04 ms`**, **`2.33 ± 0.14 ms`**, and **`8.68 ± 1.02 ms`** (**up to 2.4× faster** than sequential file restore), immediately verified by live `cargo check --offline`.                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                           |
+
+---
+
+## Technical Monographs & Further Reading
+
+Long-form architecture notes with methodology, figures, and reproducible benchmarks:
+
+- **[Monograph 03 — Beyond Git Feature Branches & Shared Folders](https://heurion.org/en/blog/aegis-os-transactional-agent-kernel)** ([中文](https://heurion.org/blog/aegis-os-transactional-agent-kernel)): 0.42ms trunk-anchored CoW shadow workspaces, TTL claims, 4-tier LCS auto-merge with domain gates, and SHA-256 CAS artifact buses.
+- **[Monograph 02 — Human-Agent Capability & Permission Parity](https://heurion.org/en/blog/human-agent-capability-parity-ai-native-software)** ([中文](https://heurion.org/blog/human-agent-capability-parity-ai-native-software)): AI permissions equal user permissions, zero-fork in-process invocation, and compile-time route-to-tool parity.
+- **[Monograph 01 — Why Free-Form Shell Agents Fail at Research Manuscripts](https://heurion.org/en/blog/dual-surface-crdt-clinical-ai)** ([中文](https://heurion.org/blog/dual-surface-crdt-clinical-ai)): dual-surface CRDT, byte-preserving OOXML patching, and 0.128ms selective rollback.
+- **[Technical Blog Index](https://heurion.org/en/blog)** ([中文](https://heurion.org/blog)): all bilingual monographs and engineering notes.
 
 ---
 
@@ -435,7 +451,7 @@ cargo build --release -p aos-cli --features ablation && python3 scripts/e5_ablat
 
 To help us understand adoption across operating systems and coding clients (`agy`, `claude`, `codex`), `aegis-os` records a minimal, strictly anonymous ping during `aegis-os install` and at most once per UTC day on session start:
 
-- **What is sent**: A one-way irreversible 16-hex-character hash (`anon-<16hex>`), Aegis OS version (`0.4.5`), OS/architecture (`macos-aarch64`, `linux-x86_64`), and client type (`agy`, `claude-code`, `codex-cli`).
+- **What is sent**: A one-way irreversible 16-hex-character hash (`anon-<16hex>`), Aegis OS version (`0.4.6`), OS/architecture (`macos-aarch64`, `linux-x86_64`), and client type (`agy`, `claude-code`, `codex-cli`).
 - **What is NEVER sent**: No source code, file paths, repository names, environment variables, prompts, usernames, or hostnames are ever collected.
 - **Inspect or Opt Out Anytime**:
   - View current telemetry & GitHub release stats in your terminal: `aegis-os stats`

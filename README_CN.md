@@ -1,6 +1,6 @@
 # Aegis OS (`aegis-os`)
 
-**[English](README.md) | [简体中文](README_CN.md) | [Aegis OS 官网概览](https://heurion.org/aegis-os/) | [使用教程](https://heurion.org/aegis-os/tutorial/) | [云端控制台与 Pro 订阅 ($29/月)](https://heurion.org/aegis-cloud/dashboard) | [边界审批台](https://heurion.org/aegis-cloud/approve)**
+**[English](README.md) | [简体中文](README_CN.md) | [Aegis OS 官网概览](https://heurion.org/aegis-os/) | [使用教程](https://heurion.org/aegis-os/tutorial/) | [技术博客](https://heurion.org/blog) | [云端控制台与 Pro 订阅 ($29/月)](https://heurion.org/aegis-cloud/dashboard) | [边界审批台](https://heurion.org/aegis-cloud/approve)**
 
 **面向自主编程 Agent（`agy`、`claude`、`codex`）的事务型多租户操作系统运行时与云端沙箱 PaaS —— 彻底消除授权弹窗疲劳，兼顾零信任内核隔离与多 Agent 协同**
 
@@ -17,7 +17,7 @@
 
 1. **严重的授权弹窗疲劳（Authorization Fatigue）**：在多步工程任务中，45%–57% 的工具调用会触发人工确认弹窗，打断思考流。
 2. **裸奔模式（`--yolo` / `--dangerously-skip-permissions`）极度危险**：直接关闭确认会让 Agent 暴露在宿主机的 `~/.ssh`、`~/.aws`、`~/.kube` 私钥以及原地误删代码的风险之下。
-3. **多 Agent 并行冲突与笔记本算力过载**：同时开启多个 Agent 窗口修改同一目录会导致互相覆盖、编译缓存失效，且重型 `cargo build` / `npm build` 会占满本地 CPU 与内存。
+3. **多 Agent 并行冲突与笔记本算力过载**：同时开启多个 Agent 窗口修改同一目录会导致互相覆盖（无协调共享目录基准中 **41.2%** 的并发写入会丢失或损坏）、编译缓存失效，且重型 `cargo build` / `npm build` 会占满本地 CPU 与内存。
 
 **Aegis OS (`aegis-os`)** 将安全边界从“单次工具调用弹窗”提升为**“事务型写时复制（CoW）工作区边界”**：
 - 在工作区内部：Agent 拥有独立的 CoW 影子仓库与 OS 内核沙箱（macOS `Seatbelt` / Linux `bwrap`），**读写代码、跑测试、多 Agent 通信 0 弹窗自动放行（减少 94%–99.8% 弹窗）**；
@@ -113,8 +113,8 @@ Phase 1 限制（暂不要把它当成完整安全边界）：
 ## 五大核心技术支柱
 
 1. **事务型写时复制文件系统与 4 层自动三路合并 (`aos-vfs`)**：
-   - 基于 macOS APFS `clonefile`（1,000 文件仅需 `6.28 ms`）与 Linux Btrfs/XFS `ioctl(FICLONE)` reflink（`15.6 ms`）实现零拷贝分支；跨挂载点（如 `ext4 -> tmpfs`）下超大文件回退为完整物理拷贝，而不是指向原路径的符号链接——当 shadow 挂到原项目路径后，该链接会变成自指。ext4 的 O(1) 回退（OverlayFS / fuse-overlayfs）在后续阶段实现。
-   - 内置 **4 层 LCS Diff3 三路合并引擎**：支持未修改文件零拷贝快进、不同行并发修改自动拼接、同锚点 `use`/`import`/`mod` 声明自动去重并集，以及 `.aegis/verify.json` / `AOS_VERIFY_CMD` 预提交沙箱语义门禁。
+   - 基于 macOS APFS `clonefile`（1,000 文件仅需 `6.28 ms`）与 Linux Btrfs/XFS `ioctl(FICLONE)` reflink（`15.6 ms`）实现零拷贝分支；跨挂载点（如 `ext4 -> tmpfs`）下超大文件回退为完整物理拷贝，而不是指向原路径的符号链接——当 shadow 挂到原项目路径后，该链接会变成自指。ext4 的 O(1) 回退（OverlayFS / fuse-overlayfs）在后续阶段实现。（Monograph 03 中的 `0.42 ms` 指主干锚定的元数据派生；这里的 `6.28 ms` / `15.6 ms` 指 1,000 文件 / 78.1 MB 工作区的完整供给，两者口径不同。）
+   - 内置 **4 层 LCS Diff3 三路合并引擎**：支持未修改文件零拷贝快进、不同行并发修改自动拼接、同锚点 `use`/`import`/`mod` 声明自动去重并集，以及 `.aegis/verify.json` / `AOS_VERIFY_CMD` 预提交沙箱语义门禁。在 Monograph 03 的多 Agent 负载中，该引擎可自动归并 **98.7%** 的并发修改，剩余 1.3% 进入领域预检门。
 2. **双层 OS 内核沙箱与进程组生命周期控制 (`aos-sandbox`)**：
    - 基于 macOS Seatbelt (`/usr/bin/sandbox-exec`) 与 Linux Bubblewrap (`bwrap --unshare-all`) 强制执行只读根目录与 `$HOME` 默认拒绝（`--tmpfs` 遮蔽并只读回挂 `.rustup` / `.cargo` 工具链），支持 `pause()` / `resume()` / `destroy()` 真实进程组信号管控（`SIGSTOP` / `SIGCONT` / `SIGKILL`）。
 3. **零信任出站代理、HTTPS `CONNECT` 隧道与边界密钥注入 (`aos-egress`)**：
@@ -136,3 +136,12 @@ Phase 1 限制（暂不要把它当成完整安全边界）：
 - **随时关闭**：设置环境变量 `export DO_NOT_TRACK=1` 或 `export AOS_TELEMETRY_DISABLED=1`，或执行 `touch ~/.gemini/aegis-telemetry-opt-out` 即可完全静默。
 
 更多架构细节、39 个 MCP 工具完整列表、`AAP-1.0` 应用生态与论文基准测试报告请参阅英文主文档：[README.md](README.md)。
+
+---
+
+## 延伸阅读
+
+- **[Monograph 03 — 超越 Git 分支与共享目录](https://heurion.org/blog/aegis-os-transactional-agent-kernel)**（[English](https://heurion.org/en/blog/aegis-os-transactional-agent-kernel)）：0.42ms 主干锚定 CoW 影子工作区、TTL 租约锁、四级 LCS 归并与 SHA-256 CAS 产物总线。
+- **[Monograph 02 — 人机权限与能力对等](https://heurion.org/blog/human-agent-capability-parity-ai-native-software)**（[English](https://heurion.org/en/blog/human-agent-capability-parity-ai-native-software)）：AI 的权限 = 用户的权限、进程内零分叉调用与编译期全路由工具对等不变量。
+- **[Monograph 01 — 为什么自由 Shell 智能体在科研论文写作中会失效](https://heurion.org/blog/dual-surface-crdt-clinical-ai)**（[English](https://heurion.org/en/blog/dual-surface-crdt-clinical-ai)）：双表面 CRDT、字节级 OOXML 补丁与 0.128ms 单轮靶向回滚。
+- **[技术博客总目录](https://heurion.org/blog)**（[English](https://heurion.org/en/blog)）：全部双语系统架构专论与工程手记。
