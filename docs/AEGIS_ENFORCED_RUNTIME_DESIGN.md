@@ -14,56 +14,100 @@
 
 | Phase | 状态 | 已完成 | 下一步 |
 |---|---|---|---|
-| **Phase 0** 说真话与可观测性 | ✅ 完成 | README / 设计文档分级、`doctor` enforcement 检查、客户端矩阵、可移植 `.agents/hooks.json` | 持续维护兼容矩阵 |
-| **Phase 1** `aos run` Linux MVP | ✅ 完成 | bwrap 进程树、CoW shadow、宿主只读、`$HOME`/系统目录遮蔽、Git 视图、状态目录分层、工具链挂载、CONNECT egress allowlist、TUI 继承、Ctrl-C、bwrap 版本探测 | macOS Seatbelt（Phase 4） |
-| **Phase 2** Effect / 审批 / 租约 | 🟡 部分完成 | `aos-core::effect`、commit approval ticket、`evidence_hash` + TOCTOU、`aos approvals` CLI/Web、`workspace_commit` 租约、敏感路径守卫、audit/`aos why` | Base URL 反向代理 + L7 DLP、opt-in MITM、完整 policy broker UI |
-| **Phase 3** DomainProfile / 预检 / CAS | 🟡 部分完成 | `--profile auto`、文本 LCS、二进制排他锁+基线哈希、`aos verify` 沙箱预检门、`aos publish` / `artifacts list/fetch` CAS | docs/data 专用合并器、Schema/PHI 预置 profile、章节/分区 claim |
-| **Phase 4** macOS / 内核加固 | ⬜ 未开始 | — | Seatbelt 默认收紧、Landlock/seccomp、microVM 试点 |
+| **Phase 0** 说真话与可观测性 | 🟡 部分完成 | `doctor` 现在检查 Aegis 配置条目、PATH shim/enforcement 状态、broker 缺失提示；README 有 Phase 1 limits；`.agents/hooks.json` 可移植 | 公开客户端能力矩阵、Hook 实际加载状态、telemetry |
+| **Phase 1** `aos run` Linux MVP | 🟡 MVP 完成，完整交付未完成 | bwrap 进程树、CoW shadow、宿主只读、`$HOME`/系统目录遮蔽、Git 目录视图、状态目录持久化绑定、工具链挂载、CONNECT egress allowlist、PTY + SIGWINCH/SIGTERM/Ctrl-C、退出摘要与 pending 退出码、advisory 降级、bwrap 版本探测 | worktree `.git`、OverlayFS、observe 网络只读 |
+| **Phase 2** Effect / 审批 / 租约 | 🟡 部分完成 | `aos-core::effect` + `policy_action` 桥接、commit approval ticket、**full-content SHA-256 evidence** + TOCTOU、`aos approvals` CLI/Web、`workspace_commit` 租约（复用 policy matcher）、敏感路径守卫、哈希链 audit/`aos why`、**模型 API Base URL 反向代理 + L7 DLP**、**per-session broker + `AOS_SESSION_TOKEN` + `AOS_CONTROL_SOCKET` + MCP stdio bridge + `aos adapter hello/capabilities/evaluate/effect/heartbeat`**、AdapterManifest / `aos agent add/test`、OpenCode V1 plugin、`aos policy watch` + 桌面通知 | opt-in MITM、DecisionClass/Cedar 属性、OpenCode V2 tool hooks、Hermes plugin、完整 policy broker UI、通用第三方 API L7 |
+| **Phase 3** DomainProfile / 预检 / CAS | 🟡 部分完成 | `DomainProfile` 接口 + `.aegis/workspace.json` profile/verify、`aos workspace profile`、read/write claims、文本 LCS、二进制排他锁+基线哈希、`aos verify`、`aos publish` / `artifacts list/fetch`（带 verify 门与 shadow 路径约束）、`aos diff --render`（文本 preview） | docs/data 专用合并器、Office CRDT、Schema/PHI 预置 profile、五客户端 adapter/plugin、章节/分区 claim |
+| **Phase 4** macOS / 内核加固 | 🟡 部分完成 | macOS Seatbelt launcher MVP：shadow cwd、宿主只读、credential deny、egress proxy、PTY、broker TCP control、MCP bridge；macOS 已手工验证 | Seatbelt default-deny 收敛、路径重映射、Landlock/seccomp、microVM 试点 |
 | **Phase 5** 高级领域 / IDE / 企业 | ⬜ 未开始 | — | Office CRDT、AAP-1.0、UOMP、IDE daemon、MDM |
 
 **当前验证**
 
 ```text
-cargo test -p aos-cli -p aos-core -p aos-vfs   # 52 passed
-cargo clippy -p aos-cli -p aos-core -p aos-vfs -- -D warnings
+cargo test -p aos-cli -p aos-core -p aos-vfs   # 69 passed (macOS, rustc 1.99)
+cargo test -p aos-egress                       # 7 passed; 2 ignored (real TLS handshake)
+cargo clippy --workspace --all-targets -- -D warnings
 ```
 
-手工覆盖：`aos run` 宿主只读 / shadow 写入、Git 视图、Claude/OpenCode 启动、CONNECT allowlist、未授权域名 403、commit 审批/租约/TOCTOU、`aos approvals serve`、`aos verify`、`aos publish` / `aos artifacts fetch`。
+手工覆盖：`aos run` 宿主只读 / shadow 写入、Git 视图、Claude/OpenCode 启动、CONNECT allowlist、未授权域名 403、commit 审批/租约/TOCTOU（full-content hash）、`aos approvals serve`、`aos verify`、`aos publish` / `aos artifacts fetch`、`aos run --no-enforce`、`aos uninstall --shim-only`。
+
+**Linux VM 验证（Ubuntu 24.04 aarch64 / bwrap 0.9.0，需关闭 AppArmor unprivileged userns 限制）**：
+
+- `aos run -- /bin/sh` 内 `AOS_SESSION_TOKEN` / `AOS_CONTROL_SOCKET` 可见；
+- `aos adapter heartbeat`、`evaluate`、`hello`、`capabilities` 通过只读挂载的 broker socket 工作；
+- `aos mcp-bridge` 的 `tools/list` 返回 39 个工具，`fs_write` 只写 shadow，宿主文件未创建；
+- `aos agent test sh` 在会话内完成 hello + heartbeat + MCP tools/list，输出 `PASS (live broker)`；
+- `aos adapter evaluate shell --input '{"command":"git push origin main"}'` 返回 `ask` + escalation id；
+- `script -q -c "aos run -- /bin/sh -c 'tty; stty size'" /dev/null` 在 `aos run` 下得到 PTY：`/dev/console`、`24 80`；
+- Agent 正常退出后返回码为 `10`，退出摘要列出 shadow 变更。
+
+**macOS Seatbelt MVP 验证（macOS 27 / aarch64）**：
+
+- `aos run -- /bin/sh` 进入 Seatbelt，cwd 为 shadow，`AOS_HOST_ROOT` 可只读访问宿主项目；
+- 写宿主项目、写 `/tmp`、读 `/Users/<user>/.ssh/*` 均返回 `Operation not permitted`；
+- `aos adapter heartbeat/session` 通过 loopback TCP broker 工作；
+- `aos mcp-bridge` 的 `tools/list`/`fs_write` 正常，MCP 写入只落 shadow；
+- `script -q /dev/null ...` 下 `tty` 为 `/dev/ttys006`、`stty size` 为 `24 80`；
+- Agent 退出后 shadow 摘要和退出码正常。
 
 **近期计划（按优先级）**
 
-1. **P0：Base URL 反向代理 + L7 DLP**  
-   把 `ANTHROPIC_BASE_URL` / `OPENAI_BASE_URL` 指向本地反向代理，支持流式响应、请求体 DLP、边界密钥注入；完成后再做 opt-in MITM。  
-   完成标准：`api.anthropic.com` / `api.openai.com` 走 L7 模式，恶意 body 被拒绝，SSE 首 token 延迟不退化。
+1. **P0：完整 MCP bridge + Adapter hello/capabilities + Hook/plugin 自动接入**
+   per-session broker 已提供 `AOS_SESSION_TOKEN` / `AOS_CONTROL_SOCKET`、`adapter.evaluate/effect/heartbeat` 和 human escalation/lease/audit；下一步把 MCP JSON-RPC 桥进 sandbox，并让 Claude/AGY/OpenCode/Hermes adapter 自动声明能力、消费 allow/ask/deny。
+   完成标准：Agent 只能通过 session token 调用 broker；未知 MCP server 默认拒绝；TUI 活跃时审批走旁路。
 
-2. **P1：OverlayFS / fuse-overlayfs CoW backend**  
-   在 ext4 上实现 O(1) shadow 创建，删除第二次 baseline 全量拷贝。  
+2. **P1：opt-in MITM / 第三方 API L7**
+   模型 API 的 Base URL L7 已完成；下一步为不支持 base URL 的第三方 API 做 opt-in MITM（per-session CA、pin 失败回退、明确 L7 不可用）。
+   完成标准：列入 `mitm_domains` 的域名可做 method/path/body 审计；未列入域名仍只记录 `net.connect`。
+
+3. **P1：OverlayFS / fuse-overlayfs CoW backend**
+   在 ext4 上实现 O(1) shadow 创建，删除第二次 baseline 全量拷贝。
    完成标准：1 GB 数据集启动 P95 < 150 ms，`doctor` 显示 `cow_backend: overlay`。
 
-3. **P1：docs/data profile 深化**  
-   章节/段落 claim、Schema-aware data merge、PHI/schema verify、CAS + task DAG 接力。  
+4. **P1：docs/data profile 深化**
+   章节/段落 claim、Schema-aware data merge、PHI/schema verify、CAS + task DAG 接力。
    完成标准：多 Agent 改不同章节成功、同段落冲突、数据 Schema/PHI 失败不落盘、下游只读 CAS 哈希。
 
-4. **P2：macOS Seatbelt + isolated VM**  
-   Phase 4 平台工作，需要 macOS 实机验证。  
+5. **P2：macOS Seatbelt + isolated VM**
+   Phase 4 平台工作，需要 macOS 实机验证。
    完成标准：`aos run -- claude` 在 macOS 上完成同样的文件/网络边界测试。
 
-5. **P2：OpenCode plugin / Hermes adapter**  
-   OpenCode 已有 MCP 配置与 `--standalone` 启动；补齐 install-time plugin 与 Hermes Adapter Protocol。  
+6. **P2：OpenCode plugin / Hermes adapter**
+   OpenCode 已有 MCP 配置与 `--standalone` 启动；补齐 install-time plugin 与 Hermes Adapter Protocol。
    完成标准：`aos agent test` 能验证 heartbeat、permission hook、MCP 工具调用。
 
 **已知限制**
 
-- Linux only；需要 bubblewrap **>= 0.10**（`--bind-fd`）。
-- Egress 是 CONNECT-only 域名 allowlist；L7 DLP / 密钥注入 / MITM 尚未实现。
-- 审批台是本地 CLI/Web，未接入云端 `/approve` 或 TUI 内嵌面板。
-- CoW 仍可能回退到 lazy-copy；OverlayFS 尚未落地。
-- macOS Seatbelt、Office CRDT、AAP-1.0、UOMP、IDE 集成未开始。
+- Linux 需要 bubblewrap（`--bind-fd`；当前验证 0.9.0/Ubuntu 24.04）；macOS 使用 `/usr/bin/sandbox-exec`，以 shadow 作为 cwd，不做路径重映射。
+- 通用 HTTPS 出站仍是 CONNECT-only 域名 allowlist；模型 API 已走 Base URL 反向代理，可做 method/path/body DLP 与边界密钥注入；opt-in MITM / 任意第三方 API L7 尚未实现。
+- `aos run` 已有 per-session broker、`AOS_SESSION_TOKEN` / `AOS_CONTROL_SOCKET`、MCP stdio bridge、`aos adapter hello/capabilities/evaluate/effect/heartbeat`、`aos agent add/test`、OpenCode V1 plugin，以及 Ask 时的 macOS/Linux 桌面通知 + `aos policy watch`；但 OpenCode V2 工具 hook、Hermes plugin、TUI 内嵌审批和完整 AskEach UX 仍未完成。
+- observe 目前只保证 shadow 只读 + commit 拒绝；CONNECT 隧道无法做 L7 方法级只读。
+- 审批台是本地 CLI/Web，未接入云端 `/approve` 或 TUI 内嵌面板；PTY 已支持真实终端，但审批通知仍没有内嵌状态栏。
+- CoW 仍可能回退到 lazy-copy；OverlayFS 尚未落地，`cow_backend` 只报告 `reflink-or-copy`。
+- Git 视图只支持 `.git` 目录；worktree/submodule 的 `.git` 文件尚未处理。
+- macOS Seatbelt 已有 enforced launcher MVP，但仍是 `allow default` + deny 写/凭据/网络，且使用 shadow 作为 cwd（无路径重映射）；default-deny 收敛、VM 形态、Office CRDT、AAP-1.0、UOMP、IDE 集成和 Hermes adapter 未完成。
 - `.agents/hooks.json` 已改为可移植的 `aegis-os` + `--workspace ".."`，不再写死机器路径。
+- 默认 runtime 已迁到 `~/.aegis`（可用 `AOS_RUNTIME_DIR` 覆盖）；旧 `/tmp/aegis-os-runtime` 会话不会自动迁移。
 
 ---
 
 ## 变更记录
+
+- **v0.5**（2026-11-06）：按代码评审落地安全与可用性修复：
+  - evidence hash 现在绑定 old/new 完整 SHA-256，不再只依赖截断 preview；二进制同尺寸替换会使审批失效；
+  - `aos commit` 租约检查复用 policy matcher（org/agent/action/task/`sha256:<evidence>`），并拒绝 observe session；
+  - commit 前检查 peer write claims；`coord_claim` 支持 `read` / `write` 模式；
+  - launcher 持久化绑定 Agent 状态目录、增加退出摘要、pending=10 退出码、SIGWINCH/SIGTERM 转发、`--no-enforce`/advisory；
+  - `aos status` / `doctor` 显示 enforcement、backend、shim、配置条目；默认 runtime 改为 `~/.aegis`；
+  - `aos publish` 增加 verify 门与 shadow 路径约束；`aos diff --render` 输出文本 diff preview；
+  - 新增模型 API Base URL 反向代理：`ANTHROPIC_BASE_URL` / `OPENAI_BASE_URL` / `OPENAI_API_BASE` / `GOOGLE_GEMINI_BASE_URL` 指向 session egress proxy，支持 L7 请求体 DLP、域名/method/path 约束、边界密钥注入和 SSE 流式响应；
+  - 新增 per-session broker：`AOS_SESSION_TOKEN` / `AOS_CONTROL_SOCKET`、`adapter.hello|capabilities|evaluate|effect|heartbeat`、`/v1/mcp` JSON-RPC bridge、human escalation/lease/audit 路由，以及 `aos adapter` / `aos mcp-bridge` 客户端；原生 Claude/AGY hook 已接 broker 的 deny/ask；新增 AdapterManifest 与 `aos agent add/test`，OpenCode/Hermes plugin 全量接入仍待补；
+  - launcher 在真实终端下使用 `openpty` + `setsid`/`TIOCSCTTY`，保留 TUI raw mode、输入流和 `SIGWINCH` resize；管道/CI 继续使用继承 stdio；
+  - 新增 `plugins/opencode-aegis.js` 并随 `aos install` 安装；OpenCode V1 `tool.execute.before/after`、`permission.ask`、`shell.env` 已接 broker，V2 工具 hook 仍待补；
+  - broker 在 `ask` 时写 `pending_escalations.jsonl` 并发送 macOS/Linux 桌面通知；新增 `aos policy watch` 旁路监听；
+  - 新增 macOS Seatbelt launcher MVP：shadow cwd、宿主只读、credential deny、egress proxy、PTY、TCP control socket + MCP bridge；macOS 已手工验证；
+  - 新增 `DomainProfile` 接口、`.aegis/workspace.json` profile/verify 解析、`aos workspace profile`；
+  - audit 改为 SHA-256 hash chain；`aos why` 校验链；修复全 workspace clippy 与测试平台门控。
 
 - **v0.4**（2026-11-06）：更新实施状态与计划：
   - Phase 1 Linux 完成；Phase 2/3 部分完成；
@@ -364,12 +408,12 @@ $ aegis-os install --enforce
 
 安装器行为：
 
-- 扫描 `PATH` 中已知 Agent；只对检测到的写入配置，`--all` 表示全部，`--agent <id>` 表示单个。
-- 写入 `~/.aegis/bin/{claude,codex,agy,opencode,hermes}` shim；shim 解析真实二进制时排除 `~/.aegis/bin`，避免递归。
-- 在 shell 配置中追加 `export PATH="$HOME/.aegis/bin:$PATH"`，支持 bash / zsh / fish；用标记块保证幂等。
+- 扫描 `PATH` 中已知 Agent；当前实现配置 AGY / Claude / Codex / OpenCode，`--all` / `--agent <id>` 仍是 planned。
+- 写入 `~/.aegis/bin/{claude,codex,agy,opencode,hermes}` shim；shim 解析真实二进制时排除 `~/.aegis/bin`，避免递归；`AOS_ENFORCEMENT=advisory` 会让 shim 直接执行真实二进制。
+- 在 shell 配置中追加 `export PATH="$HOME/.aegis/bin:$PATH"`（fish 用 `set -gx PATH`），支持 `.zshrc` / `.bashrc` / `.profile` / fish；用标记块保证幂等。
 - 保留原始客户端配置；不覆盖用户已有 MCP / Hook，只合并标记块。
-- 未知 MCP Agent 打印 `aos agent add` 指引，不假装支持。
-- `aegis-os uninstall --shim-only` 可只移除 shim，不影响 Agent 本体。
+- 未知 MCP Agent 打印 `aos agent add` 指引，不假装支持（`aos agent add` 仍 planned）。
+- `aegis-os uninstall --shim-only` 移除 shim 与 shell PATH block；当前不会自动删除客户端 MCP/Hook 块，也不会删除 shadow，需手工处理。
 
 ### 5.3 日常启动
 
@@ -414,7 +458,7 @@ Agent exited. 7 files changed in shadow.
   aegis-os diff      查看
   aegis-os commit    落盘（走审批）
   aegis-os discard   丢弃
-  aegis-os last      恢复上一次会话的 shadow
+  aegis-os last      定位上一次会话的 shadow 目录
 ```
 
 这条摘要必须由 launcher 在 Agent 退出后打印，不能依赖 Agent 自己汇报。
@@ -427,7 +471,7 @@ Agent exited. 7 files changed in shadow.
 | egress proxy 启动失败 | 启动失败；不静默直连 |
 | MCP broker 不可达 | 启动失败；提示 `aos doctor` |
 | Hook 未加载 | enforced 仍安全；`doctor` 显示「Hook 缺失，UX 降级」 |
-| Agent 崩溃 | shadow 保留；`aos last` 恢复 |
+| Agent 崩溃 | shadow 保留；`aos last` 定位最近会话 |
 | 用户 `--no-enforce` | 启动 advisory；记录审计事件；企业策略可拒绝 |
 
 ### 5.7 关闭保护
@@ -577,13 +621,13 @@ aegis-os run [OPTIONS] -- <agent> [agent-args...]
 
 Options:
   --mode <observe|implement>     会话模式，默认 implement
-  --enforcement <advisory|enforced|isolated>
+  --enforcement <advisory|enforced|isolated>   # isolated planned
   --workspace <path>             项目目录，默认 cwd
-  --session <id>                 恢复已有会话
+  --session <id>                 恢复已有会话（planned）
   --no-enforce                   显式降级到 advisory
   --read-only                    等价于 --mode observe
-  --isolated                     等价于 --enforcement isolated
-  --no-shim                      跳过 PATH shim 检查
+  --isolated                     等价于 --enforcement isolated（planned）
+  --no-shim                      跳过 PATH shim 检查（planned）
 ```
 
 示例：
@@ -607,6 +651,8 @@ aos run -- opencode --standalone
 8. Agent 退出后：停止 broker / proxy，汇总 shadow 变更，打印退出摘要，持久化 session 元数据。
 
 #### 7.1.3 PTY 与信号
+
+> **当前实现**：真实终端下使用 `openpty` + `setsid`/`TIOCSCTTY` 启动 bwrap，保留 raw mode、窗口尺寸和输入流；管道 / CI 仍使用继承 stdio，避免注入终端控制序列。`SIGWINCH` 会 resize PTY 并转发信号；`SIGTERM` / 两次 Ctrl-C 路径已覆盖。
 
 - 使用 `forkpty` / `openpty`（Rust `nix` 或 `portable-pty`）；Agent 的 TUI、颜色、鼠标、窗口大小全部保持。
 - `SIGWINCH` 转发到沙箱内 Agent；`SIGINT` 转发到前台进程组；`SIGTERM` 先优雅关闭，超时后 `SIGKILL` 进程组。
@@ -651,7 +697,7 @@ Agent 视图:  /home/user/work/payments -> bind shadow（读写）
 
 - Shadow 通过 `--bind <shadow> <project>` 挂到 Agent 的原项目路径；Agent 看到的路径是 `<project>`，宿主侧才是 `<shadow>`。因此 `.git` 和 index 的挂载点要用 **Agent 视图路径**，不是宿主侧 shadow 路径：
   - 普通仓库：`--ro-bind /aegis/host/<name>/.git <project>/.git`
-  - worktree / submodule 的 `.git` 文件：`--ro-bind /aegis/host/<name>/.git <project>/.git`（文件级）
+  - worktree / submodule 的 `.git` 文件：`--ro-bind /aegis/host/<name>/.git <project>/.git`（文件级；当前实现只处理 `.git` 目录，文件级待补）
 - `GIT_INDEX_FILE=$HOME/.aegis-git-index`：从宿主 `.git/index` 复制一份可写副本到 agent home（不在工作树内，避免 `git status` 看到未跟踪文件）；`git status` 只更新这份索引，不碰宿主。
 - `GIT_OPTIONAL_LOCKS=0`：减少不必要的 index 刷新。
 - `GIT_DIR` / `GIT_WORK_TREE` 作为 fallback：`GIT_DIR=/aegis/host/<name>/.git`、`GIT_WORK_TREE=<project>`（不是宿主侧 `<shadow>`）。
@@ -699,6 +745,8 @@ Agent 视图:  /home/user/work/payments -> bind shadow（读写）
   - `HTTP_PROXY` / `HTTPS_PROXY` 指向沙箱内 egress bridge。
 - 不注入 `SSH_AUTH_SOCK`、`GPG_AGENT_INFO`、云厂商全局凭证；需要时走 egress 代理注入。
 - macOS Keychain / OAuth：优先使用 Agent 自己的登录态文件；OAuth refresh token 需要可写时，使用 0600 的单文件挂载并在会话结束后原子写回，不把整个 Keychain 暴露给沙箱。
+- **当前实现**注入 `AOS_SESSION_ID` / `AOS_SESSION_TOKEN` / `AOS_CONTROL_SOCKET` / `AOS_ENFORCEMENT` / `AOS_WORKSPACE` / `AOS_HOST_ROOT` / `AOS_PROFILE` 等；`AOS_CONTROL_SOCKET` 指向只读挂载的 per-session broker socket。
+- L7 Base URL 模式下，`ANTHROPIC_API_KEY` / `ANTHROPIC_AUTH_TOKEN` / `OPENAI_API_KEY` 在沙箱内是 `$AOS_SECRET_*` 占位符；真实值只存在于 egress gateway 的 vault，并在 loopback → provider 的边界注入。
 
 #### 7.1.5.1 Agent 状态目录分层
 
@@ -822,6 +870,8 @@ enforced launcher 需要新增/调整：
 #### 7.2.2 macOS：Seatbelt
 
 当前 `generate_macos_seatbelt_profile` 是 `(allow default)` + 写/凭据/网络限制。enforced 模式的目标是 **默认拒绝 + 白名单**，但 Phase 4 先用 `allow default` + 更严格的 deny（写、凭据、网络、敏感路径）跑兼容性矩阵，再逐步收敛；不要一次性切换到 default-deny，否则会用 macOS 工具链兼容性换安全演示。
+
+> **当前实现**：`aos run` 在 macOS 使用 Seatbelt launcher MVP：cwd 设为 shadow、宿主项目通过 `AOS_HOST_ROOT` 只读访问、写入限制在 shadow/agent_home/org pub、credential regex deny、出站仅 localhost egress proxy、broker 用 loopback TCP（Seatbelt 无法按 Unix socket 路径过滤）。PTY、MCP bridge、adapter 已验证。
 
 ```scheme
 (version 1)
@@ -984,7 +1034,7 @@ pub struct Effect {
 | `approval.decide` | `escalation:esc-...` | 审批 |
 | `agent.spawn` | `agent:<id>` | 子 Agent |
 
-Rust `EffectKind` 到策略 action 字符串使用 snake_case 映射：`FsRead → fs.read`、`BinaryWrite → binary.write`、`DatasetSchemaChange → dataset.schema_change`、`AppInvoke → app.invoke`、`MemoryRead → memory.read`、`ArtifactPublish → org_artifact_publish`。保留这张映射表，避免 Rust 枚举和 Cedar 字符串漂移。
+`EffectKind::action()` 是审计/事件使用的 dotted 形式（`fs.read`、`binary.write`、`workspace.commit`）；`EffectKind::policy_action()` 是现有 Cedar 策略与租约使用的 underscore 形式（`fs_read`、`workspace_commit`）。`Effect::to_policy_context` 统一走后者，避免 Rust 枚举、Cedar 字符串和 `aos commit` 租约之间漂移。
 
 `net.request` 只有在 **Base URL 反向代理** 或 **Opt-in MITM** 模式下才可用；标准 HTTPS CONNECT 只能产生 `net.connect`，不能伪造 method / path / body 审计。详见 §7.6。
 
@@ -1141,6 +1191,8 @@ forbid(
 复用 `LeaseGrant`，扩展字段：
 
 ```rust
+// Planned extension; current LeaseGrant uses action_pattern + resource_pattern
+// (`*`, or `sha256:<evidence>` for one-shot) plus kind/task_id.
 pub struct LeaseGrant {
     // existing fields...
     #[serde(default)]
@@ -1222,7 +1274,7 @@ Agent wants to read outside the workspace:
 
 | 环境 | 默认渠道 |
 |---|---|
-| 桌面 + TUI | 桌面通知 + BEL + OSC 0 标题（`⏳ Aegis: 1 approval pending`）；用户在另一个终端 `aos approve` 或 Web 审批。**不向当前 PTY 写审批文本** |
+| 桌面 + TUI | 桌面通知（macOS `osascript` / Linux `notify-send`）+ `aos policy watch`；用户在另一个终端审批。**不向当前 PTY 写审批文本** |
 | SSH / 无 GUI | OSC 0 标题 + BEL；提示用户另开终端 `aos approve`，或由 MCP / Hook 返回结构化挂起状态，交给客户端原生权限框 |
 | Web / 远程 | `/approve` 网页，支持 SHA-256 diff 锁定 |
 | CI / 非交互 | 预置租约或 `--yes`（仅限预先声明的范围）；否则失败 |
@@ -1301,9 +1353,9 @@ Agent wants to read outside the workspace:
 #### 7.6.3 默认策略
 
 - 任意 HTTPS：默认 CONNECT，只做域名/端口 allowlist。
-- 模型 API：Phase 2 起默认 Base URL 反向代理，启用 L7 DLP + 密钥注入；如果客户端不支持 base URL，降级为 CONNECT，并在 `doctor` 标注 `l7: unavailable`。
+- 模型 API：Phase 2 起默认 Base URL 反向代理，启用 L7 DLP + 密钥注入；当前已支持 Anthropic / OpenAI / Gemini / DeepSeek / Mistral / Groq / xAI / OpenRouter 路由。如果客户端不支持 base URL，降级为 CONNECT，并在 `doctor` 标注 `l7: unavailable`（doctor 的逐客户端标注仍待补）。
 - 需要 L7 的第三方 API：显式加入 `mitm_domains`，opt-in MITM。
-- 代理健康检查：`/v1/health`；launcher 启动前检查。
+- 代理健康检查：`/v1/health`；launcher 启动前检查（仍待补；当前 bind 成功即视为可用）。
 - 失败关闭：代理不可用则 Agent 无法出网；不自动直连。
 - 隐私：Base URL / MITM 会看到 prompt 和响应；必须在首次启用时向用户说明，企业版提供关闭 body 日志的默认配置。
 
@@ -1321,7 +1373,7 @@ Agent wants to read outside the workspace:
   8. `commit_to_host_with_options()`；串行锁 + epoch 复检。
   9. 审计。
 - `--mode observe`：commit 硬拒绝。
-- `aos discard`：删除 shadow；`aos last`：恢复。
+- `aos discard`：删除 shadow；`aos last`：定位最近会话目录。
 - 二进制文件：默认不落盘；需要 `overwrite_binaries` 时强制 sensitive 审批。
 
 #### 7.7.1 领域化提交流水线
@@ -1583,6 +1635,8 @@ Agent（不可信）  ──Unix socket / CLI──▶  Aegis broker（受信任
 - **降级**：Agent 不实现协议时，仍可通过 MCP + launcher 工作；`doctor` 标注 `adapter: none`。
 - **安全边界**：协议是 cooperative 的，只用于 advisory UX 和审计；enforced 的安全仍由内核负责。
 
+> **当前实现**：`AOS_SESSION_TOKEN` / `AOS_CONTROL_SOCKET`、`adapter.hello` / `capabilities` / `evaluate` / `effect` / `heartbeat`、`/v1/mcp` JSON-RPC bridge（`aos mcp-bridge` / `aos mcp-stdio` 自动委派）和 `aos adapter` 客户端已落地；MCP 工具与 launcher 共用同一个 CoW shadow。AdapterManifest、`aos agent add/test` 和 OpenCode V1 plugin 已落地；OpenCode V2 的工具 hook、Hermes plugin 全量接入仍待补。原生 Claude/AGY hook 在 `aos run` 内会优先询问 broker 的 deny/ask 决定，allow 仍回落到既有边界路由。
+
 **AdapterManifest**（安装器与 `doctor` 共用）：
 
 ```json
@@ -1686,13 +1740,15 @@ aos agent test hermes              # 跑一组工具调用冒烟测试
 
 ### 8.1 命令树
 
+> `[planned]` 表示尚未实现。当前 `aos run` 已支持 `--no-enforce` / `--enforcement advisory`，但还没有 `--session`；`aos install` 还没有 `--all` / `--agent`。
+
 ```text
 aegis-os
-├── install [--enforce] [--all] [--agent <id>] [--dry-run]
+├── install [--enforce] [--all] [--agent <id>] [--dry-run]   # --all/--agent planned
 ├── uninstall [--shim-only]
-├── doctor [--agent <id>]
+├── doctor [--agent <id>]                                     # --agent planned
 ├── status [--json]
-├── run [--mode observe|implement] [--profile auto|code|docs|data|binary|app_state|memory|mixed] [--enforcement ...] -- <agent> [...]
+├── run [--mode observe|implement] [--profile ...] [--enforcement ...] [--no-enforce] -- <agent> [...]
 ├── last
 ├── diff [--session <id>] [--render]
 ├── verify [--session <id>]
@@ -1718,22 +1774,26 @@ aegis-os
 │   └── test <id>
 ├── policy
 │   ├── status
+│   ├── watch [--interval-secs 2]
 │   ├── diff [<escalation-id>]
 │   ├── lease --action <pattern> --resource <pattern> --ttl <duration>
-│   ├── revoke <lease-id>
-│   └── explain <event-id>
+│   ├── revoke <lease-id>                                    # planned
+│   └── explain <event-id>                                   # planned
 ├── top
 ├── workspace
 │   ├── status
-│   ├── profile set <code|docs|data|binary|app_state|memory|mixed>
+│   ├── profile [<code|docs|data|binary|app_state|memory|mixed>]
 │   ├── snapshot --label ...
 │   ├── rollback --snapshot-id ...
 │   └── list
-├── mcp-bridge --socket <path>          # 隐藏命令：沙箱内 MCP stdio → broker
-├── adapter
-│   ├── evaluate --json                 # Agent Adapter Protocol：工具执行前
-│   ├── effect --json                   # 工具执行后上报 effect
-│   └── heartbeat                       # 会话存活
+├── mcp-bridge                          # 沙箱内 MCP stdio → broker（使用 AOS_CONTROL_SOCKET）
+├── adapter                             # Agent Adapter Protocol client
+│   ├── hello --client <id> --version <v> [--capabilities '<json>']
+│   ├── capabilities
+│   ├── evaluate <tool> [--input '<json>']
+│   ├── effect <tool> --effect <e> [--input '<json>']
+│   ├── heartbeat
+│   └── session
 └── cloud ...
 ```
 
@@ -1741,18 +1801,20 @@ aegis-os
 
 ```text
 $ aos status
-Session:      ses_7f3a9c (active)
-Mode:         enforced / implement
-Agent:        claude-code (pid 48213)
-Workspace:    /home/jz/work/payments
-CoW:          overlay (upper 7 files) · baseline manifest
-Git view:     host .git ro · index writable · hooks disabled
-Shadow:       ~/.aegis/sessions/ses_7f3a9c/shadow (7 files changed)
-Sandbox:      bwrap 0.9.0 · landlock v3 · seccomp on
-Egress:       proxy 127.0.0.1:54123 · mode connect · 3 domains allowed
-Approvals:    1 pending (workspace_commit)
-Leases:       fs.read:~/work/shared (12m left), net:registry.npmjs.org (session)
-Audit:        ~/.aegis/sessions/ses_7f3a9c/audit.jsonl
+Session:   ses_7f3a9c
+Status:    exited
+Enforce:   enforced (filesystem+egress (no broker/effect approval yet))
+Mode:      implement
+Profile:   code
+Agent:     payments/claude-code
+Workspace: /home/jz/work/payments
+Shadow:    /home/jz/.aegis/sessions/ses_7f3a9c/cow_workspace/upper_workspace
+CoW:       reflink-or-copy
+Git view:  host .git ro + session index
+Network:   egress-allowlist+l7-base-url
+Broker:    session control socket (adapter.evaluate/effect/heartbeat)
+Approval:  pending (esc-1f88d046)
+Exit:      10
 ```
 
 JSON：
@@ -1762,18 +1824,19 @@ JSON：
   "session_id": "ses_7f3a9c",
   "mode": "implement",
   "enforcement": "enforced",
-  "agent": { "id": "claude-code", "pid": 48213 },
+  "enforcement_scope": "filesystem+egress (no broker/effect approval yet)",
+  "profile": "code",
+  "org_id": "payments",
+  "agent_id": "claude-code",
   "workspace": "/home/jz/work/payments",
-  "shadow": "/home/jz/.aegis/sessions/ses_7f3a9c/shadow",
-  "cow_backend": "overlay",
-  "git_view": { "enabled": true, "index": "writable", "hooks": "disabled" },
-  "sandbox": { "driver": "bwrap", "landlock": "v3", "seccomp": true },
-  "egress": { "proxy": "127.0.0.1:54123", "mode": "connect", "allowed_domains": 3 },
-  "pending_escalations": 1,
-  "leases": [
-    { "action": "fs.read", "resource": "home:~/work/shared", "expires_in_secs": 720 },
-    { "action": "net.connect", "resource": "net:registry.npmjs.org:443", "expires_in_secs": null }
-  ]
+  "shadow": "/home/jz/.aegis/sessions/ses_7f3a9c/cow_workspace/upper_workspace",
+  "cow_backend": "reflink-or-copy",
+  "broker": true,
+  "control_socket": "/run/aegis/control/control.sock",
+  "git_view": true,
+  "network": "egress-allowlist+l7-base-url",
+  "status": "exited",
+  "exit_code": 10
 }
 ```
 
@@ -1783,10 +1846,10 @@ JSON：
 |---|---|
 | 0 | Agent 正常退出，无未处理变更 |
 | 10 | Agent 正常退出，shadow 有未提交变更 |
-| 20 | 沙箱 / 代理 / broker 启动失败 |
-| 21 | 策略拒绝启动（企业配置） |
-| 22 | Session token / 身份校验失败 |
-| 130 | 用户 Ctrl-C |
+| 20 | 沙箱 / 代理 / broker 启动失败（目前启动错误统一返回 1，20 待实现） |
+| 21 | 策略拒绝启动（企业配置；待实现） |
+| 22 | Session token / 身份校验失败（待实现） |
+| 130 | 用户 Ctrl-C（依赖 Agent/bwrap 退出状态） |
 | 128+N | Agent 被信号 N 杀死 |
 
 ### 8.4 错误文案
@@ -1859,7 +1922,9 @@ JSON：
   "shadow_upper": "/home/jz/.aegis/sessions/ses_7f3a9c/shadow_upper",
   "agent_home": "/home/jz/.aegis/sessions/ses_7f3a9c/agent_home",
   "host_ro": "/aegis/host/payments",
-  "cow_backend": "overlay",
+  "cow_backend": "reflink-or-copy",
+  "broker": true,
+  "control_socket": "/run/aegis/control/control.sock",
   "git_view": {
     "enabled": true,
     "host_git": "/aegis/host/payments/.git",
@@ -1883,30 +1948,31 @@ JSON：
 | `proc_exec` | enforced 下不再需要逐命令审批；记录 effect；仍支持后台任务 |
 | `workspace_commit` | 增加 `evidence_hash`、`requested_lease`、`effect_summary` |
 | `workspace_status` | 返回 enforcement level、read/write scope、leases |
-| `policy_request_capability` | 新增：Agent 申请能力（read / net / exec），返回 escalation id |
-| `session_status` | 新增：Agent 查询当前会话模式、shadow、配额 |
-| `coord_claim` | 增加 `mode: read|write` |
+| `policy_request_capability` | planned：Agent 申请能力（read / net / exec），返回 escalation id |
+| `session_status` | planned：Agent 查询当前会话模式、shadow、配额 |
+| `coord_claim` | 已增加 `mode: read|write`（read 可与 read 共存，write 独占） |
 | `policy_approve_escalation` / `policy_grant_lease` | 继续对 Agent 拒绝；人类 CLI/Web 专用 |
 
 ### 9.4 控制面 API（Unix socket）
 
 | 方法 | 路径 | 调用者 | 说明 |
 |---|---|---|---|
-| GET | `/v1/session` | agent / human | 会话状态 |
-| POST | `/v1/adapter/evaluate` | adapter | 工具调用评估 |
-| POST | `/v1/effects` | adapter / sandbox | 记录 effect |
-| POST | `/v1/escalations` | agent | 申请能力 |
-| GET | `/v1/escalations` | human | 列出待审批 |
-| POST | `/v1/escalations/:id/decide` | human | 批准 / 拒绝 |
-| POST | `/v1/leases` | human | 授予租约 |
-| DELETE | `/v1/leases/:id` | human | 撤销租约 |
-| GET | `/v1/audit` | human | 审计查询 |
-| POST | `/v1/session/stop` | human | 停止会话 |
+| GET | `/v1/session` | agent | ✅ 会话状态 |
+| POST | `/v1/adapter/evaluate` | adapter | ✅ 工具调用评估（Effect → policy） |
+| POST | `/v1/adapter/effect` / `/v1/effects` | adapter / sandbox | ✅ 记录 effect |
+| POST | `/v1/adapter/heartbeat` | adapter | ✅ 心跳 |
+| POST | `/v1/escalations` | agent | planned（当前由 adapter.evaluate 的 Ask 自动创建） |
+| GET | `/v1/escalations` | human | ✅ 列出待审批 |
+| POST | `/v1/escalations/:id/decide` | human | ✅ 批准 / 拒绝 |
+| POST | `/v1/leases` | human | ✅ 授予租约 |
+| DELETE | `/v1/leases/:id` | human | ✅ 撤销租约 |
+| GET | `/v1/audit` | human | ✅ 审计查询 |
+| POST | `/v1/session/stop` | human | planned |
 
 鉴权：
 
-- Agent token：scope `agent`；只能访问 `/v1/session`、`/v1/effects`、`/v1/escalations`（POST）。
-- Human token：scope `human`；可访问审批、租约、审计、停止。
+- Agent token：scope `agent`；只能访问 `/v1/session`、`/v1/adapter/evaluate|effect|heartbeat`、`/v1/effects`。
+- Human token：scope `human`；可访问审批、租约、审计（`/v1/session/stop` 仍 planned）。
 - Human token 只存在 `human.token` 0600 和 CLI/Web 内存中；不注入 Agent 环境。
 
 ### 9.5 策略配置
@@ -2071,7 +2137,7 @@ JSON：
 
 ### Phase 3：会话模式、DomainProfile 接口与五客户端（🟡 部分完成：profile/verify/CAS 已完成，专用合并器未完成）
 
-**目标**：observe / implement 模式；read/write claim；只交付 `DomainProfile` 扩展接口和两类通用合并器；完成五个 Tier A 客户端适配。**不**在本阶段做 Schema-aware 数据合并、Office CRDT、PHI、CAS、AAP / UOMP。
+**目标**：observe / implement 模式；read/write claim；只交付 `DomainProfile` 扩展接口和两类通用合并器；完成五个 Tier A 客户端适配。**不**在本阶段做 Schema-aware 数据合并、Office CRDT、PHI、数据流水线 CAS（`org_artifact_publish` + DAG）、AAP / UOMP；本地 `aos publish` / `artifacts` 基础 CAS 属于本阶段。
 
 交付：
 
@@ -2090,7 +2156,7 @@ JSON：
 
 **明确不在 Phase 3**：
 
-- Schema-aware 数据自动合并、PHI 扫描、CAS 流水线；
+- Schema-aware 数据自动合并、PHI 扫描、CAS 数据流水线与任务 DAG（本地 publish/list/fetch 已在 Phase 3）；
 - Office `.docx` / `.pptx` 的 CRDT 块级锁；
 - 章节 / 段落 / 表分区 / 行区间 claim；
 - `app_state` / `memory` profile；
@@ -2264,7 +2330,7 @@ JSON：
 - `aegis-os install --enforce` 显式选择 enforced；`doctor` 显示差异。
 - `aegis-os install --all` 扫描并接入所有检测到的 Agent（AGY / Claude / Codex / OpenCode / Hermes / Tier B）。
 - 现有 MCP 工具、Hook、CoW、commit 审批全部保留。
-- 现有代码仓库默认 `profile=code`；文档 / 数据工作区默认 `mixed`，可用 `aos workspace profile set docs|data` 切换。
+- 现有代码仓库默认 `profile=code`；文档 / 数据工作区默认 `mixed`，可用 `aos workspace profile docs|data` 切换。
 - Git 视图默认开启（`.git` ro + `GIT_INDEX_FILE` 可写副本）；可用 `AOS_GIT_VIEW=0` 关闭，但 Agent 的 git 上下文会退化。
 - ext4 默认尝试 OverlayFS / fuse-overlayfs；不可用时回退 lazy-copy，`doctor` 显示 backend。
 - Agent 状态目录首次启动时按 §7.1.5.1 分层挂载；OAuth 凭据文件在会话结束后原子写回。
@@ -2285,9 +2351,9 @@ JSON：
 
 ### 12.3 卸载
 
-- `aos uninstall --shim-only`：移除 PATH shim，保留 MCP / Hook。
-- `aos uninstall`：移除 Aegis 配置块、MCP Server、Hook、runtime 目录；不删除用户原 Agent 配置。
-- 卸载前提示 shadow 中未提交的变更。
+- `aos uninstall --shim-only`：移除 PATH shim 与 shell PATH block；保留 MCP / Hook 和 shadow。
+- 完整 `aos uninstall` 目前与 `--shim-only` 行为相同，只额外打印提示；移除客户端 MCP/Hook 配置块、runtime 目录和未提交 shadow 仍是 planned。
+- 卸载前检查未提交 shadow / 提示用户仍是 planned。
 
 ### 12.4 发布
 
@@ -2353,19 +2419,21 @@ JSON：
 
 | 能力 | 现有位置 | 改造 |
 |---|---|---|
-| CLI 命令 | `crates/aos-cli/src/main.rs` | 新增 `Run` / `Status` / `Last` / `Verify` / `Publish` / `Discard` / `Why` / `Agent` |
-| Hook 路由 | `crates/aos-cli/src/routing.rs` | 保留为 advisory adapter；新增 effect 映射 |
-| Hook 处理 | `crates/aos-cli/src/hooks.rs` | 改为调用 broker `/v1/adapter/evaluate` |
-| 安装器 | `crates/aos-cli/src/installer.rs` | 新增 PATH shim、五客户端检测、manifest、enforcement 状态 |
-| Agent 适配 | 新增 `crates/aos-adapters/` | AdapterManifest、AGY / Claude / Codex / OpenCode / Hermes + Tier B |
+| CLI 命令 | `crates/aos-cli/src/main.rs` | `Run` / `Status` / `Last` / `Diff --render` / `Verify` / `Publish` / `Discard` / `Why` / `Agent` / `Uninstall` / `workspace profile` |
+| DomainProfile | `crates/aos-core/src/profile.rs` | merge / claims / verify / evidence / overwrite 接口与默认值；`launcher` 读取 `.aegis/workspace.json` |
+| Hook 路由 | `crates/aos-cli/src/routing.rs` | 保留为 advisory adapter；effect 映射仍待接线 |
+| Hook 处理 | `crates/aos-cli/src/hooks.rs` | 改为调用 broker `/v1/adapter/evaluate`（planned） |
+| 安装器 | `crates/aos-cli/src/installer.rs` | PATH shim、shell PATH block、五客户端检测、`doctor` enforcement 状态 |
+| Agent 适配 | 新增 `crates/aos-adapters/` | planned：AdapterManifest、AGY / Claude / Codex / OpenCode / Hermes + Tier B |
 | 沙箱 | `crates/aos-sandbox/src/lib.rs` | `--ro-bind / /` + tmpfs 遮蔽、Git 视图、Agent 状态目录、Landlock、launcher 模式、路径映射 |
-| Egress | `crates/aos-egress` / `crates/aos-sandbox/src/bridge.rs` | CONNECT 仅 `net.connect`；Base URL 反向代理；opt-in MITM |
-| 策略 | `crates/aos-policy/src/lib.rs` | effect action、DecisionClass、租约扩展、Cedar 属性、DomainProfile |
-| MCP | `crates/aos-mcp-gateway/src/lib.rs` | broker 模式、session token、`policy_request_capability`；CAS / app / memory 在 Phase 5 |
-| CoW | `crates/aos-vfs/src/lib.rs` | OverlayFS / fuse-overlayfs backend、baseline manifest、二进制基线哈希、渲染 diff |
-| 审计 | `crates/aos-recorder/src/lib.rs` | EffectRecord、领域证据、`aos why` |
-| OpenCode | 新增 `crates/aos-opencode-plugin/` 或 npm 包 | V2 plugin + adapter |
-| Hermes | 第一方 adapter | Adapter Protocol 参考实现 |
+| Egress | `crates/aos-egress` / `crates/aos-sandbox/src/bridge.rs` | CONNECT 仅 `net.connect`；Base URL 反向代理（L7 DLP / secret injection）已接入 launcher；opt-in MITM planned |
+| Session broker | `crates/aos-cli/src/session_broker.rs` | per-session Unix socket、agent/human token、adapter.evaluate/effect/heartbeat、escalation/lease/audit 路由 |
+| 策略 | `crates/aos-policy/src/lib.rs` | `Effect::to_policy_context` 桥接、租约 matcher、Cedar 属性、DecisionClass（planned） |
+| MCP | `crates/aos-mcp-gateway/src/lib.rs` | 完整 MCP bridge（planned）、`policy_request_capability`（planned）；session token/broker 已在 `session_broker.rs`；CAS / app / memory 在 Phase 5 |
+| CoW | `crates/aos-vfs/src/lib.rs` | OverlayFS / fuse-overlayfs backend（planned）、baseline manifest（planned）、full-content SHA-256 evidence |
+| 审计 | `crates/aos-recorder/src/lib.rs` + launcher `audit.jsonl` | 哈希链 evidence；`aos why` 校验链；EffectRecord（planned） |
+| OpenCode | 新增 `crates/aos-opencode-plugin/` 或 npm 包 | planned：V2 plugin + adapter |
+| Hermes | 第一方 adapter | planned：Adapter Protocol 参考实现 |
 
 ### 14.2 现有 Hook matcher 缺口
 
@@ -2752,7 +2820,7 @@ CLI --profile
 ```
 
 - 该文件属于 sensitive commit：Agent 不能自己改预检门。
-- 人类可以通过 `aos workspace profile set docs` 修改。
+- 人类可以通过 `aos workspace profile docs` 修改。
 - 企业策略可以强制 profile 和 verify，不允许项目覆盖。
 
 ### 17.10 领域预检门目录
