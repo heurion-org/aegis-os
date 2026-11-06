@@ -152,6 +152,15 @@ enum Commands {
         cmd: Option<String>,
     },
 
+    /// Publish session artifacts to the organization SHA-256 CAS
+    Publish {
+        #[arg(long)]
+        session: Option<String>,
+        /// File or directory (relative to the shadow); defaults to changed files
+        #[arg(long = "path")]
+        paths: Vec<String>,
+    },
+
     /// Commit the latest (or named) session shadow to the host workspace (human action)
     Commit {
         #[arg(long)]
@@ -2167,6 +2176,10 @@ async fn main() -> anyhow::Result<()> {
 
         Commands::Verify { session, cmd } => {
             launcher::verify(&runtime_dir, session.as_deref(), cmd.as_deref()).await?;
+        }
+
+        Commands::Publish { session, paths } => {
+            launcher::publish(&runtime_dir, session.as_deref(), paths).await?;
         }
 
         Commands::Commit { session, paths, allow_sensitive, yes } => {

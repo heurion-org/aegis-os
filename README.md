@@ -103,6 +103,7 @@ aegis-os verify          # run .aegis/verify.json / AOS_VERIFY_CMD in the sandbo
 aegis-os commit          # diff + evidence hash; --yes for non-interactive
 aegis-os approvals list  # pending/approved commit tickets
 aegis-os approvals approve <esc-id>
+aegis-os publish         # publish changed artifacts to SHA-256 CAS
 aegis-os why             # approval ticket + audit trail
 aegis-os discard
 ```

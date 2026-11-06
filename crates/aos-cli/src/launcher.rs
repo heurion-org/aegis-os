@@ -19,6 +19,7 @@ use aos_core::{
     SandboxDriver, TransactionalWorkspace,
 };
 use aos_egress::AegisEgressGateway;
+use aos_mcp_gateway::AegisRuntimeKernel;
 use aos_sandbox::NativeOsSandboxDriver;
 use aos_vfs::CoWWorkspace;
 use anyhow::{bail, Context};
@@ -1609,6 +1610,115 @@ pub(crate) async fn verify(
         bail!("Aegis: no sessions under {}", runtime_dir.display());
     };
     run_verify_for_session(runtime_dir, &value, override_cmd).await
+}
+
+fn content_type(path: &Path) -> &'static str {
+    match path
+        .extension()
+        .and_then(|s| s.to_str())
+        .unwrap_or("")
+        .to_ascii_lowercase()
+        .as_str()
+    {
+        "csv" => "text/csv",
+        "tsv" => "text/tab-separated-values",
+        "json" => "application/json",
+        "jsonl" => "application/x-ndjson",
+        "md" | "markdown" => "text/markdown",
+        "tex" => "application/x-tex",
+        "pdf" => "application/pdf",
+        "png" => "image/png",
+        "jpg" | "jpeg" => "image/jpeg",
+        "svg" => "image/svg+xml",
+        "parquet" => "application/vnd.apache.parquet",
+        "zip" => "application/zip",
+        _ => "application/octet-stream",
+    }
+}
+
+pub(crate) async fn publish(
+    runtime_dir: &Path,
+    session_id: Option<&str>,
+    requested_paths: Vec<String>,
+) -> anyhow::Result<()> {
+    let Some((dir, value)) = find_session(runtime_dir, session_id)? else {
+        bail!("Aegis: no sessions under {}", runtime_dir.display());
+    };
+    let workspace = value
+        .get("workspace")
+        .and_then(|v| v.as_str())
+        .context("session is missing workspace")?;
+    let shadow = value
+        .get("shadow")
+        .and_then(|v| v.as_str())
+        .context("session is missing shadow")?;
+    let org_id = value
+        .get("org_id")
+        .and_then(|v| v.as_str())
+        .context("session is missing org_id")?;
+    let agent_id = value
+        .get("agent_id")
+        .and_then(|v| v.as_str())
+        .context("session is missing agent_id")?;
+
+    let paths = if requested_paths.is_empty() {
+        CoWWorkspace::diff_dirs(Path::new(workspace), Path::new(shadow), None)
+            .await?
+            .into_iter()
+            .map(|d| d.relative_path)
+            .collect::<Vec<_>>()
+    } else {
+        requested_paths
+    };
+    if paths.is_empty() {
+        println!("Nothing to publish.");
+        return Ok(());
+    }
+
+    let kernel = AegisRuntimeKernel::new(runtime_dir).await?;
+    let identity = AgentIdentity::new(org_id, agent_id, "publisher");
+    let mut published = Vec::new();
+    for rel in paths {
+        let rel = rel.trim_start_matches('/').to_string();
+        let path = Path::new(shadow).join(&rel);
+        if !path.is_file() {
+            println!("skip {rel} (not a regular file)");
+            continue;
+        }
+        let meta = std::fs::metadata(&path)?;
+        if meta.len() > 64 * 1024 * 1024 {
+            println!("skip {rel} ({} bytes; publish limit is 64 MiB)", meta.len());
+            continue;
+        }
+        let bytes = std::fs::read(&path)?;
+        let artifact = kernel
+            .org_storage
+            .publish_artifact(
+                &identity,
+                &rel,
+                &bytes,
+                content_type(&path),
+                json!({ "session_id": value.get("session_id"), "path": rel }),
+            )
+            .await?;
+        println!("{}  {}", artifact.uri, rel);
+        published.push(json!({
+            "path": rel,
+            "uri": artifact.uri,
+            "sha256": artifact.sha256,
+            "size_bytes": artifact.size_bytes,
+            "content_type": artifact.content_type,
+        }));
+    }
+    std::fs::write(
+        dir.join("published.json"),
+        serde_json::to_vec_pretty(&json!({
+            "session_id": value.get("session_id"),
+            "artifacts": published,
+            "published_at_ms": chrono::Utc::now().timestamp_millis(),
+        }))?,
+    )?;
+    Ok(())
 }
 
 fn bwrap_supports_bind_fd(path: &Path) -> bool {
