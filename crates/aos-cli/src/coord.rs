@@ -67,7 +67,13 @@ async fn compute_radar_delta(
             } else {
                 format!(" ({})", c.note)
             };
-            format!("`{}` claimed by `{}`{}{}", glob, c.owner, task_tag, note_tag)
+            format!(
+                "`{}` claimed by `{}`{}{}",
+                aos_core::claims::claim_glob(&glob),
+                c.owner,
+                task_tag,
+                note_tag
+            )
         })
         .collect();
     peer_claims.sort();

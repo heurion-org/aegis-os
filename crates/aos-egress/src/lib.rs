@@ -47,6 +47,8 @@ pub struct OutboundRequestSpec {
 pub enum EgressVerdict {
     AllowedAndSanitized {
         injected_headers: HashMap<String, String>,
+        /// Path/query after boundary placeholders were replaced (e.g. Gemini `?key=...`).
+        injected_path: String,
         secrets_injected: Vec<String>,
     },
     RequiresEscalation {
@@ -279,20 +281,82 @@ impl AegisEgressGateway {
         body: Option<&str>,
     ) -> anyhow::Result<EgressVerdict> {
         let mut out_headers = req.headers.clone();
+        let mut out_path = req.path.clone();
+        let mut dlp_path = req.path.clone();
         let mut secrets_injected = Vec::new();
         let vault = self.vault.read().await;
         let scopes = self.scopes.read().await;
         let normalized_path = Self::normalize_request_path(&req.path);
+        let org_prefix = format!("{}::", identity.org_id);
 
-        // 1. First inspect all headers for `$AOS_SECRET_*` placeholders and enforce per-secret domain + method/path bindings
+        // 1. First inspect headers and URL path/query for `$AOS_SECRET_*` placeholders and enforce
+        // per-secret domain + method/path bindings. Path placeholders are replaced at the boundary
+        // (Gemini commonly sends `?key=$AOS_SECRET_...`).
         // Sort by descending placeholder length so `$AOS_SECRET_GH_SCOPED` is matched before `$AOS_SECRET_GH`.
         let mut entries: Vec<(&String, &SecretVaultEntry)> = vault.iter().collect();
         entries.sort_by_key(|(_, entry)| std::cmp::Reverse(entry.placeholder.len()));
 
+        for &(vault_key, secret_entry) in &entries {
+            if !vault_key.starts_with(&org_prefix)
+                || !out_path.contains(&secret_entry.placeholder)
+            {
+                continue;
+            }
+            if !aos_core::ablated("secret_binding") {
+                if !secret_entry
+                    .allowed_domains
+                    .iter()
+                    .any(|d| d.eq_ignore_ascii_case(&req.target_domain))
+                {
+                    return Ok(EgressVerdict::BlockedSecretExfiltration {
+                        placeholder: secret_entry.placeholder.clone(),
+                        unauthorized_domain: req.target_domain.clone(),
+                    });
+                }
+                if let Some(scope) = scopes.get(vault_key) {
+                    if !scope.allowed_methods.is_empty()
+                        && !scope
+                            .allowed_methods
+                            .iter()
+                            .any(|m| m.eq_ignore_ascii_case(&req.method))
+                    {
+                        return Ok(EgressVerdict::BlockedSecretExfiltration {
+                            placeholder: secret_entry.placeholder.clone(),
+                            unauthorized_domain: format!(
+                                "{} (disallowed method {})",
+                                req.target_domain, req.method
+                            ),
+                        });
+                    }
+                    if !scope.allowed_path_prefixes.is_empty()
+                        && !scope
+                            .allowed_path_prefixes
+                            .iter()
+                            .any(|p| normalized_path.starts_with(p))
+                    {
+                        return Ok(EgressVerdict::BlockedSecretExfiltration {
+                            placeholder: secret_entry.placeholder.clone(),
+                            unauthorized_domain: format!(
+                                "{} (disallowed path {})",
+                                req.target_domain, normalized_path
+                            ),
+                        });
+                    }
+                }
+            }
+            out_path = out_path.replace(
+                &secret_entry.placeholder,
+                &secret_entry.real_secret_value,
+            );
+            // Keep the DLP input free of the authorized placeholder, but retain any other query.
+            dlp_path = dlp_path.replace(&secret_entry.placeholder, "");
+            secrets_injected.push(secret_entry.placeholder.clone());
+        }
+
         // 1b. Outbound L7 DLP inspection on URL query string and HTTP request body (prevents exfiltrating
         // secrets or private keys inside the body/query of an allowlisted endpoint such as POST /repos/acme/app/issues).
         if !aos_core::ablated("secret_binding") {
-            let query_part = req.path.split_once('?').map(|(_, q)| q).unwrap_or("");
+            let query_part = dlp_path.split_once('?').map(|(_, q)| q).unwrap_or("");
             if let Some(dlp_hit) =
                 Self::inspect_payload_dlp(query_part, &entries, &identity.org_id)
                     .or_else(|| body.and_then(|b| Self::inspect_payload_dlp(b, &entries, &identity.org_id)))
@@ -391,6 +455,7 @@ impl AegisEgressGateway {
 
         Ok(EgressVerdict::AllowedAndSanitized {
             injected_headers: out_headers,
+            injected_path: out_path,
             secrets_injected,
         })
     }
@@ -730,6 +795,7 @@ impl AegisEgressGateway {
                         {
                             Ok(EgressVerdict::AllowedAndSanitized {
                                 injected_headers,
+                                injected_path,
                                 ..
                             }) => {
                                 if let Err(err) = gw_conn
@@ -740,7 +806,7 @@ impl AegisEgressGateway {
                                         domain,
                                         domain,
                                         &method,
-                                        &upstream_path,
+                                        &injected_path,
                                         &injected_headers,
                                         &req_body,
                                     )
@@ -952,13 +1018,15 @@ impl AegisEgressGateway {
                     {
                         Ok(EgressVerdict::AllowedAndSanitized {
                             injected_headers,
+                            injected_path,
                             secrets_injected,
                         }) => {
                             if should_forward_upstream {
                                 match tokio::net::TcpStream::connect(&upstream_addr).await {
                                     Ok(mut upstream) => {
-                                        let origin_path =
-                                            Self::extract_origin_path_and_query(&spec.path);
+                                        let origin_path = Self::extract_origin_path_and_query(
+                                            &injected_path,
+                                        );
                                         let mut out_req =
                                             format!("{} {} HTTP/1.1\r\n", spec.method, origin_path);
                                         let mut has_host = false;
@@ -985,14 +1053,24 @@ impl AegisEgressGateway {
                                             out_req.push_str(&req_body);
                                         }
                                         if upstream.write_all(out_req.as_bytes()).await.is_ok() {
-                                            let mut upstream_resp = Vec::new();
-                                            if upstream
-                                                .read_to_end(&mut upstream_resp)
-                                                .await
-                                                .is_ok()
-                                                && !upstream_resp.is_empty()
-                                            {
-                                                let _ = stream.write_all(&upstream_resp).await;
+                                            // Stream the upstream response directly instead of
+                                            // buffering it in memory. This keeps large/model
+                                            // responses (and SSE token streams) bounded.
+                                            let mut buf = [0u8; 8192];
+                                            let mut copied = 0usize;
+                                            loop {
+                                                match upstream.read(&mut buf).await {
+                                                    Ok(0) => break,
+                                                    Ok(n) => {
+                                                        if stream.write_all(&buf[..n]).await.is_err() {
+                                                            return;
+                                                        }
+                                                        copied += n;
+                                                    }
+                                                    Err(_) => break,
+                                                }
+                                            }
+                                            if copied > 0 {
                                                 return;
                                             }
                                         }
@@ -1107,6 +1185,52 @@ mod tests {
 
         assert!(AegisEgressGateway::base_url_route("/v1/messages").is_none());
         assert!(AegisEgressGateway::base_url_route("/__aegis/base/anthropicx/v1").is_none());
+    }
+
+    #[tokio::test]
+    async fn gemini_query_key_is_injected_at_the_boundary() {
+        let gw = AegisEgressGateway::new();
+        gw.allow_domains(
+            "acme",
+            vec!["generativelanguage.googleapis.com".to_string()],
+        )
+        .await;
+        gw.register_scoped_secret(
+            SecretVaultEntry {
+                org_id: "acme".to_string(),
+                placeholder: "$AOS_SECRET_GEMINI".to_string(),
+                real_secret_value: "gemini-real-key".to_string(),
+                allowed_domains: vec!["generativelanguage.googleapis.com".to_string()],
+            },
+            vec!["POST".to_string()],
+            vec!["/v1beta/".to_string()],
+        )
+        .await;
+        let agent = AgentIdentity::new("acme", "coder-1", "Engineer");
+        let verdict = gw
+            .inspect_and_inject_with_body(
+                &agent,
+                &OutboundRequestSpec {
+                    target_domain: "generativelanguage.googleapis.com".to_string(),
+                    method: "POST".to_string(),
+                    path: "/v1beta/models/gemini:generateContent?key=$AOS_SECRET_GEMINI".to_string(),
+                    headers: HashMap::new(),
+                },
+                Some("{\"contents\":[]}"),
+            )
+            .await
+            .unwrap();
+        match verdict {
+            EgressVerdict::AllowedAndSanitized {
+                injected_path,
+                secrets_injected,
+                ..
+            } => {
+                assert!(injected_path.contains("key=gemini-real-key"));
+                assert_eq!(secrets_injected, vec!["$AOS_SECRET_GEMINI".to_string()]);
+            }
+            other => panic!("unexpected verdict: {other:?}"),
+        }
     }
 
     #[tokio::test]
@@ -1320,6 +1444,7 @@ mod tests {
         match verdict {
             EgressVerdict::AllowedAndSanitized {
                 injected_headers,
+                injected_path: _,
                 secrets_injected,
             } => {
                 assert_eq!(

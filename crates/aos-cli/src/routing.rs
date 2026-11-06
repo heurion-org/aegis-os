@@ -252,6 +252,14 @@ const RUNTIME_STATE_MARKERS: &[&str] = &[
     "/aegis-os-runtime/audit.jsonl",
     "/aegis-os-runtime/routing_decisions.jsonl",
     "/aegis-os-runtime/stop_budgets.json",
+    "/.aegis/",
+    "/human.token",
+    "/agent.token",
+    "/approval.json",
+    "/advisory.jsonl",
+    "/pending_escalations.jsonl",
+    "/effects.jsonl",
+    "/policy_state.json",
 ];
 
 /// Disallow `AOS_HOST=1` from being used as a blanket sandbox bypass for shell interpreters
@@ -427,12 +435,16 @@ pub fn invokes_approval_cli(cmd: &str) -> bool {
         }
         let rest: Vec<&str> = words[i + 1..].iter().map(|s| s.as_str()).filter(|w| !w.starts_with('-')).collect();
         rest.first().copied() == Some("approve")
+            || rest.contains(&"commit")
             || rest.windows(2).any(|pair| {
                 matches!(
                     pair,
                     ["policy", "approve"]
                         | ["policy", "lease"]
                         | ["workspace", "commit"]
+                        | ["approvals", "approve"]
+                        | ["approvals", "deny"]
+                        | ["approvals", "serve"]
                         | ["cloud", "approve"]
                         | ["cloud", "approver"]
                         | ["memory", "approve"]
@@ -697,6 +709,12 @@ mod tests {
             "aegis-os memory deny consent-1",
             "aegis-os memory ui",
             "aegis-os memory connect claude --scope notes",
+            "aegis-os commit --yes --allow-sensitive",
+            "aos commit",
+            "aegis-os --workspace . commit",
+            "aegis-os approvals approve esc-1",
+            "aegis-os approvals deny esc-1",
+            "aegis-os approvals serve",
         ] {
             assert!(matches!(classify_run_command(cmd, root, root), Route::Deny { .. }), "{cmd}");
         }
@@ -820,6 +838,14 @@ mod tests {
         assert_eq!(kind("aegis-os workspace commit"), "deny_ring0");
         assert_eq!(kind("curl -X POST http://127.0.0.1:7080/v1/approvals/decide"), "deny_ring0");
         assert_eq!(kind("cat /private/tmp/aegis-os-runtime/policy.json"), "deny_ring0");
+        assert_eq!(
+            kind("cat /Users/user/.aegis/sessions/ses_x/human.token"),
+            "deny_ring0"
+        );
+        assert_eq!(
+            kind("cat /Users/user/.aegis/sessions/ses_x/agent.token"),
+            "deny_ring0"
+        );
         // AOS_HOST=1 cannot be used to run arbitrary shell interpreters or rm/python/sed on host
         assert_eq!(kind("AOS_HOST=1 sh -c 'rm -rf /repo'"), "redirect_proc_exec");
         assert_eq!(kind("AOS_HOST=1 python3 -c 'import os'"), "redirect_proc_exec");

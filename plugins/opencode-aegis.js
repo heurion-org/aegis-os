@@ -22,7 +22,7 @@ function brokerRequest(method, path, payload, timeoutMs = 5000) {
 
   return new Promise((resolve, reject) => {
     const socket = net.createConnection(socketPath, () => socket.write(request));
-    let data = "";
+    const chunks = [];
     let settled = false;
     const fail = (error) => {
       if (settled) return;
@@ -31,11 +31,12 @@ function brokerRequest(method, path, payload, timeoutMs = 5000) {
       reject(error);
     };
     socket.setTimeout(timeoutMs, () => fail(new Error("Aegis broker request timed out")));
-    socket.on("data", (chunk) => (data += chunk.toString("utf8")));
+    socket.on("data", (chunk) => chunks.push(chunk));
     socket.on("error", fail);
     socket.on("end", () => {
       if (settled) return;
       settled = true;
+      const data = Buffer.concat(chunks).toString("utf8");
       const split = data.indexOf("\r\n\r\n");
       if (split < 0) return reject(new Error("malformed Aegis broker response"));
       const head = data.slice(0, split);
@@ -83,7 +84,7 @@ export default {
         try {
           await brokerRequest("POST", "/v1/adapter/effect", {
             tool: event.tool,
-            input: event.args ?? {},
+            input: output?.args ?? event?.args ?? {},
             effect: "observed",
             output: { title: output?.title ?? "" },
           });

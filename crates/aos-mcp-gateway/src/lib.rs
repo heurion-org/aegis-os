@@ -738,7 +738,7 @@ impl AegisRuntimeKernel {
                     .collect();
                 for g in mine {
                     table.remove(&g);
-                    changed.push(g);
+                    changed.push(claims::claim_glob(&g).to_string());
                 }
             }
 
@@ -1157,6 +1157,8 @@ impl AegisRuntimeKernel {
                         "change_type": d.change_type,
                         "old_size": d.old_size,
                         "new_size": d.new_size,
+                        "old_sha256": d.old_sha256,
+                        "new_sha256": d.new_sha256,
                         "preview_diff": d.preview_diff,
                     })).collect::<Vec<_>>(),
                 });
@@ -2492,6 +2494,7 @@ impl AegisRuntimeKernel {
                                 return Ok(serde_json::to_value(
                                     aos_egress::EgressVerdict::AllowedAndSanitized {
                                         injected_headers: headers,
+                                        injected_path: path,
                                         secrets_injected: Vec::new(),
                                     },
                                 )?);

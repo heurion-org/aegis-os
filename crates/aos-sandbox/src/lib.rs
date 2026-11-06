@@ -367,9 +367,6 @@ impl NativeOsSandboxInstance {
                     if orgs_root.file_name().and_then(|n| n.to_str()) == Some("orgs") =>
                 {
                     let runtime = Self::sbpl_path(runtime_root);
-                    let agent_root = Self::sbpl_path(
-                        self.config.agent_home_dir.parent().unwrap_or(&self.config.agent_home_dir),
-                    );
                     let shared_ro = Self::sbpl_path(&self.config.org_shared_ro_dir);
                     let org_pub = Self::sbpl_path(&org_dir.join("pub"));
                     let org_paas = Self::sbpl_path(
@@ -377,11 +374,15 @@ impl NativeOsSandboxInstance {
                             .join("paas_workspaces")
                             .join(&self.config.identity.org_id),
                     );
+                    // Only the current workspace/home are readable under runtime. Do NOT allow
+                    // the whole session directory: it contains human.token, approval tickets and
+                    // other control-plane material that the agent must never read.
                     format!(
                         r#"
 (deny file-read-data (subpath "{runtime}"))
 (allow file-read-data
-    (subpath "{agent_root}")
+    (subpath "{ws}")
+    (subpath "{home}")
     (subpath "{shared_ro}")
     (subpath "{org_pub}")
     (subpath "{org_paas}")

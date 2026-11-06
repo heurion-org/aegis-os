@@ -24,8 +24,8 @@
 **当前验证**
 
 ```text
-cargo test -p aos-cli -p aos-core -p aos-vfs   # 69 passed (macOS, rustc 1.99)
-cargo test -p aos-egress                       # 7 passed; 2 ignored (real TLS handshake)
+cargo test -p aos-cli -p aos-core -p aos-vfs   # 70 passed (macOS, rustc 1.99)
+cargo test -p aos-egress                       # 8 passed; 2 ignored (real TLS handshake)
 cargo clippy --workspace --all-targets -- -D warnings
 ```
 
@@ -69,7 +69,7 @@ cargo clippy --workspace --all-targets -- -D warnings
    完成标准：多 Agent 改不同章节成功、同段落冲突、数据 Schema/PHI 失败不落盘、下游只读 CAS 哈希。
 
 5. **P2：macOS Seatbelt + isolated VM**
-   Phase 4 平台工作，需要 macOS 实机验证。
+   macOS Seatbelt launcher MVP 已在实机验证（shadow cwd、broker TCP、credential/token deny、PTY）；仍缺 default-deny 收敛、路径重映射和 isolated VM。
    完成标准：`aos run -- claude` 在 macOS 上完成同样的文件/网络边界测试。
 
 6. **P2：OpenCode plugin / Hermes adapter**
@@ -92,6 +92,15 @@ cargo clippy --workspace --all-targets -- -D warnings
 ---
 
 ## 变更记录
+
+- **v0.6**（2026-11-06）：按 005edfb..d76fdc9 代码评审修复：
+  - evidence hash 统一为 bare hex，修复 launcher `sha256:sha256:` 双前缀；MCP `workspace_commit` 补 `old_sha256` / `new_sha256`；
+  - `approve_escalation` 的 OneShot 优先于 TaskScoped；已 Approved/Denied 的票据不可重复审批；批量敏感路径不再残留组合租约；
+  - read claim 的 `claim_glob` 贯穿 release / radar / gateway 广播，修复读锁与写锁冲突检测；
+  - macOS Seatbelt runtime 只允许当前 workspace/home 读取，禁止读取 `human.token` / `agent.token`；macOS 分支前移 `validate_workspace_roots` 和 OpenCode `--standalone` 检查；
+  - routing 拦截 `aos commit` / `aos approvals`，运行时标记覆盖 `~/.aegis` 和 token 文件；Hook broker 输出同时兼容 AGY / Claude；SessionStart 去重修复；
+  - Gemini `?key=$AOS_SECRET_*` 在边界替换；L7/转发上游响应改为流式转发，避免大响应全量缓冲；OpenCode plugin 修复 UTF-8 分片；补齐 clippy `unknown_lints`。
+  - 仍待收敛：launcher `approval.json` / `audit.jsonl` 与 `AegisPolicyKernel` / `AegisFlightRecorder` 两套账本尚未合并（见 §13 风险与开放问题）。
 
 - **v0.5**（2026-11-06）：按代码评审落地安全与可用性修复：
   - evidence hash 现在绑定 old/new 完整 SHA-256，不再只依赖截断 preview；二进制同尺寸替换会使审批失效；
@@ -1803,7 +1812,7 @@ aegis-os
 $ aos status
 Session:   ses_7f3a9c
 Status:    exited
-Enforce:   enforced (filesystem+egress (no broker/effect approval yet))
+Enforce:   enforced (filesystem+egress+broker)
 Mode:      implement
 Profile:   code
 Agent:     payments/claude-code
@@ -1824,7 +1833,7 @@ JSON：
   "session_id": "ses_7f3a9c",
   "mode": "implement",
   "enforcement": "enforced",
-  "enforcement_scope": "filesystem+egress (no broker/effect approval yet)",
+  "enforcement_scope": "filesystem+egress+broker (commit + live policy)",
   "profile": "code",
   "org_id": "payments",
   "agent_id": "claude-code",
@@ -2173,9 +2182,11 @@ JSON：
 - observe 会话无法写入宿主或 shadow（或写入后被丢弃）。
 - OpenCode 共享服务检测生效。
 
-### Phase 4：macOS 与内核加固（⬜ 未开始）
+### Phase 4：macOS 与内核加固（🟡 部分完成）
 
 **目标**：macOS enforced 可用；Landlock / seccomp 落地；microVM 试点。
+
+已完成：macOS Seatbelt launcher MVP（shadow cwd、宿主只读、credential/token deny、egress proxy、PTY、broker TCP control、MCP bridge、Git shim），并已在 macOS 实机验证。未完成：default-deny 收敛、路径重映射、Landlock、seccomp、microVM。
 
 交付：
 
@@ -2390,6 +2401,7 @@ JSON：
 | 应用状态回滚困难 | 写坏 SaaS 数据 | 幂等键 + 补偿事务 + dry-run；高风险需双人审批 |
 | Adapter Protocol 漂移 | Hermes / 第三方失效 | 协议版本 + `doctor` 心跳 + enforced launcher 兜底 |
 | `aos agent add` 恶意 manifest | 任意命令执行 | manifest 签名 / 审核 / 只允许声明式配置 |
+| launcher 与 policy kernel 双审批/审计账本 | 证据与处置状态不一致 | 短期共用 bare-hex evidence；后续统一到 `AegisPolicyKernel` + `AegisFlightRecorder` |
 
 ### 13.2 开放问题
 

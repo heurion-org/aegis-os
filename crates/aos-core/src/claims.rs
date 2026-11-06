@@ -313,7 +313,7 @@ pub fn release_claims_for_task(table: &mut ClaimTable, task_id: &str) -> Vec<(St
     let mut released = Vec::new();
     table.retain(|glob, claim| {
         if claim.task_id.as_deref() == Some(task_id) {
-            released.push((glob.clone(), claim.owner.clone()));
+            released.push((claim_glob(glob).to_string(), claim.owner.clone()));
             false
         } else {
             true
@@ -339,7 +339,7 @@ pub fn release_claims_matching_paths(
                 .iter()
                 .any(|p| glob_match(claim_glob(glob), p) || globs_may_overlap(glob, p, committed_paths))
         {
-            released.push(glob.clone());
+            released.push(claim_glob(glob).to_string());
             false
         } else {
             true
@@ -446,6 +446,46 @@ mod tests {
             ClaimMode::Read
         )
         .is_some());
+    }
+
+    #[test]
+    fn read_claim_keys_are_stripped_from_release_and_overlap_paths() {
+        let mut table = ClaimTable::new();
+        table.insert(
+            claim_key("src/lib.rs", "reader-a", ClaimMode::Read),
+            Claim {
+                owner: "reader-a".to_string(),
+                expires_at_ms: 2_000,
+                note: String::new(),
+                task_id: Some("task-1".to_string()),
+                mode: ClaimMode::Read,
+            },
+        );
+        assert!(globs_may_overlap(
+            &claim_key("src/lib.rs", "reader-a", ClaimMode::Read),
+            "src/lib.rs",
+            &[]
+        ));
+        assert_eq!(
+            release_claims_matching_paths(&mut table, "reader-a", &["src/lib.rs".to_string()]),
+            vec!["src/lib.rs".to_string()]
+        );
+
+        let mut table = ClaimTable::new();
+        table.insert(
+            claim_key("paper/**", "reader-a", ClaimMode::Read),
+            Claim {
+                owner: "reader-a".to_string(),
+                expires_at_ms: 2_000,
+                note: String::new(),
+                task_id: Some("task-1".to_string()),
+                mode: ClaimMode::Read,
+            },
+        );
+        assert_eq!(
+            release_claims_for_task(&mut table, "task-1"),
+            vec![("paper/**".to_string(), "reader-a".to_string())]
+        );
     }
 
     #[test]

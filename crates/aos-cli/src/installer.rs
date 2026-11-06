@@ -818,7 +818,7 @@ pub(crate) async fn run_doctor(home_dir: &Path) -> anyhow::Result<()> {
             shim_dir.display()
         );
     }
-    println!("  - broker: not started by `aos run` yet; filesystem + egress only");
+    println!("  - broker: per-session Unix/TCP control socket is started by `aos run`");
     println!(
         "  - l7: base-url routes available for Anthropic / OpenAI / Gemini / DeepSeek / Mistral / Groq / xAI / OpenRouter"
     );
@@ -869,7 +869,12 @@ pub(crate) async fn run_doctor(home_dir: &Path) -> anyhow::Result<()> {
     }
     #[cfg(not(target_os = "linux"))]
     {
-        println!("  - status: NOT AVAILABLE on this OS (macOS Seatbelt is Phase 4)");
+        if Path::new("/usr/bin/sandbox-exec").exists() {
+            println!("  - status: READY (macOS Seatbelt MVP; shadow cwd, no path remap)");
+            println!("  - launch: `aegis-os --workspace . run -- claude`");
+        } else {
+            println!("  - status: BLOCKED (/usr/bin/sandbox-exec is missing)");
+        }
     }
     Ok(())
 }

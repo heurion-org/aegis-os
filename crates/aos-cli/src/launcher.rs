@@ -1529,23 +1529,44 @@ fn boundary_secret_placeholder(env_key: &str) -> Option<&'static str> {
         "ANTHROPIC_API_KEY" => Some("$AOS_SECRET_ANTHROPIC_API_KEY"),
         "ANTHROPIC_AUTH_TOKEN" => Some("$AOS_SECRET_ANTHROPIC_AUTH_TOKEN"),
         "OPENAI_API_KEY" => Some("$AOS_SECRET_OPENAI_API_KEY"),
+        "GEMINI_API_KEY" => Some("$AOS_SECRET_GEMINI_API_KEY"),
+        "GOOGLE_API_KEY" => Some("$AOS_SECRET_GOOGLE_API_KEY"),
         _ => None,
     }
 }
 
 async fn register_boundary_secrets(gateway: &AegisEgressGateway, identity: &AgentIdentity) {
-    for (env_key, placeholder, domain) in [
+    for (env_key, placeholder, domain, paths) in [
         (
             "ANTHROPIC_API_KEY",
             "$AOS_SECRET_ANTHROPIC_API_KEY",
             "api.anthropic.com",
+            vec!["/v1/"],
         ),
         (
             "ANTHROPIC_AUTH_TOKEN",
             "$AOS_SECRET_ANTHROPIC_AUTH_TOKEN",
             "api.anthropic.com",
+            vec!["/v1/"],
         ),
-        ("OPENAI_API_KEY", "$AOS_SECRET_OPENAI_API_KEY", "api.openai.com"),
+        (
+            "OPENAI_API_KEY",
+            "$AOS_SECRET_OPENAI_API_KEY",
+            "api.openai.com",
+            vec!["/v1/"],
+        ),
+        (
+            "GEMINI_API_KEY",
+            "$AOS_SECRET_GEMINI_API_KEY",
+            "generativelanguage.googleapis.com",
+            vec!["/v1/", "/v1beta/"],
+        ),
+        (
+            "GOOGLE_API_KEY",
+            "$AOS_SECRET_GOOGLE_API_KEY",
+            "generativelanguage.googleapis.com",
+            vec!["/v1/", "/v1beta/"],
+        ),
     ] {
         let Ok(value) = std::env::var(env_key) else {
             continue;
@@ -1568,7 +1589,7 @@ async fn register_boundary_secrets(gateway: &AegisEgressGateway, identity: &Agen
                     "PATCH".to_string(),
                     "DELETE".to_string(),
                 ],
-                vec!["/v1/".to_string()],
+                paths.into_iter().map(str::to_string).collect(),
             )
             .await;
     }
@@ -1822,6 +1843,12 @@ fn sha256_hex(bytes: &[u8]) -> String {
     format!("sha256:{}", hex::encode(Sha256::digest(bytes)))
 }
 
+/// Policy evidence hashes are stored as bare hex; the policy matcher adds the `sha256:` namespace
+/// exactly once when it builds the lease resource pattern.
+fn sha256_plain(bytes: &[u8]) -> String {
+    hex::encode(Sha256::digest(bytes))
+}
+
 fn diff_label(kind: &aos_core::DiffChangeType) -> &'static str {
     match kind {
         aos_core::DiffChangeType::Added => "A",
@@ -1844,7 +1871,7 @@ fn approval_evidence(diffs: &[aos_core::FileDiffEntry]) -> anyhow::Result<(Value
             "preview": d.preview_diff,
         })).collect::<Vec<_>>()
     });
-    let hash = sha256_hex(&serde_json::to_vec(&payload)?);
+    let hash = sha256_plain(&serde_json::to_vec(&payload)?);
     Ok((payload, hash))
 }
 
@@ -2379,34 +2406,6 @@ async fn run_inner(
         return Ok(exit_code(status));
     }
 
-    #[cfg(target_os = "macos")]
-    {
-        return run_macos_inner(
-            &project,
-            &identity,
-            runtime_dir,
-            &mode,
-            &profile,
-            command,
-            host_home,
-        )
-        .await;
-    }
-
-    #[cfg(all(not(target_os = "linux"), not(target_os = "macos")))]
-    bail!("aos run: enforced mode is not implemented on this OS");
-
-    let bwrap = aos_sandbox::linux_bwrap_path()
-        .context("aos run: bubblewrap not found at /usr/bin/bwrap, /usr/local/bin/bwrap or /bin/bwrap; install bubblewrap")?;
-    let bwrap = PathBuf::from(bwrap);
-    if !bwrap_supports_bind_fd(&bwrap) {
-        bail!(
-            "aos run: {} is too old for the Phase 1 launcher (missing --bind-fd/--ro-bind-fd). \
-             Upgrade bubblewrap to >= 0.10 (Ubuntu 24.04+, Debian 13+, or build from source).",
-            bwrap.display()
-        );
-    }
-
     validate_workspace_roots(&project, host_home, runtime_dir)?;
     let host_name = project
         .file_name()
@@ -2415,7 +2414,6 @@ async fn run_inner(
         .to_string();
 
     let mut command = command.to_vec();
-    let (agent_bin_mounts, extra_path) = agent_mounts(host_home, &mut command)?;
     if command
         .first()
         .and_then(|c| Path::new(c).file_name())
@@ -2436,6 +2434,36 @@ async fn run_inner(
             command.insert(1, "--standalone".to_string());
         }
     }
+
+    #[cfg(target_os = "macos")]
+    {
+        return run_macos_inner(
+            &project,
+            &identity,
+            runtime_dir,
+            &mode,
+            &profile,
+            &command,
+            host_home,
+        )
+        .await;
+    }
+
+    #[cfg(all(not(target_os = "linux"), not(target_os = "macos")))]
+    bail!("aos run: enforced mode is not implemented on this OS");
+
+    let bwrap = aos_sandbox::linux_bwrap_path()
+        .context("aos run: bubblewrap not found at /usr/bin/bwrap, /usr/local/bin/bwrap or /bin/bwrap; install bubblewrap")?;
+    let bwrap = PathBuf::from(bwrap);
+    if !bwrap_supports_bind_fd(&bwrap) {
+        bail!(
+            "aos run: {} is too old for the Phase 1 launcher (missing --bind-fd/--ro-bind-fd). \
+             Upgrade bubblewrap to >= 0.10 (Ubuntu 24.04+, Debian 13+, or build from source).",
+            bwrap.display()
+        );
+    }
+
+    let (agent_bin_mounts, extra_path) = agent_mounts(host_home, &mut command)?;
 
     let session_id = format!("ses_{}", &uuid::Uuid::new_v4().simple().to_string()[..12]);
     let session_dir = runtime_dir.join("sessions").join(&session_id);
@@ -2568,7 +2596,7 @@ async fn run_inner(
         "session_id": session_id.clone(),
         "mode": mode.clone(),
         "enforcement": "enforced",
-        "enforcement_scope": "filesystem+egress (no broker/effect approval yet)",
+        "enforcement_scope": "filesystem+egress+broker (commit + live policy)",
         "profile": profile.clone(),
         "org_id": identity.org_id.clone(),
         "agent_id": identity.agent_id.clone(),
@@ -2818,6 +2846,7 @@ async fn run_macos_inner(
     for rel in [".run", ".cache", ".local/share", "tmp"] {
         std::fs::create_dir_all(agent_home.join(rel))?;
     }
+    install_git_shim(&agent_home)?;
 
     let cow_base = session_dir.join("cow_workspace");
     std::fs::create_dir_all(&cow_base)?;
@@ -3355,6 +3384,10 @@ mod tests {
             good_hash, swapped_hash,
             "same-size binary content with the same preview must not share an evidence hash"
         );
+        assert!(
+            !good_hash.starts_with("sha256:"),
+            "policy evidence hashes must be bare hex; the lease matcher adds the sha256: namespace"
+        );
     }
 
     #[test]
@@ -3367,7 +3400,10 @@ mod tests {
             boundary_secret_placeholder("OPENAI_API_KEY"),
             Some("$AOS_SECRET_OPENAI_API_KEY")
         );
-        assert_eq!(boundary_secret_placeholder("GEMINI_API_KEY"), None);
+        assert_eq!(
+            boundary_secret_placeholder("GEMINI_API_KEY"),
+            Some("$AOS_SECRET_GEMINI_API_KEY")
+        );
     }
 
     #[test]

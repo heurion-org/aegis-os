@@ -914,15 +914,14 @@ impl PolicyEngine for AegisPolicyKernel {
                 .iter_mut()
                 .find(|e| e.escalation_id == escalation_id)
                 .with_context(|| format!("Escalation '{}' not found", escalation_id))?;
-            if item.status == EscalationStatus::Denied {
-                anyhow::bail!("Escalation '{}' has already been denied", escalation_id);
-            }
-            if item.status == EscalationStatus::Expired {
+            if item.status != EscalationStatus::Pending {
+                let status = item.status.clone();
                 drop(list);
                 let _ = self.flush_to_disk_unlocked().await;
                 anyhow::bail!(
-                    "Escalation '{}' has expired and can no longer be approved",
-                    escalation_id
+                    "Escalation '{}' is not pending (status: {:?}) and cannot be approved again",
+                    escalation_id,
+                    status
                 );
             }
             item.status = EscalationStatus::Approved;
@@ -962,10 +961,12 @@ impl PolicyEngine for AegisPolicyKernel {
             base_resource_pattern
         };
         let task_id = target.task_id.clone();
-        let kind = if task_id.is_some() {
-            LeaseKind::TaskScoped
-        } else if is_oneshot {
+        // One-shot must win over task scoping: an agent inside an active A2A task would
+        // otherwise turn "Approve Once" into a replayable TaskScoped lease.
+        let kind = if is_oneshot {
             LeaseKind::OneShot
+        } else if task_id.is_some() {
+            LeaseKind::TaskScoped
         } else {
             LeaseKind::Ttl
         };
@@ -981,12 +982,12 @@ impl PolicyEngine for AegisPolicyKernel {
             task_id: task_id.clone(),
         };
 
+        let mut primary_lease = lease.clone();
         {
             let mut leases = self.leases.write().await;
-            leases.push(lease.clone());
             // When approving a sensitive commit escalation (which may batch multiple sensitive files
             // like `"Cargo.toml, package.json"`), ensure each individual sensitive target and a
-            // companion one-shot `workspace_commit` lease are granted in a single approval click!
+            // companion one-shot `workspace_commit` lease are granted in a single approval click.
             if target.action == "workspace_commit_sensitive" {
                 let parts: Vec<&str> = target
                     .target_resource
@@ -995,7 +996,7 @@ impl PolicyEngine for AegisPolicyKernel {
                     .filter(|s| !s.is_empty())
                     .collect();
                 if parts.len() > 1 {
-                    for part in parts {
+                    for (idx, part) in parts.into_iter().enumerate() {
                         let part_pattern = if is_oneshot {
                             if let Some(ref ev_hash) = target.evidence_hash {
                                 format!("{}#sha256:{}", part, ev_hash)
@@ -1005,7 +1006,7 @@ impl PolicyEngine for AegisPolicyKernel {
                         } else {
                             part.to_string()
                         };
-                        leases.push(LeaseGrant {
+                        let part_lease = LeaseGrant {
                             lease_id: format!("lease-{}", &Uuid::new_v4().to_string()[..8]),
                             org_id: target.org_id.clone(),
                             agent_id: target.agent_id.clone(),
@@ -1015,8 +1016,15 @@ impl PolicyEngine for AegisPolicyKernel {
                             granted_by: approved_by.to_string(),
                             kind,
                             task_id: task_id.clone(),
-                        });
+                        };
+                        if idx == 0 {
+                            primary_lease = part_lease.clone();
+                        }
+                        leases.push(part_lease);
                     }
+                } else {
+                    // One combined target is already represented by `lease`.
+                    leases.push(lease.clone());
                 }
                 let companion_resource = if is_oneshot {
                     target
@@ -1035,17 +1043,21 @@ impl PolicyEngine for AegisPolicyKernel {
                     resource_pattern: companion_resource,
                     expires_at_ms: now_ms + 900_000,
                     granted_by: approved_by.to_string(),
-                    kind: if task_id.is_some() {
+                    kind: if is_oneshot {
+                        LeaseKind::OneShot
+                    } else if task_id.is_some() {
                         LeaseKind::TaskScoped
                     } else {
-                        LeaseKind::OneShot
+                        LeaseKind::Ttl
                     },
                     task_id,
                 });
+            } else {
+                leases.push(lease.clone());
             }
         }
         self.flush_to_disk_unlocked().await?;
-        Ok(lease)
+        Ok(primary_lease)
     }
 
     async fn revoke_leases_for_task(&self, task_id: &str) -> anyhow::Result<usize> {
@@ -1096,6 +1108,13 @@ impl PolicyEngine for AegisPolicyKernel {
                 .iter_mut()
                 .find(|e| e.escalation_id == escalation_id)
                 .with_context(|| format!("Escalation '{}' not found", escalation_id))?;
+            if item.status != EscalationStatus::Pending {
+                anyhow::bail!(
+                    "Escalation '{}' is not pending (status: {:?}) and cannot be denied",
+                    escalation_id,
+                    item.status
+                );
+            }
             item.status = EscalationStatus::Denied;
             item.decided_by = Some(denied_by.to_string());
             item.decided_at_ms = Some(now_ms);
@@ -1224,6 +1243,78 @@ mod tests {
             .unwrap();
         assert_eq!(lease.kind, LeaseKind::TaskScoped);
         assert_eq!(lease.task_id.as_deref(), Some("task-1"));
+    }
+
+    #[tokio::test]
+    async fn one_shot_wins_over_task_scope_and_approved_ticket_cannot_be_reused() {
+        let kernel = AegisPolicyKernel::new();
+        let agent = AgentIdentity::new("acme", "coder-1", "Coder");
+        let ctx = PolicyContext {
+            principal: agent,
+            action: "workspace_commit".to_string(),
+            target_org_id: "acme".to_string(),
+            target_resource: "/workspace".to_string(),
+            metadata: json!({ "task_id": "task-1" }),
+        };
+        let escalation_id = match kernel.evaluate(&ctx).await.unwrap() {
+            PolicyDecision::Ask { escalation_id, .. } => escalation_id,
+            other => panic!("expected Ask, got {other:?}"),
+        };
+        let lease = kernel
+            .approve_escalation(&escalation_id, 0, "user")
+            .await
+            .unwrap();
+        assert_eq!(lease.kind, LeaseKind::OneShot);
+        assert_eq!(lease.task_id.as_deref(), Some("task-1"));
+        assert!(kernel
+            .approve_escalation(&escalation_id, 0, "user")
+            .await
+            .is_err());
+        assert!(kernel.deny_escalation(&escalation_id, "user").await.is_err());
+    }
+
+    #[tokio::test]
+    async fn sensitive_batch_approval_grants_split_leases_without_combined_residue() {
+        let kernel = AegisPolicyKernel::new();
+        let agent = AgentIdentity::new("acme", "coder-1", "Coder");
+        let ctx = PolicyContext {
+            principal: agent,
+            action: "workspace_commit".to_string(),
+            target_org_id: "acme".to_string(),
+            target_resource: "/workspace".to_string(),
+            metadata: json!({ "paths": ["Cargo.toml", "package.json"] }),
+        };
+        let escalation_id = match kernel.evaluate(&ctx).await.unwrap() {
+            PolicyDecision::Ask { escalation_id, .. } => escalation_id,
+            other => panic!("expected Ask, got {other:?}"),
+        };
+        kernel
+            .approve_escalation(&escalation_id, 0, "user")
+            .await
+            .unwrap();
+
+        {
+            let leases = kernel.leases.read().await;
+            assert!(leases
+                .iter()
+                .all(|lease| !lease.resource_pattern.contains(", ")));
+            for path in ["Cargo.toml", "package.json"] {
+                assert!(leases.iter().any(|lease| {
+                    lease.action_pattern == "workspace_commit_sensitive"
+                        && lease.resource_pattern == path
+                        && lease.kind == LeaseKind::OneShot
+                }));
+            }
+        }
+
+        assert!(matches!(
+            kernel.evaluate(&ctx).await.unwrap(),
+            PolicyDecision::Allow { .. }
+        ));
+        assert!(matches!(
+            kernel.evaluate(&ctx).await.unwrap(),
+            PolicyDecision::Ask { .. }
+        ));
     }
 
     #[tokio::test]

@@ -1096,7 +1096,7 @@ impl AuditEvent {
 }
 
 /// Pure-Rust FIPS 180-4 SHA-256 hex digest helper so `aos-core` needs no extra crate dependencies.
-#[allow(clippy::chunks_exact_to_as_chunks)]
+#[allow(unknown_lints, clippy::chunks_exact_to_as_chunks)]
 pub fn sha256_hex(data: &[u8]) -> String {
     const K: [u32; 64] = [
         0x428a2f98, 0x71374491, 0xb5c0fbcf, 0xe9b5dba5, 0x3956c25b, 0x59f111f1, 0x923f82a4,

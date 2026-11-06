@@ -7,6 +7,20 @@ use serde_json::{json, Value};
 use std::io::Read;
 use std::path::{Path, PathBuf};
 
+/// Emit both the AGY top-level `decision`/`reason` and Claude Code's
+/// `hookSpecificOutput` shape so neither client silently ignores a boundary decision.
+fn hook_decision(effect: &str, reason: &str) -> Value {
+    json!({
+        "decision": effect,
+        "reason": reason,
+        "hookSpecificOutput": {
+            "hookEventName": "PreToolUse",
+            "permissionDecision": effect,
+            "permissionDecisionReason": reason
+        }
+    })
+}
+
 // AGY & Claude Code Hook Handler (`SessionStart` & `PreToolUse`)
 // ============================================================================
 
@@ -380,8 +394,13 @@ pub(crate) async fn handle_agy_hook(
 
     match event {
         "SessionStart" => {
-            let guard_key = format!("SessionStart:{}:{}", conv_tag, std::process::id() / 2);
-            let _ = aos_core::session::once_guard(&cli.runtime_dir, &guard_key);
+            // A short-lived hook process has a fresh PID every time; key the guard by the
+            // conversation/session identity instead, and honor the false return value.
+            let guard_key = format!("SessionStart:{conv_tag}");
+            if !aos_core::session::once_guard(&cli.runtime_dir, &guard_key) {
+                println!("{{}}");
+                return Ok(());
+            }
             let refresh = env.workspace.refresh_from_host().await.unwrap_or_default();
             let unread = kernel
                 .ipc
@@ -559,13 +578,7 @@ pub(crate) async fn handle_agy_hook(
                             .unwrap_or("Aegis policy denied this tool call");
                         println!(
                             "{}",
-                            serde_json::to_string(&json!({
-                                "hookSpecificOutput": {
-                                    "hookEventName": "PreToolUse",
-                                    "permissionDecision": effect,
-                                    "permissionDecisionReason": reason
-                                }
-                            }))?
+                            serde_json::to_string(&hook_decision(effect, reason))?
                         );
                         return Ok(());
                     }
@@ -601,10 +614,7 @@ pub(crate) async fn handle_agy_hook(
                                 );
                                 println!(
                                     "{}",
-                                    serde_json::to_string(&json!({
-                                        "decision": "deny",
-                                        "reason": conflict
-                                    }))?
+                                    serde_json::to_string(&hook_decision("deny", &conflict))?
                                 );
                                 return Ok(());
                             }
@@ -682,10 +692,7 @@ pub(crate) async fn handle_agy_hook(
                         .await;
                         println!(
                             "{}",
-                            serde_json::to_string(&json!({
-                                "decision": "ask",
-                                "reason": reason
-                            }))?
+                            serde_json::to_string(&hook_decision("ask", &reason))?
                         );
                         return Ok(());
                     }
@@ -722,10 +729,7 @@ pub(crate) async fn handle_agy_hook(
                             );
                             println!(
                                 "{}",
-                                serde_json::to_string(&json!({
-                                    "decision": "deny",
-                                    "reason": conflict
-                                }))?
+                                serde_json::to_string(&hook_decision("deny", &conflict))?
                             );
                             return Ok(());
                         }
@@ -795,10 +799,7 @@ pub(crate) async fn handle_agy_hook(
                     .await;
                     println!(
                         "{}",
-                        serde_json::to_string(&json!({
-                            "decision": "ask",
-                            "reason": reason
-                        }))?
+                        serde_json::to_string(&hook_decision("ask", &reason))?
                     );
                     return Ok(());
                 }
