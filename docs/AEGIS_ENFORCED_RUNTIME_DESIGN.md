@@ -28,7 +28,7 @@ Phase 1 已在 `main` 落地以下能力：
 - `aos verify`：在沙箱内执行 `.aegis/verify.json` 或 `AOS_VERIFY_CMD`；`aos commit` 也会先跑该预检门，失败则不生成审批单。
 - 已修复：大文件 CoW 自指 symlink、工具链凭据泄露、`workspace=$HOME` 复制敏感目录、TIOCSTI、bwrap 版本探测、resolv.conf、node_modules 自指、Ctrl-C、OAuth 写回、权限、Git shim、NixOS/Linuxbrew 兼容。
 
-**尚未完成**：L7 DLP / Base URL 反向代理 / opt-in MITM、OpenCode/Hermes 的 install-time plugin 配置、完整 policy broker/租约/审批 UI、macOS Seatbelt、DomainProfile 的 docs/data/binary 合并器、Phase 5 的 Office CRDT / CAS / AAP / UOMP。
+**尚未完成**：L7 DLP / Base URL 反向代理 / opt-in MITM、审批 Web Console 对接、OpenCode/Hermes 的 install-time plugin 配置、macOS Seatbelt、docs/data/binary 的专用合并器（CAS 发布已可用）、Phase 5 的 Office CRDT / AAP-1.0 / UOMP / IDE 集成。
 
 ---
 
