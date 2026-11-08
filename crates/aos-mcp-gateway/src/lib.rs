@@ -463,7 +463,7 @@ impl AegisRuntimeKernel {
     }
 
     /// Releases claims owned by `identity.agent_id` that cover `committed_paths`.
-    async fn release_claims_matching_committed_paths(
+    pub async fn release_claims_matching_committed_paths(
         &self,
         identity: &AgentIdentity,
         committed_paths: &[String],
@@ -1149,21 +1149,8 @@ impl AegisRuntimeKernel {
                 )
                 .await
                 .unwrap_or_default();
-                let canonical_diff_payload = json!({
-                    "overwrite_binaries": overwrite_binaries,
-                    "skip_verify": skip_verify,
-                    "diffs": diffs.iter().map(|d| json!({
-                        "path": d.relative_path,
-                        "change_type": d.change_type,
-                        "old_size": d.old_size,
-                        "new_size": d.new_size,
-                        "old_sha256": d.old_sha256,
-                        "new_sha256": d.new_sha256,
-                        "preview_diff": d.preview_diff,
-                    })).collect::<Vec<_>>(),
-                });
-                let evidence_hash =
-                    aos_core::sha256_hex(canonical_diff_payload.to_string().as_bytes());
+                let (_canonical_diff_payload, evidence_hash) =
+                    aos_core::compute_diff_evidence(&diffs, overwrite_binaries, skip_verify);
                 if let Some(obj) = audit_metadata.as_object_mut() {
                     obj.insert("paths".to_string(), json!(touched));
                     obj.insert(

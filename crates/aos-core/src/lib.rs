@@ -170,6 +170,16 @@ pub enum DiffChangeType {
     Deleted,
 }
 
+impl DiffChangeType {
+    pub fn short_label(&self) -> &'static str {
+        match self {
+            Self::Added => "A",
+            Self::Modified => "M",
+            Self::Deleted => "D",
+        }
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct FileDiffEntry {
     pub relative_path: String,
@@ -184,6 +194,36 @@ pub struct FileDiffEntry {
     /// SHA-256 of the full shadow content.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub new_sha256: Option<String>,
+}
+
+/// Builds the canonical JSON evidence payload and bare 64-hex SHA-256 commitment for a CoW diff.
+/// Shared by both `aos-mcp-gateway` (`workspace_commit`) and `aos-cli` (`aos commit` / `aos approvals`)
+/// so a `OneShot` lease pinned to `sha256:<evidence_hash>` is valid across both planes.
+pub fn compute_diff_evidence(
+    diffs: &[FileDiffEntry],
+    overwrite_binaries: bool,
+    skip_verify: bool,
+) -> (serde_json::Value, String) {
+    let mut sorted: Vec<&FileDiffEntry> = diffs.iter().collect();
+    sorted.sort_by(|a, b| a.relative_path.cmp(&b.relative_path));
+    let payload = serde_json::json!({
+        "overwrite_binaries": overwrite_binaries,
+        "skip_verify": skip_verify,
+        "diffs": sorted.into_iter().map(|d| serde_json::json!({
+            "path": d.relative_path,
+            "change": d.change_type.short_label(),
+            "change_type": d.change_type,
+            "old_size": d.old_size,
+            "new_size": d.new_size,
+            "old_sha256": d.old_sha256,
+            "new_sha256": d.new_sha256,
+            "preview": d.preview_diff,
+            "preview_diff": d.preview_diff,
+        })).collect::<Vec<_>>(),
+    });
+    let bytes = serde_json::to_vec(&payload).unwrap_or_else(|_| payload.to_string().into_bytes());
+    let hash = sha256_hex(&bytes);
+    (payload, hash)
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

@@ -2436,8 +2436,12 @@ async fn main() -> anyhow::Result<()> {
         Commands::Approvals { action } => match action {
             ApprovalAction::List => launcher::approvals_list(&runtime_dir)?,
             ApprovalAction::Show { id } => launcher::approval_show(&runtime_dir, &id)?,
-            ApprovalAction::Approve { id } => launcher::approval_decide(&runtime_dir, &id, true)?,
-            ApprovalAction::Deny { id } => launcher::approval_decide(&runtime_dir, &id, false)?,
+            ApprovalAction::Approve { id } => {
+                launcher::approval_decide(&runtime_dir, &id, true).await?
+            }
+            ApprovalAction::Deny { id } => {
+                launcher::approval_decide(&runtime_dir, &id, false).await?
+            }
             ApprovalAction::Serve { port, token } => {
                 launcher::approvals_serve(&runtime_dir, port, token).await?
             }

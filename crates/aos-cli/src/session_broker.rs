@@ -96,7 +96,10 @@ impl SessionBroker {
             use std::os::unix::fs::PermissionsExt;
             let _ = std::fs::set_permissions(&control_dir, std::fs::Permissions::from_mode(0o700));
         }
-        let socket_path = control_dir.join("control.sock");
+        let mut socket_path = control_dir.join("control.sock");
+        if socket_path.as_os_str().len() >= 100 {
+            socket_path = control_dir.join("c.s");
+        }
         let _ = std::fs::remove_file(&socket_path);
 
         let agent_token = format!(
@@ -959,7 +962,7 @@ mod tests {
         let broker = SessionBroker::start(
             &runtime,
             &session_dir,
-            session_dir.join("control"),
+            tmp.path().join("c"),
             BrokerSession {
                 session_id: "ses_test".to_string(),
                 mode: "implement".to_string(),

@@ -16,9 +16,9 @@
 |---|---|---|---|
 | **Phase 0** 说真话与可观测性 | 🟡 部分完成 | `doctor` 现在检查 Aegis 配置条目、PATH shim/enforcement 状态、broker 缺失提示；README 有 Phase 1 limits；`.agents/hooks.json` 可移植 | 公开客户端能力矩阵、Hook 实际加载状态、telemetry |
 | **Phase 1** `aos run` Linux MVP | 🟡 MVP 完成，完整交付未完成 | bwrap 进程树、CoW shadow、宿主只读、`$HOME`/系统目录遮蔽、Git 目录视图、状态目录持久化绑定、工具链挂载、CONNECT egress allowlist、PTY + SIGWINCH/SIGTERM/Ctrl-C、退出摘要与 pending 退出码、advisory 降级、bwrap 版本探测 | worktree `.git`、OverlayFS、observe 网络只读 |
-| **Phase 2** Effect / 审批 / 租约 | 🟡 部分完成 | `aos-core::effect` + `policy_action` 桥接、commit approval ticket、**full-content SHA-256 evidence** + TOCTOU、`aos approvals` CLI/Web、`workspace_commit` 租约（复用 policy matcher）、敏感路径守卫、哈希链 audit/`aos why`、**模型 API Base URL 反向代理 + L7 DLP**、**per-session broker + `AOS_SESSION_TOKEN` + `AOS_CONTROL_SOCKET` + MCP stdio bridge + `aos adapter hello/capabilities/evaluate/effect/heartbeat`**、AdapterManifest / `aos agent add/test`、OpenCode V1 plugin、`aos policy watch` + 桌面通知 | opt-in MITM、DecisionClass/Cedar 属性、OpenCode V2 tool hooks、Hermes plugin、完整 policy broker UI、通用第三方 API L7 |
+| **Phase 2** Effect / 审批 / 租约 | 🟡 部分完成 | `aos-core::effect` + `policy_action` 桥接、commit approval ticket、**统一 `aos_core::compute_diff_evidence` 全量 SHA-256 证据哈希** + TOCTOU、`aos approvals` CLI/Web 与 `AegisPolicyKernel` (`policy_state.json`) + `AegisFlightRecorder` (`flight_recorder.jsonl`) 双端同步、`workspace_commit` 租约（复用 policy matcher）、敏感路径守卫、哈希链 audit/`aos why`、**模型 API Base URL 反向代理 + L7 DLP**、**per-session broker + `AOS_SESSION_TOKEN` + `AOS_CONTROL_SOCKET` + MCP stdio bridge + `aos adapter hello/capabilities/evaluate/effect/heartbeat`**、AdapterManifest / `aos agent add/test`、OpenCode V1 plugin、`aos policy watch` + 桌面通知 | opt-in MITM、DecisionClass/Cedar 属性、OpenCode V2 tool hooks、Hermes plugin、完整 policy broker UI、通用第三方 API L7 |
 | **Phase 3** DomainProfile / 预检 / CAS | 🟡 部分完成 | `DomainProfile` 接口 + `.aegis/workspace.json` profile/verify、`aos workspace profile`、read/write claims、文本 LCS、二进制排他锁+基线哈希、`aos verify`、`aos publish` / `artifacts list/fetch`（带 verify 门与 shadow 路径约束）、`aos diff --render`（文本 preview） | docs/data 专用合并器、Office CRDT、Schema/PHI 预置 profile、五客户端 adapter/plugin、章节/分区 claim |
-| **Phase 4** macOS / 内核加固 | 🟡 部分完成 | macOS Seatbelt launcher MVP：shadow cwd、宿主只读、credential deny、egress proxy、PTY、broker TCP control、MCP bridge；macOS 已手工验证 | Seatbelt default-deny 收敛、路径重映射、Landlock/seccomp、microVM 试点 |
+| **Phase 4** macOS / 内核加固 | 🟡 部分完成 | macOS Seatbelt launcher MVP：shadow cwd、宿主只读、credential deny、`.aegis-bin` 只读 Git shim `PATH` 置顶、egress proxy、PTY、broker TCP control、MCP bridge；macOS 已手工验证 | Seatbelt default-deny 收敛、路径重映射、Landlock/seccomp、microVM 试点 |
 | **Phase 5** 高级领域 / IDE / 企业 | ⬜ 未开始 | — | Office CRDT、AAP-1.0、UOMP、IDE daemon、MDM |
 
 **当前验证**
@@ -2401,7 +2401,7 @@ JSON：
 | 应用状态回滚困难 | 写坏 SaaS 数据 | 幂等键 + 补偿事务 + dry-run；高风险需双人审批 |
 | Adapter Protocol 漂移 | Hermes / 第三方失效 | 协议版本 + `doctor` 心跳 + enforced launcher 兜底 |
 | `aos agent add` 恶意 manifest | 任意命令执行 | manifest 签名 / 审核 / 只允许声明式配置 |
-| launcher 与 policy kernel 双审批/审计账本 | 证据与处置状态不一致 | 短期共用 bare-hex evidence；后续统一到 `AegisPolicyKernel` + `AegisFlightRecorder` |
+| launcher 与 policy kernel 双审批/审计账本 | 证据与处置状态不一致 | 已统一 `aos_core::compute_diff_evidence`，并在 `launcher::commit` / `approval_decide` 中双向同步 `approval.json`、`AegisPolicyKernel` (`policy_state.json`) 与 `AegisFlightRecorder` (`flight_recorder.jsonl`) |
 
 ### 13.2 开放问题
 

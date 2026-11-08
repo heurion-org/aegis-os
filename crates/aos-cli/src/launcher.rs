@@ -15,7 +15,8 @@
 //! or `/tmp` is replaced by tmpfs, a path source under those trees is no longer resolvable.
 
 use aos_core::{
-    AgentIdentity, ExecSpec, IsolationTier, ResourceLimits, SandboxConfig, SandboxDriver,
+    AgentIdentity, AuditEvent, EscalationStatus, ExecSpec, IsolationTier, LeaseGrant, LeaseKind,
+    PolicyContext, PolicyDecision, PolicyEngine, ResourceLimits, SandboxConfig, SandboxDriver,
     TransactionalWorkspace,
 };
 use aos_egress::{AegisEgressGateway, SecretVaultEntry};
@@ -1048,9 +1049,11 @@ pub(crate) async fn commit(
     );
     commit_effect.metadata = json!({
         "paths": changed.clone(),
+        "host_root": workspace,
         "evidence_hash": evidence_hash.clone(),
+        "evidence": evidence.clone(),
     });
-    let lease_ctx = commit_effect.to_policy_context(commit_identity, org_id);
+    let lease_ctx = commit_effect.to_policy_context(commit_identity.clone(), org_id);
     let lease = policy.match_active_lease(&lease_ctx).await;
 
     let approval_path = dir.join("approval.json");
@@ -1068,7 +1071,41 @@ pub(crate) async fn commit(
     let approval = if existing_approved {
         existing_record.unwrap()
     } else {
-        let escalation_id = format!("esc-{}", &uuid::Uuid::new_v4().simple().to_string()[..10]);
+        // Reuse an existing Pending escalation in policy_state.json for the same diff hash if one
+        // exists, or register a new one so `aos approvals` and `aos policy` share a single ledger.
+        let existing_policy_esc = policy
+            .list_escalations(org_id)
+            .await
+            .ok()
+            .and_then(|list| {
+                list.into_iter().find(|e| {
+                    e.agent_id == agent_id
+                        && e.status == EscalationStatus::Pending
+                        && e.evidence_hash.as_deref() == Some(evidence_hash.as_str())
+                })
+            });
+        let escalation_id = if let Some(esc) = existing_policy_esc {
+            esc.escalation_id
+        } else if lease.is_none() {
+            let ask_ctx = PolicyContext {
+                principal: commit_identity.clone(),
+                action: "workspace_commit".to_string(),
+                target_org_id: org_id.to_string(),
+                target_resource: "/workspace".to_string(),
+                metadata: json!({
+                    "paths": changed,
+                    "host_root": workspace,
+                    "evidence_hash": evidence_hash,
+                    "evidence": evidence,
+                }),
+            };
+            match policy.evaluate(&ask_ctx).await? {
+                PolicyDecision::Ask { escalation_id, .. } => escalation_id,
+                _ => format!("esc-{}", &uuid::Uuid::new_v4().simple().to_string()[..10]),
+            }
+        } else {
+            format!("esc-{}", &uuid::Uuid::new_v4().simple().to_string()[..10])
+        };
         let approval = json!({
             "escalation_id": escalation_id,
             "action": "workspace.commit",
@@ -1110,19 +1147,43 @@ pub(crate) async fn commit(
         approve_interactively(&diffs, &evidence_hash, &ticket_id)?
     };
     if !approved {
+        let now_ms = chrono::Utc::now().timestamp_millis();
+        let _ = policy.deny_escalation(&ticket_id, "cli-interactive").await;
         let mut denied = approval.clone();
         denied["status"] = json!("denied");
-        denied["decided_at_ms"] = json!(chrono::Utc::now().timestamp_millis());
+        denied["decided_at_ms"] = json!(now_ms);
         let _ = std::fs::write(approval_path, serde_json::to_vec_pretty(&denied)?);
         append_audit(
             &dir,
             json!({
                 "event": "workspace.commit",
                 "decision": "denied",
+                "escalation_id": ticket_id,
                 "evidence_hash": evidence_hash,
-                "timestamp_ms": chrono::Utc::now().timestamp_millis(),
+                "timestamp_ms": now_ms,
             }),
         );
+        let _ = kernel
+            .recorder
+            .record(AuditEvent {
+                event_id: format!("evt-{}", &uuid::Uuid::new_v4().to_string()[..8]),
+                timestamp_ms: now_ms,
+                org_id: org_id.to_string(),
+                agent_id: agent_id.to_string(),
+                action: "workspace.commit".to_string(),
+                resource: workspace.to_string(),
+                policy_decision: format!("denied:{ticket_id}"),
+                snapshot_id: None,
+                details: json!({
+                    "escalation_id": ticket_id,
+                    "evidence_hash": evidence_hash,
+                    "paths": changed,
+                }),
+                task_id: None,
+                prev_hash: None,
+                event_hash: None,
+            })
+            .await;
         bail!("aos commit: cancelled by user");
     }
 
@@ -1141,20 +1202,54 @@ pub(crate) async fn commit(
     }
 
     let committed = ws.commit_to_host(paths).await?;
+    if lease.is_none()
+        && policy
+            .approve_escalation(&ticket_id, 0, "cli-interactive")
+            .await
+            .is_ok()
+    {
+        let _ = policy.match_active_lease(&lease_ctx).await;
+    }
+    let now_ms = chrono::Utc::now().timestamp_millis();
     let mut approved_record = approval;
     approved_record["status"] = json!("approved");
-    approved_record["decided_at_ms"] = json!(chrono::Utc::now().timestamp_millis());
+    approved_record["decided_at_ms"] = json!(now_ms);
     let _ = std::fs::write(approval_path, serde_json::to_vec_pretty(&approved_record)?);
     append_audit(
         &dir,
         json!({
             "event": "workspace.commit",
             "decision": "approved",
+            "escalation_id": ticket_id,
             "paths": committed,
             "evidence_hash": evidence_hash,
-            "timestamp_ms": chrono::Utc::now().timestamp_millis(),
+            "timestamp_ms": now_ms,
         }),
     );
+    let _ = kernel
+        .recorder
+        .record(AuditEvent {
+            event_id: format!("evt-{}", &uuid::Uuid::new_v4().to_string()[..8]),
+            timestamp_ms: now_ms,
+            org_id: org_id.to_string(),
+            agent_id: agent_id.to_string(),
+            action: "workspace.commit".to_string(),
+            resource: workspace.to_string(),
+            policy_decision: format!("approved:{ticket_id}"),
+            snapshot_id: None,
+            details: json!({
+                "escalation_id": ticket_id,
+                "paths": committed,
+                "evidence_hash": evidence_hash,
+            }),
+            task_id: None,
+            prev_hash: None,
+            event_hash: None,
+        })
+        .await;
+    let _ = kernel
+        .release_claims_matching_committed_paths(&commit_identity, &committed)
+        .await;
     for path in committed {
         println!("committed {path}");
     }
@@ -1178,29 +1273,75 @@ pub(crate) fn why(runtime_dir: &Path, session_id: Option<&str>) -> anyhow::Resul
         eprintln!("Aegis: no sessions under {}", runtime_dir.display());
         return Ok(());
     };
-    println!("Session: {}", value.get("session_id").and_then(|v| v.as_str()).unwrap_or("-"));
-    println!("Status:  {}", value.get("status").and_then(|v| v.as_str()).unwrap_or("unknown"));
+    print!("{}", format_why_summary(&dir, &value)?);
+    Ok(())
+}
+
+fn format_why_summary(dir: &Path, value: &Value) -> anyhow::Result<String> {
+    use std::fmt::Write as _;
+    let mut out = String::new();
+    let _ = writeln!(
+        out,
+        "Session: {}",
+        value.get("session_id").and_then(|v| v.as_str()).unwrap_or("-")
+    );
+    let _ = writeln!(
+        out,
+        "Status:  {}",
+        value
+            .get("status")
+            .and_then(|v| v.as_str())
+            .unwrap_or("unknown")
+    );
     let approval = dir.join("approval.json");
     if approval.is_file() {
         let raw = std::fs::read_to_string(&approval)?;
         let record: Value = serde_json::from_str(&raw)?;
-        println!("\nApproval:");
-        println!("{}", serde_json::to_string_pretty(&record)?);
+        let _ = writeln!(out, "\nApproval:");
+        let _ = writeln!(out, "{}", serde_json::to_string_pretty(&record)?);
     } else {
-        println!("\nApproval: none (no commit requested)");
+        let _ = writeln!(out, "\nApproval: none (no commit requested)");
     }
     let audit = dir.join("audit.jsonl");
     if let Ok(raw) = std::fs::read_to_string(&audit) {
-        let tail: Vec<&str> = raw.lines().rev().take(10).collect();
+        let tail: Vec<&str> = raw
+            .lines()
+            .filter(|l| !l.trim().is_empty())
+            .rev()
+            .take(10)
+            .collect();
         if !tail.is_empty() {
-            println!("\nAudit chain: {}", if audit_chain_valid(&raw) { "valid" } else { "INVALID" });
-            println!("Audit tail:");
+            let _ = writeln!(
+                out,
+                "\nAudit chain: {}",
+                if audit_chain_valid(&raw) {
+                    "valid"
+                } else {
+                    "INVALID"
+                }
+            );
+            let _ = writeln!(out, "Audit tail:");
             for line in tail.into_iter().rev() {
-                println!("  {line}");
+                let _ = writeln!(out, "  {line}");
             }
         }
     }
-    Ok(())
+    let effects = dir.join("effects.jsonl");
+    if let Ok(raw) = std::fs::read_to_string(&effects) {
+        let tail: Vec<&str> = raw
+            .lines()
+            .filter(|l| !l.trim().is_empty())
+            .rev()
+            .take(10)
+            .collect();
+        if !tail.is_empty() {
+            let _ = writeln!(out, "\nEffects tail:");
+            for line in tail.into_iter().rev() {
+                let _ = writeln!(out, "  {line}");
+            }
+        }
+    }
+    Ok(out)
 }
 
 fn audit_chain_valid(raw: &str) -> bool {
@@ -1326,7 +1467,7 @@ async fn approvals_web_approve(
     if form.token != state.token {
         return Html("<h1>401 Unauthorized</h1>".to_string());
     }
-    let message = match approval_decide(&state.runtime_dir, &id, true) {
+    let message = match approval_decide(&state.runtime_dir, &id, true).await {
         Ok(()) => format!("approved {id}"),
         Err(err) => format!("error: {err}"),
     };
@@ -1345,7 +1486,7 @@ async fn approvals_web_deny(
     if form.token != state.token {
         return Html("<h1>401 Unauthorized</h1>".to_string());
     }
-    let message = match approval_decide(&state.runtime_dir, &id, false) {
+    let message = match approval_decide(&state.runtime_dir, &id, false).await {
         Ok(()) => format!("denied {id}"),
         Err(err) => format!("error: {err}"),
     };
@@ -1750,20 +1891,61 @@ fn detect_profile(root: &Path) -> &'static str {
 }
 
 fn collect_approvals(runtime_dir: &Path) -> Vec<(PathBuf, Value)> {
+    let mut tickets: Vec<(PathBuf, Value)> = Vec::new();
+    let mut seen_ids = std::collections::HashSet::new();
     let sessions = runtime_dir.join("sessions");
-    let Ok(entries) = std::fs::read_dir(&sessions) else {
-        return Vec::new();
-    };
-    let mut tickets = Vec::new();
-    for entry in entries.flatten() {
-        let path = entry.path().join("approval.json");
-        let Ok(raw) = std::fs::read_to_string(&path) else {
-            continue;
-        };
-        let Ok(ticket) = serde_json::from_str::<Value>(&raw) else {
-            continue;
-        };
-        tickets.push((entry.path(), ticket));
+    if let Ok(entries) = std::fs::read_dir(&sessions) {
+        for entry in entries.flatten() {
+            let path = entry.path().join("approval.json");
+            let Ok(raw) = std::fs::read_to_string(&path) else {
+                continue;
+            };
+            let Ok(ticket) = serde_json::from_str::<Value>(&raw) else {
+                continue;
+            };
+            if let Some(id) = ticket.get("escalation_id").and_then(|v| v.as_str()) {
+                seen_ids.insert(id.to_string());
+            }
+            tickets.push((entry.path(), ticket));
+        }
+    }
+    if let Ok(raw) = std::fs::read_to_string(runtime_dir.join("policy_state.json")) {
+        if let Ok(state) = serde_json::from_str::<Value>(&raw) {
+            if let Some(escalations) = state.get("escalations").and_then(|v| v.as_array()) {
+                for esc in escalations {
+                    let Some(id) = esc.get("escalation_id").and_then(|v| v.as_str()) else {
+                        continue;
+                    };
+                    if seen_ids.contains(id) {
+                        continue;
+                    }
+                    let status = esc
+                        .get("status")
+                        .and_then(|v| v.as_str())
+                        .unwrap_or("pending")
+                        .to_ascii_lowercase();
+                    let paths = esc
+                        .pointer("/evidence/paths")
+                        .cloned()
+                        .unwrap_or_else(|| json!([]));
+                    let ticket = json!({
+                        "escalation_id": id,
+                        "action": esc.get("action").cloned().unwrap_or_else(|| json!("workspace_commit")),
+                        "org_id": esc.get("org_id").cloned().unwrap_or_else(|| json!("default")),
+                        "agent_id": esc.get("agent_id").cloned().unwrap_or_else(|| json!("agent")),
+                        "paths": paths,
+                        "evidence_hash": esc.get("evidence_hash").cloned().unwrap_or(Value::Null),
+                        "evidence": esc.get("evidence").cloned().unwrap_or(Value::Null),
+                        "status": status,
+                        "created_at_ms": esc.get("created_at_ms").cloned().unwrap_or(json!(0)),
+                        "decided_by": esc.get("decided_by").cloned().unwrap_or(Value::Null),
+                        "decided_at_ms": esc.get("decided_at_ms").cloned().unwrap_or(Value::Null),
+                    });
+                    seen_ids.insert(id.to_string());
+                    tickets.push((PathBuf::from("policy"), ticket));
+                }
+            }
+        }
     }
     tickets
 }
@@ -1788,8 +1970,8 @@ pub(crate) fn approvals_list(runtime_dir: &Path) -> anyhow::Result<()> {
     Ok(())
 }
 
-fn find_ticket(runtime_dir: &Path, id: &str) -> anyhow::Result<(PathBuf, Value)> {
-    let entries = std::fs::read_dir(runtime_dir.join("sessions"))?;
+fn find_session_ticket(runtime_dir: &Path, id: &str) -> Option<(PathBuf, Value)> {
+    let entries = std::fs::read_dir(runtime_dir.join("sessions")).ok()?;
     for entry in entries.flatten() {
         let path = entry.path().join("approval.json");
         let Ok(raw) = std::fs::read_to_string(&path) else {
@@ -1799,7 +1981,16 @@ fn find_ticket(runtime_dir: &Path, id: &str) -> anyhow::Result<(PathBuf, Value)>
             continue;
         };
         if ticket.get("escalation_id").and_then(|v| v.as_str()) == Some(id) {
-            return Ok((entry.path(), ticket));
+            return Some((entry.path(), ticket));
+        }
+    }
+    None
+}
+
+fn find_ticket(runtime_dir: &Path, id: &str) -> anyhow::Result<(PathBuf, Value)> {
+    for (dir, ticket) in collect_approvals(runtime_dir) {
+        if ticket.get("escalation_id").and_then(|v| v.as_str()) == Some(id) {
+            return Ok((dir, ticket));
         }
     }
     bail!("Aegis: escalation '{id}' not found")
@@ -1811,26 +2002,135 @@ pub(crate) fn approval_show(runtime_dir: &Path, id: &str) -> anyhow::Result<()> 
     Ok(())
 }
 
-pub(crate) fn approval_decide(runtime_dir: &Path, id: &str, approve: bool) -> anyhow::Result<()> {
-    let (dir, mut ticket) = find_ticket(runtime_dir, id)?;
-    ticket["status"] = json!(if approve { "approved" } else { "denied" });
-    ticket["decided_by"] = json!("cli-human");
-    ticket["decided_at_ms"] = json!(chrono::Utc::now().timestamp_millis());
-    std::fs::write(
-        dir.join("approval.json"),
-        serde_json::to_vec_pretty(&ticket)?,
-    )?;
-    append_audit(
-        &dir,
-        json!({
-            "event": "workspace.commit",
-            "decision": if approve { "approved" } else { "denied" },
-            "escalation_id": id,
-            "evidence_hash": ticket.get("evidence_hash"),
-            "decided_by": "cli-human",
-            "timestamp_ms": chrono::Utc::now().timestamp_millis(),
-        }),
-    );
+pub(crate) async fn approval_decide(runtime_dir: &Path, id: &str, approve: bool) -> anyhow::Result<()> {
+    let session_hit = find_session_ticket(runtime_dir, id);
+    let kernel = AegisRuntimeKernel::new(runtime_dir).await?;
+    let policy_hit = kernel
+        .policy
+        .list_escalations("*")
+        .await?
+        .into_iter()
+        .find(|e| e.escalation_id == id);
+
+    if session_hit.is_none() && policy_hit.is_none() {
+        bail!("Aegis: escalation '{id}' not found");
+    }
+
+    if let Some((_, ref ticket)) = session_hit {
+        let status = ticket
+            .get("status")
+            .and_then(|v| v.as_str())
+            .unwrap_or("pending");
+        if status != "pending" {
+            bail!(
+                "Escalation '{id}' is not pending (status: {status}) and cannot be decided again"
+            );
+        }
+    }
+
+    let now_ms = chrono::Utc::now().timestamp_millis();
+    let mut org_id = "default".to_string();
+    let mut agent_id = "agy-agent".to_string();
+    let mut evidence_hash: Option<String> = None;
+
+    if let Some(ref esc) = policy_hit {
+        org_id = esc.org_id.clone();
+        agent_id = esc.agent_id.clone();
+        evidence_hash = esc.evidence_hash.clone();
+        if approve {
+            kernel.policy.approve_escalation(id, 0, "cli-human").await?;
+        } else {
+            kernel.policy.deny_escalation(id, "cli-human").await?;
+        }
+    }
+
+    if let Some((dir, mut ticket)) = session_hit {
+        if let Ok(raw_session) = std::fs::read_to_string(dir.join("session.json")) {
+            if let Ok(session_val) = serde_json::from_str::<Value>(&raw_session) {
+                if let Some(o) = session_val.get("org_id").and_then(|v| v.as_str()) {
+                    org_id = o.to_string();
+                }
+                if let Some(a) = session_val.get("agent_id").and_then(|v| v.as_str()) {
+                    agent_id = a.to_string();
+                }
+            }
+        }
+        if evidence_hash.is_none() {
+            evidence_hash = ticket
+                .get("evidence_hash")
+                .and_then(|v| v.as_str())
+                .map(str::to_string);
+        }
+        // If a standalone session ticket was created without a matching entry in policy_state.json,
+        // mint a SHA-256-pinned OneShot lease on approval so both ledgers stay synchronized.
+        if policy_hit.is_none() && approve {
+            let resource_pattern = match evidence_hash.as_deref() {
+                Some(h) if !h.is_empty() => format!("sha256:{h}"),
+                _ => "*".to_string(),
+            };
+            let _ = kernel
+                .policy
+                .grant_lease(LeaseGrant {
+                    lease_id: format!("lease-{}", &uuid::Uuid::new_v4().to_string()[..8]),
+                    org_id: org_id.clone(),
+                    agent_id: agent_id.clone(),
+                    action_pattern: "workspace_commit".to_string(),
+                    resource_pattern,
+                    expires_at_ms: now_ms + 900_000,
+                    granted_by: "cli-human".to_string(),
+                    kind: LeaseKind::OneShot,
+                    task_id: None,
+                })
+                .await;
+        }
+        ticket["status"] = json!(if approve { "approved" } else { "denied" });
+        ticket["decided_by"] = json!("cli-human");
+        ticket["decided_at_ms"] = json!(now_ms);
+        std::fs::write(
+            dir.join("approval.json"),
+            serde_json::to_vec_pretty(&ticket)?,
+        )?;
+        append_audit(
+            &dir,
+            json!({
+                "event": "workspace.commit",
+                "decision": if approve { "approved" } else { "denied" },
+                "escalation_id": id,
+                "evidence_hash": ticket.get("evidence_hash"),
+                "decided_by": "cli-human",
+                "timestamp_ms": now_ms,
+            }),
+        );
+    }
+
+    let decision_label = if approve {
+        "approved:cli-human"
+    } else {
+        "denied:cli-human"
+    };
+    let _ = kernel
+        .recorder
+        .record(AuditEvent {
+            event_id: format!("evt-{}", &uuid::Uuid::new_v4().to_string()[..8]),
+            timestamp_ms: now_ms,
+            org_id,
+            agent_id,
+            action: "workspace.commit".to_string(),
+            resource: id.to_string(),
+            policy_decision: decision_label.to_string(),
+            snapshot_id: None,
+            details: json!({
+                "escalation_id": id,
+                "decision": if approve { "approved" } else { "denied" },
+                "evidence_hash": evidence_hash,
+                "decided_by": "cli-human",
+            }),
+            task_id: None,
+            prev_hash: None,
+            event_hash: None,
+        })
+        .await;
+
     println!(
         "{} {}",
         if approve { "approved" } else { "denied" },
@@ -1843,36 +2143,12 @@ fn sha256_hex(bytes: &[u8]) -> String {
     format!("sha256:{}", hex::encode(Sha256::digest(bytes)))
 }
 
-/// Policy evidence hashes are stored as bare hex; the policy matcher adds the `sha256:` namespace
-/// exactly once when it builds the lease resource pattern.
-fn sha256_plain(bytes: &[u8]) -> String {
-    hex::encode(Sha256::digest(bytes))
-}
-
 fn diff_label(kind: &aos_core::DiffChangeType) -> &'static str {
-    match kind {
-        aos_core::DiffChangeType::Added => "A",
-        aos_core::DiffChangeType::Modified => "M",
-        aos_core::DiffChangeType::Deleted => "D",
-    }
+    kind.short_label()
 }
 
 fn approval_evidence(diffs: &[aos_core::FileDiffEntry]) -> anyhow::Result<(Value, String)> {
-    let payload = json!({
-        "diffs": diffs.iter().map(|d| json!({
-            "path": d.relative_path,
-            "change": diff_label(&d.change_type),
-            "old_size": d.old_size,
-            "new_size": d.new_size,
-            // The preview is truncated for human display; the SHA-256 digests are what make the
-            // evidence hash a cryptographic commitment to the complete old/new bytes.
-            "old_sha256": d.old_sha256,
-            "new_sha256": d.new_sha256,
-            "preview": d.preview_diff,
-        })).collect::<Vec<_>>()
-    });
-    let hash = sha256_plain(&serde_json::to_vec(&payload)?);
-    Ok((payload, hash))
+    Ok(aos_core::compute_diff_evidence(diffs, false, false))
 }
 
 fn print_evidence(diffs: &[aos_core::FileDiffEntry]) {
@@ -2823,6 +3099,25 @@ fn terminal_size() -> libc::winsize {
     ws
 }
 
+#[cfg_attr(not(target_os = "macos"), allow(dead_code))]
+fn build_macos_agent_path(
+    agent_home: &Path,
+    current_exe: Option<&Path>,
+    host_path: &str,
+) -> String {
+    let mut parts = vec![agent_home.join(".aegis-bin").display().to_string()];
+    if let Some(parent) = current_exe.and_then(|exe| exe.parent()) {
+        let dir = parent.display().to_string();
+        if !dir.is_empty() && !parts.contains(&dir) {
+            parts.push(dir);
+        }
+    }
+    if !host_path.is_empty() {
+        parts.push(host_path.to_string());
+    }
+    parts.join(":")
+}
+
 #[cfg(target_os = "macos")]
 #[allow(clippy::too_many_arguments)]
 async fn run_macos_inner(
@@ -2922,12 +3217,9 @@ async fn run_macos_inner(
     push(&mut envs, "XDG_CONFIG_HOME", agent_home.join(".config").display().to_string());
     push(&mut envs, "XDG_DATA_HOME", agent_home.join(".local/share").display().to_string());
     push(&mut envs, "XDG_CACHE_HOME", agent_home.join(".cache").display().to_string());
-    let mut path = std::env::var("PATH").unwrap_or_default();
-    if let Ok(exe) = std::env::current_exe() {
-        if let Some(parent) = exe.parent() {
-            path = format!("{}:{path}", parent.display());
-        }
-    }
+    let host_path = std::env::var("PATH").unwrap_or_default();
+    let current_exe = std::env::current_exe().ok();
+    let path = build_macos_agent_path(&agent_home, current_exe.as_deref(), &host_path);
     push(&mut envs, "PATH", path);
     for key in ["TERM", "LANG", "LC_ALL", "SHELL", "USER", "LOGNAME"] {
         if let Ok(value) = std::env::var(key) {
@@ -3483,6 +3775,162 @@ mod tests {
             std::os::unix::fs::symlink(&outside, shadow.join("escape.txt")).unwrap();
             assert!(shadow_artifact_path(&shadow, "escape.txt").is_err());
         }
+    }
+
+    #[test]
+    fn canonical_diff_evidence_matches_across_cli_and_mcp_gateway() {
+        let a = aos_core::FileDiffEntry {
+            relative_path: "src/lib.rs".to_string(),
+            change_type: aos_core::DiffChangeType::Modified,
+            old_size: Some(12),
+            new_size: Some(24),
+            preview_diff: Some("@@ -1 +1 @@\n-old\n+new".to_string()),
+            old_sha256: Some("sha256:1111".to_string()),
+            new_sha256: Some("sha256:2222".to_string()),
+        };
+        let b = aos_core::FileDiffEntry {
+            relative_path: "README.md".to_string(),
+            change_type: aos_core::DiffChangeType::Added,
+            old_size: None,
+            new_size: Some(8),
+            preview_diff: Some("+hello".to_string()),
+            old_sha256: None,
+            new_sha256: Some("sha256:3333".to_string()),
+        };
+        let (cli_payload, cli_hash) = approval_evidence(&[a.clone(), b.clone()]).unwrap();
+        let (mcp_payload, mcp_hash) =
+            aos_core::compute_diff_evidence(&[b, a], false, false);
+        assert_eq!(cli_hash, mcp_hash);
+        assert_eq!(cli_payload, mcp_payload);
+    }
+
+    #[tokio::test]
+    async fn approval_decide_bridges_session_ticket_and_policy_kernel_and_flight_recorder() {
+        let tmp = tempfile::tempdir().unwrap();
+        let runtime = tmp.path().join("runtime");
+        let project = tmp.path().join("proj");
+        std::fs::create_dir_all(&project).unwrap();
+        std::fs::write(project.join("hello.txt"), "v1\n").unwrap();
+
+        let session_dir = runtime.join("sessions/ses_test123");
+        std::fs::create_dir_all(&session_dir).unwrap();
+        let cow = CoWWorkspace::init(&project, session_dir.join("cow_workspace"))
+            .await
+            .unwrap();
+        std::fs::write(cow.shadow_root().join("hello.txt"), "v2\n").unwrap();
+
+        let diffs = CoWWorkspace::diff_dirs(&project, cow.shadow_root(), None)
+            .await
+            .unwrap();
+        let (evidence, evidence_hash) = approval_evidence(&diffs).unwrap();
+
+        let kernel = AegisRuntimeKernel::new(&runtime).await.unwrap();
+        let principal = AgentIdentity::new("acme", "claude-code", "cli-commit");
+        let ask = kernel
+            .policy
+            .evaluate(&PolicyContext {
+                principal,
+                action: "workspace_commit".to_string(),
+                target_org_id: "acme".to_string(),
+                target_resource: "/workspace".to_string(),
+                metadata: json!({
+                    "paths": ["hello.txt"],
+                    "host_root": project.display().to_string(),
+                    "evidence_hash": evidence_hash,
+                    "evidence": evidence,
+                }),
+            })
+            .await
+            .unwrap();
+        let PolicyDecision::Ask { escalation_id, .. } = ask else {
+            panic!("expected Ask decision");
+        };
+
+        std::fs::write(
+            session_dir.join("session.json"),
+            serde_json::to_vec_pretty(&json!({
+                "session_id": "ses_test123",
+                "org_id": "acme",
+                "agent_id": "claude-code",
+                "mode": "implement",
+                "profile": "code",
+                "workspace": project.display().to_string(),
+                "shadow": cow.shadow_root().display().to_string(),
+                "agent_home": session_dir.join("agent_home").display().to_string(),
+                "status": "exited",
+                "created_at_ms": 1,
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+        std::fs::write(
+            session_dir.join("approval.json"),
+            serde_json::to_vec_pretty(&json!({
+                "escalation_id": escalation_id,
+                "action": "workspace.commit",
+                "paths": ["hello.txt"],
+                "evidence_hash": evidence_hash,
+                "evidence": evidence,
+                "status": "pending",
+                "created_at_ms": 1,
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+
+        approval_decide(&runtime, &escalation_id, true)
+            .await
+            .unwrap();
+
+        // Both approval.json and policy_state.json must be Approved, and re-approving must fail.
+        assert!(approval_decide(&runtime, &escalation_id, true).await.is_err());
+
+        // Now `commit` consumes the OneShot lease and lands the file without `--yes`.
+        commit(&runtime, Some("ses_test123"), None, false, false)
+            .await
+            .unwrap();
+        assert_eq!(
+            std::fs::read_to_string(project.join("hello.txt")).unwrap(),
+            "v2\n"
+        );
+
+        // Flight recorder hash chain must be valid and contain both the human approval and commit.
+        let chain = kernel.recorder.verify_chain(Some("acme")).await.unwrap();
+        assert_eq!(chain["verified"], true);
+        assert!(chain["total_events"].as_u64().unwrap_or(0) >= 2);
+    }
+
+    #[test]
+    fn macos_agent_path_prepends_aegis_bin_before_host_path() {
+        let agent_home = Path::new("/tmp/aegis/sessions/ses_1/agent_home");
+        let exe = Path::new("/opt/aegis/bin/aegis-os");
+        let path = build_macos_agent_path(agent_home, Some(exe), "/usr/local/bin:/usr/bin");
+        let entries: Vec<&str> = path.split(':').collect();
+        assert_eq!(entries[0], "/tmp/aegis/sessions/ses_1/agent_home/.aegis-bin");
+        assert_eq!(entries[1], "/opt/aegis/bin");
+        assert_eq!(entries[2], "/usr/local/bin");
+        assert_eq!(entries[3], "/usr/bin");
+    }
+
+    #[test]
+    fn why_summary_includes_approval_audit_and_effects_tails() {
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = tmp.path();
+        append_audit(dir, json!({"event": "workspace.commit", "decision": "approved"}));
+        std::fs::write(
+            dir.join("effects.jsonl"),
+            "{\"effect_kind\":\"fs.write\",\"decision\":\"allow\",\"resource\":\"src/main.rs\"}\n",
+        )
+        .unwrap();
+        let meta = json!({
+            "session_id": "ses_demo",
+            "status": "exited",
+        });
+        let summary = format_why_summary(dir, &meta).unwrap();
+        assert!(summary.contains("Session: ses_demo"));
+        assert!(summary.contains("Audit chain: valid"));
+        assert!(summary.contains("Effects tail:"));
+        assert!(summary.contains("\"effect_kind\":\"fs.write\""));
     }
 
     #[cfg(target_os = "linux")]

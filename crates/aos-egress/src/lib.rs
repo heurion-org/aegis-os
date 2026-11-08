@@ -555,7 +555,7 @@ impl AegisEgressGateway {
         method: &str,
         path: &str,
         headers: &HashMap<String, String>,
-        body: &str,
+        body: &[u8],
     ) -> anyhow::Result<()> {
         let tcp = TcpStream::connect(upstream_addr).await?;
         let mut upstream: Box<dyn ProxyStream> = if use_tls {
@@ -590,10 +590,10 @@ impl AegisEgressGateway {
         // Keep the response streaming; SSE providers never finish before the last token, and
         // buffering the response would destroy first-token latency.
         request.push_str("Connection: close\r\n\r\n");
-        if !body.is_empty() {
-            request.push_str(body);
-        }
         upstream.write_all(request.as_bytes()).await?;
+        if !body.is_empty() {
+            upstream.write_all(body).await?;
+        }
 
         let mut buf = [0u8; 8192];
         loop {
@@ -702,7 +702,7 @@ impl AegisEgressGateway {
                             .await;
                     }
 
-                    let mut req_body = String::new();
+                    let mut req_body: Vec<u8> = Vec::new();
                     if chunked {
                         let mut raw = Vec::new();
                         loop {
@@ -752,13 +752,14 @@ impl AegisEgressGateway {
                             let _ = reader.get_mut().write_all(resp.as_bytes()).await;
                             return;
                         }
-                        req_body = String::from_utf8_lossy(&raw).into_owned();
+                        req_body = raw;
                     } else if content_length > 0 {
                         let mut buf = vec![0u8; content_length];
                         if reader.read_exact(&mut buf).await.is_ok() {
-                            req_body = String::from_utf8_lossy(&buf).into_owned();
+                            req_body = buf;
                         }
                     }
+                    let req_body_text = String::from_utf8_lossy(&req_body);
                     let buffered_tail = reader.buffer().to_vec();
                     drop(reader);
 
@@ -790,7 +791,11 @@ impl AegisEgressGateway {
                             headers: route_headers,
                         };
                         match gw_conn
-                            .inspect_and_inject_with_body(&identity, &spec, Some(req_body.as_str()))
+                            .inspect_and_inject_with_body(
+                                &identity,
+                                &spec,
+                                Some(req_body_text.as_ref()),
+                            )
                             .await
                         {
                             Ok(EgressVerdict::AllowedAndSanitized {
@@ -1010,7 +1015,7 @@ impl AegisEgressGateway {
                     let body_opt = if req_body.is_empty() {
                         None
                     } else {
-                        Some(req_body.as_str())
+                        Some(req_body_text.as_ref())
                     };
                     let (status_line, body) = match gw_conn
                         .inspect_and_inject_with_body(&identity, &spec, body_opt)
@@ -1049,10 +1054,12 @@ impl AegisEgressGateway {
                                             ));
                                         }
                                         out_req.push_str("Connection: close\r\n\r\n");
-                                        if !req_body.is_empty() {
-                                            out_req.push_str(&req_body);
+                                        let mut write_ok =
+                                            upstream.write_all(out_req.as_bytes()).await.is_ok();
+                                        if write_ok && !req_body.is_empty() {
+                                            write_ok = upstream.write_all(&req_body).await.is_ok();
                                         }
-                                        if upstream.write_all(out_req.as_bytes()).await.is_ok() {
+                                        if write_ok {
                                             // Stream the upstream response directly instead of
                                             // buffering it in memory. This keeps large/model
                                             // responses (and SSE token streams) bounded.
@@ -1284,7 +1291,7 @@ mod tests {
                 "GET",
                 "/v1/models",
                 &headers,
-                "",
+                b"",
             )
             .await
             .unwrap();
@@ -1392,7 +1399,7 @@ mod tests {
                 "POST",
                 "/v1/messages",
                 &HashMap::new(),
-                "{}",
+                b"{}",
             )
             .await
             .unwrap();
@@ -1402,6 +1409,68 @@ mod tests {
         let response = client_task.await.unwrap();
         assert!(response.starts_with("HTTP/1.1 200 OK"));
         assert!(response.ends_with("hello"));
+    }
+
+    #[tokio::test]
+    async fn reverse_proxy_preserves_binary_request_body_bytes() {
+        let raw_payload: Vec<u8> = vec![0xff, 0x00, 0xfe, 0x89, b'P', b'N', b'G', 0x0d, 0x0a, 0x1a];
+        let expected_payload = raw_payload.clone();
+
+        let upstream = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let upstream_addr = upstream.local_addr().unwrap().to_string();
+        let upstream_task = tokio::spawn(async move {
+            let (mut sock, _) = upstream.accept().await.unwrap();
+            let mut buf = Vec::new();
+            let mut chunk = [0u8; 256];
+            loop {
+                let n = sock.read(&mut chunk).await.unwrap();
+                if n == 0 {
+                    break;
+                }
+                buf.extend_from_slice(&chunk[..n]);
+                if let Some(pos) = buf.windows(4).position(|w| w == b"\r\n\r\n") {
+                    let body_slice = &buf[pos + 4..];
+                    if body_slice.len() >= expected_payload.len() {
+                        assert_eq!(body_slice, expected_payload.as_slice());
+                        break;
+                    }
+                }
+            }
+            sock.write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\nConnection: close\r\n\r\nok")
+                .await
+                .unwrap();
+        });
+
+        let client_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let client_addr = client_listener.local_addr().unwrap();
+        let client_task = tokio::spawn(async move {
+            let (mut sock, _) = client_listener.accept().await.unwrap();
+            let mut response = Vec::new();
+            sock.read_to_end(&mut response).await.unwrap();
+            response
+        });
+
+        let mut client = TcpStream::connect(client_addr).await.unwrap();
+        let gateway = AegisEgressGateway::new();
+        gateway
+            .forward_reverse_proxy(
+                &mut client,
+                &upstream_addr,
+                false,
+                "api.openai.com",
+                "api.openai.com",
+                "POST",
+                "/v1/audio/transcriptions",
+                &HashMap::new(),
+                &raw_payload,
+            )
+            .await
+            .unwrap();
+        drop(client);
+
+        upstream_task.await.unwrap();
+        let response = client_task.await.unwrap();
+        assert!(response.ends_with(b"ok"));
     }
 
     #[tokio::test]
