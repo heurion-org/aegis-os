@@ -1662,6 +1662,28 @@ impl AegisRuntimeKernel {
                         }
                     }
                 }
+                let short_evidence = pre_commit_evidence_hash
+                    .as_deref()
+                    .map(|h| h.strip_prefix("sha256:").unwrap_or(h))
+                    .map(|h| &h[..h.len().min(12)])
+                    .unwrap_or("cow-3way");
+                let git_trailer = format!(
+                    "Aegis-OS-Verified: principal={}/{} files={} evidence=sha256:{} verify={}",
+                    identity.org_id,
+                    identity.agent_id,
+                    committed.len(),
+                    short_evidence,
+                    if verify_cmd.is_some() { "passed" } else { "cow-3way" }
+                );
+                let pr_markdown_badge = format!(
+                    "[![Verified by Aegis OS](https://img.shields.io/badge/Aegis_OS-CoW_Verified_%28{}_files%29-0A7D52)](https://github.com/heurion-org/aegis-os)\n\
+                     > 🛡️ **Transactional Agent Commit (`{}/{}`)** · `{}` file(s) merged via 4-Tier CoW · Evidence: `sha256:{}` · [Run Agents Safely with Aegis OS](https://github.com/heurion-org/aegis-os)",
+                    committed.len(),
+                    identity.org_id,
+                    identity.agent_id,
+                    committed.len(),
+                    short_evidence
+                );
                 Ok(json!({
                     "status": "committed_to_host",
                     "host_root": host_root,
@@ -1670,7 +1692,12 @@ impl AegisRuntimeKernel {
                     "epoch_reverified": epoch_reverified,
                     "committed_files": committed,
                     "released_claims": released_claims,
-                    "committed_source_files": committed_source_files
+                    "committed_source_files": committed_source_files,
+                    "audit_receipt": {
+                        "evidence_hash": pre_commit_evidence_hash,
+                        "git_trailer": git_trailer,
+                        "pr_markdown_badge": pr_markdown_badge,
+                    }
                 }))
             }
 

@@ -329,6 +329,20 @@ enum Commands {
         json: bool,
     },
 
+    /// Run a 5-second local Coding Agent Security & Approval Fatigue Audit and generate a shareable report (`audit-me`)
+    #[command(name = "audit-me", visible_aliases = ["checkup", "risk-scan"])]
+    AuditMe {
+        /// Optional custom home directory (defaults to `$HOME`)
+        #[arg(long)]
+        home_dir: Option<PathBuf>,
+        /// Output only the copy-pasteable Markdown share card (for GitHub PRs, X, Reddit, Slack)
+        #[arg(long, visible_alias = "markdown", default_value_t = false)]
+        share: bool,
+        /// Output raw JSON diagnostic report
+        #[arg(long, default_value_t = false)]
+        json: bool,
+    },
+
     /// Approve (or `--deny`) the latest pending boundary escalation (auto-detects Local vs. Cloud mode)
     Approve {
         /// Escalation ID (e.g. `esc-...`); defaults to the latest pending escalation when omitted
@@ -2549,6 +2563,26 @@ async fn main() -> anyhow::Result<()> {
                 endpoint.as_deref(),
                 admin_secret.as_deref(),
                 &repo,
+                json,
+            )
+            .await?;
+        }
+
+        Commands::AuditMe {
+            home_dir,
+            share,
+            json,
+        } => {
+            let target_home = home_dir.unwrap_or_else(|| {
+                std::env::var("HOME")
+                    .map(PathBuf::from)
+                    .unwrap_or_else(|_| PathBuf::from("."))
+            });
+            telemetry::render_audit_me_report(
+                &target_home,
+                &workspace,
+                &cli.runtime_dir,
+                share,
                 json,
             )
             .await?;

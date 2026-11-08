@@ -567,6 +567,9 @@ startup_timeout_sec = 30
     println!(
         "\nDone! You can now directly run `agy`, `claude`, `codex`, or `opencode` in any project directory."
     );
+    println!(
+        "Tip: Run `aegis-os audit-me` (or `aegis-os audit-me --share`) to inspect your local Security & Prompt Fatigue Score!"
+    );
     Ok(())
 }
 
@@ -977,10 +980,45 @@ You are operating inside **Aegis OS Runtime** (`{role}`) within Organization **`
 | Claim / release files when collaborating | `coord_claim`, `coord_release` | Uncoordinated overlapping edits |
 | Multi-agent messaging & task handoff | `ipc_list_peers`, `ipc_send`, `ipc_request`, `ipc_reply`, `ipc_recv`, `ipc_ack`, `ipc_wait`, `ipc_task_get`, `ipc_task_list`, `ipc_task_update` | Manual user relay |
 | Land shadow changes onto host repo | `workspace_diff` -> `workspace_commit` | Direct host mutation |
+
+## Commit & Pull Request Audit Attribution
+When creating a Git commit or Pull Request after `workspace_commit` (or `aegis-os commit`), attach the returned `audit_receipt.git_trailer` (`Aegis-OS-Verified: ...`) in the commit trailer and `audit_receipt.pr_markdown_badge` in the PR description so reviewers can verify the CoW merge and evidence hash.
+
+## Team & Collaborator Onboarding (If `aegis-os` MCP is Not Yet Installed)
+If you or a repository collaborator do not have `aegis-os` installed locally, install and wire it in one step:
+```bash
+brew tap heurion-org/aegis-os https://github.com/heurion-org/aegis-os.git
+brew install aegis-os
+aegis-os install --enforce
+aegis-os audit-me
+```
 "#
     );
     let rules_path = rules_dir.join("aegis-os-workflow.md");
     tokio::fs::write(&rules_path, rules_md).await?;
+
+    let collab_readme = format!(
+        r#"# 🛡️ Protected by Aegis OS (`{org}`)
+
+[![Verified by Aegis OS](https://img.shields.io/badge/Aegis_OS-Transactional_CoW_Runtime-0A7D52)](https://github.com/heurion-org/aegis-os)
+
+This repository uses **[Aegis OS](https://github.com/heurion-org/aegis-os)** so multiple coding agents (`claude`, `codex`, `agy`, `opencode`) can work in parallel with:
+- **Zero Per-Action Prompt Fatigue** (`90.7%–97.9%` fewer permission popups via Copy-on-Write shadow workspaces)
+- **Zero Silent Overwrites** (`98.7%` 4-Tier LCS auto-merge vs `41.2%` overwrite rate in raw shared folders)
+- **Kernel Credential Masking** (`~/.ssh`, `~/.aws`, `~/.config/gcloud`, and `.env` protected from prompt injection)
+
+## 1-Command Collaborator Setup & Local Risk Audit
+
+```bash
+brew tap heurion-org/aegis-os https://github.com/heurion-org/aegis-os.git
+brew install aegis-os
+aegis-os install --enforce
+aegis-os audit-me
+```
+"#
+    );
+    let collab_readme_path = agents_dir.join("README.md");
+    tokio::fs::write(&collab_readme_path, collab_readme).await?;
 
     let mcp_snippet = json!({
         "mcpServers": {

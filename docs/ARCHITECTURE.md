@@ -11,7 +11,7 @@ This document describes how Aegis OS is put together: the trust boundary, runtim
 3. **Effects over tools.** Policy is expressed over `fs.read`, `fs.write`, `proc.exec`, `net.request`, `secret.use`, and commit effects—not over client-specific tool names.
 4. **Fail closed.** If the sandbox, egress proxy, or broker is unavailable, an enforced session refuses to start.
 5. **Domain-agnostic artifact tree.** Code, documents, data pipelines, binaries, and app state share one shadow / claim / verify / commit kernel; domain differences live in profiles.
-6. **Platform honesty.** Linux enforced mode is Phase 1. The full macOS enforced launcher is Phase 4; macOS `proc_exec` Seatbelt sandboxing is a separate, already-existing capability.
+6. **Platform honesty.** Linux enforced mode (`bwrap`) is Phase 1 complete. macOS has a Seatbelt launcher MVP (`aegis-os run` via `sandbox-exec` with shadow `cwd`, read-only host project, credential path deny, egress proxy, PTY, and TCP broker) plus `proc_exec` Seatbelt sandboxing; full macOS path-remapping and default-deny convergence are Phase 4.
 
 ---
 
@@ -58,21 +58,21 @@ Host user space
 | Mode | Launch | Enforcement point | Guarantees | Status |
 |---|---|---|---|---|
 | **Advisory** | `aegis-os install`; user starts the agent | Hooks / MCP / rules | Reduces prompt fatigue and catches honest mistakes; **not** a security boundary against a hijacked agent | ✅ Available |
-| **Enforced** | `aegis-os run -- <agent>` or PATH shim | Launcher + kernel sandbox + broker + egress proxy | Host writes confined to shadow; credential reads blocked; egress restricted; commits approved/leased | ✅ Linux Phase 1; macOS Phase 4 |
+| **Enforced** | `aegis-os run -- <agent>` or PATH shim | Launcher + kernel sandbox + broker + egress proxy | Host writes confined to shadow; credential reads blocked; egress restricted; commits approved/leased | ✅ Linux Phase 1 (`bwrap`); macOS Seatbelt MVP (full path-remapping Phase 4) |
 | **Isolated** | `aegis-os run --isolated` / Aegis Cloud | microVM + remote policy | Host-level isolation for untrusted repos and multi-tenant teams | 🟡 Cloud sandbox available; local `--isolated` Phase 4 |
 
-The mode is surfaced in `aegis-os status` and `aegis-os doctor`. A missing hook degrades UX, not enforcement; a missing sandbox/proxy/broker fails the launch.
+The mode is surfaced in `aegis-os status`, `aegis-os doctor`, and `aegis-os audit-me`. A missing hook degrades UX, not enforcement; a missing sandbox/proxy/broker fails the launch.
 
 ---
 
 ## 4. Session lifecycle
 
-1. **Install / shim** — `aegis-os install` writes advisory hooks/MCP config. `aegis-os install --enforce` creates `~/.aegis/bin` shims so `claude` (etc.) launch through `aegis-os run`.
+1. **Install / shim** — `aegis-os install` writes advisory hooks/MCP config and collaborator workflow rules (`.agents/rules/aegis-os-workflow.md` + `.agents/README.md`). `aegis-os install --enforce` creates `~/.aegis/bin` shims so `claude` (etc.) launch through `aegis-os run`.
 2. **Launch** — the supervisor resolves the real agent binary (excluding its own shim), creates a session id, and starts the agent as a child process.
 3. **Workspace setup** — create the CoW shadow, read-only host view, masked `$HOME`, Git view, egress proxy, and policy session before the agent starts.
 4. **Execution** — the agent uses native tools or MCP. Native writes land in the shadow; reads are narrowed to the project/toolchains; network goes through the proxy.
 5. **Verify / diff** — `aegis-os verify` runs the configured domain gate in the sandbox; `aegis-os diff` compares shadow vs host.
-6. **Commit** — `workspace_commit` computes an evidence hash, re-merges against the current host trunk, and requests approval or a lease. The host is untouched until approval.
+6. **Commit** — `workspace_commit` computes an evidence hash, re-merges against the current host trunk, requests approval or a lease, and emits an `Aegis-OS-Verified` audit receipt (`git_trailer` + `pr_markdown_badge`). The host is untouched until approval.
 7. **Exit** — if the agent exits without committing, the launcher prints a summary: `diff` / `commit` / `discard` / `last`.
 8. **Audit** — boundary events are appended to the hash-chained ledger; `aegis-os why` reconstructs the approval/audit trail.
 
@@ -82,11 +82,11 @@ The mode is surfaced in `aegis-os status` and `aegis-os doctor`. A missing hook 
 
 | Crate | Responsibility |
 |---|---|
-| `aos-cli` | `aegis-os` binary: installer, launcher/session supervisor, hooks, routing, `status`/`doctor`/`top`, approvals, memory UI, bench. |
+| `aos-cli` | `aegis-os` binary: installer, launcher/session supervisor, hooks, routing, `status`/`doctor`/`audit-me`/`top`, approvals, memory UI, bench. |
 | `aos-core` | Core traits and types: effects, scopes, reversibility, session identity, A2A state machine, glob claims. |
 | `aos-vfs` | CoW shadow workspace, snapshots, 4-tier LCS Diff3 merge, `mtime` sync, Org CAS/KV. |
 | `aos-sandbox` | Native OS sandbox drivers: macOS Seatbelt, Linux bwrap, microVM control-plane interface. |
-| `aos-egress` | Identity-pinned CONNECT proxy, domain allowlist, Unix-socket bridge; L7 DLP/secret injection are Phase 2. |
+| `aos-egress` | Identity-pinned CONNECT proxy, domain allowlist, Model API Base-URL L7 reverse proxy with DLP & `$AOS_SECRET_*` boundary secret injection, Unix-socket bridge; opt-in non-model HTTPS MITM is Phase 2. |
 | `aos-policy` | Cedar-style 5-stage policy engine (`R0a`–`R4`), commit-time poisoning guard, TTL/one-shot leases, escalation queue. |
 | `aos-ipc` | Global/intra-org peer registry, A2A task lifecycle, P2P mailboxes, correlated RPC, pub/sub. |
 | `aos-recorder` | Append-only JSONL flight recorder for syscalls, boundary events, and security telemetry. |
@@ -128,10 +128,10 @@ Measured multi-agent auto-merge: **98.7%** without human intervention; the remai
 
 ## 7. Sandbox and egress
 
-- **Linux enforced launcher** — bwrap with a read-only root view, `$HOME`/system-directory masking, read-only toolchains, per-session home, Git view, and process-group lifecycle.
-- **macOS** — Seatbelt is used for `proc_exec` sandboxing today. The full `aegis-os run` parent-process launcher is Phase 4; do not describe macOS as having enforced-launcher parity yet.
-- **Egress today** — identity-pinned CONNECT proxy + domain allowlist; host loopback is unreachable. `egress_http_request` currently inspects/rewrites at the boundary and does not forward yet.
-- **Egress Phase 2** — base-URL reverse proxy for method/path-level inspection, boundary secret injection, and DLP; opt-in MITM later. Until then, do not claim L7 inspection.
+- **Linux enforced launcher** — `bwrap >= 0.10` (`--bind-fd`) with a read-only root view, `$HOME`/system-directory masking, read-only toolchains, per-session home, Git view, and process-group lifecycle.
+- **macOS enforced launcher MVP & `proc_exec`** — Seatbelt (`sandbox-exec`) is used both for `proc_exec` sandboxing and for the `aegis-os run` macOS launcher MVP (shadow `cwd`, read-only host project, credential path deny for `~/.ssh`/`~/.aws`/`~/.gnupg`/etc., egress proxy, PTY, and TCP broker). Full macOS path-remapping at the original host path and default-deny read convergence are Phase 4.
+- **Egress today** — identity-pinned CONNECT proxy + domain allowlist for general HTTPS (host loopback is unreachable), plus a **Model API Base-URL L7 reverse proxy** (`ANTHROPIC_BASE_URL`, `OPENAI_BASE_URL`, `GOOGLE_GEMINI_BASE_URL`) that enforces method/path allowlists, L7 request DLP, and `$AOS_SECRET_*` boundary secret injection.
+- **Egress Phase 2 remaining** — opt-in MITM CA inspection for arbitrary non-model third-party HTTPS endpoints.
 - **Process lifecycle** — active sandbox process groups support real `SIGSTOP` / `SIGCONT` / `SIGKILL` for pause/resume/destroy.
 
 ---
@@ -212,8 +212,10 @@ Local vs Cloud share the same MCP behavior; Cloud offloads heavy builds and mult
 
 - `aegis-os status` — current session, mode, shadow, leases, pending approvals.
 - `aegis-os doctor` — install health, enforcement level, hook/MCP status, OpenCode shared-service detection.
+- `aegis-os audit-me` — 5-second local credential exposure & prompt-fatigue diagnostic (with `--share` Markdown badge export).
 - `aegis-os top` — live peer radar, A2A tasks, claims, leases.
 - `aegis-os why` — approval ticket + audit trail.
+- **Commit / PR Audit Receipts** — `aegis-os commit`, `workspace_commit`, and `workspace_export_pr` emit `Aegis-OS-Verified: session=... principal=... files=... evidence=sha256:...` git trailers and Markdown verification badges.
 - **Hash-chained ledger** — every boundary event records `task_id`, `prev_hash`, `event_hash = sha256(prev_hash || canonical_event)`; `hash_chain_verified` is exposed through task inspection.
 - **Telemetry** — anonymous install/session ping only; no source, paths, prompts, usernames, or hostnames. Opt out with `DO_NOT_TRACK=1`, `AOS_TELEMETRY_DISABLED=1`, or `touch ~/.gemini/aegis-telemetry-opt-out`.
 
@@ -239,20 +241,20 @@ Local vs Cloud share the same MCP behavior; Cloud offloads heavy builds and mult
 
 | Phase | Status | Scope |
 |---|---|---|
-| **Phase 0** — observability | ✅ Complete | `doctor`/`status` enforcement level, client matrix, portable hooks |
+| **Phase 0** — observability | ✅ Complete | `doctor`/`status`/`audit-me` enforcement level, client matrix, portable hooks |
 | **Phase 1** — `aegis-os run` Linux MVP | ✅ Complete (Linux) | bwrap, CoW shadow, host read-only, `$HOME` masking, Git view, CONNECT egress |
-| **Phase 2** — effect/approval/lease | 🟡 Partial | effects, commit tickets, `evidence_hash`/TOCTOU, leases, approvals CLI/Web, verify, CAS; L7 DLP/base-URL/MITM remaining |
+| **Phase 2** — effect/approval/lease & L7 model proxy | 🟡 Mostly Complete | effects, commit tickets, `evidence_hash`/TOCTOU, leases, approvals CLI/Web, verify, CAS, Model API base-URL L7 reverse proxy + DLP + `$AOS_SECRET_*` injection; opt-in non-model HTTPS MITM remaining |
 | **Phase 3** — DomainProfile | 🟡 Partial | profile auto, text LCS, binary claims, verify, CAS; docs/data mergers remaining |
-| **Phase 4** — macOS / kernel hardening | ⬜ Not started | macOS enforced launcher, Landlock/seccomp, microVM pilot |
+| **Phase 4** — macOS / kernel hardening | 🟡 In Progress | macOS Seatbelt launcher MVP (`aegis-os run` on macOS) landed; full path-remapping, Landlock/seccomp, and microVM pilot remaining |
 | **Phase 5** — advanced domains / IDE / enterprise | ⬜ Not started | Office CRDT, AAP/UOMP deep integration, IDE daemon, MDM |
 
 **Known limits**
 
-- Enforced launcher: Linux only; bubblewrap ≥ 0.10. macOS enforced launcher is Phase 4 (macOS `proc_exec` Seatbelt is separate).
-- Egress: CONNECT-only; L7 DLP/secret injection/MITM in Phase 2.
+- Enforced launcher parity: Linux (`bwrap >= 0.10`) mounts the shadow at the original host path; macOS `aegis-os run` uses a Seatbelt launcher MVP (shadow `cwd`, read-only host project, credential path deny, egress proxy, PTY, TCP broker), with full path-remapping in Phase 4.
+- Egress: Model API traffic uses the Base-URL L7 reverse proxy (DLP + secret injection); general non-model HTTPS uses CONNECT domain allowlisting (opt-in MITM in Phase 2).
 - Approval console: local CLI/Web; cloud `/approve` and TUI panels not wired into the launcher yet.
 - CoW: ext4 may fall back to lazy-copy; OverlayFS backend not landed.
-- Clients: OpenCode plugin and Hermes adapter in progress; Codex has no tool-level hook in advisory mode.
+- Clients: OpenCode V1 plugin (`plugins/opencode-aegis.js`) is installed by `aegis-os install`, while V2 fine-grained tool hooks and the Hermes adapter are in progress; Codex has no tool-level hook in advisory mode.
 - Advisory hooks are not a security boundary.
 
 ---

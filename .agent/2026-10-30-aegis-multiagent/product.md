@@ -1,10 +1,10 @@
 # PRD-lite — Aegis OS 多 Agent 控制平面（Phase 0 / Phase 1）
 
-日期：2026-10-30
+日期：2026-10-30（2026-11-08 同步实施状态与 PLG 引流闭环）
 角色：Product Partner（G1）
-状态：待 critic 审查 + 用户确认（G2）
+状态：G2 已批准 · Phase 0 核心切片（#1–#7 + Dogfood-01/02）与 P0 PLG 引流闭环已落地
 范围：Phase 0（0–4 周）、Phase 1（1–3 个月）方向
-上游：`.agent/2026-10-30-aegis-multiagent/brief.md`
+上游：`.agent/2026-10-30-aegis-multiagent/brief.md` · `.agent/2026-10-30-aegis-multiagent/decision.md`
 
 标注约定：**[事实]** = 代码/文档可验证；**[推断]** = 由事实推出但未验证；**[假设]** = 待用户/数据验证；**[观点]** = 产品判断。
 
@@ -88,19 +88,19 @@
 - 记忆：`sessions` / `consent_requests` / `revoke_session` / audit（`crates/aos-memory-server/src/auth_store.rs`）。
 - Workspace：每 agent 一个 CoW 影子工作区 `<runtime>/orgs/<org>/agents/<agent>/cow_workspace/`，4 级合并（README）。
 
-**关键缺口（Phase 0 要补的正是这些）[事实]**：
+**关键缺口与 Phase 0 落地状态 [事实]**：
 
-| 缺口 | 证据 | 后果 |
+| 缺口 | 初始证据 | 落地状态（2026-11） |
 |---|---|---|
-| G1 `A2ATask` 无 `workspace_id` / `parent_task_id` / `consent_id` / `lease_id` | `aos-core/src/lib.rs:481-496` | task board 只能是平表；无法回答“这个任务动了哪个工作区、用了谁的授权” |
-| G2 `LeaseGrant` 无 `task_id` | `aos-core/src/lib.rs:775-785` | 授权只能按 agent + action + resource 给，**不能按任务给**；任务结束授权不自动收 |
-| G3 `consent_requests` 无 `task_id` | `aos-memory-server/src/auth_store.rs` | 记忆同意与 A2A 任务无关联，撤销任务不会撤销记忆会话 |
-| G4 `update_task_state` 无状态机校验、无 actor 授权 | `aos-ipc/src/lib.rs:358-423` | 任何已认证 agent 可把任意任务改成任意状态（含终态回退） |
-| G5 `tasks/get` / `tasks/cancel` 无 org 归属校验 | `aos-mcp-gateway/src/lib.rs:2482-2528` | **[推断]** 知道 task_id 的跨租户调用方可读/取消他人任务 |
-| G6 持久化是全量文件重写 + 无锁 | `aos-ipc/src/lib.rs:87-102` | 多进程并发写 = last-writer-wins，任务状态可能静默丢失 |
-| G7 AgentCard 声明 `streaming: true` / `pushNotifications: true`，但未实现 `message/stream` 与 push config | `aos-core/src/lib.rs:567-573` vs gateway 路由表 | 对外能力虚标，第三方 A2A client 会走进死路 |
-| G8 `AuditEvent` 无 `task_id` / `consent_id` / `workspace_id` 一等字段 | `aos-core/src/lib.rs:844-855` | 审计只能靠 `details` 里的自由文本拼，无法可靠回溯 |
-| G9 Claim 是 agent 级、非 task 级；任务取消不释放 claim | `claims.rs`（`Claim{owner,expires_at_ms,note}`） | 任务死后 claim 占着文件最多 2 小时，阻塞其他 agent |
+| G1 `A2ATask` 无 `workspace_id` / `parent_task_id` / `consent_id` / `lease_id` | `aos-core/src/lib.rs:481-496` | **[已实现 — Slice #2]** `A2ATask` 已扩展 `parent_task_id`、`workspace_id`、`lease_ids`、`consent_ids`、`failure_kind`，旧 `ipc_state.json` 兼容加载 |
+| G2 `LeaseGrant` 无 `task_id` | `aos-core/src/lib.rs:775-785` | **[已实现 — Slice #4]** `LeaseGrant` / `PendingEscalation` 支持 `task_id` 绑定，不转发 raw token，终态拒绝复用 |
+| G3 `consent_requests` 无 `task_id` | `aos-memory-server/src/auth_store.rs` | **[已实现 — Slice #5]** `consent_requests` 与 `sessions` 携带 `task_id`，双向撤销传播已打通 |
+| G4 `update_task_state` 无状态机校验、无 actor 授权 | `aos-ipc/src/lib.rs:358-423` | **[已实现 — Slice #2]** 强制合法状态转移表、requester/assignee/operator 授权校验、终态不可回退 |
+| G5 `tasks/get` / `tasks/cancel` 无 org 归属校验 | `aos-mcp-gateway/src/lib.rs:2482-2528` | **[已实现 — Slice #1]** 跨 org 访问/列举/取消及跨租户 `ipc_task_*` 一律拒绝（403） |
+| G6 持久化是全量文件重写 + 无锁 | `aos-ipc/src/lib.rs:87-102` | **[已实现 — Slice #3]** 引入 `.ipc_state.lock` 排他锁 + 临时文件 `sync_all` + 原子 `rename` |
+| G7 AgentCard 声明 `streaming: true` / `pushNotifications: true`，但未实现 `message/stream` 与 push config | `aos-core/src/lib.rs:567-573` vs gateway 路由表 | **[已实现 — Slice #1]** `AgentCard.capabilities` 诚实声明为 `streaming: false`、`pushNotifications: false` |
+| G8 `AuditEvent` 无 `task_id` / `consent_id` / `workspace_id` 一等字段 | `aos-core/src/lib.rs:844-855` | **[已实现 — Slice #6 / Dogfood-01]** 哈希链审计账本（`prev_hash` / `event_hash`）与 `aegis-os a2a show` 关联回溯已落地 |
+| G9 Claim 是 agent 级、非 task 级；任务取消不释放 claim | `claims.rs`（`Claim{owner,expires_at_ms,note}`） | **[已实现 — Slice #4]** `Claim.task_id` 绑定任务，任务进入终态自动释放关联文件锁 |
 
 > 注：G5 的实际可利用性取决于 `/v1/a2a` 与 `/a2a` 的认证包装层，需 builder/critic 在实现前确认；本 PRD 将其列为 Phase 0 必修项，不论严重性最终定级。
 
@@ -235,7 +235,7 @@
 - ❌ 图形化 Mission Control 改造（现有 `/dashboard` 不改版）。
 - ❌ 新的 Agent 编排 DSL / DAG 调度器 / 重试与补偿引擎。
 - ❌ 跨机器 / 跨组织 A2A 联邦与任务迁移。
-- ❌ 浏览器 consent UI（CLI 审批是 Phase 0 唯一路径）。
+- ✅ 浏览器本地 consent UI 已通过 `aegis-os memory ui`（`127.0.0.1`）提供，与 CLI 审批并存；不做云端托管式多租户 consent 门户。
 - ❌ UOMP 协议变更（只做 Aegis 侧字段扩展，不改规范）。
 - ❌ 任何形式的“agent 自批”或“agent 之间互授权限”。
 - ❌ 定价、品牌、对外发布材料。
@@ -266,6 +266,8 @@
 | K8 | **任务卡死率** | 处于非终态且 `last_update` 超过 30 min 的任务占比 | TBD-baseline | ≤5% | ≤2% | board 统计 |
 | K9 | **7 日留存** | 激活用户中，第 7 天仍有 ≥1 个 A2A task 达终态的比例 | TBD-baseline | ≥35% | ≥45% | 事件回传 / dogfood 日志 |
 | K10 | **授权疲劳抑制** | 每任务人工确认次数（escalation 批准数 / 任务数） | 现状 ~45–57% 工具调用需确认（README 引论文） | ≤1.0 | ≤0.5 | policy escalation 计数 |
+| K11 | **体检引流转化（`audit-me`）** | 运行 `aegis-os audit-me`（含 `--share` 导出 Markdown 徽章卡）并在同日完成 `install` / `run` 的比例 | 新增（P0-1 已上线） | ≥25% 导出分享或执行加固 | ≥40% | 本地 CLI 子命令与分享卡引流统计 |
+| K12 | **仓库协作者裂变（`Aegis-OS-Verified`）** | 携带 `Aegis-OS-Verified` Git trailer / PR 徽章与 `.agents/README.md` 的提交带动的协作者新装占比 | 新增（P0-2 已上线） | ≥15% 新装来自仓库/PR 触点 | ≥30% | Commit/PR 审计回执与仓库触点统计 |
 
 **指标使用规则 [观点]**：K1/K9 看采用，K3/K10 看“授权设计是否合理”，K4/K5/K6 看“安全承诺是否兑现”，K7/K8 看“多 agent 是否真的更好用”。**任何安全类指标（K4–K6）不达标，Phase 0 不得进入 private beta，即使采用类指标很好看。**
 

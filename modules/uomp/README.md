@@ -51,6 +51,6 @@ aegis-os memory payload list
 aegis-os memory mcp                   # MCP stdio bridge
 ```
 
-Agent-first consent: `memory setup` writes a bridge profile, not a pre-authorized token. The first `memory mcp` tool call creates a consent request and waits; the user approves it with `aegis-os memory approve`. High-sensitivity items stay outside Agent scopes, and no Agent can approve its own request. Consent requests and sessions carry an optional `task_id`; terminal A2A tasks revoke their memory sessions, and revoking a session moves its bound task to `input-required`.
+Agent-first consent: `memory setup` writes a bridge profile, not a pre-authorized token. The first `memory mcp` tool call creates a consent request and waits; the user approves it with `aegis-os memory approve` or the local consent web UI (`aegis-os memory ui`, auto-started by `memory mcp`). High-sensitivity items stay outside Agent scopes, and no Agent can approve its own request. Consent requests and sessions carry an optional `task_id`; terminal A2A tasks revoke their memory sessions, and revoking a session moves its bound task to `input-required`.
 
-The browser consent page is deferred. CLI approval is the native approval path for now.
+Both CLI approval (`aegis-os memory pending` / `approve` / `deny`) and the local browser consent page (`aegis-os memory ui` on `127.0.0.1`) are available natively.

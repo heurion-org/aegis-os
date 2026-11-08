@@ -1211,9 +1211,36 @@ pub(crate) async fn commit(
         let _ = policy.match_active_lease(&lease_ctx).await;
     }
     let now_ms = chrono::Utc::now().timestamp_millis();
+    let session_id_str = value
+        .get("session_id")
+        .and_then(|v| v.as_str())
+        .unwrap_or("-");
+    let short_ev = evidence_hash
+        .strip_prefix("sha256:")
+        .unwrap_or(&evidence_hash);
+    let short_ev = &short_ev[..short_ev.len().min(12)];
+    let git_trailer = format!(
+        "Aegis-OS-Verified: session={} principal={}/{} files={} evidence=sha256:{}",
+        session_id_str,
+        org_id,
+        agent_id,
+        committed.len(),
+        short_ev
+    );
+    let pr_markdown_badge = format!(
+        "[![Verified by Aegis OS](https://img.shields.io/badge/Aegis_OS-CoW_Verified_%28{}_files%29-0A7D52)](https://github.com/heurion-org/aegis-os)\n\
+         > 🛡️ **Transactional Agent Commit (`{}/{}`)** · `{}` file(s) landed via CoW Shadow VFS · Evidence: `sha256:{}` · [Run Coding Agents Safely with Aegis OS](https://github.com/heurion-org/aegis-os)",
+        committed.len(),
+        org_id,
+        agent_id,
+        committed.len(),
+        short_ev
+    );
     let mut approved_record = approval;
     approved_record["status"] = json!("approved");
     approved_record["decided_at_ms"] = json!(now_ms);
+    approved_record["git_trailer"] = json!(git_trailer);
+    approved_record["pr_markdown_badge"] = json!(pr_markdown_badge);
     let _ = std::fs::write(approval_path, serde_json::to_vec_pretty(&approved_record)?);
     append_audit(
         &dir,
@@ -1223,6 +1250,7 @@ pub(crate) async fn commit(
             "escalation_id": ticket_id,
             "paths": committed,
             "evidence_hash": evidence_hash,
+            "git_trailer": git_trailer,
             "timestamp_ms": now_ms,
         }),
     );
@@ -1241,6 +1269,7 @@ pub(crate) async fn commit(
                 "escalation_id": ticket_id,
                 "paths": committed,
                 "evidence_hash": evidence_hash,
+                "git_trailer": git_trailer,
             }),
             task_id: None,
             prev_hash: None,
@@ -1253,6 +1282,7 @@ pub(crate) async fn commit(
     for path in committed {
         println!("committed {path}");
     }
+    println!("{git_trailer}");
     update_session_state(&dir, "committed", value.get("exit_code").and_then(|v| v.as_i64()).map(|v| v as i32));
     Ok(())
 }

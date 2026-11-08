@@ -2481,9 +2481,24 @@ impl PaasControlPlane {
             .current_dir(&host_root)
             .args(["add", "-A"])
             .output();
+        let git_trailer = format!(
+            "Aegis-OS-Verified: principal={}/{} workspace={} files={} merge=4tier-cow",
+            identity.org_id,
+            identity.agent_id,
+            workspace_id.unwrap_or("default"),
+            committed_files.len()
+        );
+        let pr_markdown_badge = format!(
+            "[![Verified by Aegis OS](https://img.shields.io/badge/Aegis_OS-CoW_Verified_%28{}_files%29-0A7D52)](https://github.com/heurion-org/aegis-os)\n\
+             > 🛡️ **Transactional Agent PR (`{}/{}`)** · `{}` file(s) merged with zero host-overwrite conflicts · Try locally: `brew install heurion-org/aegis-os/aegis-os && aegis-os audit-me`",
+            committed_files.len(),
+            identity.org_id,
+            identity.agent_id,
+            committed_files.len()
+        );
         let _ = Command::new("git")
             .current_dir(&host_root)
-            .args(["commit", "-m", &title, "--allow-empty"])
+            .args(["commit", "-m", &title, "-m", &git_trailer, "--allow-empty"])
             .output();
 
         let commit_sha = Command::new("git")
@@ -2516,17 +2531,21 @@ impl PaasControlPlane {
             "git_branch": target_branch,
             "git_commit_sha": commit_sha,
             "commit_title": title,
+            "git_trailer": git_trailer,
+            "pr_markdown_badge": pr_markdown_badge,
             "unified_patch": unified_patch,
             "github_pr_payload": {
                 "title": title,
                 "head": target_branch,
                 "base": "main",
                 "body": format!(
-                    "Automated 4-Tier LCS Diff3 CoW merge committed by Aegis OS principal `{}/{}`.\n\nCommitted files ({}):\n{}",
+                    "Automated 4-Tier LCS Diff3 CoW merge committed by Aegis OS principal `{}/{}`.\n\nCommitted files ({}):\n{}\n\n---\n{}\n\n`{}`",
                     identity.org_id,
                     identity.agent_id,
                     committed_files.len(),
-                    committed_files.iter().map(|f| format!("- `{}`", f)).collect::<Vec<_>>().join("\n")
+                    committed_files.iter().map(|f| format!("- `{}`", f)).collect::<Vec<_>>().join("\n"),
+                    pr_markdown_badge,
+                    git_trailer
                 )
             }
         }))
