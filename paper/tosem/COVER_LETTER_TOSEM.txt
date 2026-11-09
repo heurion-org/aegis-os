@@ -18,7 +18,7 @@ We evaluate Aegis OS across six Research Questions (RQ1-RQ6) on both macOS (Appl
   * Component Necessity Ablation (RQ6): A complete 9-row single-component ablation matrix across all 80 attacks demonstrates that switching off any safety component re-opens the exact attack category it guards.
 
 3. Open-Source Replication Package and Originality Declaration
-The complete Rust source code (9 crates), 46 automated unit/integration tests, anonymized real-trace corpus (28,087 tool calls), and reproducible evaluation scripts are publicly available at https://github.com/heurion-org/aegis-os. This manuscript is original, has not been published previously, and is not under consideration for publication elsewhere (a preprint is archived on arXiv).
+The complete Rust source code (9 crates), 46 automated unit/integration tests, anonymized real-trace corpus (28,087 tool calls), and reproducible evaluation scripts are publicly available at https://github.com/heurion-org/aegis-os. This manuscript is original, has not been published previously, and is not under consideration for publication elsewhere (a preprint is archived on arXiv at https://arxiv.org/abs/2611.08516, arXiv:2611.08516).
 
 Thank you very much for your time and consideration.
 

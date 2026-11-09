@@ -233,7 +233,7 @@ Local vs Cloud share the same MCP behavior; Cloud offloads heavy builds and mult
 | 200-module rollback | 8.68 ms |
 | IPC token reduction via CAS | 99.85% |
 
-`0.42 ms` in Monograph 03 is the trunk-anchored metadata fork; the provisioning numbers above measure full 1,000-file workspace setup. See [BENCHMARK_REPORT.md](../BENCHMARK_REPORT.md) and the [paper](../paper/aegis_os_arxiv_preprint.pdf) for methodology.
+`0.42 ms` in Monograph 03 is the trunk-anchored metadata fork; the provisioning numbers above measure full 1,000-file workspace setup. See [BENCHMARK_REPORT.md](../BENCHMARK_REPORT.md) and the [arXiv paper (arXiv:2611.08516)](https://arxiv.org/abs/2611.08516) ([local PDF](../paper/aegis_os_arxiv_preprint.pdf)) for methodology.
 
 ---
 
@@ -264,5 +264,5 @@ Local vs Cloud share the same MCP behavior; Cloud offloads heavy builds and mult
 - [Enforced runtime design](AEGIS_ENFORCED_RUNTIME_DESIGN.md) — threat model, effect model, phase plan, client adapters.
 - [AAP-1.0 application protocol](AEGIS_APPLICATION_PROTOCOL.md) — app manifests, grant tokens, device-code flow, lease-gated tools.
 - [UOMP memory consent mapping](UOMP_MEMORY_CONSENT_MAPPING.md) — memory scopes, consent, revocation, audit.
-- [Benchmark report](../BENCHMARK_REPORT.md) and [paper](../paper/aegis_os_arxiv_preprint.pdf).
+- [Benchmark report](../BENCHMARK_REPORT.md) and [arXiv paper (arXiv:2611.08516)](https://arxiv.org/abs/2611.08516) ([local PDF](../paper/aegis_os_arxiv_preprint.pdf)).
 - Technical monographs: [Beyond Git Branches & Shared Folders](https://heurion.org/en/blog/aegis-os-transactional-agent-kernel) · [Human-Agent Capability Parity](https://heurion.org/en/blog/human-agent-capability-parity-ai-native-software) · [Dual-Surface CRDT](https://heurion.org/en/blog/dual-surface-crdt-clinical-ai).

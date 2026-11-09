@@ -1,0 +1,27 @@
+cff-version: 1.2.0
+title: "Aegis OS (`aegis-os`)"
+message: "If you use Aegis OS in your research or engineering workflows, please cite our paper."
+type: software
+authors:
+  - family-names: "Zhao"
+    given-names: "Hui"
+    email: "huizhao@heurion.org"
+    affiliation: "Heurion Research"
+repository-code: "https://github.com/heurion-org/aegis-os"
+url: "https://heurion.org/aegis-os/"
+license: Apache-2.0
+preferred-citation:
+  type: article
+  title: "Aegis OS: A Transactional Multi-Tenant Operating System Runtime for Eliminating Authorization Fatigue in Autonomous Coding Agents"
+  authors:
+    - family-names: "Zhao"
+      given-names: "Hui"
+      email: "huizhao@heurion.org"
+      affiliation: "Heurion Research"
+  year: 2026
+  journal: "arXiv preprint arXiv:2611.08516"
+  url: "https://arxiv.org/abs/2611.08516"
+  identifiers:
+    - type: other
+      value: "arXiv:2611.08516"
+      description: "arXiv preprint identifier"

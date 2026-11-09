@@ -1,6 +1,9 @@
 ================================================================================
-ARXIV SUBMISSION METADATA (Ready to Copy-Paste into https://arxiv.org/submit)
+ARXIV SUBMISSION METADATA (Published at https://arxiv.org/abs/2611.08516)
 ================================================================================
+
+[arXiv Identifier]
+arXiv:2611.08516 (https://arxiv.org/abs/2611.08516)
 
 [Primary Category]
 cs.OS (Operating Systems)

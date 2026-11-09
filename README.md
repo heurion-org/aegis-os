@@ -1,6 +1,6 @@
 # Aegis OS (`aegis-os`)
 
-**[English](README.md) | [简体中文](README_CN.md) | [Aegis OS Website](https://heurion.org/aegis-os/) | [Tutorial](https://heurion.org/aegis-os/tutorial/) | [Technical Blog](https://heurion.org/en/blog) | [Cloud Console & Pro Subscription ($29/mo)](https://heurion.org/aegis-cloud/dashboard) | [Approval Console](https://heurion.org/aegis-cloud/approve)**
+**[English](README.md) | [简体中文](README_CN.md) | [Aegis OS Website](https://heurion.org/aegis-os/) | [Tutorial](https://heurion.org/aegis-os/tutorial/) | [arXiv Paper](https://arxiv.org/abs/2611.08516) | [Technical Blog](https://heurion.org/en/blog) | [Cloud Console & Pro Subscription ($29/mo)](https://heurion.org/aegis-cloud/dashboard) | [Approval Console](https://heurion.org/aegis-cloud/approve)**
 
 **A transactional multi-tenant agent OS runtime for autonomous coding agents (`agy`, `claude`, `codex`, `opencode`, `hermes`) — kernel isolation, CoW shadow workspaces, A2A collaboration, and effect-level approvals.**
 
@@ -9,7 +9,7 @@
 ![Rust](https://img.shields.io/badge/Rust-1.80%2B%20(2021)-orange.svg)
 ![MCP](https://img.shields.io/badge/Protocol-MCP%202024--11--05-blue.svg)
 ![A2A](https://img.shields.io/badge/Protocol-Google%20A2A-34A853.svg)
-![Paper](https://img.shields.io/badge/Paper-arXiv%20Preprint-b31b1b.svg)
+[![arXiv](https://img.shields.io/badge/arXiv-2611.08516-b31b1b.svg)](https://arxiv.org/abs/2611.08516)
 [![Blog](https://img.shields.io/badge/Blog-heurion.org%2Fen%2Fblog-0A7D52.svg)](https://heurion.org/en/blog)
 [![M8ven Score](https://m8ven.ai/badge/mcp/heurion-org/aegis-os)](https://m8ven.ai/mcp/heurion-org/aegis-os?s=readme)
 
@@ -112,11 +112,28 @@ aegis-os install
 - **Enforced runtime design** — advisory/enforced/isolated threat model, effect model, phase plan: [`docs/AEGIS_ENFORCED_RUNTIME_DESIGN.md`](docs/AEGIS_ENFORCED_RUNTIME_DESIGN.md)
 - **Detailed architecture** — trust boundary, core crates, workspace/merge model, MCP/A2A surface, domain profiles, cloud PaaS, benchmarks, status: [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md)
 - **Benchmark report** — [`BENCHMARK_REPORT.md`](BENCHMARK_REPORT.md)
-- **Paper** — [`paper/aegis_os_arxiv_preprint.pdf`](paper/aegis_os_arxiv_preprint.pdf)
+- **Paper (arXiv:2611.08516)** — [https://arxiv.org/abs/2611.08516](https://arxiv.org/abs/2611.08516) ([PDF](https://arxiv.org/pdf/2611.08516) · local copy: [`paper/aegis_os_arxiv_preprint.pdf`](paper/aegis_os_arxiv_preprint.pdf))
 - **AAP-1.0 application protocol** — [`docs/AEGIS_APPLICATION_PROTOCOL.md`](docs/AEGIS_APPLICATION_PROTOCOL.md)
 - **Memory consent / UOMP** — [`docs/UOMP_MEMORY_CONSENT_MAPPING.md`](docs/UOMP_MEMORY_CONSENT_MAPPING.md)
 - **Technical monographs** — [Beyond Git Branches & Shared Folders](https://heurion.org/en/blog/aegis-os-transactional-agent-kernel) · [Human-Agent Capability Parity](https://heurion.org/en/blog/human-agent-capability-parity-ai-native-software) · [Dual-Surface CRDT](https://heurion.org/en/blog/dual-surface-crdt-clinical-ai)
 - **Blog index** — https://heurion.org/en/blog (中文: https://heurion.org/blog)
+
+## Citation
+
+If you use Aegis OS in your research or engineering workflows, please cite our paper:
+
+```bibtex
+@article{zhao2026aegisos,
+  title   = {Aegis OS: A Transactional Multi-Tenant Operating System Runtime for Eliminating Authorization Fatigue in Autonomous Coding Agents},
+  author  = {Zhao, Hui},
+  journal = {arXiv preprint arXiv:2611.08516},
+  year    = {2026},
+  eprint  = {2611.08516},
+  archivePrefix = {arXiv},
+  primaryClass  = {cs.OS},
+  url     = {https://arxiv.org/abs/2611.08516}
+}
+```
 
 ## Telemetry & license
 
