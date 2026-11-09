@@ -25,3 +25,13 @@ preferred-citation:
     - type: other
       value: "arXiv:2611.08516"
       description: "arXiv preprint identifier"
+references:
+  - type: article
+    title: "Why Agent Plugins Are Not a Security Boundary: Inverting Control from In-Process Hooks to a Kernel-Enforced Agent Runtime"
+    authors:
+      - family-names: "Zhao"
+        given-names: "Hui"
+        email: "huizhao@heurion.org"
+        affiliation: "Heurion Research"
+    year: 2026
+    url: "https://github.com/heurion-org/aegis-os/blob/main/paper2/aegis_enforced_runtime_arxiv_preprint.pdf"
