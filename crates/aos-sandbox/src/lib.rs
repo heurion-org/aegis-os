@@ -28,12 +28,16 @@ struct EgressBridge {
     handle: tokio::task::JoinHandle<()>,
     token: String,
     sock: PathBuf,
+    temp_dir: Option<PathBuf>,
 }
 
 impl Drop for EgressBridge {
     fn drop(&mut self) {
         self.handle.abort();
         let _ = std::fs::remove_file(&self.sock);
+        if let Some(ref dir) = self.temp_dir {
+            let _ = std::fs::remove_dir_all(dir);
+        }
     }
 }
 
@@ -317,6 +321,8 @@ impl NativeOsSandboxInstance {
 (deny network-outbound)
 (allow network-outbound
     (remote ip "localhost:{port_pattern}")
+    (remote unix-socket (subpath "{home}"))
+    (remote unix-socket (path-literal "/private/var/run/mDNSResponder"))
 )"#
                 )
             } else {
@@ -328,6 +334,11 @@ impl NativeOsSandboxInstance {
 
         let cred_rules = if !aos_core::ablated("cred_mask") {
             r#"
+(deny process-exec (literal "/usr/bin/security"))
+(deny mach-lookup
+    (global-name "com.apple.security.agent")
+    (global-name "com.apple.security.agent.login")
+)
 (deny file-read*
     (regex #".*/\.ssh(/.*)?$")
     (regex #".*/\.aws(/.*)?$")
@@ -395,10 +406,16 @@ impl NativeOsSandboxInstance {
             String::new()
         };
 
-        // LaunchServices would start programs (`open -a Terminal x.command`) as children of
-        // launchd, i.e. outside this sandbox. It spans several `coreservices`/`lsd` services, so
-        // match the whole family; compilers, interpreters, git and TLS do not use them.
+        // LaunchServices and launchctl would start programs (`open -a Terminal x.command`,
+        // `launchctl bootstrap/run`) as children of `launchd`, i.e. outside this sandbox.
+        // Deny both the Mach IPC families (`coreservices`/`lsd`) and direct exec of
+        // `launchctl`, `open`, and `osascript` alongside `(deny appleevent-send)`.
         let launch_rules = r##"
+(deny process-exec
+    (literal "/bin/launchctl")
+    (literal "/usr/bin/open")
+    (literal "/usr/bin/osascript")
+)
 (deny mach-lookup (global-name-regex #"^com\.apple\.(coreservices\.|lsd\.)"))"##;
 
         format!(
@@ -483,14 +500,50 @@ impl NativeOsSandboxInstance {
         {
             return None;
         }
-        let sock = self
+        let short_id: String = self
+            .instance_id
+            .chars()
+            .filter(|c| c.is_ascii_alphanumeric())
+            .rev()
+            .take(8)
+            .collect::<Vec<_>>()
+            .into_iter()
+            .rev()
+            .collect();
+        let candidate = self
             .config
             .agent_home_dir
-            .join(format!(".aos-egress-{}.sock", self.instance_id));
+            .join(format!(".eg-{short_id}.s"));
+        let (sock, temp_dir) = if candidate.as_os_str().len() < 96 {
+            (candidate, None)
+        } else {
+            let dir = PathBuf::from(format!(
+                "/tmp/aos-sbx-{}",
+                &Uuid::new_v4().simple().to_string()[..12]
+            ));
+            std::fs::create_dir_all(&dir).ok()?;
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::PermissionsExt;
+                let _ = std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o700));
+            }
+            (dir.join("b.s"), Some(dir))
+        };
         let token = bridge::new_token();
         match bridge::spawn_host_bridge(&sock, bridge::proxy_host_port(proxy_url), token.clone()) {
-            Ok(handle) => Some((EgressBridge { handle, token, sock }, exe)),
+            Ok(handle) => Some((
+                EgressBridge {
+                    handle,
+                    token,
+                    sock,
+                    temp_dir,
+                },
+                exe,
+            )),
             Err(err) => {
+                if let Some(dir) = temp_dir {
+                    let _ = std::fs::remove_dir_all(dir);
+                }
                 eprintln!("[aos-sandbox] egress bridge unavailable, sandbox has no network path: {err}");
                 None
             }
@@ -733,24 +786,38 @@ impl SandboxInstance for NativeOsSandboxInstance {
         } else if let Some(bwrap) = linux_bwrap_path()
             .filter(|_| !kernel_sandbox_disabled && !nested_bg_inherited)
         {
-            let mut c = Command::new(bwrap);
-            c.args(self.generate_linux_bwrap_args()).arg("--");
+            let mut bwrap_args = self.generate_linux_bwrap_args();
+            let mut shim_prefix: Vec<std::ffi::OsString> = Vec::new();
             // `--unshare-net` also cuts the sandbox off from its own proxy; relay through the
             // Unix-socket bridge so it can reach exactly that proxy and nothing else.
             if !aos_core::ablated("net_isolation") {
                 if let Some(proxy) = self.config.egress_proxy_addr.as_deref() {
                     if let Some((guard, exe)) = self.start_egress_bridge(proxy) {
-                        c.arg(exe)
-                            .arg("egress-shim")
-                            .arg("--listen")
-                            .arg(bridge::proxy_host_port(proxy))
-                            .arg("--unix")
-                            .arg(&guard.sock)
-                            .arg("--");
+                        if let Some(ref dir) = guard.temp_dir {
+                            let d = dir.display().to_string();
+                            bwrap_args.extend([
+                                "--dir".to_string(),
+                                d.clone(),
+                                "--ro-bind".to_string(),
+                                d.clone(),
+                                d,
+                            ]);
+                        }
+                        shim_prefix.extend([
+                            exe.into_os_string(),
+                            "egress-shim".into(),
+                            "--listen".into(),
+                            bridge::proxy_host_port(proxy).into(),
+                            "--unix".into(),
+                            guard.sock.clone().into_os_string(),
+                            "--".into(),
+                        ]);
                         egress_bridge = Some(guard);
                     }
                 }
             }
+            let mut c = Command::new(bwrap);
+            c.args(bwrap_args).arg("--").args(shim_prefix);
             c.arg(&spec.command).args(&spec.args);
             (c, "linux-bwrap-namespace-enforced".to_string())
         } else if kernel_sandbox_disabled || nested_bg_inherited {

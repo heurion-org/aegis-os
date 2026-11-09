@@ -1,0 +1,21 @@
+uname: Linux lima-aegis-p2 6.8.0-142-generic #142-Ubuntu SMP PREEMPT_DYNAMIC Wed Sep  2 14:30:29 UTC 2026 aarch64 aarch64 aarch64 GNU/Linux
+os_release: PRETTY_NAME="Ubuntu 24.04.5 LTS"
+apparmor_restrict_unprivileged_userns: 1
+bwrap_version: bubblewrap 0.9.0
+--- pre_apparmor_profile_fail_closed_probe ---
+Error: aos run: bubblewrap user namespace probe failed: bwrap: loopback: Failed RTM_NEWADDR: Operation not permitted
+--- post_apparmor_profile_enforced_probe ---
+aos run: warning: /tmp/aegis_probe_proj is not a normal Git repository; git status/diff will be unavailable
+Aegis · enforced (filesystem) · aegis_probe_proj/agy-883f30
+  session: ses_9b9e895a3109
+  project: /tmp/aegis_probe_proj
+  shadow:  /tmp/aegis_probe_rt/sessions/ses_9b9e895a3109/cow_workspace/upper_workspace
+  git:     unavailable
+  network: egress allowlist (CONNECT for general traffic; model API Base URL L7 DLP)
+  profile: code
+  mode:    implement
+  broker:  session control socket (adapter.evaluate / effect / heartbeat)
+  approvals: commit-time tickets + live policy escalations
+
+Agent exited. No shadow changes.
+nerdctl_version: nerdctl version 2.4.1

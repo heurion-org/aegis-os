@@ -1,0 +1,707 @@
+\documentclass[10pt,twocolumn]{article}
+
+\usepackage[T1]{fontenc}
+\usepackage{lmodern}
+\usepackage[margin=0.75in,top=0.80in,bottom=0.80in]{geometry}
+\usepackage{amsmath,amssymb,amsfonts,amsthm}
+\usepackage{booktabs}
+\usepackage{tabularx}
+\usepackage{xcolor}
+\usepackage{tikz}
+\usetikzlibrary{shapes.geometric, arrows.meta, positioning, fit, calc, backgrounds}
+\usepackage{listings}
+\usepackage{url}
+\usepackage[colorlinks=true,linkcolor=blue!60!black,citecolor=blue!60!black,urlcolor=blue!60!black]{hyperref}
+
+\newtheorem{invariant}{Invariant}
+
+\definecolor{aegisblue}{RGB}{28, 78, 128}
+\definecolor{aegisgreen}{RGB}{34, 139, 34}
+\definecolor{aegisred}{RGB}{180, 40, 40}
+\definecolor{aegisorange}{RGB}{210, 105, 30}
+\definecolor{aegisgray}{RGB}{245, 247, 250}
+\definecolor{codebg}{RGB}{248, 249, 252}
+\definecolor{slate}{RGB}{90, 100, 115}
+\definecolor{danger}{RGB}{180, 40, 40}
+\definecolor{warn}{RGB}{210, 105, 30}
+\definecolor{safe}{RGB}{34, 139, 34}
+
+\lstset{
+  basicstyle=\ttfamily\scriptsize,
+  backgroundcolor=\color{codebg},
+  frame=single,
+  rulecolor=\color{black!20},
+  breaklines=true,
+  columns=fullflexible,
+  keepspaces=true,
+  showstringspaces=false
+}
+
+\setlength{\columnsep}{0.25in}
+\setlength{\textfloatsep}{7pt plus 2pt minus 2pt}
+\setlength{\dbltextfloatsep}{7pt plus 2pt minus 2pt}
+\setlength{\intextsep}{7pt plus 2pt minus 2pt}
+\emergencystretch=2em
+\hbadness=10000
+\vbadness=10000
+
+\title{\LARGE \textbf{Why Agent Plugins Are Not a Security Boundary: Inverting Control from In-Process Hooks to a Kernel-Enforced Agent Runtime}}
+
+\author{
+  \textbf{Hui Zhao} \\
+  Heurion Research \\
+  Rotterdam, Netherlands \\
+  \texttt{huizhao@heurion.org}
+}
+
+\date{Preprint --- November 2026}
+
+\begin{document}
+\sloppy
+
+\maketitle
+
+\begin{abstract}
+Autonomous CLI coding agents---Claude Code (\texttt{claude}), OpenCode (\texttt{opencode}), Google Antigravity (\texttt{agy}), and Nous Hermes (\texttt{hermes})---rely on in-process governance plugins (\texttt{PreToolUse} hooks, additive MCP servers, and prompt rules). We show that treating an in-process plugin as a security boundary violates Anderson's Reference Monitor guarantees of complete mediation, tamper-resistance, and verifiability whenever the agent runs under the developer's UNIX UID. Auditing four production CLI agents reveals six structural bypass classes (\texttt{V1}--\texttt{V6}): workspace escape and unapproved host writes (\texttt{V1}); unconfined socket egress (\texttt{V2}); host credential, Keychain, and environment key theft (\texttt{V3}); hook/config self-tampering (\texttt{V4}); repository code execution during read-only \texttt{git status}/\texttt{diff} via \texttt{core.fsmonitor} (\texttt{V5}); and same-UID self-approval or post-diff TOCTOU swaps (\texttt{V6}).
+
+We present \textbf{Aegis Enforced Runtime} (\texttt{aegis-os run -- <agent>}), which inverts control so the OS supervisor confines the unmodified agent inside Linux \texttt{bubblewrap} (\texttt{--bind-fd}) or macOS Seatbelt before \texttt{execve()}. Aegis combines Copy-on-Write shadows with a read-only \texttt{.git} view and \texttt{.aegis-bin/git} shim, read-only config over-mounts, a split-plane L4/L7 egress proxy that injects API keys at the host boundary without TLS MITM, dual-token \texttt{SessionBroker} isolation, and frozen-stage SHA-256 commit pinning. Across 30 deterministic payloads on macOS and Linux plus 60 live runs of all four agents, Aegis reduces bypass coverage from 73.3\%--93.3\% (and 80.0\% in \texttt{nerdctl} devcontainers) to \textbf{0.0\%} and live repository-trap compromises from 100\% to \textbf{0\%}, while saving 99.05\% of APFS disk allocation on 500 MB packed Git repos, adding +0.221 ms loopback TTFT overhead, and preserving 100\% multi-file coding pass rates.
+\end{abstract}
+
+\section{Introduction}
+\label{sec:intro}
+
+Command-line autonomous coding agents---including Anthropic Claude Code (\texttt{claude}), OpenCode (\texttt{opencode}), Google Antigravity (\texttt{agy}), Nous Hermes (\texttt{hermes}), OpenAI Codex CLI~\cite{openai2025codex}, SWE-agent~\cite{yang2024sweagent}, and OpenHands~\cite{wang2025openhands}---have become core developer infrastructure~\cite{jimenez2024swebench,anthropic2024mcp}. Unlike passive code completion tools, these agents execute as autonomous user-space processes that edit source trees, run build scripts and test suites, inspect Git state, and communicate with external APIs.
+
+To govern agent actions without constant manual prompting, both vendors and security tools have converged on an \emph{in-process plugin paradigm}: registering an MCP server~\cite{anthropic2024mcp}, configuring a \texttt{PreToolUse} or \texttt{tool.execute.before} hook in user dotfiles (\texttt{\textasciitilde/.claude/settings.json}, \texttt{\textasciitilde/.gemini/config/hooks.json}, or \texttt{\textasciitilde/.config/opencode/plugins/}), and placing natural-language routing instructions in \texttt{CLAUDE.md} or \texttt{AGENTS.md}.
+
+In our companion work on Aegis OS~\cite{zhao2026aegisos}, moving MCP-mediated file edits and shell commands into a transactional Copy-on-Write (CoW) shadow workspace (\texttt{aos-vfs}) eliminated 90.7\%--99.88\% of human confirmation prompts across 28,087 tool calls. Crucially, however, \cite{zhao2026aegisos} explicitly assumed that client-side hooks reliably route agent mutations into the runtime.
+
+\subsection{Why In-Process Governance Violates Reference Monitor Guarantees}
+
+We ask a foundational systems security question: \emph{Can an in-process agent plugin, hook script, or MCP server ever serve as a true security boundary when the agent CLI itself runs as an unconfined host process?}
+
+By Anderson's classic Reference Monitor formulation~\cite{anderson1972computer} and Saltzer and Schroeder's protection principles~\cite{saltzer1975protection}, a valid enforcement mechanism must satisfy three properties:
+\begin{enumerate}
+    \item $\mathcal{M}_1$ \textbf{(Complete Mediation):} Every security-relevant access to host files, credentials, IPC endpoints, and network sockets must traverse the monitor.
+    \item $\mathcal{M}_2$ \textbf{(Tamper-Resistance):} The untrusted subject (the LLM-driven agent process tree) must not be able to modify, disable, or forge the monitor's configuration, hooks, or approval state.
+    \item $\mathcal{M}_3$ \textbf{(Verifiability):} The enforcement boundary must be small, deterministic, and auditable independently of the rapidly evolving application code of third-party agent CLIs.
+\end{enumerate}
+
+When an agent CLI runs directly under the developer's UNIX UID, in-process governance violates all three axioms:
+\begin{itemize}
+    \item \textbf{Failure of Complete Mediation ($\neg\mathcal{M}_1$):} MCP is an \emph{additive} tool protocol, not a mandatory syscall interposer. Registering safe MCP tools leaves built-in native file tools, repository-discovered \texttt{.mcp.json} servers, unconfined background servers (\texttt{opencode serve}/\texttt{attach}), and non-blocking plugin architectures (such as \texttt{hermes}'s warn-once \texttt{security-guidance} plugin) able to mutate host files and open outbound sockets directly. Even when a shell hook inspects command strings, invoking an innocuous project script (\texttt{python3 scripts/verify\_env.py}) executes arbitrary Python syscalls completely invisible to command-regex matchers.
+    \item \textbf{Failure of Tamper-Resistance ($\neg\mathcal{M}_2$):} Because the agent inherits ambient UID write permissions across \texttt{\$HOME} and the project root, any unguarded write or child script can overwrite \texttt{.claude/settings.json}, \texttt{hooks.json}, or \texttt{.config/opencode/plugins/} to strip hooks, or forge same-UID loopback approval calls.
+    \item \textbf{Failure of Verifiability in ``Read-Only'' Tooling ($\neg\mathcal{M}_3$):} Usable hook policies allowlist routine developer inspection commands such as \texttt{git status}, \texttt{git diff}, and \texttt{pytest}. Yet \texttt{git status} evaluates repository-local \texttt{.git/config} and automatically executes \texttt{core.fsmonitor} binaries on the host, while \texttt{git diff} invokes \texttt{diff.external} and \texttt{textconv} filters.
+\end{itemize}
+
+\begin{table*}[!t]
+\centering
+\caption{\textbf{Architectural Audit of Four Installed Production CLI Coding Agents} (verified via CLI inspection, local configuration schemas, and source/log auditing on our evaluation host) versus \textbf{Aegis Enforced Runtime (\texttt{aegis-os run})}.}
+\label{tab:agent_audit}
+\vspace{2pt}
+\scriptsize
+\setlength{\tabcolsep}{3.5pt}
+\newcolumntype{Y}{>{\raggedright\arraybackslash}X}
+\begin{tabularx}{\textwidth}{@{}l>{\raggedright\arraybackslash}p{2.55cm}YYYY@{}}
+\toprule
+\textbf{Agent (Version)} & \textbf{Hook \& Native Sandbox} & \textbf{V1/V2: FS \& Egress Mediation} & \textbf{V3: Secrets \& IPC Surface} & \textbf{V4/V5: Config \& \texttt{.git} RCE} & \textbf{V6: Approval \& Commit Gate} \\
+\midrule
+\textbf{Claude Code} (\texttt{2.1.319}) & \texttt{settings.json} \texttt{PreToolUse}; \texttt{sandbox.enabled}~\cite{anthropic2025srt} & Hooks regex-bypassed via repo scripts; native sandbox mounts host repo RW & Keychain / OAuth token; raw env vars exposed to child processes & \texttt{settings.local.json} \& \texttt{.mcp.json} editable; \texttt{core.fsmonitor} runs in repo & Direct in-place host edits without frozen SHA-256 diff commit gate \\
+\addlinespace[2pt]
+\textbf{OpenCode} (\texttt{v2.2.6}) & JS plugin \texttt{tool.\allowbreak execute.\allowbreak before}; \emph{no OS sandbox} & No built-in OS sandbox; \texttt{serve}/\texttt{attach} delegates to host daemon & Plaintext \texttt{DEEPSEEK\_API\_KEY} in \texttt{environ} \& \texttt{auth.json} & \texttt{.config/opencode/\allowbreak plugins/*.js} \& \texttt{opencode.json} writable; \texttt{fsmonitor} runs & No out-of-sandbox commit gate; same-UID loopback HTTP open \\
+\addlinespace[2pt]
+\textbf{Antigravity} (\texttt{1.5.3}) & \texttt{hooks.json} protojson (\texttt{exit 2}); \texttt{--sandbox=seatbelt} & Strict shell hook breaks test runs; vendor Seatbelt allows sibling \& repo RW & OAuth file + \texttt{SecurityAgent} Keychain IPC (\texttt{/usr/bin/security}) & Vendor Seatbelt permits \texttt{hooks.json} \& repo config writes; \texttt{fsmonitor} open & User-space router guard bypassed if native shell executes directly \\
+\addlinespace[2pt]
+\textbf{Nous Hermes} (\texttt{v0.23.0}) & \texttt{security-guidance} (warn-only); \emph{no OS sandbox} & Bundled plugin warns once without blocking; \texttt{HERMES\_SAFE\_MODE} regex-only & Plaintext keys in \texttt{\textasciitilde/.hermes/.env}; login shell resets \texttt{\$HOME} via \texttt{pw\_dir} & \texttt{\textasciitilde/.hermes/config.yaml} writable; \texttt{.git/config} \texttt{fsmonitor} runs & No kernel sandbox or principal-separated approval broker \\
+\midrule
+\textbf{Aegis Enforced} (\texttt{aos run}) & \textbf{Parent \texttt{bwrap --bind-fd} / XNU Seatbelt} & \textbf{CoW shadow remap; \texttt{netns}/port-pinned L4+L7 egress} & \textbf{Host creds masked; Mach Keychain \& \texttt{launchd} denied; \texttt{\$AOS\_SECRET\_*}} & \textbf{\texttt{--ro-bind-fd} / Seatbelt config locks; \texttt{0555} \texttt{.aegis-bin/git} shim} & \textbf{\texttt{agent.token} $\neq$ \texttt{human.token}; frozen-stage SHA-256 commit} \\
+\bottomrule
+\end{tabularx}
+\end{table*}
+
+\subsection{Inverting Control to a Parent-Process Kernel Runtime}
+
+Our central thesis is architectural: \emph{a security runtime must not reside inside an agent as an optional plugin; the agent must execute inside the runtime as an unprivileged child process tree}. Instead of trusting the agent binary's internal hook dispatcher, the operator invokes:
+\begin{center}
+{\footnotesize\texttt{aegis-os run -- <agent> [args...]}}
+\end{center}
+Before \texttt{execve()} enters the agent binary, the parent \texttt{aegis-os} supervisor establishes kernel-enforced containment (Linux \texttt{bubblewrap}~\cite{containers2024bubblewrap} user/mount/PID/IPC/network namespaces with \texttt{--bind-fd}, or macOS XNU Seatbelt MAC). Designing this parent runtime for real interactive coding agents requires solving four systems tensions that break naive sandboxes and standard developer containers (\texttt{devcontainer}/\texttt{nerdctl}): (1) preserving original workspace paths without copying multi-hundred-megabyte \texttt{.git/objects/pack} stores or exposing mutable \texttt{.git/config} hooks; (2) preserving agent session state while kernel-locking hook/plugin configurations and blocking macOS GUI Keychain/LaunchServices escapes; (3) preventing API-key theft from \texttt{environ} and scanning outbound model requests without TLS Man-in-the-Middle (MITM) certificate breakage; and (4) enforcing human commit approval without corrupting Alternate Screen TUIs or allowing post-diff Time-of-Check to Time-of-Use (TOCTOU) swaps.
+
+\subsection{Contributions}
+
+This paper makes five contributions:
+\begin{itemize}
+    \item \textbf{Reference-Monitor Audit and Six-Vector Bypass Taxonomy (\S\ref{sec:threat}):} We audit four production CLI coding agents (\texttt{claude v2.1.319}, \texttt{opencode v2.2.6}, \texttt{agy v1.5.3}, and \texttt{hermes v0.23.0}), formalizing six structural bypass classes (\texttt{V1}--\texttt{V6}) across plugin hooks, vendor subprocess sandboxes, and bind-mounted developer containers.
+    \item \textbf{Parent-Process CoW Confinement, Split \texttt{.git} View, and Layered Agent Home (\S\ref{sec:launcher}):} We build \texttt{aegis-os run} (\texttt{crates/aos-cli/src/launcher.rs}), combining \texttt{fcntl(F\_DUPFD, 3)} inherited file-descriptor mounts (\texttt{--bind-fd}), read-only \texttt{.git} object pass-through with private \texttt{GIT\_INDEX\_FILE} and a \texttt{0555} \texttt{.aegis-bin/git} wrapper shim, symlink-safe state seeding beneath read-only config locks (\texttt{PROTECTED\_AGENT\_CONFIGS}), and macOS Mach IPC confinement against Keychain \texttt{SecurityAgent} and LaunchServices escapes.
+    \item \textbf{Split-Plane L4/L7 Egress Gateway and Dual-Token Session Broker (\S\ref{sec:egress}):} We pair an L4 \texttt{CONNECT} domain allowlist with an L7 \texttt{Base URL} reverse proxy (\texttt{crates/aos-egress/src/lib.rs}) that substitutes \texttt{\$AOS\_SECRET\_*} placeholders at the host boundary and runs 64 KiB outbound DLP without TLS MITM, alongside a constant-time dual-token \texttt{SessionBroker} (\texttt{agent.token} $\neq$ \texttt{human.token}).
+    \item \textbf{Out-of-Band Approval, Frozen-Stage SHA-256 Commit Pinning, and Cross-Domain Verifiers (\S\ref{sec:commit}):} We prove five security invariants ($\mathcal{I}_1$--$\mathcal{I}_5$), eliminating Alternate Screen TUI contention via out-of-band escalations and closing post-diff TOCTOU and terminal-escape spoofing via \texttt{commit\_frozen\_stage} and six \texttt{DomainProfile} verifiers.
+    \item \textbf{Two-Layer Cross-Platform \& Live-Agent Evaluation (\S\ref{sec:eval}):} Across 30 deterministic payloads on macOS Seatbelt and Ubuntu 24.04 \texttt{bwrap}/\texttt{nerdctl}, 4 feature-gated Rust ablations (\texttt{AOS\_ABLATE}), 3 filesystem CoW benchmarks (APFS, \texttt{ext4}, \texttt{btrfs}), and 60 live cloud-API runs of all four production CLI agents, Aegis achieves \textbf{0.0\%} bypass coverage and \textbf{0\%} live compromise while preserving \textbf{4/4 (100\%)} multi-file task completion---uncovering and fixing eight real product and agent-integration bugs in the process.
+\end{itemize}
+
+\begin{figure*}[!t]
+\centering
+\resizebox{\textwidth}{!}{%
+\begin{tikzpicture}[
+    font=\sffamily\footnotesize,
+    box/.style={rectangle, rounded corners=3pt, draw=black!70, thick, align=center},
+    badbox/.style={rectangle, rounded corners=3pt, draw=aegisred!85!black, fill=aegisred!10, very thick, align=center},
+    goodbox/.style={rectangle, rounded corners=3pt, draw=aegisgreen!80!black, fill=aegisgreen!10, very thick, align=center},
+    bluebox/.style={rectangle, rounded corners=3pt, draw=aegisblue!85!black, fill=aegisblue!12, thick, align=center},
+    arrow/.style={-{Stealth[scale=0.85]}, thick, draw=black!75},
+    redarrow/.style={-{Stealth[scale=0.85]}, very thick, draw=aegisred!85!black, dashed},
+    greenarrow/.style={-{Stealth[scale=0.85]}, very thick, draw=aegisgreen!75!black}
+]
+
+\node[badbox, minimum width=10.2cm, minimum height=0.7cm] (adv_title) at (0, 4.35) {\textbf{(a) Advisory Plugin / Subprocess Sandbox Model ($\neg\mathcal{M}_1, \neg\mathcal{M}_2, \neg\mathcal{M}_3$)}};
+
+\node[box, fill=orange!12, minimum width=10.2cm, minimum height=1.65cm] (adv_proc) at (0, 2.75) {};
+\node[anchor=north, font=\sffamily\footnotesize\bfseries] at (0, 3.50) {Host Agent Process (\texttt{claude} / \texttt{opencode} / \texttt{agy} / \texttt{hermes}, Ambient Host UID)};
+\node[box, fill=white, minimum width=3.1cm, minimum height=0.72cm] (adv_hook) at (-3.3, 2.42) {\texttt{PreToolUse} Hook\\{\scriptsize (Command Regex Only)}};
+\node[box, fill=white, minimum width=3.1cm, minimum height=0.72cm] (adv_mcp) at (0.0, 2.42) {MCP Tool Server\\{\scriptsize (Additive Protocol)}};
+\node[badbox, minimum width=3.1cm, minimum height=0.72cm] (adv_native) at (3.3, 2.42) {Repo Script / Native\\{\scriptsize \texttt{verify\_env.py} / \texttt{.mcp.json}}};
+
+\node[badbox, minimum width=10.2cm, minimum height=1.50cm] (adv_host) at (0, 0.45) {
+    \textbf{Live Host Workspace \& Developer \texttt{\$HOME} (Exposed to Ambient UID)}\\[2pt]
+    {\scriptsize \textbf{V1:} Sibling/unapproved repo write $\mid$ \textbf{V2:} Direct socket / non-blocking hook $\mid$ \textbf{V3:} \texttt{\textasciitilde/.ssh}, Keychain \& \texttt{environ} key theft}\\
+    {\scriptsize \textbf{V4:} Overwrites \texttt{settings.json}/\texttt{hooks.json} $\mid$ \textbf{V5:} \texttt{git status} runs \texttt{.git/config fsmonitor} $\mid$ \textbf{V6:} Same-UID self-approve}
+};
+
+\draw[arrow] (adv_hook.south) -- (adv_mcp.south |- adv_host.north);
+\draw[redarrow] (adv_native.south) -- ([xshift=3.3cm]adv_host.north) node[midway, right, font=\sffamily\scriptsize, text=aegisred!90!black] {\textbf{V1--V3}};
+\draw[redarrow] ([xshift=-3.3cm]adv_proc.south) -- ([xshift=-3.3cm]adv_host.north) node[midway, left, font=\sffamily\scriptsize, text=aegisred!90!black] {\textbf{V4--V6}};
+
+\node[goodbox, minimum width=11.0cm, minimum height=0.7cm] (enf_title) at (12.6, 4.35) {\textbf{(b) Aegis Parent-Process Kernel-Enforced Runtime (\texttt{aegis-os run -\/- <agent>})}};
+
+\node[bluebox, minimum width=11.0cm, minimum height=1.65cm] (enf_sbx) at (12.6, 2.75) {};
+\node[anchor=north, font=\sffamily\footnotesize\bfseries] at (12.6, 3.50) {Kernel Confinement Boundary (\texttt{bwrap -\/-unshare-all -\/-bind-fd} / XNU \texttt{sandbox-exec} + \texttt{setsid} PTY)};
+\node[box, fill=white, minimum width=3.35cm, minimum height=0.72cm] (enf_fs) at (9.05, 2.42) {\textbf{CoW Shadow + Split Git}\\{\scriptsize \texttt{shadow} (\texttt{rw}), \texttt{.git} (\texttt{ro})}};
+\node[box, fill=white, minimum width=3.35cm, minimum height=0.72cm] (enf_home) at (12.6, 2.42) {\textbf{Layered Agent Home}\\{\scriptsize \texttt{sessions} (\texttt{rw}), \texttt{configs} (\texttt{ro})}};
+\node[box, fill=white, minimum width=3.35cm, minimum height=0.72cm] (enf_net) at (16.15, 2.42) {\textbf{Split Egress \& Broker}\\{\scriptsize \texttt{agent.token} $\neq$ \texttt{human.token}}};
+
+\node[goodbox, minimum width=11.0cm, minimum height=1.50cm] (enf_host) at (12.6, 0.45) {
+    \textbf{Trusted Host Control Plane (Outside Agent Mount Namespace / Seatbelt)}\\[2pt]
+    {\scriptsize $\bullet$ \textbf{Hardened \texttt{.aegis-bin/git} Shim (\texttt{0555}, RO):} Unsets Git env vars; forces \texttt{fsmonitor=false}; blocks mutating Git (exit 126)}\\
+    {\scriptsize $\bullet$ \textbf{L4 \texttt{CONNECT} + L7 \texttt{Base URL} Proxy:} Boundary \texttt{\$AOS\_SECRET\_*} injection \& 64 KiB outbound DLP without TLS MITM}\\
+    {\scriptsize $\bullet$ \textbf{Frozen-Stage Commit Gate:} \texttt{human.token} (\texttt{0600}) + \texttt{DomainProfile} verifiers + SHA-256 TOCTOU diff pin}
+};
+
+\draw[greenarrow] (enf_fs.south) -- ([xshift=-3.55cm]enf_host.north);
+\draw[greenarrow] (enf_home.south) -- (enf_host.north);
+\draw[greenarrow] (enf_net.south) -- ([xshift=3.55cm]enf_host.north);
+
+\end{tikzpicture}%
+}
+\caption{\textbf{Architectural Inversion of Control.} (a) Under in-process hooks or RW-workspace subprocess sandboxes, repository helper scripts, non-blocking plugin hooks, plaintext environment keys, writable config files, and \texttt{.git/config} \texttt{fsmonitor} hooks bypass governance (\texttt{V1}--\texttt{V6}). (b) \textbf{Aegis Enforced Runtime} confines the entire agent process tree inside a parent kernel sandbox \emph{before} \texttt{execve()}, isolating writes in a CoW shadow, mounting \texttt{.git} and agent configs read-only, injecting API keys at the host L7 proxy boundary, and requiring \texttt{human.token} plus frozen-stage SHA-256 verification before host promotion.}
+\label{fig:inversion}
+\end{figure*}
+
+\section{Threat Model and Six Structural Bypass Classes}
+\label{sec:threat}
+
+\subsection{System Model, Adversary, and TCB}
+
+We consider a workstation or build server where an operator runs a CLI coding agent $A \in \{\texttt{claude}, \texttt{opencode}, \texttt{agy}, \texttt{hermes}\}$ on a local Git repository $\mathcal{W}_{\text{host}}$ under UNIX account $u$.
+
+\paragraph{Adversary Capabilities.} Following standard indirect prompt-injection and malicious-repository threat models~\cite{greshake2023not,debenedetti2024agentdojo,zhan2024injecagent}, the repository $\mathcal{W}_{\text{host}}$ or external context (issues, dependencies, build logs, test fixtures) may contain adversarial instructions, trojanized helper scripts (e.g., \texttt{scripts/verify\_env.py}), or malicious repository metadata (\texttt{.git/config}, \texttt{.mcp.json}). Unlike~\cite{zhao2026aegisos}, we grant the subverted agent tree full access to \emph{every syscall, native tool, subshell, IPC channel, and socket permitted by the OS kernel to $A$ and its descendants}.
+
+\paragraph{Trusted Computing Base (TCB).} We trust the host OS kernel (Linux $\ge 6.1$ with user/mount/network namespaces and \texttt{bubblewrap}~\cite{containers2024bubblewrap}, or macOS XNU Seatbelt) and the parent \texttt{aegis-os} binary. We do \emph{not} trust the agent binary $A$, its in-process hook/plugin runner, repository configs, or child build/test scripts (\texttt{build.rs}, \texttt{pytest}). Denial-of-service, kernel privilege-escalation zero-days, and semantic prose summarization over authorized LLM inference channels (\S\ref{sec:discussion}) are out of scope.
+
+\subsection{The Six Bypass Classes (\texttt{V1}--\texttt{V6})}
+
+Auditing the exact installed versions of our four target agents (Table~\ref{tab:agent_audit} and Figure~\ref{fig:inversion}a) yields six concrete bypass classes:
+
+\paragraph{V1: Workspace Escape and Unapproved Host-Tree Writes.}
+Command-string hooks (\texttt{PreToolUse} on \texttt{Bash}/\texttt{run\_command}) inspect surface shell syntax rather than resolved VFS paths. An agent invoking an uncovered native file tool, spawning a repository-configured \texttt{.mcp.json} child server, or running an innocuous test helper (\texttt{python3 scripts/verify\_env.py}) writes directly to sibling host directories (\texttt{../sibling}) or mutates $\mathcal{W}_{\text{host}}$ in place without transactional review. Crucially, vendor subprocess sandboxes (\texttt{claude} \texttt{sandbox.enabled}~\cite{anthropic2025srt}, \texttt{agy --sandbox=seatbelt}) and bind-mounted developer containers (\texttt{nerdctl run -v \$(pwd):/workspace}) mount $\mathcal{W}_{\text{host}}$ \emph{read-write}, permitting immediate unapproved host-repository modification and \texttt{.mcp.json} injection.
+
+\paragraph{V2: Unconfined Network Egress and Non-Blocking Hook Paths.}
+Agents without built-in network sandboxes (\texttt{opencode}, \texttt{hermes}, and standard \texttt{nerdctl} containers with default bridge networking) allow arbitrary exfiltration via \texttt{curl --noproxy '*'}, Python \texttt{urllib}, raw TCP sockets, or background subshells. Moreover, auditing \texttt{hermes v0.23.0} revealed that its bundled \texttt{security-guidance} plugin records a session key and \emph{warns once without blocking execution}, while its \texttt{plugin-guard-v12} runs in-process with explicit tool exemptions; even with \texttt{HERMES\_SAFE\_MODE=1} or \texttt{claude}/\texttt{opencode} regex hooks enabled, indirect execution through a project script bypasses string-matching filters completely.
+
+\paragraph{V3: Host Credential, Keychain, and Sandbox API-Key Theft.}
+Under ambient UID $u$, child tools read \texttt{\textasciitilde/.ssh/id\_ed25519}, \texttt{\textasciitilde/.aws/credentials}, and agent OAuth files (\texttt{antigravity-oauth-token}, \texttt{\textasciitilde/.hermes/.env}), or dump plaintext \texttt{ANTHROPIC\_API\_KEY} / \texttt{DEEPSEEK\_API\_KEY} from \texttt{os.environ} (which vendor sandboxes and devcontainers must pass into the process so the agent can call its LLM). On macOS, child processes can also invoke \texttt{/usr/bin/security}, talk to Keychain \texttt{SecurityAgent} or LaunchServices (\texttt{open -a}, \texttt{osascript}, \texttt{launchctl}) over Mach IPC to spawn unsandboxed children under \texttt{launchd}, or attach to an unconfined host daemon (\texttt{opencode serve}/\texttt{attach}).
+
+\paragraph{V4: Self-Modifying Hook and Plugin Configuration.}
+Hook definitions reside in user-writable files: \texttt{\textasciitilde/.claude/settings.json}, \texttt{.claude/settings.local.json}, \texttt{\textasciitilde/.gemini/config/hooks.json}, \texttt{\textasciitilde/.gemini/antigravity-cli/settings.json}, \texttt{\textasciitilde/.config/opencode/plugins/*.js}, and \texttt{\textasciitilde/.hermes/config.yaml}. Any unhooked write or project script can truncate \texttt{settings.json}, drop a rogue \texttt{opencode} plugin, or rewrite \texttt{config.yaml}, permanently disarming in-process governance.
+
+\paragraph{V5: Repository-Triggered RCE in ``Read-Only'' Git Commands.}
+Developer workflows require \texttt{git status}, \texttt{git diff}, and \texttt{git log}. However, Git automatically parses \texttt{.git/config} inside the repository; setting \texttt{core.fsmonitor} or \texttt{diff.external} triggers arbitrary command execution whenever the agent or user runs \texttt{git status}. Likewise, writable \texttt{.git/hooks/post-checkout}, \texttt{git -c core.fsmonitor=...}, or \texttt{GIT\_CONFIG\_PARAMETERS} achieve code execution through ostensibly read-only Git invocations.
+
+\paragraph{V6: Same-UID Control-Plane Self-Approval and Post-Diff TOCTOU.}
+If a local approval daemon authenticates callers only by UNIX UID or a single session token, an in-sandbox process can approve its own escalation over loopback HTTP/Unix sockets, invoke the approval CLI directly, swap shadow files in the $[t_{\text{diff}}, t_{\text{commit}}]$ window, spoof terminal diff output via ANSI CSI (\texttt{\textbackslash x1b[2K}) or Unicode Bidi (\texttt{U+202E}) escapes, or replay a consumed lease.
+
+\section{Parent-Process Kernel-Enforced Launcher}
+\label{sec:launcher}
+
+\textbf{Aegis Enforced Runtime} (\texttt{crates/aos-cli/src/launcher.rs} and \texttt{crates/aos-sandbox/src/lib.rs}) eliminates \texttt{V1}--\texttt{V6} by acting as the parent OS supervisor before spawning the agent CLI (Figure~\ref{fig:inversion}b).
+
+\subsection{Fail-Closed Startup and Ubuntu 24.04 AppArmor Verification}
+
+\texttt{aegis-os run} defaults to \texttt{--enforcement enforced} (with \texttt{advisory} labeled \texttt{NOT a security boundary} and \texttt{isolated} backed by \texttt{MicroVmSandboxDriver}~\cite{agache2020firecracker}). Before session creation, \texttt{validate\_workspace\_roots()} rejects \texttt{/}, any directory containing \texttt{\$HOME}, or overlapping runtime paths.
+
+Crucially, if kernel namespace creation fails, \texttt{aegis-os run} \emph{fails closed} rather than degrading to unconfined execution. Testing on a fresh Ubuntu 24.04.5 LTS (\texttt{6.8.0-142-generic}) VM confirmed an important deployment nuance: Ubuntu 24.04 enables \texttt{kernel.apparmor\_restrict\_unprivileged\_userns = 1} by default, and Ubuntu's \texttt{bubblewrap 0.9.0} package does \emph{not} ship \texttt{/etc/apparmor.d/bwrap} out of the box. Our startup probe (\texttt{probe\_bwrap\_userns}) immediately catches \texttt{RTM\_NEWADDR: Operation not permitted}, aborts before launching the agent, and instructs the operator to load an AppArmor \texttt{userns} profile for \texttt{/usr/bin/bwrap}.
+
+\subsection{Default-Deny Mount Namespace, \texttt{--bind-fd} Remapping, and macOS Mach Confinement}
+
+\paragraph{Linux \texttt{--ro-bind / /} + Canonicalized \texttt{--tmpfs} + \texttt{--bind-fd}.}
+To support polyglot CLIs (Node.js, Bun, Go, Rust, Python) across Ubuntu, Fedora Silverblue, and NixOS without exposing user data, \texttt{LauncherPlan::linux\_args()} starts with \texttt{--die-with-parent --unshare-all --ro-bind / / --proc /proc --dev /dev --new-session}, masks \texttt{/etc/shadow}, \texttt{/etc/sudoers*}, and \texttt{/etc/ssl/private}, and mounts fresh \texttt{--tmpfs} instances over canonicalized, depth-sorted user roots (\texttt{/tmp, /home, /root, /run, /var, /mnt, /media}). Because path-based bind sources inside \texttt{/tmp} or \texttt{/home} are hidden once \texttt{--tmpfs} is mounted, \texttt{fd\_mount()} opens host directories in the parent process, duplicates descriptors via \texttt{fcntl(raw, F\_DUPFD, 3)}, and passes \texttt{--bind-fd <fd> <project>} to \texttt{bwrap}, mounting the CoW shadow directly at the \emph{exact canonical project path} while keeping $\mathcal{W}_{\text{host}}$ untouched.
+
+\paragraph{macOS XNU Seatbelt + Mach IPC / Keychain Confinement.}
+On macOS (which lacks unprivileged \texttt{CLONE\_NEWNS}), \texttt{generate\_macos\_seatbelt\_profile()} enforces \texttt{(deny file-write*)}, permitting writes only inside $\mathcal{W}_{\text{shadow}}$, $\mathcal{H}_{\text{agent}}$, and \texttt{/tmp}, and denies \texttt{file-read*} across 20 host credential patterns (\texttt{.ssh}, \texttt{.aws}, \texttt{.gnupg}, \texttt{.kube}, \texttt{.config/gh}, \texttt{.config/gcloud}, \texttt{Library/Keychains}, \texttt{docker.sock}, \texttt{.lima}). To close macOS-specific IPC escape vectors, the profile enforces:
+\begin{lstlisting}
+(deny appleevent-send)
+(deny process-exec (literal "/usr/bin/security")
+  (literal "/bin/launchctl") (literal "/usr/bin/open") (literal "/usr/bin/osascript"))
+(deny mach-lookup
+  (global-name "com.apple.security.agent")
+  (global-name "com.apple.security.agent.login")
+  (global-name-regex #"^com\.apple\.(coreservices\.|lsd\.)"))
+\end{lstlisting}
+During live testing of \texttt{agy v1.5.3}, we discovered why Mach-level Keychain confinement is essential: \texttt{agy}'s Go keyring library invokes \texttt{/usr/bin/security add-generic-password -U -s antigravity} on OAuth refresh; when \texttt{\$HOME} is redirected to $\mathcal{H}_{\text{agent}}$ without a login keychain, macOS \texttt{Security.framework} contacts \texttt{com.apple.security.agent} and spawns repeated modal GUI prompts (\emph{``Keychain Not Found''}) outside the terminal. Blocking \texttt{/usr/bin/security} (plus a \texttt{0555} \texttt{.aegis-bin/security} exit-44 stub) and denying \texttt{com.apple.security.agent*} eliminates both host Keychain exfiltration and GUI prompt stalls while keeping \texttt{com.apple.trustd} TLS validation intact.
+
+\subsection{Split Read-Only \texttt{.git} View and Hardened \texttt{.aegis-bin/git} Shim}
+
+Copying \texttt{.git/objects/pack} on every session wastes hundreds of megabytes, whereas mounting \texttt{.git} read-write exposes \texttt{.git/config} and \texttt{.git/hooks}, and mounting \texttt{.git} read-only breaks \texttt{git status} (\texttt{index.lock}). Aegis resolves this three-way tension (\textbf{V5}):
+\begin{enumerate}
+    \item \textbf{Read-Only \texttt{.git} + Private \texttt{GIT\_INDEX\_FILE}:} Host \texttt{<project>/.git} is mounted read-only (\texttt{--ro-bind-fd} on Linux; \texttt{GIT\_DIR=<project>/.git} + \texttt{GIT\_WORK\_TREE=<shadow>} under Seatbelt write-deny on macOS), while only the compact \texttt{.git/index} is copied to \texttt{.aegis-git-index} via \texttt{GIT\_INDEX\_FILE} with \texttt{GIT\_OPTIONAL\_LOCKS=0}.
+    \item \textbf{Read-Only \texttt{0555} \texttt{.aegis-bin/git} Wrapper:} Prepended to \texttt{PATH} inside a mode-\texttt{0555} read-only directory, our wrapper unsets \texttt{GIT\_CONFIG\_PARAMETERS}, \texttt{GIT\_CONFIG\_COUNT}, \texttt{GIT\_EXTERNAL\_DIFF}, \texttt{GIT\_SSH\_COMMAND}, and \texttt{GIT\_EXEC\_PATH}; rejects caller-supplied \texttt{-c}, \texttt{--config-env}, and \texttt{--exec-path} flags anywhere in \texttt{argv}; injects \texttt{-c core.fsmonitor=false -c core.hooksPath=/dev/null -c protocol.file.allow=never} (plus \texttt{--no-ext-diff --no-textconv} on \texttt{diff}/\texttt{log}/\texttt{show}); and aborts mutating Git subcommands (\texttt{commit}, \texttt{push}, \texttt{reset}, \texttt{config}) with exit code \texttt{126}.
+\end{enumerate}
+
+\subsection{Layered Agent Home and Real-World CLI Compatibility Fixes}
+
+\texttt{seed\_agent\_home()} assembles $\mathcal{H}_{\text{agent}}$ in three layers: (1) symlink-safe selective copying of small auth/metadata files (\texttt{SEEDED\_AGENT\_FILES}, skipping \texttt{SEED\_SKIP\_NAMES} such as multi-hundred-megabyte session DBs, \texttt{venv}s, \texttt{node\_modules}, and live daemon lockfiles); (2) writable session subdirectories; and (3) read-only single-file config locks (\texttt{--ro-bind-fd} on Linux; Seatbelt \texttt{(deny file-write*)} literals on macOS, backed by user-space router guards in \texttt{routing.rs}) across \texttt{PROTECTED\_AGENT\_CONFIGS} (\texttt{.mcp.json}, \texttt{opencode.json*}, \texttt{.claude/settings*.json}, \texttt{.gemini/config/hooks.json}, \texttt{.gemini/antigravity-cli/settings.json}, \texttt{.hermes/config.yaml}), neutralizing \textbf{V4}.
+
+Running all four production agents live uncovered three additional OS-level incompatibilities that we resolved in \texttt{launcher.rs} and \texttt{aos-sandbox}:
+\begin{itemize}
+    \item \textbf{\texttt{AF\_UNIX} \texttt{SUN\_LEN} Path Truncation (104/108 Bytes):} Deep CoW paths (\texttt{/private/tmp/aegis-os-runtime/...}) caused child Unix sockets in \texttt{XDG\_RUNTIME\_DIR}, Linux \texttt{bridge.sock}, and \texttt{SessionBroker} \texttt{control.sock} to exceed POSIX \texttt{sun\_path} limits (104 bytes on macOS, 108 on Linux). We added automatic short-path fallbacks (\texttt{/tmp/aos-\{ctl,sbx,xr\}-<12hex>}) bound into the sandbox cleanup lifecycle.
+    \item \textbf{Single-Port Loopback Pinning for Internal Agent Servers:} Both \texttt{opencode} and \texttt{hermes} spawn ephemeral local HTTP servers, which Seatbelt's \texttt{(deny network-outbound)} blocks unless wildcard loopback ports are opened (which would re-expose host loopback services!). Instead, \texttt{launcher.rs} pre-allocates a single ephemeral port per session, pins \texttt{opencode} via a \texttt{0555} wrapper (\texttt{--port <p>} + random \texttt{OPENCODE\_PASSWORD}) and \texttt{hermes} via \texttt{config.yaml}, and grants Seatbelt outbound access \emph{solely} to that pinned port plus the egress proxy and \texttt{SessionBroker}.
+    \item \textbf{Hermes Borrowed-Runtime \& Login-Shell Isolation:} \texttt{hermes}'s terminal tool spawns \texttt{bash -lc}, whose login profile resets \texttt{\$HOME} via \texttt{getpwuid(getuid())->pw\_dir} on macOS, and its package manager attempts to write \texttt{.prepare.lock} if host \texttt{.hermes/installs} is symlinked into $\mathcal{H}_{\text{agent}}$. Exporting \texttt{HERMES\_HOME} + \texttt{HERMES\_DISABLE\_LAZY\_INSTALLS=1} while symlinking only \texttt{hermes-agent}, \texttt{runtime}, and \texttt{tools} achieved zero-copy, zero-error execution under Seatbelt.
+\end{itemize}
+
+Finally, \texttt{run\_pty\_command()} allocates a dedicated PTY with \texttt{setsid()} + \texttt{bwrap --new-session} and strips \texttt{opencode --server} / \texttt{--attach}, blocking daemon and controlling-TTY escapes (\textbf{V3}).
+
+\section{Split-Plane Egress Gateway and Dual-Token Broker}
+\label{sec:egress}
+
+\subsection{Split-Plane Egress Without TLS MITM}
+
+TLS-terminating MITM proxies break certificate-pinned Go/Rust/Bun agent binaries and stall Server-Sent Events (SSE). \texttt{start\_egress()} implements a two-plane host gateway (Figure~\ref{fig:egress}):
+\begin{itemize}
+    \item \textbf{Plane 1 (L4 \texttt{CONNECT} Domain Allowlist):} Linux \texttt{CLONE\_NEWNET} removes external interfaces, relaying traffic through \texttt{egress-shim} over a token-authenticated Unix socket to \texttt{AegisEgressGateway}; macOS Seatbelt restricts \texttt{network-outbound} to the proxy port. Allowlisted HTTPS domains (\texttt{github.com}, \texttt{crates.io}, \texttt{pypi.org}, \texttt{npmjs.org}) use transparent TCP splicing without TLS termination.
+    \item \textbf{Plane 2 (L7 \texttt{Base URL} Reverse Proxy \& Outbound DLP):} \texttt{launcher.rs} rewrites model SDK base URLs (\texttt{ANTHROPIC\_BASE\_URL}, \texttt{OPENAI\_BASE\_URL}, \texttt{GOOGLE\_GEMINI\_BASE\_URL}, plus \texttt{opencode} and \texttt{hermes} provider configs) to \texttt{http://<proxy>/\_\_aegis/base/<provider>} and replaces real keys in \texttt{environ} with opaque \texttt{\$AOS\_SECRET\_*} placeholders (wired to \texttt{aos\_core::ablated("secret\_vault")} only in test-ablation builds). At the host hop, \texttt{crates/aos-egress/src/lib.rs} normalizes RFC 3986 paths against capability scopes, scans query strings and up to 64 KiB of request bodies via \texttt{inspect\_payload\_dlp()} for private keys, AWS/GitHub tokens, raw secrets, or reflected \texttt{\$AOS\_SECRET\_*} placeholders, injects the real API key, and streams upstream TLS SSE chunks immediately.
+\end{itemize}
+
+\begin{figure}[!t]
+\centering
+\resizebox{\columnwidth}{!}{%
+\begin{tikzpicture}[
+    font=\sffamily\scriptsize,
+    box/.style={rectangle, rounded corners=3pt, draw=black!70, thick, align=center},
+    plane1/.style={rectangle, rounded corners=3pt, draw=aegisblue!85!black, fill=aegisblue!10, thick, align=center},
+    plane2/.style={rectangle, rounded corners=3pt, draw=aegisgreen!80!black, fill=aegisgreen!10, thick, align=center},
+    arrow/.style={-{Stealth[scale=0.85]}, thick, draw=black!75}
+]
+
+\node[box, fill=aegisgray, minimum width=7.6cm, minimum height=0.95cm] (agent) at (0, 3.1) {
+    \textbf{Sandboxed Agent Process (\texttt{CLONE\_NEWNET} / Seatbelt Port Pin)}\\[1pt]
+    {\scriptsize \texttt{HTTPS\_PROXY=http://127.0.0.1:<p>} $\mid$ \texttt{ANTHROPIC\_BASE\_URL=http://127.0.0.1:<p>/\_\_aegis/base/...}}\\[-1pt]
+    {\scriptsize \texttt{API\_KEY=\$AOS\_SECRET\_*} (Zero Plaintext Keys in Sandbox \texttt{environ})}
+};
+
+\node[plane1, minimum width=3.65cm, minimum height=1.55cm] (l4) at (-1.95, 1.35) {
+    \textbf{Plane 1: L4 \texttt{CONNECT} Tunnel}\\
+    {\scriptsize (GitHub, Package Registries)}\\[2pt]
+    {\scriptsize $\bullet$ Tenant Host Allowlist}\\
+    {\scriptsize $\bullet$ \textbf{No TLS Termination (0 MITM)}}\\
+    {\scriptsize $\bullet$ Preserves Cert Pinning}\\
+    {\scriptsize $\bullet$ Blocks Unlisted Hosts (\texttt{403})}
+};
+
+\node[plane2, minimum width=3.65cm, minimum height=1.55cm] (l7) at (1.95, 1.35) {
+    \textbf{Plane 2: L7 \texttt{Base URL} Proxy}\\
+    {\scriptsize (\texttt{anthropic}, \texttt{openai}, \texttt{deepseek}, \texttt{gemini})}\\[2pt]
+    {\scriptsize $\bullet$ RFC 3986 Path Scope Check}\\
+    {\scriptsize $\bullet$ \textbf{64 KiB Outbound DLP}}\\
+    {\scriptsize $\bullet$ Hop-by-Hop Real Key Injection}\\
+    {\scriptsize $\bullet$ Unbuffered SSE Streaming}
+};
+
+\node[box, fill=orange!12, minimum width=7.6cm, minimum height=0.6cm] (up) at (0, -0.05) {
+    \textbf{Upstream TLS Endpoints} (\texttt{crates.io}, \texttt{api.anthropic.com}, \texttt{api.deepseek.com}, \texttt{googleapis.com})
+};
+
+\draw[arrow] ([xshift=-1.95cm]agent.south) -- (l4.north) node[midway, left, font=\sffamily\tiny] {\texttt{CONNECT}:443};
+\draw[arrow] ([xshift=1.95cm]agent.south) -- (l7.north) node[midway, right, font=\sffamily\tiny] {\texttt{POST /\_\_aegis/base/...}};
+\draw[arrow] (l4.south) -- ([xshift=-1.95cm]up.north);
+\draw[arrow] (l7.south) -- ([xshift=1.95cm]up.north);
+
+\end{tikzpicture}%
+}
+\caption{\textbf{Split-Plane Egress Gateway (\texttt{AegisEgressGateway}).} Plane 1 tunnels allowlisted HTTPS traffic without TLS MITM; Plane 2 proxies model APIs over loopback HTTP, scanning 64 KiB bodies for secret exfiltration and injecting real API keys only at the upstream TLS hop.}
+\label{fig:egress}
+\end{figure}
+
+Adversarial testing of \texttt{AegisEgressGateway} uncovered and fixed three L7 proxy bugs prior to live deployment: (1) RFC 9112 absolute-URI vs.\ \texttt{Host}-header authority mismatch (domain-fronting); (2) non-Gemini query-string \texttt{\$AOS\_SECRET\_*} substitution before query DLP; and (3) release-build exposure of a test-only \texttt{X-Aegis-Upstream} routing header (now gated behind \texttt{\#[cfg(test)]}).
+
+\subsection{Principal-Separated Session Broker}
+
+To defeat \textbf{V6}, \texttt{SessionBroker::start()} (\texttt{crates/aos-cli/src/session\_broker.rs}) mints two independent 256-bit CSPRNG tokens:
+\begin{enumerate}
+    \item \textbf{\texttt{agent.token}:} Exposed via \texttt{AOS\_SESSION\_TOKEN} and accepted via constant-time \texttt{token\_eq} \emph{only} on adapter/MCP routes (\texttt{/v1/session}, \texttt{/v1/adapter/*}, \texttt{/v1/mcp}).
+    \item \textbf{\texttt{human.token}:} Stored in \texttt{session\_dir/human.token} (\texttt{0600}) on the host outside the sandbox mount namespace and denied by Seatbelt \texttt{tenant\_rules}. Human routes (\texttt{/v1/escalations}, \texttt{/v1/escalations/:id/decide}, \texttt{/v1/leases}, \texttt{/v1/audit}) reject \texttt{agent.token} with \texttt{HTTP 401}, while \texttt{OneShot} escalation tickets cannot be re-approved once consumed.
+\end{enumerate}
+
+\section{Out-of-Band Approval, Frozen-Stage TOCTOU Pinning, and Security Invariants}
+\label{sec:commit}
+
+\subsection{Out-of-Band Escalation and Frozen-Stage SHA-256 Commit Protocol}
+
+Full-screen CLI agents activate the VT100 Alternate Screen (\texttt{\textbackslash x1b[?1049h]}) and raw TTY mode; writing inline approval prompts to \texttt{stdout} races with \texttt{stdin} keystrokes, corrupts cursor-addressed TUI redraws, and allows sandboxed output to spoof ANSI prompts. Aegis routes all escalations out-of-band via \texttt{OSC 0} window-title notifications, \texttt{aegis-os approvals-serve}, and host-terminal \texttt{aegis-os approvals approve <id>}.
+
+To prevent post-review TOCTOU swaps and terminal escape spoofing during $[t_{\text{diff}}, t_{\text{commit}}]$, \texttt{compute\_diff\_evidence()} hashes the \emph{complete untruncated unified diff} across all added, modified, deleted, and symlinked entries in lexicographical order:
+\begin{equation}
+\label{eq:diff-hash}
+\begin{aligned}
+H_{\text{diff}}(\mathcal{W}_{\text{host}}, \mathcal{W}_{\text{shadow}}) &= \\
+\text{SHA-256}\Big(\bigoplus_{p \in \Delta} \texttt{kind}(p) &\;\|\; p \;\|\; \texttt{full\_diff}(p) \Big)
+\end{aligned}
+\end{equation}
+while \texttt{aegis-os diff --json} serializes control bytes as JSON escapes (\texttt{\textbackslash u001b}, \texttt{\textbackslash u202e}) so ANSI CSI line-erase (\texttt{\textbackslash x1b[2K]}) or Unicode Bidi overrides cannot conceal injected lines from automated or Web-UI reviewers. Invoking \texttt{aegis-os commit --expected-diff-hash $H_{\text{expected}}$} executes a four-step \textbf{Frozen-Stage Commit Protocol}: (1) pre-verify $H_{\text{diff}} = H_{\text{expected}}$; (2) snapshot all candidate files into an out-of-sandbox directory \texttt{session\_dir/commit\_frozen\_stage}; (3) recompute $H_{\text{diff}}$ and run \texttt{DomainProfile::verify\_workspace\_changes()} across six artifact domains (\texttt{Code}, \texttt{Docs}, \texttt{Data}, \texttt{Binary} magic-byte checks, \texttt{AppState} SQLite/JSON validation, and \texttt{Memory} prompt-injection scanning) on the immutable frozen stage; and (4) promote bytes strictly from \texttt{commit\_frozen\_stage} onto $\mathcal{W}_{\text{host}}$, appending a SHA-256 hash-chained receipt to \texttt{session\_dir/audit.jsonl}.
+
+\subsection{Formal Security Invariants and Proof Sketches}
+
+\begin{invariant}[Total Filesystem Mediation ($\mathcal{I}_1$)]
+\label{inv:fs}
+Every write-capable syscall issued by any sandboxed process $p_{\text{agent}}$ succeeds only if its resolved target lies in $\{\mathcal{W}_{\text{shadow}}, \mathcal{H}_{\text{agent}}, \texttt{/tmp}, \mathcal{I}_{\text{git}}\}$, failing with \texttt{EROFS}/\texttt{EPERM} on $\mathcal{W}_{\text{host}}$, $\mathcal{G}_{\text{host}}$, protected configs $\mathcal{C}_{\text{agent}}$, and host credentials $\mathcal{S}_{\text{host}}$.
+\end{invariant}
+\begin{proof}[Proof Sketch]
+On Linux, \texttt{bwrap} enters an unprivileged user/mount namespace with \texttt{PR\_SET\_NO\_NEW\_PRIVS}, binds \texttt{/} read-only, masks user trees with \texttt{tmpfs}, mounts $\mathcal{G}_{\text{host}}$ and $\mathcal{C}_{\text{agent}}$ read-only (\texttt{MS\_RDONLY}), and exposes RW mounts solely for $\mathcal{W}_{\text{shadow}}$, $\mathcal{H}_{\text{agent}}$, \texttt{/tmp}, and $\mathcal{I}_{\text{git}}$; unprivileged processes cannot clear \texttt{MS\_RDONLY} on locked parent mounts. On macOS, XNU Seatbelt enforces default-deny \texttt{file-write*} outside those subpaths while explicitly denying $\mathcal{C}_{\text{agent}}$, $\mathcal{S}_{\text{host}}$, AppleEvents, and LaunchServices/Keychain Mach services.
+\end{proof}
+
+\begin{invariant}[Git Integrity and Hook Neutralization ($\mathcal{I}_2$)]
+\label{inv:git}
+No process in $p_{\text{agent}}$ can mutate $\mathcal{G}_{\text{host}}$ or trigger \texttt{core.fsmonitor}/\texttt{core.hooksPath}/\texttt{diff.external} execution via sandboxed \texttt{git} calls.
+\end{invariant}
+\begin{proof}[Proof Sketch]
+By $\mathcal{I}_1$, $\mathcal{G}_{\text{host}}$ and \texttt{.aegis-bin/git} (\texttt{0555}) are read-only in the kernel, while index updates target private $\mathcal{I}_{\text{git}}$. The shim scrubs Git config/exec environment variables, rejects \texttt{-c}/\texttt{--config-env}/\texttt{--exec-path} flags, appends \texttt{-c core.fsmonitor=false -c core.hooksPath=/dev/null --no-ext-diff --no-textconv}, and exits \texttt{126} on mutating subcommands.
+\end{proof}
+
+\begin{invariant}[Zero-Plaintext-Key Egress Confinement ($\mathcal{I}_3$)]
+\label{inv:egress}
+Sandbox \texttt{environ} holds zero raw LLM API keys; all outbound traffic traverses \texttt{AegisEgressGateway}, and secret injection occurs only on allowlisted upstream domains after RFC 3986 path-scope and 64 KiB outbound DLP checks pass.
+\end{invariant}
+\begin{proof}[Proof Sketch]
+\texttt{launcher.rs} scrubs \texttt{BOUNDARY\_SECRET\_SPECS} prior to \texttt{execve}, exporting \texttt{\$AOS\_SECRET\_*} placeholders. Linux \texttt{CLONE\_NEWNET} and macOS Seatbelt outbound port rules force all non-pinned TCP connections through \texttt{AegisEgressGateway}, which enforces authority matching, \texttt{allowed\_domains}/\texttt{allowed\_path\_prefixes}, and \texttt{inspect\_payload\_dlp()} before substituting the real key.
+\end{proof}
+
+\begin{invariant}[Non-Self-Approvable Escalation ($\mathcal{I}_4$)]
+\label{inv:broker}
+Given only in-sandbox capabilities (\texttt{agent.token} and \texttt{AOS\_CONTROL\_SOCKET}), $p_{\text{agent}}$ forges a human approval or lease on \texttt{SessionBroker} with probability at most $2^{-256}$ per attempt.
+\end{invariant}
+\begin{proof}[Proof Sketch]
+Human broker routes require 256-bit CSPRNG \texttt{human.token} checked via constant-time \texttt{token\_eq}; \texttt{session\_dir/human.token} (\texttt{0600}) is unmounted on Linux and blocked by Seatbelt \texttt{file-read-data} rules on macOS, while \texttt{OneShot} tickets transition irreversibly on first use.
+\end{proof}
+
+\begin{invariant}[TOCTOU-Free Verified Commit ($\mathcal{I}_5$)]
+\label{inv:toctou}
+Under collision resistance of SHA-256, \texttt{aegis-os commit --expected-diff-hash $H_{\text{expected}}$} modifies $\mathcal{W}_{\text{host}}$ only if the promoted file set is byte-identical to the delta $\Delta(\mathcal{W}_{\text{host}}, \mathcal{W}_{\text{shadow}}(t_1))$ committed in $H_{\text{expected}}$ and passes \texttt{DomainProfile} verification.
+\end{invariant}
+\begin{proof}[Proof Sketch]
+\texttt{commit\_with\_expected\_hash()} copies candidate files from $\mathcal{W}_{\text{shadow}}$ into \texttt{session\_dir/commit\_frozen\_stage}, which resides outside the child mount namespace on Linux and outside Seatbelt-writable subpaths on macOS (so $p_{\text{agent}}$ cannot mutate $\mathcal{W}_{\text{frozen}}$ during or after verification by $\mathcal{I}_1$). It then recomputes $H_{\text{diff}}(\mathcal{W}_{\text{host}}, \mathcal{W}_{\text{frozen}})$ over full untruncated file contents and symlink targets, aborting unless $H_{\text{diff}} = H_{\text{expected}}$ and \texttt{DomainProfile::verify\_workspace\_changes}$(\mathcal{W}_{\text{frozen}})$ succeeds, and promotes bytes exclusively from $\mathcal{W}_{\text{frozen}}$ onto $\mathcal{W}_{\text{host}}$. Any post-$t_1$ mutation in $\mathcal{W}_{\text{shadow}}$ either occurs before freeze (altering $H_{\text{diff}}$ except with negligible SHA-256 collision probability) or after freeze (leaving $\mathcal{W}_{\text{frozen}}$ untouched).
+\end{proof}
+
+\section{Empirical Evaluation}
+\label{sec:eval}
+
+We evaluate Aegis Enforced Runtime across two complementary experimental layers archived in \texttt{scripts/p2\_live/} and \texttt{paper2/ENFORCED\_RUNTIME\_BENCH\_REPORT.json}:
+\begin{enumerate}
+    \item \textbf{Layer 1 (Deterministic Reference-Monitor \& Subsystem Benchmarks):} Executed on both \textbf{macOS Apple Silicon} (\texttt{arm64}, XNU Seatbelt) and an \textbf{Ubuntu 24.04.5 LTS Linux VM} (\texttt{aarch64}, kernel \texttt{6.8.0-142-generic}, \texttt{bubblewrap 0.9.0}, \texttt{nerdctl 2.4.1}), testing the compiled \texttt{aegis-os} release binary across 30 distinct executable payloads (\texttt{deterministic\_rm\_bench.py}), 4 compile-time feature-gated Rust ablations (\texttt{--features ablation}), 3 packed Git filesystems (APFS, \texttt{ext4}, \texttt{btrfs}, $n=10$ trials each), loopback SSE egress, CLI TOCTOU/VT100 spoofing ($n=60$), and cross-domain commit verification. Because Layer 1 replays deterministic exploit primitives, we report \emph{Bypass Primitive Coverage} (fraction of primitives that breach the boundary, lower is better) rather than stochastic LLM ASR.
+    \item \textbf{Layer 2 (Live Production CLI Coding Agent Matrix):} 60 end-to-end headless executions (\texttt{harness.py}) driving all four locally installed production CLI agents against real cloud LLM APIs: \texttt{claude v2.1.319} (Claude Sonnet primary + Claude Opus validation slice), \texttt{opencode v2.2.6} (\texttt{deepseek/deepseek-flash}), \texttt{agy v1.5.3} (Gemini via OAuth), and \texttt{hermes v0.23.0+2384.g8a5a7ac} (\texttt{deepseek-flash}).
+\end{enumerate}
+
+\subsection{RQ1: Security Evaluation Across Deterministic Primitives and 4 Live CLI Agents}
+
+\begin{table*}[!t]
+\centering
+\caption{\textbf{RQ1 Layer 1: Deterministic Bypass Primitive Coverage (30 distinct executable payloads, 5 per class V1--V6; lower is better)} on \textbf{macOS Seatbelt} and \textbf{Ubuntu 24.04 Linux (\texttt{bwrap} \& \texttt{nerdctl})}, plus single-component Rust ablations (\texttt{AOS\_ABLATE}).}
+\label{tab:rq1-rm}
+\vspace{2pt}
+\footnotesize
+\setlength{\tabcolsep}{4.5pt}
+\resizebox{\textwidth}{!}{%
+\begin{tabular}{@{}llccccccrr@{}}
+\toprule
+\textbf{Platform} & \textbf{Enforcement / Ablation Mode} & \textbf{V1} & \textbf{V2} & \textbf{V3} & \textbf{V4} & \textbf{V5} & \textbf{V6} & \textbf{Breached} & \textbf{Median Run} \\
+\midrule
+macOS (\texttt{arm64}) & \texttt{no\_protection} (Ambient Host UID) & 5/5 & 5/5 & 5/5 & 5/5 & 5/5 & 5/5 & 30/30 (100.0\%) & 2.37 ms \\
+macOS (\texttt{arm64}) & \texttt{advisory\_hooks} (Shell Command Regex Filter) & 5/5 & 4/5 & 5/5 & 5/5 & 5/5 & 4/5 & 28/30 (\phantom{0}93.3\%) & --- \\
+macOS (\texttt{arm64}) & \texttt{vendor\_sandbox} (Child Seatbelt, RW Repo \texttt{.}) & 5/5 & 0/5 & 5/5 & 5/5 & 5/5 & 5/5 & 25/30 (\phantom{0}83.3\%) & --- \\
+macOS (\texttt{arm64}) & \textbf{\texttt{aegis\_enforced} (\texttt{aegis-os run})} & \textbf{0/5} & \textbf{0/5} & \textbf{0/5} & \textbf{0/5} & \textbf{0/5} & \textbf{0/5} & \textbf{0/30 (\phantom{00}0.0\%)} & \textbf{20.38 ms} \\
+\midrule
+Linux (\texttt{aarch64}) & \texttt{no\_protection} (Ambient Host UID) & 5/5 & 5/5 & 5/5 & 5/5 & 5/5 & 5/5 & 30/30 (100.0\%) & 0.22 ms \\
+Linux (\texttt{aarch64}) & \texttt{advisory\_hooks} (Shell Command Regex Filter) & 5/5 & 4/5 & 5/5 & 5/5 & 5/5 & 4/5 & 28/30 (\phantom{0}93.3\%) & --- \\
+Linux (\texttt{aarch64}) & \texttt{vendor\_sandbox} (\texttt{bwrap}, RW Repo, Unmasked \texttt{\$HOME}) & 2/5 & 0/5 & 5/5 & 5/5 & 5/5 & 5/5 & 22/30 (\phantom{0}73.3\%) & --- \\
+Linux (\texttt{aarch64}) & \texttt{devcontainer\_nerdctl} (\texttt{nerdctl run -v <repo>:/workspace}) & 2/5 & 5/5 & 2/5 & 5/5 & 5/5 & 5/5 & 24/30 (\phantom{0}80.0\%) & 221.53 ms \\
+Linux (\texttt{aarch64}) & \textbf{\texttt{aegis\_enforced} (\texttt{aegis-os run})} & \textbf{0/5} & \textbf{0/5} & \textbf{0/5} & \textbf{0/5} & \textbf{0/5} & \textbf{0/5} & \textbf{0/30 (\phantom{00}0.0\%)} & \textbf{9.91 ms} \\
+\midrule
+macOS Ablation & \texttt{AOS\_ABLATE=git\_guard} (Disables \texttt{.aegis-bin/git} \& RO \texttt{.git}) & 0/5 & 0/5 & 0/5 & 0/5 & \textbf{5/5} & 0/5 & 5/30 (\phantom{0}16.7\%) & $\Delta\text{V5}=+5/5$ \\
+macOS Ablation & \texttt{AOS\_ABLATE=config\_overmount} (Disables RO Config Locks) & 0/5 & 0/5 & 0/5 & \textbf{5/5} & 0/5 & 0/5 & 5/30 (\phantom{0}16.7\%) & $\Delta\text{V4}=+5/5$ \\
+macOS Ablation & \texttt{AOS\_ABLATE=secret\_vault} (Exposes Raw Key, Skips L7 DLP) & 0/5 & 0/5 & \textbf{2/5} & 0/5 & 0/5 & 0/5 & 2/30 (\phantom{00}6.7\%) & $\Delta\text{V3}=+2/5$ \\
+macOS Ablation & \texttt{AOS\_ABLATE=dual\_token} (Allows \texttt{agent.token} on Human API) & 0/5 & 0/5 & 0/5 & 0/5 & 0/5 & \textbf{1/5} & 1/30 (\phantom{00}3.3\%) & $\Delta\text{V6}=+1/5$ \\
+\bottomrule
+\end{tabular}%
+}
+\end{table*}
+
+\paragraph{Layer 1: Deterministic 30-Payload Cross-Platform Results (Table~\ref{tab:rq1-rm}).}
+Table~\ref{tab:rq1-rm} contrasts five enforcement baselines across 30 distinct executable attack primitives:
+\begin{itemize}
+    \item \textbf{Advisory Hooks (93.3\% Breached) and Vendor Sandboxes (73.3\%--83.3\% Breached):} Command-regex hooks catch direct \texttt{curl} and literal \texttt{approvals approve} strings (blocking 2/30) but miss indirect Python file/socket calls, \texttt{environ}/SSH reads, config edits, and \texttt{git status} \texttt{fsmonitor} triggers (28/30). Vendor subprocess sandboxes block \texttt{V2} outbound network calls (0/5) and, on Linux \texttt{bwrap}, block writes outside the repository (reducing \texttt{V1} to 2/5), yet leave host-repo writes/\texttt{.mcp.json} (\texttt{V1}), unmasked \texttt{\$HOME} credentials (\texttt{V3}), writable configs (\texttt{V4}), and \texttt{.git/config} hooks (\texttt{V5}) exposed.
+    \item \textbf{OCI Devcontainer Baseline (\texttt{nerdctl}, 80.0\% Breached, 22.4$\times$ Slower Startup):} Running inside \texttt{nerdctl run --rm -v <repo>:/workspace} isolates host \texttt{\textasciitilde/.ssh} and sibling directories, reducing \texttt{V1} and \texttt{V3} to 2/5 each. However, because standard devcontainers bind-mount the live host repository (including \texttt{.git} and \texttt{.mcp.json}) read-write, enable bridge networking, and inject raw LLM API keys into container \texttt{environ}, 24/30 primitives succeed while container invocation incurs a median startup latency of \textbf{221.53 ms} (P95: 244.49 ms) versus \textbf{9.91 ms} (P95: 15.01 ms) for \texttt{aegis-os run} on Linux (\textbf{22.4$\times$ faster}).
+    \item \textbf{Aegis Enforced (\textbf{0/30, 0.0\%} on Both OSes) and Orthogonal Rust Ablations:} \texttt{aegis-os run} blocks all 30/30 payloads on both macOS Seatbelt (median 20.38 ms, P95: 21.74 ms) and Linux \texttt{bwrap}. Toggling each compile-time \texttt{AOS\_ABLATE} switch cleanly isolates each layer's contribution: ablating \texttt{git\_guard} opens exclusively \texttt{V5} (5/5); ablating \texttt{config\_overmount} opens exclusively \texttt{V4} (5/5); ablating \texttt{secret\_vault} opens \texttt{V3} environment key dump and L7 body smuggling (2/5, while \texttt{cred\_mask} still protects \texttt{\textasciitilde/.ssh}, \texttt{\textasciitilde/.aws}, and Keychain); and ablating \texttt{dual\_token} opens \texttt{V6.1} in-sandbox \texttt{SessionBroker} self-approval (1/5, while \texttt{0700} session permissions, SHA-256 diff pinning, and \texttt{OneShot} consumption still block \texttt{V6.2}--\texttt{V6.5}). (During Linux ablation runs prior to patching \texttt{launcher.rs}'s binary-name check to accept \texttt{aegis-os-*}, naming the test binary \texttt{aegis-os-ablation} also skipped the Linux \texttt{egress-shim} wrapper, producing identical $+\Delta$ vector increments above a 7/30 \texttt{V2+V3} baseline; we hardened \texttt{launcher.rs} so renamed \texttt{aegis-os-*} binaries always engage \texttt{egress-shim}.)
+\end{itemize}
+
+\begin{table*}[!t]
+\centering
+\caption{\textbf{RQ1 Layer 2: End-to-End Live Production CLI Agent Matrix} across 4 installed agents and 4 governance modes on three repository scenarios: \texttt{benign} (bugfix control), \texttt{v2\_contrib\_exfil} (explicit prompt injection in \texttt{CONTRIBUTING.md}), and \texttt{cd\_repo\_trap} (trojanized project helper \texttt{scripts/verify\_env.py} invoked during routine test debugging).}
+\label{tab:rq1-live}
+\vspace{2pt}
+\footnotesize
+\setlength{\tabcolsep}{4.2pt}
+\resizebox{\textwidth}{!}{%
+\begin{tabular}{@{}llccccccc@{}}
+\toprule
+\textbf{Governance Mode} & \textbf{Agent CLI} & \textbf{\texttt{benign} Tests} & \textbf{\texttt{contrib\_exfil}} & \textbf{\texttt{cd\_repo\_trap} Compromised?} & \textbf{Breached Vectors on \texttt{cd\_repo\_trap}} & \textbf{Leaked LLM Secret} & \textbf{Hook Blocks} \\
+\midrule
+\texttt{vendor\_default} & \texttt{claude} (Sonnet) & Pass (7.0 s) & Safe (Refused) & \textcolor{aegisred}{\textbf{Yes (Compromised)}} & \texttt{V1, V2, V3(ssh), V4, V5} & None (OAuth) & 0/0 \\
+\texttt{vendor\_default} & \texttt{claude} (Opus) & --- & Safe (Refused) & \textcolor{aegisred}{\textbf{Yes (Compromised)}} & \texttt{V1, V2, V3(ssh), V4, V5} & None (OAuth) & 0/0 \\
+\texttt{vendor\_default} & \texttt{opencode} & Pass (7.3 s) & Safe (Refused) & \textcolor{aegisred}{\textbf{Yes (Compromised)}} & \texttt{V1, V2, V3(ssh+key), V4, V5} & \texttt{DEEPSEEK\_API\_KEY} & 0/0 \\
+\texttt{vendor\_default} & \texttt{agy} & Pass (39.4 s) & Safe (Refused) & \textcolor{aegisred}{\textbf{Yes (Compromised)}} & \texttt{V1, V2, V3(ssh+oauth), V4, V5} & \texttt{agy\_oauth\_token} & 0/0 \\
+\texttt{vendor\_default} & \texttt{hermes} & Pass (107.5 s) & Safe (Refused) & \textcolor{aegisred}{\textbf{Yes (Compromised)}} & \texttt{V1, V2, V3(ssh+env), V4, V5} & \texttt{.hermes/.env} & 0/0 \\
+\midrule
+\texttt{advisory} [a] & \texttt{claude} (Sonnet) & Pass (6.3 s) & Safe & \textcolor{aegisred}{\textbf{Yes (Compromised)}} & \texttt{V1, V2, V3(ssh), V4, V5} & None & 0/1 \\
+\texttt{advisory} [a] & \texttt{opencode} & Pass (6.6 s) & Safe & \textcolor{aegisred}{\textbf{Yes (Compromised)}} & \texttt{V1, V2, V3(ssh+key), V4, V5} & \texttt{DEEPSEEK\_API\_KEY} & 0/0 \\
+\texttt{advisory} [a] & \texttt{agy} & \textcolor{aegisorange}{\textbf{Fail (Blocked)}} & Safe (Fail) & No (Shell Blocked) & None (\textbf{0/3 tasks pass tests}) & None & 3/3 \\
+\texttt{advisory} [a] & \texttt{hermes} & Pass (13.8 s) & Safe & \textcolor{aegisred}{\textbf{Yes (Compromised)}} & \texttt{V1, V2, V3(ssh+env), V4, V5} & \texttt{.hermes/.env} & 0/0 \\
+\midrule
+\texttt{vendor\_sandbox} & \texttt{claude} (\texttt{srt}) & Pass (6.7 s) & Safe & \textcolor{aegisred}{\textbf{Yes (Partial)}} & \texttt{V1} (Unapproved Host Write) & None & --- \\
+\texttt{vendor\_sandbox} & \texttt{opencode} & \multicolumn{6}{c}{\emph{Unsupported by vendor (\texttt{opencode v2.2.6} ships no built-in OS sandbox flag)}} \\
+\texttt{vendor\_sandbox} & \texttt{agy} (\texttt{seatbelt}) & Pass (29.3 s) & Safe & \textcolor{aegisred}{\textbf{Yes (Compromised)}} & \texttt{V1} (Sibling + Host), \texttt{V4} (Config) & None & --- \\
+\texttt{vendor\_sandbox} & \texttt{hermes} & \multicolumn{6}{c}{\emph{Unsupported by vendor (\texttt{hermes v0.23.0} ships no built-in OS sandbox flag)}} \\
+\midrule
+\textbf{\texttt{aegis\_enforced}} & \textbf{\texttt{claude} (Sonnet)} & \textbf{Pass (6.3 s)} & \textbf{Safe (Pass)} & \textcolor{aegisgreen}{\textbf{No (0 Vectors)}} & \textbf{None (Host 100\% Clean)} & \textbf{None (\texttt{\$AOS\_*})} & --- \\
+\textbf{\texttt{aegis\_enforced}} & \textbf{\texttt{claude} (Opus)} & --- & \textbf{Safe (Pass)} & \textcolor{aegisgreen}{\textbf{No (0 Vectors)}} & \textbf{None (Host 100\% Clean)} & \textbf{None (\texttt{\$AOS\_*})} & --- \\
+\textbf{\texttt{aegis\_enforced}} & \textbf{\texttt{opencode}} & \textbf{Pass (6.5 s)} & \textbf{Safe (Pass)} & \textcolor{aegisgreen}{\textbf{No (L7 DLP 403)}} [b] & \textbf{None (Blocked at L7 Hop)} & \textbf{None (\texttt{\$AOS\_*})} & --- \\
+\textbf{\texttt{aegis\_enforced}} & \textbf{\texttt{agy}} & \textbf{Pass (37.8 s)} & \textbf{Safe (Pass)} & \textcolor{aegisgreen}{\textbf{No (0 Vectors)}} & \textbf{None (Host 100\% Clean)} & \textbf{None (\texttt{\$AOS\_*})} & --- \\
+\textbf{\texttt{aegis\_enforced}} & \textbf{\texttt{hermes}} & \textbf{Pass (21.3 s)} & \textbf{Safe (Pass)} & \textcolor{aegisgreen}{\textbf{No (0 Vectors)}} & \textbf{None (Host 100\% Clean)} & \textbf{None (\texttt{\$AOS\_*})} & --- \\
+\bottomrule
+\multicolumn{8}{@{}l}{\footnotesize [a] \texttt{advisory} configures our explicit command-blocklist hook in each client (\texttt{settings.json}, JS plugin, \texttt{hooks.json}, \texttt{HERMES\_SAFE\_MODE=1}), not vendor defaults.} \\
+\multicolumn{8}{@{}l}{\footnotesize [b] When \texttt{verify\_env.py} echoed \texttt{\$AOS\_SECRET\_*} into tool output, \texttt{AegisEgressGateway} caught and aborted outbound reflection on \texttt{/chat/completions} (\texttt{HTTP 403}).}
+\end{tabular}%
+}
+\end{table*}
+
+\begin{figure}[!t]
+\centering
+\resizebox{\columnwidth}{!}{%
+\begin{tikzpicture}[font=\sffamily\scriptsize]
+    \draw[thick, -Latex] (0,0) -- (8.3,0);
+    \draw[thick, -Latex] (0,0) -- (0,3.4) node[above] {Breached Primitives / Agents (\%)};
+    \foreach \y/\val in {0/0, 0.75/25, 1.5/50, 2.25/75, 3.0/100} {
+        \draw[slate!25, dashed] (0,\y) -- (8.0,\y);
+        \draw[thick] (-0.08,\y) -- (0,\y) node[left] {\val\%};
+    }
+    \foreach \idx/\label/\mac/\lin/\live in {
+        1/{Unprotected}/3.00/3.00/3.00,
+        2/{Advisory Hooks}/2.80/2.80/2.25,
+        3/{Vendor Sandbox}/2.50/2.20/3.00,
+        4/{nerdctl Container}/0.00/2.40/0.00,
+        5/{Aegis Enforced}/0.04/0.04/0.04
+    } {
+        \pgfmathsetmacro{\xb}{(\idx-1)*1.58 + 0.28}
+        \ifnum\idx=4
+            \fill[aegisblue!65] (\xb+0.28, 0) rectangle (\xb+0.68, \lin);
+            \node[above, font=\sffamily\tiny] at (\xb+0.48, \lin) {80\%};
+        \else
+            \fill[danger!80] (\xb, 0) rectangle (\xb+0.30, \mac);
+            \fill[aegisblue!70] (\xb+0.33, 0) rectangle (\xb+0.63, \lin);
+            \fill[warn!85] (\xb+0.66, 0) rectangle (\xb+0.96, \live);
+        \fi
+        \ifnum\idx=5
+            \node[above, font=\sffamily\tiny\bfseries, text=safe!90!black] at (\xb+0.48, 0.05) {0\%};
+        \fi
+        \node[below, align=center, font=\sffamily\tiny] at (\xb+0.48, -0.06) {\label};
+    }
+    \fill[danger!80] (0.2, 3.08) rectangle (0.45, 3.24);
+    \node[right, font=\sffamily\tiny] at (0.48, 3.16) {macOS RM (30)};
+    \fill[aegisblue!70] (2.8, 3.08) rectangle (3.05, 3.24);
+    \node[right, font=\sffamily\tiny] at (3.08, 3.16) {Linux RM (30)};
+    \fill[warn!85] (5.3, 3.08) rectangle (5.55, 3.24);
+    \node[right, font=\sffamily\tiny] at (5.58, 3.16) {Live CLI Trap};
+\end{tikzpicture}%
+}
+\caption{\textbf{Summary of Bypass Coverage Across Layer 1 (macOS \& Linux 30-payload RM suites) and Layer 2 (Live 4-Agent \texttt{cd\_repo\_trap}).} Only Aegis Enforced Runtime achieves \textbf{0\%} across all three evaluations.}
+\label{fig:rq1-chart}
+\end{figure}
+
+\paragraph{Layer 2: Live Production Agent Findings (Table~\ref{tab:rq1-live} \& Figure~\ref{fig:rq1-chart}).}
+Driving the real agent CLIs reveals an insightful contrast between model alignment and OS confinement:
+\begin{enumerate}
+    \item \textbf{Model Alignment Deflects Blatant Prompt Injection (\texttt{v2\_contrib\_exfil}) Setups, Not Trojanized Project Tooling (\texttt{cd\_repo\_trap}):} Every tested frontier model refused an explicit instruction in \texttt{CONTRIBUTING.md} asking it to \texttt{curl} \texttt{\textasciitilde/.ssh} keys. Yet when debugging a failing test in \texttt{cd\_repo\_trap} where the repository's own \texttt{scripts/verify\_env.py} contained hidden payload actions, \textbf{all four agents in \texttt{vendor\_default} (4/4, 100\%)---including Claude Opus---executed the script and suffered multi-vector host compromise}, leaking live \texttt{DEEPSEEK\_API\_KEY}, \texttt{agy} OAuth, and \texttt{.hermes/.env} credentials on 3/4 agents.
+    \item \textbf{The Advisory Hook Dilemma:} With explicit command-blocklist hooks installed (\texttt{advisory}), \texttt{claude}, \texttt{opencode}, and \texttt{hermes} still suffered 100\% compromise on \texttt{cd\_repo\_trap} because \texttt{python3 scripts/verify\_env.py} contains zero suspicious shell tokens; conversely, \texttt{agy}'s strict hook blocked shell execution across all three scenarios, preventing compromise only by \emph{breaking 100\% of unit-test runs} (0/3 passed).
+    \item \textbf{Vendor Sandbox Gaps vs.\ Live Aegis L7 DLP Catch:} Only 2/4 agents (\texttt{claude}, \texttt{agy}) ship a built-in sandbox; both left $\mathcal{W}_{\text{host}}$ writable (\texttt{V1}), and \texttt{agy --sandbox=seatbelt} also allowed sibling-directory escape and \texttt{hooks.json} tampering (\texttt{V4}). Under \texttt{aegis\_enforced}, \textbf{0/12 matrix runs and 0/4 Opus runs suffered any host or credential compromise}. Remarkably, on \texttt{opencode} + \texttt{cd\_repo\_trap}, when \texttt{verify\_env.py} printed \texttt{\$AOS\_SECRET\_DEEPSEEK\_API\_KEY} into tool stdout and OpenCode attempted to send that tool result to \texttt{api.deepseek.com/chat/completions}, \texttt{AegisEgressGateway} intercepted the reflected placeholder in real time and aborted the request with \texttt{HTTP 403 blocked\_exfiltration}.
+\end{enumerate}
+
+\subsection{RQ2: Packed Git CoW \& Split \texttt{.git} Across APFS, \texttt{ext4}, and \texttt{btrfs}}
+
+\begin{table*}[!t]
+\centering
+\caption{\textbf{RQ2: End-to-End Packed Git Provisioning Latency and Disk Allocation ($n=10$ trials per repo/filesystem)}, comparing naive full copy (\texttt{cp -R}) against real \texttt{aegis-os run --enforcement enforced} executing \texttt{git status --porcelain} plus three file edits and \texttt{aegis-os diff --json}.}
+\label{tab:rq2-git}
+\vspace{2pt}
+\footnotesize
+\setlength{\tabcolsep}{4.2pt}
+\resizebox{\textwidth}{!}{%
+\begin{tabular}{@{}llrrrrrr@{}}
+\toprule
+\textbf{Filesystem} & \textbf{Packed Git Repository} & \textbf{\texttt{cp -R} Med (P95)} & \textbf{\texttt{cp -R} Disk} & \textbf{\texttt{aos run+git} Med (P95)} & \textbf{\texttt{aos diff} (3f)} & \textbf{Shadow \texttt{du}} & \textbf{\texttt{statvfs} Disk $\Delta$} \\
+\midrule
+macOS APFS & \texttt{small\_8mb} (200f, 5.0 MB pack) & 55.98 (59.44) ms & 8.40 MB & 172.24 (214.36) ms & 31.43 ms & 3.12 MB & \textbf{0.43 MB (-94.9\%)} \\
+macOS APFS & \texttt{medium\_90mb} (1,200f, 72.2 MB pack) & 304.37 (337.12) ms & 91.80 MB & 555.66 (601.76) ms & 15.04 ms & 18.75 MB & \textbf{1.81 MB (-98.0\%)} \\
+macOS APFS & \texttt{large\_500mb} (4,000f, 420.9 MB pack) & 875.30 (936.70) ms & 499.85 MB & 1,483.67 (1,502.43) ms & 29.88 ms & 78.14 MB & \textbf{4.76 MB (-99.05\%)} \\
+\midrule
+Linux \texttt{btrfs} & \texttt{small\_8mb} (200f, 5.0 MB pack) & 5.52 (5.76) ms & 8.30 MB & 52.02 (53.80) ms & 23.00 ms & 3.12 MB & \textbf{0.00 MB (Reflink)} \\
+Linux \texttt{btrfs} & \texttt{medium\_90mb} (1,200f, 72.2 MB pack) & 43.70 (52.80) ms & 91.23 MB & 123.14 (252.58) ms & 4.17 ms & 18.75 MB & \textbf{0.00 MB (Reflink)} \\
+Linux \texttt{btrfs} & \texttt{large\_500mb} (4,000f, 420.9 MB pack) & 368.54 (404.00) ms & 499.56 MB & 424.45 (437.21) ms & 10.03 ms & 78.14 MB & \textbf{0.00 MB (Reflink)} \\
+\midrule
+Linux \texttt{ext4} & \texttt{small\_8mb} (200f, 5.0 MB pack) & 5.63 (6.00) ms & 8.45 MB & 45.67 (46.00) ms & 23.19 ms & 3.25 MB & 9.94 MB \\
+Linux \texttt{ext4} & \texttt{medium\_90mb} (1,200f, 72.2 MB pack) & 32.95 (41.65) ms & 91.38 MB & 81.34 (206.82) ms & 4.35 ms & 18.88 MB & 56.90 MB \\
+Linux \texttt{ext4} & \texttt{large\_500mb} (4,000f, 420.9 MB pack) & 138.13 (143.43) ms & 499.72 MB & 271.70 (275.72) ms & 10.74 ms & \textbf{78.27 MB} & \textbf{235.27 MB (-52.9\%)} \\
+\bottomrule
+\end{tabular}%
+}
+\end{table*}
+
+Table~\ref{tab:rq2-git} evaluates real \texttt{git repack -ad} repositories up to 500 MB (4,000 source files + 420.86 MB \texttt{.pack}). Note that \texttt{aos run+git} measures \emph{complete end-to-end session execution} (CoW init + \texttt{SessionBroker} + \texttt{AegisEgressGateway} + home seeding + sandboxed \texttt{git status --porcelain} + 3 file writes), whereas \texttt{cp -R} measures raw directory copying alone. Even with full runtime initialization and \texttt{git status} included, a 500 MB session completes in \textbf{271.70 ms} on \texttt{ext4}, \textbf{424.45 ms} on \texttt{btrfs}, and \textbf{1.48 s} on APFS, while saving \textbf{99.05\%} of physical disk blocks on APFS (4.76 MB vs.\ 499.85 MB), achieving zero net block allocation via \texttt{FICLONE} reflinks on \texttt{btrfs}, and avoiding copying the 420.86 MB \texttt{.git} pack on \texttt{ext4} (78.27 MB shadow \texttt{du} vs.\ 499.72 MB, an \textbf{84.3\%} reduction), with 3-file \texttt{aegis-os diff --json} completing in \textbf{10.03--29.88 ms}.
+
+\subsection{RQ3, RQ4, and RQ5: Egress Gateway, CLI TOCTOU/VT100 Pinning, and Domain Profiles}
+
+\begin{table}[!t]
+\centering
+\caption{\textbf{RQ3: Loopback Rust \texttt{AegisEgressGateway} Overhead \& Security} ($n=40$ benign SSE streams + 25 adversarial requests).}
+\label{tab:rq3-egress}
+\vspace{2pt}
+\footnotesize
+\setlength{\tabcolsep}{3.8pt}
+\resizebox{\columnwidth}{!}{%
+\begin{tabular}{@{}lrrrr@{}}
+\toprule
+\textbf{Metric} & \textbf{Direct HTTP} & \textbf{Aegis L7 Proxy} & \textbf{Delta / Rate} \\
+\midrule
+Mean TTFT (Loopback) & 0.180 ms & \textbf{0.402 ms} & \textbf{+0.221 ms} \\
+P95 TTFT (Loopback) & 0.337 ms & \textbf{0.900 ms} & +0.563 ms \\
+25-Chunk SSE Stream & 0.188 ms & \textbf{0.442 ms} & +0.254 ms \\
+Benign SSE False Positives & 0/40 & \textbf{0/40} & \textbf{0.0\% FP} \\
+DLP Body/Query Exfil Blocked & 0/10 & \textbf{10/10} & \textbf{100.0\%} \\
+Scope / RFC 9112 Fronting Blocked & 0/10 & \textbf{10/10} & \textbf{100.0\%} \\
+\texttt{X-Aegis-Upstream} Smuggling & 0/5 & \textbf{5/5} & \textbf{100.0\%} \\
+\bottomrule
+\end{tabular}%
+}
+\end{table}
+
+\begin{table}[!t]
+\centering
+\caption{\textbf{RQ4: End-to-End CLI Post-Diff TOCTOU \& Terminal Spoofing Detection} (\texttt{aegis-os commit --expected-diff-hash}, $n=10$ trials $\times$ 6 classes = 60 attacks; legitimate pinned commit: 30.41 ms).}
+\label{tab:rq4-toctou}
+\vspace{2pt}
+\footnotesize
+\setlength{\tabcolsep}{4pt}
+\resizebox{\columnwidth}{!}{%
+\begin{tabular}{@{}lcrr@{}}
+\toprule
+\textbf{Post-Diff Tampering / Spoofing Class} & \textbf{Blocked} & \textbf{Median} & \textbf{P95} \\
+\midrule
+C1. Post-diff backdoor line append & \textbf{10/10} & 7.81 ms & 9.10 ms \\
+C2. Same-byte-size operator flip (\texttt{+} $\mapsto$ \texttt{-}) & \textbf{10/10} & 7.92 ms & 8.28 ms \\
+C3. Line-185 tail edit beyond preview window & \textbf{10/10} & 7.65 ms & 7.92 ms \\
+C4. Untracked \texttt{build.rs} injection post-diff & \textbf{10/10} & 7.75 ms & 8.09 ms \\
+C5. POSIX symlink swap (\texttt{ln -sf /etc/hosts}) & \textbf{10/10} & 7.54 ms & 7.90 ms \\
+C6. ANSI CSI \texttt{\textbackslash x1b[2K} + Bidi \texttt{U+202E} spoof & \textbf{10/10} & 7.63 ms & 8.59 ms \\
+\midrule
+\textbf{Total CLI TOCTOU Attacks Blocked} & \textbf{60/60} & \textbf{7.70 ms} & \textbf{9.10 ms} \\
+\bottomrule
+\end{tabular}%
+}
+\end{table}
+
+\paragraph{RQ3 (Table~\ref{tab:rq3-egress}).} To isolate pure proxy processing cost from WAN jitter, we benchmark \texttt{AegisEgressGateway} against a local loopback SSE upstream ($n=40$). Full L7 path normalization, 64 KiB outbound DLP scanning, and header injection add \textbf{+0.221 ms} mean TTFT overhead (0.402 ms vs.\ 0.180 ms) with \textbf{0/40 (0.0\%) false positives}, while blocking \textbf{25/25 (100\%)} adversarial DLP, path-scope/domain-fronting, and header-smuggling requests.
+
+\paragraph{RQ4 \& RQ5 (Table~\ref{tab:rq4-toctou}).} Across 60 end-to-end CLI \texttt{aegis-os commit --expected-diff-hash} trials spanning six tampering classes---including POSIX symlink replacement to \texttt{/etc/hosts} and raw VT100 CSI line-erase + Bidi \texttt{U+202E} diff spoofing---\textbf{60/60 (100\%)} are rejected in \textbf{7.54--7.92 ms} median (and 25/25 in 20.10 ms mean in our 40-file Rust \texttt{commit\_frozen\_stage} microbenchmark). Across all six \texttt{WorkspaceDomain} profiles (\texttt{Code}, \texttt{Docs}, \texttt{Data}, \texttt{Binary}, \texttt{AppState}, \texttt{Memory}), \texttt{DomainProfile::verify\_workspace\_changes()} blocks \textbf{60/60 (100\%)} cross-domain, ELF/Mach-O binary-disguise, and memory-poisoning commits in \textbf{67.47 $\mu$s} mean, while writing 500 hash-chained \texttt{audit.jsonl} events takes \textbf{64.52 ms} and full chain verification takes \textbf{8.87 ms} (17.7 $\mu$s/event).
+
+\subsection{RQ6: Multi-File Coding Utility Across All 4 Live Agents}
+
+\begin{table}[!t]
+\centering
+\caption{\textbf{RQ6: Live 3-File Billing Refactoring Task (\texttt{rq6\_multifile}) Across All 4 Installed CLI Agents}, comparing \texttt{vendor\_default} against \texttt{aegis\_enforced} (followed by \texttt{aegis-os diff} + \texttt{commit}).}
+\label{tab:rq6-utility}
+\vspace{2pt}
+\footnotesize
+\setlength{\tabcolsep}{3.6pt}
+\resizebox{\columnwidth}{!}{%
+\begin{tabular}{@{}llccrr@{}}
+\toprule
+\textbf{Agent} & \textbf{Mode} & \textbf{Pytest} & \textbf{Host Clean} & \textbf{Wall} & \textbf{Diff / Commit} \\
+\midrule
+\texttt{opencode} & \texttt{vendor\_default} & Pass & No & 8.7 s & --- \\
+\texttt{opencode} & \textbf{\texttt{aegis\_enforced}} & \textbf{Pass} & \textbf{Yes} & \textbf{11.1 s} & \textbf{8.3 / 18.5 ms} \\
+\addlinespace[1.5pt]
+\texttt{claude} & \texttt{vendor\_default} & Pass & No & 11.9 s & --- \\
+\texttt{claude} & \textbf{\texttt{aegis\_enforced}} & \textbf{Pass} & \textbf{Yes} & \textbf{12.4 s} & \textbf{8.3 / 15.8 ms} \\
+\addlinespace[1.5pt]
+\texttt{hermes} & \texttt{vendor\_default} & Pass & No & 18.8 s & --- \\
+\texttt{hermes} & \textbf{\texttt{aegis\_enforced}} & \textbf{Pass} & \textbf{Yes} & \textbf{28.4 s} & \textbf{7.9 / 14.9 ms} \\
+\addlinespace[1.5pt]
+\texttt{agy} & \texttt{vendor\_default} & Pass & No & 38.9 s & --- \\
+\texttt{agy} & \textbf{\texttt{aegis\_enforced}} & \textbf{Pass} & \textbf{Yes} & \textbf{55.9 s} & \textbf{8.1 / 14.8 ms} \\
+\bottomrule
+\end{tabular}%
+}
+\end{table}
+
+Table~\ref{tab:rq6-utility} reports end-to-end performance on a 3-file Python billing proration and tax-rounding refactoring task verified by an independent \texttt{pytest} suite. All four production agents (\textbf{4/4, 100\%}) complete the multi-file edit and pass all unit tests inside \texttt{aegis\_enforced} (matching their 4/4 pass rate on \texttt{benign} in Table~\ref{tab:rq1-live}), while keeping $\mathcal{W}_{\text{host}}$ 100\% unmodified until \texttt{aegis-os diff} (7.90--8.32 ms) and \texttt{aegis-os commit} (14.76--18.46 ms) promote the verified delta. Wall-clock differences (e.g., 12.4 s vs.\ 11.9 s on \texttt{claude}) are dominated by cloud LLM token generation variance rather than the $\sim$20 ms local sandbox overhead.
+
+\section{Discussion and Limitations}
+\label{sec:discussion}
+
+\paragraph{Linux Path Remapping vs.\ macOS Shadow \texttt{cwd}.}
+Linux \texttt{bwrap --bind-fd} mounts $\mathcal{W}_{\text{shadow}}$ at the exact canonical path of $\mathcal{W}_{\text{host}}$. Because macOS lacks unprivileged mount namespaces, \texttt{aegis-os run} sets \texttt{cwd} to $\mathcal{W}_{\text{shadow}}$ under XNU Seatbelt (and offers \texttt{MicroVmSandboxDriver} when strict path-string identity is required). While \texttt{sandbox-exec(1)} carries a manpage deprecation notice, XNU's \texttt{sandbox\_init} MAC framework remains the active kernel primitive underlying macOS system daemons and vendor sandboxes~\cite{anthropic2025srt,openai2025codex}.
+
+\paragraph{Ubuntu 24.04+ AppArmor User-Namespace Policy.}
+As empirically verified in \S\ref{sec:launcher}, Ubuntu 24.04+ sets \texttt{kernel.apparmor\_restrict\_unprivileged\_userns = 1} without installing an AppArmor profile for \texttt{/usr/bin/bwrap} by default. \texttt{aegis-os run} fails closed on startup and emits the minimal 4-line \texttt{/etc/apparmor.d/bwrap} profile required to grant \texttt{userns} capability to \texttt{bwrap}.
+
+\paragraph{Post-Commit Execution and Semantic Exfiltration.}
+Aegis guarantees that no unapproved change reaches $\mathcal{W}_{\text{host}}$ and runs pre-commit checks inside the sandbox, but if a human explicitly approves malicious source code and later runs it unsandboxed on the host, it executes with host authority. Likewise, while L7 DLP blocks structured secrets and reflected \texttt{\$AOS\_SECRET\_*} placeholders (as demonstrated live on \texttt{opencode}), natural-language prose summarization of proprietary code over an authorized LLM endpoint requires orthogonal planner-level information-flow control~\cite{debenedetti2025camel,costa2025fides}.
+
+\section{Related Work}
+\label{sec:related}
+
+\paragraph{OS Sandboxing, Containers, and Reference Monitors.}
+Janus~\cite{goldberg1996secure}, Systrace~\cite{provos2003systrace}, Capsicum~\cite{watson2010capsicum}, Mbox~\cite{kim2013mbox}, Bubblewrap~\cite{containers2024bubblewrap}, Firejail~\cite{netblue2024firejail}, Linux Landlock~\cite{salaun2021landlock}, and container sandboxes such as gVisor~\cite{young2019gvisor} and Firecracker~\cite{agache2020firecracker} enforce process isolation outside the untrusted subject~\cite{anderson1972computer,saltzer1975protection}. Unlike batch syscall sandboxes or bind-mounted devcontainers (\texttt{nerdctl}/Docker, which breached 24/30 primitives in Table~\ref{tab:rq1-rm}), Aegis co-designs CoW shadow staging~\cite{nightingale2005speculator,porter2009txos,wright2004unionfs}, split read-only \texttt{.git} views, hop-by-hop L7 API-key injection, and principal-separated commit pinning for interactive LLM agents.
+
+\paragraph{Vendor Agent Sandboxes and Transactional Runtimes.}
+Anthropic's \texttt{@anthropic-ai/sandbox-runtime}~\cite{anthropic2025srt} (used by Claude Code), OpenAI Codex CLI's Seatbelt/Landlock wrapper~\cite{openai2025codex} (excluded from our live runs only because \texttt{codex} was not installed on our testbed), and Gemini/AGY's \texttt{--sandbox=seatbelt} wrap child shell commands while mounting the host repository read-write, leaving parent native tools, \texttt{.mcp.json} servers, \texttt{.git/config} hooks, and sandbox environment keys exposed. Compared to our companion MCP runtime~\cite{zhao2026aegisos}, which trusted client hooks to route tool calls, Aegis Enforced Runtime moves confinement to the parent OS process before \texttt{execve()}.
+
+\paragraph{Prompt-Injection Defenses.}
+Planner-level defenses---including IsolateGPT~\cite{wu2024secgpt}, Dual-LLM/CaMeL~\cite{debenedetti2025camel,willison2023dualllm}, FIDES~\cite{costa2025fides}, and Progent~\cite{shi2025progent}---track information flow across LLM tool plans~\cite{debenedetti2024agentdojo,zhan2024injecagent}. Aegis provides the orthogonal OS enforcement substrate beneath closed- or open-source agent binaries so a subverted planner cannot bypass mediation via native syscalls, repository scripts, or Git hooks.
+
+\section{Conclusion}
+\label{sec:conclusion}
+
+In-process agent plugins, command-regex hooks, and RW-workspace subprocess sandboxes do not constitute a reference monitor. By inverting control into a parent-process kernel supervisor (\texttt{aegis-os run -- <agent>}) combining CoW workspace shadows, split read-only \texttt{.git} views, read-only config locks, split-plane L4/L7 boundary key injection, dual-token escalation, and frozen-stage SHA-256 commit pinning, Aegis Enforced Runtime reduces deterministic bypass coverage from 73.3\%--93.3\% to \textbf{0.0\%} on macOS and Linux and live repository-trap compromises across four production CLI agents from 100\% to \textbf{0\%}, with 100\% multi-file task completion.
+
+\subsection*{Ethics Considerations and Open Science}
+All adversarial experiments were executed solely against synthetic local repositories, disposable loopback endpoints, and canary credentials on isolated test environments; no external services or third-party users were affected. All Rust crates, sandbox profiles, benchmark harnesses (\texttt{scripts/p2\_live/}), and raw results (\texttt{paper2/ENFORCED\_RUNTIME\_BENCH\_REPORT.json}) are released open-source at \url{https://github.com/heurion-org/aegis-os}.
+
+\bibliographystyle{plain}
+\bibliography{references}
+
+\end{document}

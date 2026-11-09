@@ -1,0 +1,33 @@
+{
+  "rust_domains_rq5": {
+    "audit_chain_500_events_build_ms": 64.52,
+    "audit_chain_500_events_verify_ms": 8.87,
+    "audit_chain_intact_valid": true,
+    "domain_adversarial_commits_blocked": 60,
+    "domain_adversarial_commits_tested": 60,
+    "domain_verify_mean_us": 67.47
+  },
+  "rust_egress_rq3": {
+    "benign_sse_false_positives": "0/40",
+    "direct_stream_25chunks_ms": 0.188,
+    "direct_ttft_ms_mean": 0.18,
+    "direct_ttft_ms_p95": 0.337,
+    "dlp_exfil_blocked": "20/20",
+    "dlp_payloads_blocked": "10/10",
+    "header_smuggling_blocked": "5/5",
+    "l7_base_url_stream_25chunks_ms": 0.442,
+    "l7_base_url_ttft_ms_mean": 0.402,
+    "l7_base_url_ttft_ms_p95": 0.9,
+    "l7_overhead_ms": 0.221,
+    "sandbox_env_raw_secret_exposure_pct": 0.0,
+    "scope_and_traversal_blocked": "10/10",
+    "total_adversarial_egress_blocked": "25/25"
+  },
+  "rust_toctou_rq4": {
+    "toctou_block_rate_pct": 100.0,
+    "toctou_blocked": 25,
+    "toctou_reverify_mean_us": 20102.15,
+    "toctou_reverify_p95_us": 22396.17,
+    "toctou_trials": 25
+  }
+}

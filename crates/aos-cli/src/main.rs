@@ -237,6 +237,9 @@ enum Commands {
         /// Print unified-diff previews instead of only the changed path list
         #[arg(long, default_value_t = false)]
         render: bool,
+        /// Output machine-readable JSON with cryptographic diff evidence (`diff_hash`)
+        #[arg(long, default_value_t = false)]
+        json: bool,
     },
 
     /// Run the domain verification gate for the latest (or named) session
@@ -276,6 +279,9 @@ enum Commands {
         /// Skip the interactive confirmation (still requires --allow-sensitive for sensitive paths)
         #[arg(long, default_value_t = false)]
         yes: bool,
+        /// Cryptographic TOCTOU guard: abort if the current shadow diff SHA-256 does not match this expected hash
+        #[arg(long, alias = "diff-hash")]
+        expected_diff_hash: Option<String>,
     },
 
     /// Discard the latest (or named) session shadow
@@ -2316,8 +2322,12 @@ async fn main() -> anyhow::Result<()> {
             launcher::last(&runtime_dir)?;
         }
 
-        Commands::Diff { session, render } => {
-            launcher::diff(&runtime_dir, session.as_deref(), render).await?;
+        Commands::Diff {
+            session,
+            render,
+            json,
+        } => {
+            launcher::diff(&runtime_dir, session.as_deref(), render, json).await?;
         }
 
         Commands::Verify { session, cmd } => {
@@ -2335,9 +2345,23 @@ async fn main() -> anyhow::Result<()> {
             }
         },
 
-        Commands::Commit { session, paths, allow_sensitive, yes } => {
+        Commands::Commit {
+            session,
+            paths,
+            allow_sensitive,
+            yes,
+            expected_diff_hash,
+        } => {
             let filter = if paths.is_empty() { None } else { Some(paths) };
-            launcher::commit(&runtime_dir, session.as_deref(), filter, allow_sensitive, yes).await?;
+            launcher::commit_with_expected_hash(
+                &runtime_dir,
+                session.as_deref(),
+                filter,
+                allow_sensitive,
+                yes,
+                expected_diff_hash.as_deref(),
+            )
+            .await?;
         }
 
         Commands::Discard { session } => {

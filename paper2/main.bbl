@@ -1,0 +1,202 @@
+\begin{thebibliography}{10}
+
+\bibitem{agache2020firecracker}
+Alexandru Agache, Marc Brooker, Andreea Florescu, Alexandra Iordache, Anthony
+  Liguori, Rolf Neugebauer, Phil Piwonka, and Diana-Maria Popa.
+\newblock {Firecracker}: Lightweight virtualization for serverless
+  applications.
+\newblock In {\em 17th USENIX Symposium on Networked Systems Design and
+  Implementation (NSDI 20)}, pages 419--434, Santa Clara, CA, USA, 2020. USENIX
+  Association.
+
+\bibitem{anderson1972computer}
+James~P. Anderson.
+\newblock Computer security technology planning study.
+\newblock Technical Report ESD-TR-73-51, Vol. II, Electronic Systems Division,
+  Air Force Systems Command, Hanscom Field, Bedford, MA, USA, 1972.
+
+\bibitem{anthropic2024mcp}
+{Anthropic}.
+\newblock {Model Context Protocol} ({MCP}): An open protocol for connecting
+  {AI} applications to external systems.
+\newblock \url{https://modelcontextprotocol.io}, 2024.
+
+\bibitem{anthropic2025srt}
+{Anthropic}.
+\newblock {Anthropic Sandbox Runtime}
+  ({\texttt{@anthropic-ai/sandbox-runtime}}): Lightweight {OS}-level filesystem
+  and network sandboxing for {CLI} agents.
+\newblock \url{https://github.com/anthropics/sandbox-runtime}, 2025.
+
+\bibitem{costa2025fides}
+Manuel Costa, Boris K{\"o}pf, Aashish Kolluri, Andrew Paverd, Mark Russinovich,
+  Ahmed Salem, Shruti Tople, Lukas Wutschitz, and Santiago
+  Zanella-B{\'e}guelin.
+\newblock Securing {AI} agents with information-flow control.
+\newblock {\em arXiv preprint}, arXiv:2505.23643, 2025.
+
+\bibitem{debenedetti2025camel}
+Edoardo Debenedetti, Ilia Shumailov, Tianqi Fan, Jamie Hayes, Nicholas Carlini,
+  Daniel Fabian, Christoph Kern, Chongyang Shi, Andreas Terzis, and Florian
+  Tram{\`e}r.
+\newblock Defeating prompt injections by design.
+\newblock {\em arXiv preprint}, arXiv:2503.18813, 2025.
+
+\bibitem{debenedetti2024agentdojo}
+Edoardo Debenedetti, Jie Zhang, Mislav Balunovi{\'c}, Luca Beurer-Kellner, Marc
+  Fischer, and Florian Tram{\`e}r.
+\newblock {AgentDojo}: A dynamic environment to evaluate prompt injection
+  attacks and defenses for {LLM} agents.
+\newblock In {\em Advances in Neural Information Processing Systems (NeurIPS)
+  Datasets and Benchmarks Track}, volume~37, pages 92895--92935, Vancouver, BC,
+  Canada, 2024. Curran Associates, Inc.
+
+\bibitem{goldberg1996secure}
+Ian Goldberg, David Wagner, Randi Thomas, and Eric~A. Brewer.
+\newblock A secure environment for untrusted helper applications: Confining the
+  wily hacker.
+\newblock In {\em 6th USENIX Security Symposium (USENIX Security 96)}, pages
+  1--13, San Jose, CA, USA, 1996. USENIX Association.
+
+\bibitem{greshake2023not}
+Kai Greshake, Sahar Abdelnabi, Shailesh Mishra, Christoph Endres, Thorsten
+  Holz, and Mario Fritz.
+\newblock Not what you've signed up for: Compromising real-world
+  {LLM}-integrated applications with indirect prompt injection.
+\newblock In {\em Proceedings of the 16th ACM Workshop on Artificial
+  Intelligence and Security (AISec)}, pages 79--90, Copenhagen, Denmark, 2023.
+  ACM.
+
+\bibitem{jimenez2024swebench}
+Carlos~E. Jimenez, John Yang, Alexander Wettig, Shunyu Yao, Kexin Pei, Ofir
+  Press, and Karthik~R. Narasimhan.
+\newblock {SWE-bench}: Can language models resolve real-world {GitHub} issues?
+\newblock In {\em Twelfth International Conference on Learning Representations
+  (ICLR)}, Vienna, Austria, 2024. OpenReview.net.
+
+\bibitem{kim2013mbox}
+Taesoo Kim and Nickolai Zeldovich.
+\newblock Practical and effective sandboxing for non-root users.
+\newblock In {\em 2013 USENIX Annual Technical Conference (USENIX ATC 13)},
+  pages 139--144, San Jose, CA, USA, 2013. USENIX Association.
+
+\bibitem{netblue2024firejail}
+{Netblue30 and Firejail Contributors}.
+\newblock {Firejail}: {Linux} namespaces and {Seccomp-BPF} application sandbox.
+\newblock \url{https://github.com/netblue30/firejail}, 2024.
+
+\bibitem{nightingale2005speculator}
+Edmund~B. Nightingale, Peter~M. Chen, and Jason Flinn.
+\newblock Speculative execution in a distributed file system.
+\newblock In {\em Proceedings of the ACM SIGOPS 20th Symposium on Operating
+  Systems Principles (SOSP)}, pages 191--205, Brighton, United Kingdom, 2005.
+  ACM.
+
+\bibitem{openai2025codex}
+{OpenAI}.
+\newblock {OpenAI Codex CLI}: Terminal coding agent with {macOS} {Seatbelt} and
+  {Linux} {Landlock} subprocess sandboxing.
+\newblock \url{https://github.com/openai/codex}, 2025.
+
+\bibitem{porter2009txos}
+Donald~E. Porter, Owen~S. Hofmann, Christopher~J. Rossbach, Alexander Benn, and
+  Emmett Witchel.
+\newblock Operating system transactions.
+\newblock In {\em Proceedings of the ACM SIGOPS 22nd Symposium on Operating
+  Systems Principles (SOSP)}, pages 161--176, Big Sky, MT, USA, 2009. ACM.
+
+\bibitem{containers2024bubblewrap}
+{Project Atomic and Containers Organization}.
+\newblock {Bubblewrap}: Unprivileged sandboxing tool based on {Linux}
+  namespaces.
+\newblock \url{https://github.com/containers/bubblewrap}, 2024.
+
+\bibitem{provos2003systrace}
+Niels Provos.
+\newblock Improving host security with system call policies.
+\newblock In {\em 12th USENIX Security Symposium (USENIX Security 03)}, pages
+  257--272, Washington, DC, USA, 2003. USENIX Association.
+
+\bibitem{salaun2021landlock}
+Micka{\"e}l Sala{\"u}n.
+\newblock {Landlock}: Unprivileged access control ({Linux} kernel userspace
+  {API} documentation).
+\newblock \url{https://docs.kernel.org/userspace-api/landlock.html}, 2021.
+
+\bibitem{saltzer1975protection}
+Jerome~H. Saltzer and Michael~D. Schroeder.
+\newblock The protection of information in computer systems.
+\newblock {\em Proceedings of the IEEE}, 63(9):1278--1308, 1975.
+
+\bibitem{shi2025progent}
+Tianneng Shi, Jingxuan He, Zhun Wang, Hongwei Wu, and Dawn Song.
+\newblock {Progent}: Programmable privilege control for {LLM} agents.
+\newblock {\em arXiv preprint arXiv:2504.11703}, 2025.
+
+\bibitem{wang2025openhands}
+Xingyao Wang, Boxuan Li, Yufan Song, Frank~F. Xu, Xiangru Tang, Mingchen Zhuge,
+  Jiayi Pan, Yueqi Song, Bowen Li, Jaskirat Singh, Hoang~H. Tran, Fuqiang Li,
+  Ren Ma, Mingzhang Zheng, Bill Qian, Yanjun Shao, Niklas Muennighoff, Yizhe
+  Zhang, Binyuan Hui, Junyang Lin, Robert Brennan, Hao Peng, Heng Ji, and
+  Graham Neubig.
+\newblock {OpenHands}: An open platform for {AI} software developers as
+  generalist agents.
+\newblock In {\em Thirteenth International Conference on Learning
+  Representations (ICLR)}, Singapore, 2025. OpenReview.net.
+
+\bibitem{watson2010capsicum}
+Robert N.~M. Watson, Jonathan Anderson, Ben Laurie, and Kris Kennaway.
+\newblock {Capsicum}: Practical capabilities for {UNIX}.
+\newblock In {\em 19th USENIX Security Symposium (USENIX Security 10)}, pages
+  29--46, Washington, DC, USA, 2010. USENIX Association.
+
+\bibitem{willison2023dualllm}
+Simon Willison.
+\newblock The dual {LLM} pattern for building {AI} assistants that can resist
+  prompt injection.
+\newblock \url{https://simonwillison.net/2023/Apr/25/dual-llm-pattern/}, 2023.
+
+\bibitem{wright2004unionfs}
+Charles~P. Wright, Jay Dave, Puja Gupta, Harikesavan Krishnan, David~P.
+  Quigley, Erez Zadok, and Mohammad~Nayyer Zubair.
+\newblock Versatility and {Unix} semantics in namespace unification.
+\newblock {\em ACM Transactions on Storage (TOS)}, 2(1):74--105, 2006.
+
+\bibitem{wu2024secgpt}
+Yuhao Wu, Franziska Roesner, Tadayoshi Kohno, Ning Zhang, and Umar Iqbal.
+\newblock {IsolateGPT}: An execution isolation architecture for {LLM}-based
+  agentic systems.
+\newblock In {\em Network and Distributed System Security Symposium (NDSS)},
+  pages 1--18, San Diego, CA, USA, 2025. Internet Society.
+
+\bibitem{yang2024sweagent}
+John Yang, Carlos~E. Jimenez, Alexander Wettig, Kilian Lieret, Shunyu Yao,
+  Karthik Narasimhan, and Ofir Press.
+\newblock {SWE-agent}: Agent-computer interfaces enable automated software
+  engineering.
+\newblock In {\em Advances in Neural Information Processing Systems (NeurIPS)},
+  volume~37, pages 50528--50652, Vancouver, BC, Canada, 2024. Curran
+  Associates, Inc.
+
+\bibitem{young2019gvisor}
+Ethan~G. Young, Pengfei Zhu, Tyler Caraza-Harter, Andrea~C. Arpaci-Dusseau, and
+  Remzi~H. Arpaci-Dusseau.
+\newblock The true cost of containing: A {gVisor} case study.
+\newblock In {\em 11th USENIX Workshop on Hot Topics in Cloud Computing
+  (HotCloud 19)}, Renton, WA, USA, 2019. USENIX Association.
+
+\bibitem{zhan2024injecagent}
+Qiusi Zhan, Zhixiang Liang, Zifan Ying, and Daniel Kang.
+\newblock {InjecAgent}: Benchmarking indirect prompt injections in
+  tool-integrated large language model agents.
+\newblock In {\em Findings of the Association for Computational Linguistics:
+  ACL 2024}, pages 10471--10506, Bangkok, Thailand, 2024. Association for
+  Computational Linguistics.
+
+\bibitem{zhao2026aegisos}
+Hui Zhao.
+\newblock {Aegis OS}: A transactional multi-tenant operating system runtime for
+  eliminating authorization fatigue in autonomous coding agents.
+\newblock {\em arXiv preprint arXiv:2611.08516}, 2026.
+
+\end{thebibliography}

@@ -1,0 +1,80 @@
+{
+  "platform": "Linux-6.8.0-142-generic-aarch64-with-glibc2.39",
+  "system": "Linux",
+  "filesystem": "btrfs",
+  "timestamp": "2026-11-09T19:26:55Z",
+  "repos": {
+    "small_8mb": {
+      "meta": {
+        "files_count": 200,
+        "pack_files_count": 1,
+        "pack_bytes_mb": 5.04,
+        "git_dir_mb": 5.09,
+        "worktree_mb": 2.93,
+        "total_logical_mb": 8.02,
+        "host_du_mb": 8.3
+      },
+      "trials": 10,
+      "cp_r_median_ms": 5.52,
+      "cp_r_mean_ms": 5.57,
+      "cp_r_p95_ms": 5.76,
+      "cp_r_disk_delta_median_mb": 8.3,
+      "aegis_run_git_status_median_ms": 52.02,
+      "aegis_run_git_status_mean_ms": 52.0,
+      "aegis_run_git_status_p95_ms": 53.8,
+      "aegis_diff_3files_median_ms": 23.0,
+      "aegis_diff_3files_p95_ms": 23.31,
+      "aegis_shadow_du_median_mb": 3.12,
+      "aegis_statvfs_delta_median_mb": 0.0,
+      "median_speedup_vs_cp_r": 0.11
+    },
+    "medium_90mb": {
+      "meta": {
+        "files_count": 1200,
+        "pack_files_count": 1,
+        "pack_bytes_mb": 72.23,
+        "git_dir_mb": 72.4,
+        "worktree_mb": 17.58,
+        "total_logical_mb": 89.98,
+        "host_du_mb": 91.23
+      },
+      "trials": 10,
+      "cp_r_median_ms": 43.7,
+      "cp_r_mean_ms": 45.34,
+      "cp_r_p95_ms": 52.8,
+      "cp_r_disk_delta_median_mb": 91.23,
+      "aegis_run_git_status_median_ms": 123.14,
+      "aegis_run_git_status_mean_ms": 153.77,
+      "aegis_run_git_status_p95_ms": 252.58,
+      "aegis_diff_3files_median_ms": 4.17,
+      "aegis_diff_3files_p95_ms": 4.26,
+      "aegis_shadow_du_median_mb": 18.75,
+      "aegis_statvfs_delta_median_mb": 0.0,
+      "median_speedup_vs_cp_r": 0.35
+    },
+    "large_500mb": {
+      "meta": {
+        "files_count": 4000,
+        "pack_files_count": 1,
+        "pack_bytes_mb": 420.86,
+        "git_dir_mb": 421.36,
+        "worktree_mb": 78.12,
+        "total_logical_mb": 499.48,
+        "host_du_mb": 499.56
+      },
+      "trials": 10,
+      "cp_r_median_ms": 368.54,
+      "cp_r_mean_ms": 361.16,
+      "cp_r_p95_ms": 404.0,
+      "cp_r_disk_delta_median_mb": 499.56,
+      "aegis_run_git_status_median_ms": 424.45,
+      "aegis_run_git_status_mean_ms": 426.92,
+      "aegis_run_git_status_p95_ms": 437.21,
+      "aegis_diff_3files_median_ms": 10.03,
+      "aegis_diff_3files_p95_ms": 11.44,
+      "aegis_shadow_du_median_mb": 78.14,
+      "aegis_statvfs_delta_median_mb": 0.0,
+      "median_speedup_vs_cp_r": 0.87
+    }
+  }
+}

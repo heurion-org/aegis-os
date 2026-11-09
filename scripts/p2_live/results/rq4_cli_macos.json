@@ -1,0 +1,65 @@
+{
+  "platform": "macOS-27.0.1-arm64-arm-64bit",
+  "timestamp": "2026-11-09T17:45:35Z",
+  "vt100_spoof_verification": {
+    "spoof_concealed_on_raw_vt100_tty": true,
+    "evil_backdoor_visible_and_escaped_in_aegis_diff_json": false
+  },
+  "legitimate_pinned_commit_ms": 30.41,
+  "classes": {
+    "c1_post_diff_append": {
+      "description": "Post-approval backdoor line append",
+      "trials": 10,
+      "blocked": 10,
+      "block_rate_pct": 100.0,
+      "cli_verify_median_ms": 7.81,
+      "cli_verify_mean_ms": 8.22,
+      "cli_verify_p95_ms": 9.1
+    },
+    "c2_same_size_byte_swap": {
+      "description": "Same-byte-size operator flip (`st_size` invariant)",
+      "trials": 10,
+      "blocked": 10,
+      "block_rate_pct": 100.0,
+      "cli_verify_median_ms": 7.92,
+      "cli_verify_mean_ms": 7.96,
+      "cli_verify_p95_ms": 8.28
+    },
+    "c3_beyond_preview_tail_edit": {
+      "description": "Line-185 tail edit beyond diff preview window",
+      "trials": 10,
+      "blocked": 10,
+      "block_rate_pct": 100.0,
+      "cli_verify_median_ms": 7.65,
+      "cli_verify_mean_ms": 7.71,
+      "cli_verify_p95_ms": 7.92
+    },
+    "c4_untracked_build_rs_add": {
+      "description": "Untracked `build.rs` injection post-diff",
+      "trials": 10,
+      "blocked": 10,
+      "block_rate_pct": 100.0,
+      "cli_verify_median_ms": 7.75,
+      "cli_verify_mean_ms": 7.75,
+      "cli_verify_p95_ms": 8.09
+    },
+    "c5_symlink_target_swap": {
+      "description": "POSIX symlink replacement (`ln -sf /etc/hosts`)",
+      "trials": 10,
+      "blocked": 10,
+      "block_rate_pct": 100.0,
+      "cli_verify_median_ms": 7.54,
+      "cli_verify_mean_ms": 7.6,
+      "cli_verify_p95_ms": 7.9
+    },
+    "c6_ansi_bidi_terminal_spoof": {
+      "description": "ANSI CSI `\\x1b[2K` + BiDi `U+202E` diff spoof",
+      "trials": 10,
+      "blocked": 10,
+      "block_rate_pct": 100.0,
+      "cli_verify_median_ms": 7.63,
+      "cli_verify_mean_ms": 7.84,
+      "cli_verify_p95_ms": 8.59
+    }
+  }
+}

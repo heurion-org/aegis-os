@@ -79,6 +79,7 @@ pub struct AegisEgressGateway {
     org_allowed_domains: Arc<RwLock<HashMap<String, HashSet<String>>>>,
     vault: Arc<RwLock<HashMap<String, SecretVaultEntry>>>,
     scopes: Arc<RwLock<HashMap<String, SecretScopeRule>>>,
+    upstream_overrides: Arc<RwLock<HashMap<String, (String, bool)>>>,
     tls_config: Arc<ClientConfig>,
 }
 
@@ -106,8 +107,18 @@ impl AegisEgressGateway {
             org_allowed_domains: Arc::new(RwLock::new(HashMap::new())),
             vault: Arc::new(RwLock::new(HashMap::new())),
             scopes: Arc::new(RwLock::new(HashMap::new())),
+            upstream_overrides: Arc::new(RwLock::new(HashMap::new())),
             tls_config,
         }
+    }
+
+    /// Host-controlled upstream override for local integration testing and benchmarking of the
+    /// L7 Base URL reverse proxy (`/__aegis/base/...`). Never controllable via client HTTP headers.
+    pub async fn set_upstream_override(&self, domain: &str, addr: &str, use_tls: bool) {
+        self.upstream_overrides
+            .write()
+            .await
+            .insert(domain.to_string(), (addr.to_string(), use_tls));
     }
 
     pub async fn allow_domains(&self, org_id: &str, domains: Vec<String>) {
@@ -302,7 +313,19 @@ impl AegisEgressGateway {
             {
                 continue;
             }
-            if !aos_core::ablated("secret_binding") {
+            // Only Gemini APIs (`generativelanguage.googleapis.com`) authenticate via `?key=$AOS_SECRET_*`
+            // in the query string. On any other domain or query parameter name, a secret placeholder
+            // in the URL query/path is treated as outbound exfiltration and left in `dlp_path`.
+            let gemini_key_param = format!("key={}", secret_entry.placeholder);
+            let is_authorized_query_auth = req
+                .target_domain
+                .eq_ignore_ascii_case("generativelanguage.googleapis.com")
+                && (out_path.contains(&format!("?{gemini_key_param}"))
+                    || out_path.contains(&format!("&{gemini_key_param}")));
+            if !is_authorized_query_auth {
+                continue;
+            }
+            if !aos_core::ablated("secret_binding") && !aos_core::ablated("secret_vault") {
                 if !secret_entry
                     .allowed_domains
                     .iter()
@@ -355,7 +378,7 @@ impl AegisEgressGateway {
 
         // 1b. Outbound L7 DLP inspection on URL query string and HTTP request body (prevents exfiltrating
         // secrets or private keys inside the body/query of an allowlisted endpoint such as POST /repos/acme/app/issues).
-        if !aos_core::ablated("secret_binding") {
+        if !aos_core::ablated("secret_binding") && !aos_core::ablated("secret_vault") {
             let query_part = dlp_path.split_once('?').map(|(_, q)| q).unwrap_or("");
             if let Some(dlp_hit) =
                 Self::inspect_payload_dlp(query_part, &entries, &identity.org_id)
@@ -377,7 +400,7 @@ impl AegisEgressGateway {
                     continue;
                 }
                 if header_val.contains(&secret_entry.placeholder) {
-                    if !aos_core::ablated("secret_binding") {
+                    if !aos_core::ablated("secret_binding") && !aos_core::ablated("secret_vault") {
                         if !secret_entry
                             .allowed_domains
                             .iter()
@@ -479,18 +502,17 @@ impl AegisEgressGateway {
     }
 
     /// Extracts `host:port` authority from an `http://host[:port]/...` target or `Host` header.
+    /// Client-supplied `X-Aegis-Upstream` headers are ignored in production builds to prevent
+    /// domain-fronting secret exfiltration and loopback SSRF.
     fn resolve_upstream_addr(raw_target: &str, headers: &HashMap<String, String>) -> String {
+        #[cfg(test)]
         if let Some(up) = headers
             .get("X-Aegis-Upstream")
             .or_else(|| headers.get("x-aegis-upstream"))
         {
             let trimmed = up.trim();
-            if !trimmed.is_empty() {
-                return if trimmed.contains(':') {
-                    trimmed.to_string()
-                } else {
-                    format!("{trimmed}:80")
-                };
+            if trimmed.starts_with("127.0.0.1:") || trimmed.starts_with("localhost:") {
+                return trimmed.to_string();
             }
         }
         if let Some(rest) = raw_target.trim().strip_prefix("http://") {
@@ -803,11 +825,18 @@ impl AegisEgressGateway {
                                 injected_path,
                                 ..
                             }) => {
+                                let (up_addr, use_tls) = gw_conn
+                                    .upstream_overrides
+                                    .read()
+                                    .await
+                                    .get(domain)
+                                    .cloned()
+                                    .unwrap_or_else(|| (format!("{domain}:443"), true));
                                 if let Err(err) = gw_conn
                                     .forward_reverse_proxy(
                                         &mut stream,
-                                        &format!("{domain}:443"),
-                                        true,
+                                        &up_addr,
+                                        use_tls,
                                         domain,
                                         domain,
                                         &method,
@@ -903,17 +932,32 @@ impl AegisEgressGateway {
                             .await
                         {
                             Ok(EgressVerdict::AllowedAndSanitized { .. }) => {
-                                let dial_addr = headers
+                                let default_dial = if raw_target.contains(':') {
+                                    raw_target.clone()
+                                } else {
+                                    format!("{raw_target}:443")
+                                };
+                                #[cfg(test)]
+                                let test_up = headers
                                     .get("X-Aegis-Upstream")
                                     .or_else(|| headers.get("x-aegis-upstream"))
-                                    .cloned()
-                                    .unwrap_or_else(|| {
-                                        if raw_target.contains(':') {
-                                            raw_target.clone()
-                                        } else {
-                                            format!("{raw_target}:443")
-                                        }
+                                    .map(|s| s.trim().to_string())
+                                    .filter(|s| {
+                                        s.starts_with("127.0.0.1:") || s.starts_with("localhost:")
                                     });
+                                #[cfg(not(test))]
+                                let test_up: Option<String> = None;
+                                let dial_addr = if let Some((ov_addr, _)) = gw_conn
+                                    .upstream_overrides
+                                    .read()
+                                    .await
+                                    .get(&connect_spec.target_domain)
+                                    .cloned()
+                                {
+                                    ov_addr
+                                } else {
+                                    test_up.unwrap_or(default_dial)
+                                };
                                 match tokio::net::TcpStream::connect(&dial_addr).await {
                                     Ok(mut upstream) => {
                                         if stream
@@ -989,7 +1033,7 @@ impl AegisEgressGateway {
                         return;
                     }
 
-                    let target_domain = headers
+                    let host_hdr_domain = headers
                         .get("Host")
                         .or_else(|| headers.get("host"))
                         .cloned()
@@ -998,6 +1042,33 @@ impl AegisEgressGateway {
                         .next()
                         .unwrap_or("localhost")
                         .to_string();
+                    let uri_domain = raw_target
+                        .trim()
+                        .strip_prefix("http://")
+                        .or_else(|| raw_target.trim().strip_prefix("https://"))
+                        .and_then(|rest| rest.split('/').next())
+                        .and_then(|auth| auth.split(':').next())
+                        .filter(|d| !d.is_empty())
+                        .map(str::to_string);
+                    if let Some(ref ud) = uri_domain {
+                        if !ud.eq_ignore_ascii_case(&host_hdr_domain)
+                            && host_hdr_domain != "localhost"
+                        {
+                            let body = json!({
+                                "egress": "domain_fronting_mismatch",
+                                "uri_domain": ud,
+                                "host_header": host_hdr_domain
+                            })
+                            .to_string();
+                            let resp = format!(
+                                "HTTP/1.1 403 Forbidden\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                                body.len()
+                            );
+                            let _ = stream.write_all(resp.as_bytes()).await;
+                            return;
+                        }
+                    }
+                    let target_domain = uri_domain.unwrap_or(host_hdr_domain);
                     let should_forward_upstream = headers.contains_key("X-Aegis-Upstream")
                         || headers.contains_key("x-aegis-upstream")
                         || headers

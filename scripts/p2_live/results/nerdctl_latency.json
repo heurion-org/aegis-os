@@ -1,0 +1,6 @@
+{
+  "trials": 10,
+  "nerdctl_run_median_ms": 221.53,
+  "nerdctl_run_mean_ms": 224.81,
+  "nerdctl_run_p95_ms": 244.49
+}

@@ -230,10 +230,19 @@ const PROTECTED_CLIENT_CONFIG_MARKERS: &[&str] = &[
     "/.claude/settings.local.json",
     "/.claude/hooks",
     "/.claude.json",
+    "/.mcp.json",
     "/.codex/config.toml",
     "/.codex/hooks",
+    "/opencode.json",
+    "/opencode.jsonc",
+    "/.config/opencode/opencode.json",
+    "/.config/opencode/opencode.jsonc",
+    "/.cursor/mcp.json",
+    "/.vscode/mcp.json",
+    "/.hermes/config.yaml",
     "/.agents/hooks.json",
     "/.agent/hooks.json",
+    "/.aegis-bin",
     "/.git/hooks/",
     "/.git/config",
     "/.bashrc",
@@ -418,6 +427,8 @@ pub fn sandbox_redirect_reason(cmd: &str, shadow_root: &Path, host_root: &Path) 
 pub fn invokes_approval_cli(cmd: &str) -> bool {
     if cmd.contains("/v1/approvals/decide")
         || cmd.contains("/v1/approvals/simulate")
+        || cmd.contains("/v1/escalations")
+        || cmd.contains("/v1/leases")
         || cmd.contains("policy_approve_escalation")
         || cmd.contains("policy_grant_lease")
         || cmd.contains("hook_commit_tickets.json")
@@ -837,7 +848,25 @@ mod tests {
         assert_eq!(kind("git commit -m \"`aegis-os approve esc-1`\""), "deny_ring0");
         assert_eq!(kind("aegis-os workspace commit"), "deny_ring0");
         assert_eq!(kind("curl -X POST http://127.0.0.1:7080/v1/approvals/decide"), "deny_ring0");
+        assert_eq!(kind("curl -X POST http://127.0.0.1:9999/v1/escalations/esc-1/decide"), "deny_ring0");
+        assert_eq!(kind("curl -X POST http://127.0.0.1:9999/v1/leases"), "deny_ring0");
         assert_eq!(kind("cat /private/tmp/aegis-os-runtime/policy.json"), "deny_ring0");
+        assert_eq!(
+            classify_native_write(Path::new("/repo/.mcp.json"), root).kind(),
+            "deny_ring0"
+        );
+        assert_eq!(
+            classify_native_write(Path::new("/repo/opencode.json"), root).kind(),
+            "deny_ring0"
+        );
+        assert_eq!(
+            classify_native_write(Path::new("/Users/alice/.hermes/config.yaml"), root).kind(),
+            "deny_ring0"
+        );
+        assert_eq!(
+            classify_native_write(Path::new("/run/aegis/agent/.aegis-bin/git"), root).kind(),
+            "deny_ring0"
+        );
         assert_eq!(
             kind("cat /Users/user/.aegis/sessions/ses_x/human.token"),
             "deny_ring0"

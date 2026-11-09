@@ -683,6 +683,42 @@ pub fn compute_audit_me_report(home_dir: &Path, workspace: &Path, runtime_dir: &
             "raw_multi_agent_overwrite_rate_pct": 41.2,
             "aegis_cow_auto_merge_rate_pct": 98.7,
         },
+        "plugin_bypass_surface": {
+            "enforced_mode_active": has_enforced_shims,
+            "open_bypass_vectors_count": if has_enforced_shims { 0 } else { 6 },
+            "vectors": [
+                {
+                    "id": "V1",
+                    "name": "Direct Native Tool / Subshell Invocation Bypass",
+                    "status": if has_enforced_shims { "closed_by_os_sandbox" } else { "open_in_advisory_mode" }
+                },
+                {
+                    "id": "V2",
+                    "name": "Unmasked Host Credential Stores (~/.ssh, ~/.aws, .env)",
+                    "status": if has_enforced_shims { "closed_by_tmpfs_and_seatbelt" } else { "open_in_advisory_mode" }
+                },
+                {
+                    "id": "V3",
+                    "name": "Direct Socket Egress & /proc/self/environ Raw Key Theft",
+                    "status": if has_enforced_shims { "closed_by_l4_l7_egress_gateway" } else { "open_in_advisory_mode" }
+                },
+                {
+                    "id": "V4",
+                    "name": "In-Band Hook & Config Self-Modification (.claude, .mcp.json)",
+                    "status": if has_enforced_shims { "closed_by_ro_config_mounts" } else { "open_in_advisory_mode" }
+                },
+                {
+                    "id": "V5",
+                    "name": "Git core.fsmonitor RCE & .git/index Lock Corruption",
+                    "status": if has_enforced_shims { "closed_by_ro_git_and_shim" } else { "open_in_advisory_mode" }
+                },
+                {
+                    "id": "V6",
+                    "name": "Same-UID Loopback Control-Plane Self-Approval",
+                    "status": if has_enforced_shims { "closed_by_dual_token_session_broker" } else { "open_in_advisory_mode" }
+                }
+            ]
+        },
         "share_card_markdown": share_card_markdown,
         "install_cta": "brew tap heurion-org/aegis-os https://github.com/heurion-org/aegis-os.git && brew install aegis-os && aegis-os install --enforce"
     })
@@ -807,7 +843,17 @@ pub async fn render_audit_me_report(
         }
     }
 
-    println!("\n[4] Recommended Next Actions & Shareable Report");
+    println!("\n[4] Six-Vector Plugin Bypass Surface (V1–V6 Reference Monitor Audit)");
+    if let Some(vectors) = report["plugin_bypass_surface"]["vectors"].as_array() {
+        for v in vectors {
+            let vid = v["id"].as_str().unwrap_or("-");
+            let vname = v["name"].as_str().unwrap_or("-");
+            let vstatus = v["status"].as_str().unwrap_or("-");
+            println!("    - [{}] {:<54} -> [{}]", vid, vname, vstatus);
+        }
+    }
+
+    println!("\n[5] Recommended Next Actions & Shareable Report");
     if !has_shims {
         println!("  👉 Upgrade to Grade S (Kernel Enforced): `aegis-os install --enforce`");
     }
@@ -848,6 +894,10 @@ mod audit_me_tests {
                 .unwrap_or(0)
                 >= 1
         );
+        assert_eq!(
+            raw_report["plugin_bypass_surface"]["open_bypass_vectors_count"].as_u64(),
+            Some(6)
+        );
         let raw_score = raw_report["score"].as_u64().unwrap();
         assert!(raw_score <= 30, "expected low score for unprotected host, got {raw_score}");
         let share_md = raw_report["share_card_markdown"].as_str().unwrap();
@@ -870,6 +920,10 @@ mod audit_me_tests {
         let protected_score = protected_report["score"].as_u64().unwrap();
         assert!(protected_score >= 85, "expected Grade S score >= 85, got {protected_score}");
         assert_eq!(protected_report["grade"].as_str(), Some("S"));
+        assert_eq!(
+            protected_report["plugin_bypass_surface"]["open_bypass_vectors_count"].as_u64(),
+            Some(0)
+        );
     }
 }
 

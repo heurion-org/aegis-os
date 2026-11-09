@@ -54,6 +54,7 @@ pub struct SessionBroker {
     pub socket_path: PathBuf,
     pub agent_token: String,
     pub tcp_addr: Option<std::net::SocketAddr>,
+    temp_control_dir: Option<PathBuf>,
     task: Option<JoinHandle<()>>,
     tcp_task: Option<JoinHandle<()>>,
 }
@@ -77,6 +78,9 @@ impl Drop for SessionBroker {
             task.abort();
         }
         let _ = std::fs::remove_file(&self.socket_path);
+        if let Some(ref dir) = self.temp_control_dir {
+            let _ = std::fs::remove_dir_all(dir);
+        }
     }
 }
 
@@ -84,22 +88,28 @@ impl SessionBroker {
     pub async fn start(
         runtime_dir: &Path,
         session_dir: &Path,
-        control_dir: PathBuf,
+        mut control_dir: PathBuf,
         session: BrokerSession,
         identity: AgentIdentity,
         egress_proxy: Option<String>,
         expose_tcp: bool,
     ) -> Result<Self> {
+        let mut temp_control_dir = None;
+        if !expose_tcp && control_dir.join("control.sock").as_os_str().len() >= 96 {
+            let short = PathBuf::from(format!(
+                "/tmp/aos-ctl-{}",
+                &uuid::Uuid::new_v4().simple().to_string()[..12]
+            ));
+            temp_control_dir = Some(short.clone());
+            control_dir = short;
+        }
         std::fs::create_dir_all(&control_dir)?;
         #[cfg(unix)]
         {
             use std::os::unix::fs::PermissionsExt;
             let _ = std::fs::set_permissions(&control_dir, std::fs::Permissions::from_mode(0o700));
         }
-        let mut socket_path = control_dir.join("control.sock");
-        if socket_path.as_os_str().len() >= 100 {
-            socket_path = control_dir.join("c.s");
-        }
+        let socket_path = control_dir.join("control.sock");
         let _ = std::fs::remove_file(&socket_path);
 
         let agent_token = format!(
@@ -213,6 +223,7 @@ impl SessionBroker {
             socket_path,
             agent_token,
             tcp_addr,
+            temp_control_dir,
             task,
             tcp_task,
         })
@@ -411,7 +422,9 @@ where
     if agent_route && !token_eq(&presented, &state.agent_token) {
         return write_json(&mut stream, "401 Unauthorized", json!({"error": "invalid agent token"})).await;
     }
-    if human_route && !token_eq(&presented, &state.human_token) {
+    let human_auth_ok = token_eq(&presented, &state.human_token)
+        || (aos_core::ablated("dual_token") && token_eq(&presented, &state.agent_token));
+    if human_route && !human_auth_ok {
         return write_json(&mut stream, "401 Unauthorized", json!({"error": "invalid human token"})).await;
     }
 
@@ -506,19 +519,33 @@ where
             let approve = payload.get("approve").and_then(|v| v.as_bool()).unwrap_or(false);
             let ttl_secs = payload.get("ttl_secs").and_then(|v| v.as_i64()).unwrap_or(3600);
             if approve {
-                let lease = state
+                match state
                     .kernel
                     .policy
                     .approve_escalation(id, ttl_secs, "session-human-token")
-                    .await?;
-                write_json(&mut stream, "200 OK", json!({"status": "approved", "lease": lease})).await
+                    .await
+                {
+                    Ok(lease) => {
+                        write_json(&mut stream, "200 OK", json!({"status": "approved", "lease": lease})).await
+                    }
+                    Err(e) => {
+                        write_json(&mut stream, "404 Not Found", json!({"error": e.to_string()})).await
+                    }
+                }
             } else {
-                let escalation = state
+                match state
                     .kernel
                     .policy
                     .deny_escalation(id, "session-human-token")
-                    .await?;
-                write_json(&mut stream, "200 OK", json!({"status": "denied", "escalation": escalation})).await
+                    .await
+                {
+                    Ok(escalation) => {
+                        write_json(&mut stream, "200 OK", json!({"status": "denied", "escalation": escalation})).await
+                    }
+                    Err(e) => {
+                        write_json(&mut stream, "404 Not Found", json!({"error": e.to_string()})).await
+                    }
+                }
             }
         }
         ("POST", "/v1/leases") => {
