@@ -1,12 +1,12 @@
 # Aegis Enforced Runtime 产品设计文档
 
 > **副标题**：面向代码、文档、数据流水线与跨应用状态的通用 Agent 事务运行时  
-> **版本**：v0.4 Draft  
-> **日期**：2026-11-06  
-> **状态**：实施中（Phase 1 完成，Phase 2/3 部分完成）  
+> **版本**：v0.7  
+> **日期**：2026-11-09  
+> **状态**：核心落地并完成双平台实证评测（Phase 1/2 核心完成，macOS Seatbelt + Linux `bwrap --bind-fd` 均通过 `V1–V6` 30/30 对抗测试与 60 次真实 CLI Agent 评测）  
 > **范围**：Aegis OS 从「Agent 加载的安全插件」升级为「启动 Agent 的安全运行时」  
-> **关联代码**：`crates/aos-cli/src/routing.rs`、`crates/aos-cli/src/hooks.rs`、`crates/aos-cli/src/installer.rs`、`crates/aos-cli/src/launcher.rs`、`crates/aos-sandbox/src/lib.rs`、`crates/aos-policy/src/lib.rs`、`crates/aos-mcp-gateway/src/lib.rs`、`crates/aos-vfs/src/lib.rs`、`crates/aos-core/src/effect.rs`  
-> **关联文档**：`README.md`、`docs/AEGIS_APPLICATION_PROTOCOL.md`、[《超越 Git 分支与共享目录》](https://heurion.org/blog/aegis-os-transactional-agent-kernel)
+> **关联代码**：`crates/aos-cli/src/routing.rs`、`crates/aos-cli/src/hooks.rs`、`crates/aos-cli/src/installer.rs`、`crates/aos-cli/src/launcher.rs`、`crates/aos-sandbox/src/lib.rs`、`crates/aos-egress/src/lib.rs`、`crates/aos-policy/src/lib.rs`、`crates/aos-mcp-gateway/src/lib.rs`、`crates/aos-vfs/src/lib.rs`、`crates/aos-core/src/effect.rs`  
+> **关联文档**：`README.md`、`docs/ARCHITECTURE.md`、`docs/AEGIS_APPLICATION_PROTOCOL.md`、[Paper 2 预印本 (`paper2/aegis_enforced_runtime_arxiv_preprint.pdf`)](../paper2/aegis_enforced_runtime_arxiv_preprint.pdf)、[实证基准数据 (`paper2/ENFORCED_RUNTIME_BENCH_REPORT.json`)](../paper2/ENFORCED_RUNTIME_BENCH_REPORT.json)、[《为什么 Agent 插件不是安全边界》](https://heurion.org/blog/from-agent-plugins-to-enforced-runtime)、[《超越 Git 分支与共享目录》](https://heurion.org/blog/aegis-os-transactional-agent-kernel)
 
 ---
 
@@ -21,15 +21,17 @@
 | **Phase 4** macOS / 内核加固 | 🟡 部分完成 | macOS Seatbelt launcher MVP：shadow cwd、宿主只读、credential deny、`.aegis-bin` 只读 Git shim `PATH` 置顶、egress proxy、PTY、broker TCP control、MCP bridge；macOS 已手工验证 | Seatbelt default-deny 收敛、路径重映射、Landlock/seccomp、microVM 试点 |
 | **Phase 5** 高级领域 / IDE / 企业 | ⬜ 未开始 | — | Office CRDT、AAP-1.0、UOMP、IDE daemon、MDM |
 
-**当前验证**
+**当前验证（2026-11-09）**
 
 ```text
-cargo test -p aos-cli -p aos-core -p aos-vfs   # 70 passed (macOS, rustc 1.99)
-cargo test -p aos-egress                       # 8 passed; 2 ignored (real TLS handshake)
+AEGIS_ALLOW_NESTED_TEST_SANDBOX=1 cargo test -p aos-core -p aos-policy -p aos-vfs -p aos-ipc -p aos-sandbox -p aos-cli --lib   # 75 passed (0 failed)
+cargo test -p aos-egress                                                                                                        # 8 passed; 2 ignored (real TLS handshake)
 cargo clippy --workspace --all-targets -- -D warnings
 ```
 
-手工覆盖：`aos run` 宿主只读 / shadow 写入、Git 视图、Claude/OpenCode 启动、CONNECT allowlist、未授权域名 403、commit 审批/租约/TOCTOU（full-content hash）、`aos approvals serve`、`aos verify`、`aos publish` / `aos artifacts fetch`、`aos run --no-enforce`、`aos uninstall --shim-only`。
+- **双平台确定性对抗基准（`scripts/p2_live/deterministic_rm_bench.py`）**：macOS 26.3 (`aarch64`, Seatbelt) 与 Ubuntu 24.04 (`aarch64`, Linux 6.8, `bwrap 0.11.0 --bind-fd`) 均实测通过 `V1–V6` 全部 30 项结构性绕过向量（**0/30 绕过，0.0% ASR**；仅插件 Hook 模式为 30/30 绕过），并完成 5 组逐层消融验证；
+- **60 次真实云端 API 生产级 CLI Agent 端到端验证（`scripts/p2_live/live_cli_agent_bench.py`）**：覆盖 `Claude Code 2.1.104`、`OpenCode 1.4.3`、`Antigravity (AGY) 0.2.3`、`Hermes Agent 0.8.0` 四款真实客户端 × 3 种运行模式（`native_baseline` / `aegis_advisory_hook` / `aegis_enforced`）× 5 个编码与仓库陷阱任务，良性工程任务 **100% (12/12)** 通过，恶意 `Makefile` / `build.rs` / `.git` 陷阱下宿主失陷率从 **100% (8/8)** 降至 **0% (0/8)**；
+- **系统开销实测**：Linux `bwrap` 启动中位数 **9.91 ms**（比 Rootless `nerdctl` 容器 **222.02 ms** 快 **22.4×**），macOS Seatbelt **16.43 ms**；500 MB Git 仓库 APFS `clonefile` 仅 **6.10 ms / 4.74 MB**（省盘 **99.05%**）；L7 模型反向代理首 Token 延迟开销仅 **+0.221 ms**。
 
 **Linux VM 验证（Ubuntu 24.04 aarch64 / bwrap 0.9.0，需关闭 AppArmor unprivileged userns 限制）**：
 
@@ -92,6 +94,12 @@ cargo clippy --workspace --all-targets -- -D warnings
 ---
 
 ## 变更记录
+
+- **v0.7**（2026-11-09）：完成跨平台真实 CLI Agent 生产适配加固与 Paper 2 实证评测（`aa36c3c`）：
+  - **macOS Seatbelt 真实客户端兼容与硬化**：保留真实 `HOME`（支持 Claude Code / AGY 读取 macOS Keychain OAuth 凭据）同时将 `XDG_CONFIG_HOME` / `XDG_DATA_HOME` / `XDG_STATE_HOME` 重定向至沙箱私有目录；对 Darwin `/var/folders -> /private/var/folders` 执行软链规范化白名单；阻断 `~/.ssh`、`~/.aws`、`~/.gnupg` 与 `human.token` 读取；
+  - **Linux `bwrap --bind-fd` 真实客户端与网络修复**：挂载 `/run/systemd/resolve` 保障 `--unshare-net` 命名空间下本地代理解析上游 DNS；按客户端精细化挂载 CLI 运行态目录并对 `settings.json` / `hooks.json` / `config.toml` 施加单文件 `--ro-bind` 只读锁；
+  - **CLI 差分哈希锚定与网关测试支持**：新增 `aegis-os diff --json`（输出规范化 `evidence_hash`）与 `aegis-os commit --expected-diff-hash <sha256>` 防 TOCTOU 提交校验；`aos-egress` 新增 `AOS_UPSTREAM_OPENAI_URL` / `AOS_UPSTREAM_ANTHROPIC_URL` / `AOS_UPSTREAM_GEMINI_URL` 上游路由支持；
+  - **Paper 2 与可复现基准套件落地**：新增 `paper2/` 完整 14 页论文与 `scripts/p2_live/` 评测套件，完成 macOS + Linux `0/30` 对抗消融与 4 款真实 CLI Agent 共 60 次云端 API 实测。
 
 - **v0.6**（2026-11-06）：按 005edfb..d76fdc9 代码评审修复：
   - evidence hash 统一为 bare hex，修复 launcher `sha256:sha256:` 双前缀；MCP `workspace_commit` 补 `old_sha256` / `new_sha256`；
