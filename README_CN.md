@@ -105,7 +105,7 @@ aegis-os install
 | 4 款真实生产 CLI Agent 仓库木马沦陷率（`claude`、`opencode`、`agy`、`hermes`，60 格矩阵 54 次真实云端 API 运行） | **0%**（`aegis_enforced`）对比 **100%**（`vendor_default`，含 Claude Opus）· 良性及多文件重构测试通过率 **100% (8/8)** |
 | Enforced 内核沙箱启动延迟 | Linux `bwrap` **9.91 ms**（比 `nerdctl` 容器 221.53 ms **快 22.4 倍**）· macOS Seatbelt **20.38 ms** |
 | 500 MB 打包 Git 仓库（`git repack -ad`）物理磁盘增量 | APFS **4.76 MB**（**节省 99.05% 物理磁盘**）· `btrfs` **0.00 MB** 净块增量 |
-| 本地 L7 出站网关开销与 CLI TOCTOU / 终端转义门禁 | 回环 TTFT 仅 **+0.221 ms**（`0/40` 误报，`25/25` DLP 拦截）· **60/60 (100%)** 掉包攻击在 **7.70 ms** 内阻断 |
+| 本地 L7 出站网关开销与 CLI TOCTOU / 终端转义门禁 | 回环 TTFT 仅 **+0.221 ms**（`0/40` 误报，`25/25` DLP 拦截）· **60/60 (100%)** 掉包攻击全部阻断（各类中位数 **7.54–7.92 ms**） |
 | 授权弹窗削减（52 份真实会话，28,087 次工具调用）与多 Agent 归并 | 减少 **90.7%–97.9%** 弹窗 · 四级 LCS 自动归并 **98.7%** · 200 模块回滚 **8.68 ms** |
 
 > 完整复现方法详见 [`BENCHMARK_REPORT.md`](BENCHMARK_REPORT.md)（论文一多 Agent 与 VFS 基准）以及 [`paper2/ENFORCED_RUNTIME_BENCH_REPORT.json`](paper2/ENFORCED_RUNTIME_BENCH_REPORT.json) + [`scripts/p2_live/README.md`](scripts/p2_live/README.md)（论文二跨平台与真实 CLI Agent 评测套件）。

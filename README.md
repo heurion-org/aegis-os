@@ -106,7 +106,7 @@ aegis-os install
 | Live 4-agent repo-trap compromise (`claude`, `opencode`, `agy`, `hermes`, 54 executed cloud-API runs across 60-cell matrix) | **0%** (`aegis_enforced`) vs. **100%** (`vendor_default`, incl. Claude Opus) · **100% (8/8)** benign & multi-file `pytest` pass rate |
 | Enforced sandbox startup latency | **9.91 ms** Linux `bwrap` (**22.4× faster** than `nerdctl`'s 221.53 ms) · **20.38 ms** macOS Seatbelt |
 | Packed 500 MB Git CoW disk allocation (`git repack -ad`) | **4.76 MB** on APFS (**99.05% physical disk saved**) · **0.00 MB** net delta on `btrfs` |
-| Loopback L7 Egress Proxy overhead & CLI TOCTOU/VT100 gate | **+0.221 ms** mean TTFT (`0/40` FP, `25/25` DLP blocked) · **60/60 (100%)** TOCTOU swaps blocked in **7.70 ms** |
+| Loopback L7 Egress Proxy overhead & CLI TOCTOU/VT100 gate | **+0.221 ms** mean TTFT (`0/40` FP, `25/25` DLP blocked) · **60/60 (100%)** TOCTOU swaps blocked (**7.54–7.92 ms** per-class median) |
 | Prompt reduction (52 real sessions, 28,087 tool calls) & 4-tier LCS auto-merge | **90.7%–97.9%** fewer prompts · **98.7%** auto-merge · **8.68 ms** 200-module rollback |
 
 > See [`BENCHMARK_REPORT.md`](BENCHMARK_REPORT.md) (Paper 1 multi-agent & VFS suite) and [`paper2/ENFORCED_RUNTIME_BENCH_REPORT.json`](paper2/ENFORCED_RUNTIME_BENCH_REPORT.json) + [`scripts/p2_live/README.md`](scripts/p2_live/README.md) (Paper 2 cross-platform & live CLI agent suite) for full reproduction instructions.
