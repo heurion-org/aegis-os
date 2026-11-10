@@ -103,7 +103,7 @@ aegis-os install
 | Metric | Result |
 |---|---|
 | V1–V6 bypass coverage (30 executable payloads, macOS Seatbelt & Linux `bwrap`) | **0/30 (0.0%)** vs. **93.3%** advisory hooks · **73.3%–83.3%** vendor sandboxes · **80.0%** `nerdctl` devcontainer |
-| Live 4-agent repo-trap compromise (`claude`, `opencode`, `agy`, `hermes`, 60 cloud-API runs) | **0%** (`aegis_enforced`) vs. **100%** (`vendor_default`, incl. Claude Opus) · **100% (4/4)** multi-file `pytest` pass rate |
+| Live 4-agent repo-trap compromise (`claude`, `opencode`, `agy`, `hermes`, 54 executed cloud-API runs across 60-cell matrix) | **0%** (`aegis_enforced`) vs. **100%** (`vendor_default`, incl. Claude Opus) · **100% (8/8)** benign & multi-file `pytest` pass rate |
 | Enforced sandbox startup latency | **9.91 ms** Linux `bwrap` (**22.4× faster** than `nerdctl`'s 221.53 ms) · **20.38 ms** macOS Seatbelt |
 | Packed 500 MB Git CoW disk allocation (`git repack -ad`) | **4.76 MB** on APFS (**99.05% physical disk saved**) · **0.00 MB** net delta on `btrfs` |
 | Loopback L7 Egress Proxy overhead & CLI TOCTOU/VT100 gate | **+0.221 ms** mean TTFT (`0/40` FP, `25/25` DLP blocked) · **60/60 (100%)** TOCTOU swaps blocked in **7.70 ms** |

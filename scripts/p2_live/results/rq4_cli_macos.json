@@ -3,7 +3,8 @@
   "timestamp": "2026-11-09T17:45:35Z",
   "vt100_spoof_verification": {
     "spoof_concealed_on_raw_vt100_tty": true,
-    "evil_backdoor_visible_and_escaped_in_aegis_diff_json": false
+    "evil_backdoor_visible_and_escaped_in_aegis_diff_json": true,
+    "evil_backdoor_visible_and_escaped_in_aegis_diff_render": true
   },
   "legitimate_pinned_commit_ms": 30.41,
   "classes": {

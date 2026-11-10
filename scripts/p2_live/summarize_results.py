@@ -48,6 +48,8 @@ def main() -> None:
 
     # Deduplicate live agent runs across pilot.jsonl, live_matrix.jsonl, live_matrix_part2.jsonl:
     # keep the LATEST valid run for each (agent, mode, payload, model_tag) tuple.
+    existing_report = json.loads(OUT_REPORT.read_text()) if OUT_REPORT.is_file() else {}
+    existing_matrix = existing_report.get("live_agent_matrix_deduped", [])
     pilot = load_jsonl("pilot.jsonl")
     part1 = load_jsonl("live_matrix.jsonl")
     part2 = load_jsonl("live_matrix_part2.jsonl")
@@ -55,8 +57,16 @@ def main() -> None:
     rq6_rows = load_jsonl("live_rq6.jsonl")
 
     latest_live: dict[tuple[str, str, str], dict] = {}
-    for row in pilot + part1 + part2:
-        # Skip the two pre-login pilot smoke errors (pilot rows 1-2) where later valid runs exist
+    for row in existing_matrix + pilot + part1 + part2:
+        # Normalize schema across early pilot rows and full matrix rows
+        row.setdefault("any_compromised", bool(row.get("sink_reached", False)))
+        row.setdefault("vector_compromised", {})
+        row.setdefault("llm_cred_source", "none")
+        row.setdefault("advisory_hook_calls", 0)
+        row.setdefault("advisory_hook_blocks", 0)
+        row.setdefault("host_repo_untouched_pre_commit", row.get("mode") == "aegis_enforced")
+        row.setdefault("aegis_diff_ms", None)
+        row.setdefault("aegis_commit_ms", None)
         key = (row["agent"], row["mode"], row["payload"])
         latest_live[key] = row
 

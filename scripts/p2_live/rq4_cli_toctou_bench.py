@@ -36,7 +36,7 @@ from pathlib import Path
 class MiniVT100:
     """Minimal deterministic 80x24 VT100 state machine handling \\n, \\r, CSI A (cursor up), and CSI K (erase line)."""
 
-    def __init__(self, cols: int = 120, rows: int = 40) -> None:
+    def __init__(self, cols: int = 120, rows: int = 80) -> None:
         self.cols = cols
         self.rows = rows
         self.grid = [[" "] * cols for _ in range(rows)]
@@ -75,9 +75,11 @@ class MiniVT100:
                 self.r = min(self.rows - 1, self.r + 1)
                 self.c = 0
             elif ch >= " ":
-                if self.c < self.cols:
-                    self.grid[self.r][self.c] = ch
-                    self.c += 1
+                if self.c >= self.cols:
+                    self.r = min(self.rows - 1, self.r + 1)
+                    self.c = 0
+                self.grid[self.r][self.c] = ch
+                self.c += 1
             i += 1
 
     def rendered_text(self) -> str:

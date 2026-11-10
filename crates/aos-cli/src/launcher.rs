@@ -2962,12 +2962,34 @@ fn approval_evidence(diffs: &[aos_core::FileDiffEntry]) -> anyhow::Result<(Value
     Ok(aos_core::compute_diff_evidence(diffs, false, false))
 }
 
+fn sanitize_terminal_line(line: &str) -> String {
+    let mut out = String::with_capacity(line.len());
+    for ch in line.chars() {
+        match ch {
+            '\x1b' => out.push_str("\\u001b"),
+            '\r' => out.push_str("\\r"),
+            '\x00'..='\x08' | '\x0b'..='\x1f' | '\x7f' => {
+                out.push_str(&format!("\\u{:04x}", ch as u32));
+            }
+            '\u{202a}'..='\u{202e}' | '\u{2066}'..='\u{2069}' => {
+                out.push_str(&format!("\\u{:04x}", ch as u32));
+            }
+            _ => out.push(ch),
+        }
+    }
+    out
+}
+
 fn print_evidence(diffs: &[aos_core::FileDiffEntry]) {
     for diff in diffs.iter().take(20) {
-        println!("{} {}", diff_label(&diff.change_type), diff.relative_path);
+        println!(
+            "{} {}",
+            diff_label(&diff.change_type),
+            sanitize_terminal_line(&diff.relative_path)
+        );
         if let Some(preview) = &diff.preview_diff {
             for line in preview.lines().take(40) {
-                println!("  {line}");
+                println!("  {}", sanitize_terminal_line(line));
             }
         }
     }

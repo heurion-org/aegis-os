@@ -11,7 +11,7 @@ This document describes how Aegis OS is put together: the trust boundary, runtim
 3. **Effects over tools.** Policy is expressed over `fs.read`, `fs.write`, `proc.exec`, `net.request`, `secret.use`, and commit effects—not over client-specific tool names.
 4. **Fail closed.** If the sandbox, egress proxy, or broker is unavailable, an enforced session refuses to start.
 5. **Domain-agnostic artifact tree.** Code, documents, data pipelines, binaries, and app state share one shadow / claim / verify / commit kernel; domain differences live in profiles.
-6. **Platform honesty.** Both Linux (`bwrap >= 0.10` with `--bind-fd`, `--unshare-net`, `/run/systemd/resolve` DNS pass-through, and layered state mounts) and macOS (`sandbox-exec` Seatbelt with canonicalized Darwin paths, `HOME` preservation for Keychain/OAuth, credential/token read-deny, `.aegis-bin` Git shim, and loopback L4/L7 egress) are verified end-to-end across live production CLI agents (`Claude Code`, `OpenCode`, `AGY`, `Hermes`, plus `Codex`). On Linux, the shadow is bind-mounted at the original host path; on macOS, the agent runs with `cwd` in the CoW shadow (full macOS VFS path-remapping and local `--isolated` microVM remain Phase 4).
+6. **Platform honesty.** Both Linux (`bwrap >= 0.9.0` with `--bind-fd`, `--unshare-net`, `/run/systemd/resolve` DNS pass-through, and layered state mounts) and macOS (`sandbox-exec` Seatbelt with canonicalized Darwin paths, `HOME` preservation for Keychain/OAuth, credential/token read-deny, `.aegis-bin` Git shim, and loopback L4/L7 egress) are verified end-to-end across live production CLI agents (`Claude Code v2.1.319`, `OpenCode v2.2.6`, `AGY v1.5.3`, `Hermes v0.23.0`, plus `Codex` adapter support). On Linux, the shadow is bind-mounted at the original host path; on macOS, the agent runs with `cwd` in the CoW shadow (full macOS VFS path-remapping and local `--isolated` microVM remain Phase 4).
 
 ---
 
@@ -239,11 +239,11 @@ Local vs Cloud share the same MCP behavior; Cloud offloads heavy builds and mult
 
 | Metric | Result |
 |---|---|
-| Structural bypass suite (`V1–V6`, 30 deterministic exploits / OS) | **0/30 (0.0%)** on macOS Seatbelt & **0/30 (0.0%)** on Linux `bwrap --bind-fd` (vs. 30/30 plugin-only) |
-| Live production CLI agent evaluation (4 agents × 3 modes × 5 tasks = 60 cloud-API runs) | **100% (12/12)** benign task completion; **0% (0/8)** repo-trap host compromise (vs. **100% (8/8)** native & hook-only) |
-| Enforced parent-launcher startup latency (500-file repo) | **9.91 ms** Linux `bwrap` (**22.4×** faster than rootless `nerdctl` 222.02 ms); **16.43 ms** macOS Seatbelt |
-| 500 MB Git repository CoW shadow overhead | **6.10 ms** APFS `clonefile`, **4.74 MB** disk (**99.05%** disk saved via read-only `.git` pass-through) |
-| Loopback L7 Base-URL reverse proxy overhead | **+0.221 ms** median TTFT (+7.9%), **+0.197 ms** total SSE stream latency |
+| Structural bypass suite (`V1–V6`, 30 deterministic exploits / OS) | **0/30 (0.0%)** on macOS Seatbelt & **0/30 (0.0%)** on Linux `bwrap --bind-fd` (vs. **93.3% (28/30)** advisory hooks, **73.3%–83.3%** vendor sandboxes, **80.0% (24/30)** `nerdctl` devcontainer) |
+| Live production CLI agent evaluation (4 agents, 54 executed cloud-API runs across 60-cell matrix) | **100% (8/8)** benign & multi-file task completion; **0% (0/4)** repo-trap (`cd_repo_trap`) host compromise under `aegis_enforced` (vs. **100% (4/4)** in `vendor_default`, incl. Claude Opus, and **3/4** in `advisory`) |
+| Enforced parent-launcher startup latency | **9.91 ms** median (**15.01 ms** P95) Linux `bwrap` (**22.4×** faster than rootless `nerdctl`'s **221.53 ms**); **20.38 ms** median (**21.74 ms** P95) macOS Seatbelt |
+| 500 MB packed Git repository (`git repack -ad`) CoW shadow overhead | **4.76 MB** physical disk delta on APFS (**99.05%** saved vs. **499.85 MB** `cp -R`); **0.00 MB** net delta on `btrfs` (`FICLONE`); **78.27 MB** shadow `du` (**235.27 MB** `statvfs`) on `ext4`; **10.03–29.88 ms** 3-file `aegis-os diff --json` |
+| Loopback L7 Base-URL reverse proxy & CLI TOCTOU gate | **+0.221 ms** mean TTFT (`0.180 -> 0.402 ms`, `0/40` false positives, `25/25` adversarial DLP/fronting/smuggling blocked); **60/60 (100%)** CLI TOCTOU/VT100 spoofing attacks blocked in **7.70 ms** median |
 
 `0.42 ms` in Monograph 03 is the trunk-anchored metadata fork; the provisioning numbers above measure full multi-file workspace setup. See [BENCHMARK_REPORT.md](../BENCHMARK_REPORT.md), [paper2/ENFORCED_RUNTIME_BENCH_REPORT.json](../paper2/ENFORCED_RUNTIME_BENCH_REPORT.json), [Paper 1 (`arXiv:2611.08516`)](https://arxiv.org/abs/2611.08516), and [Paper 2 (`paper2/aegis_enforced_runtime_arxiv_preprint.pdf`)](../paper2/aegis_enforced_runtime_arxiv_preprint.pdf) for full methodology.
 

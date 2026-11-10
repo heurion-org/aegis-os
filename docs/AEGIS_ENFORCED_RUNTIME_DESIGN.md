@@ -3,7 +3,7 @@
 > **副标题**：面向代码、文档、数据流水线与跨应用状态的通用 Agent 事务运行时  
 > **版本**：v0.7  
 > **日期**：2026-11-09  
-> **状态**：核心落地并完成双平台实证评测（Phase 1/2 核心完成，macOS Seatbelt + Linux `bwrap --bind-fd` 均通过 `V1–V6` 30/30 对抗测试与 60 次真实 CLI Agent 评测）  
+> **状态**：核心落地并完成双平台实证评测（Phase 1/2 核心完成，macOS Seatbelt + Linux `bwrap --bind-fd` 均通过 `V1–V6` 30/30 对抗测试与 60 格矩阵 / 54 次真实 CLI Agent 评测）  
 > **范围**：Aegis OS 从「Agent 加载的安全插件」升级为「启动 Agent 的安全运行时」  
 > **关联代码**：`crates/aos-cli/src/routing.rs`、`crates/aos-cli/src/hooks.rs`、`crates/aos-cli/src/installer.rs`、`crates/aos-cli/src/launcher.rs`、`crates/aos-sandbox/src/lib.rs`、`crates/aos-egress/src/lib.rs`、`crates/aos-policy/src/lib.rs`、`crates/aos-mcp-gateway/src/lib.rs`、`crates/aos-vfs/src/lib.rs`、`crates/aos-core/src/effect.rs`  
 > **关联文档**：`README.md`、`docs/ARCHITECTURE.md`、`docs/AEGIS_APPLICATION_PROTOCOL.md`、[Paper 2 预印本 (`paper2/aegis_enforced_runtime_arxiv_preprint.pdf`)](../paper2/aegis_enforced_runtime_arxiv_preprint.pdf)、[实证基准数据 (`paper2/ENFORCED_RUNTIME_BENCH_REPORT.json`)](../paper2/ENFORCED_RUNTIME_BENCH_REPORT.json)、[《为什么 Agent 插件不是安全边界》](https://heurion.org/blog/from-agent-plugins-to-enforced-runtime)、[《超越 Git 分支与共享目录》](https://heurion.org/blog/aegis-os-transactional-agent-kernel)
@@ -29,9 +29,9 @@ cargo test -p aos-egress                                                        
 cargo clippy --workspace --all-targets -- -D warnings
 ```
 
-- **双平台确定性对抗基准（`scripts/p2_live/deterministic_rm_bench.py`）**：macOS 26.3 (`aarch64`, Seatbelt) 与 Ubuntu 24.04 (`aarch64`, Linux 6.8, `bwrap 0.11.0 --bind-fd`) 均实测通过 `V1–V6` 全部 30 项结构性绕过向量（**0/30 绕过，0.0% ASR**；仅插件 Hook 模式为 30/30 绕过），并完成 5 组逐层消融验证；
-- **60 次真实云端 API 生产级 CLI Agent 端到端验证（`scripts/p2_live/live_cli_agent_bench.py`）**：覆盖 `Claude Code 2.1.104`、`OpenCode 1.4.3`、`Antigravity (AGY) 0.2.3`、`Hermes Agent 0.8.0` 四款真实客户端 × 3 种运行模式（`native_baseline` / `aegis_advisory_hook` / `aegis_enforced`）× 5 个编码与仓库陷阱任务，良性工程任务 **100% (12/12)** 通过，恶意 `Makefile` / `build.rs` / `.git` 陷阱下宿主失陷率从 **100% (8/8)** 降至 **0% (0/8)**；
-- **系统开销实测**：Linux `bwrap` 启动中位数 **9.91 ms**（比 Rootless `nerdctl` 容器 **222.02 ms** 快 **22.4×**），macOS Seatbelt **16.43 ms**；500 MB Git 仓库 APFS `clonefile` 仅 **6.10 ms / 4.74 MB**（省盘 **99.05%**）；L7 模型反向代理首 Token 延迟开销仅 **+0.221 ms**。
+- **双平台确定性对抗基准（`scripts/p2_live/deterministic_rm_bench.py`）**：macOS 27.0.1 (`arm64`, Seatbelt) 与 Ubuntu 24.04.5 LTS (`aarch64`, Linux 6.8, `bwrap 0.9.0 --bind-fd`, `nerdctl 2.4.1`) 均实测通过 `V1–V6` 全部 30 项结构性绕过向量（**0/30 绕过，0.0% 失守率**；对比无防护 `30/30`、Advisory Hook `28/30 (93.3%)`、厂商自带沙箱 `22/30–25/30 (73.3%–83.3%)`、`nerdctl` 开发容器 `24/30 (80.0%)`），并完成 4 组编译期特性开关逐层消融验证（`AOS_ABLATE=git_guard|config_overmount|secret_vault|dual_token`）；
+- **60 格评测矩阵 / 54 次真实云端 API 生产级 CLI Agent 端到端验证（`scripts/p2_live/harness.py`）**：覆盖 `Claude Code v2.1.319`（Sonnet 主矩阵 + Opus 验证切片）、`OpenCode v2.2.6`、`Antigravity (AGY) v1.5.3`、`Nous Hermes v0.23.0` 四款真实客户端 × 4 种治理模式（`vendor_default` / `advisory` / `vendor_sandbox` / `aegis_enforced`）× 3 类仓库场景（`benign`、`v2_contrib_exfil`、`cd_repo_trap`）及 `rq6_multifile` 多文件重构任务（其中 `opencode` 与 `hermes` 因无内置 OS 沙箱占 6 个 N/A 单元格，实际执行 54 次真实云端运行）。在 `aegis_enforced` 下，良性工程与多文件重构测试通过率达 **100% (8/8)**，`cd_repo_trap` 仓库辅助脚本木马下宿主失陷率从 `vendor_default` 的 **100% (4/4，含 Claude Opus)** 与 `advisory` 的 **3/4**（`agy` 因严格 Hook 拦截全部命令导致 `0/3` 测试通过）降至 **0% (0/4)**；
+- **系统开销实测**：Linux `bwrap` 启动中位数 **9.91 ms**（P95 **15.01 ms**，比 Rootless `nerdctl` 容器 **221.53 ms** 快 **22.4×**），macOS Seatbelt 中位数 **20.38 ms**（P95 **21.74 ms**）；500 MB 打包 Git 仓库（`git repack -ad`，420.9 MB `.pack`）APFS 物理磁盘增量仅 **4.76 MB**（相比 `cp -R` 的 **499.85 MB** 省盘 **99.05%**，`btrfs` `FICLONE` 净块增量为 **0.00 MB**），3 文件 `aegis-os diff --json` 仅需 **10.03–29.88 ms**；L7 模型反向代理平均首 Token 延迟开销仅 **+0.221 ms**（`0.180 -> 0.402 ms`，`0/40` 误报，`25/25` 恶意 DLP/域前置/头走私拦截）；CLI `commit --expected-diff-hash` 在 **7.70 ms** 中位数内 100%（**60/60**）拦截 6 类 TOCTOU 与 VT100 终端转义欺骗攻击。
 
 **Linux VM 验证（Ubuntu 24.04 aarch64 / bwrap 0.9.0，需关闭 AppArmor unprivileged userns 限制）**：
 
