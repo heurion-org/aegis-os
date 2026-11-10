@@ -35,6 +35,12 @@ Manuel Costa, Boris K{\"o}pf, Aashish Kolluri, Andrew Paverd, Mark Russinovich,
 \newblock Securing {AI} agents with information-flow control.
 \newblock {\em arXiv preprint}, arXiv:2505.23643, 2025.
 
+\bibitem{dagger2025containeruse}
+{Dagger}.
+\newblock {Container Use} ({\texttt{container-use}}): Isolated container and
+  {Git} worktree environments for coding agents.
+\newblock \url{https://github.com/dagger/container-use}, 2025.
+
 \bibitem{debenedetti2025camel}
 Edoardo Debenedetti, Ilia Shumailov, Tianqi Fan, Jamie Hayes, Nicholas Carlini,
   Daniel Fabian, Christoph Kern, Chongyang Shi, Andreas Terzis, and Florian
@@ -91,6 +97,12 @@ Edmund~B. Nightingale, Peter~M. Chen, and Jason Flinn.
 \newblock In {\em Proceedings of the ACM SIGOPS 20th Symposium on Operating
   Systems Principles (SOSP)}, pages 191--205, Brighton, United Kingdom, 2005.
   ACM.
+
+\bibitem{nvidia2026openshell}
+{NVIDIA}.
+\newblock {NVIDIA OpenShell}: Kernel-enforced container runtime and policy
+  control plane for autonomous {AI} agents.
+\newblock \url{https://github.com/NVIDIA/OpenShell}, 2026.
 
 \bibitem{openai2025codex}
 {OpenAI}.
