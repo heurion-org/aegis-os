@@ -52,16 +52,10 @@ const TOOLCHAIN_STAGE: &str = "/run/aegis/toolchain";
 const PROTECTED_AGENT_CONFIGS: &[&str] = &[
     ".claude/settings.json",
     ".claude/settings.local.json",
-    ".claude.json",
     ".codex/config.toml",
-    ".gemini/settings.json",
-    ".gemini/antigravity-cli/settings.json",
     ".gemini/config/hooks.json",
     ".gemini/config/mcp_config.json",
-    ".config/opencode/opencode.json",
-    ".config/opencode/opencode.jsonc",
     ".cursor/mcp.json",
-    ".hermes/config.yaml",
 ];
 
 const PROTECTED_AGENT_PLUGIN_DIRS: &[&str] = &[
@@ -169,6 +163,7 @@ struct FdMount {
 
 struct EgressGuard {
     handle: Option<tokio::task::JoinHandle<()>>,
+    cred_watch_handle: Option<tokio::task::JoinHandle<()>>,
     sock: Option<PathBuf>,
     egress_dir: PathBuf,
     temp_dir: Option<PathBuf>,
@@ -177,6 +172,9 @@ struct EgressGuard {
 impl Drop for EgressGuard {
     fn drop(&mut self) {
         if let Some(handle) = self.handle.take() {
+            handle.abort();
+        }
+        if let Some(handle) = self.cred_watch_handle.take() {
             handle.abort();
         }
         if let Some(ref sock) = self.sock {
@@ -592,13 +590,10 @@ fn ensure_protected_agent_configs(agent_home: &Path) -> anyhow::Result<()> {
     for (rel, stub) in [
         (".claude/settings.json", "{}\n"),
         (".claude/settings.local.json", "{}\n"),
-        (".gemini/settings.json", "{}\n"),
-        (".gemini/antigravity-cli/settings.json", "{}\n"),
         (".gemini/config/hooks.json", "{}\n"),
         (".gemini/config/mcp_config.json", "{}\n"),
         (".cursor/mcp.json", "{}\n"),
         (".codex/config.toml", "# protected by aegis-os\n"),
-        (".hermes/config.yaml", "{}\n"),
     ] {
         let p = agent_home.join(rel);
         if !p.exists() {
@@ -607,6 +602,13 @@ fn ensure_protected_agent_configs(agent_home: &Path) -> anyhow::Result<()> {
             }
             std::fs::write(&p, stub)?;
         }
+    }
+    let hermes_cfg = agent_home.join(".hermes/config.yaml");
+    if !hermes_cfg.exists() {
+        if let Some(parent) = hermes_cfg.parent() {
+            std::fs::create_dir_all(parent)?;
+        }
+        std::fs::write(&hermes_cfg, "{}\n")?;
     }
     for rel_dir in PROTECTED_AGENT_PLUGIN_DIRS {
         std::fs::create_dir_all(agent_home.join(rel_dir))?;
@@ -658,11 +660,13 @@ fn rewrite_opencode_config_for_l7(agent_home: &Path, proxy: &str) {
     if aos_core::ablated("secret_vault") {
         return;
     }
-    let cfg_path = agent_home.join(".config/opencode/opencode.json");
-    if cfg_path.is_file() {
-        if let Ok(existing) = std::fs::read_to_string(&cfg_path) {
-            let merged = opencode_l7_config_content(proxy, Some(&existing));
-            let _ = std::fs::write(&cfg_path, merged);
+    for rel in [".config/opencode/opencode.json", ".config/opencode/opencode.jsonc"] {
+        let cfg_path = agent_home.join(rel);
+        if cfg_path.is_file() {
+            if let Ok(existing) = std::fs::read_to_string(&cfg_path) {
+                let merged = opencode_l7_config_content(proxy, Some(&existing));
+                let _ = std::fs::write(&cfg_path, merged);
+            }
         }
     }
 }
@@ -1107,17 +1111,29 @@ fn sync_credentials(agent_home: &Path, host_home: &Path) {
     const CREDENTIAL_FILES: &[&str] = &[
         ".claude/.credentials.json",
         ".codex/auth.json",
-        ".local/share/opencode/auth.json",
+        ".hermes/auth.json",
+        ".gemini/oauth_creds.json",
+        ".gemini/google_accounts.json",
+        ".gemini/state.json",
+        ".gemini/antigravity-cli/oauth_creds.json",
+        ".gemini/antigravity-cli/google_accounts.json",
+        ".gemini/antigravity-cli/state.json",
     ];
     for rel in CREDENTIAL_FILES {
         let src = agent_home.join(rel);
         if !src.is_file() {
             continue;
         }
-        // Never overwrite host credentials with boundary-sanitized `$AOS_SECRET_*` placeholders.
+        // Never overwrite host credentials with boundary-sanitized `$AOS_SECRET_*` placeholders,
+        // and skip redundant writes when the file content has not changed.
         if let Ok(raw) = std::fs::read_to_string(&src) {
             if raw.contains("$AOS_SECRET_") {
                 continue;
+            }
+            if let Ok(existing) = std::fs::read_to_string(host_home.join(rel)) {
+                if existing == raw {
+                    continue;
+                }
             }
         }
         let dst = host_home.join(rel);
@@ -1126,7 +1142,7 @@ fn sync_credentials(agent_home: &Path, host_home: &Path) {
         };
         if std::fs::create_dir_all(parent).is_err() {
             continue;
-        }
+        };
         let tmp = parent.join(format!(".aegis-cred-{}-{}", std::process::id(), uuid::Uuid::new_v4().simple()));
         if std::fs::copy(&src, &tmp).is_err() {
             continue;
@@ -1141,6 +1157,272 @@ fn sync_credentials(agent_home: &Path, host_home: &Path) {
                 "aos run: warning: could not write back {}: {err}",
                 dst.display()
             );
+        }
+    }
+
+    // Merge OAuth login account metadata (`oauthAccount`, `hasCompletedOnboarding`, `userID`)
+    // written by Claude Code `/login` in `agent_home/.claude.json` back into `host_home/.claude.json`
+    // without touching host-owned `mcpServers` or security settings.
+    let agent_claude_json = agent_home.join(".claude.json");
+    if agent_claude_json.is_file() {
+        if let Ok(agent_raw) = std::fs::read_to_string(&agent_claude_json) {
+            if let Ok(Value::Object(agent_obj)) = serde_json::from_str::<Value>(&agent_raw) {
+                let host_claude_json = host_home.join(".claude.json");
+                let mut host_obj = std::fs::read_to_string(&host_claude_json)
+                    .ok()
+                    .and_then(|raw| serde_json::from_str::<Value>(&raw).ok())
+                    .and_then(|v| match v {
+                        Value::Object(map) => Some(map),
+                        _ => None,
+                    })
+                    .unwrap_or_default();
+                let mut changed = false;
+                for key in ["oauthAccount", "hasCompletedOnboarding", "userID"] {
+                    if let Some(val) = agent_obj.get(key) {
+                        if !val.is_null() && host_obj.get(key) != Some(val) {
+                            host_obj.insert(key.to_string(), val.clone());
+                            changed = true;
+                        }
+                    }
+                }
+                if changed {
+                    if let Ok(serialized) = serde_json::to_vec_pretty(&Value::Object(host_obj)) {
+                        let tmp = host_home.join(format!(
+                            ".aegis-claude-json-{}-{}",
+                            std::process::id(),
+                            uuid::Uuid::new_v4().simple()
+                        ));
+                        if std::fs::write(&tmp, serialized).is_ok() {
+                            if std::fs::rename(&tmp, &host_claude_json).is_err() {
+                                let _ = std::fs::remove_file(&tmp);
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    // Merge OAuth credentials (`google_credentials`) and user preferences written by `agy` / `gemini`
+    // inside `agent_home/.gemini/antigravity-cli/settings.json` and `agent_home/.gemini/settings.json`
+    // back into `host_home` without allowing sandbox modifications to `security`, `hooks`, `mcpServers`,
+    // `tools`, or `extensions`.
+    for rel_settings in [
+        ".gemini/antigravity-cli/settings.json",
+        ".gemini/settings.json",
+    ] {
+        let agent_settings = agent_home.join(rel_settings);
+        if !agent_settings.is_file() {
+            continue;
+        }
+        let Ok(agent_raw) = std::fs::read_to_string(&agent_settings) else {
+            continue;
+        };
+        if agent_raw.contains("$AOS_SECRET_") {
+            continue;
+        }
+        let Ok(Value::Object(agent_obj)) = serde_json::from_str::<Value>(&agent_raw) else {
+            continue;
+        };
+        let host_settings = host_home.join(rel_settings);
+        let mut host_obj = std::fs::read_to_string(&host_settings)
+            .ok()
+            .and_then(|raw| serde_json::from_str::<Value>(&raw).ok())
+            .and_then(|v| match v {
+                Value::Object(map) => Some(map),
+                _ => None,
+            })
+            .unwrap_or_default();
+        let mut changed = false;
+        for (key, val) in &agent_obj {
+            if matches!(
+                key.as_str(),
+                "security" | "hooks" | "mcpServers" | "tools" | "extensions"
+            ) {
+                continue;
+            }
+            if host_obj.get(key) != Some(val) {
+                host_obj.insert(key.clone(), val.clone());
+                changed = true;
+            }
+        }
+        if changed {
+            let Some(parent) = host_settings.parent() else {
+                continue;
+            };
+            if std::fs::create_dir_all(parent).is_err() {
+                continue;
+            }
+            if let Ok(serialized) = serde_json::to_vec_pretty(&Value::Object(host_obj)) {
+                let tmp = parent.join(format!(
+                    ".aegis-gemini-settings-{}-{}",
+                    std::process::id(),
+                    uuid::Uuid::new_v4().simple()
+                ));
+                if std::fs::write(&tmp, serialized).is_ok() {
+                    if std::fs::rename(&tmp, &host_settings).is_err() {
+                        let _ = std::fs::remove_file(&tmp);
+                    }
+                }
+            }
+        }
+    }
+
+    // Merge OpenCode credentials (`.local/share/opencode/auth.json`) provider-by-provider so
+    // `$AOS_SECRET_*` placeholders for already-configured API providers never prevent syncing a
+    // newly connected API key or OAuth token (`opencode auth login` / `/connect`) back to the host.
+    let agent_oc_auth = agent_home.join(".local/share/opencode/auth.json");
+    if agent_oc_auth.is_file() {
+        if let Ok(agent_raw) = std::fs::read_to_string(&agent_oc_auth) {
+            if let Ok(Value::Object(agent_obj)) = serde_json::from_str::<Value>(&agent_raw) {
+                let host_oc_auth = host_home.join(".local/share/opencode/auth.json");
+                let mut host_obj = std::fs::read_to_string(&host_oc_auth)
+                    .ok()
+                    .and_then(|raw| serde_json::from_str::<Value>(&raw).ok())
+                    .and_then(|v| match v {
+                        Value::Object(map) => Some(map),
+                        _ => None,
+                    })
+                    .unwrap_or_default();
+                let mut changed = false;
+                for (prov, entry) in agent_obj {
+                    let entry_str = entry.to_string();
+                    if entry_str.contains("$AOS_SECRET_") {
+                        continue;
+                    }
+                    if host_obj.get(&prov) != Some(&entry) {
+                        host_obj.insert(prov, entry);
+                        changed = true;
+                    }
+                }
+                if changed {
+                    if let Some(parent) = host_oc_auth.parent() {
+                        let _ = std::fs::create_dir_all(parent);
+                        if let Ok(serialized) = serde_json::to_vec_pretty(&Value::Object(host_obj))
+                        {
+                            let tmp = parent.join(format!(
+                                ".aegis-oc-auth-{}-{}",
+                                std::process::id(),
+                                uuid::Uuid::new_v4().simple()
+                            ));
+                            if std::fs::write(&tmp, serialized).is_ok() {
+                                {
+                                    use std::os::unix::fs::PermissionsExt;
+                                    let _ = std::fs::set_permissions(
+                                        &tmp,
+                                        std::fs::Permissions::from_mode(0o600),
+                                    );
+                                }
+                                if std::fs::rename(&tmp, &host_oc_auth).is_err() {
+                                    let _ = std::fs::remove_file(&tmp);
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+}
+
+fn restore_native_oauth_store_for_agent(
+    host_home: &Path,
+    agent_home: &Path,
+    command: &[String],
+    harvested_secrets: &std::collections::HashMap<String, String>,
+) {
+    use std::os::unix::fs::PermissionsExt;
+    if is_claude_command(command) && !harvested_secrets.contains_key("CLAUDE_CODE_OAUTH_TOKEN") {
+        let src = host_home.join(".claude/.credentials.json");
+        let dst = agent_home.join(".claude/.credentials.json");
+        if src.is_file() {
+            if let Ok(raw) = std::fs::read_to_string(&src) {
+                if !raw.contains("$AOS_SECRET_") {
+                    if let Some(parent) = dst.parent() {
+                        let _ = std::fs::create_dir_all(parent);
+                    }
+                    if std::fs::write(&dst, raw).is_ok() {
+                        let _ =
+                            std::fs::set_permissions(&dst, std::fs::Permissions::from_mode(0o600));
+                    }
+                }
+            }
+        }
+    }
+    if is_codex_command(command) && !harvested_secrets.contains_key("OPENAI_API_KEY") {
+        let src = host_home.join(".codex/auth.json");
+        let dst = agent_home.join(".codex/auth.json");
+        if src.is_file() {
+            if let Ok(raw) = std::fs::read_to_string(&src) {
+                if !raw.contains("$AOS_SECRET_") {
+                    if let Some(parent) = dst.parent() {
+                        let _ = std::fs::create_dir_all(parent);
+                    }
+                    if std::fs::write(&dst, raw).is_ok() {
+                        let _ =
+                            std::fs::set_permissions(&dst, std::fs::Permissions::from_mode(0o600));
+                    }
+                }
+            }
+        }
+    }
+    if is_hermes_command(command) {
+        let src = host_home.join(".hermes/auth.json");
+        let dst = agent_home.join(".hermes/auth.json");
+        if src.is_file() {
+            if let Ok(raw) = std::fs::read_to_string(&src) {
+                if !raw.contains("$AOS_SECRET_") {
+                    if let Some(parent) = dst.parent() {
+                        let _ = std::fs::create_dir_all(parent);
+                    }
+                    if std::fs::write(&dst, raw).is_ok() {
+                        let _ =
+                            std::fs::set_permissions(&dst, std::fs::Permissions::from_mode(0o600));
+                    }
+                }
+            }
+        }
+    }
+    if is_opencode_command(command) {
+        let src = host_home.join(".local/share/opencode/auth.json");
+        let dst = agent_home.join(".local/share/opencode/auth.json");
+        if src.is_file() {
+            if let Ok(host_raw) = std::fs::read_to_string(&src) {
+                if let Ok(Value::Object(host_map)) = serde_json::from_str::<Value>(&host_raw) {
+                    let mut dst_map = std::fs::read_to_string(&dst)
+                        .ok()
+                        .and_then(|raw| serde_json::from_str::<Value>(&raw).ok())
+                        .and_then(|v| match v {
+                            Value::Object(m) => Some(m),
+                            _ => None,
+                        })
+                        .unwrap_or_default();
+                    let mut changed = false;
+                    for (prov, entry) in host_map {
+                        let is_oauth = entry
+                            .get("type")
+                            .and_then(|v| v.as_str())
+                            .is_some_and(|t| t != "api");
+                        if is_oauth || opencode_provider_secret_spec(&prov).is_none() {
+                            dst_map.insert(prov, entry);
+                            changed = true;
+                        }
+                    }
+                    if changed {
+                        if let Some(parent) = dst.parent() {
+                            let _ = std::fs::create_dir_all(parent);
+                        }
+                        if let Ok(bytes) = serde_json::to_vec_pretty(&Value::Object(dst_map)) {
+                            if std::fs::write(&dst, bytes).is_ok() {
+                                let _ = std::fs::set_permissions(
+                                    &dst,
+                                    std::fs::Permissions::from_mode(0o600),
+                                );
+                            }
+                        }
+                    }
+                }
+            }
         }
     }
 }
@@ -2048,9 +2330,16 @@ pub(crate) async fn approvals_serve(
     Ok(())
 }
 
+fn is_aegis_shim_dir(dir: &Path) -> bool {
+    dir.ends_with(".aegis/bin")
+}
+
 fn find_in_path(bin: &str) -> Option<PathBuf> {
     let path = std::env::var_os("PATH")?;
     for dir in std::env::split_paths(&path) {
+        if is_aegis_shim_dir(&dir) {
+            continue;
+        }
         let candidate = dir.join(bin);
         if candidate.is_file() {
             return Some(candidate);
@@ -2161,7 +2450,15 @@ fn agent_mounts(
         bail!("aos run: no agent command given");
     };
     let found = if program.contains('/') {
-        Some(PathBuf::from(&program))
+        let candidate = PathBuf::from(&program);
+        if candidate.parent().is_some_and(is_aegis_shim_dir) {
+            candidate
+                .file_name()
+                .and_then(|n| n.to_str())
+                .and_then(find_in_path)
+        } else {
+            Some(candidate)
+        }
     } else {
         find_in_path(&program)
     };
@@ -2348,19 +2645,33 @@ fn harvest_host_secrets(
     }
 
     // 4. Host `~/.claude/.credentials.json` (Linux / cross-platform OAuth store)
+    // When running `claude` itself without an explicit `CLAUDE_CODE_OAUTH_TOKEN` in the caller's
+    // environment, do not inject `CLAUDE_CODE_OAUTH_TOKEN` into `process.env`. Setting
+    // `CLAUDE_CODE_OAUTH_TOKEN` in `process.env` prevents Claude Code from auto-refreshing
+    // expired OAuth tokens via `refreshToken`, triggers a warning during `/login`, and breaks
+    // direct HTTPS CONNECT calls to `api.anthropic.com/api/oauth/*`. Instead, `claude` uses its
+    // isolated `agent_home/.claude/.credentials.json` (while non-Claude agents like `hermes`
+    // continue to receive the boundary-injected placeholder if valid).
     let has_anthropic = secrets.contains_key("ANTHROPIC_API_KEY")
         || secrets.contains_key("ANTHROPIC_AUTH_TOKEN")
         || secrets.contains_key("CLAUDE_CODE_OAUTH_TOKEN");
-    if !has_anthropic {
+    if !has_anthropic && !is_claude_command(command) {
         if let Ok(raw) = std::fs::read_to_string(host_home.join(".claude/.credentials.json")) {
             if let Ok(val) = serde_json::from_str::<Value>(&raw) {
-                if let Some(tok) = val
-                    .pointer("/claudeAiOauth/accessToken")
-                    .and_then(|v| v.as_str())
-                    .map(str::trim)
-                    .filter(|s| !s.is_empty() && !s.contains("$AOS_SECRET_"))
-                {
-                    secrets.insert("CLAUDE_CODE_OAUTH_TOKEN".to_string(), tok.to_string());
+                let now_ms = chrono::Utc::now().timestamp_millis();
+                let expired = val
+                    .pointer("/claudeAiOauth/expiresAt")
+                    .and_then(|v| v.as_i64())
+                    .is_some_and(|exp| exp > 0 && exp <= now_ms + 60_000);
+                if !expired {
+                    if let Some(tok) = val
+                        .pointer("/claudeAiOauth/accessToken")
+                        .and_then(|v| v.as_str())
+                        .map(str::trim)
+                        .filter(|s| !s.is_empty() && !s.contains("$AOS_SECRET_"))
+                    {
+                        secrets.insert("CLAUDE_CODE_OAUTH_TOKEN".to_string(), tok.to_string());
+                    }
                 }
             }
         }
@@ -2446,6 +2757,8 @@ async fn register_boundary_secrets(
 async fn start_egress(
     identity: &AgentIdentity,
     session_dir: &Path,
+    agent_home: &Path,
+    host_home: &Path,
     harvested_secrets: &std::collections::HashMap<String, String>,
 ) -> anyhow::Result<(EgressGuard, String, String)> {
     let gateway = Arc::new(AegisEgressGateway::new());
@@ -2460,7 +2773,9 @@ async fn start_egress(
         "www.googleapis.com",
         "sts.googleapis.com",
         "iamcredentials.googleapis.com",
+        "play.googleapis.com",
         "antigravity.google.com",
+        "antigravity-cli-auto-updater-974169037036.us-central1.run.app",
         "api.deepseek.com",
         "api.mistral.ai",
         "api.groq.com",
@@ -2470,6 +2785,15 @@ async fn start_egress(
         "opencode.ai",
         "api.opencode.ai",
         "models.dev",
+        "portal.nousresearch.com",
+        "inference-api.nousresearch.com",
+        "api.nousresearch.com",
+        "api.together.xyz",
+        "api.fireworks.ai",
+        "huggingface.co",
+        "router.huggingface.co",
+        "api.githubcopilot.com",
+        "copilot-proxy.githubusercontent.com",
         "claude.ai",
         "platform.claude.com",
         "console.anthropic.com",
@@ -2504,6 +2828,109 @@ async fn start_egress(
     }
     gateway.allow_domains(&identity.org_id, domains).await;
     register_boundary_secrets(&gateway, identity, harvested_secrets).await;
+    let gw_watch = gateway.clone();
+    let id_watch = identity.clone();
+    let agent_home_watch = agent_home.to_path_buf();
+    let host_home_watch = host_home.to_path_buf();
+    let cred_watch_handle = tokio::spawn(async move {
+        let mut last_creds = std::fs::read_to_string(agent_home_watch.join(".claude/.credentials.json"))
+            .unwrap_or_default();
+        let mut last_claude_json = std::fs::read_to_string(agent_home_watch.join(".claude.json"))
+            .unwrap_or_default();
+        let mut last_agy_settings =
+            std::fs::read_to_string(agent_home_watch.join(".gemini/antigravity-cli/settings.json"))
+                .unwrap_or_default();
+        let mut last_gemini_settings =
+            std::fs::read_to_string(agent_home_watch.join(".gemini/settings.json"))
+                .unwrap_or_default();
+        let mut last_oc_auth =
+            std::fs::read_to_string(agent_home_watch.join(".local/share/opencode/auth.json"))
+                .unwrap_or_default();
+        let mut last_hermes_auth =
+            std::fs::read_to_string(agent_home_watch.join(".hermes/auth.json"))
+                .unwrap_or_default();
+        loop {
+            tokio::time::sleep(std::time::Duration::from_millis(250)).await;
+            let mut need_sync = false;
+            if let Ok(raw) = std::fs::read_to_string(agent_home_watch.join(".claude/.credentials.json")) {
+                if raw != last_creds && !raw.contains("$AOS_SECRET_") {
+                    last_creds = raw.clone();
+                    need_sync = true;
+                    if let Ok(val) = serde_json::from_str::<Value>(&raw) {
+                        if let Some(tok) = val
+                            .pointer("/claudeAiOauth/accessToken")
+                            .and_then(|v| v.as_str())
+                            .map(str::trim)
+                            .filter(|s| !s.is_empty() && !s.contains("$AOS_SECRET_"))
+                        {
+                            let mut map = std::collections::HashMap::new();
+                            map.insert("CLAUDE_CODE_OAUTH_TOKEN".to_string(), tok.to_string());
+                            register_boundary_secrets(&gw_watch, &id_watch, &map).await;
+                        }
+                    }
+                }
+            }
+            if let Ok(raw_json) = std::fs::read_to_string(agent_home_watch.join(".claude.json")) {
+                if raw_json != last_claude_json {
+                    last_claude_json = raw_json;
+                    need_sync = true;
+                }
+            }
+            if let Ok(raw_agy) =
+                std::fs::read_to_string(agent_home_watch.join(".gemini/antigravity-cli/settings.json"))
+            {
+                if raw_agy != last_agy_settings {
+                    last_agy_settings = raw_agy;
+                    need_sync = true;
+                }
+            }
+            if let Ok(raw_gem) =
+                std::fs::read_to_string(agent_home_watch.join(".gemini/settings.json"))
+            {
+                if raw_gem != last_gemini_settings {
+                    last_gemini_settings = raw_gem;
+                    need_sync = true;
+                }
+            }
+            if let Ok(raw_oc) =
+                std::fs::read_to_string(agent_home_watch.join(".local/share/opencode/auth.json"))
+            {
+                if raw_oc != last_oc_auth {
+                    last_oc_auth = raw_oc.clone();
+                    need_sync = true;
+                    if let Ok(Value::Object(map)) = serde_json::from_str::<Value>(&raw_oc) {
+                        let mut new_secrets = std::collections::HashMap::new();
+                        for (prov, entry) in map {
+                            if let Some((env_key, _)) = opencode_provider_secret_spec(&prov) {
+                                if let Some(val) = entry
+                                    .get("key")
+                                    .and_then(|v| v.as_str())
+                                    .map(str::trim)
+                                    .filter(|s| !s.is_empty() && !s.contains("$AOS_SECRET_"))
+                                {
+                                    new_secrets.insert(env_key.to_string(), val.to_string());
+                                }
+                            }
+                        }
+                        if !new_secrets.is_empty() {
+                            register_boundary_secrets(&gw_watch, &id_watch, &new_secrets).await;
+                        }
+                    }
+                }
+            }
+            if let Ok(raw_hermes) =
+                std::fs::read_to_string(agent_home_watch.join(".hermes/auth.json"))
+            {
+                if raw_hermes != last_hermes_auth {
+                    last_hermes_auth = raw_hermes;
+                    need_sync = true;
+                }
+            }
+            if need_sync {
+                sync_credentials(&agent_home_watch, &host_home_watch);
+            }
+        }
+    });
     let proxy = gateway
         .start_local_proxy_with_bound_identity("127.0.0.1:0", Some(identity.clone()))
         .await?;
@@ -2520,6 +2947,7 @@ async fn start_egress(
         Ok((
             EgressGuard {
                 handle: None,
+                cred_watch_handle: Some(cred_watch_handle),
                 sock: None,
                 egress_dir,
                 temp_dir: None,
@@ -2549,6 +2977,7 @@ async fn start_egress(
         Ok((
             EgressGuard {
                 handle: Some(handle),
+                cred_watch_handle: Some(cred_watch_handle),
                 sock: Some(sock),
                 egress_dir,
                 temp_dir,
@@ -2575,10 +3004,57 @@ fn l7_base_url_envs(proxy: &str) -> Vec<(&'static str, String)> {
     ]
 }
 
+fn strip_jsonc_comments(input: &str) -> String {
+    let mut out = String::with_capacity(input.len());
+    let mut chars = input.chars().peekable();
+    let mut in_string = false;
+    let mut escaped = false;
+    while let Some(c) = chars.next() {
+        if in_string {
+            out.push(c);
+            if escaped {
+                escaped = false;
+            } else if c == '\\' {
+                escaped = true;
+            } else if c == '"' {
+                in_string = false;
+            }
+            continue;
+        }
+        if c == '"' {
+            in_string = true;
+            out.push(c);
+        } else if c == '/' && chars.peek() == Some(&'/') {
+            let _ = chars.next();
+            for nc in chars.by_ref() {
+                if nc == '\n' {
+                    out.push('\n');
+                    break;
+                }
+            }
+        } else if c == '/' && chars.peek() == Some(&'*') {
+            let _ = chars.next();
+            while let Some(nc) = chars.next() {
+                if nc == '*' && chars.peek() == Some(&'/') {
+                    let _ = chars.next();
+                    break;
+                }
+            }
+        } else {
+            out.push(c);
+        }
+    }
+    out
+}
+
 fn opencode_l7_config_content(proxy: &str, existing: Option<&str>) -> String {
     let base = format!("http://{proxy}/__aegis/base");
     let mut root = existing
-        .and_then(|raw| serde_json::from_str::<Value>(raw).ok())
+        .and_then(|raw| {
+            serde_json::from_str::<Value>(raw)
+                .or_else(|_| serde_json::from_str::<Value>(&strip_jsonc_comments(raw)))
+                .ok()
+        })
         .filter(|v| v.is_object())
         .unwrap_or_else(|| json!({}));
     let providers = json!({
@@ -2596,13 +3072,27 @@ fn opencode_l7_config_content(proxy: &str, existing: Option<&str>) -> String {
             .or_insert_with(|| json!({}));
         if let (Some(dst), Some(src)) = (prov_entry.as_object_mut(), providers.as_object()) {
             for (k, v) in src {
-                dst.entry(k.clone()).or_insert_with(|| v.clone());
+                let entry = dst.entry(k.clone()).or_insert_with(|| json!({}));
+                if let (Some(entry_obj), Some(src_opts)) = (
+                    entry.as_object_mut(),
+                    v.get("options").and_then(|o| o.as_object()),
+                ) {
+                    let opts = entry_obj
+                        .entry("options".to_string())
+                        .or_insert_with(|| json!({}));
+                    if let Some(opts_obj) = opts.as_object_mut() {
+                        for (ok, ov) in src_opts {
+                            opts_obj.entry(ok.clone()).or_insert_with(|| ov.clone());
+                        }
+                    }
+                }
             }
         }
     }
     serde_json::to_string(&root).unwrap_or_else(|_| "{}".to_string())
 }
 
+#[cfg_attr(not(target_os = "macos"), allow(dead_code))]
 fn canonicalize_allowing_missing(path: &Path) -> PathBuf {
     if let Ok(canon) = std::fs::canonicalize(path) {
         return canon;
@@ -3460,6 +3950,22 @@ fn probe_bwrap_userns(path: &Path) -> Result<(), String> {
     })
 }
 
+fn is_claude_command(command: &[String]) -> bool {
+    command
+        .first()
+        .and_then(|c| Path::new(c).file_name())
+        .and_then(|s| s.to_str())
+        .is_some_and(|name| name == "claude" || name.starts_with("claude-"))
+}
+
+fn is_codex_command(command: &[String]) -> bool {
+    command
+        .first()
+        .and_then(|c| Path::new(c).file_name())
+        .and_then(|s| s.to_str())
+        .is_some_and(|name| name == "codex" || name.starts_with("codex-"))
+}
+
 fn is_opencode_command(command: &[String]) -> bool {
     command
         .first()
@@ -3476,6 +3982,7 @@ fn is_hermes_command(command: &[String]) -> bool {
         .is_some_and(|name| name == "hermes" || name.starts_with("hermes-"))
 }
 
+#[cfg_attr(not(target_os = "macos"), allow(dead_code))]
 fn is_informational_agent_invocation(command: &[String]) -> bool {
     command
         .iter()
@@ -3711,17 +4218,14 @@ async fn run_inner(
 
     let mut command = command.to_vec();
     if is_opencode_command(&command) {
-        if command.iter().any(|arg| arg == "--server") {
-            bail!(
-                "aos run: OpenCode --server can connect to the host's shared background service \
-                 and bypass the sandbox; use --standalone inside aos run"
-            );
-        }
-        let informational = command
+        if command
             .iter()
-            .any(|arg| matches!(arg.as_str(), "--version" | "--help" | "-V" | "-h"));
-        if !informational && !command.iter().any(|arg| arg == "--standalone") {
-            command.insert(1, "--standalone".to_string());
+            .any(|arg| arg == "--server" || arg.starts_with("--server=") || arg == "attach")
+        {
+            bail!(
+                "aos run: OpenCode --server / attach can connect to the host's shared background service \
+                 and bypass the sandbox"
+            );
         }
     }
 
@@ -3769,6 +4273,7 @@ async fn run_inner(
     let _ = std::fs::set_permissions(&session_dir, std::fs::Permissions::from_mode(0o700));
     let _ = std::fs::set_permissions(&agent_home, std::fs::Permissions::from_mode(0o700));
     seed_agent_home(host_home, &agent_home)?;
+    restore_native_oauth_store_for_agent(host_home, &agent_home, &orig_command, &harvested_secrets);
     for rel in [".run", ".cache", ".local/share", ".local/state", ".cargo/registry", ".cargo/git", ".rustup/toolchains"] {
         std::fs::create_dir_all(agent_home.join(rel))?;
     }
@@ -3797,7 +4302,8 @@ async fn run_inner(
         .unwrap_or(false);
     let (egress_guard, proxy, bridge_token, network_shared, command) = if egress_enabled {
         let (guard, proxy, token) =
-            start_egress(&identity, &session_dir, &harvested_secrets).await?;
+            start_egress(&identity, &session_dir, &agent_home, host_home, &harvested_secrets)
+                .await?;
         rewrite_hermes_config_for_l7(&agent_home, &proxy, None);
         rewrite_opencode_config_for_l7(&agent_home, &proxy);
         let exe_name = exe
@@ -3997,7 +4503,12 @@ async fn run_inner(
     // Real terminals get a PTY so TUI clients keep raw mode, mouse input and window resizing.
     // Pipes / CI keep the inherited-stdio path to avoid injecting terminal control sequences.
     if std::io::stdin().is_terminal() && std::io::stdout().is_terminal() {
-        let args = plan.linux_args();
+        let mut args = plan.linux_args();
+        // `run_pty_command` allocates a dedicated PTY pair (`openpty`) and calls `setsid()` +
+        // `TIOCSCTTY` on the child's slave fd, which already isolates the host terminal from
+        // `TIOCSTI`. Stripping `--new-session` prevents `bwrap` from calling `setsid()` a second
+        // time and detaching `/dev/tty` inside the sandbox.
+        args.retain(|a| a != "--new-session");
         return run_pty_command(
             &plan.bwrap.to_string_lossy(),
             &args,
@@ -4147,6 +4658,7 @@ async fn run_macos_inner(
     let _ = std::fs::set_permissions(&session_dir, std::fs::Permissions::from_mode(0o700));
     let _ = std::fs::set_permissions(&agent_home, std::fs::Permissions::from_mode(0o700));
     seed_agent_home(host_home, &agent_home)?;
+    restore_native_oauth_store_for_agent(host_home, &agent_home, command, &harvested_secrets);
     for rel in [".run", ".cache", ".local/share", ".local/state", "tmp"] {
         std::fs::create_dir_all(agent_home.join(rel))?;
     }
@@ -4187,7 +4699,7 @@ async fn run_macos_inner(
     }
 
     let (_egress_guard, proxy, _bridge_token) =
-        start_egress(identity, &session_dir, &harvested_secrets).await?;
+        start_egress(identity, &session_dir, &agent_home, host_home, &harvested_secrets).await?;
     rewrite_hermes_config_for_l7(&agent_home, &proxy, hermes_pinned_port);
     rewrite_opencode_config_for_l7(&agent_home, &proxy);
     let broker = crate::session_broker::SessionBroker::start(
@@ -4446,6 +4958,7 @@ async fn run_macos_inner(
     }
 }
 
+#[cfg_attr(not(target_os = "macos"), allow(dead_code))]
 #[allow(clippy::too_many_arguments)]
 async fn run_plain_command(
     program: &str,
@@ -4494,6 +5007,39 @@ async fn run_plain_command(
     Ok(effective)
 }
 
+struct RawTerminalGuard {
+    fd: libc::c_int,
+    orig: Option<libc::termios>,
+}
+
+impl RawTerminalGuard {
+    fn enter(fd: libc::c_int) -> Self {
+        let mut orig: libc::termios = unsafe { std::mem::zeroed() };
+        if unsafe { libc::tcgetattr(fd, &mut orig) } != 0 {
+            return Self { fd, orig: None };
+        }
+        let mut raw = orig;
+        unsafe {
+            libc::cfmakeraw(&mut raw);
+            let _ = libc::tcsetattr(fd, libc::TCSANOW, &raw);
+        }
+        Self {
+            fd,
+            orig: Some(orig),
+        }
+    }
+}
+
+impl Drop for RawTerminalGuard {
+    fn drop(&mut self) {
+        if let Some(ref orig) = self.orig.take() {
+            unsafe {
+                let _ = libc::tcsetattr(self.fd, libc::TCSADRAIN, orig);
+            }
+        }
+    }
+}
+
 #[allow(clippy::too_many_arguments)]
 async fn run_pty_command(
     program: &str,
@@ -4522,11 +5068,15 @@ async fn run_pty_command(
         return Err(std::io::Error::last_os_error()).context("allocating a PTY");
     }
 
-    // Preserve the caller's raw-mode termios so TUI clients see the same input semantics.
+    // Seed the slave PTY with the caller's initial termios before switching the host terminal
+    // into raw passthrough mode (`cfmakeraw`), so arrow keys, Esc, and terminal capability
+    // replies are forwarded byte-by-byte to the sandbox PTY without local canonical buffering or
+    // echo on the host tty.
     let mut term: libc::termios = unsafe { std::mem::zeroed() };
     if unsafe { libc::tcgetattr(libc::STDIN_FILENO, &mut term) } == 0 {
         let _ = unsafe { libc::tcsetattr(slave, libc::TCSANOW, &term) };
     }
+    let raw_guard = RawTerminalGuard::enter(libc::STDIN_FILENO);
 
     let master_file = unsafe { File::from_raw_fd(master) };
     let slave_file = unsafe { File::from_raw_fd(slave) };
@@ -4571,12 +5121,32 @@ async fn run_pty_command(
     let mut reader = master_file.try_clone()?;
     let mut writer = master_file.try_clone()?;
     std::thread::spawn(move || {
-        let mut out = std::io::stdout().lock();
-        let _ = std::io::copy(&mut reader, &mut out);
+        use std::io::{Read, Write};
+        let mut buf = [0u8; 8192];
+        let mut out = std::io::stdout();
+        while let Ok(n) = reader.read(&mut buf) {
+            if n == 0 {
+                break;
+            }
+            if out.write_all(&buf[..n]).is_err() {
+                break;
+            }
+            let _ = out.flush();
+        }
     });
     std::thread::spawn(move || {
-        let mut input = std::io::stdin().lock();
-        let _ = std::io::copy(&mut input, &mut writer);
+        use std::io::{Read, Write};
+        let mut buf = [0u8; 1024];
+        let mut input = std::io::stdin();
+        while let Ok(n) = input.read(&mut buf) {
+            if n == 0 {
+                break;
+            }
+            if writer.write_all(&buf[..n]).is_err() {
+                break;
+            }
+            let _ = writer.flush();
+        }
     });
 
     let pid = child.id();
@@ -4590,6 +5160,7 @@ async fn run_pty_command(
         tokio::select! {
             status = &mut wait => {
                 let status = status??;
+                drop(raw_guard);
                 let code = exit_code(status);
                 sync_credentials(agent_home, host_home);
                 let pending = print_exit_summary(session_dir, host_project, shadow).await;
@@ -4600,6 +5171,7 @@ async fn run_pty_command(
             signal = tokio::signal::ctrl_c() => {
                 if signal.is_err() {
                     let status = wait.await??;
+                    drop(raw_guard);
                     let code = exit_code(status);
                     sync_credentials(agent_home, host_home);
                     let pending = print_exit_summary(session_dir, host_project, shadow).await;
@@ -5727,5 +6299,278 @@ mod tests {
                     .exists()
             });
         assert!(shadow_write, "the write must land in the session shadow");
+    }
+
+    #[test]
+    fn raw_terminal_guard_disables_canonical_echo_and_restores_on_drop() {
+        let mut master: libc::c_int = -1;
+        let mut slave: libc::c_int = -1;
+        assert_eq!(
+            unsafe {
+                libc::openpty(
+                    &mut master,
+                    &mut slave,
+                    std::ptr::null_mut(),
+                    std::ptr::null_mut(),
+                    std::ptr::null_mut(),
+                )
+            },
+            0
+        );
+        let mut before: libc::termios = unsafe { std::mem::zeroed() };
+        assert_eq!(unsafe { libc::tcgetattr(slave, &mut before) }, 0);
+        assert_ne!(before.c_lflag & (libc::ICANON | libc::ECHO), 0);
+
+        {
+            let _guard = super::RawTerminalGuard::enter(slave);
+            let mut raw: libc::termios = unsafe { std::mem::zeroed() };
+            assert_eq!(unsafe { libc::tcgetattr(slave, &mut raw) }, 0);
+            assert_eq!(raw.c_lflag & (libc::ICANON | libc::ECHO), 0);
+        }
+
+        let mut after: libc::termios = unsafe { std::mem::zeroed() };
+        assert_eq!(unsafe { libc::tcgetattr(slave, &mut after) }, 0);
+        assert_eq!(after.c_lflag & (libc::ICANON | libc::ECHO), before.c_lflag & (libc::ICANON | libc::ECHO));
+        unsafe {
+            libc::close(slave);
+            libc::close(master);
+        }
+    }
+
+    #[test]
+    fn claude_oauth_store_and_account_metadata_roundtrip_cleanly() {
+        assert!(
+            !PROTECTED_AGENT_CONFIGS.contains(&".claude.json"),
+            ".claude.json must remain writable in agent_home for /login and turn state"
+        );
+        assert!(
+            !PROTECTED_AGENT_CONFIGS.contains(&".gemini/antigravity-cli/settings.json")
+                && !PROTECTED_AGENT_CONFIGS.contains(&".gemini/settings.json"),
+            "agy and gemini settings.json must remain writable in agent_home for atomic rename during OAuth login"
+        );
+        let tmp = tempfile::tempdir().unwrap();
+        let host_home = tmp.path().join("host");
+        let agent_home = tmp.path().join("agent");
+        std::fs::create_dir_all(host_home.join(".claude")).unwrap();
+        std::fs::write(
+            host_home.join(".claude/.credentials.json"),
+            r#"{"claudeAiOauth":{"accessToken":"sk-ant-oat01-initial","refreshToken":"sk-ant-ort01-refresh","expiresAt":1}}"#,
+        )
+        .unwrap();
+        std::fs::write(
+            host_home.join(".claude.json"),
+            r#"{"mcpServers":{"aegis-os":{"command":"aegis-os"}}}"#,
+        )
+        .unwrap();
+
+        let claude_cmd = vec!["claude".to_string()];
+        let harvested_claude = harvest_host_secrets(&host_home, &claude_cmd);
+        assert!(
+            !harvested_claude.contains_key("CLAUDE_CODE_OAUTH_TOKEN")
+                || std::env::var("CLAUDE_CODE_OAUTH_TOKEN").is_ok(),
+            "harvest_host_secrets must not inject CLAUDE_CODE_OAUTH_TOKEN from .credentials.json for claude"
+        );
+
+        seed_agent_home(&host_home, &agent_home).unwrap();
+        let empty_harvested = std::collections::HashMap::new();
+        restore_native_oauth_store_for_agent(
+            &host_home,
+            &agent_home,
+            &claude_cmd,
+            &empty_harvested,
+        );
+        assert!(
+            agent_home.join(".claude/.credentials.json").is_file(),
+            "claude session must receive its native .credentials.json store"
+        );
+
+        // Simulate `/login` updating `.claude/.credentials.json` and `.claude.json` inside the sandbox.
+        std::fs::write(
+            agent_home.join(".claude/.credentials.json"),
+            r#"{"claudeAiOauth":{"accessToken":"sk-ant-oat01-fresh","refreshToken":"sk-ant-ort01-fresh"}}"#,
+        )
+        .unwrap();
+        std::fs::write(
+            agent_home.join(".claude.json"),
+            r#"{"oauthAccount":{"accountUuid":"acc_123","emailAddress":"dev@example.com"},"hasCompletedOnboarding":true,"mcpServers":{"evil":{"command":"sh"}}}"#,
+        )
+        .unwrap();
+
+        sync_credentials(&agent_home, &host_home);
+
+        let synced_creds =
+            std::fs::read_to_string(host_home.join(".claude/.credentials.json")).unwrap();
+        assert!(synced_creds.contains("sk-ant-oat01-fresh"));
+
+        let synced_claude_json: Value = serde_json::from_str(
+            &std::fs::read_to_string(host_home.join(".claude.json")).unwrap(),
+        )
+        .unwrap();
+        assert_eq!(
+            synced_claude_json
+                .pointer("/oauthAccount/accountUuid")
+                .and_then(|v| v.as_str()),
+            Some("acc_123")
+        );
+        assert_eq!(
+            synced_claude_json
+                .get("hasCompletedOnboarding")
+                .and_then(|v| v.as_bool()),
+            Some(true)
+        );
+        assert!(
+            synced_claude_json.pointer("/mcpServers/evil").is_none(),
+            "sync_credentials must never copy sandbox mcpServers modifications to host .claude.json"
+        );
+        assert!(
+            synced_claude_json.pointer("/mcpServers/aegis-os").is_some(),
+            "host .claude.json mcpServers must remain intact"
+        );
+    }
+
+    #[test]
+    fn opencode_and_hermes_oauth_and_configs_roundtrip_cleanly() {
+        assert!(
+            !PROTECTED_AGENT_CONFIGS.contains(&".config/opencode/opencode.json")
+                && !PROTECTED_AGENT_CONFIGS.contains(&".config/opencode/opencode.jsonc")
+                && !PROTECTED_AGENT_CONFIGS.contains(&".hermes/config.yaml"),
+            "opencode and hermes primary config files must remain writable in agent_home for atomic rename"
+        );
+
+        let jsonc_input = r#"{
+            // User custom theme and instructions
+            "theme": "tokyonight",
+            /* Multi-line comment with "url": "http://ignore.me" */
+            "provider": {
+                "anthropic": {
+                    "options": { "timeout": 60000 }
+                }
+            }
+        }"#;
+        let rewritten_jsonc =
+            opencode_l7_config_content("127.0.0.1:40101", Some(jsonc_input));
+        let parsed_jsonc: Value = serde_json::from_str(&rewritten_jsonc).unwrap();
+        assert_eq!(
+            parsed_jsonc.get("theme").and_then(|v| v.as_str()),
+            Some("tokyonight")
+        );
+        assert_eq!(
+            parsed_jsonc
+                .pointer("/provider/anthropic/options/baseURL")
+                .and_then(|v| v.as_str()),
+            Some("http://127.0.0.1:40101/__aegis/base/anthropic/v1")
+        );
+        assert_eq!(
+            parsed_jsonc
+                .pointer("/provider/anthropic/options/timeout")
+                .and_then(|v| v.as_i64()),
+            Some(60000)
+        );
+
+        let tmp = tempfile::tempdir().unwrap();
+        let host_home = tmp.path().join("host");
+        let agent_home = tmp.path().join("agent");
+        std::fs::create_dir_all(host_home.join(".local/share/opencode")).unwrap();
+        std::fs::create_dir_all(host_home.join(".hermes")).unwrap();
+        std::fs::write(
+            host_home.join(".local/share/opencode/auth.json"),
+            r#"{"anthropic":{"type":"api","key":"sk-ant-real-host-secret"},"github-copilot":{"type":"oauth","refresh":"ghr_initial","access":"ghu_initial","expires":123}}"#,
+        )
+        .unwrap();
+        std::fs::write(
+            host_home.join(".hermes/auth.json"),
+            r#"{"nous":{"access_token":"nous-initial-token","refresh_token":"nous-refresh"}}"#,
+        )
+        .unwrap();
+
+        let opencode_cmd = vec!["opencode".to_string()];
+        let harvested_opencode = harvest_host_secrets(&host_home, &opencode_cmd);
+        assert_eq!(
+            harvested_opencode.get("ANTHROPIC_API_KEY").map(|s| s.as_str()),
+            Some("sk-ant-real-host-secret")
+        );
+
+        seed_agent_home(&host_home, &agent_home).unwrap();
+        restore_native_oauth_store_for_agent(
+            &host_home,
+            &agent_home,
+            &opencode_cmd,
+            &harvested_opencode,
+        );
+
+        let seeded_opencode_auth: Value = serde_json::from_str(
+            &std::fs::read_to_string(agent_home.join(".local/share/opencode/auth.json")).unwrap(),
+        )
+        .unwrap();
+        assert_eq!(
+            seeded_opencode_auth
+                .pointer("/anthropic/key")
+                .and_then(|v| v.as_str()),
+            Some("$AOS_SECRET_ANTHROPIC_API_KEY"),
+            "L7 API key in agent_home must stay scrubbed with placeholder"
+        );
+        assert_eq!(
+            seeded_opencode_auth
+                .pointer("/github-copilot/access")
+                .and_then(|v| v.as_str()),
+            Some("ghu_initial"),
+            "OAuth entry in opencode auth.json must be preserved in agent_home"
+        );
+
+        // Simulate user running `/connect` in opencode to add OpenAI while Anthropic still has placeholder.
+        std::fs::write(
+            agent_home.join(".local/share/opencode/auth.json"),
+            r#"{"anthropic":{"type":"api","key":"$AOS_SECRET_ANTHROPIC_API_KEY"},"github-copilot":{"type":"oauth","refresh":"ghr_fresh","access":"ghu_fresh","expires":456},"openai":{"type":"api","key":"sk-proj-newly-connected"}}"#,
+        )
+        .unwrap();
+
+        let hermes_cmd = vec!["hermes".to_string()];
+        restore_native_oauth_store_for_agent(
+            &host_home,
+            &agent_home,
+            &hermes_cmd,
+            &std::collections::HashMap::new(),
+        );
+        assert!(
+            agent_home.join(".hermes/auth.json").is_file(),
+            "hermes session must receive its native .hermes/auth.json store"
+        );
+        std::fs::write(
+            agent_home.join(".hermes/auth.json"),
+            r#"{"nous":{"access_token":"nous-fresh-token","refresh_token":"nous-fresh-refresh"}}"#,
+        )
+        .unwrap();
+
+        sync_credentials(&agent_home, &host_home);
+
+        let synced_opencode_auth: Value = serde_json::from_str(
+            &std::fs::read_to_string(host_home.join(".local/share/opencode/auth.json")).unwrap(),
+        )
+        .unwrap();
+        assert_eq!(
+            synced_opencode_auth
+                .pointer("/anthropic/key")
+                .and_then(|v| v.as_str()),
+            Some("sk-ant-real-host-secret"),
+            "sync_credentials must preserve real host secret when agent_home has L7 placeholder"
+        );
+        assert_eq!(
+            synced_opencode_auth
+                .pointer("/openai/key")
+                .and_then(|v| v.as_str()),
+            Some("sk-proj-newly-connected"),
+            "sync_credentials must merge newly connected provider keys from agent_home"
+        );
+        assert_eq!(
+            synced_opencode_auth
+                .pointer("/github-copilot/access")
+                .and_then(|v| v.as_str()),
+            Some("ghu_fresh"),
+            "sync_credentials must update refreshed OAuth tokens in opencode auth.json"
+        );
+
+        let synced_hermes_auth =
+            std::fs::read_to_string(host_home.join(".hermes/auth.json")).unwrap();
+        assert!(synced_hermes_auth.contains("nous-fresh-token"));
     }
 }

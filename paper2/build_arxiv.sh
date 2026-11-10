@@ -11,16 +11,24 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 cd "$SCRIPT_DIR"
 
 echo "[1/5] Compiling main.tex with Tectonic to generate fresh PDF and precompiled main.bbl..."
-if [ ! -d "$HOME/Library/Caches/TectonicProject.Tectonic" ] && [ -d "/Users/huizhao/Library/Caches/TectonicProject.Tectonic" ]; then
-  mkdir -p "$HOME/Library/Caches"
-  cp -cR /Users/huizhao/Library/Caches/TectonicProject.Tectonic "$HOME/Library/Caches/"
+TECTONIC_BIN="/opt/homebrew/bin/tectonic"
+if [ ! -x "$TECTONIC_BIN" ] && command -v tectonic >/dev/null 2>&1; then
+  TECTONIC_BIN="$(command -v tectonic)"
 fi
-TECTONIC_CACHE_FLAG=""
-if [ -d "$HOME/Library/Caches/TectonicProject.Tectonic" ]; then
-  TECTONIC_CACHE_FLAG="-C"
+if [ -x "$TECTONIC_BIN" ]; then
+  if [ ! -d "$HOME/Library/Caches/TectonicProject.Tectonic" ] && [ -d "/Users/huizhao/Library/Caches/TectonicProject.Tectonic" ]; then
+    mkdir -p "$HOME/Library/Caches"
+    cp -cR /Users/huizhao/Library/Caches/TectonicProject.Tectonic "$HOME/Library/Caches/"
+  fi
+  TECTONIC_CACHE_FLAG=""
+  if [ -d "$HOME/Library/Caches/TectonicProject.Tectonic" ]; then
+    TECTONIC_CACHE_FLAG="-C"
+  fi
+  "$TECTONIC_BIN" $TECTONIC_CACHE_FLAG --keep-intermediates --keep-logs main.tex
+  cp main.pdf aegis_enforced_runtime_arxiv_preprint.pdf
+else
+  echo "  (tectonic not installed locally; packaging existing precompiled main.bbl + main.pdf)"
 fi
-/opt/homebrew/bin/tectonic $TECTONIC_CACHE_FLAG --keep-intermediates --keep-logs main.tex
-cp main.pdf aegis_enforced_runtime_arxiv_preprint.pdf
 
 echo "[2/5] Creating clean working deep copy (tmp_arxiv/)..."
 rm -rf tmp_arxiv ax.tar arxiv_submission.tar.gz
@@ -60,7 +68,9 @@ PY
 echo "[4/5] Verifying clean compilation inside isolated tmp_arxiv/ (without .bib)..."
 (
   cd tmp_arxiv
-  /opt/homebrew/bin/tectonic $TECTONIC_CACHE_FLAG main.tex >/dev/null
+  if [ -x "$TECTONIC_BIN" ]; then
+    "$TECTONIC_BIN" $TECTONIC_CACHE_FLAG main.tex >/dev/null
+  fi
   rm -f main.pdf *.aux *.log *.out *.blg *.synctex* .DS_Store
 )
 
@@ -69,6 +79,7 @@ echo "[5/5] Creating ax.tar and arxiv_submission.tar.gz (macOS extended attribut
   cd tmp_arxiv
   COPYFILE_DISABLE=1 tar -cvf ../ax.tar *
   COPYFILE_DISABLE=1 tar -czvf ../arxiv_submission.tar.gz *
+  cp ../arxiv_submission.tar.gz ../aegis_os_paper2_arxiv_submission.tar.gz
 )
 rm -rf tmp_arxiv
 

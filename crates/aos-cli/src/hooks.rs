@@ -8,7 +8,8 @@ use std::io::Read;
 use std::path::{Path, PathBuf};
 
 /// Emit both the AGY top-level `decision`/`reason` and Claude Code's
-/// `hookSpecificOutput` shape so neither client silently ignores a boundary decision.
+/// `hookSpecificOutput` shape when called by Claude Code; strip `hookSpecificOutput`
+/// for AGY because AGY's `protojson` parser rejects unknown fields.
 fn hook_decision(effect: &str, reason: &str) -> Value {
     json!({
         "decision": effect,
@@ -19,6 +20,16 @@ fn hook_decision(effect: &str, reason: &str) -> Value {
             "permissionDecisionReason": reason
         }
     })
+}
+
+fn emit_hook_json(mut val: Value, is_claude: bool) -> anyhow::Result<()> {
+    if !is_claude {
+        if let Some(obj) = val.as_object_mut() {
+            obj.remove("hookSpecificOutput");
+        }
+    }
+    println!("{}", serde_json::to_string(&val)?);
+    Ok(())
 }
 
 // AGY & Claude Code Hook Handler (`SessionStart` & `PreToolUse`)
@@ -512,6 +523,8 @@ pub(crate) async fn handle_agy_hook(
                     return Ok(());
                 }
             }
+            let is_claude_payload =
+                payload.get("tool_name").is_some() || cli.client.eq_ignore_ascii_case("claude");
             let tool_name = payload
                 .get("toolCall")
                 .and_then(|tc| tc.get("name"))
@@ -576,10 +589,7 @@ pub(crate) async fn handle_agy_hook(
                             .or_else(|| decision.get("suggested_lease_scope"))
                             .and_then(|v| v.as_str())
                             .unwrap_or("Aegis policy denied this tool call");
-                        println!(
-                            "{}",
-                            serde_json::to_string(&hook_decision(effect, reason))?
-                        );
+                        emit_hook_json(hook_decision(effect, reason), is_claude_payload)?;
                         return Ok(());
                     }
                 }
@@ -612,10 +622,7 @@ pub(crate) async fn handle_agy_hook(
                                     "deny_claim_conflict",
                                     &conflict,
                                 );
-                                println!(
-                                    "{}",
-                                    serde_json::to_string(&hook_decision("deny", &conflict))?
-                                );
+                                emit_hook_json(hook_decision("deny", &conflict), is_claude_payload)?;
                                 return Ok(());
                             }
                         }
@@ -656,18 +663,7 @@ pub(crate) async fn handle_agy_hook(
                                 &changed_files,
                             )
                             .await;
-                            println!(
-                                "{}",
-                                serde_json::to_string(&json!({
-                                    "decision": "ask",
-                                    "reason": reason,
-                                    "hookSpecificOutput": {
-                                        "hookEventName": "PreToolUse",
-                                        "permissionDecision": "ask",
-                                        "permissionDecisionReason": reason
-                                    }
-                                }))?
-                            );
+                            emit_hook_json(hook_decision("ask", &reason), is_claude_payload)?;
                             return Ok(());
                         }
                     }
@@ -690,10 +686,7 @@ pub(crate) async fn handle_agy_hook(
                             &changed_files,
                         )
                         .await;
-                        println!(
-                            "{}",
-                            serde_json::to_string(&hook_decision("ask", &reason))?
-                        );
+                        emit_hook_json(hook_decision("ask", &reason), is_claude_payload)?;
                         return Ok(());
                     }
                     println!(
@@ -727,10 +720,7 @@ pub(crate) async fn handle_agy_hook(
                                 "deny_claim_conflict",
                                 &conflict,
                             );
-                            println!(
-                                "{}",
-                                serde_json::to_string(&hook_decision("deny", &conflict))?
-                            );
+                            emit_hook_json(hook_decision("deny", &conflict), is_claude_payload)?;
                             return Ok(());
                         }
                     }
@@ -767,18 +757,7 @@ pub(crate) async fn handle_agy_hook(
                             &changed_files,
                         )
                         .await;
-                        println!(
-                            "{}",
-                            serde_json::to_string(&json!({
-                                "decision": "ask",
-                                "reason": reason,
-                                "hookSpecificOutput": {
-                                    "hookEventName": "PreToolUse",
-                                    "permissionDecision": "ask",
-                                    "permissionDecisionReason": reason
-                                }
-                            }))?
-                        );
+                        emit_hook_json(hook_decision("ask", &reason), is_claude_payload)?;
                         return Ok(());
                     }
                 }
@@ -797,10 +776,7 @@ pub(crate) async fn handle_agy_hook(
                         &changed_files,
                     )
                     .await;
-                    println!(
-                        "{}",
-                        serde_json::to_string(&hook_decision("ask", &reason))?
-                    );
+                    emit_hook_json(hook_decision("ask", &reason), is_claude_payload)?;
                     return Ok(());
                 }
                 println!(
@@ -837,7 +813,7 @@ pub(crate) async fn handle_agy_hook(
                     );
                 }
                 let out = route.to_hook_decision(routing_mode);
-                println!("{}", serde_json::to_string(&out)?);
+                emit_hook_json(out, is_claude_payload)?;
                 return Ok(());
             }
 
@@ -913,7 +889,7 @@ pub(crate) async fn handle_agy_hook(
                     );
                 }
                 let out = route.to_hook_decision(routing_mode);
-                println!("{}", serde_json::to_string(&out)?);
+                emit_hook_json(out, is_claude_payload)?;
                 return Ok(());
             }
 
@@ -994,7 +970,7 @@ pub(crate) async fn handle_agy_hook(
                         );
                     }
                 }
-                println!("{}", serde_json::to_string(&out)?);
+                emit_hook_json(out, is_claude_payload)?;
                 return Ok(());
             }
 

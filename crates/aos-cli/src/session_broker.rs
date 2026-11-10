@@ -53,6 +53,7 @@ pub struct SessionBroker {
     pub control_dir: PathBuf,
     pub socket_path: PathBuf,
     pub agent_token: String,
+    #[cfg_attr(not(target_os = "macos"), allow(dead_code))]
     pub tcp_addr: Option<std::net::SocketAddr>,
     temp_control_dir: Option<PathBuf>,
     task: Option<JoinHandle<()>>,
@@ -62,6 +63,7 @@ pub struct SessionBroker {
 impl SessionBroker {
     /// Endpoint the agent should put in `AOS_CONTROL_SOCKET`. macOS Seatbelt cannot path-filter
     /// Unix-domain sockets, so macOS uses a loopback TCP listener instead.
+    #[cfg_attr(not(target_os = "macos"), allow(dead_code))]
     pub fn control_endpoint(&self) -> String {
         self.tcp_addr
             .map(|addr| format!("tcp://{addr}"))

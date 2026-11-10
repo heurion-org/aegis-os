@@ -566,6 +566,44 @@ impl AegisEgressGateway {
         None
     }
 
+    async fn resolve_upstream_addrs(upstream_addr: &str) -> anyhow::Result<Vec<SocketAddr>> {
+        let mut addrs: Vec<SocketAddr> = tokio::net::lookup_host(upstream_addr).await?.collect();
+        if addrs.is_empty() {
+            bail!("no socket addresses resolved for '{upstream_addr}'");
+        }
+        // Prefer IPv4 before IPv6 so dual-stack hosts with broken IPv6 PMTU or middlebox resets
+        // on large TLS records fall through to IPv4 first while retaining IPv6 as fallback.
+        addrs.sort_by_key(|a| a.is_ipv6());
+        Ok(addrs)
+    }
+
+    async fn connect_upstream_tcp(upstream_addr: &str) -> std::io::Result<TcpStream> {
+        let addrs: Vec<SocketAddr> = match tokio::net::lookup_host(upstream_addr).await {
+            Ok(iter) => {
+                let mut v: Vec<SocketAddr> = iter.collect();
+                v.sort_by_key(|a| a.is_ipv6());
+                v
+            }
+            Err(err) => return Err(err),
+        };
+        let mut last_err = None;
+        for addr in addrs {
+            match TcpStream::connect(addr).await {
+                Ok(tcp) => {
+                    let _ = tcp.set_nodelay(true);
+                    return Ok(tcp);
+                }
+                Err(err) => last_err = Some(err),
+            }
+        }
+        Err(last_err.unwrap_or_else(|| {
+            std::io::Error::new(
+                std::io::ErrorKind::AddrNotAvailable,
+                format!("no addresses resolved for {upstream_addr}"),
+            )
+        }))
+    }
+
     #[allow(clippy::too_many_arguments)]
     async fn forward_reverse_proxy(
         &self,
@@ -579,16 +617,6 @@ impl AegisEgressGateway {
         headers: &HashMap<String, String>,
         body: &[u8],
     ) -> anyhow::Result<()> {
-        let tcp = TcpStream::connect(upstream_addr).await?;
-        let mut upstream: Box<dyn ProxyStream> = if use_tls {
-            let name = ServerName::try_from(server_name.to_string())
-                .map_err(|err| anyhow::anyhow!("invalid TLS server name '{server_name}': {err}"))?;
-            let connector = TlsConnector::from(self.tls_config.clone());
-            Box::new(connector.connect(name, tcp).await?)
-        } else {
-            Box::new(tcp)
-        };
-
         let mut request = format!("{method} {path} HTTP/1.1\r\n");
         for (key, value) in headers {
             let lower = key.to_ascii_lowercase();
@@ -612,20 +640,100 @@ impl AegisEgressGateway {
         // Keep the response streaming; SSE providers never finish before the last token, and
         // buffering the response would destroy first-token latency.
         request.push_str("Connection: close\r\n\r\n");
-        upstream.write_all(request.as_bytes()).await?;
-        if !body.is_empty() {
-            upstream.write_all(body).await?;
+
+        let addrs = Self::resolve_upstream_addrs(upstream_addr).await?;
+        let max_attempts = addrs.len().min(2).max(1);
+        let mut last_err: Option<anyhow::Error> = None;
+
+        for attempt in 0..max_attempts {
+            let addr = addrs[attempt % addrs.len()];
+            let tcp = match TcpStream::connect(addr).await {
+                Ok(s) => {
+                    let _ = s.set_nodelay(true);
+                    s
+                }
+                Err(err) => {
+                    last_err = Some(err.into());
+                    continue;
+                }
+            };
+            let mut upstream: Box<dyn ProxyStream> = if use_tls {
+                let name = ServerName::try_from(server_name.to_string()).map_err(|err| {
+                    anyhow::anyhow!("invalid TLS server name '{server_name}': {err}")
+                })?;
+                let connector = TlsConnector::from(self.tls_config.clone());
+                match connector.connect(name, tcp).await {
+                    Ok(tls) => Box::new(tls),
+                    Err(err) => {
+                        last_err = Some(err.into());
+                        continue;
+                    }
+                }
+            } else {
+                Box::new(tcp)
+            };
+
+            // If upstream rejects the request headers early (e.g., 401/400/429) and closes its
+            // receive side while a large POST body is still being written, `write_all` or `flush`
+            // can return `ConnectionReset` / `BrokenPipe` even though the HTTP error response is
+            // already buffered and readable on `upstream`. Always attempt to read the response
+            // before treating a write error as fatal.
+            let write_res: std::io::Result<()> = async {
+                if !body.is_empty() && body.len() <= 256 * 1024 {
+                    let mut combined = Vec::with_capacity(request.len() + body.len());
+                    combined.extend_from_slice(request.as_bytes());
+                    combined.extend_from_slice(body);
+                    upstream.write_all(&combined).await?;
+                } else {
+                    upstream.write_all(request.as_bytes()).await?;
+                    if !body.is_empty() {
+                        upstream.write_all(body).await?;
+                    }
+                }
+                upstream.flush().await
+            }
+            .await;
+
+            let mut buf = [0u8; 8192];
+            let mut wrote_any = false;
+            let mut read_err: Option<std::io::Error> = None;
+            loop {
+                match upstream.read(&mut buf).await {
+                    Ok(0) => break,
+                    Ok(n) => {
+                        wrote_any = true;
+                        if client.write_all(&buf[..n]).await.is_err() {
+                            break;
+                        }
+                        let _ = client.flush().await;
+                    }
+                    Err(err) => {
+                        // HTTPS upstreams (e.g., Cloudflare / api.anthropic.com) frequently close
+                        // the TCP connection at the end of a `Connection: close` response without
+                        // sending a TLS `close_notify` alert, which `rustls 0.23` surfaces as
+                        // `UnexpectedEof`. Once response headers/bytes have been streamed to the
+                        // client, returning `Err` would append `HTTP/1.1 502 Bad Gateway` onto the
+                        // tail of the response stream and break chunked/SSE parsers.
+                        if wrote_any {
+                            break;
+                        }
+                        read_err = Some(err);
+                        break;
+                    }
+                }
+            }
+
+            if wrote_any {
+                return Ok(());
+            }
+            if let Some(err) = write_res.err().or(read_err) {
+                last_err = Some(err.into());
+                continue;
+            }
+            return Ok(());
         }
 
-        let mut buf = [0u8; 8192];
-        loop {
-            let n = upstream.read(&mut buf).await?;
-            if n == 0 {
-                break;
-            }
-            client.write_all(&buf[..n]).await?;
-        }
-        Ok(())
+        Err(last_err.unwrap_or_else(|| anyhow::anyhow!("upstream request to {domain} failed")))
     }
 
     /// Starts a lightweight local HTTP Egress Proxy listener (`127.0.0.1:port`) that inspects
@@ -670,7 +778,7 @@ impl AegisEgressGateway {
                     let method = parts.first().copied().unwrap_or("GET").to_string();
                     let raw_target = parts.get(1).copied().unwrap_or("/").to_string();
 
-                    let mut headers = HashMap::new();
+                    let mut headers: HashMap<String, String> = HashMap::new();
                     let mut content_length: usize = 0;
                     let mut body_too_large = false;
                     loop {
@@ -692,7 +800,31 @@ impl AegisEgressGateway {
                                     content_length = declared;
                                 }
                             }
-                            headers.insert(key, val);
+                            if let Some(existing_key) = headers
+                                .keys()
+                                .find(|existing| existing.eq_ignore_ascii_case(&key))
+                                .cloned()
+                            {
+                                let lower = key.to_ascii_lowercase();
+                                if matches!(
+                                    lower.as_str(),
+                                    "host"
+                                        | "content-length"
+                                        | "content-type"
+                                        | "authorization"
+                                        | "x-api-key"
+                                        | "user-agent"
+                                ) {
+                                    headers.insert(existing_key, val);
+                                } else if let Some(prev) = headers.get_mut(&existing_key) {
+                                    if !prev.is_empty() {
+                                        prev.push_str(", ");
+                                    }
+                                    prev.push_str(&val);
+                                }
+                            } else {
+                                headers.insert(key, val);
+                            }
                         }
                     }
 
@@ -958,7 +1090,7 @@ impl AegisEgressGateway {
                                 } else {
                                     test_up.unwrap_or(default_dial)
                                 };
-                                match tokio::net::TcpStream::connect(&dial_addr).await {
+                                match Self::connect_upstream_tcp(&dial_addr).await {
                                     Ok(mut upstream) => {
                                         if stream
                                             .write_all(
