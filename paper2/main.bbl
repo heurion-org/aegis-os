@@ -33,7 +33,7 @@ Manuel Costa, Boris K{\"o}pf, Aashish Kolluri, Andrew Paverd, Mark Russinovich,
   Ahmed Salem, Shruti Tople, Lukas Wutschitz, and Santiago
   Zanella-B{\'e}guelin.
 \newblock Securing {AI} agents with information-flow control.
-\newblock {\em arXiv preprint}, arXiv:2505.23643, 2025.
+\newblock {\em arXiv preprint arXiv:2505.23643}, 2025.
 
 \bibitem{dagger2025containeruse}
 {Dagger}.
@@ -46,7 +46,7 @@ Edoardo Debenedetti, Ilia Shumailov, Tianqi Fan, Jamie Hayes, Nicholas Carlini,
   Daniel Fabian, Christoph Kern, Chongyang Shi, Andreas Terzis, and Florian
   Tram{\`e}r.
 \newblock Defeating prompt injections by design.
-\newblock {\em arXiv preprint}, arXiv:2503.18813, 2025.
+\newblock {\em arXiv preprint arXiv:2503.18813}, 2025.
 
 \bibitem{debenedetti2024agentdojo}
 Edoardo Debenedetti, Jie Zhang, Mislav Balunovi{\'c}, Luca Beurer-Kellner, Marc
@@ -141,7 +141,8 @@ Jerome~H. Saltzer and Michael~D. Schroeder.
 \newblock {\em Proceedings of the IEEE}, 63(9):1278--1308, 1975.
 
 \bibitem{shi2025progent}
-Tianneng Shi, Jingxuan He, Zhun Wang, Hongwei Wu, and Dawn Song.
+Tianneng Shi, Jingxuan He, Zhun Wang, Linyu Wu, Hongwei Li, Wenbo Guo, and Dawn
+  Song.
 \newblock {Progent}: Programmable privilege control for {LLM} agents.
 \newblock {\em arXiv preprint arXiv:2504.11703}, 2025.
 
