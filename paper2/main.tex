@@ -152,42 +152,42 @@ This paper makes five contributions:
     greenarrow/.style={-{Stealth[scale=0.85]}, very thick, draw=aegisgreen!75!black}
 ]
 
-\node[badbox, minimum width=10.2cm, minimum height=0.7cm] (adv_title) at (0, 4.35) {\textbf{(a) Advisory Plugin / Subprocess Sandbox Model ($\neg\mathcal{M}_1, \neg\mathcal{M}_2, \neg\mathcal{M}_3$)}};
+\node[badbox, minimum width=11.0cm, minimum height=0.72cm] (adv_title) at (0, 4.45) {\textbf{(a) Advisory Plugin / Subprocess Sandbox Model ($\neg\mathcal{M}_1, \neg\mathcal{M}_2, \neg\mathcal{M}_3$)}};
 
-\node[box, fill=orange!12, minimum width=10.2cm, minimum height=1.65cm] (adv_proc) at (0, 2.75) {};
-\node[anchor=north, font=\sffamily\footnotesize\bfseries] at (0, 3.50) {Host Agent Process (\texttt{claude} / \texttt{opencode} / \texttt{agy} / \texttt{hermes}, Ambient Host UID)};
-\node[box, fill=white, minimum width=3.1cm, minimum height=0.72cm] (adv_hook) at (-3.3, 2.42) {\texttt{PreToolUse} Hook\\{\scriptsize (Command Regex Only)}};
-\node[box, fill=white, minimum width=3.1cm, minimum height=0.72cm] (adv_mcp) at (0.0, 2.42) {MCP Tool Server\\{\scriptsize (Additive Protocol)}};
-\node[badbox, minimum width=3.1cm, minimum height=0.72cm] (adv_native) at (3.3, 2.42) {Repo Script / Native\\{\scriptsize \texttt{verify\_env.py} / \texttt{.mcp.json}}};
+\node[box, fill=orange!12, minimum width=11.0cm, minimum height=1.72cm] (adv_proc) at (0, 2.80) {};
+\node[anchor=north, font=\sffamily\footnotesize\bfseries] at (0, 3.56) {Host Agent Process (\texttt{claude} / \texttt{opencode} / \texttt{agy} / \texttt{hermes}, Ambient Host UID)};
+\node[box, fill=white, minimum width=3.25cm, text width=3.05cm, inner sep=2.5pt, minimum height=0.74cm] (adv_hook) at (-3.50, 2.44) {\texttt{PreToolUse} Hook\\{\scriptsize (Command Regex Only)}};
+\node[box, fill=white, minimum width=3.25cm, text width=3.05cm, inner sep=2.5pt, minimum height=0.74cm] (adv_mcp) at (0.0, 2.44) {MCP Tool Server\\{\scriptsize (Additive Protocol)}};
+\node[badbox, minimum width=3.25cm, text width=3.05cm, inner sep=2.5pt, minimum height=0.74cm] (adv_native) at (3.50, 2.44) {Repo Script / Native\\{\scriptsize \texttt{verify\_env.py} / \texttt{.mcp.json}}};
 
-\node[badbox, minimum width=10.2cm, text width=9.9cm, inner sep=3pt, minimum height=1.50cm] (adv_host) at (0, 0.22) {
+\node[badbox, minimum width=11.0cm, text width=10.5cm, inner sep=4pt, minimum height=1.55cm] (adv_host) at (0, 0.20) {
     \textbf{Live Host Workspace \& Developer \texttt{\$HOME} (Exposed to Ambient UID)}\\[2pt]
     {\scriptsize \textbf{V1:} Sibling/unapproved repo write $\mid$ \textbf{V2:} Direct socket / non-blocking hook $\mid$ \textbf{V3:} \texttt{\textasciitilde/.ssh}, Keychain \& \texttt{environ} key theft}\\
     {\scriptsize \textbf{V4:} Overwrites \texttt{settings.json}/\texttt{hooks.json} $\mid$ \textbf{V5:} \texttt{git status} runs \texttt{.git/config fsmonitor} $\mid$ \textbf{V6:} Same-UID self-approve}
 };
 
-\draw[arrow] (adv_hook.south) -- (adv_mcp.south |- adv_host.north);
-\draw[redarrow] (adv_native.south) -- ([xshift=3.3cm]adv_host.north) node[midway, right, font=\sffamily\scriptsize, text=aegisred!90!black] {\textbf{V1--V3}};
-\draw[redarrow] ([xshift=-3.3cm]adv_proc.south) -- ([xshift=-3.3cm]adv_host.north) node[midway, left, font=\sffamily\scriptsize, text=aegisred!90!black] {\textbf{V4--V6}};
+\draw[redarrow] ([xshift=-3.50cm]adv_proc.south) -- ([xshift=-3.50cm]adv_host.north) node[midway, left, font=\sffamily\scriptsize, text=aegisred!90!black] {\textbf{V4--V6}};
+\draw[arrow] (adv_proc.south) -- (adv_host.north) node[midway, right, font=\sffamily\scriptsize] {Optional};
+\draw[redarrow] ([xshift=3.50cm]adv_proc.south) -- ([xshift=3.50cm]adv_host.north) node[midway, right, font=\sffamily\scriptsize, text=aegisred!90!black] {\textbf{V1--V3}};
 
-\node[goodbox, minimum width=11.0cm, minimum height=0.7cm] (enf_title) at (12.6, 4.35) {\textbf{(b) Aegis Parent-Process Kernel-Enforced Runtime (\texttt{aegis-os run -\/- <agent>})}};
+\node[goodbox, minimum width=11.4cm, minimum height=0.72cm] (enf_title) at (12.6, 4.45) {\textbf{(b) Aegis Parent-Process Kernel-Enforced Runtime (\texttt{aegis-os run -\/- <agent>})}};
 
-\node[bluebox, minimum width=11.0cm, minimum height=1.65cm] (enf_sbx) at (12.6, 2.75) {};
-\node[anchor=north, font=\sffamily\footnotesize\bfseries] at (12.6, 3.50) {Kernel Confinement (\texttt{bwrap -\/-unshare-all -\/-bind-fd} / XNU Seatbelt + \texttt{setsid} PTY)};
-\node[box, fill=white, minimum width=3.35cm, minimum height=0.72cm] (enf_fs) at (9.05, 2.42) {\textbf{CoW Shadow + Split Git}\\{\scriptsize \texttt{shadow} (\texttt{rw}), \texttt{.git} (\texttt{ro})}};
-\node[box, fill=white, minimum width=3.35cm, minimum height=0.72cm] (enf_home) at (12.6, 2.42) {\textbf{Layered Agent Home}\\{\scriptsize \texttt{sessions} (\texttt{rw}), \texttt{configs} (\texttt{ro})}};
-\node[box, fill=white, minimum width=3.35cm, minimum height=0.72cm] (enf_net) at (16.15, 2.42) {\textbf{Split Egress \& Broker}\\{\scriptsize \texttt{agent.token} $\neq$ \texttt{human.token}}};
+\node[bluebox, minimum width=11.4cm, minimum height=1.72cm] (enf_sbx) at (12.6, 2.80) {};
+\node[anchor=north, font=\sffamily\footnotesize\bfseries] at (12.6, 3.56) {Kernel Sandbox (\texttt{bwrap -\/-unshare-all -\/-bind-fd} / XNU Seatbelt + \texttt{setsid} PTY)};
+\node[box, fill=white, minimum width=3.40cm, text width=3.20cm, inner sep=2.5pt, minimum height=0.74cm] (enf_fs) at (8.95, 2.44) {\textbf{CoW Shadow + Split Git}\\{\scriptsize \texttt{shadow} (\texttt{rw}), \texttt{.git} (\texttt{ro})}};
+\node[box, fill=white, minimum width=3.40cm, text width=3.20cm, inner sep=2.5pt, minimum height=0.74cm] (enf_home) at (12.6, 2.44) {\textbf{Layered Agent Home}\\{\scriptsize \texttt{sessions} (\texttt{rw}), \texttt{configs} (\texttt{ro})}};
+\node[box, fill=white, minimum width=3.40cm, text width=3.20cm, inner sep=2.5pt, minimum height=0.74cm] (enf_net) at (16.25, 2.44) {\textbf{Split Egress \& Broker}\\{\scriptsize \texttt{agent.token} $\neq$ \texttt{human.token}}};
 
-\node[goodbox, minimum width=11.0cm, text width=10.7cm, inner sep=3pt, minimum height=1.50cm] (enf_host) at (12.6, 0.22) {
+\node[goodbox, minimum width=11.4cm, text width=10.9cm, inner sep=4pt, minimum height=1.55cm] (enf_host) at (12.6, 0.20) {
     \textbf{Trusted Host Control Plane (Outside Agent Mount Namespace / Seatbelt)}\\[2pt]
     {\scriptsize $\bullet$ \textbf{Hardened \texttt{.aegis-bin/git} Shim (\texttt{0555}, RO):} Unsets Git env vars; forces \texttt{fsmonitor=false}; blocks mutating Git (exit 126)}\\
     {\scriptsize $\bullet$ \textbf{L4 \texttt{CONNECT} + L7 \texttt{Base URL} Proxy:} Boundary \texttt{\$AOS\_SECRET\_*} injection \& 64 KiB outbound DLP without TLS MITM}\\
     {\scriptsize $\bullet$ \textbf{Frozen-Stage Commit Gate:} \texttt{human.token} (\texttt{0600}) + \texttt{DomainProfile} verifiers + SHA-256 TOCTOU diff pin}
 };
 
-\draw[greenarrow] (enf_fs.south) -- ([xshift=-3.55cm]enf_host.north);
-\draw[greenarrow] (enf_home.south) -- (enf_host.north);
-\draw[greenarrow] (enf_net.south) -- ([xshift=3.55cm]enf_host.north);
+\draw[greenarrow] ([xshift=-3.65cm]enf_sbx.south) -- ([xshift=-3.65cm]enf_host.north);
+\draw[greenarrow] (enf_sbx.south) -- (enf_host.north);
+\draw[greenarrow] ([xshift=3.65cm]enf_sbx.south) -- ([xshift=3.65cm]enf_host.north);
 
 \end{tikzpicture}%
 }
@@ -301,7 +301,7 @@ TLS-terminating MITM proxies break certificate-pinned Go/Rust/Bun agent binaries
     arrow/.style={-{Stealth[scale=0.85]}, thick, draw=black!75}
 ]
 
-\node[box, fill=aegisgray, minimum width=8.4cm, text width=8.1cm, inner sep=3pt, minimum height=1.10cm] (agent) at (0, 3.45) {
+\node[box, fill=aegisgray, minimum width=8.4cm, text width=8.1cm, inner sep=3pt, minimum height=1.10cm] (agent) at (0, 3.65) {
     \textbf{Sandboxed Agent Process (\texttt{CLONE\_NEWNET} / Seatbelt Port Pin)}\\[1pt]
     {\scriptsize \texttt{HTTPS\_PROXY=http://127.0.0.1:<p>}}\\[-1pt]
     {\scriptsize \texttt{ANTHROPIC\_BASE\_URL=http://127.0.0.1:<p>/\_\_aegis/base/...}}\\[-1pt]
@@ -326,7 +326,7 @@ TLS-terminating MITM proxies break certificate-pinned Go/Rust/Bun agent binaries
     {\scriptsize $\bullet$ Unbuffered SSE Streaming}
 };
 
-\node[box, fill=orange!12, minimum width=8.4cm, text width=8.1cm, inner sep=3pt, minimum height=0.6cm] (up) at (0, -0.25) {
+\node[box, fill=orange!12, minimum width=8.4cm, text width=8.1cm, inner sep=3pt, minimum height=0.6cm] (up) at (0, -0.40) {
     \textbf{Upstream TLS Endpoints} (\texttt{crates.io}, \texttt{api.anthropic.com}, \texttt{api.deepseek.com}, \texttt{googleapis.com})
 };
 
@@ -404,7 +404,7 @@ Human broker routes require 256-bit CSPRNG \texttt{human.token} checked via cons
 
 \begin{invariant}[TOCTOU-Free Verified Commit ($\mathcal{I}_5$)]
 \label{inv:toctou}
-Under collision resistance of SHA-256, \texttt{aegis-os commit -\/-expected-diff-hash $H_{\text{expected}}$} modifies $\mathcal{W}_{\text{host}}$ only if the promoted file set is byte-identical to the delta $\Delta(\mathcal{W}_{\text{host}}, \mathcal{W}_{\text{shadow}}(t_1))$ committed in $H_{\text{expected}}$ and passes \texttt{DomainProfile} verification.
+Under collision resistance of SHA-256, {\normalfont\texttt{aegis-os commit -\/-expected-diff-hash}} $H_{\text{expected}}$ modifies $\mathcal{W}_{\text{host}}$ only if the promoted file set is byte-identical to the delta $\Delta(\mathcal{W}_{\text{host}}, \mathcal{W}_{\text{shadow}}(t_1))$ committed in $H_{\text{expected}}$ and passes \texttt{DomainProfile} verification.
 \end{invariant}
 \begin{proof}[Proof Sketch]
 \texttt{commit\_with\_expected\_hash()} copies candidate files from $\mathcal{W}_{\text{shadow}}$ into \texttt{session\_dir/commit\_frozen\_stage}, which resides outside the child mount namespace on Linux and outside Seatbelt-writable subpaths on macOS (so $p_{\text{agent}}$ cannot mutate $\mathcal{W}_{\text{frozen}}$ during or after verification by $\mathcal{I}_1$). It then recomputes $H_{\text{diff}}(\mathcal{W}_{\text{host}}, \mathcal{W}_{\text{frozen}})$ over full untruncated file contents and symlink targets, aborting unless $H_{\text{diff}} = H_{\text{expected}}$ and \texttt{DomainProfile::verify\_workspace\_changes}$(\mathcal{W}_{\text{frozen}})$ succeeds, and promotes bytes exclusively from $\mathcal{W}_{\text{frozen}}$ onto $\mathcal{W}_{\text{host}}$. Any post-$t_1$ mutation in $\mathcal{W}_{\text{shadow}}$ either occurs before freeze (altering $H_{\text{diff}}$ except with negligible SHA-256 collision probability) or after freeze (leaving $\mathcal{W}_{\text{frozen}}$ untouched).
@@ -506,7 +506,7 @@ Table~\ref{tab:rq1-rm} contrasts five enforcement baselines across 30 distinct e
 \resizebox{\columnwidth}{!}{%
 \begin{tikzpicture}[font=\sffamily\scriptsize]
     \draw[thick, -Latex] (0,0) -- (8.3,0);
-    \draw[thick, -Latex] (0,0) -- (0,3.4) node[above] {Breached Primitives / Agents (\%)};
+    \draw[thick, -Latex] (0,0) -- (0,3.65) node[above] {Breached Primitives / Agents (\%)};
     \foreach \y/\val in {0/0, 0.75/25, 1.5/50, 2.25/75, 3.0/100} {
         \draw[slate!25, dashed] (0,\y) -- (8.0,\y);
         \draw[thick] (-0.08,\y) -- (0,\y) node[left] {\val\%};
@@ -532,12 +532,12 @@ Table~\ref{tab:rq1-rm} contrasts five enforcement baselines across 30 distinct e
         \fi
         \node[below, align=center, font=\sffamily\tiny] at (\xb+0.48, -0.06) {\label};
     }
-    \fill[danger!80] (0.2, 3.08) rectangle (0.45, 3.24);
-    \node[right, font=\sffamily\tiny] at (0.48, 3.16) {macOS RM (30)};
-    \fill[aegisblue!70] (2.8, 3.08) rectangle (3.05, 3.24);
-    \node[right, font=\sffamily\tiny] at (3.08, 3.16) {Linux RM (30)};
-    \fill[warn!85] (5.3, 3.08) rectangle (5.55, 3.24);
-    \node[right, font=\sffamily\tiny] at (5.58, 3.16) {Live CLI Trap};
+    \fill[danger!80] (0.2, 3.26) rectangle (0.45, 3.42);
+    \node[right, font=\sffamily\tiny] at (0.48, 3.34) {macOS RM (30)};
+    \fill[aegisblue!70] (2.8, 3.26) rectangle (3.05, 3.42);
+    \node[right, font=\sffamily\tiny] at (3.08, 3.34) {Linux RM (30)};
+    \fill[warn!85] (5.3, 3.26) rectangle (5.55, 3.42);
+    \node[right, font=\sffamily\tiny] at (5.58, 3.34) {Live CLI Trap};
 \end{tikzpicture}%
 }
 \caption{\textbf{Summary of Bypass Coverage Across Layer 1 (macOS \& Linux 30-payload RM suites) and Layer 2 (Live 4-Agent \texttt{cd\_repo\_trap}).} Only Aegis Enforced Runtime achieves \textbf{0\%} across all three evaluations.}
