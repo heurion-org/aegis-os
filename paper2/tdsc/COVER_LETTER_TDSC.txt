@@ -1,0 +1,35 @@
+Dear Editor-in-Chief and Associate Editor of IEEE TDSC,
+
+Please find enclosed our manuscript entitled "Why Agent Plugins Are Not a Security Boundary: Inverting Control from In-Process Hooks to a Kernel-Enforced Agent Runtime" for consideration as a Regular Research Paper in IEEE Transactions on Dependable and Secure Computing (TDSC).
+
+1. Motivation and Fit with IEEE TDSC
+Autonomous command-line coding agents—including Anthropic Claude Code (claude), OpenCode (opencode), Google Antigravity (agy), and Nous Hermes (hermes)—have rapidly become core software engineering infrastructure. Currently, both agent vendors and developer security tools attempt to govern these agents through in-process plugins: PreToolUse shell-command hooks, additive Model Context Protocol (MCP) tool servers, and natural-language prompt rules.
+
+In this paper, we ask a foundational operating-system and dependable-computing question: Can an in-process plugin or RW-mounted subprocess sandbox ever satisfy Anderson's Reference Monitor guarantees (complete mediation, tamper-resistance, and verifiability) when the agent CLI runs under the developer's ambient UNIX UID? Auditing four installed production CLI agents—and grounding our findings in a wave of 2021-2026 disclosed CVEs across Claude Code (CVE-2025-59536, CVE-2026-21852, CVE-2026-55607), MCP tooling (CVE-2025-53109, CVE-2025-53110, CVE-2025-6514, CVE-2025-49596, CVE-2025-54135/54136), and Hermes/Git (CVE-2026-71963, CVE-2025-48384)—reveals six structural bypass classes (V1-V6) that persist even after per-client application patches.
+
+2. Summary of Technical Contributions and Empirical Findings
+We design, implement in Rust, and empirically evaluate Aegis Enforced Runtime (aegis-os run -- <agent>), which inverts control so that the parent OS supervisor confines the unmodified third-party agent binary inside Linux bubblewrap (--bind-fd) or macOS XNU Seatbelt prior to execve():
+  (i) Kernel Filesystem, Config, and Split Git Containment (aos-cli, aos-sandbox): Combines Copy-on-Write shadow workspace remapping (fcntl(F_DUPFD, 3) + bwrap --bind-fd on Linux; Seatbelt MAC + Mach Keychain/LaunchServices IPC confinement on macOS), layered agent homes with kernel read-only hook/plugin over-mounts and an O_NOFOLLOW AST-allowlisted OAuth declassification gate, and a split read-only .git view paired with a mode-0555 .aegis-bin/git shim that neutralizes repository core.fsmonitor and hook execution while avoiding copying multi-hundred-megabyte Git packfiles.
+  (ii) Split-Plane L4/L7 Egress Gateway and Boundary Secret Vault (aos-egress): Pairs an L4 CONNECT domain allowlist with a loopback L7 Base-URL reverse proxy that scrubs plaintext API keys from sandbox environ, scans up to 64 KiB of outbound request bodies/queries for credential exfiltration, and injects real API tokens at the upstream hop without TLS MITM certificate breakage.
+  (iii) Principal-Separated SessionBroker, Frozen-Stage Commit Gate, and Security Invariants: Separates 256-bit agent.token and human.token credentials for TUI-safe out-of-band escalations, escapes ANSI CSI and Unicode Bidi (Trojan Source) terminal spoofing sequences in diffs, and executes a four-step Frozen-Stage SHA-256 Commit Protocol across six DomainProfile validators, backed by five formal security invariants (I1-I5).
+
+Across two experimental layers on macOS Apple Silicon (Seatbelt, APFS) and Ubuntu 24.04 LTS (bwrap, nerdctl OCI devcontainers, ext4, btrfs):
+  * Deterministic Cross-OS Suite & Rust Ablations (RQ1 Layer 1): Across 30 executable bypass primitives, Aegis reduces breach coverage from 93.3% (advisory hooks), 73.3%-83.3% (vendor sandboxes), and 80.0% (nerdctl OCI devcontainers) to 0.0% on both macOS (20.38 ms median) and Linux (9.91 ms median—22.4x faster than nerdctl's 221.53 ms), with four compile-time feature-gated Rust ablations confirming exact orthogonal necessity.
+  * Live 4-Agent Cloud-API Matrix (RQ1 Layer 2 & RQ6): Across 54 executed live runs (60-cell matrix) of claude (Sonnet & Opus), opencode, agy, and hermes, frontier model alignment refuses blatant prompt injections (0/4 compromised) yet suffers 100% (4/4) multi-vector host compromise on trojanized repository unit-test fixtures (cd_repo_trap); Aegis reduces live compromises to 0% (including a real-time L7 DLP HTTP 403 interception on OpenCode) while preserving 100% (8/8) benign and multi-file refactoring test pass rates.
+  * Subsystem Efficiency (RQ2-RQ5): Split read-only .git + CoW saves 99.05% of APFS physical disk blocks on 500 MB packed Git repositories (0.00 MB net delta on btrfs), loopback L7 DLP/key injection adds +0.221 ms mean TTFT overhead (0/40 false positives), and frozen-stage SHA-256 commit pinning + DomainProfile verification block 60/60 post-diff TOCTOU/VT100 swaps (7.54-7.92 ms median) and 60/60 cross-domain/memory-poisoning commits (67.47 us mean).
+
+3. Relationship to Prior Preprints, Originality, and Open-Source Artifact
+This manuscript is original, is formatted within TDSC's 14-page regular-paper limit (13 pages in IEEEtran compsoc), has not been published previously, and is not under consideration elsewhere. In accordance with IEEE preprint disclosure policies:
+  * A preliminary preprint of this study is archived on CERN Zenodo (DOI: 10.5281/zenodo.24170505). Compared with that preprint, this TDSC submission adds systematic grounding of V1-V6 in disclosed 2021-2026 CVEs (Table 2), full per-profile frozen-stage verification analysis (Table 9), and full IEEE Computer Society Transactions formatting.
+  * Our companion manuscript (arXiv:2611.08516, cited as [1]) studies cooperative multi-agent authorization-fatigue reduction, two-phase LCS Diff3 merging, and MCP/A2A IPC under the assumption of cooperative client routing; the present manuscript addresses the distinct OS security problem of adversarial/trojanized agent confinement before execve(), sharing zero figures, tables, or experimental datasets with [1].
+  * The complete Rust source code, OS sandbox profiles, benchmark suite (scripts/p2_live/), and raw evaluation logs are publicly available under Apache-2.0 at https://github.com/heurion-org/aegis-os.
+
+Thank you very much for your time and consideration.
+
+Sincerely,
+
+Hui Zhao
+Researcher, Heurion Research
+Rotterdam, Netherlands
+Email: huizhao@heurion.org
+Open-Source Artifact: https://github.com/heurion-org/aegis-os

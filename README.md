@@ -1,6 +1,6 @@
 # Aegis OS (`aegis-os`)
 
-**[English](README.md) | [简体中文](README_CN.md) | [Aegis OS Website](https://heurion.org/en/aegis-os/) | [Tutorial](https://heurion.org/en/aegis-os/tutorial/) | [Paper 1 (arXiv:2611.08516)](https://arxiv.org/abs/2611.08516) | [Paper 2 (Enforced Runtime PDF)](paper2/aegis_enforced_runtime_arxiv_preprint.pdf) | [Technical Blog](https://heurion.org/en/blog) | [Cloud Console & Pro ($29/mo)](https://heurion.org/aegis-cloud/dashboard) | [Approval Console](https://heurion.org/aegis-cloud/approve)**
+**[English](README.md) | [简体中文](README_CN.md) | [Aegis OS Website](https://heurion.org/en/aegis-os/) | [Tutorial](https://heurion.org/en/aegis-os/tutorial/) | [Paper 1 (arXiv:2611.08516)](https://arxiv.org/abs/2611.08516) | [Paper 2 (DOI: 10.5281/zenodo.24170505)](https://doi.org/10.5281/zenodo.24170505) | [Technical Blog](https://heurion.org/en/blog) | [Cloud Console & Pro ($29/mo)](https://heurion.org/aegis-cloud/dashboard) | [Approval Console](https://heurion.org/aegis-cloud/approve)**
 
 **A transactional multi-tenant agent OS runtime for autonomous coding agents (`claude`, `opencode`, `agy`, `hermes`, `codex`) — parent-process kernel sandboxing, CoW shadow workspaces, A2A collaboration, and SHA-256 TOCTOU-pinned approvals.**
 
@@ -10,6 +10,7 @@
 ![MCP](https://img.shields.io/badge/Protocol-MCP%202024--11--05-blue.svg)
 ![A2A](https://img.shields.io/badge/Protocol-Google%20A2A-34A853.svg)
 [![arXiv](https://img.shields.io/badge/arXiv-2611.08516-b31b1b.svg)](https://arxiv.org/abs/2611.08516)
+[![DOI](https://zenodo.org/badge/DOI/10.5281/zenodo.24170505.svg)](https://doi.org/10.5281/zenodo.24170505)
 [![Blog](https://img.shields.io/badge/Blog-heurion.org%2Fen%2Fblog-0A7D52.svg)](https://heurion.org/en/blog)
 [![M8ven Score](https://m8ven.ai/badge/mcp/heurion-org/aegis-os)](https://m8ven.ai/mcp/heurion-org/aegis-os?s=readme)
 
@@ -103,7 +104,7 @@ aegis-os install
 | Metric | Result |
 |---|---|
 | V1–V6 bypass coverage (30 executable payloads, macOS Seatbelt & Linux `bwrap`) | **0/30 (0.0%)** vs. **93.3%** advisory hooks · **73.3%–83.3%** vendor sandboxes · **80.0%** `nerdctl` devcontainer |
-| Live 4-agent repo-trap compromise (`claude`, `opencode`, `agy`, `hermes`, 54 executed cloud-API runs across 60-cell matrix) | **0%** (`aegis_enforced`) vs. **100%** (`vendor_default`, incl. Claude Opus) · **100% (8/8)** benign & multi-file `pytest` pass rate |
+| Live 4-agent repo-trap compromise (`claude`, `opencode`, `agy`, `hermes`, 54 executed cloud-API runs across 60-cell matrix) | **0%** (`aegis_enforced`) vs. **100%** (`vendor_default`, incl. Claude Opus) · **100% (8/8)** benign & multi-file `unittest` pass rate |
 | Enforced sandbox startup latency | **9.91 ms** Linux `bwrap` (**22.4× faster** than `nerdctl`'s 221.53 ms) · **20.38 ms** macOS Seatbelt |
 | Packed 500 MB Git CoW disk allocation (`git repack -ad`) | **4.76 MB** on APFS (**99.05% physical disk saved**) · **0.00 MB** net delta on `btrfs` |
 | Loopback L7 Egress Proxy overhead & CLI TOCTOU/VT100 gate | **+0.221 ms** mean TTFT (`0/40` FP, `25/25` DLP blocked) · **60/60 (100%)** TOCTOU swaps blocked (**7.54–7.92 ms** per-class median) |
@@ -117,7 +118,7 @@ aegis-os install
 - **Detailed architecture** — trust boundary, core crates, workspace/merge model, MCP/A2A surface, domain profiles, cloud PaaS, benchmarks, status: [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md)
 - **Benchmark reports** — [`BENCHMARK_REPORT.md`](BENCHMARK_REPORT.md) · [`paper2/ENFORCED_RUNTIME_BENCH_REPORT.json`](paper2/ENFORCED_RUNTIME_BENCH_REPORT.json) · [`scripts/p2_live/README.md`](scripts/p2_live/README.md)
 - **Paper 1 (Transactional Agent OS · arXiv:2611.08516)** — [https://arxiv.org/abs/2611.08516](https://arxiv.org/abs/2611.08516) ([PDF](https://arxiv.org/pdf/2611.08516) · local copy: [`paper/aegis_os_arxiv_preprint.pdf`](paper/aegis_os_arxiv_preprint.pdf))
-- **Paper 2 (Enforced Runtime & Plugin Security Boundary)** — *Why Agent Plugins Are Not a Security Boundary: Inverting Control from In-Process Hooks to a Kernel-Enforced Agent Runtime* ([PDF](paper2/aegis_enforced_runtime_arxiv_preprint.pdf) · [LaTeX](paper2/main.tex))
+- **Paper 2 (Enforced Runtime & Plugin Security Boundary · DOI: 10.5281/zenodo.24170505)** — [https://doi.org/10.5281/zenodo.24170505](https://doi.org/10.5281/zenodo.24170505) ([Zenodo Record](https://zenodo.org/records/24170505) · local PDF: [`paper2/aegis_enforced_runtime_arxiv_preprint.pdf`](paper2/aegis_enforced_runtime_arxiv_preprint.pdf) · [LaTeX](paper2/main.tex))
 - **AAP-1.0 application protocol** — [`docs/AEGIS_APPLICATION_PROTOCOL.md`](docs/AEGIS_APPLICATION_PROTOCOL.md)
 - **Memory consent / UOMP** — [`docs/UOMP_MEMORY_CONSENT_MAPPING.md`](docs/UOMP_MEMORY_CONSENT_MAPPING.md)
 - **Technical monographs** — [Why Agent Plugins Are Not a Security Boundary](https://heurion.org/en/blog/from-agent-plugins-to-enforced-runtime) · [Beyond Git Branches & Shared Folders](https://heurion.org/en/blog/aegis-os-transactional-agent-kernel) · [Human-Agent Capability Parity](https://heurion.org/en/blog/human-agent-capability-parity-ai-native-software) · [Dual-Surface CRDT](https://heurion.org/en/blog/dual-surface-crdt-clinical-ai)
@@ -140,11 +141,14 @@ If you use Aegis OS in your research or engineering workflows, please cite our p
 }
 
 @misc{zhao2026enforced,
-  title   = {Why Agent Plugins Are Not a Security Boundary: Inverting Control from In-Process Hooks to a Kernel-Enforced Agent Runtime},
-  author  = {Zhao, Hui},
-  year    = {2026},
-  note    = {Preprint, Heurion Research},
-  url     = {https://github.com/heurion-org/aegis-os/blob/main/paper2/aegis_enforced_runtime_arxiv_preprint.pdf}
+  title     = {Why Agent Plugins Are Not a Security Boundary: Inverting Control from In-Process Hooks to a Kernel-Enforced Agent Runtime},
+  author    = {Zhao, Hui},
+  year      = {2026},
+  month     = nov,
+  publisher = {Zenodo},
+  version   = {v1},
+  doi       = {10.5281/zenodo.24170505},
+  url       = {https://doi.org/10.5281/zenodo.24170505}
 }
 ```
 

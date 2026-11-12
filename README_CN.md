@@ -1,6 +1,6 @@
 # Aegis OS (`aegis-os`)
 
-**[English](README.md) | [简体中文](README_CN.md) | [Aegis OS 官网](https://heurion.org/aegis-os/) | [使用教程](https://heurion.org/aegis-os/tutorial/) | [论文一 (arXiv:2611.08516)](https://arxiv.org/abs/2611.08516) | [论文二 (Enforced Runtime PDF)](paper2/aegis_enforced_runtime_arxiv_preprint.pdf) | [技术博客](https://heurion.org/blog) | [云端控制台与 Pro ($29/月)](https://heurion.org/aegis-cloud/dashboard) | [边界审批台](https://heurion.org/aegis-cloud/approve)**
+**[English](README.md) | [简体中文](README_CN.md) | [Aegis OS 官网](https://heurion.org/aegis-os/) | [使用教程](https://heurion.org/aegis-os/tutorial/) | [论文一 (arXiv:2611.08516)](https://arxiv.org/abs/2611.08516) | [论文二 (DOI: 10.5281/zenodo.24170505)](https://doi.org/10.5281/zenodo.24170505) | [技术博客](https://heurion.org/blog) | [云端控制台与 Pro ($29/月)](https://heurion.org/aegis-cloud/dashboard) | [边界审批台](https://heurion.org/aegis-cloud/approve)**
 
 **面向自主编程 Agent（`claude`、`opencode`、`agy`、`hermes`、`codex`）的事务型多租户 Agent OS 运行时 —— 父进程内核沙箱、CoW 影子工作区、A2A 协同与 SHA-256 防 TOCTOU 篡改审批。**
 
@@ -10,6 +10,7 @@
 ![MCP](https://img.shields.io/badge/Protocol-MCP%202024--11--05-blue.svg)
 ![A2A](https://img.shields.io/badge/Protocol-Google%20A2A-34A853.svg)
 [![arXiv](https://img.shields.io/badge/arXiv-2611.08516-b31b1b.svg)](https://arxiv.org/abs/2611.08516)
+[![DOI](https://zenodo.org/badge/DOI/10.5281/zenodo.24170505.svg)](https://doi.org/10.5281/zenodo.24170505)
 [![Blog](https://img.shields.io/badge/Blog-heurion.org%2Fblog-0A7D52.svg)](https://heurion.org/blog)
 
 ---
@@ -116,7 +117,7 @@ aegis-os install
 - **详细架构** — 信任边界、核心 crate、工作区与合并模型、MCP/A2A 接口、领域 profile、云端 PaaS、基准与实施状态：[`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md)
 - **基准报告** — [`BENCHMARK_REPORT.md`](BENCHMARK_REPORT.md) · [`paper2/ENFORCED_RUNTIME_BENCH_REPORT.json`](paper2/ENFORCED_RUNTIME_BENCH_REPORT.json) · [`scripts/p2_live/README.md`](scripts/p2_live/README.md)
 - **论文一（事务型多租户 Agent OS · arXiv:2611.08516）** — [https://arxiv.org/abs/2611.08516](https://arxiv.org/abs/2611.08516)（[PDF](https://arxiv.org/pdf/2611.08516) · 本地副本：[`paper/aegis_os_arxiv_preprint.pdf`](paper/aegis_os_arxiv_preprint.pdf)）
-- **论文二（Enforced 内核运行时与插件安全边界）** — *Why Agent Plugins Are Not a Security Boundary: Inverting Control from In-Process Hooks to a Kernel-Enforced Agent Runtime*（[PDF](paper2/aegis_enforced_runtime_arxiv_preprint.pdf) · [LaTeX](paper2/main.tex)）
+- **论文二（Enforced 内核运行时与插件安全边界 · DOI: 10.5281/zenodo.24170505）** — [https://doi.org/10.5281/zenodo.24170505](https://doi.org/10.5281/zenodo.24170505)（[Zenodo 页面](https://zenodo.org/records/24170505) · 本地副本：[`paper2/aegis_enforced_runtime_arxiv_preprint.pdf`](paper2/aegis_enforced_runtime_arxiv_preprint.pdf) · [LaTeX](paper2/main.tex)）
 - **AAP-1.0 应用协议** — [`docs/AEGIS_APPLICATION_PROTOCOL.md`](docs/AEGIS_APPLICATION_PROTOCOL.md)
 - **记忆同意 / UOMP** — [`docs/UOMP_MEMORY_CONSENT_MAPPING.md`](docs/UOMP_MEMORY_CONSENT_MAPPING.md)
 - **技术专论** — [为什么 Agent 插件不是安全边界](https://heurion.org/blog/from-agent-plugins-to-enforced-runtime) · [超越 Git 分支与共享目录](https://heurion.org/blog/aegis-os-transactional-agent-kernel) · [人机权限与能力对等](https://heurion.org/blog/human-agent-capability-parity-ai-native-software) · [双表面 CRDT](https://heurion.org/blog/dual-surface-crdt-clinical-ai)
@@ -139,11 +140,14 @@ aegis-os install
 }
 
 @misc{zhao2026enforced,
-  title   = {Why Agent Plugins Are Not a Security Boundary: Inverting Control from In-Process Hooks to a Kernel-Enforced Agent Runtime},
-  author  = {Zhao, Hui},
-  year    = {2026},
-  note    = {Preprint, Heurion Research},
-  url     = {https://github.com/heurion-org/aegis-os/blob/main/paper2/aegis_enforced_runtime_arxiv_preprint.pdf}
+  title     = {Why Agent Plugins Are Not a Security Boundary: Inverting Control from In-Process Hooks to a Kernel-Enforced Agent Runtime},
+  author    = {Zhao, Hui},
+  year      = {2026},
+  month     = nov,
+  publisher = {Zenodo},
+  version   = {v1},
+  doi       = {10.5281/zenodo.24170505},
+  url       = {https://doi.org/10.5281/zenodo.24170505}
 }
 ```
 
