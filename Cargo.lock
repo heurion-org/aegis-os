@@ -321,15 +321,20 @@ dependencies = [
  "anyhow",
  "aos-core",
  "async-trait",
+ "base64",
  "chrono",
  "hex",
  "libc",
+ "rand",
+ "ring",
  "serde",
  "serde_json",
  "sha2",
  "tempfile",
  "tokio",
+ "tracing",
  "uuid",
+ "zeroize",
 ]
 
 [[package]]

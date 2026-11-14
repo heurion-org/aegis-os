@@ -207,6 +207,9 @@ const CREDENTIAL_MARKERS: &[&str] = &[
     "/.docker",
     "/.azure",
     "/.config/gcloud",
+    "/.config/aegis-os",
+    "/master.kek",
+    "/.master.kek",
     "/Library/Keychains",
     "/.config/gh/hosts",
     "/.git-credentials",
@@ -269,6 +272,11 @@ const RUNTIME_STATE_MARKERS: &[&str] = &[
     "/pending_escalations.jsonl",
     "/effects.jsonl",
     "/policy_state.json",
+    "/dek.envelope.json",
+    ".dek.enc.json",
+    ".sparsebundle",
+    ".luks.img",
+    ".gocryptfs",
 ];
 
 /// Disallow `AOS_HOST=1` from being used as a blanket sandbox bypass for shell interpreters

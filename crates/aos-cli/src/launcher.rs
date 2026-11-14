@@ -1551,6 +1551,86 @@ fn restore_native_oauth_store_for_agent(
     }
 }
 
+fn prepare_session_cow_base(
+    runtime_dir: &Path,
+    org_id: &str,
+    session_id: &str,
+    session_dir: &Path,
+) -> anyhow::Result<(PathBuf, aos_vfs::vault::VaultStatus)> {
+    let vault_status = aos_vfs::vault::OrgVaultManager::new(runtime_dir)
+        .ensure_org_unlocked(org_id)
+        .with_context(|| format!("unlocking OrgVault for organization '{}'", org_id))?;
+    let session_cow_link = session_dir.join("cow_workspace");
+    if vault_status.encrypted {
+        let launcher_sessions_dir = vault_status.mount_dir.join("launcher_sessions");
+        let vault_session_dir = launcher_sessions_dir.join(session_id);
+        let vault_cow_base = vault_session_dir.join("cow_workspace");
+        std::fs::create_dir_all(&vault_cow_base).with_context(|| {
+            format!(
+                "creating encrypted session CoW workspace at {}",
+                vault_cow_base.display()
+            )
+        })?;
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let _ = std::fs::set_permissions(
+                &launcher_sessions_dir,
+                std::fs::Permissions::from_mode(0o700),
+            );
+            let _ = std::fs::set_permissions(
+                &vault_session_dir,
+                std::fs::Permissions::from_mode(0o700),
+            );
+            let _ =
+                std::fs::set_permissions(&vault_cow_base, std::fs::Permissions::from_mode(0o700));
+            if session_cow_link.symlink_metadata().is_err() {
+                std::os::unix::fs::symlink(&vault_cow_base, &session_cow_link).with_context(
+                    || {
+                        format!(
+                            "symlinking {} -> {}",
+                            session_cow_link.display(),
+                            vault_cow_base.display()
+                        )
+                    },
+                )?;
+            }
+        }
+        #[cfg(not(unix))]
+        {
+            let _ = &session_cow_link;
+        }
+        return Ok((vault_cow_base, vault_status));
+    }
+
+    std::fs::create_dir_all(&session_cow_link)?;
+    Ok((session_cow_link, vault_status))
+}
+
+fn unlock_session_vault_if_needed(
+    runtime_dir: &Path,
+    session_dir: &Path,
+    value: &Value,
+) -> anyhow::Result<()> {
+    let cow_is_symlink = session_dir
+        .join("cow_workspace")
+        .symlink_metadata()
+        .map(|m| m.file_type().is_symlink())
+        .unwrap_or(false);
+    let flagged_encrypted = value
+        .get("vault_encrypted")
+        .and_then(|v| v.as_bool())
+        .unwrap_or(false);
+    if cow_is_symlink || flagged_encrypted {
+        if let Some(org_id) = value.get("org_id").and_then(|v| v.as_str()) {
+            aos_vfs::vault::OrgVaultManager::new(runtime_dir)
+                .ensure_org_unlocked(org_id)
+                .with_context(|| format!("unlocking OrgVault for organization '{}'", org_id))?;
+        }
+    }
+    Ok(())
+}
+
 fn update_session_state(session_dir: &Path, status: &str, exit_code: Option<i32>) {
     let path = session_dir.join("session.json");
     let Ok(raw) = std::fs::read_to_string(&path) else {
@@ -1562,7 +1642,9 @@ fn update_session_state(session_dir: &Path, status: &str, exit_code: Option<i32>
     value["status"] = json!(status);
     value["exit_code"] = json!(exit_code);
     value["updated_at_ms"] = json!(chrono::Utc::now().timestamp_millis());
-    let _ = std::fs::write(path, serde_json::to_vec_pretty(&value).unwrap_or_default());
+    if let Ok(bytes) = serde_json::to_vec_pretty(&value) {
+        let _ = aos_core::session::write_bytes_atomic_synced(&path, &bytes);
+    }
 }
 
 fn latest_session(runtime_dir: &Path) -> anyhow::Result<Option<(PathBuf, Value)>> {
@@ -1681,13 +1763,18 @@ pub(crate) fn last(runtime_dir: &Path) -> anyhow::Result<()> {
 }
 
 fn find_session(runtime_dir: &Path, session_id: Option<&str>) -> anyhow::Result<Option<(PathBuf, Value)>> {
-    if let Some(id) = session_id {
+    let found = if let Some(id) = session_id {
         let dir = runtime_dir.join("sessions").join(id);
         let raw = std::fs::read_to_string(dir.join("session.json"))
             .with_context(|| format!("reading session {}", dir.display()))?;
-        return Ok(Some((dir, serde_json::from_str(&raw)?)));
+        Some((dir, serde_json::from_str(&raw)?))
+    } else {
+        latest_session(runtime_dir)?
+    };
+    if let Some((ref dir, ref value)) = found {
+        unlock_session_vault_if_needed(runtime_dir, dir, value)?;
     }
-    latest_session(runtime_dir)
+    Ok(found)
 }
 
 pub(crate) async fn diff(
@@ -1823,7 +1910,8 @@ pub(crate) async fn commit_with_expected_hash(
     let policy = aos_policy::AegisPolicyKernel::with_state_file(Some(
         runtime_dir.join("policy_state.json"),
     ));
-    let base = dir.join("cow_workspace");
+    let raw_base = dir.join("cow_workspace");
+    let base = std::fs::read_link(&raw_base).unwrap_or(raw_base);
     let ws = CoWWorkspace::init(workspace, &base)
         .await
         .with_context(|| format!("opening session workspace {}", dir.display()))?;
@@ -2194,6 +2282,20 @@ pub(crate) fn discard(runtime_dir: &Path, session_id: Option<&str>) -> anyhow::R
         let aegis_bin = dir.join("agent_home/.aegis-bin");
         let _ = std::fs::set_permissions(&aegis_bin, std::fs::Permissions::from_mode(0o755));
         let _ = std::fs::set_permissions(aegis_bin.join("git"), std::fs::Permissions::from_mode(0o755));
+    }
+    let cow_link = dir.join("cow_workspace");
+    if let Ok(target) = std::fs::read_link(&cow_link) {
+        let _ = std::fs::remove_dir_all(&target);
+        if let Some(parent) = target.parent() {
+            if parent
+                .parent()
+                .and_then(|p| p.file_name())
+                .and_then(|n| n.to_str())
+                == Some("launcher_sessions")
+            {
+                let _ = std::fs::remove_dir_all(parent);
+            }
+        }
     }
     std::fs::remove_dir_all(&dir)
         .with_context(|| format!("removing session {}", dir.display()))?;
@@ -4420,6 +4522,7 @@ async fn run_inner(
         .unwrap_or("workspace")
         .to_string();
 
+    #[cfg_attr(target_os = "macos", allow(unused_mut))]
     let mut command = command.to_vec();
     if is_opencode_command(&command) {
         if command
@@ -4486,8 +4589,8 @@ async fn run_inner(
         install_git_shim(&agent_home)?;
     }
 
-    let cow_base = session_dir.join("cow_workspace");
-    std::fs::create_dir_all(&cow_base)?;
+    let (cow_base, vault_status) =
+        prepare_session_cow_base(runtime_dir, &identity.org_id, &session_id, &session_dir)?;
     let cow = CoWWorkspace::init(&project, &cow_base)
         .await
         .with_context(|| format!("creating CoW workspace for {}", project.display()))?;
@@ -4628,6 +4731,8 @@ async fn run_inner(
         "shadow": shadow.display().to_string(),
         "agent_home": agent_home.display().to_string(),
         "cow_backend": "reflink-or-copy",
+        "vault_encrypted": vault_status.encrypted,
+        "vault_backend": vault_status.backend.as_str(),
         "broker": true,
         "control_socket": crate::session_broker::CONTROL_SOCKET_IN_SANDBOX,
         "git_view": plan.git_view_enabled(),
@@ -4639,9 +4744,9 @@ async fn run_inner(
         "status": "running",
         "created_at_ms": chrono::Utc::now().timestamp_millis(),
     });
-    std::fs::write(
-        session_dir.join("session.json"),
-        serde_json::to_vec_pretty(&session_meta)?,
+    aos_core::session::write_bytes_atomic_synced(
+        &session_dir.join("session.json"),
+        &serde_json::to_vec_pretty(&session_meta)?,
     )?;
 
     eprintln!(
@@ -4894,8 +4999,8 @@ async fn run_macos_inner(
         None
     };
 
-    let cow_base = session_dir.join("cow_workspace");
-    std::fs::create_dir_all(&cow_base)?;
+    let (cow_base, vault_status) =
+        prepare_session_cow_base(runtime_dir, &identity.org_id, &session_id, &session_dir)?;
     let cow = CoWWorkspace::init(project, &cow_base)
         .await
         .with_context(|| format!("creating CoW workspace for {}", project.display()))?;
@@ -5128,6 +5233,8 @@ async fn run_macos_inner(
         "shadow": shadow.display().to_string(),
         "agent_home": agent_home.display().to_string(),
         "cow_backend": "apfs-clone-or-copy",
+        "vault_encrypted": vault_status.encrypted,
+        "vault_backend": vault_status.backend.as_str(),
         "broker": true,
         "control_socket": broker.control_endpoint(),
         "git_view": host_git.is_dir(),
@@ -5136,7 +5243,10 @@ async fn run_macos_inner(
         "status": "running",
         "created_at_ms": chrono::Utc::now().timestamp_millis(),
     });
-    std::fs::write(session_dir.join("session.json"), serde_json::to_vec_pretty(&meta)?)?;
+    aos_core::session::write_bytes_atomic_synced(
+        &session_dir.join("session.json"),
+        &serde_json::to_vec_pretty(&meta)?,
+    )?;
 
     eprintln!(
         "Aegis · enforced (macOS Seatbelt) · {}/{}",
@@ -6531,18 +6641,22 @@ mod tests {
     fn raw_terminal_guard_disables_canonical_echo_and_restores_on_drop() {
         let mut master: libc::c_int = -1;
         let mut slave: libc::c_int = -1;
-        assert_eq!(
-            unsafe {
-                libc::openpty(
-                    &mut master,
-                    &mut slave,
-                    std::ptr::null_mut(),
-                    std::ptr::null_mut(),
-                    std::ptr::null_mut(),
-                )
-            },
-            0
-        );
+        let rc = unsafe {
+            libc::openpty(
+                &mut master,
+                &mut slave,
+                std::ptr::null_mut(),
+                std::ptr::null_mut(),
+                std::ptr::null_mut(),
+            )
+        };
+        if rc != 0
+            && std::io::Error::last_os_error().raw_os_error() == Some(libc::EPERM)
+            && std::env::var_os("AOS_SANDBOX_ID").is_some()
+        {
+            return;
+        }
+        assert_eq!(rc, 0);
         let mut before: libc::termios = unsafe { std::mem::zeroed() };
         assert_eq!(unsafe { libc::tcgetattr(slave, &mut before) }, 0);
         assert_ne!(before.c_lflag & (libc::ICANON | libc::ECHO), 0);
@@ -6959,5 +7073,41 @@ mod tests {
             "headless opencode run must not overwrite existing host API key"
         );
         assert!(synced_oc.get("evil").is_none());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn discard_cleans_up_symlinked_vault_launcher_session() {
+        let tmp = tempfile::tempdir().unwrap();
+        let runtime = tmp.path().join("runtime");
+        let session_dir = runtime.join("sessions/ses_vault1");
+        let target_session = runtime.join("orgs/acme/launcher_sessions/ses_vault1");
+        let target_cow = target_session.join("cow_workspace");
+        let sibling_session = runtime.join("orgs/acme/launcher_sessions/ses_other/cow_workspace");
+
+        std::fs::create_dir_all(&session_dir).unwrap();
+        std::fs::create_dir_all(target_cow.join("upper_workspace")).unwrap();
+        std::fs::create_dir_all(&sibling_session).unwrap();
+        std::fs::write(target_cow.join("upper_workspace/x.txt"), "draft\n").unwrap();
+        std::os::unix::fs::symlink(&target_cow, session_dir.join("cow_workspace")).unwrap();
+        std::fs::write(
+            session_dir.join("session.json"),
+            serde_json::to_vec_pretty(&json!({
+                "session_id": "ses_vault1",
+                "org_id": "acme",
+                "agent_id": "claude-code",
+                "vault_encrypted": true,
+                "status": "exited",
+                "created_at_ms": 1,
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+
+        super::discard(&runtime, Some("ses_vault1")).unwrap();
+
+        assert!(!session_dir.exists());
+        assert!(!target_session.exists());
+        assert!(sibling_session.exists());
     }
 }

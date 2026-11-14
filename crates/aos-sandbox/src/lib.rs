@@ -347,6 +347,7 @@ impl NativeOsSandboxInstance {
     (regex #".*/\.docker(/.*)?$")
     (regex #".*/\.config/gh(/.*)?$")
     (regex #".*/\.config/gcloud(/.*)?$")
+    (regex #".*/\.config/aegis-os(/.*)?$")
     (regex #".*/\.azure(/.*)?$")
     (regex #".*/\.npmrc$")
     (regex #".*/\.pypirc$")
@@ -385,6 +386,7 @@ impl NativeOsSandboxInstance {
                             .join("paas_workspaces")
                             .join(&self.config.identity.org_id),
                     );
+                    let org_vault_paas = Self::sbpl_path(&org_dir.join("paas_workspaces"));
                     // Only the current workspace/home are readable under runtime. Do NOT allow
                     // the whole session directory: it contains human.token, approval tickets and
                     // other control-plane material that the agent must never read.
@@ -397,6 +399,7 @@ impl NativeOsSandboxInstance {
     (subpath "{shared_ro}")
     (subpath "{org_pub}")
     (subpath "{org_paas}")
+    (subpath "{org_vault_paas}")
 )"#
                     )
                 }
@@ -409,12 +412,15 @@ impl NativeOsSandboxInstance {
         // LaunchServices and launchctl would start programs (`open -a Terminal x.command`,
         // `launchctl bootstrap/run`) as children of `launchd`, i.e. outside this sandbox.
         // Deny both the Mach IPC families (`coreservices`/`lsd`) and direct exec of
-        // `launchctl`, `open`, and `osascript` alongside `(deny appleevent-send)`.
+        // `launchctl`, `open`, and `osascript` alongside `(deny appleevent-send)`, and
+        // block `hdiutil`/`diskutil` so agents cannot detach or tamper with encrypted OrgVault mounts.
         let launch_rules = r##"
 (deny process-exec
     (literal "/bin/launchctl")
     (literal "/usr/bin/open")
     (literal "/usr/bin/osascript")
+    (literal "/usr/bin/hdiutil")
+    (literal "/usr/sbin/diskutil")
 )
 (deny mach-lookup (global-name-regex #"^com\.apple\.(coreservices\.|lsd\.)"))"##;
 
@@ -438,8 +444,15 @@ impl NativeOsSandboxInstance {
     }
 
     /// Credential directories hidden from Linux sandboxes (relative to each home directory).
-    const CRED_DIRS: &'static [&'static str] =
-        &[".ssh", ".aws", ".gnupg", ".kube", ".docker", ".config/gh"];
+    const CRED_DIRS: &'static [&'static str] = &[
+        ".ssh",
+        ".aws",
+        ".gnupg",
+        ".kube",
+        ".docker",
+        ".config/gh",
+        ".config/aegis-os",
+    ];
     /// Credential files hidden from Linux sandboxes (relative to each home directory).
     const CRED_FILES: &'static [&'static str] = &[".npmrc", ".pypirc", ".netrc", ".git-credentials"];
 
@@ -682,6 +695,10 @@ impl NativeOsSandboxInstance {
                         .join(&self.config.identity.org_id);
                     if org_paas.is_dir() {
                         extra_org_ro_mounts.push(org_paas.to_string_lossy().into_owned());
+                    }
+                    let org_vault_paas = org_dir.join("paas_workspaces");
+                    if org_vault_paas.is_dir() {
+                        extra_org_ro_mounts.push(org_vault_paas.to_string_lossy().into_owned());
                     }
                 }
             }

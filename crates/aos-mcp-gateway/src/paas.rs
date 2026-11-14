@@ -1887,7 +1887,19 @@ impl PaasControlPlane {
             );
         }
 
-        let host_repo = self.workspaces_root.join(org_id).join(&ws_id).join("host_repo");
+        let vault_status = kernel.ensure_org_vault(org_id).await?;
+        let host_repo = if vault_status.encrypted {
+            vault_status
+                .mount_dir
+                .join("paas_workspaces")
+                .join(&ws_id)
+                .join("host_repo")
+        } else {
+            self.workspaces_root
+                .join(org_id)
+                .join(&ws_id)
+                .join("host_repo")
+        };
         if host_repo.exists() {
             let _ = tokio::fs::remove_dir_all(&host_repo).await;
         }
@@ -2038,6 +2050,19 @@ impl PaasControlPlane {
         kernel
             .evict_agent_environments(&record.org_id, &record.agents)
             .await;
+        let has_other_active = {
+            let state = self.state.read().await;
+            state.workspaces.iter().any(|w| {
+                w.org_id == record.org_id
+                    && w.workspace_id != record.workspace_id
+                    && w.status == WorkspaceLifecycleState::Active
+            })
+        };
+        if !has_other_active {
+            let vault = kernel.vault.clone();
+            let lock_org_id = record.org_id.clone();
+            let _ = tokio::task::spawn_blocking(move || vault.lock_org(&lock_org_id)).await;
+        }
         self.flush().await?;
         Ok(record)
     }
@@ -2114,6 +2139,7 @@ impl PaasControlPlane {
         kernel
             .evict_agent_environments(&removed.org_id, &removed.agents)
             .await;
+        let _ = kernel.ensure_org_vault(&removed.org_id).await;
         if let Some(ws_dir) = removed.host_repo_path.parent() {
             let _ = tokio::fs::remove_dir_all(ws_dir).await;
         }
@@ -2171,6 +2197,9 @@ impl PaasControlPlane {
             kernel.evict_agent_environments(&ws.org_id, &ws.agents).await;
         }
         let _ = tokio::fs::remove_dir_all(self.workspaces_root.join(org_id)).await;
+        let vault = kernel.vault.clone();
+        let destroy_org_id = org_id.to_string();
+        let _ = tokio::task::spawn_blocking(move || vault.destroy_org(&destroy_org_id)).await;
         self.flush().await?;
         Ok(json!({ "status": if found { "deleted" } else { "not_found" }, "org_id": org_id, "removed": counts }))
     }
@@ -2211,6 +2240,7 @@ impl PaasControlPlane {
             (cloned, was_hib)
         };
 
+        kernel.ensure_org_vault(&record.org_id).await?;
         for agent_id in &record.agents {
             let identity = AgentIdentity::new(&record.org_id, agent_id.clone(), "Aegis Cloud Agent");
             kernel
@@ -2307,6 +2337,7 @@ impl PaasControlPlane {
                 target_host_repo = Some(ws.host_repo_path);
             }
         } else {
+            let _ = kernel.ensure_org_vault(org_id).await;
             let list = self.list_workspaces(Some(org_id)).await;
             if let Some(first) = list.first() {
                 target_host_repo = Some(first.host_repo_path.clone());

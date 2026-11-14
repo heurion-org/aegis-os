@@ -215,13 +215,101 @@ fn read_binding(path: &Path) -> Option<SessionBinding> {
     serde_json::from_slice(&bytes).ok()
 }
 
-fn write_json_atomic(path: &Path, value: &impl Serialize) -> std::io::Result<()> {
+fn write_bytes_atomic_with_mode(
+    path: &Path,
+    bytes: &[u8],
+    mode_override: Option<u32>,
+) -> std::io::Result<()> {
+    use std::io::Write;
     if let Some(parent) = path.parent() {
-        std::fs::create_dir_all(parent)?;
+        if !parent.as_os_str().is_empty() {
+            std::fs::create_dir_all(parent)?;
+        }
     }
-    let tmp = path.with_extension(format!("tmp-{}-{}", std::process::id(), uuid::Uuid::new_v4().simple()));
-    std::fs::write(&tmp, serde_json::to_vec_pretty(value).unwrap_or_default())?;
-    std::fs::rename(tmp, path)
+    #[cfg(unix)]
+    let preserved_mode = if mode_override.is_none() {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::metadata(path)
+            .ok()
+            .map(|m| m.permissions().mode() & 0o7777)
+    } else {
+        None
+    };
+
+    let file_name = path
+        .file_name()
+        .and_then(|n| n.to_str())
+        .filter(|n| !n.is_empty())
+        .unwrap_or("file");
+    let tmp = path.with_file_name(format!(
+        ".{}.aegis-tmp-{}-{}",
+        file_name,
+        std::process::id(),
+        uuid::Uuid::new_v4().simple()
+    ));
+
+    let write_res = (|| -> std::io::Result<()> {
+        let mut f = std::fs::OpenOptions::new()
+            .create_new(true)
+            .write(true)
+            .open(&tmp)?;
+        f.write_all(bytes)?;
+        #[cfg(unix)]
+        if let Some(mode) = mode_override.or(preserved_mode) {
+            use std::os::unix::fs::PermissionsExt;
+            f.set_permissions(std::fs::Permissions::from_mode(mode))?;
+        }
+        f.sync_all()?;
+        Ok(())
+    })();
+    if let Err(err) = write_res {
+        let _ = std::fs::remove_file(&tmp);
+        return Err(err);
+    }
+
+    if let Err(err) = std::fs::rename(&tmp, path) {
+        let _ = std::fs::remove_file(&tmp);
+        return Err(err);
+    }
+    #[cfg(unix)]
+    if let Some(parent) = path.parent() {
+        let dir_path = if parent.as_os_str().is_empty() {
+            Path::new(".")
+        } else {
+            parent
+        };
+        if let Ok(dir) = std::fs::File::open(dir_path) {
+            if let Err(err) = dir.sync_all() {
+                if !matches!(
+                    err.raw_os_error(),
+                    Some(libc::EINVAL) | Some(libc::EPERM) | Some(libc::EROFS)
+                ) && err.kind() != std::io::ErrorKind::Unsupported
+                {
+                    return Err(err);
+                }
+            }
+        }
+    }
+    Ok(())
+}
+
+/// Atomically writes `bytes` to `path` via a sibling temporary file, calling `sync_all()`
+/// on the temporary file before renaming and syncing the parent directory afterwards.
+/// Preserves existing file mode bits on Unix when overwriting an existing file.
+pub fn write_bytes_atomic_synced(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
+    write_bytes_atomic_with_mode(path, bytes, None)
+}
+
+/// Async variant of [`write_bytes_atomic_synced`].
+pub async fn write_bytes_atomic_synced_async(path: &Path, bytes: Vec<u8>) -> anyhow::Result<()> {
+    let path = path.to_path_buf();
+    tokio::task::spawn_blocking(move || write_bytes_atomic_synced(&path, &bytes)).await??;
+    Ok(())
+}
+
+fn write_json_atomic(path: &Path, value: &impl Serialize) -> std::io::Result<()> {
+    let bytes = serde_json::to_vec_pretty(value).unwrap_or_default();
+    write_bytes_atomic_with_mode(path, &bytes, Some(0o600))
 }
 
 /// Acquires an exclusive cross-process `flock` synchronously for a persisted JSON state file (`<path>.lock`).
@@ -269,25 +357,11 @@ pub async fn acquire_file_lock(path: &Path) -> anyhow::Result<std::fs::File> {
 }
 
 /// Synchronously writes `value` as pretty-printed JSON (owner-only `0o600` on Unix) to a unique
-/// sibling temporary file and atomically renames it onto `path` when the caller ALREADY holds
-/// `acquire_file_lock_sync(path)`.
+/// sibling temporary file, fsyncs it, and atomically renames it onto `path` when the caller ALREADY
+/// holds `acquire_file_lock_sync(path)`.
 pub fn write_json_pretty_unlocked_sync<T: Serialize>(path: &Path, value: &T) -> anyhow::Result<()> {
-    if let Some(parent) = path.parent() {
-        std::fs::create_dir_all(parent)?;
-    }
     let bytes = serde_json::to_vec_pretty(value)?;
-    let tmp = path.with_extension(format!(
-        "json.tmp-{}-{}",
-        std::process::id(),
-        uuid::Uuid::new_v4().simple()
-    ));
-    std::fs::write(&tmp, bytes)?;
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-        std::fs::set_permissions(&tmp, std::fs::Permissions::from_mode(0o600))?;
-    }
-    std::fs::rename(&tmp, path)?;
+    write_bytes_atomic_with_mode(path, &bytes, Some(0o600))?;
     Ok(())
 }
 
@@ -298,28 +372,16 @@ pub fn write_json_pretty_atomic_sync<T: Serialize>(path: &Path, value: &T) -> an
     write_json_pretty_unlocked_sync(path, value)
 }
 
-/// Writes `value` as pretty-printed JSON to a unique sibling temporary file and atomically
-/// renames it onto `path` when the caller ALREADY holds `acquire_file_lock(path)`.
+/// Writes `value` as pretty-printed JSON to a unique sibling temporary file, fsyncs it, and
+/// atomically renames it onto `path` when the caller ALREADY holds `acquire_file_lock(path)`.
 pub async fn write_json_pretty_unlocked<T: Serialize + Sync>(
     path: &Path,
     value: &T,
 ) -> anyhow::Result<()> {
-    if let Some(parent) = path.parent() {
-        tokio::fs::create_dir_all(parent).await?;
-    }
     let bytes = serde_json::to_vec_pretty(value)?;
-    let tmp = path.with_extension(format!(
-        "json.tmp-{}-{}",
-        std::process::id(),
-        uuid::Uuid::new_v4().simple()
-    ));
-    tokio::fs::write(&tmp, bytes).await?;
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-        tokio::fs::set_permissions(&tmp, std::fs::Permissions::from_mode(0o600)).await?;
-    }
-    tokio::fs::rename(&tmp, path).await?;
+    let path = path.to_path_buf();
+    tokio::task::spawn_blocking(move || write_bytes_atomic_with_mode(&path, &bytes, Some(0o600)))
+        .await??;
     Ok(())
 }
 

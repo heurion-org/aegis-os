@@ -89,11 +89,17 @@ cargo clippy --workspace --all-targets -- -D warnings
 - Git 视图只支持 `.git` 目录；worktree/submodule 的 `.git` 文件尚未处理。
 - macOS Seatbelt 已有 enforced launcher MVP，但仍是 `allow default` + deny 写/凭据/网络，且使用 shadow 作为 cwd（无路径重映射）；default-deny 收敛、VM 形态、Office CRDT、AAP-1.0、UOMP、IDE 集成和 Hermes adapter 未完成。
 - `.agents/hooks.json` 已改为可移植的 `aegis-os` + `--workspace ".."`，不再写死机器路径。
-- 默认 runtime 已迁到 `~/.aegis`（可用 `AOS_RUNTIME_DIR` 覆盖）；旧 `/tmp/aegis-os-runtime` 会话不会自动迁移。
+- 默认 runtime 已迁到 `~/.aegis`（可用 `AOS_RUNTIME_DIR` 覆盖），旧 `/tmp/aegis-os-runtime` 启动参数现在会自动重定向到 `~/.aegis` 并无损迁移遗留 shadow；CoW 影子工作区、快照与 Cloud PaaS 租户工作区默认持久化在按组织隔离的 OS 加密卷 `OrgVault` 内（macOS 使用无 root APFS Encrypted `.sparsebundle`，Linux/Cloud 使用 `LUKS2 + Btrfs` 或 `gocryptfs` FUSE，无后端可用时回退 `PlainDir0700`）。
 
 ---
 
 ## 变更记录
+
+- **v0.8**（2026-11-14）：落地按组织隔离的 OS 加密持久化卷 `OrgVault` 与崩溃恢复机制：
+  - **Per-Org 加密卷 `OrgVault`（`crates/aos-vfs/src/vault.rs`）**：将 `<runtime_root>/orgs/<org_id>` 整体挂载为操作系统级加密 sparse/块卷——macOS 本地采用 Rootless APFS Encrypted `.sparsebundle`（AES-256，保留 `clonefile(2)`），云端/特权 Linux 采用 `LUKS2 (dm-crypt) + Btrfs`（`zstd` 压缩与 `BTRFS_IOC_SNAP_CREATE_V2` / `FICLONE`），无特权 Linux 支持 `gocryptfs` FUSE 回退；
+  - **信封加密与密钥隔离**：使用 `ring` `AES-256-GCM`（`Aad = org_id`）实现 `KEK -> DEK` 信封封装；KEK 按 `AOS_VAULT_MASTER_KEY`（Cloud KMS）→ macOS Keychain → Linux Secret Service → 沙箱屏蔽的 `0o600` `~/.config/aegis-os/master.kek` 顺序加载，并在 Seatbelt/`bwrap` 与 `routing.rs` 中封锁 KEK、DEK 信封、`hdiutil`/`diskutil`；
+  - **Cloud PaaS 加密级联休眠（Scale-to-Zero）**：`hibernate_workspace` 在组织无活跃工作区时自动 `umount` 并 `cryptsetup close` 卸载卷与密钥，`wake_workspace_if_needed` 自动重新解密解锁，`delete_org` 执行密码学擦除（crypto-erasure）；
+  - **落盘 `fsync` 原子性与重启动恢复**：`write_bytes_atomic_synced` 为影子文件、快照索引、`session_bindings.json` 与 `session.json` 补齐 `fsync` + 父目录刷盘；`host_commits` epoch 从 `/tmp` 迁出持久化；新增死进程孤儿影子检测（`recoverable_orphaned_shadows`）、`workspace_sync(adopt_orphaned_agent)` 与 `aegis-os vault {status,unlock,lock,recover}`，并将遗留 `/tmp/aegis-os-runtime` 自动救援至 `~/.aegis`。
 
 - **v0.7**（2026-11-09）：完成跨平台真实 CLI Agent 生产适配加固与 Paper 2 实证评测（`aa36c3c`）：
   - **macOS Seatbelt 真实客户端兼容与硬化**：保留真实 `HOME`（支持 Claude Code / AGY 读取 macOS Keychain OAuth 凭据）同时将 `XDG_CONFIG_HOME` / `XDG_DATA_HOME` / `XDG_STATE_HOME` 重定向至沙箱私有目录；对 Darwin `/var/folders -> /private/var/folders` 执行软链规范化白名单；阻断 `~/.ssh`、`~/.aws`、`~/.gnupg` 与 `human.token` 读取；
@@ -430,7 +436,8 @@ $ aegis-os install --enforce
 - 在 shell 配置中追加 `export PATH="$HOME/.aegis/bin:$PATH"`（fish 用 `set -gx PATH`），支持 `.zshrc` / `.bashrc` / `.profile` / fish；用标记块保证幂等。
 - 保留原始客户端配置；不覆盖用户已有 MCP / Hook，只合并标记块。
 - 未知 MCP Agent 打印 `aos agent add` 指引，不假装支持（`aos agent add` 仍 planned）。
-- `aegis-os uninstall --shim-only` 移除 shim 与 shell PATH block；当前不会自动删除客户端 MCP/Hook 块，也不会删除 shadow，需手工处理。
+- `aegis-os uninstall`：移除 `~/.aegis/bin` PATH shim、shell RC PATH 块与 4 款全局客户端（AGY / Claude Code / Codex / OpenCode）中的 Aegis MCP / Hook / 权限 / 规则注入，同时无损保留用户的其余配置；支持 `--shim-only`（仅去 shim）、`--workspace-clean`（清理项目 `.agents/`）、`--dry-run`（演习预览），以及 `--purge --yes`（先锁定并卸载所有 `OrgVault` 加密卷，再销毁 `~/.aegis` 运行时状态与主密钥 KEK 材料）。
+- `aegis-os upgrade`（别名 `update` / `self-update`）：自动识别安装来源（Homebrew / 本地源码编译 `cargo install --path` / Cargo Git / Ed25519 签名发行版 `ssh-keygen -Y verify`），原地升级后默认使用新二进制刷新全局客户端集成配置与现有 shim（自动迁移遗留 `/tmp/aegis-os-runtime` 指向）；支持 `--check`、`--method <auto|release|brew|source|cargo>`、`--tag <vX.Y.Z>`、`--source-dir`、`--offline`、`--refresh-only`、`--no-refresh` 与 `--dry-run`。
 
 ### 5.3 日常启动
 

@@ -8,10 +8,11 @@
 #![recursion_limit = "512"]
 
 use aos_core::{
-    claims, A2AArtifact, A2ATaskState, AgentIdentity, AgentSkill, AuditEvent, ExecSpec,
-    FlightRecorder, IpcBus, IpcEnvelope, IpcKind, IsolationTier, LeaseGrant, LeaseKind, MessageDeliveryStatus,
-    OrgSharedStorage, PolicyContext, PolicyDecision, PolicyEngine, ResourceLimits, SandboxConfig,
-    SandboxDriver, SandboxInstance, TransactionalWorkspace,
+    claims, A2AArtifact, A2ATaskState, AgentIdentity, AgentSkill, AuditEvent, DiffChangeType,
+    ExecSpec, FlightRecorder, IpcBus, IpcEnvelope, IpcKind, IsolationTier, LeaseGrant, LeaseKind,
+    MessageDeliveryStatus, OrgSharedStorage, PolicyContext, PolicyDecision, PolicyEngine,
+    ResourceLimits, SandboxConfig, SandboxDriver, SandboxInstance, SnapshotMeta,
+    TransactionalWorkspace,
 };
 use aos_egress::{AegisEgressGateway, SecretVaultEntry};
 use aos_ipc::AegisIpcBus;
@@ -19,6 +20,7 @@ use aos_memory::MemoryAction;
 use aos_policy::AegisPolicyKernel;
 use aos_recorder::AegisFlightRecorder;
 use aos_sandbox::{MicroVmSandboxDriver, NativeOsSandboxDriver};
+use aos_vfs::vault::{OrgVaultManager, VaultStatus};
 use aos_vfs::{CoWWorkspace, OrgCasAndKvStore};
 use anyhow::{bail, Context};
 use chrono::Utc;
@@ -283,6 +285,7 @@ pub struct AegisRuntimeKernel {
     pub recorder: Arc<dyn FlightRecorder>,
     pub paas: Arc<PaasControlPlane>,
     pub app_store: Arc<AppStoreRegistry>,
+    pub vault: Arc<OrgVaultManager>,
     memory_url: Option<String>,
     memory_bridge_token: Option<String>,
     memory_task_secret: Option<String>,
@@ -292,6 +295,17 @@ pub struct AegisRuntimeKernel {
 
 impl AegisRuntimeKernel {
     pub async fn new(runtime_data_root: impl AsRef<Path>) -> anyhow::Result<Self> {
+        let raw_root = runtime_data_root.as_ref().to_path_buf();
+        tokio::fs::create_dir_all(&raw_root).await?;
+        let root = std::fs::canonicalize(&raw_root).unwrap_or(raw_root);
+        let vault = Arc::new(OrgVaultManager::new(&root));
+        Self::new_with_vault(&root, vault).await
+    }
+
+    pub async fn new_with_vault(
+        runtime_data_root: impl AsRef<Path>,
+        vault: Arc<OrgVaultManager>,
+    ) -> anyhow::Result<Self> {
         let raw_root = runtime_data_root.as_ref().to_path_buf();
         tokio::fs::create_dir_all(&raw_root).await?;
         let root = std::fs::canonicalize(&raw_root).unwrap_or(raw_root);
@@ -317,6 +331,7 @@ impl AegisRuntimeKernel {
             recorder,
             paas,
             app_store,
+            vault,
             memory_url: std::env::var("AOS_MEMORY_URL")
                 .ok()
                 .filter(|value| !value.is_empty()),
@@ -329,6 +344,163 @@ impl AegisRuntimeKernel {
             agents: Arc::new(RwLock::new(HashMap::new())),
             mounted_mcp_servers: Arc::new(RwLock::new(Vec::new())),
         })
+    }
+
+    pub async fn ensure_org_vault(&self, org_id: &str) -> anyhow::Result<VaultStatus> {
+        let vault = self.vault.clone();
+        let org = org_id.to_string();
+        tokio::task::spawn_blocking(move || vault.ensure_org_unlocked(&org)).await?
+    }
+
+    async fn is_agent_live(
+        &self,
+        org_id: &str,
+        agent_id: &str,
+        peers: &[aos_core::PeerInfo],
+    ) -> bool {
+        if let Some(peer) = peers.iter().find(|p| p.agent_id == agent_id) {
+            if let Some(pid) = peer.pid {
+                return aos_core::session::is_pid_alive(pid, peer.start_time);
+            }
+            if peer.online {
+                return true;
+            }
+        }
+        self.agents
+            .read()
+            .await
+            .contains_key(&Self::agent_key(org_id, agent_id))
+    }
+
+    pub async fn detect_orphaned_shadows(
+        &self,
+        identity: &AgentIdentity,
+        host_source_root: &Path,
+    ) -> Vec<Value> {
+        let agents_dir = self
+            .runtime_data_root
+            .join("orgs")
+            .join(&identity.org_id)
+            .join("agents");
+        let Ok(mut rd) = tokio::fs::read_dir(&agents_dir).await else {
+            return Vec::new();
+        };
+        let peers = self.ipc.list_peers(&identity.org_id).await.unwrap_or_default();
+        let mut orphaned = Vec::new();
+        while let Ok(Some(entry)) = rd.next_entry().await {
+            let other_id = entry.file_name().to_string_lossy().to_string();
+            if other_id == identity.agent_id || other_id.starts_with('.') {
+                continue;
+            }
+            if self.is_agent_live(&identity.org_id, &other_id, &peers).await {
+                continue;
+            }
+            let cow_base = entry.path().join("cow_workspace");
+            let orphan_upper = cow_base.join("upper_workspace");
+            if !orphan_upper.is_dir() {
+                continue;
+            }
+            let Ok(diffs) = CoWWorkspace::diff_dirs(host_source_root, &orphan_upper, None).await
+            else {
+                continue;
+            };
+            if diffs.is_empty() {
+                continue;
+            }
+            let snapshots_count = tokio::fs::read(cow_base.join("snapshots.json"))
+                .await
+                .ok()
+                .and_then(|b| serde_json::from_slice::<Vec<SnapshotMeta>>(&b).ok())
+                .map(|s| s.len())
+                .unwrap_or(0);
+            let changed_paths: Vec<String> = diffs.iter().map(|d| d.relative_path.clone()).collect();
+            orphaned.push(json!({
+                "agent_id": other_id,
+                "uncommitted_changes_count": diffs.len(),
+                "changed_paths": changed_paths,
+                "snapshots_count": snapshots_count,
+            }));
+        }
+        orphaned
+    }
+
+    pub async fn recover_orphaned_agent_shadow(
+        &self,
+        identity: &AgentIdentity,
+        from_agent_id: &str,
+    ) -> anyhow::Result<Value> {
+        if from_agent_id.is_empty()
+            || from_agent_id == "."
+            || from_agent_id == ".."
+            || from_agent_id.contains('/')
+            || from_agent_id.contains('\\')
+            || from_agent_id.contains("..")
+            || from_agent_id.contains('*')
+        {
+            bail!("Invalid orphaned agent id '{}'", from_agent_id);
+        }
+        if from_agent_id == identity.agent_id {
+            bail!("Cannot adopt shadow workspace from self ('{}')", from_agent_id);
+        }
+        self.ensure_org_vault(&identity.org_id).await?;
+        let env = self.get_agent_environment(identity).await?;
+        let peers = self.ipc.list_peers(&identity.org_id).await.unwrap_or_default();
+        if self
+            .is_agent_live(&identity.org_id, from_agent_id, &peers)
+            .await
+        {
+            bail!(
+                "Agent '{}' is still alive; cannot adopt an active shadow workspace",
+                from_agent_id
+            );
+        }
+        let orphan_upper = self
+            .runtime_data_root
+            .join("orgs")
+            .join(&identity.org_id)
+            .join("agents")
+            .join(from_agent_id)
+            .join("cow_workspace")
+            .join("upper_workspace");
+        if !orphan_upper.is_dir() {
+            bail!(
+                "Orphaned shadow workspace for agent '{}' not found",
+                from_agent_id
+            );
+        }
+
+        let diffs =
+            CoWWorkspace::diff_dirs(env.workspace.host_source_root(), &orphan_upper, None).await?;
+        let pre_snap = env.workspace.create_snapshot("pre-orphan-recovery").await?;
+        let mut recovered_paths = Vec::new();
+        for entry in diffs {
+            let (clean, dst_path) =
+                shadow_path_for_write(env.workspace.shadow_root(), &entry.relative_path)?;
+            match entry.change_type {
+                DiffChangeType::Added | DiffChangeType::Modified => {
+                    let src_path = orphan_upper.join(&clean);
+                    let bytes = tokio::fs::read(&src_path).await.with_context(|| {
+                        format!("reading orphaned shadow file '{}'", src_path.display())
+                    })?;
+                    aos_core::session::write_bytes_atomic_synced_async(&dst_path, bytes).await?;
+                    recovered_paths.push(clean);
+                }
+                DiffChangeType::Deleted => {
+                    if dst_path.exists() {
+                        tokio::fs::remove_file(&dst_path).await?;
+                        recovered_paths.push(clean);
+                    }
+                }
+            }
+        }
+
+        Ok(json!({
+            "status": "recovered_orphaned_shadow",
+            "from_agent_id": from_agent_id,
+            "pre_recovery_snapshot_id": pre_snap.snapshot_id,
+            "recovered_paths_count": recovered_paths.len(),
+            "recovered_paths": recovered_paths,
+        }))
     }
 
     /// Attach an already-created workspace/sandbox environment to this kernel. The launcher uses
@@ -834,6 +1006,7 @@ impl AegisRuntimeKernel {
         tier: IsolationTier,
         subscribed_topics: Vec<String>,
     ) -> anyhow::Result<Arc<AgentEnvironment>> {
+        self.ensure_org_vault(&identity.org_id).await?;
         let key = Self::agent_key(&identity.org_id, &identity.agent_id);
         if let Some(existing) = self.agents.read().await.get(&key) {
             if existing.workspace.shadow_root().join(".initialized").exists()
@@ -1322,10 +1495,11 @@ impl AegisRuntimeKernel {
                     .context("Missing 'content'")?;
                 let (clean, full_path) =
                     shadow_path_for_write(env.workspace.shadow_root(), rel_path)?;
-                if let Some(parent) = full_path.parent() {
-                    tokio::fs::create_dir_all(parent).await?;
-                }
-                tokio::fs::write(&full_path, content).await?;
+                aos_core::session::write_bytes_atomic_synced_async(
+                    &full_path,
+                    content.as_bytes().to_vec(),
+                )
+                .await?;
                 Ok(json!({
                     "status": "written_to_cow_shadow",
                     "path": clean,
@@ -1359,7 +1533,11 @@ impl AegisRuntimeKernel {
                     );
                 }
                 let updated = original.replace(target, replacement);
-                tokio::fs::write(&full_path, &updated).await?;
+                aos_core::session::write_bytes_atomic_synced_async(
+                    &full_path,
+                    updated.into_bytes(),
+                )
+                .await?;
                 Ok(json!({
                     "status": "edited_in_cow_shadow",
                     "path": clean,
@@ -1403,6 +1581,9 @@ impl AegisRuntimeKernel {
             }
 
             "workspace_status" => {
+                if !env.workspace.shadow_root().exists() {
+                    let _ = self.ensure_org_vault(&identity.org_id).await;
+                }
                 let refresh = env.workspace.refresh_from_host().await?;
                 let diffs = env.workspace.diff(None).await?;
                 let snapshots = env.workspace.list_snapshots().await?;
@@ -1412,13 +1593,19 @@ impl AegisRuntimeKernel {
                     .await?;
                 let escalations = self.policy.list_escalations(&identity.org_id).await?;
                 let (claims, _) = self.load_claims(&identity.org_id).await.unwrap_or_default();
+                let vault_status = self.vault.status_org(&identity.org_id).ok();
+                let orphaned = self
+                    .detect_orphaned_shadows(identity, env.workspace.host_source_root())
+                    .await;
                 Ok(json!({
                     "identity": identity,
                     "shadow_root": env.workspace.shadow_root(),
                     "host_source_root": env.workspace.host_source_root(),
+                    "vault": vault_status,
                     "auto_refresh": refresh,
                     "uncommitted_changes_count": diffs.len(),
                     "uncommitted_changes": diffs,
+                    "recoverable_orphaned_shadows": orphaned,
                     "active_claims": claims,
                     "snapshots": snapshots,
                     "unread_ipc_messages_count": unread_ipc.len(),
@@ -1427,11 +1614,25 @@ impl AegisRuntimeKernel {
             }
 
             "workspace_sync" => {
+                let orphan_recovery = if let Some(from_agent_id) = args
+                    .get("adopt_orphaned_agent")
+                    .and_then(|v| v.as_str())
+                    .map(str::trim)
+                    .filter(|s| !s.is_empty())
+                {
+                    Some(
+                        self.recover_orphaned_agent_shadow(identity, from_agent_id)
+                            .await?,
+                    )
+                } else {
+                    None
+                };
                 let refresh = env.workspace.refresh_from_host().await?;
                 let diffs = env.workspace.diff(None).await?;
                 let (claims, _) = self.load_claims(&identity.org_id).await.unwrap_or_default();
                 Ok(json!({
                     "status": if refresh.conflicts.is_empty() { "synced" } else { "conflicts_detected" },
+                    "orphan_recovery": orphan_recovery,
                     "refresh_report": refresh,
                     "uncommitted_changes_count": diffs.len(),
                     "uncommitted_changes": diffs,
@@ -1820,6 +2021,7 @@ impl AegisRuntimeKernel {
             // 3. Intra-Organization Shared CAS Artifacts & KV Tools
             // ----------------------------------------------------------------
             "org_artifact_publish" => {
+                self.ensure_org_vault(&identity.org_id).await?;
                 let name = args
                     .get("name")
                     .and_then(|v| v.as_str())
@@ -1848,6 +2050,7 @@ impl AegisRuntimeKernel {
             }
 
             "org_artifact_fetch" => {
+                self.ensure_org_vault(&identity.org_id).await?;
                 let uri = args
                     .get("uri")
                     .and_then(|v| v.as_str())
@@ -1860,6 +2063,7 @@ impl AegisRuntimeKernel {
             }
 
             "org_kv_put" => {
+                self.ensure_org_vault(&identity.org_id).await?;
                 let ns = args
                     .get("namespace")
                     .and_then(|v| v.as_str())
@@ -1878,6 +2082,7 @@ impl AegisRuntimeKernel {
             }
 
             "org_kv_get" => {
+                self.ensure_org_vault(&identity.org_id).await?;
                 let ns = args
                     .get("namespace")
                     .and_then(|v| v.as_str())
@@ -2835,8 +3040,16 @@ impl AegisRuntimeKernel {
                 },
                 {
                     "name": "workspace_sync",
-                    "description": "[Zero-Prompt] Rebase and 3-way merge host commits from peer Agents into your CoW shadow workspace, updating file mtimes and returning a detailed RefreshReport (including any conflict_details).",
-                    "inputSchema": { "type": "object", "properties": {} }
+                    "description": "[Zero-Prompt] Rebase and 3-way merge host commits from peer Agents into your CoW shadow workspace, updating file mtimes and returning a detailed RefreshReport (including any conflict_details). Optionally adopt uncommitted shadow edits from a crashed/dead peer via `adopt_orphaned_agent`.",
+                    "inputSchema": {
+                        "type": "object",
+                        "properties": {
+                            "adopt_orphaned_agent": {
+                                "type": "string",
+                                "description": "Optional dead/crashed peer agent_id whose uncommitted shadow edits should be adopted into your shadow workspace."
+                            }
+                        }
+                    }
                 },
                 {
                     "name": "workspace_snapshot",
@@ -7710,5 +7923,311 @@ mod tests {
                 .all(|l| l.lease_id != lease_id),
             "Revoked lease must be removed from active leases"
         );
+    }
+
+    #[tokio::test]
+    async fn test_orphaned_shadow_detection_and_recovery_after_crash() {
+        let temp = tempfile::tempdir().unwrap();
+        let runtime_root = temp.path().join("runtime");
+        let host_repo = temp.path().join("host_repo");
+        tokio::fs::create_dir_all(&host_repo).await.unwrap();
+        tokio::fs::write(host_repo.join("main.rs"), "fn main() {}\n")
+            .await
+            .unwrap();
+
+        {
+            let kernel1 = AegisRuntimeKernel::new(&runtime_root).await.unwrap();
+            let crashed = AgentIdentity::new("org-recover", "agy-dead", "Worker");
+            kernel1
+                .ensure_agent_environment(
+                    crashed.clone(),
+                    &host_repo,
+                    IsolationTier::NativeOsSandbox,
+                    vec!["*".to_string()],
+                )
+                .await
+                .unwrap();
+            kernel1
+                .ipc
+                .update_peer_metadata(
+                    &crashed,
+                    Some("agy".to_string()),
+                    Some(999_999_999),
+                    Some(1),
+                    Some(host_repo.display().to_string()),
+                )
+                .await
+                .unwrap();
+            kernel1
+                .call_tool(
+                    &crashed,
+                    "fs_write",
+                    json!({ "path": "recovered_exp.rs", "content": "pub fn exp() -> u32 { 42 }\n" }),
+                )
+                .await
+                .unwrap();
+            kernel1
+                .call_tool(
+                    &crashed,
+                    "fs_write",
+                    json!({ "path": "main.rs", "content": "fn main() { println!(\"recovered\"); }\n" }),
+                )
+                .await
+                .unwrap();
+            kernel1
+                .call_tool(
+                    &crashed,
+                    "workspace_snapshot",
+                    json!({ "label": "before-crash" }),
+                )
+                .await
+                .unwrap();
+        }
+
+        // Simulate post-reboot fresh runtime kernel and new agent session.
+        let kernel2 = AegisRuntimeKernel::new(&runtime_root).await.unwrap();
+        let new_agent = AgentIdentity::new("org-recover", "agy-live", "Lead");
+        kernel2
+            .ensure_agent_environment(
+                new_agent.clone(),
+                &host_repo,
+                IsolationTier::NativeOsSandbox,
+                vec!["*".to_string()],
+            )
+            .await
+            .unwrap();
+
+        let status = kernel2
+            .call_tool(&new_agent, "workspace_status", json!({}))
+            .await
+            .unwrap();
+        let orphaned = status["recoverable_orphaned_shadows"].as_array().unwrap();
+        assert_eq!(orphaned.len(), 1, "expected 1 orphaned shadow: {status}");
+        assert_eq!(orphaned[0]["agent_id"], "agy-dead");
+        assert_eq!(orphaned[0]["uncommitted_changes_count"], 2);
+
+        let sync_res = kernel2
+            .call_tool(
+                &new_agent,
+                "workspace_sync",
+                json!({ "adopt_orphaned_agent": "agy-dead" }),
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            sync_res["orphan_recovery"]["status"],
+            "recovered_orphaned_shadow"
+        );
+        assert_eq!(sync_res["orphan_recovery"]["recovered_paths_count"], 2);
+
+        let read_new = kernel2
+            .call_tool(&new_agent, "fs_read", json!({ "path": "recovered_exp.rs" }))
+            .await
+            .unwrap();
+        assert_eq!(read_new["content"], "pub fn exp() -> u32 { 42 }\n");
+        let read_main = kernel2
+            .call_tool(&new_agent, "fs_read", json!({ "path": "main.rs" }))
+            .await
+            .unwrap();
+        assert_eq!(
+            read_main["content"],
+            "fn main() { println!(\"recovered\"); }\n"
+        );
+
+        // Host repo must remain untouched until explicit workspace_commit.
+        assert!(!host_repo.join("recovered_exp.rs").exists());
+        assert_eq!(
+            std::fs::read_to_string(host_repo.join("main.rs")).unwrap(),
+            "fn main() {}\n"
+        );
+    }
+
+    struct TestPaasVaultMounter {
+        store: PathBuf,
+        mounted: std::sync::Mutex<std::collections::HashSet<PathBuf>>,
+    }
+
+    impl TestPaasVaultMounter {
+        fn copy_dir(src: &Path, dst: &Path) -> std::io::Result<()> {
+            std::fs::create_dir_all(dst)?;
+            for entry in std::fs::read_dir(src)? {
+                let entry = entry?;
+                let sp = entry.path();
+                let dp = dst.join(entry.file_name());
+                let meta = std::fs::symlink_metadata(&sp)?;
+                if meta.file_type().is_symlink() {
+                    #[cfg(unix)]
+                    {
+                        let t = std::fs::read_link(&sp)?;
+                        let _ = std::fs::remove_file(&dp);
+                        std::os::unix::fs::symlink(t, &dp)?;
+                    }
+                } else if meta.is_dir() {
+                    Self::copy_dir(&sp, &dp)?;
+                } else {
+                    std::fs::copy(&sp, &dp)?;
+                }
+            }
+            Ok(())
+        }
+    }
+
+    impl aos_vfs::vault::VolumeMounter for TestPaasVaultMounter {
+        fn detect_preferred_backend(&self) -> aos_vfs::vault::VaultBackendKind {
+            aos_vfs::vault::VaultBackendKind::LuksBtrfs
+        }
+
+        fn is_mounted(&self, mount_dir: &Path) -> bool {
+            self.mounted.lock().unwrap().contains(mount_dir)
+        }
+
+        fn create_and_mount(
+            &self,
+            _backend: aos_vfs::vault::VaultBackendKind,
+            org_id: &str,
+            backing_path: &Path,
+            mount_dir: &Path,
+            _size_gb: u64,
+            _dek: &str,
+        ) -> anyhow::Result<()> {
+            if let Some(p) = backing_path.parent() {
+                std::fs::create_dir_all(p)?;
+            }
+            std::fs::write(backing_path, b"LUKS2_MOCK")?;
+            std::fs::create_dir_all(self.store.join(org_id))?;
+            std::fs::create_dir_all(mount_dir)?;
+            self.mounted.lock().unwrap().insert(mount_dir.to_path_buf());
+            Ok(())
+        }
+
+        fn mount_existing(
+            &self,
+            _backend: aos_vfs::vault::VaultBackendKind,
+            org_id: &str,
+            backing_path: &Path,
+            mount_dir: &Path,
+            _dek: &str,
+        ) -> anyhow::Result<()> {
+            if !backing_path.exists() {
+                bail!("missing backing");
+            }
+            std::fs::create_dir_all(mount_dir)?;
+            let payload = self.store.join(org_id);
+            if payload.is_dir() {
+                Self::copy_dir(&payload, mount_dir)?;
+            }
+            self.mounted.lock().unwrap().insert(mount_dir.to_path_buf());
+            Ok(())
+        }
+
+        fn unmount(
+            &self,
+            _backend: aos_vfs::vault::VaultBackendKind,
+            org_id: &str,
+            mount_dir: &Path,
+        ) -> anyhow::Result<()> {
+            let payload = self.store.join(org_id);
+            if payload.exists() {
+                let _ = std::fs::remove_dir_all(&payload);
+            }
+            if mount_dir.is_dir() {
+                Self::copy_dir(mount_dir, &payload)?;
+                for entry in std::fs::read_dir(mount_dir)? {
+                    let p = entry?.path();
+                    if p.is_dir() {
+                        std::fs::remove_dir_all(p)?;
+                    } else {
+                        std::fs::remove_file(p)?;
+                    }
+                }
+            }
+            self.mounted.lock().unwrap().remove(mount_dir);
+            Ok(())
+        }
+    }
+
+    #[tokio::test]
+    async fn test_paas_hibernate_locks_org_vault_and_wake_unlocks() {
+        let temp = tempfile::tempdir().unwrap();
+        let runtime_root = temp.path().join("runtime");
+        let mounter = Arc::new(TestPaasVaultMounter {
+            store: temp.path().join("encrypted_payloads"),
+            mounted: std::sync::Mutex::new(std::collections::HashSet::new()),
+        });
+        let vault = Arc::new(OrgVaultManager::with_components(
+            &runtime_root,
+            aos_vfs::vault::VaultMode::Enforced,
+            4,
+            Arc::new(aos_vfs::vault::InMemoryKekProvider::new([0x55u8; 32])),
+            mounter,
+        ));
+        let kernel = Arc::new(
+            AegisRuntimeKernel::new_with_vault(&runtime_root, vault.clone())
+                .await
+                .unwrap(),
+        );
+
+        let ws = kernel
+            .paas
+            .provision_workspace(
+                &kernel,
+                "cloud-org",
+                "ws-vault-test",
+                ".",
+                "main",
+                vec!["agy-cloud".to_string()],
+            )
+            .await
+            .unwrap();
+        let st_active = vault.status_org("cloud-org").unwrap();
+        assert!(st_active.encrypted);
+        assert!(st_active.mounted);
+        assert!(
+            ws.host_repo_path
+                .starts_with(st_active.mount_dir.join("paas_workspaces")),
+            "Cloud host_repo_path must live inside encrypted OrgVault mount: {}",
+            ws.host_repo_path.display()
+        );
+
+        let cloud_agent = AgentIdentity::new("cloud-org", "agy-cloud", "Aegis Cloud Agent");
+        kernel
+            .call_tool(
+                &cloud_agent,
+                "fs_write",
+                json!({ "path": "cloud_exp.txt", "content": "CLOUD_UNCOMMITTED_EXP" }),
+            )
+            .await
+            .unwrap();
+
+        kernel
+            .paas
+            .hibernate_workspace(&kernel, "cloud-org", &ws.workspace_id)
+            .await
+            .unwrap();
+        let st_hib = vault.status_org("cloud-org").unwrap();
+        assert!(!st_hib.mounted, "Hibernation must lock & unmount OrgVault");
+        assert!(
+            !st_hib
+                .mount_dir
+                .join("agents/agy-cloud/cow_workspace/upper_workspace/cloud_exp.txt")
+                .exists(),
+            "Plaintext shadow file must not exist on mountpoint while hibernated"
+        );
+
+        let (_woke, _) = kernel
+            .paas
+            .wake_workspace_if_needed(&kernel, "cloud-org", &ws.workspace_id)
+            .await
+            .unwrap();
+        let st_woke = vault.status_org("cloud-org").unwrap();
+        assert!(st_woke.mounted, "Wake must unlock & mount OrgVault");
+
+        let read_back = kernel
+            .call_tool(&cloud_agent, "fs_read", json!({ "path": "cloud_exp.txt" }))
+            .await
+            .unwrap();
+        assert_eq!(read_back["content"], "CLOUD_UNCOMMITTED_EXP");
+
+        let _ = vault.lock_all();
     }
 }

@@ -55,6 +55,195 @@ fn default_runtime_dir() -> PathBuf {
         .unwrap_or_else(|| PathBuf::from("/tmp/aegis-os-runtime"))
 }
 
+fn is_legacy_volatile_tmp_runtime(raw: &Path) -> bool {
+    raw == Path::new("/tmp/aegis-os-runtime") || raw == Path::new("/private/tmp/aegis-os-runtime")
+}
+
+/// Best-effort recursive copy that preserves symlinks (as symlinks, never following cycles)
+/// without overwriting already-present destination entries.
+fn copy_dir_missing_preserving_symlinks(src: &Path, dst: &Path) -> std::io::Result<()> {
+    let meta = std::fs::symlink_metadata(src)?;
+    let ft = meta.file_type();
+    if ft.is_symlink() {
+        if std::fs::symlink_metadata(dst).is_ok() {
+            return Ok(());
+        }
+        if let Some(parent) = dst.parent() {
+            std::fs::create_dir_all(parent)?;
+        }
+        let target = std::fs::read_link(src)?;
+        #[cfg(unix)]
+        {
+            std::os::unix::fs::symlink(&target, dst)?;
+        }
+        #[cfg(not(unix))]
+        {
+            let _ = target;
+        }
+        return Ok(());
+    }
+    if ft.is_dir() {
+        std::fs::create_dir_all(dst)?;
+        for entry in std::fs::read_dir(src)? {
+            let entry = entry?;
+            let dst_child = dst.join(entry.file_name());
+            let _ = copy_dir_missing_preserving_symlinks(&entry.path(), &dst_child);
+        }
+        return Ok(());
+    }
+    if ft.is_file() {
+        if std::fs::symlink_metadata(dst).is_ok() {
+            return Ok(());
+        }
+        if let Some(parent) = dst.parent() {
+            std::fs::create_dir_all(parent)?;
+        }
+        std::fs::copy(src, dst)?;
+        let _ = std::fs::set_permissions(dst, meta.permissions());
+    }
+    Ok(())
+}
+
+/// Opportunistically rescues legacy volatile shadows/CAS/session bindings from `/tmp/aegis-os-runtime`
+/// into `target_root` (e.g. `~/.aegis`) without ever writing to `stdout` (which breaks JSON stdio
+/// hooks and MCP transports).
+fn rescue_legacy_tmp_runtime(
+    legacy_root: &Path,
+    target_root: &Path,
+    vault_mode_override: Option<aos_vfs::vault::VaultMode>,
+) {
+    if !legacy_root.is_dir() || legacy_root == target_root {
+        return;
+    }
+
+    let legacy_bindings = legacy_root.join("session_bindings.json");
+    let target_bindings = target_root.join("session_bindings.json");
+    if legacy_bindings.is_file() && !target_bindings.exists() {
+        if let Some(parent) = target_bindings.parent() {
+            let _ = std::fs::create_dir_all(parent);
+        }
+        let _ = std::fs::copy(&legacy_bindings, &target_bindings);
+    }
+
+    let legacy_orgs = legacy_root.join("orgs");
+    let Ok(org_entries) = std::fs::read_dir(&legacy_orgs) else {
+        return;
+    };
+    for org_entry in org_entries.flatten() {
+        let org_path = org_entry.path();
+        if !org_path.is_dir() {
+            continue;
+        }
+        let org_id = org_entry.file_name().to_string_lossy().to_string();
+        if org_id.starts_with('.') || org_id.is_empty() {
+            continue;
+        }
+        let has_agents = org_path.join("agents").is_dir();
+        let has_cas = org_path.join("cas").is_dir();
+        let has_kv = org_path.join("kv.json").is_file();
+        if !has_agents && !has_cas && !has_kv {
+            continue;
+        }
+
+        let mut mgr = aos_vfs::vault::OrgVaultManager::new(target_root);
+        if let Some(mode) = vault_mode_override {
+            mgr = mgr.with_mode(mode);
+        }
+        let target_org = match mgr.ensure_org_unlocked(&org_id) {
+            Ok(st) => st.mount_dir,
+            Err(_) => target_root.join("orgs").join(&org_id),
+        };
+
+        if has_agents {
+            if let Ok(agent_entries) = std::fs::read_dir(org_path.join("agents")) {
+                for agent_entry in agent_entries.flatten() {
+                    let agent_src = agent_entry.path();
+                    if !agent_src.is_dir() {
+                        continue;
+                    }
+                    let agent_id = agent_entry.file_name();
+                    if agent_id.to_string_lossy().starts_with('.') {
+                        continue;
+                    }
+                    let agent_dst = target_org.join("agents").join(&agent_id);
+                    if !agent_dst.join("cow_workspace/.initialized").exists() {
+                        let _ = copy_dir_missing_preserving_symlinks(&agent_src, &agent_dst);
+                    }
+                }
+            }
+        }
+
+        if has_cas {
+            let _ = copy_dir_missing_preserving_symlinks(
+                &org_path.join("cas"),
+                &target_org.join("cas"),
+            );
+        }
+
+        if has_kv {
+            let dst_kv = target_org.join("kv.json");
+            if !dst_kv.exists() {
+                if let Some(parent) = dst_kv.parent() {
+                    let _ = std::fs::create_dir_all(parent);
+                }
+                let _ = std::fs::copy(org_path.join("kv.json"), dst_kv);
+            }
+        }
+    }
+}
+
+pub(crate) fn normalize_runtime_dir_with(
+    raw: PathBuf,
+    home: Option<&Path>,
+    explicit_env_runtime: Option<&std::ffi::OsStr>,
+    allow_volatile_tmp: bool,
+    vault_mode_override: Option<aos_vfs::vault::VaultMode>,
+) -> PathBuf {
+    if !is_legacy_volatile_tmp_runtime(&raw) || explicit_env_runtime.is_some() || allow_volatile_tmp {
+        return raw;
+    }
+    let Some(h) = home.filter(|p| !p.as_os_str().is_empty()) else {
+        return raw;
+    };
+    let target = h.join(".aegis");
+    rescue_legacy_tmp_runtime(&raw, &target, vault_mode_override);
+    target
+}
+
+fn normalize_runtime_dir(raw: PathBuf) -> PathBuf {
+    let home = std::env::var_os("HOME").map(PathBuf::from);
+    let explicit_env = std::env::var_os("AOS_RUNTIME_DIR");
+    let allow_volatile = std::env::var_os("AOS_ALLOW_VOLATILE_TMP_RUNTIME")
+        .map(|v| {
+            let s = v.to_string_lossy();
+            let t = s.trim();
+            !t.is_empty() && t != "0" && !t.eq_ignore_ascii_case("false")
+        })
+        .unwrap_or(false);
+    normalize_runtime_dir_with(raw, home.as_deref(), explicit_env.as_deref(), allow_volatile, None)
+}
+
+fn resolve_target_home_and_runtime(
+    home_dir: Option<PathBuf>,
+    cli_runtime_dir: &Path,
+) -> (bool, PathBuf, PathBuf) {
+    let custom_home = home_dir.is_some();
+    let target_home = home_dir.unwrap_or_else(|| {
+        std::env::var("HOME")
+            .map(PathBuf::from)
+            .unwrap_or_else(|_| PathBuf::from("."))
+    });
+    let effective_runtime_dir = if custom_home
+        && std::env::var_os("AOS_RUNTIME_DIR").is_none()
+        && cli_runtime_dir == default_runtime_dir()
+    {
+        target_home.join(".aegis")
+    } else {
+        cli_runtime_dir.to_path_buf()
+    };
+    (custom_home, target_home, effective_runtime_dir)
+}
+
 #[derive(Parser)]
 #[command(
     name = "aegis-os",
@@ -184,11 +373,24 @@ enum Commands {
         enforce: bool,
     },
 
-    /// Remove Aegis PATH shims and the shell PATH block (client MCP/Hook blocks stay)
+    /// Remove Aegis PATH shims, client MCP/Hook/rule integrations, and optionally runtime/vault data
     Uninstall {
-        /// Only remove shims; keep client configuration blocks (currently both modes do)
+        /// Only remove ~/.aegis/bin shims and shell PATH block; keep client MCP/Hook integrations
         #[arg(long, default_value_t = false)]
         shim_only: bool,
+        /// Also lock/destroy all OrgVaults, delete ~/.aegis runtime state, and remove master KEK material
+        #[arg(long, default_value_t = false)]
+        purge: bool,
+        /// Also remove Aegis-generated files inside `<workspace>/.agents/`
+        #[arg(long, default_value_t = false)]
+        workspace_clean: bool,
+        /// Preview what would be removed without modifying files or vaults
+        #[arg(long, default_value_t = false)]
+        dry_run: bool,
+        /// Confirm destructive `--purge` non-interactively
+        #[arg(long, short = 'y', default_value_t = false)]
+        yes: bool,
+        /// Optional custom home directory (defaults to `$HOME`; useful for testing/sandboxing)
         #[arg(long)]
         home_dir: Option<PathBuf>,
     },
@@ -314,9 +516,37 @@ enum Commands {
         session: Option<String>,
     },
 
-    /// Upgrade Aegis OS in-place to the latest signed release and refresh client integrations
+    /// Upgrade Aegis OS in-place (Homebrew / Source / Cargo / Signed Release) and refresh client integrations
     #[command(visible_aliases = ["update", "self-update"])]
-    Upgrade,
+    Upgrade {
+        /// Check current version vs latest available release and inspect client config drift
+        #[arg(long, default_value_t = false)]
+        check: bool,
+        /// Upgrade source (`auto`, `release`, `brew`, `source`, `cargo`)
+        #[arg(long, default_value = "auto")]
+        method: String,
+        /// Target release tag (e.g. `v0.4.6`) when upgrading via `release` or `cargo`
+        #[arg(long, visible_alias = "target-version")]
+        tag: Option<String>,
+        /// Explicit path to local Aegis OS source checkout (for `--method source`)
+        #[arg(long)]
+        source_dir: Option<PathBuf>,
+        /// Build offline when using `--method source` (or skip remote lookup with `--check`)
+        #[arg(long, default_value_t = false)]
+        offline: bool,
+        /// Skip binary upgrade and only re-sync client MCP/Hook/rule integrations and shims
+        #[arg(long, default_value_t = false)]
+        refresh_only: bool,
+        /// Upgrade the binary only without updating client MCP/Hook configurations
+        #[arg(long, default_value_t = false)]
+        no_refresh: bool,
+        /// Print detected install method and upgrade plan without modifying files or binary
+        #[arg(long, default_value_t = false)]
+        dry_run: bool,
+        /// Optional custom home directory for post-upgrade client refresh (defaults to `$HOME`)
+        #[arg(long)]
+        home_dir: Option<PathBuf>,
+    },
 
     /// View Product Growth & User Analytics (GitHub Release downloads, DAU / WAU / MAU, Retention & Client breakdown)
     #[command(visible_alias = "telemetry")]
@@ -402,6 +632,12 @@ enum Commands {
     Workspace {
         #[command(subcommand)]
         action: WorkspaceAction,
+    },
+
+    /// Manage per-organization encrypted OrgVault persistence & crash recovery
+    Vault {
+        #[command(subcommand)]
+        action: VaultAction,
     },
 
     /// Inspect pending boundary escalations and grant Session Leases
@@ -761,6 +997,26 @@ enum WorkspaceAction {
         profile: Option<String>,
     },
     Commit,
+}
+
+#[derive(Subcommand)]
+enum VaultAction {
+    /// Inspect encrypted OrgVault status across organizations and check for recoverable dead-PID shadows
+    Status {
+        /// Output raw JSON status
+        #[arg(long, default_value_t = false)]
+        json: bool,
+    },
+    /// Unlock / mount the organization's encrypted OrgVault volume
+    Unlock,
+    /// Lock / unmount the organization's encrypted OrgVault volume
+    Lock,
+    /// Adopt an orphaned dead-PID shadow workspace from a previous agent session into the current agent
+    Recover {
+        /// Previous orphaned agent ID (as shown by `aegis-os vault status` or `workspace_status`)
+        #[arg(long)]
+        from_agent: String,
+    },
 }
 
 #[derive(Subcommand)]
@@ -2295,6 +2551,7 @@ async fn main() -> anyhow::Result<()> {
             std::process::exit(0);
         }
     }
+    cli.runtime_dir = normalize_runtime_dir(cli.runtime_dir);
     if cli.workspace == Path::new(".") {
         if let Ok(env_ws) = std::env::var("AOS_WORKSPACE") {
             if !env_ws.trim().is_empty() {
@@ -2532,13 +2789,28 @@ async fn main() -> anyhow::Result<()> {
             }
         }
 
-        Commands::Uninstall { shim_only, home_dir } => {
-            let target_home = home_dir.unwrap_or_else(|| {
-                std::env::var("HOME")
-                    .map(PathBuf::from)
-                    .unwrap_or_else(|_| PathBuf::from("."))
-            });
-            installer::uninstall_shims(&target_home, shim_only)?;
+        Commands::Uninstall {
+            shim_only,
+            purge,
+            workspace_clean,
+            dry_run,
+            yes,
+            home_dir,
+        } => {
+            let (custom_home, target_home, effective_runtime_dir) =
+                resolve_target_home_and_runtime(home_dir, &cli.runtime_dir);
+            installer::run_uninstall(installer::UninstallOptions {
+                home_dir: &target_home,
+                runtime_dir: &effective_runtime_dir,
+                workspace: &workspace,
+                shim_only,
+                purge,
+                workspace_clean,
+                dry_run,
+                yes,
+                purge_host_credentials: !custom_home,
+            })
+            .await?;
         }
 
         Commands::Doctor { home_dir } => {
@@ -2550,8 +2822,33 @@ async fn main() -> anyhow::Result<()> {
             installer::run_doctor(&target_home).await?;
         }
 
-        Commands::Upgrade => {
-            installer::run_upgrade().await?;
+        Commands::Upgrade {
+            check,
+            method,
+            tag,
+            source_dir,
+            offline,
+            refresh_only,
+            no_refresh,
+            dry_run,
+            home_dir,
+        } => {
+            let (_custom_home, target_home, effective_runtime_dir) =
+                resolve_target_home_and_runtime(home_dir, &cli.runtime_dir);
+            installer::run_upgrade(installer::UpgradeOptions {
+                home_dir: &target_home,
+                runtime_dir: &effective_runtime_dir,
+                workspace: &workspace,
+                check,
+                method: &method,
+                tag: tag.as_deref(),
+                source_dir: source_dir.as_deref(),
+                offline,
+                refresh_only,
+                no_refresh,
+                dry_run,
+            })
+            .await?;
         }
 
         Commands::Approve {
@@ -3391,6 +3688,113 @@ async fn main() -> anyhow::Result<()> {
             bench::run_full_benchmark_suite(Some(report_out)).await?;
         }
 
+        Commands::Vault { action } => match action {
+            VaultAction::Status { json: as_json } => {
+                let mgr = aos_vfs::vault::OrgVaultManager::new(&runtime_dir);
+                let current = mgr.status_org(&identity.org_id)?;
+                let orgs = mgr.list_org_statuses()?;
+                let orphaned = if current.mounted || !current.encrypted {
+                    let kernel = AegisRuntimeKernel::new(&runtime_dir).await?;
+                    kernel.detect_orphaned_shadows(&identity, &workspace).await
+                } else {
+                    Vec::new()
+                };
+                if as_json {
+                    println!(
+                        "{}",
+                        serde_json::to_string_pretty(&json!({
+                            "runtime_dir": runtime_dir,
+                            "org": current,
+                            "all_orgs": orgs,
+                            "recoverable_orphaned_shadows": orphaned,
+                        }))?
+                    );
+                } else {
+                    println!("Runtime:   {}", runtime_dir.display());
+                    println!(
+                        "OrgVault:  {} (backend={}, encrypted={}, mounted={}, key_source={})",
+                        current.org_id,
+                        current.backend.as_str(),
+                        current.encrypted,
+                        current.mounted,
+                        current.key_source
+                    );
+                    println!("MountDir:  {}", current.mount_dir.display());
+                    if let Some(ref backing) = current.backing_path {
+                        println!("Backing:   {}", backing.display());
+                    }
+                    if orgs.len() > 1 {
+                        println!("\nAll Organizations ({}):", orgs.len());
+                        for st in &orgs {
+                            println!(
+                                "  - {} [{}] encrypted={} mounted={} key={}",
+                                st.org_id,
+                                st.backend.as_str(),
+                                st.encrypted,
+                                st.mounted,
+                                st.key_source
+                            );
+                        }
+                    }
+                    if !orphaned.is_empty() {
+                        println!("\nRecoverable Orphaned Shadows ({}):", orphaned.len());
+                        for item in &orphaned {
+                            let aid = item
+                                .get("agent_id")
+                                .and_then(|v| v.as_str())
+                                .unwrap_or("unknown");
+                            let count = item
+                                .get("changed_files_count")
+                                .and_then(|v| v.as_u64())
+                                .unwrap_or(0);
+                            println!(
+                                "  - {} ({} changed file(s)) -> recover with: aegis-os vault recover --from-agent {}",
+                                aid, count, aid
+                            );
+                        }
+                    }
+                }
+            }
+            VaultAction::Unlock => {
+                let st = aos_vfs::vault::OrgVaultManager::new(&runtime_dir)
+                    .ensure_org_unlocked(&identity.org_id)?;
+                println!(
+                    "OrgVault '{}' unlocked (backend={}, encrypted={}, mounted={}, mount_dir={})",
+                    st.org_id,
+                    st.backend.as_str(),
+                    st.encrypted,
+                    st.mounted,
+                    st.mount_dir.display()
+                );
+            }
+            VaultAction::Lock => {
+                let st = aos_vfs::vault::OrgVaultManager::new(&runtime_dir)
+                    .lock_org(&identity.org_id)?;
+                println!(
+                    "OrgVault '{}' locked (backend={}, encrypted={}, mounted={})",
+                    st.org_id,
+                    st.backend.as_str(),
+                    st.encrypted,
+                    st.mounted
+                );
+            }
+            VaultAction::Recover { from_agent } => {
+                let kernel = AegisRuntimeKernel::new(&runtime_dir).await?;
+                kernel
+                    .ensure_agent_environment(
+                        identity.clone(),
+                        &workspace,
+                        IsolationTier::NativeOsSandbox,
+                        vec!["*".to_string()],
+                    )
+                    .await?;
+                let res = kernel
+                    .recover_orphaned_agent_shadow(&identity, &from_agent)
+                    .await?;
+                println!("{}", serde_json::to_string_pretty(&res)?);
+            }
+        },
+
         Commands::Demo => {
             run_end_to_end_multi_client_demo().await?;
         }
@@ -4139,5 +4543,114 @@ async fn inspect_policy_escalation(
     }
     Ok(())
 }
+
+#[cfg(test)]
+mod vault_cli_tests {
+    use super::*;
+    use std::ffi::OsStr;
+
+    #[test]
+    fn test_normalize_runtime_dir_rescues_legacy_tmp_path() {
+        let tmp = tempfile::tempdir().unwrap();
+        let fake_home = tmp.path().join("home");
+        std::fs::create_dir_all(&fake_home).unwrap();
+
+        let legacy_tmp = PathBuf::from("/tmp/aegis-os-runtime");
+        let legacy_priv_tmp = PathBuf::from("/private/tmp/aegis-os-runtime");
+
+        // 1. Default auto-redirect when neither AOS_RUNTIME_DIR nor opt-out env is set.
+        let redirected = normalize_runtime_dir_with(
+            legacy_tmp.clone(),
+            Some(&fake_home),
+            None,
+            false,
+            Some(aos_vfs::vault::VaultMode::Off),
+        );
+        assert_eq!(redirected, fake_home.join(".aegis"));
+
+        let redirected_priv = normalize_runtime_dir_with(
+            legacy_priv_tmp.clone(),
+            Some(&fake_home),
+            None,
+            false,
+            Some(aos_vfs::vault::VaultMode::Off),
+        );
+        assert_eq!(redirected_priv, fake_home.join(".aegis"));
+
+        // 2. Explicit AOS_RUNTIME_DIR preserves user override.
+        let env_preserved = normalize_runtime_dir_with(
+            legacy_tmp.clone(),
+            Some(&fake_home),
+            Some(OsStr::new("/tmp/aegis-os-runtime")),
+            false,
+            Some(aos_vfs::vault::VaultMode::Off),
+        );
+        assert_eq!(env_preserved, legacy_tmp);
+
+        // 3. Explicit AOS_ALLOW_VOLATILE_TMP_RUNTIME=1 preserves legacy path.
+        let opt_out_preserved = normalize_runtime_dir_with(
+            legacy_tmp.clone(),
+            Some(&fake_home),
+            None,
+            true,
+            Some(aos_vfs::vault::VaultMode::Off),
+        );
+        assert_eq!(opt_out_preserved, legacy_tmp);
+
+        // 4. Custom non-legacy runtime dir is untouched.
+        let custom = tmp.path().join("custom-rt");
+        let unchanged = normalize_runtime_dir_with(
+            custom.clone(),
+            Some(&fake_home),
+            None,
+            false,
+            Some(aos_vfs::vault::VaultMode::Off),
+        );
+        assert_eq!(unchanged, custom);
+    }
+
+    #[test]
+    fn test_rescue_legacy_tmp_runtime_migrates_without_clobbering() {
+        let tmp = tempfile::tempdir().unwrap();
+        let legacy_root = tmp.path().join("legacy_tmp");
+        let target_root = tmp.path().join("persistent_home_aegis");
+
+        let legacy_draft = legacy_root.join("orgs/demo-org/agents/agy-old/cow_workspace/upper_workspace/draft.rs");
+        std::fs::create_dir_all(legacy_draft.parent().unwrap()).unwrap();
+        std::fs::write(&legacy_draft, "fn recovered_experiment() {}\n").unwrap();
+        std::fs::write(
+            legacy_root.join("orgs/demo-org/agents/agy-old/cow_workspace/.initialized"),
+            "2026-11-14T00:00:00Z",
+        )
+        .unwrap();
+
+        // Pre-populate an already-initialized agent in target_root that must NOT be overwritten.
+        let existing_base = target_root.join("orgs/demo-org/agents/agy-live/cow_workspace");
+        std::fs::create_dir_all(existing_base.join("upper_workspace")).unwrap();
+        std::fs::write(existing_base.join(".initialized"), "2026-11-14T01:00:00Z").unwrap();
+        std::fs::write(existing_base.join("upper_workspace/live.rs"), "fn live() {}\n").unwrap();
+
+        let legacy_live = legacy_root.join("orgs/demo-org/agents/agy-live/cow_workspace/upper_workspace");
+        std::fs::create_dir_all(&legacy_live).unwrap();
+        std::fs::write(legacy_live.join("live.rs"), "fn stale_overwrite() {}\n").unwrap();
+
+        rescue_legacy_tmp_runtime(
+            &legacy_root,
+            &target_root,
+            Some(aos_vfs::vault::VaultMode::Off),
+        );
+
+        let rescued = target_root.join("orgs/demo-org/agents/agy-old/cow_workspace/upper_workspace/draft.rs");
+        assert_eq!(
+            std::fs::read_to_string(&rescued).unwrap(),
+            "fn recovered_experiment() {}\n"
+        );
+        assert_eq!(
+            std::fs::read_to_string(existing_base.join("upper_workspace/live.rs")).unwrap(),
+            "fn live() {}\n"
+        );
+    }
+}
+
 
 

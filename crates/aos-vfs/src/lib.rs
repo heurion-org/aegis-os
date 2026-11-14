@@ -24,6 +24,8 @@ use std::sync::Arc;
 use tokio::sync::RwLock;
 use uuid::Uuid;
 
+pub mod vault;
+
 // ============================================================================
 // 1. Copy-on-Write Shadow Workspace Implementation (with APFS clonefile & 3-Way Merge)
 // ============================================================================
@@ -121,9 +123,33 @@ impl CoWWorkspace {
         let canonical = std::fs::canonicalize(&self.host_source_root)
             .unwrap_or_else(|_| self.host_source_root.clone());
         let hash = Self::sha256_bytes(canonical.to_string_lossy().as_bytes());
-        std::env::temp_dir()
-            .join("aegis-os-host-commits")
-            .join(format!("{}.epoch", &hash[..24]))
+        let dir = self.persistent_commit_root();
+        dir.join(format!("{}.epoch", &hash[..24]))
+    }
+
+    fn persistent_commit_root(&self) -> PathBuf {
+        for ancestor in self.shadow_root.ancestors() {
+            if matches!(
+                ancestor.file_name().and_then(|n| n.to_str()),
+                Some("orgs") | Some("sessions")
+            ) {
+                if let Some(runtime_root) = ancestor.parent() {
+                    if !runtime_root.as_os_str().is_empty() {
+                        let candidate = runtime_root.join("host_commits");
+                        if std::fs::create_dir_all(&candidate).is_ok() {
+                            return candidate;
+                        }
+                    }
+                }
+            }
+        }
+        if let Some(home) = std::env::var_os("HOME").filter(|h| !h.is_empty()) {
+            let candidate = PathBuf::from(home).join(".aegis").join("host_commits");
+            if std::fs::create_dir_all(&candidate).is_ok() {
+                return candidate;
+            }
+        }
+        std::env::temp_dir().join("aegis-os-host-commits")
     }
 
     /// Acquires an exclusive cross-process file lock serializing commits to `host_source_root`.
@@ -144,36 +170,15 @@ impl CoWWorkspace {
     /// Increments and persists the monotonic commit epoch for `host_source_root`.
     pub async fn bump_host_commit_epoch(&self) -> anyhow::Result<u64> {
         let path = self.host_commit_state_path();
-        if let Some(parent) = path.parent() {
-            tokio::fs::create_dir_all(parent).await?;
-        }
         let next = self.read_host_commit_epoch().saturating_add(1);
-        let tmp = path.with_extension(format!(
-            "tmp-{}-{}",
-            std::process::id(),
-            Uuid::new_v4().simple()
-        ));
-        tokio::fs::write(&tmp, next.to_string()).await?;
-        tokio::fs::rename(&tmp, &path).await?;
+        aos_core::session::write_bytes_atomic_synced_async(&path, next.to_string().into_bytes())
+            .await?;
         Ok(next)
     }
 
     async fn atomic_write_str(dst: &Path, content: &str) -> anyhow::Result<()> {
-        if let Some(parent) = dst.parent() {
-            tokio::fs::create_dir_all(parent).await?;
-        }
-        let file_name = dst
-            .file_name()
-            .and_then(|n| n.to_str())
-            .unwrap_or("merged");
-        let tmp = dst.with_file_name(format!(
-            ".{}.aegis-tmp-{}-{}",
-            file_name,
-            std::process::id(),
-            Uuid::new_v4().simple()
-        ));
-        tokio::fs::write(&tmp, content).await?;
-        tokio::fs::rename(&tmp, dst).await?;
+        aos_core::session::write_bytes_atomic_synced_async(dst, content.as_bytes().to_vec())
+            .await?;
         if let Ok(f) = std::fs::OpenOptions::new().write(true).open(dst) {
             let _ = f.set_modified(std::time::SystemTime::now());
         }
