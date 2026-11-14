@@ -63,14 +63,14 @@ aegis-os commit --expected-diff-hash <sha256>
 
 Enforced 模式提供：
 
-- **宿主项目只读保护**：所有写入落在每会话独立的 CoW 影子工作区（APFS `clonefile`、`btrfs` `FICLONE`、`ext4` 轻量工作树拷贝）。
+- **宿主项目只读保护 + 按组织 OS 加密落盘（`OrgVault`）**：所有写入落在 CoW 影子工作区（APFS `clonefile`、`btrfs` `FICLONE`、`ext4` 轻量工作树拷贝），默认持久化于 `~/.aegis` 下按组织隔离的加密卷（macOS 无 root APFS Encrypted `.sparsebundle`、Linux/Cloud `LUKS2 + Btrfs` 或 `gocryptfs`），具备 `AES-256-GCM` `KEK -> DEK` 信封密钥封装、`fsync` 原子刷盘与崩溃孤儿影子恢复。
 - **宿主敏感凭据与 Mach IPC 封堵**：内核级遮蔽 `$HOME` SSH/云凭据，封堵 Keychain CLI / `SecurityAgent` 弹窗、`launchctl` 与 `osascript`；对 `.claude/settings.json`、`.mcp.json`、`opencode.json`、`.gemini/antigravity-cli/settings.json`、`.hermes/config.yaml` 施加单文件只读挂载锁。
 - **双平台分离式 `.git` 视图 + `.aegis-bin/git` 加固垫片**：在 Linux 与 macOS 上均将宿主机 `.git` 对象库只读透传（500 MB 打包 Git 仓库在 APFS 上节省 **99.05%** 物理磁盘占用），配合独立会话 `GIT_INDEX_FILE` 并强制锁定 `core.fsmonitor=false` / `core.hooksPath=/dev/null`。
 - **L4/L7 双平面出站网关**：模型 API 流量经本地 L7 Base-URL 反向代理（`ANTHROPIC_BASE_URL`、`OPENAI_BASE_URL`、`GOOGLE_GEMINI_BASE_URL`）执行 64 KiB 出站 DLP 扫描并在宿主边界注入真实密钥（沙箱内仅见 `$AOS_SECRET_*` 占位符，**零 TLS MITM 证书破坏**）；常规 HTTPS 走 L4 `CONNECT` 域名白名单。
 - **双令牌权限分离 `SessionBroker` 与冻结暂存区（Frozen-Stage）SHA-256 提交门禁**：严格隔离 `agent.token` 与 `human.token`，对 Diff 中的 VT100 CSI / Unicode Bidi 控制字符进行转义防欺骗，落盘前快照至 `commit_frozen_stage` 并运行 6 大 `DomainProfile` 校验器（`code`、`docs`、`data`、`binary`、`app_state`、`memory`）。
 - **Fail closed**：缺少 `bwrap`/`sandbox-exec`（或 Ubuntu 24.04 AppArmor 限制未配置 profile）、代理或 broker 时直接拒绝启动，绝不静默降级。
 
-会话与可观测控制：`aegis-os status` · `aegis-os diff --json` · `aegis-os verify` · `aegis-os commit --expected-diff-hash` · `aegis-os discard` · `aegis-os publish` · `aegis-os approvals` · `aegis-os why` · `aegis-os a2a board` · `aegis-os policy watch` · `aegis-os memory ui` · `aegis-os app list` · `aegis-os audit-me --share`。
+会话与可观测控制：`aegis-os status` · `aegis-os diff --json` · `aegis-os verify` · `aegis-os commit --expected-diff-hash` · `aegis-os discard` · `aegis-os publish` · `aegis-os approvals` · `aegis-os why` · `aegis-os a2a board` · `aegis-os policy watch` · `aegis-os memory ui` · `aegis-os app list` · `aegis-os audit-me --share` · `aegis-os vault status` · `aegis-os upgrade --check` · `aegis-os uninstall`。
 
 当前限制：
 
@@ -78,7 +78,7 @@ Enforced 模式提供：
 - **Ubuntu 24.04+ 非特权 userns 限制**：Ubuntu 24.04 默认开启 `kernel.apparmor_restrict_unprivileged_userns=1`；若未安装 `/etc/apparmor.d/bwrap`，`aegis-os run` 会 fail-closed 并打印配置指引。
 - **非模型 HTTPS 审计范围**：模型 API 流量走本地 Base-URL L7 反向代理（64 KiB DLP + 密钥注入）；普通白名单第三方 HTTPS 走 L4 `CONNECT` 域名过滤，不做 TLS MITM 解密。
 
-### 其他安装方式
+### 其他安装、升级与卸载方式
 
 ```bash
 # 一键签名安装（Linux & macOS）
@@ -88,15 +88,22 @@ curl -fsSL https://heurion.org/aegis-cloud/install.sh | sh
 git clone https://github.com/heurion-org/aegis-os.git && cd aegis-os
 cargo install --path crates/aos-cli
 aegis-os install
+
+# 原地升级二进制并刷新全局客户端 MCP / Hook / Shim 集成（自动识别 Brew / Cargo / 源码 / Ed25519 签名发行版）
+aegis-os upgrade --check
+aegis-os upgrade             # 或仅刷新集成与配置: aegis-os upgrade --refresh-only
+
+# 精准清理 Shim 与客户端 MCP / Hook / 规则配置（默认保留 ~/.aegis 加密卷数据，--purge 一并销毁）
+aegis-os uninstall           # 或彻底清理: aegis-os uninstall --workspace-clean --purge --yes
 ```
 
 ## 核心能力
 
-- **事务型 CoW VFS** — 0.42ms 元数据派生；1,000 文件工作区 6.28ms / 15.6ms；四级 LCS 自动归并与领域预检门。
+- **事务型 CoW VFS 与 `OrgVault` 加密卷** — 0.42ms 元数据派生；1,000 文件工作区 6.28ms / 15.6ms；四级 LCS 自动归并与领域预检门；按组织隔离的 `AES-256` 加密持久化（`KEK -> DEK` 信封加密）、`fsync` 崩溃一致性与孤儿影子接管恢复。
 - **内核沙箱与出站边界** — Linux `bwrap` 与 macOS Seatbelt enforced launcher；敏感凭据遮蔽；模型 API Base-URL L7 反向代理（DLP + `$AOS_SECRET_*` 注入）与 CONNECT 域名 allowlist。
 - **A2A IPC 与 CAS** — 同伴发现、层级任务、任务绑定文件锁、`artifact://sha256` 内容寻址接力。
 - **Cedar 策略、租约与审计** — 效果级审批、TTL / 单次租约、`evidence_hash` 锁定、哈希链审计账本，以及 `Aegis-OS-Verified` Commit/PR 审计凭证。
-- **云端 PaaS** — 多租户工作区、Git-to-PR、Scale-to-Zero 休眠、网页审批台。
+- **云端 PaaS** — 多租户工作区、Git-to-PR、密码学级 Scale-to-Zero 休眠（空闲自动 `umount` + `cryptsetup close` 卸载卷密钥、删库密码学擦除）、网页审批台。
 
 ## 关键基准
 

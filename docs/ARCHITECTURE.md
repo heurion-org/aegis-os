@@ -67,7 +67,7 @@ The mode is surfaced in `aegis-os status`, `aegis-os doctor`, and `aegis-os audi
 
 ## 4. Session lifecycle
 
-1. **Install / shim** — `aegis-os install` writes advisory hooks/MCP config and collaborator workflow rules (`.agents/rules/aegis-os-workflow.md` + `.agents/README.md`). `aegis-os install --enforce` creates `~/.aegis/bin` shims so `claude` (etc.) launch through `aegis-os run`.
+1. **Install / shim / lifecycle** — `aegis-os install` writes advisory hooks/MCP config and collaborator workflow rules (`.agents/rules/aegis-os-workflow.md` + `.agents/README.md`). `aegis-os install --enforce` creates `~/.aegis/bin` shims so `claude` (etc.) launch through `aegis-os run`. `aegis-os upgrade` updates the binary (Homebrew, Cargo, local source, or OpenSSH `RELEASE_SIGNER`-verified release) and refreshes client configs/shims; `aegis-os uninstall` surgically removes Aegis shims and client entries (`--purge --yes` also locks/destroys `~/.aegis` `OrgVault` state).
 2. **Launch** — the supervisor resolves the real agent binary (excluding its own shim), creates a session id, and starts the agent as a child process.
 3. **Workspace setup** — create the CoW shadow, read-only host view, masked `$HOME`, Git view, egress proxy, and policy session before the agent starts.
 4. **Execution** — the agent uses native tools or MCP. Native writes land in the shadow; reads are narrowed to the project/toolchains; network goes through the proxy.
@@ -82,9 +82,9 @@ The mode is surfaced in `aegis-os status`, `aegis-os doctor`, and `aegis-os audi
 
 | Crate | Responsibility |
 |---|---|
-| `aos-cli` | `aegis-os` binary: installer, launcher/session supervisor, hooks, routing, `status`/`doctor`/`audit-me`/`top`, approvals, memory UI, bench. |
+| `aos-cli` | `aegis-os` binary: installer, `upgrade`/`uninstall`, launcher/session supervisor, `vault` controls, hooks, routing, `status`/`doctor`/`audit-me`/`top`, approvals, memory UI, bench. |
 | `aos-core` | Core traits and types: effects, scopes, reversibility, session identity, A2A state machine, glob claims. |
-| `aos-vfs` | CoW shadow workspace, snapshots, 4-tier LCS Diff3 merge, `mtime` sync, Org CAS/KV. |
+| `aos-vfs` | CoW shadow workspace, per-org OS-encrypted `OrgVault` volumes (`AES-256-GCM` `KEK -> DEK` envelopes), `fsync` atomic durability, orphan shadow recovery, snapshots, 4-tier LCS Diff3 merge, `mtime` sync, Org CAS/KV. |
 | `aos-sandbox` | Native OS sandbox drivers: macOS Seatbelt, Linux bwrap, microVM control-plane interface. |
 | `aos-egress` | Identity-pinned CONNECT proxy, domain allowlist, Model API Base-URL L7 reverse proxy with DLP & `$AOS_SECRET_*` boundary secret injection, Unix-socket bridge; opt-in non-model HTTPS MITM is Phase 2. |
 | `aos-policy` | Cedar-style 5-stage policy engine (`R0a`–`R4`), commit-time poisoning guard, TTL/one-shot leases, escalation queue. |
@@ -96,15 +96,20 @@ The mode is surfaced in `aegis-os status`, `aegis-os doctor`, and `aegis-os audi
 **Workspace layout (abridged)**
 
 ```text
-<runtime_dir>/
-  orgs/<org>/agents/<agent>/cow_workspace/
-    upper_workspace/        # writable CoW upper layer
-    baseline/               # refresh baseline
-  sessions/<session_id>/    # metadata, proxy config, audit refs
-  host_commit.lock          # serialized host commits
+<runtime_dir>/              # defaults to ~/.aegis (override via AOS_RUNTIME_DIR)
+  vaults/
+    <org>.sparsebundle | <org>.luks.img   # per-org encrypted volume image
+    <org>.dek.enc.json                    # AES-256-GCM wrapped DEK envelope (Aad = org_id)
+    <org>.vault.json                      # mount & backend state
+  orgs/<org>/               # mounted per-org encrypted OrgVault volume
+    agents/<agent>/cow_workspace/
+      upper_workspace/      # writable CoW upper layer
+      baseline/             # refresh baseline
+  sessions/<session_id>/    # metadata, proxy config, audit refs (fsync-persisted)
+  host_commit.lock          # serialized host commits & epoch state
 ```
 
-The shadow is mounted at the original project path for the agent. The host tree is exposed read-only at `/aegis/host`; `.git` is read-only with a writable session index; agent state directories are split into read-only sensitive config and writable session/cache paths.
+On Linux (`bwrap --bind-fd`), the CoW shadow is bind-mounted at the original project path while the host tree is exposed read-only at `/aegis/host`; on macOS Seatbelt, the agent runs with `cwd` inside the CoW shadow while the host tree is mounted read-only. In both modes, `.git` objects are read-only with a writable session index, and agent state directories are split into read-only sensitive config and writable session/cache paths.
 
 ---
 
@@ -113,6 +118,8 @@ The shadow is mounted at the original project path for the agent. The host tree 
 `aos-vfs` provides:
 
 - **CoW fork** — APFS `clonefile` on macOS, Linux `FICLONE` reflinks (btrfs/XFS), lazy-copy fallback on ext4. Metadata fork is reported separately from full 1,000-file provisioning in the benchmarks.
+- **`OrgVault` encrypted persistence** — `<runtime_dir>/orgs/<org>` is backed by a per-organization OS-encrypted sparse volume (Rootless APFS Encrypted `.sparsebundle` preserving `clonefile` on macOS; `LUKS2 (dm-crypt) + Btrfs` with `zstd` compression and reflinks/snapshots on Linux/Cloud; `gocryptfs` FUSE or `PlainDir0700` fallback on unprivileged Linux). Per-org DEKs are wrapped with `ring` `AES-256-GCM` (`Aad = org_id`) under a master KEK resolved from `AOS_VAULT_MASTER_KEY` (Cloud KMS) → macOS Keychain → Linux Secret Service → `0o600` `~/.config/aegis-os/master.kek`.
+- **Crash durability & orphan recovery** — shadow writes, snapshot indexes, `session_bindings.json`, and `session.json` use `fsync` + parent-directory sync (`write_bytes_atomic_synced`); legacy `/tmp/aegis-os-runtime` shadows are auto-rescued into `~/.aegis`; dead-PID uncommitted shadows are surfaced by `workspace_status` / `aegis-os vault status` and recoverable via `workspace_sync(adopt_orphaned_agent)` or `aegis-os vault recover --from-agent <id>`.
 - **Continuous rebase** — refresh from host at turn/tool boundaries; bump `mtime` on fast-forwarded files so incremental compilers recompile.
 - **4-tier merge**:
   1. untouched files → fast-forward;
@@ -129,7 +136,7 @@ Measured multi-agent auto-merge: **98.7%** without human intervention; the remai
 ## 7. Sandbox and egress
 
 - **Linux enforced launcher** — `bwrap >= 0.10` (`--bind-fd`) with a read-only root view (`--ro-bind / /`), `$HOME`/system-directory `--tmpfs` masking (including `/run`; DNS is resolved host-side by the egress bridge), read-only toolchains, layered CLI runtime state mounts with single-file `--ro-bind` config locks, Git read-only object pass-through + per-session `GIT_INDEX_FILE`, `--unshare-net` Unix-bridge egress, and process-group lifecycle.
-- **macOS enforced launcher & `proc_exec`** — Seatbelt (`sandbox-exec`) confines both `aegis-os run` and `proc_exec`: shadow `cwd`, read-only host project, symlink-canonicalized Darwin runtime/temp paths, preserved `HOME` for macOS Keychain/OAuth compatibility paired with explicit file-read/write deny on `~/.ssh`, `~/.aws`, `~/.gnupg`, `~/.kube`, and `~/.aegis/**/human.token`, read-only `.aegis-bin` Git shim (`core.fsmonitor=false`, `core.hooksPath=/dev/null`), PTY forwarding, and loopback TCP broker/egress. Full macOS VFS path-remapping at the original host path and default-deny read convergence remain Phase 4.
+- **macOS enforced launcher & `proc_exec`** — Seatbelt (`sandbox-exec`) confines both `aegis-os run` and `proc_exec`: shadow `cwd`, read-only host project, symlink-canonicalized Darwin runtime/temp paths, preserved `HOME` for macOS Keychain/OAuth compatibility paired with explicit file-read/write deny on `~/.ssh`, `~/.aws`, `~/.gnupg`, `~/.kube`, `~/.aegis/**/human.token`, `~/.config/aegis-os/master.kek`, `vaults/*.dek.enc.json`, vault backing images, and volume utilities (`hdiutil` / `diskutil`, also filtered by PreToolUse routing and matched by Linux `bwrap` `$HOME` masking), read-only `.aegis-bin` Git shim (`core.fsmonitor=false`, `core.hooksPath=/dev/null`), PTY forwarding, and loopback TCP broker/egress. Full macOS VFS path-remapping at the original host path and default-deny read convergence remain Phase 4.
 - **Egress today** — identity-pinned L4 `CONNECT` proxy + domain allowlist for general HTTPS (host loopback is unreachable), plus a **Model API Base-URL L7 reverse proxy** (`ANTHROPIC_BASE_URL`, `OPENAI_BASE_URL`, `GOOGLE_GEMINI_BASE_URL`, with `AOS_UPSTREAM_*_URL` routing) that enforces method/path allowlists, L7 request-body DLP, zero-buffered SSE streaming (`+0.221 ms` TTFT overhead), and `$AOS_SECRET_*` boundary secret injection.
 - **Egress Phase 2 remaining** — opt-in MITM CA inspection for arbitrary non-model third-party HTTPS endpoints.
 - **Process lifecycle** — active sandbox process groups support real `SIGSTOP` / `SIGCONT` / `SIGKILL` for pause/resume/destroy.
@@ -198,7 +205,7 @@ The same shadow/claim/verify/commit kernel covers multiple artifact types. Profi
 Aegis Cloud turns the local runtime into a multi-tenant control plane:
 
 - **Tenant keys** — `ak_live_*`, SHA-256 hashed, bound to `(org_id, agent_id, role, workspace_id)`.
-- **Workspaces** — provision from a Git repo, fork parallel CoW agent environments, sync source-only changes, hibernate/wake with scale-to-zero.
+- **Workspaces** — provision from a Git repo, fork parallel CoW agent environments, sync source-only changes, hibernate/wake with cryptographic scale-to-zero (`umount` + `cryptsetup close` evicts volume keys from RAM when an org has no active workspaces, auto-unlock on wake, cryptographic erasure on org deletion).
 - **Git-to-PR** — reconcile with the 4-tier merge, commit to a branch, export a patch/PR payload.
 - **Approvals** — cloud TOTP approver; tenant key alone cannot approve.
 - **Quotas / metering** — per-tenant syscalls, sandbox ms, CoW bytes; plan-based concurrency.
@@ -215,6 +222,8 @@ Local vs Cloud share the same MCP behavior; Cloud offloads heavy builds and mult
 - `aegis-os audit-me` — 5-second local credential exposure & prompt-fatigue diagnostic (with `--share` Markdown badge export).
 - `aegis-os top` — live peer radar, A2A tasks, claims, leases.
 - `aegis-os why` — approval ticket + audit trail.
+- `aegis-os vault status|unlock|lock|recover` — per-org encrypted `OrgVault` backend/mount/key-source inspection, manual lock/unlock, and dead-PID orphan shadow adoption.
+- `aegis-os upgrade` / `aegis-os uninstall` — version/drift check (`--check`), install-method-aware in-place upgrade + client/shim refresh (`--refresh-only`), and surgical client/shim/vault uninstallation (`--shim-only`, `--workspace-clean`, `--purge --yes`).
 - **Commit / PR Audit Receipts** — `aegis-os commit`, `workspace_commit`, and `workspace_export_pr` emit `Aegis-OS-Verified: session=... principal=... files=... evidence=sha256:...` git trailers and Markdown verification badges.
 - **Hash-chained ledger** — every boundary event records `task_id`, `prev_hash`, `event_hash = sha256(prev_hash || canonical_event)`; `hash_chain_verified` is exposed through task inspection.
 - **Telemetry** — anonymous install/session ping only; no source, paths, prompts, usernames, or hostnames. Opt out with `DO_NOT_TRACK=1`, `AOS_TELEMETRY_DISABLED=1`, or `touch ~/.gemini/aegis-telemetry-opt-out`.

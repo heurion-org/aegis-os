@@ -12,7 +12,7 @@ git tag v0.4.0 && git push origin v0.4.0
 
 ## Trust model
 
-- `install.sh` and the node accept only binaries signed by the release key (OpenSSH signature, namespace `aegis-os-release`). Mirrors and CDNs are not trusted.
+- `install.sh`, `aegis-os upgrade`, and the node accept only binaries signed by the release key (OpenSSH signature, namespace `aegis-os-release`). Mirrors and CDNs are not trusted.
 - The release private key exists only in the `release` environment's secrets. The deploy key can only trigger `aegis-upgrade`, which cannot install anything unsigned.
 - Limits: a full compromise of heurion.org can still serve a modified `install.sh`. Users who need more assurance can fetch the installer from GitHub. A signed but older release can be replayed (no rollback protection).
 

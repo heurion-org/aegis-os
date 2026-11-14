@@ -100,6 +100,7 @@ cargo clippy --workspace --all-targets -- -D warnings
   - **信封加密与密钥隔离**：使用 `ring` `AES-256-GCM`（`Aad = org_id`）实现 `KEK -> DEK` 信封封装；KEK 按 `AOS_VAULT_MASTER_KEY`（Cloud KMS）→ macOS Keychain → Linux Secret Service → 沙箱屏蔽的 `0o600` `~/.config/aegis-os/master.kek` 顺序加载，并在 Seatbelt/`bwrap` 与 `routing.rs` 中封锁 KEK、DEK 信封、`hdiutil`/`diskutil`；
   - **Cloud PaaS 加密级联休眠（Scale-to-Zero）**：`hibernate_workspace` 在组织无活跃工作区时自动 `umount` 并 `cryptsetup close` 卸载卷与密钥，`wake_workspace_if_needed` 自动重新解密解锁，`delete_org` 执行密码学擦除（crypto-erasure）；
   - **落盘 `fsync` 原子性与重启动恢复**：`write_bytes_atomic_synced` 为影子文件、快照索引、`session_bindings.json` 与 `session.json` 补齐 `fsync` + 父目录刷盘；`host_commits` epoch 从 `/tmp` 迁出持久化；新增死进程孤儿影子检测（`recoverable_orphaned_shadows`）、`workspace_sync(adopt_orphaned_agent)` 与 `aegis-os vault {status,unlock,lock,recover}`，并将遗留 `/tmp/aegis-os-runtime` 自动救援至 `~/.aegis`。
+  - **生命周期管理 CLI（`uninstall` & `upgrade`）**：落地外科手术式 `aegis-os uninstall`（按客户端无损清理 AGY / Claude Code / Codex / OpenCode 中的 Aegis MCP / Hook / 权限 / 规则，支持 `--shim-only`、`--workspace-clean`、`--dry-run` 及先锁定卸载所有 `OrgVault` 再销毁 `~/.aegis`/KEK 的 `--purge --yes`）与原地升级 `aegis-os upgrade`（别名 `update` / `self-update`，自动识别 Homebrew / 本地 Cargo 源码 / Cargo Git / 内置 `RELEASE_SIGNER` Ed25519 签名发行版，支持 `--check`、`--method`、`--tag`、`--source-dir`、`--offline`、`--refresh-only`、`--no-refresh`、`--dry-run`，升级后自动刷新客户端配置、迁移旧 `/tmp/aegis-os-runtime` 指向并重刷现有 shim）。
 
 - **v0.7**（2026-11-09）：完成跨平台真实 CLI Agent 生产适配加固与 Paper 2 实证评测（`aa36c3c`）：
   - **macOS Seatbelt 真实客户端兼容与硬化**：保留真实 `HOME`（支持 Claude Code / AGY 读取 macOS Keychain OAuth 凭据）同时将 `XDG_CONFIG_HOME` / `XDG_DATA_HOME` / `XDG_STATE_HOME` 重定向至沙箱私有目录；对 Darwin `/var/folders -> /private/var/folders` 执行软链规范化白名单；阻断 `~/.ssh`、`~/.aws`、`~/.gnupg` 与 `human.token` 读取；
@@ -1769,7 +1770,8 @@ aos agent test hermes              # 跑一组工具调用冒烟测试
 ```text
 aegis-os
 ├── install [--enforce] [--all] [--agent <id>] [--dry-run]   # --all/--agent planned
-├── uninstall [--shim-only]
+├── upgrade [--check] [--method <auto|release|brew|source|cargo>] [--tag <vX.Y.Z>] [--refresh-only] [--dry-run]
+├── uninstall [--shim-only] [--workspace-clean] [--purge --yes] [--dry-run]
 ├── doctor [--agent <id>]                                     # --agent planned
 ├── status [--json]
 ├── run [--mode observe|implement] [--profile ...] [--enforcement ...] [--no-enforce] -- <agent> [...]
@@ -1810,6 +1812,11 @@ aegis-os
 │   ├── snapshot --label ...
 │   ├── rollback --snapshot-id ...
 │   └── list
+├── vault
+│   ├── status [--json]
+│   ├── unlock
+│   ├── lock
+│   └── recover --from-agent <id>
 ├── mcp-bridge                          # 沙箱内 MCP stdio → broker（使用 AOS_CONTROL_SOCKET）
 ├── adapter                             # Agent Adapter Protocol client
 │   ├── hello --client <id> --version <v> [--capabilities '<json>']
@@ -2377,15 +2384,15 @@ JSON：
 
 ### 12.3 卸载
 
-- `aos uninstall --shim-only`：移除 PATH shim 与 shell PATH block；保留 MCP / Hook 和 shadow。
-- 完整 `aos uninstall` 目前与 `--shim-only` 行为相同，只额外打印提示；移除客户端 MCP/Hook 配置块、runtime 目录和未提交 shadow 仍是 planned。
-- 卸载前检查未提交 shadow / 提示用户仍是 planned。
+- `aegis-os uninstall --shim-only`：移除 `~/.aegis/bin` PATH shim 与 shell RC PATH 块；保留客户端 MCP / Hook / 规则与 `~/.aegis` 运行时数据。
+- 完整 `aegis-os uninstall`（已落地）：在清理 shim 与 shell PATH 块之外，外科手术式移除 AGY、Claude Code、Codex 与 OpenCode 全局配置中的 Aegis MCP、Hook、权限与规则条目，同时无损保留用户的其余非 Aegis 配置；默认保留 `~/.aegis` 运行时及 `OrgVault` 加密卷。
+- 扩展开关与未提交影子检查：`--workspace-clean` 移除项目 `<workspace>/.agents/` 规则文件；`--dry-run` 预演移除清单；`--purge --yes` 在删除 `~/.aegis` 与主密钥 KEK 材料前先锁定并卸载所有 `OrgVault` 加密卷；未传 `--yes` 且启用 `--purge` 或检测到未提交/活跃 `OrgVault` 影子时，会检查并提示用户确认，避免误删未落盘更改。
 
-### 12.4 发布
+### 12.4 发布与原地升级
 
-- Homebrew / install.sh 增加 `aegis-os run` 依赖检查（bwrap / sandbox-exec）。
-- 版本升级时自动刷新 shim，但不自动切换 enforcement 模式。
-- `aos doctor` 在升级后提示「enforced 可用」。
+- Homebrew / `install.sh` 增加 `aegis-os run` 依赖检查（`bwrap` / `sandbox-exec`）。
+- `aegis-os upgrade`（别名 `update` / `self-update`）：支持 `--check` 校验当前版本与 GitHub 最新发行版及客户端配置漂移（含遗留 `/tmp/aegis-os-runtime` 检测），支持 `--method <auto|release|brew|source|cargo>`、`--tag <vX.Y.Z>`、`--source-dir`、`--offline`、`--refresh-only`、`--no-refresh` 与 `--dry-run`。使用签名发行版升级时，强制通过 `ssh-keygen -Y verify` 对二进制执行编译内置公钥（`RELEASE_SIGNER`，namespace 为 `aegis-os-release`）签名校验后再原子替换。
+- 升级时自动使用新二进制刷新全局客户端集成并重刷现有 shim（同步迁移遗留 `/tmp/aegis-os-runtime` 指向），但不自动切换用户的 enforcement 模式；`aegis-os doctor` 持续报告配置健康度与 `enforced` 可用状态。
 
 ---
 

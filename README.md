@@ -64,14 +64,14 @@ aegis-os commit --expected-diff-hash <sha256>
 
 Enforced mode gives you:
 
-- **Host project read-only**; all writes land in a per-session CoW shadow (`clonefile` on APFS, `FICLONE` on `btrfs`, fast workspace-only copy on `ext4`).
+- **Host project read-only + OS-encrypted shadow persistence (`OrgVault`)**: all writes land in a CoW shadow (`clonefile` on APFS, `FICLONE` on `btrfs`, fast workspace-only copy on `ext4`) persisted inside a per-org encrypted volume under `~/.aegis` (Rootless APFS Encrypted `.sparsebundle` on macOS, `LUKS2 + Btrfs` or `gocryptfs` on Linux/Cloud) with `AES-256-GCM` `KEK -> DEK` envelope keys, `fsync` crash durability, and dead-PID orphan recovery.
 - **Host credentials & Mach IPC masked**: `$HOME` SSH/cloud keys, Keychain CLI/Mach `SecurityAgent` popups, `launchctl`, and `osascript` are blocked by the kernel; protected hook/MCP configs (`.claude/settings.json`, `.mcp.json`, `opencode.json`, `.gemini/antigravity-cli/settings.json`, `.hermes/config.yaml`) are locked read-only.
 - **Split `.git` view + hardened `.aegis-bin/git` shim** on both Linux and macOS: host `.git` objects are mounted read-only (saving **99.05%** of physical disk blocks on 500 MB packed repos on APFS) paired with a private session `GIT_INDEX_FILE` and forced `core.fsmonitor=false` / `core.hooksPath=/dev/null`.
 - **Split-plane L4/L7 egress proxy**: Model API traffic routes through a local L7 Base-URL reverse proxy (`ANTHROPIC_BASE_URL`, `OPENAI_BASE_URL`, `GOOGLE_GEMINI_BASE_URL`) with 64 KiB outbound DLP scanning and host-boundary `$AOS_SECRET_*` secret injection (**zero TLS MITM**); general HTTPS uses an L4 `CONNECT` allowlist.
 - **Principal-separated `SessionBroker` & frozen-stage SHA-256 commit gate**: Isolates `agent.token` from `human.token`, escapes VT100 CSI / Unicode Bidi control sequences in diffs, snapshots candidate files into `commit_frozen_stage`, and runs 6 `DomainProfile` verifiers (`code`, `docs`, `data`, `binary`, `app_state`, `memory`) before promoting to the host.
 - **Fail closed**: missing `bwrap`/`sandbox-exec` (or restricted Ubuntu 24.04 AppArmor userns without profile), proxy, or broker refuses startup instead of silently degrading.
 
-Session & observability controls: `aegis-os status` · `aegis-os diff --json` · `aegis-os verify` · `aegis-os commit --expected-diff-hash` · `aegis-os discard` · `aegis-os publish` · `aegis-os approvals` · `aegis-os why` · `aegis-os a2a board` · `aegis-os policy watch` · `aegis-os memory ui` · `aegis-os app list` · `aegis-os audit-me --share`.
+Session & observability controls: `aegis-os status` · `aegis-os diff --json` · `aegis-os verify` · `aegis-os commit --expected-diff-hash` · `aegis-os discard` · `aegis-os publish` · `aegis-os approvals` · `aegis-os why` · `aegis-os a2a board` · `aegis-os policy watch` · `aegis-os memory ui` · `aegis-os app list` · `aegis-os audit-me --share` · `aegis-os vault status` · `aegis-os upgrade --check` · `aegis-os uninstall`.
 
 Current enforced-runtime limits:
 
@@ -79,7 +79,7 @@ Current enforced-runtime limits:
 - **Ubuntu 24.04+ unprivileged userns**: Ubuntu 24.04 enables `kernel.apparmor_restrict_unprivileged_userns=1` by default; `aegis-os run` fails closed with setup instructions if `/etc/apparmor.d/bwrap` is not installed.
 - **Non-model HTTPS inspection**: Model API traffic uses the L7 Base-URL reverse proxy (64 KiB DLP + `$AOS_SECRET_*` injection); general allowlisted HTTPS uses L4 `CONNECT` domain filtering without TLS MITM.
 
-### Other install paths
+### Install, upgrade & uninstall
 
 ```bash
 # One-line signed installer (Linux & macOS)
@@ -89,15 +89,22 @@ curl -fsSL https://heurion.org/aegis-cloud/install.sh | sh
 git clone https://github.com/heurion-org/aegis-os.git && cd aegis-os
 cargo install --path crates/aos-cli
 aegis-os install
+
+# Upgrade binary + refresh client MCP/Hook/shim integrations (Brew / Cargo / Source / Ed25519-signed release)
+aegis-os upgrade --check
+aegis-os upgrade             # or: aegis-os upgrade --refresh-only
+
+# Surgically remove shims & client MCP/Hook/rule integrations (keeps ~/.aegis vaults unless --purge)
+aegis-os uninstall           # or: aegis-os uninstall --workspace-clean --purge --yes
 ```
 
 ## Core capabilities
 
-- **Transactional CoW VFS** — 0.42 ms metadata fork; 6.28 ms / 15.6 ms for a 1,000-file workspace; 4-tier LCS auto-merge with domain verification gates.
+- **Transactional CoW VFS & encrypted `OrgVault`** — 0.42 ms metadata fork; 6.28 ms / 15.6 ms for a 1,000-file workspace; 4-tier LCS auto-merge with domain verification gates; per-org `AES-256` encrypted shadow persistence (`KEK -> DEK` envelope keys), `fsync` crash durability, and dead-PID orphan recovery.
 - **Kernel sandbox & egress** — Linux `bwrap` and macOS Seatbelt enforced launchers; credential masking; Model API base-URL L7 reverse proxy with DLP & `$AOS_SECRET_*` injection + CONNECT domain allowlist.
 - **A2A IPC & CAS** — peer discovery, hierarchical tasks, task-bound file claims, `artifact://sha256` content-addressed hand-offs.
 - **Cedar policy, leases & audit** — effect-level approvals, TTL/one-shot leases, `evidence_hash` pinning, hash-chained audit ledger, and `Aegis-OS-Verified` commit/PR receipts.
-- **Cloud PaaS** — multi-tenant workspaces, Git-to-PR export, scale-to-zero hibernation, web approval console.
+- **Cloud PaaS** — multi-tenant workspaces, Git-to-PR export, cryptographic scale-to-zero hibernation (`umount` + `cryptsetup close` on idle, crypto-erasure on delete), web approval console.
 
 ## Key benchmarks
 
