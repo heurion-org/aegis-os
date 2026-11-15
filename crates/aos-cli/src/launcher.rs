@@ -4266,18 +4266,22 @@ fn is_hermes_command(command: &[String]) -> bool {
         .is_some_and(|name| name == "hermes" || name.starts_with("hermes-"))
 }
 
-fn is_agy_or_gemini_command(command: &[String]) -> bool {
+fn command_binary_name(command: &[String]) -> Option<&str> {
     command
         .first()
         .and_then(|c| Path::new(c).file_name())
         .and_then(|s| s.to_str())
-        .is_some_and(|name| {
-            name == "agy"
-                || name.starts_with("agy-")
-                || name.contains("antigravity")
-                || name == "gemini"
-                || name.starts_with("gemini-")
-        })
+}
+
+fn is_agy_command(command: &[String]) -> bool {
+    command_binary_name(command)
+        .is_some_and(|name| name == "agy" || name.starts_with("agy-") || name.contains("antigravity"))
+}
+
+fn is_agy_or_gemini_command(command: &[String]) -> bool {
+    is_agy_command(command)
+        || command_binary_name(command)
+            .is_some_and(|name| name == "gemini" || name.starts_with("gemini-"))
 }
 
 fn is_hermes_config_subcommand(command: &[String]) -> bool {
@@ -4286,6 +4290,412 @@ fn is_hermes_config_subcommand(command: &[String]) -> bool {
             .get(1)
             .map(String::as_str)
             .is_some_and(|sub| matches!(sub, "setup" | "config" | "model" | "auth" | "login"))
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct HostLifecycleInvocation {
+    client: &'static str,
+    subcommand: String,
+    quiet_banner: bool,
+}
+
+fn flag_matches(arg: &str, disallowed: &[&str]) -> bool {
+    disallowed.iter().any(|&f| {
+        arg == f || (f.starts_with("--") && arg.starts_with(f) && arg.as_bytes().get(f.len()) == Some(&b'='))
+    })
+}
+
+fn infer_known_client_name(command: &[String]) -> Option<&'static str> {
+    if is_claude_command(command) {
+        Some("claude")
+    } else if is_codex_command(command) {
+        Some("codex")
+    } else if is_opencode_command(command) {
+        Some("opencode")
+    } else if is_hermes_command(command) {
+        Some("hermes")
+    } else if is_agy_command(command) {
+        Some("agy")
+    } else if command_binary_name(command)
+        .is_some_and(|name| name == "gemini" || name.starts_with("gemini-"))
+    {
+        Some("gemini")
+    } else {
+        None
+    }
+}
+
+/// Classify host CLI self-update / install / uninstall invocations that must write to
+/// host toolchain locations outside Seatbelt / bubblewrap read-only mounts.
+/// Rejects `--` separators and any prompt/session/execution/config-injection flags to prevent
+/// prompt smuggling into unsandboxed host execution.
+fn classify_host_lifecycle_subcommand(command: &[String]) -> Option<HostLifecycleInvocation> {
+    if command.len() < 2 || command.iter().any(|a| a == "--") {
+        return None;
+    }
+
+    if is_agy_command(command) {
+        let sub = command[1].as_str();
+        if matches!(sub, "update" | "self-update" | "install")
+            && !command[2..].iter().any(|a| {
+                flag_matches(
+                    a,
+                    &[
+                        "-p",
+                        "--print",
+                        "--prompt",
+                        "--prompt-interactive",
+                        "-i",
+                        "-c",
+                        "--continue",
+                        "--conversation",
+                        "--agent",
+                        "--mode",
+                        "--model",
+                        "--settings",
+                        "--add-dir",
+                        "--dangerously-skip-permissions",
+                        "--remote-agent",
+                        "--remote-control",
+                        "acp",
+                        "mcp",
+                        "plugin",
+                        "plugins",
+                    ],
+                )
+            })
+        {
+            return Some(HostLifecycleInvocation {
+                client: "agy",
+                subcommand: sub.to_string(),
+                quiet_banner: false,
+            });
+        }
+        return None;
+    }
+
+    if is_claude_command(command) {
+        let sub = command[1].as_str();
+        if matches!(sub, "update" | "upgrade" | "install")
+            && !command[2..].iter().any(|a| {
+                flag_matches(
+                    a,
+                    &[
+                        "-p",
+                        "--print",
+                        "--prompt",
+                        "-c",
+                        "--continue",
+                        "-r",
+                        "--resume",
+                        "--dangerously-skip-permissions",
+                        "--allow-dangerously-skip-permissions",
+                        "--settings",
+                        "--mcp-config",
+                        "--agents",
+                        "--agent",
+                        "--system-prompt",
+                        "--append-system-prompt",
+                        "--plugin-dir",
+                        "--add-dir",
+                        "--tools",
+                        "--allowedTools",
+                        "--allowed-tools",
+                        "-w",
+                        "--worktree",
+                        "--bg",
+                        "--background",
+                    ],
+                )
+            })
+        {
+            return Some(HostLifecycleInvocation {
+                client: "claude",
+                subcommand: sub.to_string(),
+                quiet_banner: false,
+            });
+        }
+        return None;
+    }
+
+    if is_opencode_command(command) {
+        let mut idx = 1;
+        while let Some(arg) = command.get(idx).map(String::as_str) {
+            if arg == "--print-logs" || arg.starts_with("--log-level=") {
+                idx += 1;
+            } else if arg == "--log-level" {
+                idx += 2;
+            } else {
+                break;
+            }
+        }
+        let Some(sub) = command.get(idx).map(String::as_str) else {
+            return None;
+        };
+        if matches!(sub, "upgrade" | "update" | "uninstall")
+            && !command[1..].iter().any(|a| {
+                flag_matches(
+                    a,
+                    &[
+                        "--prompt",
+                        "-c",
+                        "--continue",
+                        "-s",
+                        "--session",
+                        "--auto",
+                        "--server",
+                        "--standalone",
+                        "run",
+                        "serve",
+                        "acp",
+                        "attach",
+                        "mini",
+                    ],
+                )
+            })
+        {
+            return Some(HostLifecycleInvocation {
+                client: "opencode",
+                subcommand: sub.to_string(),
+                quiet_banner: false,
+            });
+        }
+        return None;
+    }
+
+    if is_hermes_command(command) {
+        let sub_idx = match command.get(1).map(String::as_str) {
+            Some("update" | "uninstall") => Some(1),
+            Some("-p" | "--profile")
+                if command
+                    .get(2)
+                    .is_some_and(|p| !p.is_empty() && !p.starts_with('-'))
+                    && matches!(command.get(3).map(String::as_str), Some("update" | "uninstall")) =>
+            {
+                Some(3)
+            }
+            Some(arg)
+                if arg.starts_with("--profile=")
+                    && !arg["--profile=".len()..].is_empty()
+                    && matches!(command.get(2).map(String::as_str), Some("update" | "uninstall")) =>
+            {
+                Some(2)
+            }
+            _ => None,
+        }?;
+        let sub = command[sub_idx].as_str();
+        if !command[sub_idx + 1..].iter().any(|a| {
+            flag_matches(
+                a,
+                &[
+                    "-z",
+                    "--resume",
+                    "-c",
+                    "--continue",
+                    "--in",
+                    "--worktree",
+                    "-w",
+                    "--accept-hooks",
+                    "--skills",
+                    "--yolo",
+                    "--tui",
+                    "--cli",
+                    "--dev",
+                    "chat",
+                    "acp",
+                    "serve",
+                    "gateway",
+                    "console",
+                ],
+            )
+        }) {
+            return Some(HostLifecycleInvocation {
+                client: "hermes",
+                subcommand: sub.to_string(),
+                quiet_banner: false,
+            });
+        }
+        return None;
+    }
+
+    if is_codex_command(command) {
+        let sub = command[1].as_str();
+        if matches!(sub, "update" | "upgrade" | "self-update" | "uninstall")
+            && !command[2..].iter().any(|a| {
+                flag_matches(
+                    a,
+                    &[
+                        "exec",
+                        "e",
+                        "-p",
+                        "--prompt",
+                        "-c",
+                        "--config",
+                        "--full-auto",
+                        "--dangerously-bypass-approvals-and-sandbox",
+                        "--yolo",
+                        "--cd",
+                        "-C",
+                        "--add-dir",
+                        "mcp",
+                        "mcp-server",
+                    ],
+                )
+            })
+        {
+            return Some(HostLifecycleInvocation {
+                client: "codex",
+                subcommand: sub.to_string(),
+                quiet_banner: false,
+            });
+        }
+    }
+
+    None
+}
+
+fn classify_pure_info_subcommand(command: &[String]) -> Option<HostLifecycleInvocation> {
+    if command.len() != 2 {
+        return None;
+    }
+    let client = infer_known_client_name(command)?;
+    if matches!(
+        command[1].as_str(),
+        "--version" | "-v" | "-V" | "--help" | "-h"
+    ) {
+        Some(HostLifecycleInvocation {
+            client,
+            subcommand: command[1].clone(),
+            quiet_banner: true,
+        })
+    } else {
+        None
+    }
+}
+
+/// Remove `~/.aegis/bin` shims and relative entries (e.g., `.`, `""`) from `PATH`
+/// before spawning host lifecycle commands so subshells do not recurse through shims.
+fn sanitize_host_lifecycle_path(path_os: Option<&std::ffi::OsStr>) -> Option<std::ffi::OsString> {
+    let raw = path_os?;
+    let clean: Vec<PathBuf> = std::env::split_paths(raw)
+        .filter(|dir| !dir.as_os_str().is_empty() && dir.is_absolute() && !is_aegis_shim_dir(dir))
+        .collect();
+    std::env::join_paths(clean).ok()
+}
+
+fn find_in_given_path(bin: &str, path_os: Option<&std::ffi::OsStr>) -> Option<PathBuf> {
+    let raw = path_os?;
+    for dir in std::env::split_paths(raw) {
+        if is_aegis_shim_dir(&dir) {
+            continue;
+        }
+        let candidate = dir.join(bin);
+        if candidate.is_file() {
+            return Some(candidate);
+        }
+    }
+    None
+}
+
+fn resolve_host_agent_binary(
+    program: &str,
+    path_os: Option<&std::ffi::OsStr>,
+) -> anyhow::Result<PathBuf> {
+    let p = Path::new(program);
+    if p.components().count() > 1 {
+        if !p.parent().is_some_and(is_aegis_shim_dir) && p.is_file() {
+            return Ok(p.to_path_buf());
+        }
+        if let Some(name) = p.file_name().and_then(|s| s.to_str()) {
+            if let Some(found) = find_in_given_path(name, path_os) {
+                return Ok(found);
+            }
+        }
+    } else if let Some(found) = find_in_given_path(program, path_os) {
+        return Ok(found);
+    }
+    bail!(
+        "aos run: real binary for `{program}` not found on host PATH (outside .aegis/bin)"
+    );
+}
+
+fn refresh_stale_agent_binary_path(command: &mut [String]) {
+    let Some(first) = command.first() else {
+        return;
+    };
+    let p = Path::new(first);
+    if p.components().count() > 1 && (p.parent().is_some_and(is_aegis_shim_dir) || !p.is_file()) {
+        if let Some(name) = p.file_name().and_then(|s| s.to_str()) {
+            if let Some(found) = find_in_path(name) {
+                command[0] = found.display().to_string();
+            }
+        }
+    }
+}
+
+fn audit_host_lifecycle_command(
+    runtime_dir: &Path,
+    identity: &AgentIdentity,
+    lifecycle: &HostLifecycleInvocation,
+    bin: &Path,
+    args: &[String],
+) {
+    let audit_dir = runtime_dir.join("audit");
+    let _ = std::fs::create_dir_all(&audit_dir);
+    let _ = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(audit_dir.join("host_lifecycle.jsonl"))
+        .and_then(|mut file| {
+            writeln!(
+                file,
+                "{}",
+                json!({
+                    "event": "host.lifecycle",
+                    "client": lifecycle.client,
+                    "subcommand": lifecycle.subcommand,
+                    "binary": bin.display().to_string(),
+                    "args": args,
+                    "org_id": identity.org_id,
+                    "agent_id": identity.agent_id,
+                    "pid": std::process::id(),
+                    "timestamp_ms": chrono::Utc::now().timestamp_millis(),
+                })
+            )
+        });
+}
+
+async fn run_host_lifecycle_command(
+    identity: &AgentIdentity,
+    runtime_dir: &Path,
+    command: &[String],
+    host_home: &Path,
+    lifecycle: &HostLifecycleInvocation,
+) -> anyhow::Result<i32> {
+    let bin = resolve_host_agent_binary(&command[0], std::env::var_os("PATH").as_deref())?;
+    audit_host_lifecycle_command(runtime_dir, identity, lifecycle, &bin, &command[1..]);
+    if !lifecycle.quiet_banner {
+        eprintln!(
+            "Aegis · host lifecycle · {}/{} (running `{} {}` on host outside sandbox)",
+            identity.org_id, identity.agent_id, lifecycle.client, lifecycle.subcommand
+        );
+    }
+    let mut cmd = Command::new(&bin);
+    cmd.args(&command[1..])
+        .env("AOS_ENFORCEMENT", "advisory")
+        .env_remove("AOS_SESSION_ID")
+        .env_remove("AOS_CONTROL_SOCKET");
+    if host_home.is_dir() {
+        cmd.current_dir(host_home);
+    }
+    if let Some(clean_path) = sanitize_host_lifecycle_path(std::env::var_os("PATH").as_deref()) {
+        cmd.env("PATH", clean_path);
+    }
+    let mut child = cmd
+        .spawn()
+        .with_context(|| format!("launching host lifecycle command `{}`", bin.display()))?;
+    let status = child.wait().await?;
+    Ok(exit_code(status))
 }
 
 #[cfg_attr(not(target_os = "macos"), allow(dead_code))]
@@ -4441,7 +4851,9 @@ async fn run_inner(
     if program.trim().is_empty() {
         bail!("aos run: empty agent command");
     }
-    if std::env::var_os("AOS_SESSION_ID").is_some() {
+    if std::env::var_os("AOS_SESSION_ID").is_some()
+        || std::env::var("AOS_CONTROL_SOCKET").is_ok_and(|s| !s.trim().is_empty())
+    {
         bail!("aos run: refusing to nest an enforced session inside another Aegis session");
     }
 
@@ -4463,6 +4875,20 @@ async fn run_inner(
     }
 
     let identity = infer_identity(identity, command);
+    if let Some(lifecycle) = classify_host_lifecycle_subcommand(command) {
+        return run_host_lifecycle_command(
+            &identity,
+            runtime_dir,
+            command,
+            host_home,
+            &lifecycle,
+        )
+        .await;
+    }
+
+    let mut command = command.to_vec();
+    refresh_stale_agent_binary_path(&mut command);
+
     let project = std::fs::canonicalize(workspace)
         .with_context(|| format!("canonicalizing workspace {}", workspace.display()))?;
     if !project.is_dir() {
@@ -4515,15 +4941,25 @@ async fn run_inner(
         return Ok(exit_code(status));
     }
 
-    validate_workspace_roots(&project, host_home, runtime_dir)?;
+    if let Err(ws_err) = validate_workspace_roots(&project, host_home, runtime_dir) {
+        if let Some(info) = classify_pure_info_subcommand(&command) {
+            return run_host_lifecycle_command(
+                &identity,
+                runtime_dir,
+                &command,
+                host_home,
+                &info,
+            )
+            .await;
+        }
+        return Err(ws_err);
+    }
     let host_name = project
         .file_name()
         .and_then(|s| s.to_str())
         .unwrap_or("workspace")
         .to_string();
 
-    #[cfg_attr(target_os = "macos", allow(unused_mut))]
-    let mut command = command.to_vec();
     if is_opencode_command(&command) {
         if command
             .iter()
@@ -7109,5 +7545,238 @@ mod tests {
         assert!(!session_dir.exists());
         assert!(!target_session.exists());
         assert!(sibling_session.exists());
+    }
+
+    #[test]
+    fn host_lifecycle_classifier_covers_all_agents_and_blocks_smuggling() {
+        let vec_s = |items: &[&str]| -> Vec<String> {
+            items.iter().map(|s| (*s).to_string()).collect()
+        };
+
+        for (argv, expected_client, expected_sub) in [
+            (&["agy", "update"][..], "agy", "update"),
+            (
+                &["/Users/me/.local/bin/agy", "self-update", "--channel", "stable"][..],
+                "agy",
+                "self-update",
+            ),
+            (&["agy", "install", "--skip-path"][..], "agy", "install"),
+            (&["claude", "update"][..], "claude", "update"),
+            (
+                &["/Users/me/.local/bin/claude", "upgrade", "--version"][..],
+                "claude",
+                "upgrade",
+            ),
+            (&["claude", "install", "stable"][..], "claude", "install"),
+            (
+                &["opencode", "upgrade", "--method", "brew"][..],
+                "opencode",
+                "upgrade",
+            ),
+            (
+                &["/opt/homebrew/bin/opencode", "--print-logs", "--log-level", "debug", "update"]
+                    [..],
+                "opencode",
+                "update",
+            ),
+            (
+                &["opencode", "--log-level=info", "uninstall"][..],
+                "opencode",
+                "uninstall",
+            ),
+            (&["hermes", "update", "--check"][..], "hermes", "update"),
+            (
+                &["hermes", "update", "--gateway", "--yes"][..],
+                "hermes",
+                "update",
+            ),
+            (
+                &["hermes", "-p", "coder", "update", "--no-gateway-restart"][..],
+                "hermes",
+                "update",
+            ),
+            (
+                &["hermes", "--profile=research", "uninstall"][..],
+                "hermes",
+                "uninstall",
+            ),
+            (&["codex", "update"][..], "codex", "update"),
+            (&["codex", "self-update"][..], "codex", "self-update"),
+        ] {
+            let parsed = classify_host_lifecycle_subcommand(&vec_s(argv))
+                .unwrap_or_else(|| panic!("expected lifecycle match for {argv:?}"));
+            assert_eq!(parsed.client, expected_client, "argv={argv:?}");
+            assert_eq!(parsed.subcommand, expected_sub, "argv={argv:?}");
+            assert!(!parsed.quiet_banner);
+        }
+
+        for argv in [
+            &["agy"][..],
+            &["agy", "update", "-p", "pwn host"][..],
+            &["agy", "update", "--settings=/tmp/evil.json"][..],
+            &["agy", "update", "--", "bash"][..],
+            &["claude", "update", "--mcp-config", "/tmp/evil.json"][..],
+            &["claude", "update", "--dangerously-skip-permissions"][..],
+            &["claude", "-p", "update"][..],
+            &["opencode", "run", "update"][..],
+            &["opencode", "--prompt", "hi", "upgrade"][..],
+            &["opencode", "upgrade", "--server", "http://localhost:4096"][..],
+            &["opencode", "--log-level", "upgrade"][..],
+            &["hermes", "update", "-z", "escape"][..],
+            &["hermes", "-p", "coder", "chat"][..],
+            &["hermes", "-p", "--bad", "update"][..],
+            &["hermes", "update", "--yolo"][..],
+            &["codex", "exec", "update"][..],
+            &["unknown-tool", "update"][..],
+        ] {
+            assert!(
+                classify_host_lifecycle_subcommand(&vec_s(argv)).is_none(),
+                "must reject host lifecycle bypass for {argv:?}"
+            );
+        }
+
+        let ver = classify_pure_info_subcommand(&vec_s(&["agy", "--version"])).unwrap();
+        assert_eq!(ver.client, "agy");
+        assert!(ver.quiet_banner);
+        let help = classify_pure_info_subcommand(&vec_s(&["claude", "--help"])).unwrap();
+        assert_eq!(help.client, "claude");
+        assert!(help.quiet_banner);
+        assert!(
+            classify_pure_info_subcommand(&vec_s(&["agy", "--version", "-p", "evil"])).is_none()
+        );
+
+        let clean = sanitize_host_lifecycle_path(Some(std::ffi::OsStr::new(
+            "/Users/u/.aegis/bin:.:relative/dir:/Users/u/.local/bin::/opt/homebrew/bin",
+        )))
+        .unwrap();
+        let clean_dirs: Vec<PathBuf> = std::env::split_paths(&clean).collect();
+        assert_eq!(
+            clean_dirs,
+            vec![
+                PathBuf::from("/Users/u/.local/bin"),
+                PathBuf::from("/opt/homebrew/bin")
+            ]
+        );
+
+        let tmp = tempfile::tempdir().unwrap();
+        let shim_dir = tmp.path().join(".aegis/bin");
+        let real_dir = tmp.path().join(".local/bin");
+        std::fs::create_dir_all(&shim_dir).unwrap();
+        std::fs::create_dir_all(&real_dir).unwrap();
+        let shim_agy = shim_dir.join("agy");
+        let real_agy = real_dir.join("agy");
+        std::fs::write(&shim_agy, "#!/bin/sh\nexit 1\n").unwrap();
+        std::fs::write(&real_agy, "#!/bin/sh\nexit 0\n").unwrap();
+        let joined_path = std::env::join_paths([&shim_dir, &real_dir]).unwrap();
+        let resolved =
+            resolve_host_agent_binary(&shim_agy.display().to_string(), Some(&joined_path))
+                .unwrap();
+        assert_eq!(resolved, real_agy);
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn run_inner_executes_host_lifecycle_updates_across_all_supported_agents() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let tmp = tempfile::tempdir().unwrap();
+        let temp_home = std::fs::canonicalize(tmp.path()).unwrap();
+        let real_bin_dir = temp_home.join(".local/bin");
+        let shim_dir = temp_home.join(".aegis/bin");
+        let project_dir = temp_home.join("work/my-project");
+        let runtime_dir = temp_home.join("runtime");
+        std::fs::create_dir_all(&real_bin_dir).unwrap();
+        std::fs::create_dir_all(&shim_dir).unwrap();
+        std::fs::create_dir_all(&project_dir).unwrap();
+        std::fs::create_dir_all(&runtime_dir).unwrap();
+
+        for agent in ["agy", "claude", "opencode", "hermes"] {
+            let real_bin = real_bin_dir.join(agent);
+            let script = format!(
+                "#!/bin/sh\nset -eu\nSELF_DIR=\"$(cd \"$(dirname \"$0\")\" && pwd)\"\nif [ \"${{1:-}}\" = \"--version\" ]; then\n  echo \"{agent} 9.9.9\"\n  exit 0\nfi\nprintf \"cwd=%s\\nenforce=%s\\nargs=%s\\n\" \"$PWD\" \"${{AOS_ENFORCEMENT:-}}\" \"$*\" > \"$SELF_DIR/{agent}.updated\"\n"
+            );
+            std::fs::write(&real_bin, script).unwrap();
+            std::fs::set_permissions(&real_bin, std::fs::Permissions::from_mode(0o755)).unwrap();
+
+            let shim_bin = shim_dir.join(agent);
+            std::fs::write(&shim_bin, "#!/bin/sh\nexit 99\n").unwrap();
+            std::fs::set_permissions(&shim_bin, std::fs::Permissions::from_mode(0o755)).unwrap();
+        }
+
+        let base_identity = AgentIdentity::new("org1", "agy-agent", "Lead Agent");
+
+        let cases: &[(&str, &Path, &[&str], &str)] = &[
+            ("agy", &project_dir, &["update"], "update"),
+            ("claude", &temp_home, &["update"], "update"),
+            ("opencode", &project_dir, &["upgrade"], "upgrade"),
+            (
+                "hermes",
+                &temp_home,
+                &["-p", "coder", "update", "--check"],
+                "-p coder update --check",
+            ),
+        ];
+
+        for (agent, ws, args, expected_args) in cases {
+            let marker = real_bin_dir.join(format!("{agent}.updated"));
+            let _ = std::fs::remove_file(&marker);
+            let mut argv = vec![real_bin_dir.join(agent).display().to_string()];
+            argv.extend(args.iter().map(|s| (*s).to_string()));
+            let code = run_inner(
+                ws,
+                &base_identity,
+                &runtime_dir,
+                "implement",
+                "code",
+                "enforced",
+                &argv,
+                &temp_home,
+            )
+            .await
+            .unwrap_or_else(|e| panic!("{agent} lifecycle invocation failed: {e:#}"));
+            assert_eq!(code, 0, "{agent} exited non-zero");
+
+            let recorded = std::fs::read_to_string(&marker)
+                .unwrap_or_else(|e| panic!("missing marker for {agent}: {e}"));
+            assert!(
+                recorded.contains(&format!("cwd={}", temp_home.display())),
+                "{agent} must run with host_home cwd, got:\n{recorded}"
+            );
+            assert!(
+                recorded.contains("enforce=advisory"),
+                "{agent} must set AOS_ENFORCEMENT=advisory, got:\n{recorded}"
+            );
+            assert!(
+                recorded.contains(&format!("args={expected_args}")),
+                "{agent} unexpected args:\n{recorded}"
+            );
+        }
+
+        let version_cmd = vec![
+            real_bin_dir.join("agy").display().to_string(),
+            "--version".to_string(),
+        ];
+        let ver_code = run_inner(
+            &temp_home,
+            &base_identity,
+            &runtime_dir,
+            "implement",
+            "code",
+            "enforced",
+            &version_cmd,
+            &temp_home,
+        )
+        .await
+        .expect("agy --version from $HOME should succeed");
+        assert_eq!(ver_code, 0);
+
+        let audit_text = std::fs::read_to_string(runtime_dir.join("audit/host_lifecycle.jsonl"))
+            .expect("host_lifecycle.jsonl must exist");
+        for client in ["agy", "claude", "opencode", "hermes"] {
+            assert!(
+                audit_text.contains(&format!("\"client\":\"{client}\"")),
+                "audit log missing {client}:\n{audit_text}"
+            );
+        }
     }
 }

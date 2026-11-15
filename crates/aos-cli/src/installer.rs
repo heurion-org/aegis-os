@@ -1536,15 +1536,34 @@ pub(crate) async fn run_uninstall(opts: UninstallOptions<'_>) -> anyhow::Result<
     Ok(())
 }
 
+/// Prefer the stable Homebrew symlink when `current_exe()` resolves into a versioned Cellar
+/// path so `~/.aegis/bin/*` shims do not break after `brew upgrade aegis-os`.
+fn stable_aegis_exe_for_shim() -> PathBuf {
+    let exe = std::env::current_exe().unwrap_or_else(|_| PathBuf::from("aegis-os"));
+    if exe.to_string_lossy().contains("/Cellar/aegis-os/") {
+        for cand in [
+            "/opt/homebrew/bin/aegis-os",
+            "/usr/local/bin/aegis-os",
+            "/home/linuxbrew/.linuxbrew/bin/aegis-os",
+        ] {
+            let p = Path::new(cand);
+            if p.is_file() {
+                return p.to_path_buf();
+            }
+        }
+    }
+    exe
+}
+
 pub(crate) fn install_enforced_shims(home_dir: &Path, dry_run: bool) -> anyhow::Result<()> {
     let shim_dir = home_dir.join(".aegis").join("bin");
-    let aegis = std::env::current_exe().unwrap_or_else(|_| PathBuf::from("aegis-os"));
+    let aegis = stable_aegis_exe_for_shim();
     let mut agents = Vec::new();
     for agent in ["claude", "codex", "agy", "opencode", "hermes"] {
         let mut real = None;
         if let Ok(path_env) = std::env::var("PATH") {
             for dir in std::env::split_paths(&path_env) {
-                if dir == shim_dir {
+                if dir == shim_dir || dir.ends_with(".aegis/bin") {
                     continue;
                 }
                 let candidate = dir.join(agent);
