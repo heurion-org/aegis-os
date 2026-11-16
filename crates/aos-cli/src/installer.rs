@@ -166,6 +166,7 @@ pub async fn install_global_clients(
         "fs_export_file",
         "workspace_switch",
         "workspace_git",
+        "github_ci_inspect",
         "runtime_configure_mode",
     ];
 
@@ -281,6 +282,7 @@ pub async fn install_global_clients(
         "mcp(aegis-os/fs_export_file)",
         "mcp(aegis-os/workspace_switch)",
         "mcp(aegis-os/workspace_git)",
+        "mcp(aegis-os/github_ci_inspect)",
         "mcp(aegis-os/runtime_configure_mode)",
     ];
     const AGY_MCP_ASK_RULES: &[&str] = &[
@@ -351,6 +353,8 @@ You are running inside the **Aegis OS Runtime (`aegis-os`)** with an isolated Co
 | Export binary/PDF artifacts to host | `fs_export_file` (zero-token copy from shadow) | Chunked hex/ASCII `write_file` workarounds |
 | Switch active project directory | `workspace_switch` | Cross-directory native `write_file` / `run_command` |
 | Git commit / tag / push on host repo | `workspace_git` (lease-gated via host broker) | Native `git commit` / `git push` in `run_command` |
+| Inspect GitHub Actions CI & failed logs | `github_ci_inspect` (`mcp_aegis-os_github_ci_inspect`) | Native `gh run view` / unauthenticated curl guessing |
+| Inspect GitHub Actions CI & failed logs | `github_ci_inspect` (`mcp_aegis-os_github_ci_inspect`) | Native `gh run view` / unauthenticated curl guessing |
 | Switch Cloud vs. Local execution mode | `runtime_configure_mode` (`mode: "cloud" \| "local"`) | Manual CLI configuration |
 <!-- AEGIS-OS-RUNTIME-END -->
 "#;
@@ -364,7 +368,11 @@ You are running inside the **Aegis OS Runtime (`aegis-os`)** with an isolated Co
     println!("[1/4] AGY (Antigravity) configured:");
     println!("      - MCP Server:  {}", agy_mcp_path.display());
     println!("      - Auto-Hooks:  {}", agy_hooks_path.display());
-    println!("      - Auto-Allow:  {} (34 `mcp(aegis-os/*)` rules)", agy_cli_settings_path.display());
+    println!(
+        "      - Auto-Allow:  {} ({} `mcp(aegis-os/*)` rules)",
+        agy_cli_settings_path.display(),
+        AGY_MCP_ALLOW_RULES.len()
+    );
     println!("      - Global Rule: {}", agy_rules_path.display());
 
     // ------------------------------------------------------------------------
@@ -438,6 +446,7 @@ You are running inside the **Aegis OS Runtime (`aegis-os`)** with an isolated Co
         "fs_export_file",
         "workspace_switch",
         "workspace_git",
+        "github_ci_inspect",
     ];
 
     merge_json_file(
@@ -506,7 +515,11 @@ You are running inside the **Aegis OS Runtime (`aegis-os`)** with an isolated Co
     }
     println!("\n[2/4] Claude Code (`claude`) configured:");
     println!("      - MCP Server:  {}", claude_mcp_path.display());
-    println!("      - Auto-Allow:  {} (34 `mcp__aegis-os__*` rules)", claude_settings_path.display());
+    println!(
+        "      - Auto-Allow:  {} ({} `mcp__aegis-os__*` rules)",
+        claude_settings_path.display(),
+        AEGIS_TOOL_NAMES.len()
+    );
     println!("      - Global Rule: {}", claude_md_path.display());
 
     // ------------------------------------------------------------------------
@@ -2765,6 +2778,7 @@ You are operating inside **Aegis OS Runtime** (`{role}`) within Organization **`
 | Export binary/PDF artifacts to host | `fs_export_file` (zero-token copy from shadow) | Chunked hex/ASCII `write_file` workarounds |
 | Switch active project directory | `workspace_switch` | Cross-directory native `write_file` / `run_command` |
 | Git commit / tag / push on host repo | `workspace_git` (lease-gated via host broker) | Native `git commit` / `git push` in `run_command` |
+| Inspect GitHub Actions CI & failed logs | `github_ci_inspect` (`mcp_aegis-os_github_ci_inspect`) | Native `gh run view` / unauthenticated curl guessing |
 
 ## Commit & Pull Request Audit Attribution
 When creating a Git commit or Pull Request after `workspace_commit` (or `aegis-os commit`), attach the returned `audit_receipt.git_trailer` (`Aegis-OS-Verified: ...`) in the commit trailer and `audit_receipt.pr_markdown_badge` in the PR description so reviewers can verify the CoW merge and evidence hash.

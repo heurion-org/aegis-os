@@ -2145,6 +2145,238 @@ pub async fn configure_workspace_mode_via_mcp(
     }
 }
 
+pub(crate) fn current_installed_aegis_max_mtime(
+    home_override: Option<&Path>,
+) -> Option<std::time::SystemTime> {
+    let mut candidates = Vec::new();
+    if let Some(h) = home_override {
+        candidates.push(h.join(".local/bin/aegis-os"));
+        candidates.push(h.join(".cargo/bin/aegis-os"));
+    } else {
+        if let Ok(exe) = std::env::current_exe() {
+            candidates.push(exe);
+        }
+        if let Ok(home) = std::env::var("HOME") {
+            let h = PathBuf::from(home);
+            candidates.push(h.join(".local/bin/aegis-os"));
+            candidates.push(h.join(".cargo/bin/aegis-os"));
+        }
+        candidates.push(PathBuf::from("/opt/homebrew/bin/aegis-os"));
+        candidates.push(PathBuf::from("/usr/local/bin/aegis-os"));
+    }
+    candidates
+        .into_iter()
+        .filter(|p| p.is_file())
+        .filter_map(|p| std::fs::metadata(p).ok().and_then(|m| m.modified().ok()))
+        .max()
+}
+
+pub(crate) fn find_newer_installed_aegis_binary(
+    startup_mtime: Option<std::time::SystemTime>,
+    home_override: Option<&Path>,
+) -> Option<PathBuf> {
+    if std::env::var("AOS_HOT_RELOAD_DELEGATED").as_deref() == Ok("1") {
+        return None;
+    }
+    let mut candidates = Vec::new();
+    if let Some(h) = home_override {
+        candidates.push(h.join(".local/bin/aegis-os"));
+        candidates.push(h.join(".cargo/bin/aegis-os"));
+    } else {
+        if let Ok(exe) = std::env::current_exe() {
+            candidates.push(exe);
+        }
+        if let Ok(home) = std::env::var("HOME") {
+            let h = PathBuf::from(home);
+            candidates.push(h.join(".local/bin/aegis-os"));
+            candidates.push(h.join(".cargo/bin/aegis-os"));
+        }
+        candidates.push(PathBuf::from("/opt/homebrew/bin/aegis-os"));
+        candidates.push(PathBuf::from("/usr/local/bin/aegis-os"));
+    }
+
+    let mut best: Option<(std::time::SystemTime, PathBuf)> = None;
+    for p in candidates {
+        let Ok(meta) = std::fs::metadata(&p) else {
+            continue;
+        };
+        if !meta.is_file() {
+            continue;
+        }
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            if meta.permissions().mode() & 0o111 == 0 {
+                continue;
+            }
+        }
+        let Ok(mtime) = meta.modified() else {
+            continue;
+        };
+        let is_newer = match startup_mtime {
+            Some(base) => mtime > base,
+            None => true,
+        };
+        if is_newer && best.as_ref().is_none_or(|(best_t, _)| mtime > *best_t) {
+            best = Some((mtime, p));
+        }
+    }
+    best.map(|(_, p)| p)
+}
+
+pub(crate) fn is_known_in_memory_mcp_tool(tool_name: &str) -> bool {
+    AegisRuntimeKernel::mcp_tools_schema()
+        .get("tools")
+        .and_then(|t| t.as_array())
+        .is_some_and(|arr| {
+            arr.iter()
+                .any(|tool| tool.get("name").and_then(|n| n.as_str()) == Some(tool_name))
+        })
+        || aos_mcp_gateway::HUMAN_ONLY_TOOLS.contains(&tool_name)
+}
+
+pub(crate) fn merge_tools_list_response(base_resp: &mut Value, delegated_resp: &Value) {
+    let Some(new_tools) = delegated_resp
+        .get("result")
+        .and_then(|r| r.get("tools"))
+        .and_then(|t| t.as_array())
+    else {
+        return;
+    };
+    let Some(base_tools) = base_resp
+        .get_mut("result")
+        .and_then(|r| r.get_mut("tools"))
+        .and_then(|t| t.as_array_mut())
+    else {
+        return;
+    };
+    let existing: std::collections::HashSet<String> = base_tools
+        .iter()
+        .filter_map(|t| t.get("name").and_then(|v| v.as_str()).map(str::to_string))
+        .collect();
+    for tool in new_tools {
+        let Some(name) = tool.get("name").and_then(|v| v.as_str()) else {
+            continue;
+        };
+        if !existing.contains(name) {
+            base_tools.push(tool.clone());
+        }
+    }
+}
+
+pub(crate) async fn delegate_mcp_rpc_to_binary(
+    bin: &Path,
+    runtime_dir: &Path,
+    workspace: &Path,
+    identity: &AgentIdentity,
+    req: &Value,
+) -> anyhow::Result<Value> {
+    let mut cmd = tokio::process::Command::new(bin);
+    cmd.args([
+        "--runtime-dir",
+        &runtime_dir.to_string_lossy(),
+        "--workspace",
+        &workspace.to_string_lossy(),
+        "--org",
+        &identity.org_id,
+        "--agent",
+        &identity.agent_id,
+        "--role",
+        &identity.role,
+        "mcp-stdio",
+    ])
+    .env_remove("AOS_CONTROL_SOCKET")
+    .env("AOS_HOT_RELOAD_DELEGATED", "1")
+    .env("AOS_NO_APPROVAL_WAIT", "1")
+    .stdin(std::process::Stdio::piped())
+    .stdout(std::process::Stdio::piped())
+    .stderr(std::process::Stdio::piped());
+
+    let mut child = cmd
+        .spawn()
+        .with_context(|| format!("spawning upgraded aegis-os binary `{}`", bin.display()))?;
+    if let Some(mut stdin) = child.stdin.take() {
+        let line = format!("{}\n", serde_json::to_string(req)?);
+        stdin.write_all(line.as_bytes()).await?;
+        stdin.flush().await?;
+    }
+    let out = tokio::time::timeout(
+        std::time::Duration::from_secs(30),
+        child.wait_with_output(),
+    )
+    .await
+    .map_err(|_| anyhow::anyhow!("timed out waiting for hot-reloaded `{}`", bin.display()))??;
+    if !out.status.success() && out.stdout.is_empty() {
+        bail!(
+            "hot-reloaded `{}` exited {}: {}",
+            bin.display(),
+            out.status,
+            String::from_utf8_lossy(&out.stderr).trim()
+        );
+    }
+    let stdout_str = String::from_utf8_lossy(&out.stdout);
+    for line in stdout_str.lines() {
+        let trimmed = line.trim();
+        if trimmed.is_empty() {
+            continue;
+        }
+        if let Ok(mut parsed) = serde_json::from_str::<Value>(trimmed) {
+            if let (Some(req_id), Some(obj)) = (req.get("id").cloned(), parsed.as_object_mut()) {
+                obj.insert("id".to_string(), req_id);
+            }
+            return Ok(parsed);
+        }
+    }
+    bail!(
+        "hot-reloaded `{}` returned no JSON-RPC response (stderr: {})",
+        bin.display(),
+        String::from_utf8_lossy(&out.stderr).trim()
+    )
+}
+
+pub(crate) async fn handle_jsonrpc_with_hot_reload(
+    kernel: &AegisRuntimeKernel,
+    runtime_dir: &Path,
+    workspace: &Path,
+    identity: &AgentIdentity,
+    req: &Value,
+    startup_mtime: Option<std::time::SystemTime>,
+    home_override: Option<&Path>,
+) -> anyhow::Result<(Value, Option<PathBuf>)> {
+    let method = req.get("method").and_then(|v| v.as_str()).unwrap_or("");
+    if method == "tools/call" {
+        let tool_name = req
+            .get("params")
+            .and_then(|p| p.get("name"))
+            .and_then(|v| v.as_str())
+            .unwrap_or("");
+        if !is_known_in_memory_mcp_tool(tool_name) {
+            if let Some(newer_bin) =
+                find_newer_installed_aegis_binary(startup_mtime, home_override)
+            {
+                if let Ok(delegated) =
+                    delegate_mcp_rpc_to_binary(&newer_bin, runtime_dir, workspace, identity, req)
+                        .await
+                {
+                    return Ok((delegated, Some(newer_bin)));
+                }
+            }
+        }
+    }
+    let mut resp = kernel.handle_jsonrpc_message(identity, req.clone()).await?;
+    if method == "tools/list" {
+        if let Some(newer_bin) = find_newer_installed_aegis_binary(startup_mtime, home_override) {
+            if let Ok(delegated) =
+                delegate_mcp_rpc_to_binary(&newer_bin, runtime_dir, workspace, identity, req).await
+            {
+                merge_tools_list_response(&mut resp, &delegated);
+            }
+        }
+        return Ok((resp, None));
+    }
+    Ok((resp, None))
+}
+
 /// Unified Stdio MCP Router (`aegis-os mcp-stdio`):
 /// - Handles `runtime_configure_mode` so the Coding Agent (`agy` / `claude` / `codex`) can switch
 ///   between Cloud Sandbox Mode and Local Community Mode on the fly without restarting the IDE.
@@ -2160,6 +2392,7 @@ pub async fn serve_unified_stdio(
     auto_agent_client: Option<String>,
 ) -> anyhow::Result<()> {
     let kernel = std::sync::Arc::new(AegisRuntimeKernel::new(&runtime_dir).await?);
+    let startup_bin_mtime = current_installed_aegis_max_mtime(None);
     let session_key = auto_agent_client
         .as_ref()
         .and_then(|_| aos_core::session::client_session_key());
@@ -2257,11 +2490,24 @@ pub async fn serve_unified_stdio(
         }
 
         if method == "tools/list" {
-            let response = json!({
+            let mut response = json!({
                 "jsonrpc": "2.0",
                 "id": id,
                 "result": AegisRuntimeKernel::mcp_tools_schema()
             });
+            if let Some(newer_bin) = find_newer_installed_aegis_binary(startup_bin_mtime, None) {
+                if let Ok(delegated) = delegate_mcp_rpc_to_binary(
+                    &newer_bin,
+                    &runtime_dir,
+                    &active_workspace,
+                    &identity,
+                    &req,
+                )
+                .await
+                {
+                    merge_tools_list_response(&mut response, &delegated);
+                }
+            }
             let out_line = format!("{}\n", serde_json::to_string(&response)?);
             stdout.write_all(out_line.as_bytes()).await?;
             stdout.flush().await?;
@@ -2608,8 +2854,18 @@ pub async fn serve_unified_stdio(
                 .await;
         }
 
-        let response = match kernel.handle_jsonrpc_message(&identity, req.clone()).await {
-            Ok(mut resp) => {
+        let response = match handle_jsonrpc_with_hot_reload(
+            &kernel,
+            &runtime_dir,
+            &active_workspace,
+            &identity,
+            &req,
+            startup_bin_mtime,
+            None,
+        )
+        .await
+        {
+            Ok((mut resp, delegated_bin)) => {
                 if let Some(esc_id) = extract_escalation_id_from_rpc(&resp) {
                     // 1. If the user already approved `workspace_commit` inside the IDE chat window
                     //    via the `PreToolUse` hook (`decision: "ask"`), consume the ticket and complete
@@ -2641,9 +2897,20 @@ pub async fn serve_unified_stdio(
                             {
                                 break;
                             }
-                            if let Ok(retry_resp) =
-                                kernel.handle_jsonrpc_message(&identity, req.clone()).await
-                            {
+                            let retry = match delegated_bin.as_deref() {
+                                Some(bin) => {
+                                    delegate_mcp_rpc_to_binary(
+                                        bin,
+                                        &runtime_dir,
+                                        &active_workspace,
+                                        &identity,
+                                        &req,
+                                    )
+                                    .await
+                                }
+                                None => kernel.handle_jsonrpc_message(&identity, req.clone()).await,
+                            };
+                            if let Ok(retry_resp) = retry {
                                 cur_esc = extract_escalation_id_from_rpc(&retry_resp);
                                 resp = retry_resp;
                             } else {
@@ -2696,9 +2963,20 @@ pub async fn serve_unified_stdio(
                                     }
                                 }
                                 if approved {
-                                    if let Ok(retry_resp) =
-                                        kernel.handle_jsonrpc_message(&identity, req).await
-                                    {
+                                    let retry = match delegated_bin.as_deref() {
+                                        Some(bin) => {
+                                            delegate_mcp_rpc_to_binary(
+                                                bin,
+                                                &runtime_dir,
+                                                &active_workspace,
+                                                &identity,
+                                                &req,
+                                            )
+                                            .await
+                                        }
+                                        None => kernel.handle_jsonrpc_message(&identity, req).await,
+                                    };
+                                    if let Ok(retry_resp) = retry {
                                         resp = retry_resp;
                                     }
                                 }

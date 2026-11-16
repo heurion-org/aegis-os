@@ -310,32 +310,79 @@ impl DefaultOsKekProvider {
         let generated = random_bytes_32()?;
         let hex_key = Zeroizing::new(hex::encode(&*generated));
 
+        // Write and fsync into a 0o600 sibling temp file before atomic rename so concurrent readers
+        // never observe an empty or partially written `master.kek`.
+        let parent = path.parent().unwrap_or_else(|| Path::new("."));
+        let tmp_path = parent.join(format!(
+            ".master.kek.tmp.{}.{}",
+            std::process::id(),
+            &uuid::Uuid::new_v4().simple().to_string()[..8]
+        ));
+
         #[cfg(unix)]
-        let open_res = {
+        let mut tmp_file = {
             use std::os::unix::fs::OpenOptionsExt;
             std::fs::OpenOptions::new()
                 .create_new(true)
                 .write(true)
                 .mode(0o600)
-                .open(&path)
+                .open(&tmp_path)?
         };
         #[cfg(not(unix))]
-        let open_res = std::fs::OpenOptions::new()
+        let mut tmp_file = std::fs::OpenOptions::new()
             .create_new(true)
             .write(true)
-            .open(&path);
+            .open(&tmp_path)?;
 
-        match open_res {
-            Ok(mut file) => {
-                file.write_all(hex_key.as_bytes())?;
-                file.sync_all()?;
-                Ok((generated, "sealed_local_kek"))
+        let write_res: anyhow::Result<()> = (|| {
+            tmp_file.write_all(hex_key.as_bytes())?;
+            tmp_file.sync_all()?;
+            Ok(())
+        })();
+        drop(tmp_file);
+        if let Err(err) = write_res {
+            let _ = std::fs::remove_file(&tmp_path);
+            return Err(err);
+        }
+
+        #[cfg(unix)]
+        {
+            // `hard_link` + `remove_file` never clobbers an existing `master.kek` if a sibling
+            // process won the initialization race between `path.exists()` and publish.
+            match std::fs::hard_link(&tmp_path, &path) {
+                Ok(()) => {
+                    let _ = std::fs::remove_file(&tmp_path);
+                    Ok((generated, "sealed_local_kek"))
+                }
+                Err(err) if err.kind() == std::io::ErrorKind::AlreadyExists => {
+                    let _ = std::fs::remove_file(&tmp_path);
+                    let raw = Zeroizing::new(std::fs::read_to_string(&path)?);
+                    Ok((decode_hex_32(&raw)?, "sealed_local_kek"))
+                }
+                Err(err) if err.kind() == std::io::ErrorKind::Unsupported => {
+                    if path.exists() {
+                        let _ = std::fs::remove_file(&tmp_path);
+                        let raw = Zeroizing::new(std::fs::read_to_string(&path)?);
+                        return Ok((decode_hex_32(&raw)?, "sealed_local_kek"));
+                    }
+                    std::fs::rename(&tmp_path, &path)?;
+                    Ok((generated, "sealed_local_kek"))
+                }
+                Err(err) => {
+                    let _ = std::fs::remove_file(&tmp_path);
+                    Err(err.into())
+                }
             }
-            Err(err) if err.kind() == std::io::ErrorKind::AlreadyExists => {
+        }
+        #[cfg(not(unix))]
+        {
+            if path.exists() {
+                let _ = std::fs::remove_file(&tmp_path);
                 let raw = Zeroizing::new(std::fs::read_to_string(&path)?);
-                Ok((decode_hex_32(&raw)?, "sealed_local_kek"))
+                return Ok((decode_hex_32(&raw)?, "sealed_local_kek"));
             }
-            Err(err) => Err(err.into()),
+            std::fs::rename(&tmp_path, &path)?;
+            Ok((generated, "sealed_local_kek"))
         }
     }
 

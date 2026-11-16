@@ -14,7 +14,8 @@ permit (
         Action::"workspace_snapshot",
         Action::"workspace_diff",
         Action::"workspace_rollback",
-        Action::"workspace_sync"
+        Action::"workspace_sync",
+        Action::"github_ci_inspect"
     ],
     resource is WorkspaceResource
 ) when {

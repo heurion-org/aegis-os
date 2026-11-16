@@ -40,6 +40,7 @@ pub struct BrokerSession {
 }
 
 struct BrokerState {
+    runtime_dir: PathBuf,
     session: BrokerSession,
     session_dir: PathBuf,
     identity: AgentIdentity,
@@ -49,6 +50,8 @@ struct BrokerState {
     effects_path: PathBuf,
     hello: RwLock<Option<Value>>,
     web_console_addr: RwLock<Option<std::net::SocketAddr>>,
+    startup_bin_mtime: Option<std::time::SystemTime>,
+    hot_reload_home_override: Option<PathBuf>,
 }
 
 pub struct SessionBroker {
@@ -92,11 +95,34 @@ impl SessionBroker {
     pub async fn start(
         runtime_dir: &Path,
         session_dir: &Path,
+        control_dir: PathBuf,
+        session: BrokerSession,
+        identity: AgentIdentity,
+        egress_proxy: Option<String>,
+        expose_tcp: bool,
+    ) -> Result<Self> {
+        Self::start_inner(
+            runtime_dir,
+            session_dir,
+            control_dir,
+            session,
+            identity,
+            egress_proxy,
+            expose_tcp,
+            None,
+        )
+        .await
+    }
+
+    async fn start_inner(
+        runtime_dir: &Path,
+        session_dir: &Path,
         mut control_dir: PathBuf,
         session: BrokerSession,
         identity: AgentIdentity,
         egress_proxy: Option<String>,
         expose_tcp: bool,
+        hot_reload_home_override: Option<PathBuf>,
     ) -> Result<Self> {
         let mut temp_control_dir = None;
         if !expose_tcp && control_dir.join("control.sock").as_os_str().len() >= 96 {
@@ -172,7 +198,10 @@ impl SessionBroker {
             )
             .await;
 
+        let startup_bin_mtime =
+            crate::cloud::current_installed_aegis_max_mtime(hot_reload_home_override.as_deref());
         let state = Arc::new(BrokerState {
+            runtime_dir: runtime_dir.to_path_buf(),
             session,
             session_dir: session_dir.to_path_buf(),
             identity,
@@ -182,6 +211,8 @@ impl SessionBroker {
             effects_path: session_dir.join("effects.jsonl"),
             hello: RwLock::new(None),
             web_console_addr: RwLock::new(None),
+            startup_bin_mtime,
+            hot_reload_home_override,
         });
 
         let (task, tcp_task, tcp_addr) = if expose_tcp {
@@ -466,11 +497,19 @@ where
             write_json(&mut stream, "200 OK", json!({"status": "recorded"})).await
         }
         ("POST", "/v1/mcp") => {
-            let response = state
-                .kernel
-                .handle_jsonrpc_message(&state.identity, payload.clone())
-                .await?;
-            let response = maybe_handle_mcp_escalation(&state, &payload, response).await;
+            let (response, delegated_bin) = crate::cloud::handle_jsonrpc_with_hot_reload(
+                &state.kernel,
+                &state.runtime_dir,
+                Path::new(&state.session.workspace),
+                &state.identity,
+                &payload,
+                state.startup_bin_mtime,
+                state.hot_reload_home_override.as_deref(),
+            )
+            .await?;
+            let response =
+                maybe_handle_mcp_escalation(&state, &payload, response, delegated_bin.as_deref())
+                    .await;
             write_json(&mut stream, "200 OK", response).await
         }
         ("POST", "/v1/adapter/hello") => {
@@ -698,6 +737,7 @@ async fn maybe_handle_mcp_escalation(
     state: &Arc<BrokerState>,
     payload: &Value,
     mut response: Value,
+    delegated_bin: Option<&Path>,
 ) -> Value {
     let Some(esc_id) = crate::cloud::extract_escalation_id_from_rpc(&response) else {
         return response;
@@ -769,11 +809,25 @@ async fn maybe_handle_mcp_escalation(
                             .unwrap_or_default()
                             .is_empty();
                     if is_approved {
-                        if let Ok(retry_resp) = state
-                            .kernel
-                            .handle_jsonrpc_message(&state.identity, payload.clone())
-                            .await
-                        {
+                        let retry = match delegated_bin {
+                            Some(bin) => {
+                                crate::cloud::delegate_mcp_rpc_to_binary(
+                                    bin,
+                                    &state.runtime_dir,
+                                    Path::new(&state.session.workspace),
+                                    &state.identity,
+                                    payload,
+                                )
+                                .await
+                            }
+                            None => {
+                                state
+                                    .kernel
+                                    .handle_jsonrpc_message(&state.identity, payload.clone())
+                                    .await
+                            }
+                        };
+                        if let Ok(retry_resp) = retry {
                             return retry_resp;
                         }
                     }
@@ -1330,6 +1384,105 @@ mod tests {
                 .unwrap_or("")
                 .contains("mcp_aegis-os_workspace_git"),
             "{redirected}"
+        );
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn broker_hot_reloads_unknown_tool_from_upgraded_binary() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let tmp = tempfile::tempdir().unwrap();
+        let runtime = tmp.path().join("runtime");
+        let session_dir = tmp.path().join("session");
+        let workspace = tmp.path().join("workspace");
+        let shadow = workspace.join("shadow");
+        let agent_home = session_dir.join("agent_home");
+        let fake_home = tmp.path().join("fake_home");
+        std::fs::create_dir_all(&session_dir).unwrap();
+        std::fs::create_dir_all(&shadow).unwrap();
+        std::fs::create_dir_all(&agent_home).unwrap();
+        std::fs::create_dir_all(fake_home.join(".local/bin")).unwrap();
+
+        let broker = SessionBroker::start_inner(
+            &runtime,
+            &session_dir,
+            tmp.path().join("c3"),
+            BrokerSession {
+                session_id: "ses_hot_reload".to_string(),
+                mode: "implement".to_string(),
+                enforcement: "enforced".to_string(),
+                workspace: workspace.display().to_string(),
+                shadow: shadow.display().to_string(),
+                agent_home: agent_home.display().to_string(),
+            },
+            AgentIdentity::new("org", "agent", "test"),
+            None,
+            false,
+            Some(fake_home.clone()),
+        )
+        .await
+        .unwrap();
+
+        // Install an "upgraded" mock binary after the broker has already started.
+        let upgraded_bin = fake_home.join(".local/bin/aegis-os");
+        let mock_script = r#"#!/bin/sh
+IFS= read -r line || exit 1
+case "$line" in
+  *"tools/list"*)
+    printf '%s\n' '{"jsonrpc":"2.0","id":1,"result":{"tools":[{"name":"future_hot_tool","description":"Hot reloaded tool","inputSchema":{"type":"object"}}]}}'
+    ;;
+  *"future_hot_tool"*)
+    printf '%s\n' '{"jsonrpc":"2.0","id":2,"result":{"content":[{"type":"text","text":"{\"status\":\"ok\",\"via\":\"hot_reload\"}"}]}}'
+    ;;
+  *)
+    printf '%s\n' '{"jsonrpc":"2.0","id":0,"result":{"isError":true,"content":[{"type":"text","text":"unexpected"}]}}'
+    ;;
+esac
+"#;
+        std::fs::write(&upgraded_bin, mock_script).unwrap();
+        std::fs::set_permissions(&upgraded_bin, std::fs::Permissions::from_mode(0o755)).unwrap();
+
+        // 1. `tools/list` must merge the newly added tool into the live broker's schema.
+        let list_resp = broker_request(
+            &broker.socket_path,
+            &broker.agent_token,
+            "POST",
+            "/v1/mcp",
+            &json!({"jsonrpc": "2.0", "id": 10, "method": "tools/list"}),
+        )
+        .await;
+        let tools = list_resp["result"]["tools"].as_array().unwrap();
+        assert!(
+            tools.iter().any(|t| t["name"] == "future_hot_tool"),
+            "upgraded tool missing from merged tools/list"
+        );
+        assert!(
+            tools.iter().any(|t| t["name"] == "fs_read"),
+            "existing tools must remain in merged tools/list"
+        );
+
+        // 2. Calling the unknown tool delegates cleanly to the upgraded binary with matching id.
+        let call_resp = broker_request(
+            &broker.socket_path,
+            &broker.agent_token,
+            "POST",
+            "/v1/mcp",
+            &json!({
+                "jsonrpc": "2.0",
+                "id": 42,
+                "method": "tools/call",
+                "params": {"name": "future_hot_tool", "arguments": {}}
+            }),
+        )
+        .await;
+        assert_eq!(call_resp["id"], 42, "{call_resp}");
+        assert!(
+            call_resp["result"]["content"][0]["text"]
+                .as_str()
+                .unwrap_or("")
+                .contains("hot_reload"),
+            "{call_resp}"
         );
     }
 }

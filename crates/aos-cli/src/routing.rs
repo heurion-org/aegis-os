@@ -394,11 +394,17 @@ fn host_boundary_reason(words: &[String], full_cmd: &str, host_root: &Path) -> O
         _ => false,
     };
     hit.then(|| {
+        let ci_tip = if cmd == "gh" && matches!(sub, "run" | "workflow") {
+            "\n  • Tip: Use zero-prompt MCP tool `mcp_aegis-os_github_ci_inspect` ({\"run_id\":<id>,\"failed_only\":true}) to inspect CI runs and failed logs safely without host `gh` execution."
+        } else {
+            ""
+        };
         format!(
-            "[Aegis OS Host Command Approval]\n  • What this does: Execute `{}` on your host workspace (`{}`).\n  • Why confirmation is required: `{}` crosses the sandbox boundary and affects host or remote state outside the isolated CoW shadow workspace.",
+            "[Aegis OS Host Command Approval]\n  • What this does: Execute `{}` on your host workspace (`{}`).\n  • Why confirmation is required: `{}` crosses the sandbox boundary and affects host or remote state outside the isolated CoW shadow workspace.{}",
             full_cmd,
             host_root.display(),
-            words.join(" ")
+            words.join(" "),
+            ci_tip
         )
     })
 }
@@ -514,12 +520,24 @@ pub fn sandbox_redirect_reason(cmd: &str, shadow_root: &Path, host_root: &Path) 
     } else {
         ""
     };
+    let ci_hint = if segments.iter().any(|s| {
+        let (_, words) = leading_words(s);
+        words.first().is_some_and(|w| basename(w) == "gh")
+            && words
+                .get(1)
+                .is_some_and(|sub| matches!(sub.as_str(), "run" | "workflow"))
+    }) {
+        "\nTip: `~/.config/gh` and Keychain tokens are masked inside sandboxes; use mcp_aegis-os_github_ci_inspect {\"run_id\":<id>,\"failed_only\":true} (or {} to list recent runs) to inspect CI status and logs via the host broker."
+    } else {
+        ""
+    };
     format!(
-        "[Aegis OS routing] Native shell is disabled for in-repo work in this workspace. Re-issue it via MCP (zero prompts, kernel-sandboxed):\n  mcp_aegis-os_proc_exec {{\"command\":\"sh\",\"args\":[\"-c\",{}]}}\ncwd = your CoW shadow workspace ({}); host files stay readable by absolute path; writes land in the shadow and reach the host only via workspace_commit.{}{}",
+        "[Aegis OS routing] Native shell is disabled for in-repo work in this workspace. Re-issue it via MCP (zero prompts, kernel-sandboxed):\n  mcp_aegis-os_proc_exec {{\"command\":\"sh\",\"args\":[\"-c\",{}]}}\ncwd = your CoW shadow workspace ({}); host files stay readable by absolute path; writes land in the shadow and reach the host only via workspace_commit.{}{}{}",
         json_str(cmd),
         shadow_root.display(),
         git_hint,
-        export_hint
+        export_hint,
+        ci_hint
     )
 }
 
@@ -744,7 +762,10 @@ pub fn canonicalize_lossy(p: &Path) -> PathBuf {
 const NATIVE_WRITE_ALLOWED_DIRS: &[&str] = &[".gemini", ".antigravity", "brain"];
 
 fn strip_nested_test_tmpdir(s: &str) -> &str {
-    if std::env::var("AEGIS_ALLOW_NESTED_TEST_SANDBOX").as_deref() != Ok("1") {
+    if !cfg!(test)
+        && std::env::var_os("AOS_SANDBOX_ID").is_none()
+        && std::env::var("AEGIS_ALLOW_NESTED_TEST_SANDBOX").as_deref() != Ok("1")
+    {
         return s;
     }
     let Some(idx) = s.find("/agent_home/.tmp") else {
@@ -1030,6 +1051,14 @@ mod tests {
         assert!(reason.contains("mcp_aegis-os_proc_exec"));
         assert!(reason.contains(r#"["-c","ls -la \"my dir\""]"#), "{reason}");
         assert!(!reason.contains("AOS_HOST=1"), "must not instruct agent to bypass sandbox via AOS_HOST=1");
+        let gh_reason = sandbox_redirect_reason("gh run view 43917672749 --log-failed", &shadow(), Path::new("/repo"));
+        assert!(gh_reason.contains("mcp_aegis-os_github_ci_inspect"), "{gh_reason}");
+        let Route::HostBoundary { reason: gh_ask_reason } =
+            classify_run_command("gh run view 43917672749 --log-failed", &shadow(), Path::new("/repo"))
+        else {
+            panic!()
+        };
+        assert!(gh_ask_reason.contains("mcp_aegis-os_github_ci_inspect"), "{gh_ask_reason}");
     }
 
     #[test]

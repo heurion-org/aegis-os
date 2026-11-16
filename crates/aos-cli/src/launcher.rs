@@ -7072,19 +7072,27 @@ mod tests {
         std::fs::write(project.join("file.txt"), "host\n").unwrap();
         std::fs::write(project.join("node_modules/pkg/index.js"), "module.exports = 1\n").unwrap();
 
+        use std::os::unix::fs::PermissionsExt;
+
         let identity = AgentIdentity::new("test", "test-agent", "test");
         let host_key = home.join(".ssh/id_rsa");
+        // Use a mock `claude` binary so `sync_credentials` recognizes an active
+        // Claude session (generic `/bin/sh` is intentionally excluded by V3 isolation).
+        let fake_claude = home.join(".local/bin/claude");
         let script = format!(
-            "echo shadow > new.txt; \
-             echo '{{\"token\":\"new\"}}' > \"$HOME/.claude/.credentials.json\"; \
-             cat node_modules/pkg/index.js >/dev/null; \
-             test ! -w node_modules/pkg/index.js; \
-             test ! -e /run/aegis/toolchain/cargo/credentials.toml; \
-             test ! -e /run/aegis/toolchain/local/share/keyrings/secret; \
-             test ! -e '{}'",
+            "#!/bin/sh\nset -eu\n\
+             echo shadow > new.txt\n\
+             echo '{{\"token\":\"new\"}}' > \"$HOME/.claude/.credentials.json\"\n\
+             cat node_modules/pkg/index.js >/dev/null\n\
+             test ! -w node_modules/pkg/index.js\n\
+             test ! -e /run/aegis/toolchain/cargo/credentials.toml\n\
+             test ! -e /run/aegis/toolchain/local/share/keyrings/secret\n\
+             test ! -e '{}'\n",
             host_key.display()
         );
-        let command = vec!["/bin/sh".to_string(), "-c".to_string(), script];
+        std::fs::write(&fake_claude, script).unwrap();
+        std::fs::set_permissions(&fake_claude, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let command = vec![fake_claude.display().to_string()];
         let code = run_inner(
             &project,
             &identity,
@@ -7097,12 +7105,16 @@ mod tests {
         )
         .await
         .unwrap();
-        assert_eq!(code, 0);
-        assert!(!project.join("new.txt").exists(), "host project must stay untouched");
         assert_eq!(
-            std::fs::read_to_string(home.join(".claude/.credentials.json")).unwrap(),
-            "{\"token\":\"new\"}\n"
+            code, 10,
+            "exit code 10 signals uncommitted shadow changes pending review"
         );
+        assert!(!project.join("new.txt").exists(), "host project must stay untouched");
+        let synced_creds: Value = serde_json::from_str(
+            &std::fs::read_to_string(home.join(".claude/.credentials.json")).unwrap(),
+        )
+        .unwrap();
+        assert_eq!(synced_creds["token"], "new");
         let shadow_write = std::fs::read_dir(runtime.join("sessions"))
             .unwrap()
             .filter_map(|entry| entry.ok())

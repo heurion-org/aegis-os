@@ -793,6 +793,436 @@ async fn execute_workspace_git_plan(
     .await?
 }
 
+fn is_valid_github_repo_slug(slug: &str) -> bool {
+    let mut parts = slug.split('/');
+    let (Some(owner), Some(repo), None) = (parts.next(), parts.next(), parts.next()) else {
+        return false;
+    };
+    let valid_part = |s: &str| -> bool {
+        !s.is_empty()
+            && s.len() <= 100
+            && s != "."
+            && s != ".."
+            && !s.starts_with('-')
+            && !s.contains("..")
+            && s.chars()
+                .all(|c| c.is_ascii_alphanumeric() || matches!(c, '.' | '_' | '-'))
+    };
+    valid_part(owner) && valid_part(repo)
+}
+
+fn extract_github_slug_from_remote_url(raw_url: &str) -> Option<String> {
+    let trimmed = raw_url.trim().trim_end_matches('/');
+    let path_part = if let Some(rest) = trimmed
+        .strip_prefix("https://github.com/")
+        .or_else(|| trimmed.strip_prefix("http://github.com/"))
+        .or_else(|| trimmed.strip_prefix("ssh://git@github.com/"))
+        .or_else(|| trimmed.strip_prefix("git://github.com/"))
+    {
+        rest
+    } else if let Some(rest) = trimmed.strip_prefix("git@github.com:") {
+        rest
+    } else {
+        return None;
+    };
+    let cleaned = path_part.strip_suffix(".git").unwrap_or(path_part).trim_end_matches('/');
+    is_valid_github_repo_slug(cleaned).then(|| cleaned.to_string())
+}
+
+fn detect_github_repo_from_git_config(host_root: &Path) -> Option<String> {
+    let raw = std::fs::read_to_string(host_root.join(".git/config")).ok()?;
+    let mut in_origin = false;
+    let mut any_github = None;
+    for line in raw.lines() {
+        let trimmed = line.trim();
+        if trimmed.starts_with('[') && trimmed.ends_with(']') {
+            in_origin = trimmed == "[remote \"origin\"]";
+            continue;
+        }
+        if let Some((k, v)) = trimmed.split_once('=') {
+            if k.trim() == "url" {
+                if let Some(slug) = extract_github_slug_from_remote_url(v.trim()) {
+                    if in_origin {
+                        return Some(slug);
+                    }
+                    if any_github.is_none() {
+                        any_github = Some(slug);
+                    }
+                }
+            }
+        }
+    }
+    any_github
+}
+
+fn is_valid_ci_branch_name(branch: &str) -> bool {
+    !branch.is_empty()
+        && branch.len() <= 128
+        && !branch.starts_with('-')
+        && !branch.starts_with('/')
+        && !branch.ends_with('/')
+        && !branch.contains("..")
+        && branch
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || matches!(c, '.' | '_' | '-' | '/'))
+}
+
+fn redact_ci_log_secrets(text: &str) -> String {
+    const PREFIXES: &[&str] = &[
+        "github_pat_",
+        "ghp_",
+        "gho_",
+        "ghu_",
+        "ghs_",
+        "sk-ant-",
+        "sk-proj-",
+        "AKIA",
+        "Bearer ",
+    ];
+    let is_tok_char = |c: char| c.is_ascii_alphanumeric() || matches!(c, '_' | '-' | '.' | '=' | '+' | '/');
+    let mut out = String::with_capacity(text.len());
+    let mut rest = text;
+    while !rest.is_empty() {
+        let mut earliest: Option<(usize, &str)> = None;
+        for &pat in PREFIXES {
+            if let Some(idx) = rest.find(pat) {
+                if earliest.is_none_or(|(best_idx, _)| idx < best_idx) {
+                    earliest = Some((idx, pat));
+                }
+            }
+        }
+        let Some((idx, pat)) = earliest else {
+            out.push_str(rest);
+            break;
+        };
+        out.push_str(&rest[..idx]);
+        let after_idx = idx + pat.len();
+        let tail = &rest[after_idx..];
+        let tok_len = tail
+            .char_indices()
+            .take_while(|&(_, ch)| is_tok_char(ch))
+            .last()
+            .map(|(off, ch)| off + ch.len_utf8())
+            .unwrap_or(0);
+        if tok_len >= 6 {
+            if pat == "Bearer " {
+                out.push_str("Bearer ");
+            }
+            out.push_str("[REDACTED_BY_AEGIS_DLP]");
+            rest = &tail[tok_len..];
+        } else {
+            out.push_str(pat);
+            rest = tail;
+        }
+    }
+    out
+}
+
+fn tail_ci_lines(text: &str, max_lines: usize) -> (String, usize, bool) {
+    let lines: Vec<&str> = text.lines().collect();
+    let total = lines.len();
+    let truncated = total > max_lines;
+    let slice = if truncated {
+        &lines[total - max_lines..]
+    } else {
+        &lines[..]
+    };
+    (slice.join("\n"), total, truncated)
+}
+
+fn resolve_system_gh_binary() -> Option<PathBuf> {
+    for candidate in ["/opt/homebrew/bin/gh", "/usr/local/bin/gh", "/usr/bin/gh"] {
+        let p = PathBuf::from(candidate);
+        if p.is_file() {
+            return Some(p);
+        }
+    }
+    let path_os = std::env::var_os("PATH")?;
+    for dir in std::env::split_paths(&path_os) {
+        let ds = dir.to_string_lossy();
+        if ds.contains("/.aegis/bin") || ds.contains("/.aegis-bin") {
+            continue;
+        }
+        let p = dir.join("gh");
+        if p.is_file() {
+            return Some(p);
+        }
+    }
+    None
+}
+
+fn run_sanitized_gh(gh_bin: &Path, args: &[&str]) -> anyhow::Result<std::process::Output> {
+    let mut cmd = std::process::Command::new(gh_bin);
+    for var in [
+        "LD_PRELOAD",
+        "LD_LIBRARY_PATH",
+        "DYLD_INSERT_LIBRARIES",
+        "DYLD_LIBRARY_PATH",
+        "DYLD_FRAMEWORK_PATH",
+    ] {
+        cmd.env_remove(var);
+    }
+    cmd.env("GH_PROMPT_DISABLED", "1")
+        .env("NO_COLOR", "1")
+        .env("GIT_TERMINAL_PROMPT", "0")
+        .args(args);
+    cmd.output()
+        .with_context(|| format!("executing {} {:?}", gh_bin.display(), args))
+}
+
+fn github_rest_get_json(url: &str) -> anyhow::Result<Value> {
+    let agent = ureq::AgentBuilder::new()
+        .timeout(std::time::Duration::from_secs(10))
+        .user_agent("aegis-os-ci-inspect")
+        .build();
+    let resp = agent
+        .get(url)
+        .set("Accept", "application/vnd.github+json")
+        .call()
+        .map_err(|e| anyhow::anyhow!("GitHub REST API GET {} failed: {}", url, e))?;
+    Ok(resp.into_json()?)
+}
+
+async fn execute_github_ci_inspect(host_root: &Path, args: &Value) -> anyhow::Result<Value> {
+    let repo = match args
+        .get("repo")
+        .and_then(|v| v.as_str())
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+    {
+        Some(explicit) => {
+            if !is_valid_github_repo_slug(explicit) {
+                bail!(
+                    "Invalid GitHub repository slug '{}'; expected `owner/repo`",
+                    explicit
+                );
+            }
+            explicit.to_string()
+        }
+        None => detect_github_repo_from_git_config(host_root).context(
+            "Could not auto-detect GitHub `owner/repo` from host `.git/config`; pass `repo` explicitly",
+        )?,
+    };
+
+    let run_id = args.get("run_id").and_then(|v| v.as_u64());
+    let job_id = args.get("job_id").and_then(|v| v.as_u64());
+    let branch = match args
+        .get("branch")
+        .and_then(|v| v.as_str())
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+    {
+        Some(b) => {
+            if !is_valid_ci_branch_name(b) {
+                bail!("Invalid branch name '{}'", b);
+            }
+            Some(b.to_string())
+        }
+        None => None,
+    };
+    let limit = args
+        .get("limit")
+        .and_then(|v| v.as_u64())
+        .unwrap_or(8)
+        .clamp(1, 20) as usize;
+    let failed_only = args
+        .get("failed_only")
+        .and_then(|v| v.as_bool())
+        .unwrap_or(true);
+    let tail_lines = args
+        .get("tail_lines")
+        .and_then(|v| v.as_u64())
+        .unwrap_or(120)
+        .clamp(1, 400) as usize;
+
+    tokio::task::spawn_blocking(move || -> anyhow::Result<Value> {
+        let gh_bin = resolve_system_gh_binary();
+
+        if let Some(jid) = job_id {
+            if let Some(ref gh) = gh_bin {
+                let log_endpoint = format!("repos/{repo}/actions/jobs/{jid}/logs");
+                if let Ok(log_out) = run_sanitized_gh(gh, &["api", &log_endpoint]) {
+                    if log_out.status.success() {
+                        let raw = String::from_utf8_lossy(&log_out.stdout);
+                        let redacted = redact_ci_log_secrets(&raw);
+                        let (tail, total_lines, truncated) = tail_ci_lines(&redacted, tail_lines);
+                        let meta = run_sanitized_gh(
+                            gh,
+                            &["api", &format!("repos/{repo}/actions/jobs/{jid}")],
+                        )
+                        .ok()
+                        .filter(|o| o.status.success())
+                        .and_then(|o| serde_json::from_slice::<Value>(&o.stdout).ok());
+                        return Ok(json!({
+                            "source": "gh_cli",
+                            "repo": repo,
+                            "job_id": jid,
+                            "job": meta,
+                            "total_log_lines": total_lines,
+                            "truncated": truncated,
+                            "log_tail": tail,
+                        }));
+                    }
+                }
+            }
+            let job_url = format!("https://api.github.com/repos/{repo}/actions/jobs/{jid}");
+            let ann_url = format!("https://api.github.com/repos/{repo}/check-runs/{jid}/annotations");
+            let job = github_rest_get_json(&job_url)?;
+            let annotations = github_rest_get_json(&ann_url).unwrap_or_else(|_| json!([]));
+            return Ok(json!({
+                "source": "github_rest_api_public",
+                "repo": repo,
+                "job_id": jid,
+                "job": job,
+                "annotations": annotations,
+                "note": "Raw Actions job logs require authenticated `gh` on the host; structured job steps and annotations returned.",
+            }));
+        }
+
+        if let Some(rid) = run_id {
+            if let Some(ref gh) = gh_bin {
+                let rid_str = rid.to_string();
+                let view_out = run_sanitized_gh(
+                    gh,
+                    &[
+                        "run",
+                        "view",
+                        &rid_str,
+                        "-R",
+                        &repo,
+                        "--json",
+                        "status,conclusion,name,headSha,headBranch,event,url,jobs",
+                    ],
+                )?;
+                if view_out.status.success() {
+                    let meta: Value = serde_json::from_slice(&view_out.stdout)
+                        .unwrap_or_else(|_| json!({}));
+                    let log_flag = if failed_only { "--log-failed" } else { "--log" };
+                    let log_out = run_sanitized_gh(
+                        gh,
+                        &["run", "view", &rid_str, "-R", &repo, log_flag],
+                    )?;
+                    let log_raw = if log_out.status.success() {
+                        String::from_utf8_lossy(&log_out.stdout).to_string()
+                    } else {
+                        String::from_utf8_lossy(&log_out.stderr).to_string()
+                    };
+                    let redacted = redact_ci_log_secrets(&log_raw);
+                    let (tail, total_lines, truncated) = tail_ci_lines(&redacted, tail_lines);
+                    return Ok(json!({
+                        "source": "gh_cli",
+                        "repo": repo,
+                        "run_id": rid,
+                        "failed_only": failed_only,
+                        "run": meta,
+                        "total_log_lines": total_lines,
+                        "truncated": truncated,
+                        "log_tail": tail,
+                    }));
+                }
+            }
+
+            let run_url = format!("https://api.github.com/repos/{repo}/actions/runs/{rid}");
+            let jobs_url = format!("https://api.github.com/repos/{repo}/actions/runs/{rid}/jobs");
+            let run = github_rest_get_json(&run_url)?;
+            let jobs = github_rest_get_json(&jobs_url)?;
+            let mut failed_annotations = Vec::new();
+            if let Some(arr) = jobs.get("jobs").and_then(|v| v.as_array()) {
+                for j in arr {
+                    if j.get("conclusion").and_then(|v| v.as_str()) == Some("failure") {
+                        if let Some(jid) = j.get("id").and_then(|v| v.as_u64()) {
+                            let ann_url = format!(
+                                "https://api.github.com/repos/{repo}/check-runs/{jid}/annotations"
+                            );
+                            if let Ok(ann) = github_rest_get_json(&ann_url) {
+                                failed_annotations.push(json!({
+                                    "job_id": jid,
+                                    "name": j.get("name"),
+                                    "annotations": ann,
+                                }));
+                            }
+                        }
+                    }
+                }
+            }
+            return Ok(json!({
+                "source": "github_rest_api_public",
+                "repo": repo,
+                "run_id": rid,
+                "run": run,
+                "jobs": jobs.get("jobs").cloned().unwrap_or_else(|| json!([])),
+                "failed_annotations": failed_annotations,
+                "note": "Authenticated `gh` CLI unavailable; returned public GitHub Actions job steps and check-run annotations.",
+            }));
+        }
+
+        if let Some(ref gh) = gh_bin {
+            let limit_str = limit.to_string();
+            let mut gh_args = vec![
+                "run",
+                "list",
+                "-R",
+                repo.as_str(),
+                "-L",
+                limit_str.as_str(),
+                "--json",
+                "databaseId,headSha,headBranch,name,status,conclusion,event,createdAt,url",
+            ];
+            if let Some(ref b) = branch {
+                gh_args.push("-b");
+                gh_args.push(b.as_str());
+            }
+            if let Ok(list_out) = run_sanitized_gh(gh, &gh_args) {
+                if list_out.status.success() {
+                    let runs: Value = serde_json::from_slice(&list_out.stdout)
+                        .unwrap_or_else(|_| json!([]));
+                    return Ok(json!({
+                        "source": "gh_cli",
+                        "repo": repo,
+                        "branch": branch,
+                        "runs": runs,
+                    }));
+                }
+            }
+        }
+
+        let mut list_url = format!(
+            "https://api.github.com/repos/{repo}/actions/runs?per_page={limit}"
+        );
+        if let Some(ref b) = branch {
+            list_url.push_str(&format!("&branch={b}"));
+        }
+        let body = github_rest_get_json(&list_url)?;
+        let runs: Vec<Value> = body
+            .get("workflow_runs")
+            .and_then(|v| v.as_array())
+            .cloned()
+            .unwrap_or_default()
+            .into_iter()
+            .map(|r| {
+                json!({
+                    "run_id": r.get("id"),
+                    "name": r.get("name"),
+                    "head_branch": r.get("head_branch"),
+                    "head_sha": r.get("head_sha"),
+                    "status": r.get("status"),
+                    "conclusion": r.get("conclusion"),
+                    "event": r.get("event"),
+                    "created_at": r.get("created_at"),
+                    "url": r.get("html_url"),
+                })
+            })
+            .collect();
+        Ok(json!({
+            "source": "github_rest_api_public",
+            "repo": repo,
+            "branch": branch,
+            "runs": runs,
+        }))
+    })
+    .await?
+}
+
 /// Tools that mint leases. They stay callable in-process (CLI `aegis-os policy approve`, dashboard,
 /// benches) but are never exposed to agents over MCP: an agent must not approve its own escalation.
 pub const HUMAN_ONLY_TOOLS: &[&str] = &["policy_approve_escalation", "policy_grant_lease"];
@@ -818,6 +1248,7 @@ pub const TOOL_ANNOTATIONS: &[(&str, bool, bool, bool, bool)] = &[
     ("workspace_export_pr", false, false, false, false),
     ("workspace_switch", false, false, true, false),
     ("workspace_git", false, true, false, true),
+    ("github_ci_inspect", true, false, true, true),
     // Arbitrary sandboxed commands; network policy depends on the sandbox profile.
     ("proc_exec", false, true, false, true),
     ("org_artifact_publish", false, false, true, false),
@@ -3424,6 +3855,10 @@ impl AegisRuntimeKernel {
                 execute_workspace_git_plan(plan, identity).await
             }
 
+            "github_ci_inspect" => {
+                execute_github_ci_inspect(env.workspace.host_source_root(), &args).await
+            }
+
             // ----------------------------------------------------------------
             // 2. Sandboxed Command Execution Tools (Zero-Prompt in Sandbox)
             // ----------------------------------------------------------------
@@ -4770,6 +5205,43 @@ impl AegisRuntimeKernel {
                             "branch": {
                                 "type": "string",
                                 "description": "Optional branch name to push (defaults to current HEAD branch)."
+                            }
+                        }
+                    }
+                },
+                {
+                    "name": "github_ci_inspect",
+                    "description": "[Zero-Prompt Read-Only] Inspect GitHub Actions workflow runs, job steps, and failed CI logs via the host broker without exposing `~/.config/gh` or Keychain tokens inside the sandbox.",
+                    "inputSchema": {
+                        "type": "object",
+                        "properties": {
+                            "repo": {
+                                "type": "string",
+                                "description": "GitHub repository slug (`owner/name`); auto-detected from host `.git/config` `origin` remote when omitted."
+                            },
+                            "run_id": {
+                                "type": "integer",
+                                "description": "Optional GitHub Actions workflow run ID to inspect (returns status + failed log tail)."
+                            },
+                            "job_id": {
+                                "type": "integer",
+                                "description": "Optional GitHub Actions job ID to inspect logs for directly."
+                            },
+                            "branch": {
+                                "type": "string",
+                                "description": "Optional branch filter when listing recent workflow runs."
+                            },
+                            "limit": {
+                                "type": "integer",
+                                "description": "Maximum workflow runs to return when listing (1..=20, default 8)."
+                            },
+                            "failed_only": {
+                                "type": "boolean",
+                                "description": "Fetch only failed step logs (`--log-failed`, default true) vs full log (`--log`) when `run_id` is given."
+                            },
+                            "tail_lines": {
+                                "type": "integer",
+                                "description": "Maximum trailing log lines to return after DLP secret redaction (1..=400, default 120)."
                             }
                         }
                     }
@@ -10624,6 +11096,83 @@ mod tests {
         assert!(
             status_after.contains("M dirty_unrelated.txt"),
             "unrelated host file must not be staged: {status_after}"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_github_ci_inspect_repo_resolution_validation_and_token_redaction() {
+        let tmp = tempfile::tempdir().unwrap();
+        let https_repo = tmp.path().join("https_repo");
+        std::fs::create_dir_all(https_repo.join(".git")).unwrap();
+        std::fs::write(
+            https_repo.join(".git/config"),
+            "[remote \"origin\"]\n\turl = https://github.com/heurion-org/aegis-os.git\n",
+        )
+        .unwrap();
+        assert_eq!(
+            detect_github_repo_from_git_config(&https_repo).as_deref(),
+            Some("heurion-org/aegis-os")
+        );
+
+        let ssh_repo = tmp.path().join("ssh_repo");
+        std::fs::create_dir_all(ssh_repo.join(".git")).unwrap();
+        std::fs::write(
+            ssh_repo.join(".git/config"),
+            "[remote \"origin\"]\n\turl = git@github.com:heurion-org/aegis-os.git\n",
+        )
+        .unwrap();
+        assert_eq!(
+            detect_github_repo_from_git_config(&ssh_repo).as_deref(),
+            Some("heurion-org/aegis-os")
+        );
+
+        assert!(is_valid_github_repo_slug("heurion-org/aegis-os"));
+        assert!(!is_valid_github_repo_slug("../etc/passwd"));
+        assert!(!is_valid_github_repo_slug("owner/repo?foo=bar"));
+        assert!(!is_valid_github_repo_slug("-bad/repo"));
+        assert!(is_valid_ci_branch_name("main"));
+        assert!(is_valid_ci_branch_name("feat/ci-fix_1"));
+        assert!(!is_valid_ci_branch_name("main&per_page=99"));
+        assert!(!is_valid_ci_branch_name("--flag-smuggle"));
+
+        let raw_log = "2026-11-16 curl -H 'Authorization: Bearer s3cr3tTok3nValu3' https://api.github.com\n\
+                       TOKEN=ghp_1234567890abcdefghijklmnoprstuv\n\
+                       PAT=github_pat_11AAAAA0123456789abcdef\n\
+                       OK_LINE=cargo test passed (中文)\n";
+        let scrubbed = redact_ci_log_secrets(raw_log);
+        assert!(!scrubbed.contains("s3cr3tTok3nValu3"), "{scrubbed}");
+        assert!(!scrubbed.contains("ghp_1234567890"), "{scrubbed}");
+        assert!(!scrubbed.contains("github_pat_11"), "{scrubbed}");
+        assert!(scrubbed.contains("Bearer [REDACTED_BY_AEGIS_DLP]"), "{scrubbed}");
+        assert!(scrubbed.contains("TOKEN=[REDACTED_BY_AEGIS_DLP]"), "{scrubbed}");
+        assert!(scrubbed.contains("OK_LINE=cargo test passed (中文)"), "{scrubbed}");
+
+        let (tailed, total, truncated) = tail_ci_lines("l1\nl2\nl3\nl4", 2);
+        assert_eq!(total, 4);
+        assert!(truncated);
+        assert_eq!(tailed, "l3\nl4");
+
+        // Reject invalid explicit repo slug cleanly without hitting network.
+        let bad_err = execute_github_ci_inspect(&https_repo, &json!({ "repo": "evil/a/b" }))
+            .await
+            .unwrap_err();
+        assert!(bad_err.to_string().contains("Invalid GitHub repository slug"));
+
+        // Verify Cedar baseline policy auto-permits `github_ci_inspect` for same-org agent.
+        let policy = AegisPolicyKernel::new();
+        let decision = policy
+            .evaluate(&PolicyContext {
+                principal: AgentIdentity::new("aegis-os", "agy-agent", "Lead"),
+                action: "github_ci_inspect".to_string(),
+                target_org_id: "aegis-os".to_string(),
+                target_resource: "/workspace".to_string(),
+                metadata: json!({}),
+            })
+            .await
+            .unwrap();
+        assert!(
+            matches!(decision, PolicyDecision::Allow { .. }),
+            "expected Cedar auto-permit for github_ci_inspect, got {decision:?}"
         );
     }
 }
