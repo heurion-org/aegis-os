@@ -743,6 +743,174 @@ impl NativeOsSandboxInstance {
     }
 }
 
+fn is_aegis_shim_dir(dir: &Path) -> bool {
+    let norm = dir.to_string_lossy().replace('\\', "/");
+    let trimmed = norm.trim_end_matches('/');
+    trimmed.ends_with("/.aegis/bin")
+        || trimmed.ends_with("/.aegis-bin")
+        || trimmed.contains("/.aegis/bin/")
+        || trimmed.contains("/.aegis-bin/")
+}
+
+fn parse_rustup_default_toolchain(settings_path: &Path) -> Option<String> {
+    let text = std::fs::read_to_string(settings_path).ok()?;
+    for line in text.lines() {
+        let trimmed = line.split('#').next()?.trim();
+        let Some((key, val)) = trimmed.split_once('=') else {
+            continue;
+        };
+        if key.trim() == "default_toolchain" {
+            let cleaned = val.trim().trim_matches(|c| c == '"' || c == '\'').trim();
+            if !cleaned.is_empty() {
+                return Some(cleaned.to_string());
+            }
+        }
+    }
+    None
+}
+
+fn resolve_rustup_toolchain_bin(
+    rustup_home: &Path,
+    rustup_toolchain: Option<&str>,
+) -> Option<PathBuf> {
+    let toolchains_dir = rustup_home.join("toolchains");
+    let entries = std::fs::read_dir(&toolchains_dir).ok()?;
+    let mut dirs: Vec<(String, PathBuf)> = entries
+        .flatten()
+        .filter_map(|e| {
+            let p = e.path();
+            let bin_dir = p.join("bin");
+            if p.is_dir() && bin_dir.join("rustc").is_file() {
+                Some((e.file_name().to_string_lossy().into_owned(), bin_dir))
+            } else {
+                None
+            }
+        })
+        .collect();
+    if dirs.is_empty() {
+        return None;
+    }
+    dirs.sort_by(|a, b| a.0.cmp(&b.0));
+
+    let mut prefs: Vec<String> = Vec::new();
+    if let Some(tc) = rustup_toolchain.map(str::trim).filter(|s| !s.is_empty()) {
+        prefs.push(tc.to_string());
+    }
+    if let Some(def) = parse_rustup_default_toolchain(&rustup_home.join("settings.toml")) {
+        if !prefs.contains(&def) {
+            prefs.push(def);
+        }
+    }
+
+    for pref in &prefs {
+        if let Some((_, bin)) = dirs.iter().find(|(name, _)| name == pref) {
+            return Some(bin.clone());
+        }
+        let prefix = format!("{pref}-");
+        if let Some((_, bin)) = dirs.iter().find(|(name, _)| name.starts_with(&prefix)) {
+            return Some(bin.clone());
+        }
+    }
+    if let Some((_, bin)) = dirs.iter().find(|(name, _)| name.starts_with("stable-")) {
+        return Some(bin.clone());
+    }
+    dirs.into_iter().next().map(|(_, bin)| bin)
+}
+
+fn build_sandbox_path(
+    work_dir: &Path,
+    workspace_dir: &Path,
+    host_home: Option<&Path>,
+    cargo_home: Option<&Path>,
+    rustup_home: Option<&Path>,
+    rustup_toolchain: Option<&str>,
+    host_path: Option<&std::ffi::OsStr>,
+) -> String {
+    let mut entries: Vec<PathBuf> = Vec::new();
+    let mut seen: std::collections::HashSet<PathBuf> = std::collections::HashSet::new();
+
+    fn push_if_valid_dir(
+        entries: &mut Vec<PathBuf>,
+        seen: &mut std::collections::HashSet<PathBuf>,
+        dir: PathBuf,
+    ) {
+        if dir.is_absolute() && !is_aegis_shim_dir(&dir) && dir.is_dir() && seen.insert(dir.clone())
+        {
+            entries.push(dir);
+        }
+    }
+
+    for rel_bin in [
+        work_dir.join("node_modules/.bin"),
+        workspace_dir.join("node_modules/.bin"),
+        work_dir.join(".venv/bin"),
+        workspace_dir.join(".venv/bin"),
+        work_dir.join("venv/bin"),
+        workspace_dir.join("venv/bin"),
+    ] {
+        push_if_valid_dir(&mut entries, &mut seen, rel_bin);
+    }
+
+    if let Some(h) = host_home {
+        for user_bin in [".local/bin", ".bun/bin", ".volta/bin"] {
+            push_if_valid_dir(&mut entries, &mut seen, h.join(user_bin));
+        }
+    }
+
+    if let Some(ch) = cargo_home {
+        push_if_valid_dir(&mut entries, &mut seen, ch.join("bin"));
+    }
+
+    for brew_rustup in [
+        "/opt/homebrew/opt/rustup/bin",
+        "/usr/local/opt/rustup/bin",
+        "/home/linuxbrew/.linuxbrew/opt/rustup/bin",
+    ] {
+        push_if_valid_dir(&mut entries, &mut seen, PathBuf::from(brew_rustup));
+    }
+
+    if let Some(raw) = host_path {
+        for dir in std::env::split_paths(raw) {
+            if !dir.as_os_str().is_empty() {
+                push_if_valid_dir(&mut entries, &mut seen, dir);
+            }
+        }
+    }
+
+    if !entries.iter().any(|d| d.join("rustc").is_file()) {
+        if let Some(tc_bin) =
+            rustup_home.and_then(|rh| resolve_rustup_toolchain_bin(rh, rustup_toolchain))
+        {
+            push_if_valid_dir(&mut entries, &mut seen, tc_bin);
+        }
+    }
+
+    for sys_dir in [
+        "/opt/homebrew/bin",
+        "/opt/homebrew/sbin",
+        "/usr/local/bin",
+        "/usr/bin",
+        "/bin",
+        "/usr/sbin",
+        "/sbin",
+    ] {
+        let p = PathBuf::from(sys_dir);
+        if seen.insert(p.clone()) {
+            entries.push(p);
+        }
+    }
+
+    std::env::join_paths(&entries)
+        .map(|s| s.to_string_lossy().into_owned())
+        .unwrap_or_else(|_| {
+            entries
+                .iter()
+                .map(|p| p.display().to_string())
+                .collect::<Vec<_>>()
+                .join(":")
+        })
+}
+
 #[async_trait]
 impl SandboxInstance for NativeOsSandboxInstance {
     fn instance_id(&self) -> &str {
@@ -877,41 +1045,48 @@ impl SandboxInstance for NativeOsSandboxInstance {
         // (registry cache, installed toolchains) and Node/Python virtualenvs inside `proc_exec`.
         // Expose them read-only by path; Seatbelt still denies writes outside the CoW roots.
         let host_home = std::env::var("HOME").ok().map(PathBuf::from);
-        let mut path_entries: Vec<String> = Vec::new();
-        for rel_bin in [
-            work_dir.join("node_modules/.bin"),
-            self.config.workspace_dir.join("node_modules/.bin"),
-            work_dir.join(".venv/bin"),
-            self.config.workspace_dir.join(".venv/bin"),
-            work_dir.join("venv/bin"),
-            self.config.workspace_dir.join("venv/bin"),
+        let cargo_home = std::env::var("CARGO_HOME")
+            .ok()
+            .map(PathBuf::from)
+            .or_else(|| host_home.as_ref().map(|h| h.join(".cargo")))
+            .filter(|p| p.is_dir());
+        let rustup_home = std::env::var("RUSTUP_HOME")
+            .ok()
+            .map(PathBuf::from)
+            .or_else(|| host_home.as_ref().map(|h| h.join(".rustup")))
+            .filter(|p| p.is_dir());
+        let rustup_toolchain = std::env::var("RUSTUP_TOOLCHAIN").ok();
+
+        let mut passthrough_toolchain_env: Vec<(&'static str, std::ffi::OsString)> = Vec::new();
+        if let Some(ref p) = cargo_home {
+            passthrough_toolchain_env.push(("CARGO_HOME", p.as_os_str().to_os_string()));
+        }
+        if let Some(ref p) = rustup_home {
+            passthrough_toolchain_env.push(("RUSTUP_HOME", p.as_os_str().to_os_string()));
+        }
+        for var in [
+            "RUSTUP_TOOLCHAIN",
+            "DEVELOPER_DIR",
+            "SDKROOT",
+            "MACOSX_DEPLOYMENT_TARGET",
         ] {
-            if rel_bin.exists() {
-                path_entries.push(rel_bin.display().to_string());
+            if let Some(val) = std::env::var_os(var).filter(|v| !v.is_empty()) {
+                passthrough_toolchain_env.push((var, val));
             }
         }
-        if let Some(ref h) = host_home {
-            for user_bin in [".local/bin", ".bun/bin", ".volta/bin"] {
-                let p = h.join(user_bin);
-                if p.is_dir() {
-                    path_entries.push(p.display().to_string());
-                }
-            }
+        for (k, v) in &passthrough_toolchain_env {
+            cmd.env(k, v);
         }
-        for (var, default_sub) in [("CARGO_HOME", ".cargo"), ("RUSTUP_HOME", ".rustup")] {
-            let candidate = std::env::var(var)
-                .ok()
-                .map(PathBuf::from)
-                .or_else(|| host_home.as_ref().map(|h| h.join(default_sub)));
-            if let Some(p) = candidate.filter(|p| p.is_dir()) {
-                if var == "CARGO_HOME" && p.join("bin").is_dir() {
-                    path_entries.push(p.join("bin").display().to_string());
-                }
-                cmd.env(var, p);
-            }
-        }
-        path_entries.push("/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin".to_string());
-        let path_val = path_entries.join(":");
+
+        let path_val = build_sandbox_path(
+            &work_dir,
+            &self.config.workspace_dir,
+            host_home.as_deref(),
+            cargo_home.as_deref(),
+            rustup_home.as_deref(),
+            rustup_toolchain.as_deref(),
+            std::env::var_os("PATH").as_deref(),
+        );
         cmd.env("PATH", &path_val);
 
         let ws_node_modules = self.config.workspace_dir.join("node_modules");
@@ -1050,14 +1225,8 @@ impl SandboxInstance for NativeOsSandboxInstance {
                 .env("AOS_ORG_AGENT_PUB", &self.config.org_agent_pub_dir)
                 .stdout(Stdio::piped())
                 .stderr(Stdio::piped());
-            for (var, default_sub) in [("CARGO_HOME", ".cargo"), ("RUSTUP_HOME", ".rustup")] {
-                let candidate = std::env::var(var)
-                    .ok()
-                    .map(PathBuf::from)
-                    .or_else(|| host_home.as_ref().map(|h| h.join(default_sub)));
-                if let Some(p) = candidate.filter(|p| p.is_dir()) {
-                    fallback.env(var, p);
-                }
+            for (k, v) in &passthrough_toolchain_env {
+                fallback.env(k, v);
             }
             if ws_node_modules.exists() {
                 fallback.env("NODE_PATH", &ws_node_modules);
@@ -1681,5 +1850,51 @@ mod tests {
             assert_ne!(blocked_write.exit_code, Some(0));
             assert!(!escape_target.exists());
         }
+    }
+
+    #[test]
+    fn sandbox_path_preserves_homebrew_and_host_toolchains_while_stripping_aegis_shims() {
+        let dir = tempfile::tempdir().unwrap();
+        let tmp = dir.path();
+        let shim1 = tmp.join(".aegis/bin");
+        let shim2 = tmp.join("ses/.aegis-bin");
+        let brew_rustup = tmp.join("homebrew/opt/rustup/bin");
+        let rustup_home = tmp.join("rustup");
+        let tc_bin = rustup_home.join("toolchains/stable-aarch64-apple-darwin/bin");
+
+        std::fs::create_dir_all(&shim1).unwrap();
+        std::fs::create_dir_all(&shim2).unwrap();
+        std::fs::create_dir_all(&brew_rustup).unwrap();
+        std::fs::create_dir_all(&tc_bin).unwrap();
+        std::fs::write(
+            rustup_home.join("settings.toml"),
+            "default_toolchain = \"stable-aarch64-apple-darwin\"\n",
+        )
+        .unwrap();
+        std::fs::write(tc_bin.join("rustc"), "#!/bin/sh\n").unwrap();
+
+        let rel_current = PathBuf::from(".");
+        let rel_sub = PathBuf::from("rel/bin");
+        let raw_path =
+            std::env::join_paths([&shim1, &shim2, &rel_current, &rel_sub, &brew_rustup]).unwrap();
+        let built = build_sandbox_path(
+            tmp,
+            tmp,
+            None,
+            None,
+            Some(&rustup_home),
+            None,
+            Some(raw_path.as_os_str()),
+        );
+        let entries: Vec<PathBuf> = std::env::split_paths(&built).collect();
+
+        assert!(entries.contains(&brew_rustup), "{entries:?}");
+        assert!(entries.contains(&tc_bin), "{entries:?}");
+        assert!(!entries.contains(&shim1), "{entries:?}");
+        assert!(!entries.contains(&shim2), "{entries:?}");
+        assert!(!entries.contains(&rel_current), "{entries:?}");
+        assert!(!entries.contains(&rel_sub), "{entries:?}");
+        assert!(entries.contains(&PathBuf::from("/usr/bin")), "{entries:?}");
+        assert!(entries.contains(&PathBuf::from("/bin")), "{entries:?}");
     }
 }
