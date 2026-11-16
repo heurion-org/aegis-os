@@ -817,6 +817,12 @@ fn resolve_rustup_toolchain_bin(
     dirs.into_iter().next().map(|(_, bin)| bin)
 }
 
+const DEFAULT_BREW_RUSTUP_BINS: &[&str] = &[
+    "/opt/homebrew/opt/rustup/bin",
+    "/usr/local/opt/rustup/bin",
+    "/home/linuxbrew/.linuxbrew/opt/rustup/bin",
+];
+
 fn build_sandbox_path(
     work_dir: &Path,
     workspace_dir: &Path,
@@ -825,6 +831,29 @@ fn build_sandbox_path(
     rustup_home: Option<&Path>,
     rustup_toolchain: Option<&str>,
     host_path: Option<&std::ffi::OsStr>,
+) -> String {
+    build_sandbox_path_with_brew_dirs(
+        work_dir,
+        workspace_dir,
+        host_home,
+        cargo_home,
+        rustup_home,
+        rustup_toolchain,
+        host_path,
+        DEFAULT_BREW_RUSTUP_BINS,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn build_sandbox_path_with_brew_dirs(
+    work_dir: &Path,
+    workspace_dir: &Path,
+    host_home: Option<&Path>,
+    cargo_home: Option<&Path>,
+    rustup_home: Option<&Path>,
+    rustup_toolchain: Option<&str>,
+    host_path: Option<&std::ffi::OsStr>,
+    brew_rustup_bins: &[&str],
 ) -> String {
     let mut entries: Vec<PathBuf> = Vec::new();
     let mut seen: std::collections::HashSet<PathBuf> = std::collections::HashSet::new();
@@ -861,11 +890,7 @@ fn build_sandbox_path(
         push_if_valid_dir(&mut entries, &mut seen, ch.join("bin"));
     }
 
-    for brew_rustup in [
-        "/opt/homebrew/opt/rustup/bin",
-        "/usr/local/opt/rustup/bin",
-        "/home/linuxbrew/.linuxbrew/opt/rustup/bin",
-    ] {
+    for brew_rustup in brew_rustup_bins {
         push_if_valid_dir(&mut entries, &mut seen, PathBuf::from(brew_rustup));
     }
 
@@ -1858,12 +1883,14 @@ mod tests {
         let tmp = dir.path();
         let shim1 = tmp.join(".aegis/bin");
         let shim2 = tmp.join("ses/.aegis-bin");
+        let host_tool_dir = tmp.join("host_tools/bin");
         let brew_rustup = tmp.join("homebrew/opt/rustup/bin");
         let rustup_home = tmp.join("rustup");
         let tc_bin = rustup_home.join("toolchains/stable-aarch64-apple-darwin/bin");
 
         std::fs::create_dir_all(&shim1).unwrap();
         std::fs::create_dir_all(&shim2).unwrap();
+        std::fs::create_dir_all(&host_tool_dir).unwrap();
         std::fs::create_dir_all(&brew_rustup).unwrap();
         std::fs::create_dir_all(&tc_bin).unwrap();
         std::fs::write(
@@ -1876,8 +1903,11 @@ mod tests {
         let rel_current = PathBuf::from(".");
         let rel_sub = PathBuf::from("rel/bin");
         let raw_path =
-            std::env::join_paths([&shim1, &shim2, &rel_current, &rel_sub, &brew_rustup]).unwrap();
-        let built = build_sandbox_path(
+            std::env::join_paths([&shim1, &shim2, &rel_current, &rel_sub, &host_tool_dir]).unwrap();
+        let brew_rustup_str = brew_rustup.to_string_lossy().into_owned();
+        let brew_dirs = [brew_rustup_str.as_str()];
+
+        let built = build_sandbox_path_with_brew_dirs(
             tmp,
             tmp,
             None,
@@ -1885,10 +1915,12 @@ mod tests {
             Some(&rustup_home),
             None,
             Some(raw_path.as_os_str()),
+            &brew_dirs,
         );
         let entries: Vec<PathBuf> = std::env::split_paths(&built).collect();
 
         assert!(entries.contains(&brew_rustup), "{entries:?}");
+        assert!(entries.contains(&host_tool_dir), "{entries:?}");
         assert!(entries.contains(&tc_bin), "{entries:?}");
         assert!(!entries.contains(&shim1), "{entries:?}");
         assert!(!entries.contains(&shim2), "{entries:?}");
@@ -1896,5 +1928,27 @@ mod tests {
         assert!(!entries.contains(&rel_sub), "{entries:?}");
         assert!(entries.contains(&PathBuf::from("/usr/bin")), "{entries:?}");
         assert!(entries.contains(&PathBuf::from("/bin")), "{entries:?}");
+
+        std::fs::write(brew_rustup.join("rustc"), "#!/bin/sh\n").unwrap();
+        let built_with_brew_rustc = build_sandbox_path_with_brew_dirs(
+            tmp,
+            tmp,
+            None,
+            None,
+            Some(&rustup_home),
+            None,
+            Some(raw_path.as_os_str()),
+            &brew_dirs,
+        );
+        let entries_with_brew_rustc: Vec<PathBuf> =
+            std::env::split_paths(&built_with_brew_rustc).collect();
+        assert!(
+            entries_with_brew_rustc.contains(&brew_rustup),
+            "{entries_with_brew_rustc:?}"
+        );
+        assert!(
+            !entries_with_brew_rustc.contains(&tc_bin),
+            "{entries_with_brew_rustc:?}"
+        );
     }
 }
