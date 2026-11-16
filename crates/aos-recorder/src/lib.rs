@@ -207,6 +207,7 @@ impl FlightRecorder for AegisFlightRecorder {
                 .await?;
             let line = format!("{}\n", serde_json::to_string(&event)?);
             file.write_all(line.as_bytes()).await?;
+            file.flush().await?;
         } else {
             let prev_hash = self
                 .events

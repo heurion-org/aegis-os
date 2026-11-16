@@ -103,6 +103,7 @@ const SEEDED_AGENT_FILES: &[&str] = &[
     ".hermes/models_dev_cache.json",
     ".hermes/models_dev_cache.etag",
     ".hermes/install_id",
+    ".gemini/antigravity-cli/cache/onboarding.json",
 ];
 
 /// Runtime state that must survive across sessions (conversation history, todos).
@@ -578,9 +579,14 @@ fn sanitize_seeded_agent_home(agent_home: &Path) -> anyhow::Result<()> {
         ".hermes/auth.json",
         ".claude/.credentials.json",
         ".codex/auth.json",
-        ".gemini/oauth_creds.json",
-        ".gemini/antigravity-cli/oauth_creds.json",
     ] {
+        let _ = std::fs::remove_file(agent_home.join(rel));
+    }
+    for rel in AGY_AND_GEMINI_OAUTH_STORE_FILES
+        .iter()
+        .chain(AGY_PLUGIN_SECRET_FILES.iter())
+        .chain(AGY_USER_SCOPE_FILES.iter())
+    {
         let _ = std::fs::remove_file(agent_home.join(rel));
     }
     for rel_settings in [
@@ -1135,7 +1141,33 @@ pub(crate) async fn run(
     .await
 }
 
-const MAX_CREDENTIAL_SYNC_BYTES: u64 = 64 * 1024;
+const MAX_CREDENTIAL_SYNC_BYTES: u64 = 256 * 1024;
+const MAX_SETTINGS_SYNC_BYTES: u64 = MAX_SEED_FILE_BYTES;
+
+const AGY_AND_GEMINI_OAUTH_STORE_FILES: &[&str] = &[
+    ".gemini/oauth_creds.json",
+    ".gemini/antigravity-cli/oauth_creds.json",
+    ".gemini/antigravity-cli/antigravity-oauth-token",
+    ".gemini/antigravity/antigravity-oauth-token",
+    ".gemini/antigravity-ide/antigravity-oauth-token",
+    ".gemini/jetski-standalone-oauth-token",
+];
+
+const AGY_PLUGIN_SECRET_FILES: &[&str] = &[
+    "Library/Application Support/antigravity/plugin-secrets.json",
+    ".config/antigravity/plugin-secrets.json",
+];
+
+const AGY_USER_SCOPE_FILES: &[&str] = &[
+    "Library/Application Support/antigravity/credential-user-scope",
+    ".config/antigravity/credential-user-scope",
+];
+
+const ALLOWED_AGY_ONBOARDING_SYNC_KEYS: &[&str] = &[
+    "onboardingComplete",
+    "consumerOnboardingComplete",
+    "enterpriseOnboardingComplete",
+];
 
 const ALLOWED_CLAUDE_JSON_SYNC_KEYS: &[&str] = &[
     "oauthAccount",
@@ -1153,6 +1185,7 @@ const ALLOWED_GEMINI_SETTINGS_SYNC_KEYS: &[&str] = &[
     "theme",
     "model",
     "default_model",
+    "agentMode",
 ];
 
 const ALLOWED_OPENCODE_AUTH_ENTRY_KEYS: &[&str] = &[
@@ -1165,6 +1198,78 @@ const ALLOWED_OPENCODE_AUTH_ENTRY_KEYS: &[&str] = &[
     "enterpriseUrl",
 ];
 
+fn walk_no_symlink_components(root: &Path, rel: &str) -> Result<Option<PathBuf>, ()> {
+    let rel_path = Path::new(rel);
+    let mut cur = root.to_path_buf();
+    let mut saw_seg = false;
+    for comp in rel_path.components() {
+        let std::path::Component::Normal(seg) = comp else {
+            return Err(());
+        };
+        cur.push(seg);
+        saw_seg = true;
+        match std::fs::symlink_metadata(&cur) {
+            Ok(meta) => {
+                if meta.file_type().is_symlink() {
+                    return Err(());
+                }
+            }
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
+                return Ok(None);
+            }
+            Err(_) => return Err(()),
+        }
+    }
+    if !saw_seg {
+        return Err(());
+    }
+    Ok(Some(cur))
+}
+
+fn read_existing_json_object_with_limit_no_symlink(
+    root: &Path,
+    rel: &str,
+    allow_placeholders: bool,
+    allow_empty: bool,
+    max_bytes: u64,
+) -> Option<(String, serde_json::Map<String, Value>)> {
+    use std::io::Read;
+    use std::os::unix::fs::OpenOptionsExt;
+
+    let cur = walk_no_symlink_components(root, rel).ok()??;
+    let leaf_meta = std::fs::symlink_metadata(&cur).ok()?;
+    if !leaf_meta.file_type().is_file() || leaf_meta.len() == 0 || leaf_meta.len() > max_bytes {
+        return None;
+    }
+    let file = std::fs::OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_NOFOLLOW)
+        .open(&cur)
+        .ok()?;
+    let mut buf = Vec::with_capacity((leaf_meta.len() as usize).min(max_bytes as usize));
+    file.take(max_bytes + 1).read_to_end(&mut buf).ok()?;
+    if buf.is_empty() || (buf.len() as u64) > max_bytes {
+        return None;
+    }
+    let raw = String::from_utf8(buf).ok()?;
+    if !allow_placeholders && raw.contains("$AOS_SECRET_") {
+        return None;
+    }
+    match serde_json::from_str::<Value>(&raw).ok()? {
+        Value::Object(map) if allow_empty || !map.is_empty() => Some((raw, map)),
+        _ => None,
+    }
+}
+
+fn read_sandbox_json_object_with_limit_no_symlink(
+    root: &Path,
+    rel: &str,
+    allow_placeholders: bool,
+    max_bytes: u64,
+) -> Option<(String, serde_json::Map<String, Value>)> {
+    read_existing_json_object_with_limit_no_symlink(root, rel, allow_placeholders, false, max_bytes)
+}
+
 /// Read and parse a non-empty JSON object from `root/rel` while rejecting any symlink component,
 /// non-regular file, `O_NOFOLLOW` open failure, or file larger than `MAX_CREDENTIAL_SYNC_BYTES`.
 /// Prevents Confused-Deputy symlink attacks where a sandboxed process points a credential path at
@@ -1174,30 +1279,92 @@ fn read_sandbox_json_object_no_symlink(
     rel: &str,
     allow_placeholders: bool,
 ) -> Option<(String, serde_json::Map<String, Value>)> {
+    read_sandbox_json_object_with_limit_no_symlink(
+        root,
+        rel,
+        allow_placeholders,
+        MAX_CREDENTIAL_SYNC_BYTES,
+    )
+}
+
+/// Safely load an existing JSON object from `host_home/rel` for key-level merging, or initialize
+/// an empty map when the path does not yet exist. Returns `None` if a symlink is encountered,
+/// the file exceeds `max_bytes`, or existing JSON is unreadable/corrupt so host files are never
+/// silently clobbered.
+fn load_or_init_host_json_for_merge(
+    host_home: &Path,
+    rel: &str,
+    max_bytes: u64,
+) -> Option<serde_json::Map<String, Value>> {
     use std::io::Read;
     use std::os::unix::fs::OpenOptionsExt;
 
     let rel_path = Path::new(rel);
-    let mut cur = root.to_path_buf();
-    let mut saw_seg = false;
-    for comp in rel_path.components() {
-        let std::path::Component::Normal(seg) = comp else {
-            return None;
-        };
-        cur.push(seg);
-        saw_seg = true;
-        let meta = std::fs::symlink_metadata(&cur).ok()?;
-        if meta.file_type().is_symlink() {
-            return None;
-        }
-    }
-    if !saw_seg {
+    let comps: Vec<&std::ffi::OsStr> = rel_path
+        .components()
+        .filter_map(|c| match c {
+            std::path::Component::Normal(s) => Some(s),
+            _ => None,
+        })
+        .collect();
+    if comps.is_empty() || comps.len() != rel_path.components().count() {
         return None;
     }
+
+    let mut cur = host_home.to_path_buf();
+    for (idx, seg) in comps.iter().enumerate() {
+        cur.push(seg);
+        let is_last = idx + 1 == comps.len();
+        match std::fs::symlink_metadata(&cur) {
+            Ok(meta) => {
+                if meta.file_type().is_symlink() {
+                    return None;
+                }
+                if !is_last && !meta.file_type().is_dir() {
+                    return None;
+                }
+            }
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
+                return Some(serde_json::Map::new());
+            }
+            Err(_) => return None,
+        }
+    }
+
+    let leaf_meta = std::fs::symlink_metadata(&cur).ok()?;
+    if !leaf_meta.file_type().is_file() || leaf_meta.len() > max_bytes {
+        return None;
+    }
+    if leaf_meta.len() == 0 {
+        return Some(serde_json::Map::new());
+    }
+    let file = std::fs::OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_NOFOLLOW)
+        .open(&cur)
+        .ok()?;
+    let mut buf = Vec::with_capacity((leaf_meta.len() as usize).min(max_bytes as usize));
+    file.take(max_bytes + 1).read_to_end(&mut buf).ok()?;
+    if (buf.len() as u64) > max_bytes {
+        return None;
+    }
+    let raw = String::from_utf8(buf).ok()?;
+    match serde_json::from_str::<Value>(&raw).ok()? {
+        Value::Object(map) => Some(map),
+        _ => None,
+    }
+}
+
+fn read_sandbox_scope_id_no_symlink(root: &Path, rel: &str) -> Option<String> {
+    use std::io::Read;
+    use std::os::unix::fs::OpenOptionsExt;
+
+    const MAX_SCOPE_ID_BYTES: u64 = 128;
+    let cur = walk_no_symlink_components(root, rel).ok()??;
     let leaf_meta = std::fs::symlink_metadata(&cur).ok()?;
     if !leaf_meta.file_type().is_file()
         || leaf_meta.len() == 0
-        || leaf_meta.len() > MAX_CREDENTIAL_SYNC_BYTES
+        || leaf_meta.len() > MAX_SCOPE_ID_BYTES
     {
         return None;
     }
@@ -1206,32 +1373,30 @@ fn read_sandbox_json_object_no_symlink(
         .custom_flags(libc::O_NOFOLLOW)
         .open(&cur)
         .ok()?;
-    let mut buf = Vec::with_capacity((leaf_meta.len() as usize).min(MAX_CREDENTIAL_SYNC_BYTES as usize));
-    file.take(MAX_CREDENTIAL_SYNC_BYTES + 1)
+    let mut buf = Vec::with_capacity(leaf_meta.len() as usize);
+    file.take(MAX_SCOPE_ID_BYTES + 1)
         .read_to_end(&mut buf)
         .ok()?;
-    if buf.is_empty() || (buf.len() as u64) > MAX_CREDENTIAL_SYNC_BYTES {
+    if buf.is_empty() || (buf.len() as u64) > MAX_SCOPE_ID_BYTES {
         return None;
     }
     let raw = String::from_utf8(buf).ok()?;
-    if !allow_placeholders && raw.contains("$AOS_SECRET_") {
+    if raw.contains("$AOS_SECRET_") {
         return None;
     }
-    match serde_json::from_str::<Value>(&raw).ok()? {
-        Value::Object(map) if !map.is_empty() => Some((raw, map)),
-        _ => None,
+    let trimmed = raw.trim();
+    if trimmed.is_empty()
+        || !trimmed
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || matches!(c, '-' | '_' | '.'))
+    {
+        return None;
     }
+    Some(trimmed.to_string())
 }
 
-fn read_host_json_object_no_symlink(root: &Path, rel: &str) -> Option<serde_json::Map<String, Value>> {
-    read_sandbox_json_object_no_symlink(root, rel, true).map(|(_, map)| map)
-}
-
-fn write_host_json_0600_no_symlink(
-    host_home: &Path,
-    rel: &str,
-    obj: &serde_json::Map<String, Value>,
-) -> bool {
+fn write_host_bytes_0600_no_symlink(host_home: &Path, rel: &str, bytes: &[u8]) -> bool {
+    use std::io::Read;
     use std::os::unix::fs::{DirBuilderExt, OpenOptionsExt};
 
     let rel_path = Path::new(rel);
@@ -1270,17 +1435,24 @@ fn write_host_json_0600_no_symlink(
         if dst_meta.file_type().is_symlink() || dst_meta.file_type().is_dir() {
             return false;
         }
-    }
-    if let Some(existing) = read_host_json_object_no_symlink(host_home, rel) {
-        if &existing == obj {
-            return false;
+        if dst_meta.len() == bytes.len() as u64 {
+            if let Ok(file) = std::fs::OpenOptions::new()
+                .read(true)
+                .custom_flags(libc::O_NOFOLLOW)
+                .open(&dst)
+            {
+                let mut existing = Vec::with_capacity(bytes.len());
+                if file
+                    .take(bytes.len() as u64 + 1)
+                    .read_to_end(&mut existing)
+                    .is_ok()
+                    && existing.as_slice() == bytes
+                {
+                    return false;
+                }
+            }
         }
     }
-
-    let Ok(mut serialized) = serde_json::to_vec_pretty(&Value::Object(obj.clone())) else {
-        return false;
-    };
-    serialized.push(b'\n');
 
     let tmp = parent.join(format!(
         ".aegis-cred-{}-{}",
@@ -1293,7 +1465,7 @@ fn write_host_json_0600_no_symlink(
         .mode(0o600)
         .open(&tmp)
         .and_then(|mut f| {
-            f.write_all(&serialized)?;
+            f.write_all(bytes)?;
             f.sync_all()
         });
     if write_res.is_err() {
@@ -1309,6 +1481,30 @@ fn write_host_json_0600_no_symlink(
         return false;
     }
     true
+}
+
+fn write_host_json_0600_no_symlink(
+    host_home: &Path,
+    rel: &str,
+    obj: &serde_json::Map<String, Value>,
+) -> bool {
+    if let Some((_, existing)) = read_existing_json_object_with_limit_no_symlink(
+        host_home,
+        rel,
+        true,
+        true,
+        MAX_SETTINGS_SYNC_BYTES,
+    ) {
+        if &existing == obj {
+            return false;
+        }
+    }
+
+    let Ok(mut serialized) = serde_json::to_vec_pretty(&Value::Object(obj.clone())) else {
+        return false;
+    };
+    serialized.push(b'\n');
+    write_host_bytes_0600_no_symlink(host_home, rel, &serialized)
 }
 
 fn is_valid_opencode_auth_entry(entry: &Value) -> bool {
@@ -1327,13 +1523,14 @@ fn is_valid_opencode_auth_entry(entry: &Value) -> bool {
 
 /// Controlled OAuth declassification gate from `agent_home` back to `host_home`.
 /// Enforces four invariants:
-/// 1. Symlink-free `O_NOFOLLOW` reads (`<= 64 KiB`) and `0600` temp-file atomic writes;
+/// 1. Symlink-free `O_NOFOLLOW` reads (`<= 256 KiB` for credential stores, `<= 8 MiB` for shared
+///    settings JSON) and `0600` temp-file atomic writes;
 /// 2. Active-client scoping (`command`) so an agent can never modify foreign-agent stores
 ///    (and non-agent commands like `python3`/`pytest` have zero write-back surface);
 /// 3. Strict JSON AST parsing + field allowlists (never raw byte copy or denylists),
 ///    dropping `hooks`, `mcpServers`, `security`, `tools`, `coreTools`, and unknown keys;
 /// 4. Opt-out via `AOS_NO_CREDENTIAL_SYNC=1`.
-fn sync_credentials(agent_home: &Path, host_home: &Path, command: &[String]) {
+pub(crate) fn sync_credentials(agent_home: &Path, host_home: &Path, command: &[String]) {
     if std::env::var_os("AOS_NO_CREDENTIAL_SYNC")
         .and_then(|v| v.into_string().ok())
         .is_some_and(|s| matches!(s.trim(), "1" | "true" | "TRUE" | "yes"))
@@ -1351,22 +1548,27 @@ fn sync_credentials(agent_home: &Path, host_home: &Path, command: &[String]) {
                 &cred_obj,
             );
         }
-        if let Some((_, agent_obj)) =
-            read_sandbox_json_object_no_symlink(agent_home, ".claude.json", false)
-        {
-            let mut host_obj =
-                read_host_json_object_no_symlink(host_home, ".claude.json").unwrap_or_default();
-            let mut changed = false;
-            for key in ALLOWED_CLAUDE_JSON_SYNC_KEYS {
-                if let Some(val) = agent_obj.get(*key) {
-                    if !val.is_null() && host_obj.get(*key) != Some(val) {
-                        host_obj.insert((*key).to_string(), val.clone());
-                        changed = true;
+        if let Some((_, agent_obj)) = read_sandbox_json_object_with_limit_no_symlink(
+            agent_home,
+            ".claude.json",
+            false,
+            MAX_SETTINGS_SYNC_BYTES,
+        ) {
+            if let Some(mut host_obj) =
+                load_or_init_host_json_for_merge(host_home, ".claude.json", MAX_SETTINGS_SYNC_BYTES)
+            {
+                let mut changed = false;
+                for key in ALLOWED_CLAUDE_JSON_SYNC_KEYS {
+                    if let Some(val) = agent_obj.get(*key) {
+                        if !val.is_null() && host_obj.get(*key) != Some(val) {
+                            host_obj.insert((*key).to_string(), val.clone());
+                            changed = true;
+                        }
                     }
                 }
-            }
-            if changed {
-                let _ = write_host_json_0600_no_symlink(host_home, ".claude.json", &host_obj);
+                if changed {
+                    let _ = write_host_json_0600_no_symlink(host_home, ".claude.json", &host_obj);
+                }
             }
         }
     } else if is_codex_command(command) {
@@ -1382,31 +1584,75 @@ fn sync_credentials(agent_home: &Path, host_home: &Path, command: &[String]) {
             let _ = write_host_json_0600_no_symlink(host_home, ".hermes/auth.json", &auth_obj);
         }
     } else if is_agy_or_gemini_command(command) {
-        for rel in [
-            ".gemini/oauth_creds.json",
+        for rel in AGY_AND_GEMINI_OAUTH_STORE_FILES.iter().copied().chain([
             ".gemini/google_accounts.json",
             ".gemini/state.json",
-            ".gemini/antigravity-cli/oauth_creds.json",
             ".gemini/antigravity-cli/google_accounts.json",
             ".gemini/antigravity-cli/state.json",
-        ] {
+        ]) {
             if let Some((_, cred_obj)) =
                 read_sandbox_json_object_no_symlink(agent_home, rel, false)
             {
                 let _ = write_host_json_0600_no_symlink(host_home, rel, &cred_obj);
             }
         }
+        if is_agy_command(command) {
+            for rel in AGY_PLUGIN_SECRET_FILES {
+                if let Some((_, secrets_obj)) =
+                    read_sandbox_json_object_no_symlink(agent_home, rel, false)
+                {
+                    let _ = write_host_json_0600_no_symlink(host_home, rel, &secrets_obj);
+                }
+            }
+            for rel in AGY_USER_SCOPE_FILES {
+                if let Some(scope) = read_sandbox_scope_id_no_symlink(agent_home, rel) {
+                    let _ = write_host_bytes_0600_no_symlink(host_home, rel, scope.as_bytes());
+                }
+            }
+            let onboarding_rel = ".gemini/antigravity-cli/cache/onboarding.json";
+            if let Some((_, agent_onb)) =
+                read_sandbox_json_object_no_symlink(agent_home, onboarding_rel, false)
+            {
+                if let Some(mut host_onb) = load_or_init_host_json_for_merge(
+                    host_home,
+                    onboarding_rel,
+                    MAX_CREDENTIAL_SYNC_BYTES,
+                ) {
+                    let mut changed = false;
+                    for key in ALLOWED_AGY_ONBOARDING_SYNC_KEYS {
+                        if let Some(val) = agent_onb.get(*key) {
+                            if val.is_boolean() && host_onb.get(*key) != Some(val) {
+                                host_onb.insert((*key).to_string(), val.clone());
+                                changed = true;
+                            }
+                        }
+                    }
+                    if changed {
+                        let _ =
+                            write_host_json_0600_no_symlink(host_home, onboarding_rel, &host_onb);
+                    }
+                }
+            }
+        }
         for rel_settings in [
             ".gemini/antigravity-cli/settings.json",
             ".gemini/settings.json",
         ] {
-            let Some((_, agent_obj)) =
-                read_sandbox_json_object_no_symlink(agent_home, rel_settings, false)
-            else {
+            let Some((_, agent_obj)) = read_sandbox_json_object_with_limit_no_symlink(
+                agent_home,
+                rel_settings,
+                false,
+                MAX_SETTINGS_SYNC_BYTES,
+            ) else {
                 continue;
             };
-            let mut host_obj =
-                read_host_json_object_no_symlink(host_home, rel_settings).unwrap_or_default();
+            let Some(mut host_obj) = load_or_init_host_json_for_merge(
+                host_home,
+                rel_settings,
+                MAX_SETTINGS_SYNC_BYTES,
+            ) else {
+                continue;
+            };
             let mut changed = false;
             for key in ALLOWED_GEMINI_SETTINGS_SYNC_KEYS {
                 if let Some(val) = agent_obj.get(*key) {
@@ -1426,11 +1672,13 @@ fn sync_credentials(agent_home: &Path, host_home: &Path, command: &[String]) {
             ".local/share/opencode/auth.json",
             true,
         ) {
-            let mut host_obj = read_host_json_object_no_symlink(
+            let Some(mut host_obj) = load_or_init_host_json_for_merge(
                 host_home,
                 ".local/share/opencode/auth.json",
-            )
-            .unwrap_or_default();
+                MAX_CREDENTIAL_SYNC_BYTES,
+            ) else {
+                return;
+            };
             let headless_run = command.get(1).is_some_and(|sub| sub == "run");
             let mut changed = false;
             for (prov, entry) in agent_obj {
@@ -1457,6 +1705,102 @@ fn sync_credentials(agent_home: &Path, host_home: &Path, command: &[String]) {
     }
 }
 
+fn agy_gemini_watch_fingerprint(agent_home: &Path, is_agy: bool) -> Vec<String> {
+    let mut fp = Vec::new();
+    for rel in AGY_AND_GEMINI_OAUTH_STORE_FILES.iter().copied().chain([
+        ".gemini/google_accounts.json",
+        ".gemini/antigravity-cli/google_accounts.json",
+    ]) {
+        fp.push(
+            read_sandbox_json_object_no_symlink(agent_home, rel, false)
+                .map(|(raw, _)| raw)
+                .unwrap_or_default(),
+        );
+    }
+    for rel_settings in [
+        ".gemini/antigravity-cli/settings.json",
+        ".gemini/settings.json",
+    ] {
+        fp.push(
+            read_sandbox_json_object_with_limit_no_symlink(
+                agent_home,
+                rel_settings,
+                false,
+                MAX_SETTINGS_SYNC_BYTES,
+            )
+            .map(|(raw, _)| raw)
+            .unwrap_or_default(),
+        );
+    }
+    if is_agy {
+        for rel in AGY_PLUGIN_SECRET_FILES {
+            fp.push(
+                read_sandbox_json_object_no_symlink(agent_home, rel, false)
+                    .map(|(raw, _)| raw)
+                    .unwrap_or_default(),
+            );
+        }
+        for rel in AGY_USER_SCOPE_FILES {
+            fp.push(read_sandbox_scope_id_no_symlink(agent_home, rel).unwrap_or_default());
+        }
+        fp.push(
+            read_sandbox_json_object_no_symlink(
+                agent_home,
+                ".gemini/antigravity-cli/cache/onboarding.json",
+                false,
+            )
+            .map(|(raw, _)| raw)
+            .unwrap_or_default(),
+        );
+    }
+    fp
+}
+
+pub(crate) fn backfill_host_agy_credentials_from_sessions(
+    runtime_dir: &Path,
+    host_home: &Path,
+) -> bool {
+    let token_rel = ".gemini/antigravity-cli/antigravity-oauth-token";
+    if host_home.join(token_rel).is_file() {
+        return false;
+    }
+    let sessions_dir = runtime_dir.join("sessions");
+    let Ok(entries) = std::fs::read_dir(&sessions_dir) else {
+        return false;
+    };
+    let mut candidates: Vec<(i64, PathBuf)> = Vec::new();
+    for entry in entries.flatten() {
+        let dir = entry.path();
+        let Ok(raw) = std::fs::read_to_string(dir.join("session.json")) else {
+            continue;
+        };
+        let Ok(value) = serde_json::from_str::<Value>(&raw) else {
+            continue;
+        };
+        let is_agy = value
+            .get("agent_id")
+            .and_then(|v| v.as_str())
+            .is_some_and(|id| id == "agy-agent" || id.starts_with("agy-"));
+        if !is_agy {
+            continue;
+        }
+        let created = value
+            .get("created_at_ms")
+            .and_then(|v| v.as_i64())
+            .unwrap_or(0);
+        candidates.push((created, dir));
+    }
+    candidates.sort_by(|a, b| b.0.cmp(&a.0));
+    for (_created, dir) in candidates {
+        let ses_agent_home = dir.join("agent_home");
+        if read_sandbox_json_object_no_symlink(&ses_agent_home, token_rel, false).is_some() {
+            sync_credentials(&ses_agent_home, host_home, &["agy".to_string()]);
+            return host_home.join(token_rel).is_file();
+        }
+    }
+    false
+}
+
 fn restore_native_oauth_store_for_agent(
     host_home: &Path,
     agent_home: &Path,
@@ -1464,14 +1808,17 @@ fn restore_native_oauth_store_for_agent(
     harvested_secrets: &std::collections::HashMap<String, String>,
 ) {
     use std::os::unix::fs::PermissionsExt;
-    let write_0600 = |dst: &Path, obj: &serde_json::Map<String, Value>| {
+    let write_bytes_0600 = |dst: &Path, bytes: &[u8]| {
         if let Some(parent) = dst.parent() {
             let _ = std::fs::create_dir_all(parent);
         }
+        if std::fs::write(dst, bytes).is_ok() {
+            let _ = std::fs::set_permissions(dst, std::fs::Permissions::from_mode(0o600));
+        }
+    };
+    let write_0600 = |dst: &Path, obj: &serde_json::Map<String, Value>| {
         if let Ok(bytes) = serde_json::to_vec_pretty(&Value::Object(obj.clone())) {
-            if std::fs::write(dst, bytes).is_ok() {
-                let _ = std::fs::set_permissions(dst, std::fs::Permissions::from_mode(0o600));
-            }
+            write_bytes_0600(dst, &bytes);
         }
     };
     if is_claude_command(command) && !harvested_secrets.contains_key("CLAUDE_CODE_OAUTH_TOKEN") {
@@ -1496,10 +1843,7 @@ fn restore_native_oauth_store_for_agent(
         }
     }
     if is_agy_or_gemini_command(command) {
-        for rel in [
-            ".gemini/oauth_creds.json",
-            ".gemini/antigravity-cli/oauth_creds.json",
-        ] {
+        for rel in AGY_AND_GEMINI_OAUTH_STORE_FILES {
             if let Some((_, map)) = read_sandbox_json_object_no_symlink(host_home, rel, false) {
                 write_0600(&agent_home.join(rel), &map);
             }
@@ -1508,16 +1852,35 @@ fn restore_native_oauth_store_for_agent(
             ".gemini/antigravity-cli/settings.json",
             ".gemini/settings.json",
         ] {
-            if let Some((_, host_map)) =
-                read_sandbox_json_object_no_symlink(host_home, rel_settings, false)
-            {
+            if let Some((_, host_map)) = read_sandbox_json_object_with_limit_no_symlink(
+                host_home,
+                rel_settings,
+                false,
+                MAX_SETTINGS_SYNC_BYTES,
+            ) {
                 if let Some(gcreds) = host_map.get("google_credentials") {
-                    let dst = agent_home.join(rel_settings);
-                    let mut dst_map = read_host_json_object_no_symlink(agent_home, rel_settings)
-                        .unwrap_or_default();
-                    dst_map.insert("google_credentials".to_string(), gcreds.clone());
-                    write_0600(&dst, &dst_map);
+                    if let Some(mut dst_map) = load_or_init_host_json_for_merge(
+                        agent_home,
+                        rel_settings,
+                        MAX_SETTINGS_SYNC_BYTES,
+                    ) {
+                        let dst = agent_home.join(rel_settings);
+                        dst_map.insert("google_credentials".to_string(), gcreds.clone());
+                        write_0600(&dst, &dst_map);
+                    }
                 }
+            }
+        }
+    }
+    if is_agy_command(command) {
+        for rel in AGY_PLUGIN_SECRET_FILES {
+            if let Some((_, map)) = read_sandbox_json_object_no_symlink(host_home, rel, false) {
+                write_0600(&agent_home.join(rel), &map);
+            }
+        }
+        for rel in AGY_USER_SCOPE_FILES {
+            if let Some(scope) = read_sandbox_scope_id_no_symlink(host_home, rel) {
+                write_bytes_0600(&agent_home.join(rel), scope.as_bytes());
             }
         }
     }
@@ -1527,25 +1890,26 @@ fn restore_native_oauth_store_for_agent(
             ".local/share/opencode/auth.json",
             false,
         ) {
-            let dst = agent_home.join(".local/share/opencode/auth.json");
-            let mut dst_map = read_host_json_object_no_symlink(
+            if let Some(mut dst_map) = load_or_init_host_json_for_merge(
                 agent_home,
                 ".local/share/opencode/auth.json",
-            )
-            .unwrap_or_default();
-            let mut changed = false;
-            for (prov, entry) in host_map {
-                let is_oauth = entry
-                    .get("type")
-                    .and_then(|v| v.as_str())
-                    .is_some_and(|t| t != "api");
-                if is_oauth || opencode_provider_secret_spec(&prov).is_none() {
-                    dst_map.insert(prov, entry);
-                    changed = true;
+                MAX_CREDENTIAL_SYNC_BYTES,
+            ) {
+                let dst = agent_home.join(".local/share/opencode/auth.json");
+                let mut changed = false;
+                for (prov, entry) in host_map {
+                    let is_oauth = entry
+                        .get("type")
+                        .and_then(|v| v.as_str())
+                        .is_some_and(|t| t != "api");
+                    if is_oauth || opencode_provider_secret_spec(&prov).is_none() {
+                        dst_map.insert(prov, entry);
+                        changed = true;
+                    }
                 }
-            }
-            if changed {
-                write_0600(&dst, &dst_map);
+                if changed {
+                    write_0600(&dst, &dst_map);
+                }
             }
         }
     }
@@ -3074,24 +3438,23 @@ async fn start_egress(
             )
             .map(|(raw, _)| raw)
             .unwrap_or_default();
-            let mut last_claude_json =
-                read_sandbox_json_object_no_symlink(&agent_home_watch, ".claude.json", false)
-                    .map(|(raw, _)| raw)
-                    .unwrap_or_default();
-            let mut last_agy_settings = read_sandbox_json_object_no_symlink(
+            let mut last_claude_json = read_sandbox_json_object_with_limit_no_symlink(
                 &agent_home_watch,
-                ".gemini/antigravity-cli/settings.json",
+                ".claude.json",
+                false,
+                MAX_SETTINGS_SYNC_BYTES,
+            )
+            .map(|(raw, _)| raw)
+            .unwrap_or_default();
+            let mut last_codex_auth = read_sandbox_json_object_no_symlink(
+                &agent_home_watch,
+                ".codex/auth.json",
                 false,
             )
             .map(|(raw, _)| raw)
             .unwrap_or_default();
-            let mut last_gemini_settings = read_sandbox_json_object_no_symlink(
-                &agent_home_watch,
-                ".gemini/settings.json",
-                false,
-            )
-            .map(|(raw, _)| raw)
-            .unwrap_or_default();
+            let mut last_agy_gemini_fp =
+                agy_gemini_watch_fingerprint(&agent_home_watch, is_agy_command(&cmd_watch));
             let mut last_oc_auth = read_sandbox_json_object_no_symlink(
                 &agent_home_watch,
                 ".local/share/opencode/auth.json",
@@ -3134,36 +3497,36 @@ async fn start_egress(
                             }
                         }
                     }
-                    if let Some((raw_json, _)) = read_sandbox_json_object_no_symlink(
+                    if let Some((raw_json, _)) = read_sandbox_json_object_with_limit_no_symlink(
                         &agent_home_watch,
                         ".claude.json",
                         false,
+                        MAX_SETTINGS_SYNC_BYTES,
                     ) {
                         if raw_json != last_claude_json {
                             last_claude_json = raw_json;
                             need_sync = true;
                         }
                     }
-                } else if is_agy_or_gemini_command(&cmd_watch) {
-                    if let Some((raw_agy, _)) = read_sandbox_json_object_no_symlink(
+                } else if is_codex_command(&cmd_watch) {
+                    if let Some((raw_codex, _)) = read_sandbox_json_object_no_symlink(
                         &agent_home_watch,
-                        ".gemini/antigravity-cli/settings.json",
+                        ".codex/auth.json",
                         false,
                     ) {
-                        if raw_agy != last_agy_settings {
-                            last_agy_settings = raw_agy;
+                        if raw_codex != last_codex_auth {
+                            last_codex_auth = raw_codex;
                             need_sync = true;
                         }
                     }
-                    if let Some((raw_gem, _)) = read_sandbox_json_object_no_symlink(
+                } else if is_agy_or_gemini_command(&cmd_watch) {
+                    let fp = agy_gemini_watch_fingerprint(
                         &agent_home_watch,
-                        ".gemini/settings.json",
-                        false,
-                    ) {
-                        if raw_gem != last_gemini_settings {
-                            last_gemini_settings = raw_gem;
-                            need_sync = true;
-                        }
+                        is_agy_command(&cmd_watch),
+                    );
+                    if fp != last_agy_gemini_fp {
+                        last_agy_gemini_fp = fp;
+                        need_sync = true;
                     }
                 } else if is_opencode_command(&cmd_watch) {
                     if let Some((raw_oc, map)) = read_sandbox_json_object_no_symlink(
@@ -7832,5 +8195,340 @@ mod tests {
                 "audit log missing {client}:\n{audit_text}"
             );
         }
+    }
+
+    #[test]
+    fn agy_oauth_token_scope_onboarding_and_oversized_settings_roundtrip() {
+        let tmp = tempfile::tempdir().unwrap();
+        let host_home = tmp.path().join("host");
+        let foreign_opencode_home = tmp.path().join("agent_opencode");
+        let foreign_claude_home = tmp.path().join("agent_claude");
+        let agent_home = tmp.path().join("agent_agy");
+        let agent_home_restart = tmp.path().join("agent_agy_restart");
+
+        std::fs::create_dir_all(host_home.join(".gemini/antigravity-cli/cache")).unwrap();
+        std::fs::create_dir_all(host_home.join("Library/Application Support/antigravity")).unwrap();
+
+        std::fs::write(
+            host_home.join(".gemini/antigravity-cli/antigravity-oauth-token"),
+            r#"{"auth_method":"consumer","id_token_email":"dev@example.com","token":{"access_token":"ya29.initial","refresh_token":"1//initial","token_type":"Bearer","expires_in":3599}}"#,
+        )
+        .unwrap();
+        std::fs::write(
+            host_home.join(".gemini/jetski-standalone-oauth-token"),
+            r#"{"auth_method":"consumer","id_token":"id.initial","token":{"access_token":"ya29.jetski-initial","refresh_token":"1//jetski-initial","token_type":"Bearer"}}"#,
+        )
+        .unwrap();
+        std::fs::write(
+            host_home.join("Library/Application Support/antigravity/plugin-secrets.json"),
+            r#"{"demo_plugin":{"token":"secret-plugin-initial"}}"#,
+        )
+        .unwrap();
+        std::fs::write(
+            host_home.join("Library/Application Support/antigravity/credential-user-scope"),
+            "a0bc123de456f789a",
+        )
+        .unwrap();
+        std::fs::write(
+            host_home.join(".gemini/antigravity-cli/cache/onboarding.json"),
+            r#"{"consumerOnboardingComplete":true,"enterpriseOnboardingComplete":false,"onboardingComplete":true}"#,
+        )
+        .unwrap();
+
+        // Build a > 100 KiB host settings.json (matching real permissions.allow bloat).
+        let big_allow: Vec<String> = (0..1800)
+            .map(|i| format!("command(echo test-permission-entry-number-{i:04})"))
+            .collect();
+        let initial_settings = json!({
+            "permissions": { "allow": big_allow },
+            "hooks": { "PreToolUse": "aegis-os" },
+            "model": "initial-model"
+        });
+        let initial_settings_bytes = serde_json::to_vec_pretty(&initial_settings).unwrap();
+        assert!(
+            initial_settings_bytes.len() > 100 * 1024,
+            "settings fixture must exceed 64 KiB (got {} bytes)",
+            initial_settings_bytes.len()
+        );
+        std::fs::write(
+            host_home.join(".gemini/antigravity-cli/settings.json"),
+            &initial_settings_bytes,
+        )
+        .unwrap();
+
+        // Foreign agents must NOT receive AGY token/scope/plugin-secret stores.
+        for (foreign_home, foreign_cmd) in [
+            (&foreign_opencode_home, vec!["opencode".to_string()]),
+            (&foreign_claude_home, vec!["claude".to_string()]),
+        ] {
+            seed_agent_home(&host_home, foreign_home).unwrap();
+            restore_native_oauth_store_for_agent(
+                &host_home,
+                foreign_home,
+                &foreign_cmd,
+                &std::collections::HashMap::new(),
+            );
+            for blocked_rel in [
+                ".gemini/antigravity-cli/antigravity-oauth-token",
+                ".gemini/jetski-standalone-oauth-token",
+                "Library/Application Support/antigravity/plugin-secrets.json",
+                "Library/Application Support/antigravity/credential-user-scope",
+            ] {
+                assert!(
+                    !foreign_home.join(blocked_rel).exists(),
+                    "foreign agent {:?} must not inherit {blocked_rel}",
+                    foreign_cmd
+                );
+            }
+        }
+
+        // AGY receives all native OAuth stores, user scope, plugin secrets, and onboarding cache.
+        let agy_cmd = vec!["agy".to_string()];
+        seed_agent_home(&host_home, &agent_home).unwrap();
+        restore_native_oauth_store_for_agent(
+            &host_home,
+            &agent_home,
+            &agy_cmd,
+            &std::collections::HashMap::new(),
+        );
+        for required_rel in [
+            ".gemini/antigravity-cli/antigravity-oauth-token",
+            ".gemini/jetski-standalone-oauth-token",
+            "Library/Application Support/antigravity/plugin-secrets.json",
+            "Library/Application Support/antigravity/credential-user-scope",
+            ".gemini/antigravity-cli/cache/onboarding.json",
+        ] {
+            assert!(
+                agent_home.join(required_rel).is_file(),
+                "agy session must receive {required_rel}"
+            );
+        }
+
+        // Simulate `agy` updating OAuth tokens, scope, plugin secrets, onboarding, and >100 KiB settings.
+        std::fs::write(
+            agent_home.join(".gemini/antigravity-cli/antigravity-oauth-token"),
+            r#"{"auth_method":"consumer","id_token_email":"dev@example.com","token":{"access_token":"ya29.fresh","refresh_token":"1//fresh","token_type":"Bearer","expires_in":3599}}"#,
+        )
+        .unwrap();
+        std::fs::write(
+            agent_home.join("Library/Application Support/antigravity/credential-user-scope"),
+            "b1cd234ef567a890b",
+        )
+        .unwrap();
+        std::fs::write(
+            agent_home.join("Library/Application Support/antigravity/plugin-secrets.json"),
+            r#"{"demo_plugin":{"token":"secret-plugin-fresh"}}"#,
+        )
+        .unwrap();
+        std::fs::write(
+            agent_home.join(".gemini/antigravity-cli/cache/onboarding.json"),
+            r#"{"consumerOnboardingComplete":true,"enterpriseOnboardingComplete":false,"onboardingComplete":true,"evil":true}"#,
+        )
+        .unwrap();
+        let mut modified_settings = initial_settings;
+        modified_settings["model"] = json!("orchestrator");
+        modified_settings["mcpServerCommand"] = json!("sh -c pwn");
+        std::fs::write(
+            agent_home.join(".gemini/antigravity-cli/settings.json"),
+            serde_json::to_vec_pretty(&modified_settings).unwrap(),
+        )
+        .unwrap();
+
+        sync_credentials(&agent_home, &host_home, &agy_cmd);
+
+        let synced_tok_path = host_home.join(".gemini/antigravity-cli/antigravity-oauth-token");
+        assert!(synced_tok_path.is_file());
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mode = std::fs::metadata(&synced_tok_path)
+                .unwrap()
+                .permissions()
+                .mode()
+                & 0o777;
+            assert_eq!(mode, 0o600, "synced OAuth token must be 0600");
+        }
+        let synced_tok: Value =
+            serde_json::from_str(&std::fs::read_to_string(&synced_tok_path).unwrap()).unwrap();
+        assert_eq!(
+            synced_tok
+                .pointer("/token/access_token")
+                .and_then(|v| v.as_str()),
+            Some("ya29.fresh")
+        );
+        assert_eq!(
+            synced_tok
+                .pointer("/token/refresh_token")
+                .and_then(|v| v.as_str()),
+            Some("1//fresh")
+        );
+
+        let synced_scope = std::fs::read(
+            host_home.join("Library/Application Support/antigravity/credential-user-scope"),
+        )
+        .unwrap();
+        assert_eq!(
+            synced_scope, b"b1cd234ef567a890b",
+            "credential-user-scope must preserve exact 17 bytes with no trailing newline"
+        );
+
+        let synced_plugin: Value = serde_json::from_str(
+            &std::fs::read_to_string(
+                host_home.join("Library/Application Support/antigravity/plugin-secrets.json"),
+            )
+            .unwrap(),
+        )
+        .unwrap();
+        assert_eq!(
+            synced_plugin
+                .pointer("/demo_plugin/token")
+                .and_then(|v| v.as_str()),
+            Some("secret-plugin-fresh")
+        );
+
+        let synced_onb: Value = serde_json::from_str(
+            &std::fs::read_to_string(
+                host_home.join(".gemini/antigravity-cli/cache/onboarding.json"),
+            )
+            .unwrap(),
+        )
+        .unwrap();
+        assert_eq!(synced_onb.get("onboardingComplete"), Some(&json!(true)));
+        assert!(
+            synced_onb.get("evil").is_none(),
+            "non-allowlisted keys must be dropped from onboarding.json"
+        );
+
+        let synced_settings_raw =
+            std::fs::read_to_string(host_home.join(".gemini/antigravity-cli/settings.json"))
+                .unwrap();
+        assert!(synced_settings_raw.len() > 100 * 1024);
+        let synced_settings: Value = serde_json::from_str(&synced_settings_raw).unwrap();
+        assert_eq!(
+            synced_settings
+                .pointer("/permissions/allow")
+                .and_then(|v| v.as_array())
+                .map(|a| a.len()),
+            Some(1800),
+            "existing >100 KiB permissions.allow list must remain intact"
+        );
+        assert_eq!(
+            synced_settings
+                .pointer("/hooks/PreToolUse")
+                .and_then(|v| v.as_str()),
+            Some("aegis-os")
+        );
+        assert_eq!(
+            synced_settings.get("model").and_then(|v| v.as_str()),
+            Some("orchestrator")
+        );
+        assert!(
+            synced_settings.get("mcpServerCommand").is_none(),
+            "non-allowlisted executable keys must be dropped from settings.json"
+        );
+
+        // Restarting `agy` in a brand new session restores all synced credentials and onboarding.
+        seed_agent_home(&host_home, &agent_home_restart).unwrap();
+        restore_native_oauth_store_for_agent(
+            &host_home,
+            &agent_home_restart,
+            &agy_cmd,
+            &std::collections::HashMap::new(),
+        );
+        let restarted_tok: Value = serde_json::from_str(
+            &std::fs::read_to_string(
+                agent_home_restart.join(".gemini/antigravity-cli/antigravity-oauth-token"),
+            )
+            .unwrap(),
+        )
+        .unwrap();
+        assert_eq!(
+            restarted_tok
+                .pointer("/token/access_token")
+                .and_then(|v| v.as_str()),
+            Some("ya29.fresh")
+        );
+        assert_eq!(
+            std::fs::read(
+                agent_home_restart
+                    .join("Library/Application Support/antigravity/credential-user-scope"),
+            )
+            .unwrap(),
+            b"b1cd234ef567a890b"
+        );
+        assert!(agent_home_restart
+            .join(".gemini/antigravity-cli/cache/onboarding.json")
+            .is_file());
+        assert!(agent_home_restart
+            .join("Library/Application Support/antigravity/plugin-secrets.json")
+            .is_file());
+    }
+
+    #[test]
+    fn backfill_host_agy_credentials_rescues_latest_agy_session_only_when_host_missing() {
+        let tmp = tempfile::tempdir().unwrap();
+        let runtime = tmp.path().join("runtime");
+        let host_home = tmp.path().join("host");
+        std::fs::create_dir_all(&host_home).unwrap();
+
+        // Newer non-agy session (must be ignored).
+        let ses_foreign = runtime.join("sessions/ses_foreign");
+        std::fs::create_dir_all(ses_foreign.join("agent_home/.gemini/antigravity-cli")).unwrap();
+        std::fs::write(
+            ses_foreign.join("session.json"),
+            r#"{"session_id":"ses_foreign","agent_id":"opencode-agent","created_at_ms":2000}"#,
+        )
+        .unwrap();
+        std::fs::write(
+            ses_foreign.join("agent_home/.gemini/antigravity-cli/antigravity-oauth-token"),
+            r#"{"auth_method":"consumer","token":{"access_token":"forged-foreign"}}"#,
+        )
+        .unwrap();
+
+        // Older valid agy session.
+        let ses_agy = runtime.join("sessions/ses_agy");
+        std::fs::create_dir_all(ses_agy.join("agent_home/.gemini/antigravity-cli/cache"))
+            .unwrap();
+        std::fs::write(
+            ses_agy.join("session.json"),
+            r#"{"session_id":"ses_agy","agent_id":"agy-agent","created_at_ms":1000}"#,
+        )
+        .unwrap();
+        std::fs::write(
+            ses_agy.join("agent_home/.gemini/antigravity-cli/antigravity-oauth-token"),
+            r#"{"auth_method":"consumer","id_token_email":"dev@example.com","token":{"access_token":"ya29.rescued"}}"#,
+        )
+        .unwrap();
+        std::fs::write(
+            ses_agy.join("agent_home/.gemini/antigravity-cli/cache/onboarding.json"),
+            r#"{"onboardingComplete":true}"#,
+        )
+        .unwrap();
+
+        assert!(backfill_host_agy_credentials_from_sessions(
+            &runtime, &host_home
+        ));
+        let host_tok =
+            std::fs::read_to_string(host_home.join(".gemini/antigravity-cli/antigravity-oauth-token"))
+                .unwrap();
+        assert!(host_tok.contains("ya29.rescued"));
+        assert!(!host_tok.contains("forged-foreign"));
+        assert!(host_home
+            .join(".gemini/antigravity-cli/cache/onboarding.json")
+            .is_file());
+
+        // Overwrite host token with newer content and confirm second call is a no-op returning false.
+        std::fs::write(
+            host_home.join(".gemini/antigravity-cli/antigravity-oauth-token"),
+            r#"{"auth_method":"consumer","token":{"access_token":"ya29.existing-host"}}"#,
+        )
+        .unwrap();
+        assert!(!backfill_host_agy_credentials_from_sessions(
+            &runtime, &host_home
+        ));
+        let host_tok_after =
+            std::fs::read_to_string(host_home.join(".gemini/antigravity-cli/antigravity-oauth-token"))
+                .unwrap();
+        assert!(host_tok_after.contains("ya29.existing-host"));
     }
 }

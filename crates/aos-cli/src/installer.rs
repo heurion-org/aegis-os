@@ -374,6 +374,16 @@ You are running inside the **Aegis OS Runtime (`aegis-os`)** with an isolated Co
         AGY_MCP_ALLOW_RULES.len()
     );
     println!("      - Global Rule: {}", agy_rules_path.display());
+    if !dry_run
+        && crate::launcher::backfill_host_agy_credentials_from_sessions(runtime_dir, home_dir)
+    {
+        println!(
+            "      - OAuth Token: rescued active AGY session token -> {}",
+            home_dir
+                .join(".gemini/antigravity-cli/antigravity-oauth-token")
+                .display()
+        );
+    }
 
     // ------------------------------------------------------------------------
     // 2. Configure Claude Code Globally (`~/.claude.json` & `~/.claude/settings.json`)

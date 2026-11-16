@@ -21,8 +21,8 @@ jobs:
       fail-fast: true
       matrix:
         include:
-          - { runner: macos-14, triple: aarch64-apple-darwin, asset: aegis-os-darwin-arm64, test: true }
-          - { runner: macos-14, triple: x86_64-apple-darwin, asset: aegis-os-darwin-x86_64, test: false }
+          - { runner: macos-15, triple: aarch64-apple-darwin, asset: aegis-os-darwin-arm64, test: true }
+          - { runner: macos-15, triple: x86_64-apple-darwin, asset: aegis-os-darwin-x86_64, test: false }
           # Ubuntu 22.04 runners: glibc 2.35 keeps binaries runnable on 22.04 servers.
           - { runner: ubuntu-22.04, triple: x86_64-unknown-linux-gnu, asset: aegis-os-linux-x86_64, test: true }
           - { runner: ubuntu-22.04-arm, triple: aarch64-unknown-linux-gnu, asset: aegis-os-linux-aarch64, test: true }

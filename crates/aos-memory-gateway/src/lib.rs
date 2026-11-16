@@ -342,6 +342,7 @@ impl AuditLog {
                 .await
             {
                 let _ = file.write_all(format!("{line}\n").as_bytes()).await;
+                let _ = file.flush().await;
             }
         } else {
             eprintln!("{line}");
