@@ -1564,13 +1564,24 @@ fn stable_aegis_exe_for_shim() -> PathBuf {
 }
 
 pub(crate) fn install_enforced_shims(home_dir: &Path, dry_run: bool) -> anyhow::Result<()> {
+    install_enforced_shims_with_path(home_dir, dry_run, None)
+}
+
+pub(crate) fn install_enforced_shims_with_path(
+    home_dir: &Path,
+    dry_run: bool,
+    path_override: Option<&std::ffi::OsStr>,
+) -> anyhow::Result<()> {
     let shim_dir = home_dir.join(".aegis").join("bin");
     let aegis = stable_aegis_exe_for_shim();
+    let path_val = path_override
+        .map(|p| p.to_os_string())
+        .or_else(|| std::env::var_os("PATH"));
     let mut agents = Vec::new();
     for agent in ["claude", "codex", "agy", "opencode", "hermes"] {
         let mut real = None;
-        if let Ok(path_env) = std::env::var("PATH") {
-            for dir in std::env::split_paths(&path_env) {
+        if let Some(ref path_env) = path_val {
+            for dir in std::env::split_paths(path_env) {
                 if dir == shim_dir || dir.ends_with(".aegis/bin") {
                     continue;
                 }
@@ -2546,6 +2557,16 @@ pub(crate) fn refresh_via_upgraded_binary(
     home_dir: &Path,
     had_shims: bool,
 ) -> anyhow::Result<()> {
+    refresh_via_upgraded_binary_with_path(new_exe, runtime_dir, home_dir, had_shims, None)
+}
+
+pub(crate) fn refresh_via_upgraded_binary_with_path(
+    new_exe: &Path,
+    runtime_dir: &Path,
+    home_dir: &Path,
+    had_shims: bool,
+    path_override: Option<&std::ffi::OsStr>,
+) -> anyhow::Result<()> {
     let pass_enforce = had_shims && binary_supports_install_enforce(new_exe);
     let mut cmd = std::process::Command::new(new_exe);
     cmd.arg("--runtime-dir")
@@ -2570,7 +2591,7 @@ pub(crate) fn refresh_via_upgraded_binary(
         );
     }
     if had_shims && !pass_enforce {
-        install_enforced_shims(home_dir, false)?;
+        install_enforced_shims_with_path(home_dir, false, path_override)?;
     }
     Ok(())
 }
@@ -2810,9 +2831,9 @@ mod install_tests {
     use super::{
         client_configs_have_stale_tmp_runtime, detect_install_method, install_global_clients,
         install_shell_path_block, is_candidate_binary_regression, parse_semver_key,
-        refresh_via_upgraded_binary, replace_or_append_marked_block, run_uninstall, run_upgrade,
-        setup_agy_workspace, validate_release_tag, InstallMethod, UninstallOptions, UpgradeOptions,
-        CURRENT_VERSION, PATH_BLOCK_START,
+        refresh_via_upgraded_binary_with_path, replace_or_append_marked_block, run_uninstall,
+        run_upgrade, setup_agy_workspace, validate_release_tag, InstallMethod, UninstallOptions,
+        UpgradeOptions, CURRENT_VERSION, PATH_BLOCK_START,
     };
     use serde_json::json;
 
@@ -3404,10 +3425,23 @@ mod install_tests {
             "matching version with --enforce support must be accepted"
         );
 
+        let fake_bin = tmp.path().join("fake_bin");
+        std::fs::create_dir_all(&fake_bin).unwrap();
+        let fake_claude = fake_bin.join("claude");
+        std::fs::write(&fake_claude, "#!/bin/sh\nexit 0\n").unwrap();
+        std::fs::set_permissions(&fake_claude, std::fs::Permissions::from_mode(0o755)).unwrap();
+
         let home = tmp.path().join("home");
         let rt = home.join(".aegis");
         std::fs::create_dir_all(&home).unwrap();
-        refresh_via_upgraded_binary(&stale_same_ver_bin, &rt, &home, true).unwrap();
+        refresh_via_upgraded_binary_with_path(
+            &stale_same_ver_bin,
+            &rt,
+            &home,
+            true,
+            Some(fake_bin.as_os_str()),
+        )
+        .unwrap();
         assert!(
             home.join(".aegis/bin/claude").is_file(),
             "enforced shim must still be installed in-process when legacy binary lacks --enforce"
