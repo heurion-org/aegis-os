@@ -1829,7 +1829,9 @@ fn find_aegis_repo_root(start: &Path) -> Option<PathBuf> {
         if cli_manifest.is_file() {
             if let Ok(text) = std::fs::read_to_string(&cli_manifest) {
                 if text.contains("name = \"aos-cli\"") {
-                    return Some(ancestor.to_path_buf());
+                    return Some(
+                        std::fs::canonicalize(ancestor).unwrap_or_else(|_| ancestor.to_path_buf()),
+                    );
                 }
             }
         }
@@ -3296,6 +3298,20 @@ mod install_tests {
                 exe: src_bin.clone()
             }
         );
+        #[cfg(unix)]
+        {
+            let sym_repo = tmp.path().join("sym_repo");
+            std::os::unix::fs::symlink(&fake_repo, &sym_repo).unwrap();
+            let sym_bin = sym_repo.join("target/release/aegis-os");
+            assert_eq!(
+                detect_install_method(&sym_bin, tmp.path(), "auto", None).unwrap(),
+                InstallMethod::Source {
+                    repo_dir: std::fs::canonicalize(&fake_repo)
+                        .unwrap_or_else(|_| fake_repo.clone()),
+                    exe: sym_bin
+                }
+            );
+        }
 
         assert_eq!(
             detect_install_method(

@@ -19,7 +19,9 @@ jobs:
       - name: Install Rust toolchain
         run: |
           command -v rustup >/dev/null || curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y --profile minimal
+          export PATH="$HOME/.cargo/bin:$PATH"
           echo "$HOME/.cargo/bin" >> "$GITHUB_PATH"
+          rustup show active-toolchain >/dev/null 2>&1 || rustup default stable
 
       - name: Install bubblewrap & configure AppArmor userns (Linux)
         if: runner.os == 'Linux'
