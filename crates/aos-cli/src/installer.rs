@@ -1846,6 +1846,12 @@ pub(crate) fn detect_install_method(
                     });
                 }
             }
+            if let Some(repo) = find_aegis_repo_root(workspace) {
+                return Ok(InstallMethod::Source {
+                    repo_dir: std::fs::canonicalize(&repo).unwrap_or(repo),
+                    exe: canon,
+                });
+            }
             Ok(InstallMethod::SignedRelease { exe: canon })
         }
         other => anyhow::bail!(
@@ -2131,6 +2137,98 @@ fn resolve_signed_target_exe(current_exe: &Path) -> PathBuf {
     current_exe.to_path_buf()
 }
 
+pub(crate) fn probe_binary_version(bin: &Path) -> Option<String> {
+    let out = std::process::Command::new(bin).arg("--version").output().ok()?;
+    if !out.status.success() {
+        return None;
+    }
+    let text = String::from_utf8_lossy(&out.stdout);
+    for tok in text.split_whitespace() {
+        let cleaned =
+            tok.trim_matches(|c: char| !c.is_ascii_alphanumeric() && c != '.' && c != '-');
+        if parse_semver_key(cleaned).is_some() {
+            return Some(cleaned.strip_prefix('v').unwrap_or(cleaned).to_string());
+        }
+    }
+    None
+}
+
+pub(crate) fn binary_supports_install_enforce(bin: &Path) -> bool {
+    let Ok(out) = std::process::Command::new(bin)
+        .args(["install", "--help"])
+        .output()
+    else {
+        return false;
+    };
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    stdout.contains("--enforce") || stderr.contains("--enforce")
+}
+
+pub(crate) fn is_candidate_binary_regression(
+    cand_bin: &Path,
+    current_version: &str,
+    current_supports_enforce: bool,
+) -> Option<String> {
+    let cur_key = parse_semver_key(current_version);
+    let cand_ver = probe_binary_version(cand_bin);
+    let cand_key = cand_ver.as_deref().and_then(parse_semver_key);
+    let cand_enforce = binary_supports_install_enforce(cand_bin);
+
+    match (cur_key, cand_key) {
+        (Some(cur), Some(cand)) if cand < cur => Some(format!(
+            "candidate binary v{} is older than current v{}",
+            cand_ver.as_deref().unwrap_or("unknown"),
+            current_version
+        )),
+        (Some(cur), Some(cand)) if cand == cur && current_supports_enforce && !cand_enforce => {
+            Some(format!(
+                "candidate binary v{} lacks `install --enforce` support present in current build",
+                cand_ver.as_deref().unwrap_or(current_version)
+            ))
+        }
+        (_, None) if current_supports_enforce && !cand_enforce => Some(
+            "candidate binary version could not be probed and lacks `install --enforce` support"
+                .to_string(),
+        ),
+        _ => None,
+    }
+}
+
+fn sync_secondary_path_binaries(source_bin: &Path, primary_target: &Path) {
+    let mut search_dirs: Vec<PathBuf> = std::env::var_os("PATH")
+        .map(|p| std::env::split_paths(&p).collect())
+        .unwrap_or_default();
+    search_dirs.push(PathBuf::from("/opt/homebrew/bin"));
+    search_dirs.push(PathBuf::from("/usr/local/bin"));
+    if let Some(home) = std::env::var_os("HOME").map(PathBuf::from) {
+        search_dirs.push(home.join(".local/bin"));
+        search_dirs.push(home.join(".cargo/bin"));
+    }
+    let target_canon = std::fs::canonicalize(primary_target).ok();
+    let mut seen = std::collections::BTreeSet::new();
+    for dir in search_dirs {
+        let cand = dir.join("aegis-os");
+        let cand_s = cand.to_string_lossy();
+        if cand == primary_target
+            || is_volatile_tmp_path(&cand)
+            || cand_s.contains("/target/release/")
+            || cand_s.contains("/target/debug/")
+            || !seen.insert(cand.clone())
+        {
+            continue;
+        }
+        if target_canon.is_some()
+            && std::fs::canonicalize(&cand).ok().as_ref() == target_canon.as_ref()
+        {
+            continue;
+        }
+        if cand.is_file() {
+            let _ = atomic_install_binary(source_bin, &cand);
+        }
+    }
+}
+
 async fn perform_signed_release_upgrade(
     exe: &Path,
     tag: Option<&str>,
@@ -2170,33 +2268,72 @@ async fn perform_signed_release_upgrade(
     let work = tempfile::tempdir()?;
     let work_path = work.path().to_path_buf();
     let asset_owned = asset.to_string();
+    let enforce_expected = tag.is_none();
 
-    let (verified_bin, downloaded_from) = tokio::task::spawn_blocking(move || -> anyhow::Result<(PathBuf, String)> {
-        let agent = ureq::AgentBuilder::new()
-            .timeout(std::time::Duration::from_secs(45))
-            .build();
-        let bin_tmp = work_path.join(&asset_owned);
-        let sig_tmp = work_path.join(format!("{}.sig", asset_owned));
-        let mut last_err = None;
-        for base in &bases_owned {
-            let bin_url = format!("{}/{}", base, asset_owned);
-            let sig_url = format!("{}/{}.sig", base, asset_owned);
-            println!("==> Downloading `{}` from {} ...", asset_owned, base);
-            if let Err(err) = download_to_file(&agent, &bin_url, &bin_tmp)
-                .and_then(|_| download_to_file(&agent, &sig_url, &sig_tmp))
-            {
-                let _ = std::fs::remove_file(&bin_tmp);
-                let _ = std::fs::remove_file(&sig_tmp);
-                last_err = Some(err);
-                continue;
+    let downloaded = tokio::task::spawn_blocking(
+        move || -> anyhow::Result<Option<(PathBuf, String)>> {
+            let agent = ureq::AgentBuilder::new()
+                .timeout(std::time::Duration::from_secs(45))
+                .build();
+            let bin_tmp = work_path.join(&asset_owned);
+            let sig_tmp = work_path.join(format!("{}.sig", asset_owned));
+            let mut last_err = None;
+            let mut skipped_regression: Option<String> = None;
+            for base in &bases_owned {
+                let bin_url = format!("{}/{}", base, asset_owned);
+                let sig_url = format!("{}/{}.sig", base, asset_owned);
+                println!("==> Downloading `{}` from {} ...", asset_owned, base);
+                if let Err(err) = download_to_file(&agent, &bin_url, &bin_tmp)
+                    .and_then(|_| download_to_file(&agent, &sig_url, &sig_tmp))
+                {
+                    let _ = std::fs::remove_file(&bin_tmp);
+                    let _ = std::fs::remove_file(&sig_tmp);
+                    last_err = Some(err);
+                    continue;
+                }
+                println!("==> Verifying Ed25519 release signature ...");
+                verify_openssh_signature(&bin_tmp, &sig_tmp, &work_path)?;
+                #[cfg(unix)]
+                {
+                    use std::os::unix::fs::PermissionsExt;
+                    let _ =
+                        std::fs::set_permissions(&bin_tmp, std::fs::Permissions::from_mode(0o755));
+                }
+                if enforce_expected {
+                    if let Some(reason) =
+                        is_candidate_binary_regression(&bin_tmp, CURRENT_VERSION, true)
+                    {
+                        println!("  ! skipping {}: {} (trying next mirror)", base, reason);
+                        let _ = std::fs::remove_file(&bin_tmp);
+                        let _ = std::fs::remove_file(&sig_tmp);
+                        skipped_regression = Some(reason);
+                        continue;
+                    }
+                }
+                return Ok(Some((bin_tmp, base.clone())));
             }
-            println!("==> Verifying Ed25519 release signature ...");
-            verify_openssh_signature(&bin_tmp, &sig_tmp, &work_path)?;
-            return Ok((bin_tmp, base.clone()));
-        }
-        Err(last_err.unwrap_or_else(|| anyhow::anyhow!("no release download sources configured")))
-    })
+            if skipped_regression.is_some() && last_err.is_none() {
+                return Ok(None);
+            }
+            Err(last_err.unwrap_or_else(|| {
+                anyhow::anyhow!(
+                    "{}",
+                    skipped_regression
+                        .unwrap_or_else(|| "no release download sources configured".to_string())
+                )
+            }))
+        },
+    )
     .await??;
+
+    let Some((verified_bin, downloaded_from)) = downloaded else {
+        println!(
+            "==> Installed binary (v{}) is already newer than published release mirrors; keeping {} intact.",
+            CURRENT_VERSION,
+            target_exe.display()
+        );
+        return Ok(target_exe);
+    };
 
     atomic_install_binary(&verified_bin, &target_exe)?;
     println!(
@@ -2205,31 +2342,7 @@ async fn perform_signed_release_upgrade(
         target_exe.display()
     );
 
-    // Refresh any secondary writable `aegis-os` copies on PATH so an older binary never shadows it.
-    let mut search_dirs: Vec<PathBuf> = std::env::var_os("PATH")
-        .map(|p| std::env::split_paths(&p).collect())
-        .unwrap_or_default();
-    search_dirs.push(PathBuf::from("/opt/homebrew/bin"));
-    search_dirs.push(PathBuf::from("/usr/local/bin"));
-    if let Some(home) = std::env::var_os("HOME").map(PathBuf::from) {
-        search_dirs.push(home.join(".cargo/bin"));
-    }
-    let target_canon = std::fs::canonicalize(&target_exe).ok();
-    let mut seen = std::collections::BTreeSet::new();
-    for dir in search_dirs {
-        let cand = dir.join("aegis-os");
-        if cand == target_exe || is_volatile_tmp_path(&cand) || !seen.insert(cand.clone()) {
-            continue;
-        }
-        if target_canon.is_some()
-            && std::fs::canonicalize(&cand).ok().as_ref() == target_canon.as_ref()
-        {
-            continue;
-        }
-        if cand.is_file() {
-            let _ = atomic_install_binary(&verified_bin, &cand);
-        }
-    }
+    sync_secondary_path_binaries(&verified_bin, &target_exe);
 
     Ok(target_exe)
 }
@@ -2331,8 +2444,17 @@ fn perform_source_upgrade(
         anyhow::bail!("`cargo install` failed with status {}", status);
     }
     let cargo_bin = cargo_bin_aegis_path().unwrap_or_else(|| exe.to_path_buf());
-    if cargo_bin.is_file() && exe != cargo_bin && !is_volatile_tmp_path(exe) && exe.is_file() {
-        let _ = atomic_install_binary(&cargo_bin, exe);
+    if cargo_bin.is_file() {
+        let exe_s = exe.to_string_lossy();
+        if exe != cargo_bin
+            && !is_volatile_tmp_path(exe)
+            && !exe_s.contains("/target/release/")
+            && !exe_s.contains("/target/debug/")
+            && exe.is_file()
+        {
+            let _ = atomic_install_binary(&cargo_bin, exe);
+        }
+        sync_secondary_path_binaries(&cargo_bin, &cargo_bin);
     }
     Ok(cargo_bin)
 }
@@ -2418,6 +2540,41 @@ async fn run_upgrade_check(method: &InstallMethod, opts: &UpgradeOptions<'_>) ->
     Ok(())
 }
 
+pub(crate) fn refresh_via_upgraded_binary(
+    new_exe: &Path,
+    runtime_dir: &Path,
+    home_dir: &Path,
+    had_shims: bool,
+) -> anyhow::Result<()> {
+    let pass_enforce = had_shims && binary_supports_install_enforce(new_exe);
+    let mut cmd = std::process::Command::new(new_exe);
+    cmd.arg("--runtime-dir")
+        .arg(runtime_dir)
+        .arg("install")
+        .arg("--home-dir")
+        .arg(home_dir);
+    if pass_enforce {
+        cmd.arg("--enforce");
+    }
+    let status = cmd.status().with_context(|| {
+        format!(
+            "invoking upgraded binary `{}` to refresh client integrations",
+            new_exe.display()
+        )
+    })?;
+    if !status.success() {
+        anyhow::bail!(
+            "`{} install` exited with status {} after upgrade",
+            new_exe.display(),
+            status
+        );
+    }
+    if had_shims && !pass_enforce {
+        install_enforced_shims(home_dir, false)?;
+    }
+    Ok(())
+}
+
 /// Upgrade `aegis-os` (Homebrew, Source, Cargo, or Ed25519-signed release) and refresh client integrations.
 pub(crate) async fn run_upgrade(opts: UpgradeOptions<'_>) -> anyhow::Result<()> {
     if let Some(tag) = opts.tag {
@@ -2425,7 +2582,19 @@ pub(crate) async fn run_upgrade(opts: UpgradeOptions<'_>) -> anyhow::Result<()> 
     }
 
     let current_exe = std::env::current_exe().unwrap_or_else(|_| PathBuf::from("aegis-os"));
-    let method = detect_install_method(&current_exe, opts.workspace, opts.method, opts.source_dir)?;
+    let exe_str = current_exe.to_string_lossy();
+    let effective_method = if opts.method.trim().eq_ignore_ascii_case("auto")
+        && opts.tag.is_some()
+        && opts.source_dir.is_none()
+        && !exe_str.contains("/Cellar/aegis-os/")
+        && !exe_str.contains("/opt/homebrew/opt/aegis-os")
+    {
+        "release"
+    } else {
+        opts.method
+    };
+    let method =
+        detect_install_method(&current_exe, opts.workspace, effective_method, opts.source_dir)?;
 
     if opts.check {
         return run_upgrade_check(&method, &opts).await;
@@ -2483,25 +2652,7 @@ pub(crate) async fn run_upgrade(opts: UpgradeOptions<'_>) -> anyhow::Result<()> 
             "\n==> Refreshing client integrations via upgraded binary ({}) ...",
             new_exe.display()
         );
-        let mut cmd = std::process::Command::new(&new_exe);
-        cmd.arg("--runtime-dir")
-            .arg(opts.runtime_dir)
-            .arg("install")
-            .arg("--home-dir")
-            .arg(opts.home_dir);
-        if had_shims {
-            cmd.arg("--enforce");
-        }
-        let status = cmd
-            .status()
-            .with_context(|| format!("invoking upgraded binary `{}` to refresh client integrations", new_exe.display()))?;
-        if !status.success() {
-            anyhow::bail!(
-                "`{} install` exited with status {} after upgrade",
-                new_exe.display(),
-                status
-            );
-        }
+        refresh_via_upgraded_binary(&new_exe, opts.runtime_dir, opts.home_dir, had_shims)?;
     }
 
     Ok(())
@@ -2658,9 +2809,10 @@ aegis-os audit-me
 mod install_tests {
     use super::{
         client_configs_have_stale_tmp_runtime, detect_install_method, install_global_clients,
-        install_shell_path_block, parse_semver_key, replace_or_append_marked_block,
-        run_uninstall, run_upgrade, setup_agy_workspace, validate_release_tag, InstallMethod,
-        UninstallOptions, UpgradeOptions, PATH_BLOCK_START,
+        install_shell_path_block, is_candidate_binary_regression, parse_semver_key,
+        refresh_via_upgraded_binary, replace_or_append_marked_block, run_uninstall, run_upgrade,
+        setup_agy_workspace, validate_release_tag, InstallMethod, UninstallOptions, UpgradeOptions,
+        CURRENT_VERSION, PATH_BLOCK_START,
     };
     use serde_json::json;
 
@@ -3097,6 +3249,20 @@ mod install_tests {
 
         assert_eq!(
             detect_install_method(
+                Path::new("/Users/dev/.local/bin/aegis-os"),
+                &fake_repo,
+                "auto",
+                None
+            )
+            .unwrap(),
+            InstallMethod::Source {
+                repo_dir: std::fs::canonicalize(&fake_repo).unwrap_or_else(|_| fake_repo.clone()),
+                exe: PathBuf::from("/Users/dev/.local/bin/aegis-os")
+            }
+        );
+
+        assert_eq!(
+            detect_install_method(
                 Path::new("/usr/local/bin/aegis-os"),
                 tmp.path(),
                 "auto",
@@ -3191,6 +3357,61 @@ mod install_tests {
             .unwrap();
         assert_eq!(rt_arg, rt.to_string_lossy());
         assert_ne!(rt_arg, "/tmp/aegis-os-runtime");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn upgrade_blocks_regressed_binary_and_falls_back_when_enforce_flag_missing() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let tmp = tempfile::tempdir().unwrap();
+        let make_mock_bin = |name: &str, script: &str| -> PathBuf {
+            let p = tmp.path().join(name);
+            std::fs::write(&p, script).unwrap();
+            std::fs::set_permissions(&p, std::fs::Permissions::from_mode(0o755)).unwrap();
+            p
+        };
+
+        let older_ver_bin = make_mock_bin(
+            "aegis-old",
+            "#!/bin/sh\nif [ \"$1\" = \"--version\" ]; then\n  echo \"aegis-os 0.4.5\"\n  exit 0\nfi\necho \"Usage: aegis-os install --home-dir <HOME_DIR>\"\nexit 0\n",
+        );
+        let stale_same_ver_bin = make_mock_bin(
+            "aegis-stale-same",
+            &format!(
+                "#!/bin/sh\nif [ \"$1\" = \"--version\" ]; then\n  echo \"aegis-os {ver}\"\n  exit 0\nfi\necho \"Usage: aegis-os install --home-dir <HOME_DIR>\"\nfor a in \"$@\"; do\n  if [ \"$a\" = \"--enforce\" ]; then\n    echo \"error: unexpected argument '--enforce' found\" >&2\n    exit 2\n  fi\ndone\nexit 0\n",
+                ver = CURRENT_VERSION
+            ),
+        );
+        let current_bin = make_mock_bin(
+            "aegis-cur",
+            &format!(
+                "#!/bin/sh\nif [ \"$1\" = \"--version\" ]; then\n  echo \"aegis-os {ver}\"\n  exit 0\nfi\necho \"Usage: aegis-os install --home-dir <HOME_DIR> --enforce\"\nexit 0\n",
+                ver = CURRENT_VERSION
+            ),
+        );
+
+        assert!(
+            is_candidate_binary_regression(&older_ver_bin, CURRENT_VERSION, true).is_some(),
+            "older release version must be flagged as regression"
+        );
+        assert!(
+            is_candidate_binary_regression(&stale_same_ver_bin, CURRENT_VERSION, true).is_some(),
+            "same-version release lacking --enforce must be flagged as regression"
+        );
+        assert!(
+            is_candidate_binary_regression(&current_bin, CURRENT_VERSION, true).is_none(),
+            "matching version with --enforce support must be accepted"
+        );
+
+        let home = tmp.path().join("home");
+        let rt = home.join(".aegis");
+        std::fs::create_dir_all(&home).unwrap();
+        refresh_via_upgraded_binary(&stale_same_ver_bin, &rt, &home, true).unwrap();
+        assert!(
+            home.join(".aegis/bin/claude").is_file(),
+            "enforced shim must still be installed in-process when legacy binary lacks --enforce"
+        );
     }
 
     use std::path::{Path, PathBuf};
