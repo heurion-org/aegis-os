@@ -7003,11 +7003,53 @@ mod tests {
         }
     }
 
+    #[cfg(unix)]
+    #[test]
+    fn bwrap_bind_fd_probe_rejects_legacy_bubblewrap_help() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let tmp = tempfile::tempdir().unwrap();
+        let legacy = tmp.path().join("bwrap-0.6.1");
+        std::fs::write(
+            &legacy,
+            "#!/bin/sh\necho 'usage: bwrap [OPTIONS...] [--] COMMAND [ARGS...]\n  --ro-bind SRC DEST\n  --bind SRC DEST'\n",
+        )
+        .unwrap();
+        std::fs::set_permissions(&legacy, std::fs::Permissions::from_mode(0o755)).unwrap();
+        assert!(!bwrap_supports_bind_fd(&legacy));
+
+        let modern = tmp.path().join("bwrap-0.10.0");
+        std::fs::write(
+            &modern,
+            "#!/bin/sh\necho 'usage: bwrap [OPTIONS...] [--] COMMAND [ARGS...]\n  --bind-fd FD DEST\n  --ro-bind-fd FD DEST'\n",
+        )
+        .unwrap();
+        std::fs::set_permissions(&modern, std::fs::Permissions::from_mode(0o755)).unwrap();
+        assert!(bwrap_supports_bind_fd(&modern));
+    }
+
     #[cfg(target_os = "linux")]
     #[tokio::test]
     async fn enforced_run_keeps_project_writes_in_shadow() {
-        if aos_sandbox::linux_bwrap_path().is_none() {
+        if std::env::var_os("AOS_SESSION_ID").is_some()
+            || std::env::var("AOS_CONTROL_SOCKET").is_ok_and(|s| !s.trim().is_empty())
+        {
+            eprintln!("skipping: running inside an active Aegis session");
+            return;
+        }
+        let Some(bwrap) = aos_sandbox::linux_bwrap_path().map(Path::new) else {
             eprintln!("skipping: bubblewrap is not installed");
+            return;
+        };
+        if !bwrap_supports_bind_fd(bwrap) {
+            eprintln!(
+                "skipping: {} lacks --bind-fd/--ro-bind-fd (need bubblewrap >= 0.9.0)",
+                bwrap.display()
+            );
+            return;
+        }
+        if let Err(reason) = probe_bwrap_userns(bwrap) {
+            eprintln!("skipping: bubblewrap userns unavailable ({reason})");
             return;
         }
 
