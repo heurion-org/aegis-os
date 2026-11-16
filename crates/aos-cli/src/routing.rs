@@ -264,7 +264,6 @@ const RUNTIME_STATE_MARKERS: &[&str] = &[
     "/aegis-os-runtime/audit.jsonl",
     "/aegis-os-runtime/routing_decisions.jsonl",
     "/aegis-os-runtime/stop_budgets.json",
-    "/.aegis/",
     "/human.token",
     "/agent.token",
     "/approval.json",
@@ -409,8 +408,76 @@ fn json_str(s: &str) -> String {
     serde_json::to_string(s).unwrap_or_else(|_| format!("\"{}\"", s))
 }
 
+pub fn is_binary_artifact_path(path: &Path) -> bool {
+    let Some(ext) = path.extension().and_then(|e| e.to_str()) else {
+        return false;
+    };
+    matches!(
+        ext.to_ascii_lowercase().as_str(),
+        "pdf"
+            | "png"
+            | "jpg"
+            | "jpeg"
+            | "gif"
+            | "webp"
+            | "ico"
+            | "bmp"
+            | "tiff"
+            | "zip"
+            | "tar"
+            | "gz"
+            | "tgz"
+            | "bz2"
+            | "xz"
+            | "zst"
+            | "7z"
+            | "wasm"
+            | "whl"
+            | "jar"
+            | "pyc"
+            | "class"
+            | "o"
+            | "a"
+            | "so"
+            | "dylib"
+            | "dll"
+            | "exe"
+            | "bin"
+            | "parquet"
+            | "feather"
+            | "arrow"
+            | "sqlite"
+            | "sqlite3"
+            | "db"
+            | "onnx"
+            | "pt"
+            | "pth"
+            | "safetensors"
+            | "gguf"
+            | "npz"
+            | "npy"
+            | "mp3"
+            | "mp4"
+            | "mov"
+            | "avi"
+            | "mkv"
+            | "wav"
+            | "flac"
+            | "ogg"
+            | "docx"
+            | "xlsx"
+            | "pptx"
+            | "epub"
+            | "woff"
+            | "woff2"
+            | "ttf"
+            | "otf"
+    )
+}
+
 pub fn sandbox_redirect_reason(cmd: &str, shadow_root: &Path, host_root: &Path) -> String {
-    let git_hint = if split_segments(cmd)
+    let segments = split_segments(cmd);
+    let git_hint = if segments
         .iter()
         .any(|s| leading_words(s).1.first().map(|w| basename(w) == "git").unwrap_or(false))
     {
@@ -421,11 +488,38 @@ pub fn sandbox_redirect_reason(cmd: &str, shadow_root: &Path, host_root: &Path) 
     } else {
         String::new()
     };
+    let export_hint = if segments.iter().any(|s| {
+        leading_words(s)
+            .1
+            .first()
+            .map(|w| {
+                matches!(
+                    basename(w),
+                    "cp"
+                        | "mv"
+                        | "install"
+                        | "rsync"
+                        | "tectonic"
+                        | "pdflatex"
+                        | "xelatex"
+                        | "lualatex"
+                        | "latexmk"
+                        | "pandoc"
+                )
+            })
+            .unwrap_or(false)
+    }) || cmd.to_ascii_lowercase().contains(".pdf")
+    {
+        "\nTip: to export a compiled binary/PDF from the shadow workspace to an external host path in zero tokens, call mcp_aegis-os_fs_export_file {\"src_path\":\"<rel_in_shadow>\",\"dst_host_path\":\"/abs/host/path\"} (or switch active workspace via mcp_aegis-os_workspace_switch {\"path\":\"/abs/project/dir\"})."
+    } else {
+        ""
+    };
     format!(
-        "[Aegis OS routing] Native shell is disabled for in-repo work in this workspace. Re-issue it via MCP (zero prompts, kernel-sandboxed):\n  mcp_aegis-os_proc_exec {{\"command\":\"sh\",\"args\":[\"-c\",{}]}}\ncwd = your CoW shadow workspace ({}); host files stay readable by absolute path; writes land in the shadow and reach the host only via workspace_commit.{}",
+        "[Aegis OS routing] Native shell is disabled for in-repo work in this workspace. Re-issue it via MCP (zero prompts, kernel-sandboxed):\n  mcp_aegis-os_proc_exec {{\"command\":\"sh\",\"args\":[\"-c\",{}]}}\ncwd = your CoW shadow workspace ({}); host files stay readable by absolute path; writes land in the shadow and reach the host only via workspace_commit.{}{}",
         json_str(cmd),
         shadow_root.display(),
-        git_hint
+        git_hint,
+        export_hint
     )
 }
 
@@ -581,15 +675,34 @@ pub fn canonicalize_lossy(p: &Path) -> PathBuf {
 /// host build artifacts or executables outside the CoW shadow transaction.
 const NATIVE_WRITE_ALLOWED_DIRS: &[&str] = &[".gemini", ".antigravity", "brain"];
 
-fn is_protected_runtime_state_path(raw: &str, canonical: &str) -> bool {
-    if RUNTIME_STATE_MARKERS
-        .iter()
-        .any(|m| raw.contains(m) || canonical.contains(m))
-    {
-        return true;
+fn strip_nested_test_tmpdir(s: &str) -> &str {
+    if std::env::var("AEGIS_ALLOW_NESTED_TEST_SANDBOX").as_deref() != Ok("1") {
+        return s;
     }
+    let Some(idx) = s.find("/agent_home/.tmp") else {
+        return s;
+    };
+    let rest = &s[idx + "/agent_home/".len()..];
+    match rest.find('/') {
+        Some(slash) => &rest[slash..],
+        None => "",
+    }
+}
+
+fn is_protected_runtime_state_path(raw: &str, canonical: &str) -> bool {
     for s in [raw, canonical] {
-        if let Some((_, after)) = s.split_once("/aegis-os-runtime/") {
+        let s_checked = strip_nested_test_tmpdir(s);
+        if RUNTIME_STATE_MARKERS.iter().any(|m| s_checked.contains(m)) {
+            return true;
+        }
+        if s_checked.contains("/.aegis/")
+            && !s_checked.contains("/cow_workspace/upper_workspace/")
+            && !s_checked.contains("/.gemini/antigravity-cli/brain/")
+            && !(s_checked.contains("/orgs/") && s_checked.contains("/cas/"))
+        {
+            return true;
+        }
+        if let Some((_, after)) = s_checked.split_once("/aegis-os-runtime/") {
             if !after.contains('/') || after.starts_with("paas_workspaces/") {
                 return true;
             }
@@ -680,6 +793,21 @@ pub fn classify_native_write(path: &Path, repo_root: &Path) -> Route {
         return Route::Pass;
     }
     let Ok(rel) = target.strip_prefix(&root) else {
+        if is_binary_artifact_path(&target) {
+            let parent = target
+                .parent()
+                .unwrap_or(Path::new("/"))
+                .to_string_lossy()
+                .into_owned();
+            let dst = target.to_string_lossy().into_owned();
+            return Route::RedirectToMcpFs {
+                reason: format!(
+                    "[Aegis OS routing] Native binary/artifact writes outside the active repository are disabled (never hex/ASCII-encode binaries through write_file). Produce the file inside the sandbox via mcp_aegis-os_proc_exec and export it in zero tokens with:\n  mcp_aegis-os_fs_export_file {{\"src_path\":\"<rel_in_shadow>\",\"dst_host_path\":{dst}}}\nor switch active workspace to the target project first via:\n  mcp_aegis-os_workspace_switch {{\"path\":{parent}}}",
+                    dst = json_str(&dst),
+                    parent = json_str(&parent)
+                ),
+            };
+        }
         return Route::HostBoundary {
             reason: format!(
                 "[Aegis OS Host File Write Approval]\n  • What this does: Modify `{}` outside your active repository (`{}`).\n  • Why confirmation is required: Target path lies outside the isolated CoW shadow workspace.",
@@ -700,6 +828,14 @@ pub fn classify_native_write(path: &Path, repo_root: &Path) -> Route {
         return Route::Pass;
     }
     let rel_s = rel.to_string_lossy();
+    if is_binary_artifact_path(&target) {
+        return Route::RedirectToMcpFs {
+            reason: format!(
+                "[Aegis OS routing] Native binary/artifact writes inside the repository are disabled (they bypass the CoW transaction and are unattributed). Generate the file in the sandbox via mcp_aegis-os_proc_exec or write base64 bytes via:\n  mcp_aegis-os_fs_write {{\"path\":{rel},\"content\":\"<base64>\",\"encoding\":\"base64\"}}\nThen land it on the host with mcp_aegis-os_workspace_commit (or export externally via mcp_aegis-os_fs_export_file).",
+                rel = json_str(&rel_s)
+            ),
+        };
+    }
     Route::RedirectToMcpFs {
         reason: format!(
             "[Aegis OS routing] Native file writes inside the repository are disabled (they bypass the CoW transaction and are unattributed). Use MCP instead (zero prompts):\n  mcp_aegis-os_fs_write {{\"path\":{rel},\"content\":...}}  or  mcp_aegis-os_fs_edit {{\"path\":{rel},\"target\":...,\"replacement\":...}}\nRead the current version with mcp_aegis-os_fs_read {{\"path\":{rel}}}. Land changes on the host with mcp_aegis-os_workspace_commit when the task is done.",
@@ -971,6 +1107,54 @@ mod tests {
             )
             .kind(),
             "pass"
+        );
+    }
+
+    #[test]
+    fn binary_artifact_writes_redirect_to_zero_copy_export_instead_of_host_ask() {
+        let repo = tempfile::tempdir().unwrap();
+        let root = repo.path();
+
+        let ext_pdf =
+            classify_native_write(Path::new("/Users/alice/workspace/SYLVA/paper/main.pdf"), root);
+        assert_eq!(ext_pdf.kind(), "redirect_mcp_fs");
+        let Route::RedirectToMcpFs { reason: ext_reason } = ext_pdf else {
+            panic!()
+        };
+        assert!(ext_reason.contains("mcp_aegis-os_fs_export_file"), "{ext_reason}");
+        assert!(
+            ext_reason.contains("mcp_aegis-os_workspace_switch"),
+            "{ext_reason}"
+        );
+
+        let in_pdf = classify_native_write(&root.join("paper/main.pdf"), root);
+        assert_eq!(in_pdf.kind(), "redirect_mcp_fs");
+        let Route::RedirectToMcpFs { reason: in_reason } = in_pdf else {
+            panic!()
+        };
+        assert!(in_reason.contains("\"paper/main.pdf\""), "{in_reason}");
+        assert!(
+            in_reason.contains(r#""encoding":"base64""#)
+                && in_reason.contains("mcp_aegis-os_proc_exec"),
+            "{in_reason}"
+        );
+
+        assert_eq!(
+            classify_native_write(Path::new("/srv/elsewhere/outside.txt"), root).kind(),
+            "host_boundary_ask"
+        );
+
+        let cp_cmd = classify_run_command(
+            "cp build/main.pdf /Users/alice/SYLVA/paper/main.pdf",
+            &shadow(),
+            root,
+        );
+        let Route::RedirectToSandbox { reason: cmd_reason } = cp_cmd else {
+            panic!()
+        };
+        assert!(
+            cmd_reason.contains("mcp_aegis-os_fs_export_file"),
+            "{cmd_reason}"
         );
     }
 }

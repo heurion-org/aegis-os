@@ -2163,10 +2163,13 @@ pub async fn serve_unified_stdio(
     let session_key = auto_agent_client
         .as_ref()
         .and_then(|_| aos_core::session::client_session_key());
+    let ws_session_key = session_key.or_else(aos_core::session::client_session_key);
     let stdin = tokio::io::stdin();
     let mut stdout = tokio::io::stdout();
     let mut reader = BufReader::new(stdin).lines();
-    let mut active_workspace = kernel.resolve_workspace_fallback(&initial_workspace);
+    let mut base_workspace = initial_workspace;
+    let mut active_workspace =
+        kernel.resolve_workspace_for_session(&base_workspace, ws_session_key.as_ref());
     let mut last_local_sync_ms = Utc::now().timestamp_millis();
     if auto_org {
         if let Some(name) = active_workspace.file_name() {
@@ -2196,14 +2199,34 @@ pub async fn serve_unified_stdio(
                 if let Some(ws_from_init) =
                     AegisRuntimeKernel::extract_workspace_from_init_params(params)
                 {
-                    active_workspace = ws_from_init;
-                    let _ = std::fs::write(
-                        runtime_dir.join("active_workspace.txt"),
-                        active_workspace.to_string_lossy().as_bytes(),
+                    base_workspace = ws_from_init;
+                    if ws_session_key.is_none() {
+                        let _ = std::fs::write(
+                            runtime_dir.join("active_workspace.txt"),
+                            base_workspace.to_string_lossy().as_bytes(),
+                        );
+                    }
+                }
+            }
+            active_workspace =
+                kernel.resolve_workspace_for_session(&base_workspace, ws_session_key.as_ref());
+            if let Some(key) = ws_session_key.as_ref() {
+                if aos_core::session::resolve_workspace_binding_for_key(&runtime_dir, key)
+                    .is_none()
+                {
+                    let client_label = auto_agent_client.as_deref().unwrap_or("mcp-client");
+                    aos_core::session::bind_workspace_for_key(
+                        &runtime_dir,
+                        client_label,
+                        key,
+                        None,
+                        &active_workspace,
+                        AegisRuntimeKernel::is_umbrella_parent_dir(&base_workspace)
+                            .then_some(base_workspace.as_path()),
+                        false,
                     );
                 }
             }
-            active_workspace = kernel.resolve_workspace_fallback(&active_workspace);
             if auto_org {
                 if let Some(name) = active_workspace.file_name() {
                     let name_str = name.to_string_lossy().to_string();
@@ -2245,7 +2268,8 @@ pub async fn serve_unified_stdio(
             continue;
         }
 
-        active_workspace = kernel.resolve_workspace_fallback(&active_workspace);
+        active_workspace =
+            kernel.resolve_workspace_for_session(&base_workspace, ws_session_key.as_ref());
         if auto_org {
             if let Some(name) = active_workspace.file_name() {
                 let name_str = name.to_string_lossy().to_string();
@@ -2590,7 +2614,7 @@ pub async fn serve_unified_stdio(
                     // 1. If the user already approved `workspace_commit` inside the IDE chat window
                     //    via the `PreToolUse` hook (`decision: "ask"`), consume the ticket and complete
                     //    all `workspace_commit_sensitive` + `workspace_commit` escalations in this batch!
-                    if tool_name == "workspace_commit"
+                    if matches!(tool_name, "workspace_commit" | "fs_export_file")
                         && consume_hook_commit_ticket(&runtime_dir, &identity.org_id)
                     {
                         let mut cur_esc = Some(esc_id);

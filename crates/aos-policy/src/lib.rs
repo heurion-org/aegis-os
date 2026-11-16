@@ -359,10 +359,25 @@ impl AegisPolicyKernel {
         changed
     }
 
+    fn strip_nested_test_tmpdir(s: &str) -> &str {
+        if std::env::var("AEGIS_ALLOW_NESTED_TEST_SANDBOX").as_deref() != Ok("1") {
+            return s;
+        }
+        let Some(idx) = s.find("/agent_home/.tmp") else {
+            return s;
+        };
+        let rest = &s[idx + "/agent_home/".len()..];
+        match rest.find('/') {
+            Some(slash) => &rest[slash..],
+            None => "",
+        }
+    }
+
     /// Returns true if a relative workspace path can trigger automatic code execution on the host
     /// during git operations, directory entry (`direnv`), CI runs, or build-system invocation
     /// (`build.rs`, `Makefile`, `package.json`, `.cargo/config.toml`, `.vscode/tasks.json`).
     pub fn is_commit_poisoning_path(p: &str) -> bool {
+        let p = Self::strip_nested_test_tmpdir(p);
         let norm = p.trim_start_matches("./").trim_start_matches('/');
         let file_name = norm.rsplit('/').next().unwrap_or(norm);
         norm.starts_with(".git/")
@@ -623,16 +638,51 @@ impl PolicyEngine for AegisPolicyKernel {
         }
 
         // 2. Hard Red-Line Sensitive Host Resource Check:
+        let redline_target = Self::strip_nested_test_tmpdir(&ctx.target_resource);
         for forbidden in &self.forbidden_host_prefixes {
-            if ctx.target_resource.starts_with(forbidden)
-                || ctx.target_resource.contains("/.ssh/")
-                || ctx.target_resource.contains("/.aws/")
-                || ctx.target_resource.contains("/.gnupg/")
-                || ctx.target_resource.contains("/.kube/")
+            if redline_target.starts_with(forbidden)
+                || redline_target.contains("/.ssh/")
+                || redline_target.contains("/.aws/")
+                || redline_target.contains("/.gnupg/")
+                || redline_target.contains("/.kube/")
+                || redline_target.ends_with("/.ssh")
+                || redline_target.ends_with("/.aws")
+                || redline_target.ends_with("/.gnupg")
+                || redline_target.ends_with("/.kube")
             {
                 return Ok(PolicyDecision::Deny {
                     reason: format!(
                         "Access to protected host path '{}' is strictly forbidden by Aegis OS Host Red-Line policy",
+                        ctx.target_resource
+                    ),
+                });
+            }
+        }
+
+        // 2a. Hard Red-Line & Poisoning Guard for `fs_export_file` (runs before lease matching so
+        // even a wildcard lease can never export over git hooks, client configs, or build scripts).
+        if ctx.action == "fs_export_file" {
+            let res = Self::strip_nested_test_tmpdir(ctx.target_resource.as_str());
+            let poisoned = Self::is_commit_poisoning_path(res)
+                || [
+                    "/.git/",
+                    "/.gemini/",
+                    "/.claude/",
+                    "/.codex/",
+                    "/.cursor/",
+                    "/.opencode/",
+                    "/.hermes/",
+                    "/.aegis/",
+                    "/.agents/hooks.json",
+                    "/hooks.json",
+                    "/mcp_config.json",
+                ]
+                .iter()
+                .any(|marker| res.contains(marker));
+            if poisoned {
+                return Ok(PolicyDecision::Deny {
+                    reason: format!(
+                        "Exporting to protected or build/hook-sensitive host path '{}' is strictly forbidden by Aegis OS policy",
                         ctx.target_resource
                     ),
                 });
@@ -740,6 +790,19 @@ impl PolicyEngine for AegisPolicyKernel {
             });
         }
 
+        // 3b. Zero-prompt workspace switching strictly within the session's umbrella root:
+        if ctx.action == "workspace_switch"
+            && ctx
+                .metadata
+                .get("within_umbrella")
+                .and_then(|v| v.as_bool())
+                == Some(true)
+        {
+            return Ok(PolicyDecision::Allow {
+                matched_rule: "aegis:umbrella:child_workspace_switch_allow".to_string(),
+            });
+        }
+
         // 4. Evaluate Declarative Cedar `permit` Rules (`policy/default.cedar` + custom Cedar policies):
         if matches!(ctx.action.as_str(), "proc_exec" | "proc_manage") {
             if let Some(cmd) = ctx.metadata.get("command").and_then(|v| v.as_str()) {
@@ -809,6 +872,49 @@ impl PolicyEngine for AegisPolicyKernel {
                         ctx.principal.agent_id, files_desc, host_label
                     ),
                     "action=workspace_commit, resource=*".to_string(),
+                )
+                .await
+            }
+
+            "fs_export_file" => {
+                let src_label = ctx
+                    .metadata
+                    .get("src_path")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("artifact");
+                let size_bytes = ctx
+                    .metadata
+                    .get("size_bytes")
+                    .and_then(|v| v.as_u64())
+                    .unwrap_or(0);
+                let content_type = ctx
+                    .metadata
+                    .get("content_type")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("application/octet-stream");
+                self.record_escalation(
+                    ctx,
+                    format!(
+                        "Agent '{}' requests to export file '{}' ({} bytes, {}) to host path '{}'",
+                        ctx.principal.agent_id,
+                        src_label,
+                        size_bytes,
+                        content_type,
+                        ctx.target_resource
+                    ),
+                    format!("action=fs_export_file, resource={}", ctx.target_resource),
+                )
+                .await
+            }
+
+            "workspace_switch" => {
+                self.record_escalation(
+                    ctx,
+                    format!(
+                        "Agent '{}' requests to switch active CoW workspace outside initial scope to '{}'",
+                        ctx.principal.agent_id, ctx.target_resource
+                    ),
+                    format!("action=workspace_switch, resource={}", ctx.target_resource),
                 )
                 .await
             }
@@ -937,6 +1043,8 @@ impl PolicyEngine for AegisPolicyKernel {
             now_ms + (ttl_secs * 1000)
         };
         let base_resource_pattern = if target.action == "workspace_commit_sensitive"
+            || target.action == "fs_export_file"
+            || target.action == "workspace_switch"
             || target.action == "egress_unlisted_domain"
             || target.action == "mcp_mount_server"
             || target.action == "org_artifact_fetch"
@@ -1690,5 +1798,148 @@ mod tests {
         let list = kernel.list_escalations("acme").await.unwrap();
         let item = list.iter().find(|e| e.escalation_id == expired_esc).unwrap();
         assert_eq!(item.status, EscalationStatus::Expired);
+    }
+
+    #[tokio::test]
+    async fn fs_export_file_pins_destination_and_evidence_and_blocks_redline_even_with_wildcard_lease() {
+        let kernel = AegisPolicyKernel::new();
+        let agent = AgentIdentity::new("acme", "coder-1", "Senior Engineer");
+
+        // Even a wildcard lease for fs_export_file must never permit exporting over hooks/keys/build scripts.
+        kernel
+            .grant_lease(LeaseGrant {
+                lease_id: "lease-wildcard".to_string(),
+                org_id: "acme".to_string(),
+                agent_id: "coder-1".to_string(),
+                action_pattern: "fs_export_file".to_string(),
+                resource_pattern: "*".to_string(),
+                expires_at_ms: Utc::now().timestamp_millis() + 60_000,
+                granted_by: "user".to_string(),
+                kind: LeaseKind::Ttl,
+                task_id: None,
+            })
+            .await
+            .unwrap();
+
+        for forbidden in [
+            "/Users/alice/.ssh/authorized_keys",
+            "/Users/alice/repo/.git/hooks/pre-commit",
+            "/Users/alice/repo/build.rs",
+            "/Users/alice/.gemini/config/hooks.json",
+        ] {
+            let deny_ctx = PolicyContext {
+                principal: agent.clone(),
+                action: "fs_export_file".to_string(),
+                target_org_id: "acme".to_string(),
+                target_resource: forbidden.to_string(),
+                metadata: json!({}),
+            };
+            assert!(
+                matches!(
+                    kernel.evaluate(&deny_ctx).await.unwrap(),
+                    PolicyDecision::Deny { .. }
+                ),
+                "expected Deny for {forbidden}"
+            );
+        }
+
+        // Now test a clean kernel without wildcard lease for One-Shot pinning.
+        let clean_kernel = AegisPolicyKernel::new();
+        let hash_good = "aaaa1111aaaa1111aaaa1111aaaa1111aaaa1111aaaa1111aaaa1111aaaa1111";
+        let hash_bad = "bbbb2222bbbb2222bbbb2222bbbb2222bbbb2222bbbb2222bbbb2222bbbb2222";
+        let export_ctx = PolicyContext {
+            principal: agent.clone(),
+            action: "fs_export_file".to_string(),
+            target_org_id: "acme".to_string(),
+            target_resource: "/Users/alice/workspace/SYLVA/paper/main.pdf".to_string(),
+            metadata: json!({
+                "src_path": "$TMPDIR/main.pdf",
+                "size_bytes": 185941,
+                "content_type": "application/pdf",
+                "evidence_hash": hash_good
+            }),
+        };
+        let esc_id = match clean_kernel.evaluate(&export_ctx).await.unwrap() {
+            PolicyDecision::Ask { escalation_id, reason, .. } => {
+                assert!(reason.contains("185941 bytes"), "{reason}");
+                assert!(reason.contains("application/pdf"), "{reason}");
+                escalation_id
+            }
+            other => panic!("Expected Ask, got {other:?}"),
+        };
+
+        let lease = clean_kernel
+            .approve_escalation(&esc_id, 0, "dev-lead")
+            .await
+            .unwrap();
+        assert_eq!(lease.kind, LeaseKind::OneShot);
+        assert_eq!(
+            lease.resource_pattern,
+            format!("/Users/alice/workspace/SYLVA/paper/main.pdf#sha256:{hash_good}")
+        );
+
+        // Different destination or swapped evidence hash must NOT match.
+        let other_dst = PolicyContext {
+            target_resource: "/Users/alice/workspace/SYLVA/paper/other.pdf".to_string(),
+            ..export_ctx.clone()
+        };
+        assert!(matches!(
+            clean_kernel.evaluate(&other_dst).await.unwrap(),
+            PolicyDecision::Ask { .. }
+        ));
+        let swapped_hash = PolicyContext {
+            metadata: json!({ "evidence_hash": hash_bad }),
+            ..export_ctx.clone()
+        };
+        assert!(matches!(
+            clean_kernel.evaluate(&swapped_hash).await.unwrap(),
+            PolicyDecision::Ask { .. }
+        ));
+
+        // Exact destination + evidence hash matches once, then consumes the One-Shot lease.
+        assert!(matches!(
+            clean_kernel.evaluate(&export_ctx).await.unwrap(),
+            PolicyDecision::Allow { .. }
+        ));
+        assert!(matches!(
+            clean_kernel.evaluate(&export_ctx).await.unwrap(),
+            PolicyDecision::Ask { .. }
+        ));
+    }
+
+    #[tokio::test]
+    async fn workspace_switch_auto_allows_within_umbrella_and_escalates_outside() {
+        let kernel = AegisPolicyKernel::new();
+        let agent = AgentIdentity::new("aegis-os", "agy-1", "Lead");
+
+        let inside_ctx = PolicyContext {
+            principal: agent.clone(),
+            action: "workspace_switch".to_string(),
+            target_org_id: "aegis-os".to_string(),
+            target_resource: "/Users/alice/workspace/SYLVA".to_string(),
+            metadata: json!({ "within_umbrella": true }),
+        };
+        assert!(matches!(
+            kernel.evaluate(&inside_ctx).await.unwrap(),
+            PolicyDecision::Allow { .. }
+        ));
+
+        let outside_ctx = PolicyContext {
+            principal: agent,
+            action: "workspace_switch".to_string(),
+            target_org_id: "aegis-os".to_string(),
+            target_resource: "/Users/alice/other/repo".to_string(),
+            metadata: json!({ "within_umbrella": false }),
+        };
+        let esc_id = match kernel.evaluate(&outside_ctx).await.unwrap() {
+            PolicyDecision::Ask { escalation_id, .. } => escalation_id,
+            other => panic!("Expected Ask, got {other:?}"),
+        };
+        let lease = kernel.approve_escalation(&esc_id, 600, "dev-lead").await.unwrap();
+        assert_eq!(lease.resource_pattern, "/Users/alice/other/repo");
+        assert!(matches!(
+            kernel.evaluate(&outside_ctx).await.unwrap(),
+            PolicyDecision::Allow { .. }
+        ));
     }
 }

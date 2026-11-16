@@ -23,9 +23,10 @@ use aos_sandbox::{MicroVmSandboxDriver, NativeOsSandboxDriver};
 use aos_vfs::vault::{OrgVaultManager, VaultStatus};
 use aos_vfs::{CoWWorkspace, OrgCasAndKvStore};
 use anyhow::{bail, Context};
+use base64::Engine as _;
 use chrono::Utc;
 use hmac::{Hmac, Mac};
-use sha2::Sha256;
+use sha2::{Digest, Sha256};
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use std::collections::HashMap;
@@ -100,6 +101,440 @@ fn shadow_path_for_read(root: &Path, host_root: &Path, rel: &str) -> anyhow::Res
     Ok((rel_path.to_string_lossy().into_owned(), real))
 }
 
+const MAX_BINARY_EXPORT_BYTES: u64 = 128 * 1024 * 1024;
+const MAX_INLINE_ARTIFACT_FETCH_BYTES: usize = 32 * 1024;
+
+fn infer_mime_type(path: &Path) -> &'static str {
+    match path
+        .extension()
+        .and_then(|s| s.to_str())
+        .unwrap_or("")
+        .to_ascii_lowercase()
+        .as_str()
+    {
+        "pdf" => "application/pdf",
+        "png" => "image/png",
+        "jpg" | "jpeg" => "image/jpeg",
+        "gif" => "image/gif",
+        "webp" => "image/webp",
+        "tiff" | "tif" => "image/tiff",
+        "svg" => "image/svg+xml",
+        "zip" => "application/zip",
+        "tar" => "application/x-tar",
+        "gz" | "tgz" => "application/gzip",
+        "parquet" => "application/vnd.apache.parquet",
+        "sqlite" | "db" => "application/vnd.sqlite3",
+        "docx" => "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+        "pptx" => "application/vnd.openxmlformats-officedocument.presentationml.presentation",
+        "xlsx" => "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+        "wasm" => "application/wasm",
+        "json" => "application/json",
+        "jsonl" => "application/x-ndjson",
+        "csv" => "text/csv",
+        "tsv" => "text/tab-separated-values",
+        "md" | "markdown" => "text/markdown",
+        "tex" | "bib" => "application/x-tex",
+        "yaml" | "yml" => "application/yaml",
+        "txt" | "log" => "text/plain",
+        _ => "application/octet-stream",
+    }
+}
+
+fn strip_root_matching_macos_private<'a>(path: &'a Path, root: &Path) -> Option<PathBuf> {
+    if let Ok(rel) = path.strip_prefix(root) {
+        return Some(rel.to_path_buf());
+    }
+    if let Ok(canon_root) = std::fs::canonicalize(root) {
+        if let Ok(rel) = path.strip_prefix(&canon_root) {
+            return Some(rel.to_path_buf());
+        }
+        #[cfg(target_os = "macos")]
+        {
+            let raw_s = path.to_string_lossy();
+            if raw_s.starts_with("/var/") || raw_s.starts_with("/tmp/") {
+                let priv_path = PathBuf::from(format!("/private{raw_s}"));
+                if let Ok(rel) = priv_path.strip_prefix(&canon_root) {
+                    return Some(rel.to_path_buf());
+                }
+            }
+            let canon_s = canon_root.to_string_lossy();
+            if let Some(stripped) = canon_s.strip_prefix("/private") {
+                if let Ok(rel) = path.strip_prefix(Path::new(stripped)) {
+                    return Some(rel.to_path_buf());
+                }
+            }
+        }
+    }
+    None
+}
+
+fn open_and_read_no_symlink(root: &Path, rel: &Path) -> anyhow::Result<(PathBuf, Vec<u8>)> {
+    use std::io::Read;
+    let canon_root = std::fs::canonicalize(root)
+        .with_context(|| format!("Sandbox root '{}' is unavailable", root.display()))?;
+    let mut cur = canon_root.clone();
+    for comp in rel.components() {
+        let std::path::Component::Normal(seg) = comp else {
+            bail!("Invalid relative path component in '{}'", rel.display());
+        };
+        cur.push(seg);
+        let meta = std::fs::symlink_metadata(&cur)
+            .with_context(|| format!("Source file '{}' not found", cur.display()))?;
+        if meta.file_type().is_symlink() {
+            bail!(
+                "Refusing to read through symlink '{}' in sandbox",
+                cur.display()
+            );
+        }
+    }
+    let meta = std::fs::symlink_metadata(&cur)
+        .with_context(|| format!("Source file '{}' not found", cur.display()))?;
+    if !meta.file_type().is_file() {
+        bail!("Source path '{}' is not a regular file", cur.display());
+    }
+    if meta.len() > MAX_BINARY_EXPORT_BYTES {
+        bail!(
+            "Source file '{}' ({} bytes) exceeds maximum binary export limit ({} bytes)",
+            cur.display(),
+            meta.len(),
+            MAX_BINARY_EXPORT_BYTES
+        );
+    }
+    let canon_file = std::fs::canonicalize(&cur)?;
+    if !canon_file.starts_with(&canon_root) {
+        bail!(
+            "Refusing to read '{}': resolves outside allowed sandbox root",
+            cur.display()
+        );
+    }
+
+    let mut opts = std::fs::OpenOptions::new();
+    opts.read(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        opts.custom_flags(libc::O_NOFOLLOW);
+    }
+    let file = opts
+        .open(&cur)
+        .with_context(|| format!("Opening source file '{}'", cur.display()))?;
+    let mut buf = Vec::with_capacity(meta.len() as usize);
+    file.take(MAX_BINARY_EXPORT_BYTES + 1).read_to_end(&mut buf)?;
+    if (buf.len() as u64) > MAX_BINARY_EXPORT_BYTES {
+        bail!("Source file '{}' exceeded export size limit while reading", cur.display());
+    }
+    Ok((canon_file, buf))
+}
+
+/// Reads raw bytes from a file strictly inside `shadow_root`, `agent_home_dir` (including `$TMPDIR`),
+/// or `org_pub_dir`, rejecting any symlink traversal via component checks + `O_NOFOLLOW`.
+fn read_sandbox_file_bytes_no_symlink(
+    shadow_root: &Path,
+    agent_home_dir: &Path,
+    org_pub_dir: &Path,
+    raw_src: &str,
+) -> anyhow::Result<(PathBuf, Vec<u8>)> {
+    let trimmed = raw_src.trim();
+    if trimmed.is_empty() {
+        bail!("Missing non-empty 'src_path'");
+    }
+    if let Some(rest) = trimmed
+        .strip_prefix("$TMPDIR/")
+        .or_else(|| trimmed.strip_prefix("${TMPDIR}/"))
+    {
+        let rel = shadow_relative(rest)?;
+        let direct = open_and_read_no_symlink(agent_home_dir, &rel);
+        if direct.is_ok() {
+            return direct;
+        }
+        return open_and_read_no_symlink(&agent_home_dir.join("tmp"), &rel);
+    }
+
+    let p = Path::new(trimmed);
+    if p.components()
+        .any(|c| matches!(c, std::path::Component::ParentDir | std::path::Component::Prefix(_)))
+    {
+        bail!("Path traversal ('..') is forbidden in source path '{}'", trimmed);
+    }
+
+    if p.is_absolute() {
+        for root in [shadow_root, agent_home_dir, org_pub_dir] {
+            if let Some(rel) = strip_root_matching_macos_private(p, root) {
+                if !rel.as_os_str().is_empty() {
+                    return open_and_read_no_symlink(root, &rel);
+                }
+            }
+        }
+        bail!(
+            "Source path '{}' must reside inside your CoW shadow workspace, agent home ($TMPDIR), or organization publish directory",
+            trimmed
+        );
+    }
+
+    let rel = shadow_relative(trimmed)?;
+    open_and_read_no_symlink(shadow_root, &rel)
+}
+
+fn canonicalize_export_dest_no_trailing_symlink(
+    dst_raw: &str,
+    overwrite: bool,
+) -> anyhow::Result<PathBuf> {
+    let dst_trimmed = dst_raw.trim();
+    let dst = Path::new(dst_trimmed);
+    if !dst.is_absolute() {
+        bail!("'dst_host_path' must be an absolute path: '{}'", dst_trimmed);
+    }
+    if dst.components().any(|c| matches!(c, std::path::Component::ParentDir)) {
+        bail!("Path traversal ('..') is forbidden in 'dst_host_path': '{}'", dst_trimmed);
+    }
+    let file_name = dst
+        .file_name()
+        .and_then(|n| n.to_str())
+        .filter(|n| !n.is_empty() && *n != "." && *n != "..")
+        .with_context(|| format!("Invalid destination filename in '{}'", dst_trimmed))?;
+
+    if let Ok(meta) = std::fs::symlink_metadata(dst) {
+        if meta.file_type().is_symlink() {
+            bail!("Refusing to export onto symlink '{}'", dst.display());
+        }
+        if meta.file_type().is_dir() {
+            bail!("Destination '{}' is a directory, not a file", dst.display());
+        }
+        if !overwrite {
+            bail!("Destination '{}' already exists and overwrite=false", dst.display());
+        }
+    }
+
+    let parent = dst
+        .parent()
+        .with_context(|| format!("Destination '{}' has no parent directory", dst.display()))?;
+    let mut existing = parent.to_path_buf();
+    let mut tail = Vec::new();
+    while !existing.exists() {
+        match existing.file_name() {
+            Some(seg) => {
+                tail.push(seg.to_os_string());
+                existing.pop();
+            }
+            None => break,
+        }
+    }
+    if let Ok(parent_meta) = std::fs::symlink_metadata(&existing) {
+        if !parent_meta.is_dir() {
+            bail!("Parent '{}' is not a directory", existing.display());
+        }
+    }
+    let mut resolved_parent = std::fs::canonicalize(&existing)
+        .with_context(|| format!("Resolving destination ancestor '{}'", existing.display()))?;
+    for seg in tail.into_iter().rev() {
+        resolved_parent.push(seg);
+    }
+    Ok(resolved_parent.join(file_name))
+}
+
+fn strip_nested_test_tmpdir(s: &str) -> &str {
+    if std::env::var("AEGIS_ALLOW_NESTED_TEST_SANDBOX").as_deref() != Ok("1") {
+        return s;
+    }
+    let Some(idx) = s.find("/agent_home/.tmp") else {
+        return s;
+    };
+    let rest = &s[idx + "/agent_home/".len()..];
+    match rest.find('/') {
+        Some(slash) => &rest[slash..],
+        None => "",
+    }
+}
+
+fn is_forbidden_export_dest(raw: &str, canonical: &str) -> bool {
+    const RING0_MARKERS: &[&str] = &[
+        "/.ssh",
+        "/.aws",
+        "/.gnupg",
+        "/.kube",
+        "/.docker",
+        "/.azure",
+        "/.config/gcloud",
+        "/.config/aegis-os",
+        "/Library/Keychains",
+        "/.git-credentials",
+        "/.netrc",
+        "/.npmrc",
+        "/.pypirc",
+        "/.vault-token",
+        "/.cargo/credentials",
+        "/.gemini/",
+        "/.claude/",
+        "/.claude.json",
+        "/.mcp.json",
+        "/.codex/",
+        "/opencode.json",
+        "/opencode.jsonc",
+        "/.config/opencode/",
+        "/.cursor/",
+        "/.vscode/",
+        "/.hermes/",
+        "/.agents/",
+        "/.agent/",
+        "/.aegis/",
+        "/.aegis-bin",
+        "/aegis-os-runtime/",
+        "/.git/",
+        "/.bashrc",
+        "/.zshrc",
+        "/.profile",
+        "/.zprofile",
+    ];
+    const SYSTEM_PREFIXES: &[&str] = &[
+        "/etc/",
+        "/private/etc/",
+        "/System/",
+        "/usr/",
+        "/bin/",
+        "/sbin/",
+        "/Library/LaunchAgents/",
+        "/Library/LaunchDaemons/",
+    ];
+    for candidate in [raw, canonical] {
+        let candidate = strip_nested_test_tmpdir(candidate);
+        if RING0_MARKERS.iter().any(|m| candidate.contains(m))
+            || SYSTEM_PREFIXES.iter().any(|p| candidate.starts_with(p))
+            || AegisPolicyKernel::is_commit_poisoning_path(candidate)
+        {
+            return true;
+        }
+    }
+    false
+}
+
+fn validate_export_payload_and_dest(
+    dst_raw: &str,
+    bytes: &[u8],
+    overwrite: bool,
+) -> anyhow::Result<(PathBuf, &'static str)> {
+    let canon_dst = canonicalize_export_dest_no_trailing_symlink(dst_raw, overwrite)?;
+    let canon_str = canon_dst.to_string_lossy();
+    if is_forbidden_export_dest(dst_raw, &canon_str) {
+        bail!(
+            "Blocked by Aegis OS Ring-0 policy: exporting to protected, credential, or build/hook-sensitive path '{}' is forbidden",
+            canon_dst.display()
+        );
+    }
+
+    let is_exec_or_script = bytes.starts_with(b"\x7fELF")
+        || bytes.starts_with(&[0xcf, 0xfa, 0xed, 0xfe])
+        || bytes.starts_with(&[0xfe, 0xed, 0xfa, 0xcf])
+        || bytes.starts_with(&[0xca, 0xfe, 0xba, 0xbe])
+        || bytes.starts_with(b"MZ")
+        || bytes.starts_with(b"#!");
+    if is_exec_or_script {
+        bail!("Refusing to export executable binary or script via fs_export_file");
+    }
+
+    let ext = canon_dst
+        .extension()
+        .and_then(|s| s.to_str())
+        .unwrap_or("")
+        .to_ascii_lowercase();
+    let magic_ok = match ext.as_str() {
+        "pdf" => bytes.starts_with(b"%PDF-"),
+        "png" => bytes.starts_with(b"\x89PNG\r\n\x1a\n"),
+        "jpg" | "jpeg" => bytes.starts_with(&[0xff, 0xd8, 0xff]),
+        "sqlite" | "db" => bytes.starts_with(b"SQLite format 3\0"),
+        _ => true,
+    };
+    if !magic_ok {
+        bail!(
+            "Payload magic-byte header mismatch for extension '.{}' when exporting to '{}'",
+            ext,
+            canon_dst.display()
+        );
+    }
+
+    let mime = infer_mime_type(&canon_dst);
+    Ok((canon_dst, mime))
+}
+
+async fn export_file_atomic_from_cas_or_bytes(
+    cas_blob: Option<PathBuf>,
+    bytes: Vec<u8>,
+    dst: PathBuf,
+) -> anyhow::Result<()> {
+    tokio::task::spawn_blocking(move || {
+        use std::io::Write;
+        let parent = dst
+            .parent()
+            .with_context(|| format!("Destination '{}' has no parent", dst.display()))?;
+        std::fs::create_dir_all(parent)?;
+        if let Ok(meta) = std::fs::symlink_metadata(&dst) {
+            if meta.file_type().is_symlink() || meta.file_type().is_dir() {
+                bail!("Refusing to export onto symlink or directory '{}'", dst.display());
+            }
+        }
+        #[cfg(unix)]
+        let mode = {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::metadata(&dst)
+                .ok()
+                .map(|m| m.permissions().mode() & 0o7777)
+                .unwrap_or(0o644)
+        };
+
+        let file_name = dst
+            .file_name()
+            .and_then(|n| n.to_str())
+            .filter(|n| !n.is_empty())
+            .unwrap_or("export");
+        let tmp = parent.join(format!(
+            ".{}.aegis-export-{}-{}",
+            file_name,
+            std::process::id(),
+            Uuid::new_v4().simple()
+        ));
+
+        let stage_res = (|| -> anyhow::Result<()> {
+            if let Some(ref blob) = cas_blob {
+                if blob.is_file() {
+                    CoWWorkspace::cow_clone_file_blocking(blob, &tmp)?;
+                    if let Ok(f) = std::fs::OpenOptions::new().write(true).open(&tmp) {
+                        #[cfg(unix)]
+                        {
+                            use std::os::unix::fs::PermissionsExt;
+                            let _ = f.set_permissions(std::fs::Permissions::from_mode(mode));
+                        }
+                        let _ = f.set_modified(std::time::SystemTime::now());
+                        let _ = f.sync_all();
+                    }
+                    return Ok(());
+                }
+            }
+            let mut f = std::fs::OpenOptions::new()
+                .create_new(true)
+                .write(true)
+                .open(&tmp)?;
+            f.write_all(&bytes)?;
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::PermissionsExt;
+                f.set_permissions(std::fs::Permissions::from_mode(mode))?;
+            }
+            let _ = f.set_modified(std::time::SystemTime::now());
+            f.sync_all()?;
+            Ok(())
+        })();
+        if let Err(err) = stage_res {
+            let _ = std::fs::remove_file(&tmp);
+            return Err(err);
+        }
+        if let Err(err) = std::fs::rename(&tmp, &dst) {
+            let _ = std::fs::remove_file(&tmp);
+            return Err(err.into());
+        }
+        Ok(())
+    })
+    .await?
+}
+
 /// Tools that mint leases. They stay callable in-process (CLI `aegis-os policy approve`, dashboard,
 /// benches) but are never exposed to agents over MCP: an agent must not approve its own escalation.
 pub const HUMAN_ONLY_TOOLS: &[&str] = &["policy_approve_escalation", "policy_grant_lease"];
@@ -114,6 +549,7 @@ pub const TOOL_ANNOTATIONS: &[(&str, bool, bool, bool, bool)] = &[
     ("fs_edit", false, true, false, false),
     ("fs_delete", false, true, true, false),
     ("fs_glob", true, false, true, false),
+    ("fs_export_file", false, true, true, false),
     // Auto-rebases the shadow onto the host before reporting.
     ("workspace_status", false, false, true, false),
     ("workspace_sync", false, false, true, false),
@@ -122,6 +558,7 @@ pub const TOOL_ANNOTATIONS: &[(&str, bool, bool, bool, bool)] = &[
     ("workspace_rollback", false, true, true, false),
     ("workspace_commit", false, true, false, false),
     ("workspace_export_pr", false, false, false, false),
+    ("workspace_switch", false, false, true, false),
     // Arbitrary sandboxed commands; network policy depends on the sandbox profile.
     ("proc_exec", false, true, false, true),
     ("org_artifact_publish", false, false, true, false),
@@ -1256,8 +1693,9 @@ impl AegisRuntimeKernel {
             .and_then(|v| v.as_str())
             .unwrap_or(&identity.org_id)
             .to_string();
-        let target_resource = args
+        let mut target_resource = args
             .get("path")
+            .or_else(|| args.get("dst_host_path"))
             .or_else(|| args.get("target_domain"))
             .or_else(|| args.get("to_agent"))
             .or_else(|| args.get("topic"))
@@ -1270,6 +1708,16 @@ impl AegisRuntimeKernel {
         let mut audit_metadata = args.clone();
         let mut pre_commit_diffs: Option<Vec<aos_core::FileDiffEntry>> = None;
         let mut pre_commit_evidence_hash: Option<String> = None;
+        let mut pre_export_plan: Option<(
+            PathBuf,
+            Vec<u8>,
+            &'static str,
+            String,
+            String,
+            String,
+            Option<PathBuf>,
+        )> = None;
+        let mut pre_switch_plan: Option<(PathBuf, String, Option<PathBuf>)> = None;
         if tool_name == "workspace_commit" {
             let filter_paths: Option<Vec<String>> = args
                 .get("paths")
@@ -1352,6 +1800,235 @@ impl AegisRuntimeKernel {
                 pre_commit_diffs = Some(diffs);
                 pre_commit_evidence_hash = Some(evidence_hash);
             }
+        } else if tool_name == "fs_export_file" {
+            let src_path = args
+                .get("src_path")
+                .and_then(|v| v.as_str())
+                .map(str::trim)
+                .filter(|s| !s.is_empty())
+                .context("Missing 'src_path'")?;
+            let dst_host_path = args
+                .get("dst_host_path")
+                .and_then(|v| v.as_str())
+                .map(str::trim)
+                .filter(|s| !s.is_empty())
+                .context("Missing 'dst_host_path'")?;
+            let overwrite = args
+                .get("overwrite")
+                .and_then(|v| v.as_bool())
+                .unwrap_or(true);
+
+            let bytes = if src_path.starts_with("artifact://") {
+                let (_meta, b) = self.org_storage.fetch_artifact(identity, src_path).await?;
+                b
+            } else {
+                let (_resolved, b) = read_sandbox_file_bytes_no_symlink(
+                    env.workspace.shadow_root(),
+                    &env.sandbox.config().agent_home_dir,
+                    &env.sandbox.config().org_agent_pub_dir,
+                    src_path,
+                )?;
+                b
+            };
+
+            let (canon_dst, mime_type) =
+                validate_export_payload_and_dest(dst_host_path, &bytes, overwrite)?;
+            let canon_rt = std::fs::canonicalize(&self.runtime_data_root)
+                .unwrap_or_else(|_| self.runtime_data_root.clone());
+            if canon_dst.starts_with(&canon_rt) {
+                bail!(
+                    "Blocked by Aegis OS Ring-0 policy: exporting into Aegis runtime state directory '{}' is forbidden",
+                    canon_dst.display()
+                );
+            }
+
+            if let Some(rel) =
+                strip_root_matching_macos_private(&canon_dst, env.workspace.host_source_root())
+            {
+                let rel_s = rel.to_string_lossy().replace('\\', "/");
+                if !rel_s.is_empty() {
+                    if let Some(msg) = self.claim_conflict_for_paths(identity, &[rel_s]).await? {
+                        bail!("{}", msg);
+                    }
+                }
+            }
+
+            self.ensure_org_vault(&identity.org_id).await?;
+            let file_name = canon_dst
+                .file_name()
+                .and_then(|n| n.to_str())
+                .unwrap_or("export.bin");
+            let artifact_meta = self
+                .org_storage
+                .publish_artifact(
+                    identity,
+                    file_name,
+                    &bytes,
+                    mime_type,
+                    json!({
+                        "export_src": src_path,
+                        "export_dst": canon_dst.display().to_string(),
+                    }),
+                )
+                .await?;
+
+            let (change_type, old_size, old_sha256) = if canon_dst.is_file() {
+                let old_bytes = tokio::fs::read(&canon_dst).await.unwrap_or_default();
+                let mut h = Sha256::new();
+                h.update(&old_bytes);
+                (
+                    DiffChangeType::Modified,
+                    Some(old_bytes.len() as u64),
+                    Some(format!("sha256:{}", hex::encode(h.finalize()))),
+                )
+            } else {
+                (DiffChangeType::Added, None, None)
+            };
+            let short_sha = &artifact_meta.sha256[..artifact_meta.sha256.len().min(16)];
+            let diff_entry = aos_core::FileDiffEntry {
+                relative_path: canon_dst.display().to_string(),
+                change_type,
+                old_size,
+                new_size: Some(bytes.len() as u64),
+                preview_diff: Some(format!(
+                    "Zero-Copy Artifact Export -> {} ({} bytes, {}, sha256:{})",
+                    canon_dst.display(),
+                    bytes.len(),
+                    mime_type,
+                    short_sha
+                )),
+                old_sha256,
+                new_sha256: Some(format!("sha256:{}", artifact_meta.sha256)),
+            };
+            let (_payload, evidence_hash) =
+                aos_core::compute_diff_evidence(std::slice::from_ref(&diff_entry), overwrite, false);
+            target_resource = canon_dst.display().to_string();
+            if let Some(obj) = audit_metadata.as_object_mut() {
+                obj.insert("src_path".to_string(), json!(src_path));
+                obj.insert("dst_host_path".to_string(), json!(target_resource.clone()));
+                obj.insert("overwrite".to_string(), json!(overwrite));
+                obj.insert("size_bytes".to_string(), json!(bytes.len()));
+                obj.insert("content_type".to_string(), json!(mime_type));
+                obj.insert("sha256".to_string(), json!(artifact_meta.sha256.clone()));
+                obj.insert("artifact_uri".to_string(), json!(artifact_meta.uri.clone()));
+                obj.insert("evidence_hash".to_string(), json!(evidence_hash.clone()));
+                obj.insert(
+                    "evidence".to_string(),
+                    json!({
+                        "changed_files_count": 1,
+                        "paths": [target_resource.clone()],
+                        "evidence_hash": evidence_hash.clone(),
+                        "artifact_uri": artifact_meta.uri.clone(),
+                        "sha256": artifact_meta.sha256.clone(),
+                        "size_bytes": bytes.len(),
+                        "content_type": mime_type,
+                    }),
+                );
+            }
+            let cas_blob_path = self
+                .runtime_data_root
+                .join("orgs")
+                .join(&identity.org_id)
+                .join("cas")
+                .join(&artifact_meta.sha256);
+            pre_commit_diffs = Some(vec![diff_entry]);
+            pre_commit_evidence_hash = Some(evidence_hash.clone());
+            pre_export_plan = Some((
+                canon_dst,
+                bytes,
+                mime_type,
+                artifact_meta.sha256,
+                artifact_meta.uri,
+                evidence_hash,
+                cas_blob_path.is_file().then_some(cas_blob_path),
+            ));
+        } else if tool_name == "workspace_switch" {
+            if std::env::var_os("AOS_SESSION_ID").is_some() {
+                bail!(
+                    "workspace_switch is unavailable inside a single-root 'aegis-os run' kernel sandbox session; use 'fs_export_file' to export files to external directories or start a new session in the target directory."
+                );
+            }
+            let raw_path = args
+                .get("path")
+                .and_then(|v| v.as_str())
+                .map(str::trim)
+                .filter(|s| !s.is_empty())
+                .context("Missing 'path'")?;
+
+            let existing_binding =
+                aos_core::session::resolve_session_workspace_binding(&self.runtime_data_root);
+            let existing_umbrella = existing_binding.as_ref().and_then(|(_, u, _)| u.clone());
+
+            let candidate = if Path::new(raw_path).is_absolute() {
+                PathBuf::from(raw_path)
+            } else if let Some(ref umb) = existing_umbrella {
+                umb.join(raw_path)
+            } else if let Some(parent) = env.workspace.host_source_root().parent() {
+                parent.join(raw_path)
+            } else {
+                bail!(
+                    "Relative workspace_switch path '{}' requires a parent or umbrella root",
+                    raw_path
+                );
+            };
+            let canon_target = std::fs::canonicalize(&candidate)
+                .with_context(|| format!("Target workspace directory '{}' not found", candidate.display()))?;
+            if !canon_target.is_dir() {
+                bail!("Target workspace '{}' is not a directory", canon_target.display());
+            }
+            if canon_target == Path::new("/") {
+                bail!("Refusing to switch workspace to '/'");
+            }
+            if let Some(home) = std::env::var_os("HOME")
+                .map(PathBuf::from)
+                .and_then(|h| std::fs::canonicalize(&h).ok())
+            {
+                if canon_target == home || home.starts_with(&canon_target) {
+                    bail!(
+                        "Refusing to switch workspace to '{}' (user home or ancestor)",
+                        canon_target.display()
+                    );
+                }
+            }
+            let canon_rt = std::fs::canonicalize(&self.runtime_data_root)
+                .unwrap_or_else(|_| self.runtime_data_root.clone());
+            if canon_target.starts_with(&canon_rt) || canon_rt.starts_with(&canon_target) {
+                bail!(
+                    "Refusing to switch workspace to '{}' (overlaps Aegis runtime state)",
+                    canon_target.display()
+                );
+            }
+            let canon_s = canon_target.to_string_lossy();
+            if is_forbidden_export_dest(&canon_s, &canon_s) {
+                bail!(
+                    "Refusing to switch workspace to protected directory '{}'",
+                    canon_target.display()
+                );
+            }
+
+            let within_umbrella = existing_umbrella
+                .as_ref()
+                .is_some_and(|u| canon_target.starts_with(u))
+                || canon_target == env.workspace.host_source_root();
+            let new_org_id = args
+                .get("org_id")
+                .and_then(|v| v.as_str())
+                .map(str::trim)
+                .filter(|s| !s.is_empty())
+                .map(str::to_string)
+                .or_else(|| {
+                    canon_target
+                        .file_name()
+                        .map(|n| n.to_string_lossy().to_string())
+                })
+                .unwrap_or_else(|| "default-org".to_string());
+
+            target_resource = canon_target.display().to_string();
+            if let Some(obj) = audit_metadata.as_object_mut() {
+                obj.insert("within_umbrella".to_string(), json!(within_umbrella));
+                obj.insert("target_org_id".to_string(), json!(new_org_id.clone()));
+            }
+            pre_switch_plan = Some((canon_target, new_org_id, existing_umbrella));
         }
         let mut resolved_cross_org_peer: Option<(String, String)> = None;
 
@@ -1433,7 +2110,7 @@ impl AegisRuntimeKernel {
                     reason,
                     suggested_lease_scope,
                 } => {
-                    if tool_name == "workspace_commit" {
+                    if matches!(tool_name, "workspace_commit" | "fs_export_file") {
                         if let Some(ref diffs) = pre_commit_diffs {
                             let diff_dir = self.runtime_data_root.join("escalation_diffs");
                             let _ = tokio::fs::create_dir_all(&diff_dir).await;
@@ -1444,7 +2121,7 @@ impl AegisRuntimeKernel {
                             .await;
                         }
                     }
-                    return Ok(json!({
+                    let mut ask_payload = json!({
                         "status": "approval_required",
                         "escalation_id": escalation_id,
                         "reason": reason,
@@ -1454,7 +2131,13 @@ impl AegisRuntimeKernel {
                             "Approve in the auto-opened Web Approval Console (/approve or /dashboard) where you can inspect the Unified Diff and click Approve Once (SHA-256 pinned) or Approve 1h, or in Cloud Mode provide your 6-digit Authenticator TOTP code in chat and pass `totp` on retry (escalation: {0}). Agents cannot self-approve without human action.",
                             escalation_id
                         )
-                    }));
+                    });
+                    if let Some((_, _, _, _, ref uri, _, _)) = pre_export_plan {
+                        if let Some(obj) = ask_payload.as_object_mut() {
+                            obj.insert("artifact_uri".to_string(), json!(uri));
+                        }
+                    }
+                    return Ok(ask_payload);
                 }
                 PolicyDecision::Deny { reason } => {
                     bail!("Policy Denied syscall '{}': {}", tool_name, reason);
@@ -1471,17 +2154,44 @@ impl AegisRuntimeKernel {
                     .get("path")
                     .and_then(|v| v.as_str())
                     .context("Missing 'path'")?;
+                let encoding = args
+                    .get("encoding")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("utf8");
                 let (clean, full_path) = shadow_path_for_read(
                     env.workspace.shadow_root(),
                     env.workspace.host_source_root(),
                     rel_path,
                 )?;
-                let content = tokio::fs::read_to_string(&full_path).await?;
-                Ok(json!({
-                    "path": clean,
-                    "content": content,
-                    "workspace_mode": "cow_shadow"
-                }))
+                let raw_bytes = tokio::fs::read(&full_path).await?;
+                match encoding {
+                    "base64" => Ok(json!({
+                        "path": clean,
+                        "encoding": "base64",
+                        "size_bytes": raw_bytes.len(),
+                        "content_base64": base64::engine::general_purpose::STANDARD.encode(&raw_bytes),
+                        "workspace_mode": "cow_shadow"
+                    })),
+                    "utf8" => match String::from_utf8(raw_bytes) {
+                        Ok(content) => Ok(json!({
+                            "path": clean,
+                            "content": content,
+                            "workspace_mode": "cow_shadow"
+                        })),
+                        Err(e) => {
+                            let size = e.into_bytes().len();
+                            bail!(
+                                "File '{}' is binary ({} bytes); inspect or process it with proc_exec, read small assets with encoding='base64', or export it via fs_export_file",
+                                clean,
+                                size
+                            );
+                        }
+                    },
+                    other => bail!(
+                        "Unsupported fs_read encoding '{}'; expected 'utf8' or 'base64'",
+                        other
+                    ),
+                }
             }
 
             "fs_write" => {
@@ -1493,18 +2203,79 @@ impl AegisRuntimeKernel {
                     .get("content")
                     .and_then(|v| v.as_str())
                     .context("Missing 'content'")?;
+                let encoding = args
+                    .get("encoding")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("utf8");
+                let raw_bytes = match encoding {
+                    "utf8" => content.as_bytes().to_vec(),
+                    "base64" => base64::engine::general_purpose::STANDARD
+                        .decode(content.trim())
+                        .context("Invalid base64 'content' in fs_write")?,
+                    other => bail!(
+                        "Unsupported fs_write encoding '{}'; expected 'utf8' or 'base64'",
+                        other
+                    ),
+                };
+                let byte_len = raw_bytes.len();
                 let (clean, full_path) =
                     shadow_path_for_write(env.workspace.shadow_root(), rel_path)?;
-                aos_core::session::write_bytes_atomic_synced_async(
-                    &full_path,
-                    content.as_bytes().to_vec(),
-                )
-                .await?;
+                aos_core::session::write_bytes_atomic_synced_async(&full_path, raw_bytes).await?;
                 Ok(json!({
                     "status": "written_to_cow_shadow",
                     "path": clean,
-                    "bytes": content.len(),
+                    "bytes": byte_len,
+                    "encoding": encoding,
                     "host_modified": false
+                }))
+            }
+
+            "fs_export_file" => {
+                let (canon_dst, bytes, mime_type, sha256, artifact_uri, evidence_hash, cas_blob) =
+                    pre_export_plan.context("Missing pre-staged fs_export_file plan")?;
+                let size_bytes = bytes.len();
+                export_file_atomic_from_cas_or_bytes(cas_blob, bytes, canon_dst.clone()).await?;
+                Ok(json!({
+                    "status": "exported_to_host",
+                    "dst_host_path": canon_dst,
+                    "size_bytes": size_bytes,
+                    "content_type": mime_type,
+                    "sha256": sha256,
+                    "artifact_uri": artifact_uri,
+                    "evidence_hash": evidence_hash,
+                }))
+            }
+
+            "workspace_switch" => {
+                let (canon_target, new_org_id, existing_umbrella) =
+                    pre_switch_plan.context("Missing pre-validated workspace_switch plan")?;
+                let new_identity = AgentIdentity::new(
+                    new_org_id,
+                    identity.agent_id.clone(),
+                    identity.role.clone(),
+                );
+                let new_env = self
+                    .ensure_agent_environment(
+                        new_identity.clone(),
+                        &canon_target,
+                        IsolationTier::NativeOsSandbox,
+                        vec!["*".to_string()],
+                    )
+                    .await?;
+                let _ = aos_core::session::bind_session_workspace(
+                    &self.runtime_data_root,
+                    "auto",
+                    None,
+                    &canon_target,
+                    existing_umbrella.as_deref(),
+                    true,
+                );
+                Ok(json!({
+                    "status": "workspace_switched",
+                    "org_id": new_identity.org_id,
+                    "agent_id": new_identity.agent_id,
+                    "host_source_root": canon_target,
+                    "shadow_root": new_env.workspace.shadow_root(),
                 }))
             }
 
@@ -2026,14 +2797,37 @@ impl AegisRuntimeKernel {
                     .get("name")
                     .and_then(|v| v.as_str())
                     .context("Missing 'name'")?;
-                let content = args
-                    .get("content")
-                    .and_then(|v| v.as_str())
-                    .context("Missing 'content'")?;
+                let (raw_bytes, inferred_ct): (Vec<u8>, Option<&'static str>) =
+                    if let Some(src_path) = args
+                        .get("source_path")
+                        .and_then(|v| v.as_str())
+                        .map(str::trim)
+                        .filter(|s| !s.is_empty())
+                    {
+                        let (resolved, bytes) = read_sandbox_file_bytes_no_symlink(
+                            env.workspace.shadow_root(),
+                            &env.sandbox.config().agent_home_dir,
+                            &env.sandbox.config().org_agent_pub_dir,
+                            src_path,
+                        )?;
+                        (bytes, Some(infer_mime_type(&resolved)))
+                    } else if let Some(b64) = args
+                        .get("content_base64")
+                        .and_then(|v| v.as_str())
+                    {
+                        let bytes = base64::engine::general_purpose::STANDARD
+                            .decode(b64.trim())
+                            .context("Invalid 'content_base64' in org_artifact_publish")?;
+                        (bytes, Some("application/octet-stream"))
+                    } else if let Some(content) = args.get("content").and_then(|v| v.as_str()) {
+                        (content.as_bytes().to_vec(), None)
+                    } else {
+                        bail!("org_artifact_publish requires one of 'source_path', 'content_base64', or 'content'");
+                    };
                 let content_type = args
                     .get("content_type")
                     .and_then(|v| v.as_str())
-                    .unwrap_or("text/plain");
+                    .unwrap_or_else(|| inferred_ct.unwrap_or("text/plain"));
                 let metadata = args.get("metadata").cloned().unwrap_or_else(|| json!({}));
 
                 let meta = self
@@ -2041,7 +2835,7 @@ impl AegisRuntimeKernel {
                     .publish_artifact(
                         identity,
                         name,
-                        content.as_bytes(),
+                        &raw_bytes,
                         content_type,
                         metadata,
                     )
@@ -2056,9 +2850,42 @@ impl AegisRuntimeKernel {
                     .and_then(|v| v.as_str())
                     .context("Missing 'uri'")?;
                 let (meta, bytes) = self.org_storage.fetch_artifact(identity, uri).await?;
+                if let Some(dest_path) = args
+                    .get("dest_path")
+                    .and_then(|v| v.as_str())
+                    .map(str::trim)
+                    .filter(|s| !s.is_empty())
+                {
+                    let (clean, full_path) =
+                        shadow_path_for_write(env.workspace.shadow_root(), dest_path)?;
+                    let size_bytes = bytes.len();
+                    aos_core::session::write_bytes_atomic_synced_async(&full_path, bytes).await?;
+                    return Ok(json!({
+                        "artifact": meta,
+                        "written_to_shadow": clean,
+                        "size_bytes": size_bytes,
+                    }));
+                }
+                if let Ok(text) = String::from_utf8(bytes.clone()) {
+                    return Ok(json!({
+                        "artifact": meta,
+                        "content": text,
+                    }));
+                }
+                if bytes.len() <= MAX_INLINE_ARTIFACT_FETCH_BYTES {
+                    return Ok(json!({
+                        "artifact": meta,
+                        "is_binary": true,
+                        "size_bytes": bytes.len(),
+                        "content_base64": base64::engine::general_purpose::STANDARD.encode(&bytes),
+                        "content": String::from_utf8_lossy(&bytes),
+                    }));
+                }
                 Ok(json!({
                     "artifact": meta,
-                    "content": String::from_utf8_lossy(&bytes)
+                    "is_binary": true,
+                    "size_bytes": bytes.len(),
+                    "hint": "Pass dest_path to stage binary artifact directly into your CoW shadow workspace, or pass artifact URI to fs_export_file.",
                 }))
             }
 
@@ -2987,7 +3814,14 @@ impl AegisRuntimeKernel {
                     "description": "[Zero-Prompt] Read a file inside the Agent's Copy-on-Write shadow workspace.",
                     "inputSchema": {
                         "type": "object",
-                        "properties": { "path": { "type": "string" } },
+                        "properties": {
+                            "path": { "type": "string" },
+                            "encoding": {
+                                "type": "string",
+                                "enum": ["utf8", "base64"],
+                                "description": "Optional output encoding ('utf8' default, or 'base64' for small binary files)."
+                            }
+                        },
                         "required": ["path"]
                     }
                 },
@@ -2998,7 +3832,12 @@ impl AegisRuntimeKernel {
                         "type": "object",
                         "properties": {
                             "path": { "type": "string" },
-                            "content": { "type": "string" }
+                            "content": { "type": "string" },
+                            "encoding": {
+                                "type": "string",
+                                "enum": ["utf8", "base64"],
+                                "description": "Optional content encoding ('utf8' default, or 'base64' for binary payloads)."
+                            }
                         },
                         "required": ["path", "content"]
                     }
@@ -3031,6 +3870,32 @@ impl AegisRuntimeKernel {
                     "inputSchema": {
                         "type": "object",
                         "properties": { "pattern": { "type": "string" } }
+                    }
+                },
+                {
+                    "name": "fs_export_file",
+                    "description": "[Lease-Gated Zero-Copy] Export a file or binary artifact (e.g. PDF, PNG, ZIP, Parquet) directly from your CoW shadow workspace, $TMPDIR, or Org CAS (`artifact://...`) to an explicit host path without encoding bytes in tool arguments. Validates magic headers, freezes a SHA-256 CAS snapshot before approval, and writes atomically via OS CoW clone/copy.",
+                    "inputSchema": {
+                        "type": "object",
+                        "properties": {
+                            "src_path": {
+                                "type": "string",
+                                "description": "Source path inside CoW shadow, $TMPDIR/agent_home, org pub dir, or `artifact://<org>/sha256:<hash>`."
+                            },
+                            "dst_host_path": {
+                                "type": "string",
+                                "description": "Absolute destination path on the host filesystem."
+                            },
+                            "overwrite": {
+                                "type": "boolean",
+                                "description": "Overwrite existing regular file at destination (default: true)."
+                            },
+                            "totp": {
+                                "type": "string",
+                                "description": "Optional 6-digit TOTP authenticator code for Cloud mode approval."
+                            }
+                        },
+                        "required": ["src_path", "dst_host_path"]
                     }
                 },
                 {
@@ -3124,6 +3989,24 @@ impl AegisRuntimeKernel {
                     }
                 },
                 {
+                    "name": "workspace_switch",
+                    "description": "[Zero-Prompt in Umbrella / Lease-Gated Outside] Switch this session's active CoW shadow workspace to a sibling or specified project directory.",
+                    "inputSchema": {
+                        "type": "object",
+                        "properties": {
+                            "path": {
+                                "type": "string",
+                                "description": "Target project directory path (absolute, or relative to the session's umbrella container)."
+                            },
+                            "org_id": {
+                                "type": "string",
+                                "description": "Optional organization ID override (defaults to target directory name)."
+                            }
+                        },
+                        "required": ["path"]
+                    }
+                },
+                {
                     "name": "proc_exec",
                     "description": "[Zero-Prompt] PREFERRED over native shell tools (run_command/Bash): execute a command (e.g. `sh -c \"grep -rn foo crates | head\"`, `cargo test`) kernel-confined inside the Agent's OS sandbox. cwd = your CoW shadow workspace (with host `node_modules`/`.venv` auto-linked read-only); writes stay in the shadow until workspace_commit. For long-running tasks (>2m, e.g. online LLM benchmarks), pass `background: true` and poll status/output with `poll_pid`.",
                     "inputSchema": {
@@ -3140,24 +4023,38 @@ impl AegisRuntimeKernel {
                 },
                 {
                     "name": "org_artifact_publish",
-                    "description": "[Zero-Prompt Intra-Org] Publish an immutable artifact to the Organization's CAS store for peer Agents.",
+                    "description": "[Zero-Prompt Intra-Org] Publish an immutable artifact (UTF-8 text, base64 payload, or sandbox file via `source_path`) to the Organization's CAS store for peer Agents.",
                     "inputSchema": {
                         "type": "object",
                         "properties": {
                             "name": { "type": "string" },
                             "content": { "type": "string" },
+                            "content_base64": {
+                                "type": "string",
+                                "description": "Optional base64-encoded binary content (alternative to `content` / `source_path`)."
+                            },
+                            "source_path": {
+                                "type": "string",
+                                "description": "Optional path inside CoW shadow or $TMPDIR/agent_home to publish raw bytes without passing content through JSON."
+                            },
                             "content_type": { "type": "string" },
                             "metadata": { "type": "object" }
                         },
-                        "required": ["name", "content"]
+                        "required": ["name"]
                     }
                 },
                 {
                     "name": "org_artifact_fetch",
-                    "description": "[Zero-Prompt Intra-Org] Fetch an artifact from the Organization's CAS store by `artifact://<org>/sha256:<hash>`.",
+                    "description": "[Zero-Prompt Intra-Org] Fetch an artifact from the Organization's CAS store by `artifact://<org>/sha256:<hash>` (pass `dest_path` to write raw bytes directly into your CoW shadow workspace).",
                     "inputSchema": {
                         "type": "object",
-                        "properties": { "uri": { "type": "string" } },
+                        "properties": {
+                            "uri": { "type": "string" },
+                            "dest_path": {
+                                "type": "string",
+                                "description": "Optional relative path in your CoW shadow workspace to write raw artifact bytes directly without JSON serialization."
+                            }
+                        },
                         "required": ["uri"]
                     }
                 },
@@ -3879,12 +4776,53 @@ impl AegisRuntimeKernel {
             || dir.join("package.json").exists()
             || dir.join("pyproject.toml").exists()
             || dir.join("go.mod").exists()
+            || dir.join(".aegis").exists()
+            || dir.join("Makefile").exists()
+            || dir.join("CMakeLists.txt").exists()
+            || dir.join("flake.nix").exists()
+            || dir.join("pom.xml").exists()
+            || dir.join("build.gradle").exists()
+            || dir.join("build.gradle.kts").exists()
+    }
+
+    /// Returns `true` only when `dir` is a pure multi-project container directory:
+    /// 1. `dir` itself is not a project root;
+    /// 2. `dir` contains no non-hidden regular files directly at its root;
+    /// 3. `dir` contains at least one direct non-hidden child directory that is a project root.
+    ///
+    /// This prevents non-Git project/paper directories (e.g. `SYLVA/paper/main.tex` with or without
+    /// a root `README.md`) from being misclassified as umbrella containers and hijacked to a sibling repo.
+    pub fn is_umbrella_parent_dir(dir: &Path) -> bool {
+        if !dir.is_dir() || Self::is_repo_root(dir) {
+            return false;
+        }
+        let Ok(entries) = std::fs::read_dir(dir) else {
+            return false;
+        };
+        let mut has_child_repo = false;
+        for entry in entries.flatten() {
+            let name = entry.file_name();
+            let name_str = name.to_string_lossy();
+            if name_str.starts_with('.') {
+                continue;
+            }
+            let Ok(ft) = entry.file_type() else {
+                continue;
+            };
+            if ft.is_file() {
+                return false;
+            }
+            if ft.is_dir() && Self::is_repo_root(&entry.path()) {
+                has_child_repo = true;
+            }
+        }
+        has_child_repo
     }
 
     /// If `dir` is an umbrella parent directory (containing one or more child repositories rather than
     /// being a repository root itself), returns the most recently modified child repository root.
     pub fn resolve_umbrella_child_repo(dir: &Path) -> Option<PathBuf> {
-        if Self::is_repo_root(dir) {
+        if !Self::is_umbrella_parent_dir(dir) {
             return None;
         }
         let entries = std::fs::read_dir(dir).ok()?;
@@ -3912,45 +4850,89 @@ impl AegisRuntimeKernel {
         best.map(|(_, p)| std::fs::canonicalize(&p).unwrap_or(p))
     }
 
-    pub fn resolve_workspace_fallback(&self, current_ws: &Path) -> PathBuf {
-        let s = current_ws.to_string_lossy();
-        let is_umbrella = !Self::is_repo_root(current_ws);
-        if s.ends_with("/.gemini/config")
+    /// Resolve the active workspace for a client session without letting concurrent windows
+    /// overwrite each other through a global `active_workspace.txt`, and without overriding
+    /// explicit non-umbrella directories (like a LaTeX paper folder without `.git`).
+    pub fn resolve_workspace_for_session(
+        &self,
+        base_ws: &Path,
+        session_key: Option<&aos_core::session::SessionKey>,
+    ) -> PathBuf {
+        let session_binding = session_key.and_then(|k| {
+            aos_core::session::resolve_workspace_binding_for_key(&self.runtime_data_root, k)
+        });
+        if let Some((bound_ws, _umbrella, true)) = &session_binding {
+            return bound_ws.clone();
+        }
+
+        let s = base_ws.to_string_lossy();
+        let is_hook_cfg = s.ends_with("/.gemini/config")
             || s.ends_with("/.agents")
-            || s.ends_with("/.agent")
-            || is_umbrella
-        {
+            || s.ends_with("/.agent");
+        let is_unspecified_ws =
+            is_hook_cfg || base_ws == Path::new(".") || base_ws.as_os_str().is_empty();
+        if is_unspecified_ws {
             if let Ok(env_ws) = std::env::var("AOS_WORKSPACE") {
                 let p = PathBuf::from(env_ws.trim());
                 if p.exists() {
                     let canon = std::fs::canonicalize(&p).unwrap_or(p);
-                    return Self::resolve_umbrella_child_repo(&canon).unwrap_or(canon);
+                    return if Self::is_umbrella_parent_dir(&canon) {
+                        Self::resolve_umbrella_child_repo(&canon).unwrap_or(canon)
+                    } else {
+                        canon
+                    };
                 }
-            }
-            let saved_file = self.runtime_data_root.join("active_workspace.txt");
-            if let Ok(saved) = std::fs::read_to_string(&saved_file) {
-                let p = PathBuf::from(saved.trim());
-                if p.exists() {
-                    let canon = std::fs::canonicalize(&p).unwrap_or(p);
-                    if !is_umbrella || Self::is_repo_root(&canon) {
-                        return canon;
-                    }
-                    if let Some(child) = Self::resolve_umbrella_child_repo(&canon) {
-                        return child;
-                    }
-                }
-            }
-            if s.ends_with("/.agents") || s.ends_with("/.agent") {
-                if let Some(parent) = current_ws.parent() {
-                    return Self::resolve_umbrella_child_repo(parent)
-                        .unwrap_or_else(|| parent.to_path_buf());
-                }
-            }
-            if let Some(child) = Self::resolve_umbrella_child_repo(current_ws) {
-                return child;
             }
         }
-        current_ws.to_path_buf()
+        if is_hook_cfg {
+            if let Some((bound_ws, _, _)) = session_binding {
+                return bound_ws;
+            }
+            if s.ends_with("/.agents") || s.ends_with("/.agent") {
+                if let Some(parent) = base_ws.parent() {
+                    let canon_parent =
+                        std::fs::canonicalize(parent).unwrap_or_else(|_| parent.to_path_buf());
+                    return if Self::is_umbrella_parent_dir(&canon_parent) {
+                        Self::resolve_umbrella_child_repo(&canon_parent).unwrap_or(canon_parent)
+                    } else {
+                        canon_parent
+                    };
+                }
+            }
+            if session_key.is_none() {
+                let saved_file = self.runtime_data_root.join("active_workspace.txt");
+                if let Ok(saved) = std::fs::read_to_string(&saved_file) {
+                    let p = PathBuf::from(saved.trim());
+                    if p.exists() {
+                        let canon = std::fs::canonicalize(&p).unwrap_or(p);
+                        return if Self::is_umbrella_parent_dir(&canon) {
+                            Self::resolve_umbrella_child_repo(&canon).unwrap_or(canon)
+                        } else {
+                            canon
+                        };
+                    }
+                }
+            }
+            return std::fs::canonicalize(base_ws).unwrap_or_else(|_| base_ws.to_path_buf());
+        }
+
+        if Self::is_umbrella_parent_dir(base_ws) {
+            let canon_umb =
+                std::fs::canonicalize(base_ws).unwrap_or_else(|_| base_ws.to_path_buf());
+            if let Some((bound_ws, _, _)) = session_binding {
+                if bound_ws.starts_with(&canon_umb) && bound_ws != canon_umb {
+                    return bound_ws;
+                }
+            }
+            return Self::resolve_umbrella_child_repo(&canon_umb).unwrap_or(canon_umb);
+        }
+
+        std::fs::canonicalize(base_ws).unwrap_or_else(|_| base_ws.to_path_buf())
+    }
+
+    pub fn resolve_workspace_fallback(&self, current_ws: &Path) -> PathBuf {
+        let key = aos_core::session::client_session_key();
+        self.resolve_workspace_for_session(current_ws, key.as_ref())
     }
 
     pub async fn serve_stdio(&self, identity: AgentIdentity) -> anyhow::Result<()> {
@@ -3976,10 +4958,13 @@ impl AegisRuntimeKernel {
         let session_key = auto_agent_client
             .as_ref()
             .and_then(|_| aos_core::session::client_session_key());
+        let ws_session_key = session_key.or_else(aos_core::session::client_session_key);
         let stdin = tokio::io::stdin();
         let mut stdout = tokio::io::stdout();
         let mut reader = BufReader::new(stdin).lines();
-        let mut active_workspace = self.resolve_workspace_fallback(&initial_workspace);
+        let mut base_workspace = initial_workspace;
+        let mut active_workspace =
+            self.resolve_workspace_for_session(&base_workspace, ws_session_key.as_ref());
         if auto_org {
             if let Some(name) = active_workspace.file_name() {
                 let name_str = name.to_string_lossy().to_string();
@@ -4007,14 +4992,45 @@ impl AegisRuntimeKernel {
             if method == "initialize" {
                 if let Some(params) = req.get("params") {
                     if let Some(ws_from_init) = Self::extract_workspace_from_init_params(params) {
-                        active_workspace = ws_from_init;
-                        let _ = std::fs::write(
-                            self.runtime_data_root.join("active_workspace.txt"),
-                            active_workspace.to_string_lossy().as_bytes(),
-                        );
+                        base_workspace = ws_from_init;
+                        if let Some(key) = ws_session_key {
+                            if aos_core::session::resolve_workspace_binding_for_key(
+                                &self.runtime_data_root,
+                                &key,
+                            )
+                            .is_none()
+                            {
+                                let resolved = self
+                                    .resolve_workspace_for_session(&base_workspace, Some(&key));
+                                let umb = if Self::is_umbrella_parent_dir(&base_workspace) {
+                                    Some(
+                                        std::fs::canonicalize(&base_workspace)
+                                            .unwrap_or_else(|_| base_workspace.clone()),
+                                    )
+                                } else {
+                                    None
+                                };
+                                let client_name = auto_agent_client.as_deref().unwrap_or("auto");
+                                let _ = aos_core::session::bind_workspace_for_key(
+                                    &self.runtime_data_root,
+                                    client_name,
+                                    &key,
+                                    None,
+                                    &resolved,
+                                    umb.as_deref(),
+                                    false,
+                                );
+                            }
+                        } else {
+                            let _ = std::fs::write(
+                                self.runtime_data_root.join("active_workspace.txt"),
+                                base_workspace.to_string_lossy().as_bytes(),
+                            );
+                        }
                     }
                 }
-                active_workspace = self.resolve_workspace_fallback(&active_workspace);
+                active_workspace =
+                    self.resolve_workspace_for_session(&base_workspace, ws_session_key.as_ref());
                 if auto_org {
                     if let Some(name) = active_workspace.file_name() {
                         let name_str = name.to_string_lossy().to_string();
@@ -4024,7 +5040,8 @@ impl AegisRuntimeKernel {
                     }
                 }
             } else if method == "tools/call" || method == "resources/read" {
-                active_workspace = self.resolve_workspace_fallback(&active_workspace);
+                active_workspace =
+                    self.resolve_workspace_for_session(&base_workspace, ws_session_key.as_ref());
                 if auto_org {
                     if let Some(name) = active_workspace.file_name() {
                         let name_str = name.to_string_lossy().to_string();
@@ -8229,5 +9246,402 @@ mod tests {
         assert_eq!(read_back["content"], "CLOUD_UNCOMMITTED_EXP");
 
         let _ = vault.lock_all();
+    }
+
+    #[tokio::test]
+    async fn test_fs_export_file_zero_copy_pdf_and_security_guards() {
+        let temp = tempfile::tempdir().unwrap();
+        let runtime_root = temp.path().join("rt");
+        let ws_root = temp.path().join("workspace");
+        let repo_a = ws_root.join("aegis-os");
+        let repo_b = ws_root.join("SYLVA");
+        std::fs::create_dir_all(repo_a.join(".git")).unwrap();
+        std::fs::create_dir_all(repo_b.join("paper")).unwrap();
+
+        let kernel = Arc::new(AegisRuntimeKernel::new(&runtime_root).await.unwrap());
+        let agent = AgentIdentity::new("aegis-os", "agy-pdf-test", "Lead");
+        let env = kernel
+            .ensure_agent_environment(
+                agent.clone(),
+                &repo_a,
+                IsolationTier::NativeOsSandbox,
+                vec!["*".to_string()],
+            )
+            .await
+            .unwrap();
+
+        let pdf_bytes: Vec<u8> = b"%PDF-1.5\n%\x93\x8c\x8b\x9e\n1 0 obj\n<< /Type /Catalog >>\nendobj\n%%EOF\n".to_vec();
+        let tmp_pdf = env.sandbox.config().agent_home_dir.join("main.pdf");
+        std::fs::write(&tmp_pdf, &pdf_bytes).unwrap();
+        let dst_pdf = std::fs::canonicalize(&repo_b).unwrap().join("paper/main.pdf");
+
+        // 1. First call freezes into CAS and escalates with evidence hash + escalation diff.
+        let ask = kernel
+            .call_tool(
+                &agent,
+                "fs_export_file",
+                json!({
+                    "src_path": "$TMPDIR/main.pdf",
+                    "dst_host_path": dst_pdf.display().to_string(),
+                    "overwrite": true
+                }),
+            )
+            .await
+            .unwrap();
+        assert_eq!(ask["status"], "approval_required", "{ask}");
+        let esc_id = ask["escalation_id"].as_str().unwrap().to_string();
+        let artifact_uri = ask["artifact_uri"].as_str().unwrap().to_string();
+        assert!(artifact_uri.starts_with("artifact://aegis-os/sha256:"));
+        assert!(runtime_root
+            .join("escalation_diffs")
+            .join(format!("{esc_id}.json"))
+            .is_file());
+
+        // 2. Approve One-Shot (`ttl_secs = 0`) pinned to destination + SHA-256 evidence.
+        let lease = kernel
+            .policy
+            .approve_escalation(&esc_id, 0, "user")
+            .await
+            .unwrap();
+        assert_eq!(lease.kind, LeaseKind::OneShot);
+
+        // 3. Bait-and-switch tamper check: modifying $TMPDIR/main.pdf must miss the SHA-256 pin!
+        std::fs::write(&tmp_pdf, b"%PDF-1.5\nTAMPERED_CONTENT\n").unwrap();
+        let tampered_res = kernel
+            .call_tool(
+                &agent,
+                "fs_export_file",
+                json!({
+                    "src_path": "$TMPDIR/main.pdf",
+                    "dst_host_path": dst_pdf.display().to_string(),
+                    "overwrite": true
+                }),
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            tampered_res["status"], "approval_required",
+            "Tampered bytes must NOT consume the SHA-256 pinned One-Shot lease"
+        );
+
+        // 4. Exporting using the frozen CAS artifact_uri succeeds with the original One-Shot lease!
+        let exported = kernel
+            .call_tool(
+                &agent,
+                "fs_export_file",
+                json!({
+                    "src_path": artifact_uri,
+                    "dst_host_path": dst_pdf.display().to_string(),
+                    "overwrite": true
+                }),
+            )
+            .await
+            .unwrap();
+        assert_eq!(exported["status"], "exported_to_host", "{exported}");
+        assert_eq!(exported["content_type"], "application/pdf");
+        assert_eq!(std::fs::read(&dst_pdf).unwrap(), pdf_bytes);
+
+        // One-Shot lease was consumed, so repeating requires a new approval.
+        let second = kernel
+            .call_tool(
+                &agent,
+                "fs_export_file",
+                json!({
+                    "src_path": artifact_uri,
+                    "dst_host_path": dst_pdf.display().to_string(),
+                    "overwrite": true
+                }),
+            )
+            .await
+            .unwrap();
+        assert_eq!(second["status"], "approval_required");
+
+        // 5. Security guards:
+        // 5a. Symlink source escaping sandbox
+        #[cfg(unix)]
+        {
+            let secret_outside = temp.path().join("host_secret.txt");
+            std::fs::write(&secret_outside, b"TOP_SECRET").unwrap();
+            let sym_src = env.sandbox.config().agent_home_dir.join("escape.pdf");
+            std::os::unix::fs::symlink(&secret_outside, &sym_src).unwrap();
+            assert!(kernel
+                .call_tool(
+                    &agent,
+                    "fs_export_file",
+                    json!({
+                        "src_path": "$TMPDIR/escape.pdf",
+                        "dst_host_path": dst_pdf.display().to_string()
+                    }),
+                )
+                .await
+                .is_err());
+        }
+
+        // 5b. ELF executable payload rejected
+        let elf_src = env.sandbox.config().agent_home_dir.join("evil.bin");
+        std::fs::write(&elf_src, b"\x7fELF\x02\x01\x01\x00").unwrap();
+        assert!(kernel
+            .call_tool(
+                &agent,
+                "fs_export_file",
+                json!({
+                    "src_path": "$TMPDIR/evil.bin",
+                    "dst_host_path": std::fs::canonicalize(&repo_b).unwrap().join("evil.bin").display().to_string()
+                }),
+            )
+            .await
+            .is_err());
+
+        // 5c. Spoofed .pdf without %PDF- magic header rejected
+        let fake_pdf = env.sandbox.config().agent_home_dir.join("fake.pdf");
+        std::fs::write(&fake_pdf, b"NOT_A_PDF_HEADER").unwrap();
+        assert!(kernel
+            .call_tool(
+                &agent,
+                "fs_export_file",
+                json!({
+                    "src_path": "$TMPDIR/fake.pdf",
+                    "dst_host_path": dst_pdf.display().to_string()
+                }),
+            )
+            .await
+            .is_err());
+
+        // 5d. Ring-0 & poisoning destinations rejected
+        std::fs::write(&tmp_pdf, &pdf_bytes).unwrap();
+        for bad_dst in [
+            temp.path().join("user/.ssh/id_rsa.pdf"),
+            repo_a.join(".git/hooks/pre-commit"),
+            repo_a.join("build.rs"),
+            runtime_root.join("policy_state.json"),
+        ] {
+            let txt_src = env.sandbox.config().agent_home_dir.join("benign.txt");
+            std::fs::write(&txt_src, b"hello").unwrap();
+            assert!(
+                kernel
+                    .call_tool(
+                        &agent,
+                        "fs_export_file",
+                        json!({
+                            "src_path": "$TMPDIR/benign.txt",
+                            "dst_host_path": bad_dst.display().to_string()
+                        }),
+                    )
+                    .await
+                    .is_err(),
+                "must reject export to {}",
+                bad_dst.display()
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn test_umbrella_detection_does_not_hijack_paper_dir() {
+        let temp = tempfile::tempdir().unwrap();
+        let runtime_root = temp.path().join("rt");
+        let ws_root = temp.path().join("workspace");
+        let repo_a = ws_root.join("aegis-os");
+        let sylva = ws_root.join("SYLVA");
+        std::fs::create_dir_all(repo_a.join(".git")).unwrap();
+        std::fs::create_dir_all(sylva.join("paper")).unwrap();
+        std::fs::write(sylva.join("paper/main.tex"), "\\documentclass{article}\n").unwrap();
+
+        assert!(AegisRuntimeKernel::is_umbrella_parent_dir(&ws_root));
+        assert!(!AegisRuntimeKernel::is_umbrella_parent_dir(&repo_a));
+        assert!(!AegisRuntimeKernel::is_umbrella_parent_dir(&sylva));
+
+        // Even if a directory has a nested `.git` child, having a top-level README.md means it's a project, not an umbrella.
+        let docs_with_subrepo = temp.path().join("docs_proj");
+        std::fs::create_dir_all(docs_with_subrepo.join("sub/.git")).unwrap();
+        std::fs::write(docs_with_subrepo.join("README.md"), "# Docs\n").unwrap();
+        assert!(!AegisRuntimeKernel::is_umbrella_parent_dir(&docs_with_subrepo));
+
+        let kernel = Arc::new(AegisRuntimeKernel::new(&runtime_root).await.unwrap());
+        // Write a stale global active_workspace.txt pointing to `aegis-os`.
+        std::fs::write(
+            runtime_root.join("active_workspace.txt"),
+            repo_a.display().to_string(),
+        )
+        .unwrap();
+
+        let key_sylva = aos_core::session::SessionKey {
+            pid: 5555,
+            start_time: 100,
+        };
+        let resolved_sylva = kernel.resolve_workspace_for_session(&sylva, Some(&key_sylva));
+        assert_eq!(
+            resolved_sylva,
+            std::fs::canonicalize(&sylva).unwrap(),
+            "Opening non-Git paper directory SYLVA must never hijack to aegis-os"
+        );
+
+        // Session bound inside umbrella root with workspace_switched=true keeps switched target.
+        let key_umb = aos_core::session::SessionKey {
+            pid: 6666,
+            start_time: 200,
+        };
+        let canon_sylva = std::fs::canonicalize(&sylva).unwrap();
+        let canon_ws = std::fs::canonicalize(&ws_root).unwrap();
+        aos_core::session::bind_workspace_for_key(
+            &runtime_root,
+            "agy",
+            &key_umb,
+            Some("conv-umb"),
+            &canon_sylva,
+            Some(&canon_ws),
+            true,
+        );
+        assert_eq!(
+            kernel.resolve_workspace_for_session(&ws_root, Some(&key_umb)),
+            canon_sylva
+        );
+
+        // `workspace_switch` from repo_a to SYLVA escalates (outside single-repo scope) and succeeds after approval.
+        let agent = AgentIdentity::new("aegis-os", "agy-switch", "Lead");
+        kernel
+            .ensure_agent_environment(
+                agent.clone(),
+                &repo_a,
+                IsolationTier::NativeOsSandbox,
+                vec!["*".to_string()],
+            )
+            .await
+            .unwrap();
+        let ask = kernel
+            .call_tool(
+                &agent,
+                "workspace_switch",
+                json!({ "path": sylva.display().to_string() }),
+            )
+            .await
+            .unwrap();
+        assert_eq!(ask["status"], "approval_required");
+        let esc_id = ask["escalation_id"].as_str().unwrap();
+        kernel
+            .policy
+            .approve_escalation(esc_id, 600, "user")
+            .await
+            .unwrap();
+        let switched = kernel
+            .call_tool(
+                &agent,
+                "workspace_switch",
+                json!({ "path": sylva.display().to_string() }),
+            )
+            .await
+            .unwrap();
+        assert_eq!(switched["status"], "workspace_switched");
+        assert_eq!(switched["org_id"], "SYLVA");
+        assert_eq!(
+            PathBuf::from(switched["host_source_root"].as_str().unwrap()),
+            canon_sylva
+        );
+    }
+
+    #[tokio::test]
+    async fn test_binary_org_artifact_source_path_dest_path_and_base64_roundtrip() {
+        let temp = tempfile::tempdir().unwrap();
+        let runtime_root = temp.path().join("rt");
+        let repo = temp.path().join("proj");
+        std::fs::create_dir_all(repo.join(".git")).unwrap();
+
+        let kernel = Arc::new(AegisRuntimeKernel::new(&runtime_root).await.unwrap());
+        let publisher = AgentIdentity::new("proj", "pub-1", "Publisher");
+        let consumer = AgentIdentity::new("proj", "con-1", "Consumer");
+        let pub_env = kernel
+            .ensure_agent_environment(
+                publisher.clone(),
+                &repo,
+                IsolationTier::NativeOsSandbox,
+                vec!["*".to_string()],
+            )
+            .await
+            .unwrap();
+        let con_env = kernel
+            .ensure_agent_environment(
+                consumer.clone(),
+                &repo,
+                IsolationTier::NativeOsSandbox,
+                vec!["*".to_string()],
+            )
+            .await
+            .unwrap();
+
+        // 1. `fs_write` + `fs_read` with base64 encoding, and UTF-8 read error on binary file
+        let small_bin = vec![0x89u8, b'P', b'N', b'G', 0x0d, 0x0a, 0x1a, 0x0a, 0xff, 0x00, 0xfe];
+        let small_b64 = base64::engine::general_purpose::STANDARD.encode(&small_bin);
+        let write_res = kernel
+            .call_tool(
+                &publisher,
+                "fs_write",
+                json!({
+                    "path": "assets/icon.png",
+                    "content": small_b64,
+                    "encoding": "base64"
+                }),
+            )
+            .await
+            .unwrap();
+        assert_eq!(write_res["bytes"], small_bin.len());
+
+        let read_b64 = kernel
+            .call_tool(
+                &publisher,
+                "fs_read",
+                json!({ "path": "assets/icon.png", "encoding": "base64" }),
+            )
+            .await
+            .unwrap();
+        assert_eq!(read_b64["content_base64"], small_b64);
+
+        let utf8_err = kernel
+            .call_tool(&publisher, "fs_read", json!({ "path": "assets/icon.png" }))
+            .await
+            .unwrap_err()
+            .to_string();
+        assert!(utf8_err.contains("binary") && utf8_err.contains("fs_export_file"), "{utf8_err}");
+
+        // 2. Large (>32 KiB) binary PNG in $TMPDIR published via `source_path` and fetched via `dest_path`
+        let mut large_png = b"\x89PNG\r\n\x1a\n".to_vec();
+        large_png.extend(vec![0xffu8; 40_000]);
+        std::fs::write(pub_env.sandbox.config().agent_home_dir.join("chart.png"), &large_png)
+            .unwrap();
+
+        let meta = kernel
+            .call_tool(
+                &publisher,
+                "org_artifact_publish",
+                json!({
+                    "name": "chart.png",
+                    "source_path": "$TMPDIR/chart.png"
+                }),
+            )
+            .await
+            .unwrap();
+        assert_eq!(meta["content_type"], "image/png");
+        let uri = meta["uri"].as_str().unwrap();
+
+        // Omitting dest_path for large binary avoids lossy multi-KB string dumps
+        let fetch_summary = kernel
+            .call_tool(&consumer, "org_artifact_fetch", json!({ "uri": uri }))
+            .await
+            .unwrap();
+        assert_eq!(fetch_summary["is_binary"], true);
+        assert!(fetch_summary.get("content").is_none());
+
+        // Passing dest_path writes exact raw bytes into consumer's CoW shadow
+        let fetch_staged = kernel
+            .call_tool(
+                &consumer,
+                "org_artifact_fetch",
+                json!({ "uri": uri, "dest_path": "figures/chart.png" }),
+            )
+            .await
+            .unwrap();
+        assert_eq!(fetch_staged["written_to_shadow"], "figures/chart.png");
+        assert_eq!(
+            std::fs::read(con_env.workspace.shadow_root().join("figures/chart.png")).unwrap(),
+            large_png
+        );
     }
 }

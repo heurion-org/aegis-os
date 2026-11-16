@@ -184,6 +184,12 @@ pub struct SessionBinding {
     pub key: SessionKey,
     #[serde(default)]
     pub conversation_id: Option<String>,
+    #[serde(default)]
+    pub workspace_root: Option<String>,
+    #[serde(default)]
+    pub umbrella_root: Option<String>,
+    #[serde(default)]
+    pub workspace_switched: bool,
     pub bound_at_ms: i64,
 }
 
@@ -428,8 +434,38 @@ pub fn bind_conversation_for_key(
         .or_else(|| existing_for_key.as_ref().map(|b| b.agent_id.clone()))
         .unwrap_or_else(|| derive_agent_id(client, key));
 
+    let workspace_root = existing_for_key
+        .as_ref()
+        .and_then(|b| b.workspace_root.clone())
+        .or_else(|| {
+            previous_for_conversation
+                .as_ref()
+                .and_then(|b| b.workspace_root.clone())
+        });
+    let umbrella_root = existing_for_key
+        .as_ref()
+        .and_then(|b| b.umbrella_root.clone())
+        .or_else(|| {
+            previous_for_conversation
+                .as_ref()
+                .and_then(|b| b.umbrella_root.clone())
+        });
+    let workspace_switched = existing_for_key
+        .as_ref()
+        .map(|b| b.workspace_switched)
+        .filter(|&s| s)
+        .unwrap_or_else(|| {
+            previous_for_conversation
+                .as_ref()
+                .is_some_and(|b| b.workspace_switched)
+        });
+
     let unchanged = existing_for_key.as_ref().is_some_and(|b| {
-        b.agent_id == agent_id && b.conversation_id.as_deref() == conversation_id
+        b.agent_id == agent_id
+            && b.conversation_id.as_deref() == conversation_id
+            && b.workspace_root == workspace_root
+            && b.umbrella_root == umbrella_root
+            && b.workspace_switched == workspace_switched
     });
     if !unchanged {
         let binding = SessionBinding {
@@ -437,6 +473,9 @@ pub fn bind_conversation_for_key(
             agent_id: agent_id.clone(),
             key: *key,
             conversation_id: conversation_id.map(|s| s.to_string()),
+            workspace_root,
+            umbrella_root,
+            workspace_switched,
             bound_at_ms: chrono::Utc::now().timestamp_millis(),
         };
         let _ = write_json_atomic(&by_key_path(runtime_dir, key), &binding);
@@ -455,6 +494,139 @@ pub fn bind_conversation(
 ) -> Option<String> {
     let key = client_session_key()?;
     Some(bind_conversation_for_key(runtime_dir, client, &key, conversation_id))
+}
+
+/// Bind the active workspace root (and optional umbrella container) strictly to `key`
+/// so concurrent client windows never overwrite each other through a global singleton file.
+pub fn bind_workspace_for_key(
+    runtime_dir: &Path,
+    client: &str,
+    key: &SessionKey,
+    conversation_id: Option<&str>,
+    workspace_root: &Path,
+    umbrella_root: Option<&Path>,
+    switched: bool,
+) -> String {
+    let previous_for_conversation = conversation_id
+        .filter(|c| !c.is_empty())
+        .and_then(|c| read_binding(&by_conversation_path(runtime_dir, c)));
+    let existing_for_key = read_binding(&by_key_path(runtime_dir, key));
+
+    let agent_id = previous_for_conversation
+        .as_ref()
+        .map(|b| b.agent_id.clone())
+        .or_else(|| existing_for_key.as_ref().map(|b| b.agent_id.clone()))
+        .unwrap_or_else(|| derive_agent_id(client, key));
+
+    let effective_client = if client.is_empty() || client == "auto" {
+        existing_for_key
+            .as_ref()
+            .map(|b| b.client.clone())
+            .or_else(|| previous_for_conversation.as_ref().map(|b| b.client.clone()))
+            .unwrap_or_else(|| client.to_string())
+    } else {
+        client.to_string()
+    };
+
+    let effective_conv_id = conversation_id
+        .filter(|c| !c.is_empty())
+        .map(str::to_string)
+        .or_else(|| {
+            existing_for_key
+                .as_ref()
+                .and_then(|b| b.conversation_id.clone())
+        });
+
+    let ws_str = workspace_root.display().to_string();
+    let preserved_umbrella = existing_for_key
+        .as_ref()
+        .and_then(|b| b.umbrella_root.clone())
+        .or_else(|| {
+            previous_for_conversation
+                .as_ref()
+                .and_then(|b| b.umbrella_root.clone())
+        })
+        .filter(|u| workspace_root.starts_with(Path::new(u)));
+    let effective_umbrella = umbrella_root
+        .map(|u| u.display().to_string())
+        .or(preserved_umbrella);
+
+    let unchanged = existing_for_key.as_ref().is_some_and(|b| {
+        b.agent_id == agent_id
+            && b.conversation_id == effective_conv_id
+            && b.workspace_root.as_deref() == Some(ws_str.as_str())
+            && b.umbrella_root == effective_umbrella
+            && b.workspace_switched == switched
+    });
+    if !unchanged {
+        let binding = SessionBinding {
+            client: effective_client,
+            agent_id: agent_id.clone(),
+            key: *key,
+            conversation_id: effective_conv_id.clone(),
+            workspace_root: Some(ws_str),
+            umbrella_root: effective_umbrella,
+            workspace_switched: switched,
+            bound_at_ms: chrono::Utc::now().timestamp_millis(),
+        };
+        let _ = write_json_atomic(&by_key_path(runtime_dir, key), &binding);
+        if let Some(ref c) = effective_conv_id {
+            let _ = write_json_atomic(&by_conversation_path(runtime_dir, c), &binding);
+        }
+    }
+    agent_id
+}
+
+/// Bind the current client process session's active workspace root (and optional umbrella parent).
+pub fn bind_session_workspace(
+    runtime_dir: &Path,
+    client: &str,
+    conversation_id: Option<&str>,
+    workspace_root: &Path,
+    umbrella_root: Option<&Path>,
+    switched: bool,
+) -> Option<String> {
+    let key = client_session_key()?;
+    Some(bind_workspace_for_key(
+        runtime_dir,
+        client,
+        &key,
+        conversation_id,
+        workspace_root,
+        umbrella_root,
+        switched,
+    ))
+}
+
+/// Resolve `(workspace_root, umbrella_root, workspace_switched)` bound to `key` if the bound directory exists.
+pub fn resolve_workspace_binding_for_key(
+    runtime_dir: &Path,
+    key: &SessionKey,
+) -> Option<(PathBuf, Option<PathBuf>, bool)> {
+    let binding = read_binding(&by_key_path(runtime_dir, key))?;
+    let ws_str = binding
+        .workspace_root
+        .as_deref()
+        .filter(|s| !s.trim().is_empty())?;
+    let ws_path = PathBuf::from(ws_str);
+    if !ws_path.is_dir() {
+        return None;
+    }
+    let umbrella_path = binding
+        .umbrella_root
+        .as_deref()
+        .filter(|s| !s.trim().is_empty())
+        .map(PathBuf::from)
+        .filter(|p| p.is_dir());
+    Some((ws_path, umbrella_path, binding.workspace_switched))
+}
+
+/// Resolve `(workspace_root, umbrella_root, workspace_switched)` for the current client process session.
+pub fn resolve_session_workspace_binding(
+    runtime_dir: &Path,
+) -> Option<(PathBuf, Option<PathBuf>, bool)> {
+    let key = client_session_key()?;
+    resolve_workspace_binding_for_key(runtime_dir, &key)
 }
 
 /// Returns `true` exactly once per `key` across processes. Used to de-duplicate hooks that are
@@ -563,5 +735,68 @@ mod tests {
         assert!(once_guard(dir.path(), "conv-1:PreInvocation:3"));
         assert!(!once_guard(dir.path(), "conv-1:PreInvocation:3"));
         assert!(once_guard(dir.path(), "conv-1:PreInvocation:4"));
+    }
+
+    #[test]
+    fn concurrent_sessions_isolate_workspace_roots_and_preserve_switch() {
+        let dir = tempfile::tempdir().unwrap();
+        let rt = dir.path();
+        let ws_root = dir.path().join("workspace");
+        let repo_a = ws_root.join("aegis-os");
+        let repo_b = ws_root.join("SYLVA");
+        std::fs::create_dir_all(&repo_a).unwrap();
+        std::fs::create_dir_all(&repo_b).unwrap();
+
+        let key_a = SessionKey { pid: 1010, start_time: 100 };
+        let key_b = SessionKey { pid: 2020, start_time: 200 };
+
+        let id_a = bind_workspace_for_key(
+            rt,
+            "agy",
+            &key_a,
+            Some("conv-a"),
+            &repo_a,
+            Some(&ws_root),
+            false,
+        );
+        let id_b = bind_workspace_for_key(
+            rt,
+            "agy",
+            &key_b,
+            Some("conv-b"),
+            &repo_b,
+            Some(&ws_root),
+            false,
+        );
+        assert_ne!(id_a, id_b);
+
+        // Two windows never clobber each other's workspace_root.
+        assert_eq!(
+            resolve_workspace_binding_for_key(rt, &key_a),
+            Some((repo_a.clone(), Some(ws_root.clone()), false))
+        );
+        assert_eq!(
+            resolve_workspace_binding_for_key(rt, &key_b),
+            Some((repo_b.clone(), Some(ws_root.clone()), false))
+        );
+
+        // Explicit workspace_switch on session A updates only session A, keeping umbrella_root & agent_id.
+        let id_a_switched =
+            bind_workspace_for_key(rt, "auto", &key_a, None, &repo_b, None, true);
+        assert_eq!(id_a_switched, id_a);
+        assert_eq!(
+            resolve_workspace_binding_for_key(rt, &key_a),
+            Some((repo_b.clone(), Some(ws_root.clone()), true))
+        );
+
+        // Re-binding conversation on a restarted client process preserves workspace_switched + umbrella_root.
+        let key_a_restarted = SessionKey { pid: 3030, start_time: 300 };
+        let id_a_resumed =
+            bind_conversation_for_key(rt, "agy", &key_a_restarted, Some("conv-a"));
+        assert_eq!(id_a_resumed, id_a);
+        assert_eq!(
+            resolve_workspace_binding_for_key(rt, &key_a_restarted),
+            Some((repo_b, Some(ws_root), true))
+        );
     }
 }

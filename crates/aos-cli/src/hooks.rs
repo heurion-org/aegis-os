@@ -43,16 +43,48 @@ fn resolve_effective_hook_workspace(
     cli_workspace: &Path,
     payload: &Value,
     runtime_dir: &Path,
+    client: &str,
+    conversation_id: Option<&str>,
 ) -> PathBuf {
+    let has_session_key = aos_core::session::client_session_key().is_some();
+
+    if let Some((bound_ws, bound_umbrella, true)) =
+        aos_core::session::resolve_session_workspace_binding(runtime_dir)
+    {
+        if bound_ws.exists() {
+            let canon = std::fs::canonicalize(&bound_ws).unwrap_or(bound_ws);
+            let _ = aos_core::session::bind_session_workspace(
+                runtime_dir,
+                client,
+                conversation_id,
+                &canon,
+                bound_umbrella.as_deref(),
+                true,
+            );
+            return canon;
+        }
+    }
+
     if let Ok(env_ws) = std::env::var("AOS_WORKSPACE") {
         let p = PathBuf::from(env_ws.trim());
         if p.exists() {
             let canon = std::fs::canonicalize(&p).unwrap_or(p);
-            let _ = std::fs::create_dir_all(runtime_dir);
-            let _ = std::fs::write(
-                runtime_dir.join("active_workspace.txt"),
-                canon.to_string_lossy().as_bytes(),
-            );
+            if aos_core::session::bind_session_workspace(
+                runtime_dir,
+                client,
+                conversation_id,
+                &canon,
+                None,
+                false,
+            )
+            .is_none()
+            {
+                let _ = std::fs::create_dir_all(runtime_dir);
+                let _ = std::fs::write(
+                    runtime_dir.join("active_workspace.txt"),
+                    canon.to_string_lossy().as_bytes(),
+                );
+            }
             return canon;
         }
     }
@@ -70,51 +102,106 @@ fn resolve_effective_hook_workspace(
         cli_workspace.to_path_buf()
     };
 
+    let mut umbrella_root: Option<PathBuf> = None;
+    let mut switched_from_binding = false;
     let cand_str = candidate.to_string_lossy().to_string();
     if cand_str.ends_with("/.agents") || cand_str.ends_with("/.agent") {
         if let Some(parent) = candidate.parent() {
             candidate = parent.to_path_buf();
         }
     } else if cand_str.ends_with("/.gemini/config") {
-        let saved_file = runtime_dir.join("active_workspace.txt");
-        if let Ok(saved) = std::fs::read_to_string(&saved_file) {
-            let p = PathBuf::from(saved.trim());
-            if p.exists() {
-                candidate = p;
+        if let Some((bound_ws, bound_umb, switched)) =
+            aos_core::session::resolve_session_workspace_binding(runtime_dir)
+        {
+            if bound_ws.exists() {
+                candidate = bound_ws;
+                umbrella_root = bound_umb;
+                switched_from_binding = switched;
+            }
+        } else if !has_session_key {
+            let saved_file = runtime_dir.join("active_workspace.txt");
+            if let Ok(saved) = std::fs::read_to_string(&saved_file) {
+                let p = PathBuf::from(saved.trim());
+                if p.exists() {
+                    candidate = p;
+                }
             }
         }
     }
 
-    // If `candidate` is an umbrella parent directory (no `.git` or `Cargo.toml` at root),
-    // inspect tool arguments (`Path` or `CommandLine`) to pinpoint the active child repository.
-    if !candidate.join(".git").exists() && !candidate.join("Cargo.toml").exists() {
+    let raw_candidate = candidate.clone();
+    let canon_candidate = std::fs::canonicalize(&candidate).unwrap_or_else(|_| candidate.clone());
+    // Only treat `candidate` as an umbrella container when it genuinely holds multiple distinct
+    // projects/repos (`is_umbrella_parent_dir`). Single non-Git project folders (e.g., LaTeX
+    // paper workspaces) stay anchored to themselves instead of hijacking into sibling folders.
+    if AegisRuntimeKernel::is_umbrella_parent_dir(&canon_candidate) {
+        let umb = canon_candidate.clone();
         let tool_args = payload
             .get("toolCall")
             .and_then(|tc| tc.get("args"))
             .cloned()
             .unwrap_or_else(|| json!({}));
-        let hint_str = tool_args
-            .get("Path")
-            .and_then(|v| v.as_str())
-            .or_else(|| tool_args.get("CommandLine").and_then(|v| v.as_str()))
-            .unwrap_or("");
-        let cand_prefix = candidate.to_string_lossy().to_string();
-        if let Some(pos) = hint_str.find(&cand_prefix) {
-            let after = &hint_str[pos + cand_prefix.len()..];
-            let sub_name = after
-                .trim_start_matches('/')
-                .split(|c: char| c == '/' || c.is_whitespace() || c == '"' || c == '\'')
-                .next()
-                .unwrap_or("");
-            if !sub_name.is_empty() {
-                let sub_path = candidate.join(sub_name);
-                if sub_path.is_dir() && (sub_path.join(".git").exists() || sub_path.join("Cargo.toml").exists()) {
-                    candidate = sub_path;
+        let inner_args = tool_args.get("Arguments");
+        let hint_candidates = [
+            tool_args.get("Path").and_then(|v| v.as_str()),
+            tool_args.get("file_path").and_then(|v| v.as_str()),
+            tool_args.get("TargetFile").and_then(|v| v.as_str()),
+            tool_args.get("dst_host_path").and_then(|v| v.as_str()),
+            tool_args.get("CommandLine").and_then(|v| v.as_str()),
+            tool_args.get("command").and_then(|v| v.as_str()),
+            inner_args.and_then(|a| a.get("path")).and_then(|v| v.as_str()),
+            inner_args
+                .and_then(|a| a.get("dst_host_path"))
+                .and_then(|v| v.as_str()),
+        ];
+        let mut resolved_from_hint = false;
+        let prefixes = [
+            raw_candidate.to_string_lossy().to_string(),
+            umb.to_string_lossy().to_string(),
+        ];
+        'hint_search: for hint_str in hint_candidates.into_iter().flatten() {
+            for prefix in &prefixes {
+                if prefix.is_empty() {
+                    continue;
+                }
+                if let Some(pos) = hint_str.find(prefix.as_str()) {
+                    let after = &hint_str[pos + prefix.len()..];
+                    let sub_name = after
+                        .trim_start_matches('/')
+                        .split(|c: char| c == '/' || c.is_whitespace() || c == '"' || c == '\'')
+                        .next()
+                        .unwrap_or("");
+                    if !sub_name.is_empty() && !sub_name.starts_with('.') {
+                        let sub_path = umb.join(sub_name);
+                        if sub_path.is_dir() {
+                            candidate = sub_path;
+                            umbrella_root = Some(umb.clone());
+                            resolved_from_hint = true;
+                            break 'hint_search;
+                        }
+                    }
                 }
             }
         }
-        if let Some(child_repo) = AegisRuntimeKernel::resolve_umbrella_child_repo(&candidate) {
-            candidate = child_repo;
+        if !resolved_from_hint {
+            if let Some((bound_ws, bound_umb, switched)) =
+                aos_core::session::resolve_session_workspace_binding(runtime_dir)
+            {
+                if bound_ws.exists()
+                    && (bound_umb.as_deref() == Some(umb.as_path()) || bound_ws.starts_with(&umb))
+                {
+                    candidate = bound_ws;
+                    umbrella_root = bound_umb.or_else(|| Some(umb.clone()));
+                    switched_from_binding = switched;
+                    resolved_from_hint = true;
+                }
+            }
+        }
+        if !resolved_from_hint {
+            if let Some(child_repo) = AegisRuntimeKernel::resolve_umbrella_child_repo(&umb) {
+                candidate = child_repo;
+                umbrella_root = Some(umb);
+            }
         }
     }
 
@@ -124,11 +211,22 @@ fn resolve_effective_hook_workspace(
         && !canon_str.ends_with("/.agents")
         && !canon_str.ends_with("/.agent")
     {
-        let _ = std::fs::create_dir_all(runtime_dir);
-        let _ = std::fs::write(
-            runtime_dir.join("active_workspace.txt"),
-            canon_str.as_bytes(),
-        );
+        if aos_core::session::bind_session_workspace(
+            runtime_dir,
+            client,
+            conversation_id,
+            &canonical,
+            umbrella_root.as_deref(),
+            switched_from_binding,
+        )
+        .is_none()
+        {
+            let _ = std::fs::create_dir_all(runtime_dir);
+            let _ = std::fs::write(
+                runtime_dir.join("active_workspace.txt"),
+                canon_str.as_bytes(),
+            );
+        }
     }
     canonical
 }
@@ -167,6 +265,57 @@ fn summarize_file_list(files: &[String], max_items: usize) -> String {
     }
 }
 
+async fn has_inline_approval_lease(
+    kernel: &AegisRuntimeKernel,
+    identity: &AgentIdentity,
+    sub_tool: &str,
+    inner_args: &Value,
+) -> bool {
+    let leases = kernel
+        .policy
+        .list_leases(&identity.org_id, Some(&identity.agent_id))
+        .await
+        .unwrap_or_default();
+    if sub_tool == "fs_export_file" {
+        let raw_dst = inner_args
+            .get("dst_host_path")
+            .and_then(|v| v.as_str())
+            .map(str::trim)
+            .unwrap_or("");
+        if raw_dst.is_empty() {
+            return false;
+        }
+        let expanded_dst = if let Some(rest) = raw_dst.strip_prefix("~/") {
+            std::env::var("HOME")
+                .map(|h| PathBuf::from(h).join(rest))
+                .unwrap_or_else(|_| PathBuf::from(raw_dst))
+        } else {
+            PathBuf::from(raw_dst)
+        };
+        let canon_dst = routing::canonicalize_lossy(&expanded_dst)
+            .to_string_lossy()
+            .into_owned();
+        return leases.iter().any(|l| {
+            if l.action_pattern != "*" && l.action_pattern != "fs_export_file" {
+                return false;
+            }
+            let pat = l.resource_pattern.as_str();
+            if pat.contains("#sha256:") || pat.starts_with("sha256:") {
+                // One-shot SHA-pinned leases must be verified against the file digest by policy.
+                return false;
+            }
+            pat == "*"
+                || pat == raw_dst
+                || pat == canon_dst
+                || (pat.ends_with('*')
+                    && canon_dst.starts_with(pat.trim_end_matches('*')))
+        });
+    }
+    leases
+        .iter()
+        .any(|l| l.action_pattern == "*" || l.action_pattern == sub_tool)
+}
+
 async fn build_boundary_approval_prompt(
     sub_tool: &str,
     inner_args: &Value,
@@ -187,6 +336,26 @@ async fn build_boundary_approval_prompt(
             host_dir,
             changed_files.len(),
             file_summary
+        );
+    }
+
+    if sub_tool == "fs_export_file" {
+        let src_path = inner_args
+            .get("src_path")
+            .or_else(|| inner_args.get("src_sandbox_path"))
+            .and_then(|v| v.as_str())
+            .unwrap_or("<unspecified>");
+        let dst_path = inner_args
+            .get("dst_host_path")
+            .and_then(|v| v.as_str())
+            .unwrap_or("<unspecified>");
+        return format!(
+            "[Aegis OS Host File Export Approval]\n  • What this does: Copy verified artifact `{}` from agent `{}/{}`'s isolated CoW shadow workspace (`{}`) directly to host path `{}` (zero LLM encoding).\n  • Approval scope: Clicking Allow grants an export lease for this host destination and completes the export immediately.",
+            src_path,
+            identity.org_id,
+            identity.agent_id,
+            host_dir,
+            dst_path
         );
     }
 
@@ -339,8 +508,13 @@ pub(crate) async fn handle_agy_hook(
         );
     }
 
-    let effective_workspace =
-        resolve_effective_hook_workspace(cli_workspace, &payload, &cli.runtime_dir);
+    let effective_workspace = resolve_effective_hook_workspace(
+        cli_workspace,
+        &payload,
+        &cli.runtime_dir,
+        &cli.client,
+        conversation_id,
+    );
     crate::telemetry::emit_telemetry_ping(
         &cli.runtime_dir,
         "daily_active",
@@ -629,33 +803,31 @@ pub(crate) async fn handle_agy_hook(
                     }
                     let use_inline_hook =
                         std::env::var("AOS_HOOK_INLINE_APPROVE").as_deref() == Ok("1");
-                    if sub_tool == "workspace_commit"
+                    if matches!(sub_tool, "workspace_commit" | "fs_export_file")
                         && use_inline_hook
                         && cloud::resolve_active_cloud_binding(&cli.runtime_dir, &effective_workspace)
                             .is_none()
                     {
-                        let has_lease = kernel
-                            .policy
-                            .list_leases(&identity.org_id, Some(&identity.agent_id))
-                            .await
-                            .unwrap_or_default()
-                            .iter()
-                            .any(|l| {
-                                l.action_pattern == "*" || l.action_pattern == "workspace_commit"
-                            });
+                        let inner_args = tool_args
+                            .get("Arguments")
+                            .cloned()
+                            .unwrap_or_else(|| json!({}));
+                        let has_lease = has_inline_approval_lease(
+                            &kernel,
+                            &identity,
+                            sub_tool,
+                            &inner_args,
+                        )
+                        .await;
                         if !has_lease {
                             cloud::record_hook_commit_ticket(&cli.runtime_dir, &identity.org_id);
-                            let inner_args = tool_args
-                                .get("Arguments")
-                                .cloned()
-                                .unwrap_or_else(|| json!({}));
                             let changed_files = env
                                 .workspace
                                 .changed_since_baseline()
                                 .await
                                 .unwrap_or_default();
                             let reason = build_boundary_approval_prompt(
-                                "workspace_commit",
+                                sub_tool,
                                 &inner_args,
                                 &identity,
                                 &effective_workspace,
@@ -727,20 +899,18 @@ pub(crate) async fn handle_agy_hook(
                 }
                 let use_inline_hook =
                     std::env::var("AOS_HOOK_INLINE_APPROVE").as_deref() == Ok("1");
-                if short_name == "workspace_commit"
+                if matches!(short_name, "workspace_commit" | "fs_export_file")
                     && use_inline_hook
                     && cloud::resolve_active_cloud_binding(&cli.runtime_dir, &effective_workspace)
                         .is_none()
                 {
-                    let has_lease = kernel
-                        .policy
-                        .list_leases(&identity.org_id, Some(&identity.agent_id))
-                        .await
-                        .unwrap_or_default()
-                        .iter()
-                        .any(|l| {
-                            l.action_pattern == "*" || l.action_pattern == "workspace_commit"
-                        });
+                    let has_lease = has_inline_approval_lease(
+                        &kernel,
+                        &identity,
+                        short_name,
+                        &tool_args,
+                    )
+                    .await;
                     if !has_lease {
                         cloud::record_hook_commit_ticket(&cli.runtime_dir, &identity.org_id);
                         let changed_files = env
@@ -749,7 +919,7 @@ pub(crate) async fn handle_agy_hook(
                             .await
                             .unwrap_or_default();
                         let reason = build_boundary_approval_prompt(
-                            "workspace_commit",
+                            short_name,
                             &tool_args,
                             &identity,
                             &effective_workspace,

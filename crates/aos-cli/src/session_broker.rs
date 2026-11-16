@@ -704,7 +704,7 @@ async fn evaluate_with_hard_guards(
         && effect.scope != ResourceScope::Shadow
     {
         return Ok(PolicyDecision::Deny {
-            reason: "host writes must go through workspace_commit".to_string(),
+            reason: "host writes must go through workspace_commit or fs_export_file".to_string(),
         });
     }
     if effect.kind == EffectKind::ProcExec && is_boundary_command(&effect.resource) {
