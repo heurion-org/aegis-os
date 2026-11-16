@@ -919,6 +919,81 @@ impl PolicyEngine for AegisPolicyKernel {
                 .await
             }
 
+            "workspace_git" => {
+                let host_root = ctx
+                    .metadata
+                    .get("host_root")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or(&ctx.target_resource);
+                let commit_message = ctx
+                    .metadata
+                    .get("commit_message")
+                    .and_then(|v| v.as_str())
+                    .map(str::trim)
+                    .filter(|s| !s.is_empty());
+                let paths_count = ctx
+                    .metadata
+                    .get("paths")
+                    .and_then(|v| v.as_array())
+                    .map(|a| a.len())
+                    .unwrap_or(0);
+                let tag = ctx
+                    .metadata
+                    .get("tag")
+                    .and_then(|v| v.as_str())
+                    .map(str::trim)
+                    .filter(|s| !s.is_empty());
+                let force_tag = ctx
+                    .metadata
+                    .get("force_tag")
+                    .and_then(|v| v.as_bool())
+                    .unwrap_or(false);
+                let push = ctx
+                    .metadata
+                    .get("push")
+                    .and_then(|v| v.as_bool())
+                    .unwrap_or(false);
+                let remote = ctx.metadata.get("remote").and_then(|v| v.as_str());
+                let branch = ctx.metadata.get("branch").and_then(|v| v.as_str());
+
+                let mut ops = Vec::new();
+                if let Some(msg) = commit_message {
+                    let first_line = msg.lines().next().unwrap_or(msg).trim();
+                    let headline: String = first_line.chars().take(72).collect();
+                    ops.push(format!("commit {} file(s) (\"{}\")", paths_count, headline));
+                }
+                if let Some(t) = tag {
+                    if force_tag {
+                        ops.push(format!("force-tag '{}'", t));
+                    } else {
+                        ops.push(format!("tag '{}'", t));
+                    }
+                }
+                if push {
+                    ops.push(format!(
+                        "push to '{}' (branch: {}, tag: {})",
+                        remote.unwrap_or("origin"),
+                        branch.filter(|s| !s.is_empty()).unwrap_or("-"),
+                        tag.unwrap_or("-")
+                    ));
+                }
+                let summary = if ops.is_empty() {
+                    "host git operation".to_string()
+                } else {
+                    ops.join(", ")
+                };
+
+                self.record_escalation(
+                    ctx,
+                    format!(
+                        "Agent '{}' requests host Git operation on '{}': {}",
+                        ctx.principal.agent_id, host_root, summary
+                    ),
+                    format!("action=workspace_git, resource={}", ctx.target_resource),
+                )
+                .await
+            }
+
             "egress_unlisted_domain" => {
                 self.record_escalation(
                     ctx,
@@ -1045,6 +1120,7 @@ impl PolicyEngine for AegisPolicyKernel {
         let base_resource_pattern = if target.action == "workspace_commit_sensitive"
             || target.action == "fs_export_file"
             || target.action == "workspace_switch"
+            || target.action == "workspace_git"
             || target.action == "egress_unlisted_domain"
             || target.action == "mcp_mount_server"
             || target.action == "org_artifact_fetch"
@@ -1940,6 +2016,92 @@ mod tests {
         assert!(matches!(
             kernel.evaluate(&outside_ctx).await.unwrap(),
             PolicyDecision::Allow { .. }
+        ));
+    }
+
+    #[tokio::test]
+    async fn workspace_git_escalates_pins_oneshot_sha256_and_isolates_push_scope() {
+        let kernel = AegisPolicyKernel::new();
+        let agent = AgentIdentity::new("aegis-os", "agy-1", "Lead");
+
+        let local_ctx = PolicyContext {
+            principal: agent.clone(),
+            action: "workspace_git".to_string(),
+            target_org_id: "aegis-os".to_string(),
+            target_resource: "git:/repo#local".to_string(),
+            metadata: json!({
+                "host_root": "/repo",
+                "paths": ["src/lib.rs"],
+                "commit_message": "fix: update sandbox",
+                "push": false,
+                "evidence_hash": "abc12345",
+            }),
+        };
+
+        let (esc_id, reason) = match kernel.evaluate(&local_ctx).await.unwrap() {
+            PolicyDecision::Ask {
+                escalation_id,
+                reason,
+                ..
+            } => (escalation_id, reason),
+            other => panic!("Expected Ask, got {other:?}"),
+        };
+        assert!(reason.contains("commit 1 file(s)"), "{reason}");
+
+        // Approve Once (`ttl_secs = 0`) -> pins resource pattern with `#sha256:abc12345`.
+        let oneshot_lease = kernel.approve_escalation(&esc_id, 0, "dev-lead").await.unwrap();
+        assert_eq!(oneshot_lease.resource_pattern, "git:/repo#local#sha256:abc12345");
+        assert_eq!(oneshot_lease.kind, LeaseKind::OneShot);
+
+        // Tampered evidence_hash must NOT match the OneShot lease.
+        let mut tampered_ctx = local_ctx.clone();
+        tampered_ctx.metadata["evidence_hash"] = json!("deadbeef");
+        assert!(matches!(
+            kernel.evaluate(&tampered_ctx).await.unwrap(),
+            PolicyDecision::Ask { .. }
+        ));
+
+        // Exact evidence_hash matches once and is consumed.
+        assert!(matches!(
+            kernel.evaluate(&local_ctx).await.unwrap(),
+            PolicyDecision::Allow { .. }
+        ));
+        assert!(matches!(
+            kernel.evaluate(&local_ctx).await.unwrap(),
+            PolicyDecision::Ask { .. }
+        ));
+
+        // Approve 10m TTL lease on `git:/repo#local` -> must NOT authorize `git:/repo#push:...`.
+        let esc_id_2 = match kernel.evaluate(&local_ctx).await.unwrap() {
+            PolicyDecision::Ask { escalation_id, .. } => escalation_id,
+            other => panic!("Expected Ask, got {other:?}"),
+        };
+        let ttl_lease = kernel.approve_escalation(&esc_id_2, 600, "dev-lead").await.unwrap();
+        assert_eq!(ttl_lease.resource_pattern, "git:/repo#local");
+        assert!(matches!(
+            kernel.evaluate(&local_ctx).await.unwrap(),
+            PolicyDecision::Allow { .. }
+        ));
+
+        let push_ctx = PolicyContext {
+            principal: agent,
+            action: "workspace_git".to_string(),
+            target_org_id: "aegis-os".to_string(),
+            target_resource: "git:/repo#push:origin:branch=main,tag=-,force_tag=false".to_string(),
+            metadata: json!({
+                "host_root": "/repo",
+                "paths": ["src/lib.rs"],
+                "commit_message": "fix: update sandbox",
+                "push": true,
+                "remote": "origin",
+                "branch": "main",
+                "force_tag": false,
+                "evidence_hash": "abc12345",
+            }),
+        };
+        assert!(matches!(
+            kernel.evaluate(&push_ctx).await.unwrap(),
+            PolicyDecision::Ask { .. }
         ));
     }
 }

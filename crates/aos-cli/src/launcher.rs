@@ -939,7 +939,7 @@ case "$cmd" in
     fi
     ;;
 esac
-echo "aos: git $cmd is disabled in enforced mode; use 'aos diff' / 'aos commit'." >&2
+echo "aos: git $cmd is disabled inside sandbox; use mcp_aegis-os_workspace_git (or host 'aos diff' / 'aos commit')." >&2
 exit 126
 "#;
     let path = dir.join("git");

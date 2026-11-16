@@ -165,6 +165,7 @@ pub async fn install_global_clients(
         "org_kv_get",
         "fs_export_file",
         "workspace_switch",
+        "workspace_git",
         "runtime_configure_mode",
     ];
 
@@ -279,6 +280,7 @@ pub async fn install_global_clients(
         "mcp(aegis-os/ipc_publish)",
         "mcp(aegis-os/fs_export_file)",
         "mcp(aegis-os/workspace_switch)",
+        "mcp(aegis-os/workspace_git)",
         "mcp(aegis-os/runtime_configure_mode)",
     ];
     const AGY_MCP_ASK_RULES: &[&str] = &[
@@ -348,6 +350,7 @@ You are running inside the **Aegis OS Runtime (`aegis-os`)** with an isolated Co
 | Land shadow changes onto host repo | `workspace_diff` -> `workspace_commit` | Direct host mutation |
 | Export binary/PDF artifacts to host | `fs_export_file` (zero-token copy from shadow) | Chunked hex/ASCII `write_file` workarounds |
 | Switch active project directory | `workspace_switch` | Cross-directory native `write_file` / `run_command` |
+| Git commit / tag / push on host repo | `workspace_git` (lease-gated via host broker) | Native `git commit` / `git push` in `run_command` |
 | Switch Cloud vs. Local execution mode | `runtime_configure_mode` (`mode: "cloud" \| "local"`) | Manual CLI configuration |
 <!-- AEGIS-OS-RUNTIME-END -->
 "#;
@@ -434,6 +437,7 @@ You are running inside the **Aegis OS Runtime (`aegis-os`)** with an isolated Co
         "ipc_publish",
         "fs_export_file",
         "workspace_switch",
+        "workspace_git",
     ];
 
     merge_json_file(
@@ -2760,6 +2764,7 @@ You are operating inside **Aegis OS Runtime** (`{role}`) within Organization **`
 | Land shadow changes onto host repo | `workspace_diff` -> `workspace_commit` | Direct host mutation |
 | Export binary/PDF artifacts to host | `fs_export_file` (zero-token copy from shadow) | Chunked hex/ASCII `write_file` workarounds |
 | Switch active project directory | `workspace_switch` | Cross-directory native `write_file` / `run_command` |
+| Git commit / tag / push on host repo | `workspace_git` (lease-gated via host broker) | Native `git commit` / `git push` in `run_command` |
 
 ## Commit & Pull Request Audit Attribution
 When creating a Git commit or Pull Request after `workspace_commit` (or `aegis-os commit`), attach the returned `audit_receipt.git_trailer` (`Aegis-OS-Verified: ...`) in the commit trailer and `audit_receipt.pr_markdown_badge` in the PR description so reviewers can verify the CoW merge and evidence hash.

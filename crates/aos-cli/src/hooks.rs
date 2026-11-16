@@ -270,12 +270,37 @@ async fn has_inline_approval_lease(
     identity: &AgentIdentity,
     sub_tool: &str,
     inner_args: &Value,
+    effective_workspace: &Path,
 ) -> bool {
     let leases = kernel
         .policy
         .list_leases(&identity.org_id, Some(&identity.agent_id))
         .await
         .unwrap_or_default();
+    if sub_tool == "workspace_git" {
+        let push = inner_args
+            .get("push")
+            .and_then(|v| v.as_bool())
+            .unwrap_or(false);
+        let force_tag = inner_args
+            .get("force_tag")
+            .and_then(|v| v.as_bool())
+            .unwrap_or(false);
+        if push || force_tag {
+            return false;
+        }
+        let canon_ws = routing::canonicalize_lossy(effective_workspace);
+        let expected_local = format!("git:{}#local", canon_ws.display());
+        let raw_local = format!("git:{}#local", effective_workspace.display());
+        return leases.iter().any(|l| {
+            (l.action_pattern == "*" || l.action_pattern == "workspace_git")
+                && !l.resource_pattern.contains("#sha256:")
+                && !l.resource_pattern.starts_with("sha256:")
+                && (l.resource_pattern == "*"
+                    || l.resource_pattern == expected_local
+                    || l.resource_pattern == raw_local)
+        });
+    }
     if sub_tool == "fs_export_file" {
         let raw_dst = inner_args
             .get("dst_host_path")
@@ -356,6 +381,41 @@ async fn build_boundary_approval_prompt(
             identity.agent_id,
             host_dir,
             dst_path
+        );
+    }
+
+    if sub_tool == "workspace_git" {
+        let paths_count = inner_args
+            .get("paths")
+            .and_then(|v| v.as_array())
+            .map(|a| a.len())
+            .unwrap_or(0);
+        let msg = inner_args
+            .get("commit_message")
+            .and_then(|v| v.as_str())
+            .unwrap_or("<none>");
+        let tag = inner_args
+            .get("tag")
+            .and_then(|v| v.as_str())
+            .unwrap_or("-");
+        let push = inner_args
+            .get("push")
+            .and_then(|v| v.as_bool())
+            .unwrap_or(false);
+        let remote = inner_args
+            .get("remote")
+            .and_then(|v| v.as_str())
+            .unwrap_or("origin");
+        return format!(
+            "[Aegis OS Host Git Boundary Approval]\n  • What this does: Execute host Git operation on `{}` via agent `{}/{}`.\n  • Commit {} file(s): \"{}\"\n  • Tag: {} | Push: {} (remote: {})\n  • Approval scope: Clicking Allow grants an inline ticket for this host Git operation.",
+            host_dir,
+            identity.org_id,
+            identity.agent_id,
+            paths_count,
+            msg.lines().next().unwrap_or(msg),
+            tag,
+            push,
+            remote
         );
     }
 
@@ -742,6 +802,25 @@ pub(crate) async fn handle_agy_hook(
                     | "fetch"
                     | "http"
             );
+            if (std::env::var("AOS_CONTROL_SOCKET").is_ok_and(|s| !s.trim().is_empty())
+                || std::env::var("AOS_ENFORCEMENT").as_deref() == Ok("enforced"))
+                && matches!(
+                    tool_name.to_ascii_lowercase().as_str(),
+                    "run_command" | "bash" | "shell"
+                )
+            {
+                let cmd = tool_args
+                    .get("CommandLine")
+                    .or_else(|| tool_args.get("command"))
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("");
+                if let Some(routing::Route::RedirectToSandbox { reason }) =
+                    routing::classify_enforced_git_redirect(cmd, &effective_workspace)
+                {
+                    emit_hook_json(hook_decision("deny", &reason), is_claude_payload)?;
+                    return Ok(());
+                }
+            }
             if broker_covers_tool
                 && std::env::var("AOS_CONTROL_SOCKET").is_ok_and(|socket| !socket.trim().is_empty())
             {
@@ -803,7 +882,7 @@ pub(crate) async fn handle_agy_hook(
                     }
                     let use_inline_hook =
                         std::env::var("AOS_HOOK_INLINE_APPROVE").as_deref() == Ok("1");
-                    if matches!(sub_tool, "workspace_commit" | "fs_export_file")
+                    if matches!(sub_tool, "workspace_commit" | "fs_export_file" | "workspace_git")
                         && use_inline_hook
                         && cloud::resolve_active_cloud_binding(&cli.runtime_dir, &effective_workspace)
                             .is_none()
@@ -817,6 +896,7 @@ pub(crate) async fn handle_agy_hook(
                             &identity,
                             sub_tool,
                             &inner_args,
+                            &effective_workspace,
                         )
                         .await;
                         if !has_lease {
@@ -899,7 +979,7 @@ pub(crate) async fn handle_agy_hook(
                 }
                 let use_inline_hook =
                     std::env::var("AOS_HOOK_INLINE_APPROVE").as_deref() == Ok("1");
-                if matches!(short_name, "workspace_commit" | "fs_export_file")
+                if matches!(short_name, "workspace_commit" | "fs_export_file" | "workspace_git")
                     && use_inline_hook
                     && cloud::resolve_active_cloud_binding(&cli.runtime_dir, &effective_workspace)
                         .is_none()
@@ -909,6 +989,7 @@ pub(crate) async fn handle_agy_hook(
                         &identity,
                         short_name,
                         &tool_args,
+                        &effective_workspace,
                     )
                     .await;
                     if !has_lease {

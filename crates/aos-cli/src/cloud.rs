@@ -1822,7 +1822,7 @@ pub async fn handle_unified_approve(
     Ok(())
 }
 
-fn extract_escalation_id_from_rpc(rpc_resp: &Value) -> Option<String> {
+pub(crate) fn extract_escalation_id_from_rpc(rpc_resp: &Value) -> Option<String> {
     let text = rpc_resp
         .get("result")?
         .get("content")?
@@ -1843,7 +1843,7 @@ fn extract_escalation_id_from_rpc(rpc_resp: &Value) -> Option<String> {
         .map(|s| s.to_string())
 }
 
-fn approval_wait_timeout_secs() -> u64 {
+pub(crate) fn approval_wait_timeout_secs() -> u64 {
     if cfg!(test) || std::env::var("AOS_NO_APPROVAL_WAIT").as_deref() == Ok("1") {
         return 0;
     }
@@ -2614,7 +2614,7 @@ pub async fn serve_unified_stdio(
                     // 1. If the user already approved `workspace_commit` inside the IDE chat window
                     //    via the `PreToolUse` hook (`decision: "ask"`), consume the ticket and complete
                     //    all `workspace_commit_sensitive` + `workspace_commit` escalations in this batch!
-                    if matches!(tool_name, "workspace_commit" | "fs_export_file")
+                    if matches!(tool_name, "workspace_commit" | "fs_export_file" | "workspace_git")
                         && consume_hook_commit_ticket(&runtime_dir, &identity.org_id)
                     {
                         let mut cur_esc = Some(esc_id);

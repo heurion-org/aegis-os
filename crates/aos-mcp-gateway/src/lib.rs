@@ -535,6 +535,264 @@ async fn export_file_atomic_from_cas_or_bytes(
     .await?
 }
 
+struct HostGitPlan {
+    git_bin: PathBuf,
+    host_root: PathBuf,
+    paths: Vec<String>,
+    commit_message: Option<String>,
+    trailers: Vec<String>,
+    tag: Option<String>,
+    force_tag: bool,
+    push: bool,
+    remote: String,
+    remote_url: Option<String>,
+    push_branch: Option<String>,
+    evidence_hash: String,
+}
+
+fn resolve_system_git_binary() -> anyhow::Result<PathBuf> {
+    ["/usr/bin/git", "/opt/homebrew/bin/git", "/usr/local/bin/git", "/bin/git"]
+        .into_iter()
+        .map(PathBuf::from)
+        .find(|p| p.is_file())
+        .context("System `git` binary not found in /usr/bin, /opt/homebrew/bin, /usr/local/bin, or /bin")
+}
+
+fn run_sanitized_host_git(
+    git_bin: &Path,
+    repo_root: &Path,
+    extra_cfg: &[(&str, &str)],
+    git_args: &[String],
+) -> anyhow::Result<std::process::Output> {
+    let mut cmd = std::process::Command::new(git_bin);
+    for var in [
+        "GIT_DIR",
+        "GIT_WORK_TREE",
+        "GIT_INDEX_FILE",
+        "GIT_OBJECT_DIRECTORY",
+        "GIT_ALTERNATE_OBJECT_DIRECTORIES",
+        "GIT_CEILING_DIRECTORIES",
+        "GIT_EXTERNAL_DIFF",
+        "GIT_EXEC_PATH",
+        "GIT_TEMPLATE_DIR",
+        "GIT_CONFIG_PARAMETERS",
+        "GIT_CONFIG_COUNT",
+        "GIT_CONFIG_GLOBAL",
+        "GIT_CONFIG_NOSYSTEM",
+        "LD_PRELOAD",
+        "DYLD_INSERT_LIBRARIES",
+    ] {
+        cmd.env_remove(var);
+    }
+    cmd.env("GIT_TERMINAL_PROMPT", "0");
+    cmd.env("GCM_INTERACTIVE", "never");
+    cmd.arg("-C").arg(repo_root);
+    cmd.args(["-c", "core.hooksPath=/dev/null", "-c", "core.fsmonitor=false"]);
+    for (k, v) in extra_cfg {
+        cmd.arg("-c").arg(format!("{k}={v}"));
+    }
+    cmd.args(git_args);
+    cmd.output()
+        .with_context(|| format!("executing {} in {}", git_bin.display(), repo_root.display()))
+}
+
+fn is_safe_remote_name(remote: &str) -> bool {
+    !remote.is_empty()
+        && remote.len() <= 64
+        && !remote.starts_with('-')
+        && remote
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || matches!(c, '.' | '_' | '-'))
+}
+
+fn is_safe_git_ref_name(git_bin: &Path, repo_root: &Path, ref_name: &str) -> bool {
+    if ref_name.is_empty()
+        || ref_name.len() > 128
+        || ref_name.starts_with('-')
+        || ref_name.starts_with('+')
+        || ref_name.contains(':')
+        || ref_name.contains('\\')
+        || ref_name.contains("..")
+        || ref_name.contains("@{")
+        || ref_name.chars().any(|c| c.is_whitespace() || c.is_control())
+    {
+        return false;
+    }
+    run_sanitized_host_git(
+        git_bin,
+        repo_root,
+        &[],
+        &[
+            "check-ref-format".to_string(),
+            "--allow-onelevel".to_string(),
+            ref_name.to_string(),
+        ],
+    )
+    .map(|o| o.status.success())
+    .unwrap_or(false)
+}
+
+async fn execute_workspace_git_plan(
+    plan: HostGitPlan,
+    identity: &AgentIdentity,
+) -> anyhow::Result<Value> {
+    let identity_org = identity.org_id.clone();
+    let identity_agent = identity.agent_id.clone();
+    tokio::task::spawn_blocking(move || {
+        let mut author_cfg: Vec<(String, String)> = Vec::new();
+        if plan.commit_message.is_some() {
+            let has_name = run_sanitized_host_git(
+                &plan.git_bin,
+                &plan.host_root,
+                &[],
+                &["config".to_string(), "user.name".to_string()],
+            )
+            .map(|o| o.status.success() && !String::from_utf8_lossy(&o.stdout).trim().is_empty())
+            .unwrap_or(false);
+            let has_email = run_sanitized_host_git(
+                &plan.git_bin,
+                &plan.host_root,
+                &[],
+                &["config".to_string(), "user.email".to_string()],
+            )
+            .map(|o| o.status.success() && !String::from_utf8_lossy(&o.stdout).trim().is_empty())
+            .unwrap_or(false);
+            if !has_name {
+                author_cfg.push((
+                    "user.name".to_string(),
+                    format!("Aegis OS ({identity_org}/{identity_agent})"),
+                ));
+            }
+            if !has_email {
+                author_cfg.push(("user.email".to_string(), "noreply@aegis-os.local".to_string()));
+            }
+        }
+        let author_cfg_refs: Vec<(&str, &str)> = author_cfg
+            .iter()
+            .map(|(k, v)| (k.as_str(), v.as_str()))
+            .collect();
+
+        if let Some(ref msg) = plan.commit_message {
+            let mut add_args = vec!["add".to_string(), "--".to_string()];
+            add_args.extend(plan.paths.iter().cloned());
+            let add_out = run_sanitized_host_git(&plan.git_bin, &plan.host_root, &[], &add_args)?;
+            if !add_out.status.success() {
+                bail!(
+                    "git add failed: {}",
+                    String::from_utf8_lossy(&add_out.stderr).trim()
+                );
+            }
+
+            let mut commit_args = vec!["commit".to_string(), "-m".to_string(), msg.clone()];
+            for trailer in &plan.trailers {
+                commit_args.push("-m".to_string());
+                commit_args.push(trailer.clone());
+            }
+            commit_args.push("--".to_string());
+            commit_args.extend(plan.paths.iter().cloned());
+            let commit_out = run_sanitized_host_git(
+                &plan.git_bin,
+                &plan.host_root,
+                &author_cfg_refs,
+                &commit_args,
+            )?;
+            if !commit_out.status.success() {
+                let err = String::from_utf8_lossy(&commit_out.stderr).trim().to_string();
+                let out = String::from_utf8_lossy(&commit_out.stdout).trim().to_string();
+                bail!("git commit failed: {}", if err.is_empty() { out } else { err });
+            }
+        }
+
+        let head_out = run_sanitized_host_git(
+            &plan.git_bin,
+            &plan.host_root,
+            &[],
+            &["rev-parse".to_string(), "--verify".to_string(), "HEAD".to_string()],
+        )?;
+        let new_head_sha = if head_out.status.success() {
+            String::from_utf8_lossy(&head_out.stdout).trim().to_string()
+        } else {
+            "UNBORN".to_string()
+        };
+
+        if let Some(ref tag) = plan.tag {
+            let mut tag_args = vec!["tag".to_string()];
+            if plan.force_tag {
+                tag_args.push("-f".to_string());
+            }
+            tag_args.push("--".to_string());
+            tag_args.push(tag.clone());
+            tag_args.push("HEAD".to_string());
+            let tag_out = run_sanitized_host_git(&plan.git_bin, &plan.host_root, &[], &tag_args)?;
+            if !tag_out.status.success() {
+                bail!(
+                    "git tag '{}' failed: {}",
+                    tag,
+                    String::from_utf8_lossy(&tag_out.stderr).trim()
+                );
+            }
+        }
+
+        let mut pushed_refs = Vec::new();
+        if plan.push {
+            if let Some(ref branch) = plan.push_branch {
+                let refspec = format!("refs/heads/{branch}:refs/heads/{branch}");
+                let push_args = vec![
+                    "push".to_string(),
+                    "--".to_string(),
+                    plan.remote.clone(),
+                    refspec,
+                ];
+                let push_out =
+                    run_sanitized_host_git(&plan.git_bin, &plan.host_root, &[], &push_args)?;
+                if !push_out.status.success() {
+                    bail!(
+                        "git push branch '{}' failed: {}",
+                        branch,
+                        String::from_utf8_lossy(&push_out.stderr).trim()
+                    );
+                }
+                pushed_refs.push(format!("refs/heads/{branch}"));
+            }
+            if let Some(ref tag) = plan.tag {
+                let mut push_tag_args = vec!["push".to_string()];
+                if plan.force_tag {
+                    push_tag_args.push("--force".to_string());
+                }
+                push_tag_args.push("--".to_string());
+                push_tag_args.push(plan.remote.clone());
+                push_tag_args.push(format!("refs/tags/{tag}:refs/tags/{tag}"));
+                let push_tag_out =
+                    run_sanitized_host_git(&plan.git_bin, &plan.host_root, &[], &push_tag_args)?;
+                if !push_tag_out.status.success() {
+                    bail!(
+                        "git push tag '{}' failed: {}",
+                        tag,
+                        String::from_utf8_lossy(&push_tag_out.stderr).trim()
+                    );
+                }
+                pushed_refs.push(format!("refs/tags/{tag}"));
+            }
+        }
+
+        Ok(json!({
+            "status": "git_completed",
+            "host_root": plan.host_root,
+            "head_sha": new_head_sha,
+            "committed": plan.commit_message.is_some(),
+            "committed_files": plan.paths,
+            "tag": plan.tag,
+            "force_tag": plan.force_tag,
+            "pushed": plan.push,
+            "remote": plan.push.then_some(plan.remote),
+            "remote_url": plan.remote_url,
+            "pushed_refs": pushed_refs,
+            "evidence_hash": plan.evidence_hash,
+        }))
+    })
+    .await?
+}
+
 /// Tools that mint leases. They stay callable in-process (CLI `aegis-os policy approve`, dashboard,
 /// benches) but are never exposed to agents over MCP: an agent must not approve its own escalation.
 pub const HUMAN_ONLY_TOOLS: &[&str] = &["policy_approve_escalation", "policy_grant_lease"];
@@ -559,6 +817,7 @@ pub const TOOL_ANNOTATIONS: &[(&str, bool, bool, bool, bool)] = &[
     ("workspace_commit", false, true, false, false),
     ("workspace_export_pr", false, false, false, false),
     ("workspace_switch", false, false, true, false),
+    ("workspace_git", false, true, false, true),
     // Arbitrary sandboxed commands; network policy depends on the sandbox profile.
     ("proc_exec", false, true, false, true),
     ("org_artifact_publish", false, false, true, false),
@@ -1665,6 +1924,449 @@ impl AegisRuntimeKernel {
         })
     }
 
+    async fn prepare_workspace_git_plan(
+        &self,
+        env: &AgentEnvironment,
+        identity: &AgentIdentity,
+        args: &Value,
+    ) -> anyhow::Result<(HostGitPlan, String, Vec<aos_core::FileDiffEntry>, Value)> {
+        let host_root = std::fs::canonicalize(env.workspace.host_source_root())
+            .unwrap_or_else(|_| env.workspace.host_source_root().to_path_buf());
+        if !host_root.join(".git").exists() {
+            bail!(
+                "Host workspace '{}' is not a Git repository",
+                host_root.display()
+            );
+        }
+        let git_bin = resolve_system_git_binary()?;
+
+        let raw_paths: Vec<String> = args
+            .get("paths")
+            .and_then(|v| serde_json::from_value(v.clone()).ok())
+            .unwrap_or_default();
+        let mut paths = Vec::new();
+        for p in raw_paths {
+            let norm = p.trim().trim_start_matches("./").to_string();
+            if !norm.is_empty() && !paths.contains(&norm) {
+                paths.push(norm);
+            }
+        }
+
+        let commit_message = match args.get("commit_message").and_then(|v| v.as_str()) {
+            Some(raw) => {
+                if raw.contains('\0') || raw.len() > 16 * 1024 {
+                    bail!("Invalid 'commit_message' in workspace_git");
+                }
+                let trimmed = raw.trim();
+                (!trimmed.is_empty()).then(|| trimmed.to_string())
+            }
+            None => None,
+        };
+
+        let mut trailers = Vec::new();
+        if let Some(arr) = args.get("trailers").and_then(|v| v.as_array()) {
+            for item in arr {
+                if let Some(s) = item.as_str() {
+                    if s.contains('\0') || s.len() > 4096 {
+                        bail!("Invalid trailer in workspace_git");
+                    }
+                    let t = s.trim();
+                    if !t.is_empty() {
+                        trailers.push(t.to_string());
+                    }
+                }
+            }
+        }
+
+        let tag = args
+            .get("tag")
+            .and_then(|v| v.as_str())
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .map(str::to_string);
+        let force_tag = args
+            .get("force_tag")
+            .and_then(|v| v.as_bool())
+            .unwrap_or(false);
+        let push = args.get("push").and_then(|v| v.as_bool()).unwrap_or(false);
+        let remote = args
+            .get("remote")
+            .and_then(|v| v.as_str())
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .unwrap_or("origin")
+            .to_string();
+        let branch_arg = args.get("branch").and_then(|v| v.as_str());
+
+        if commit_message.is_none() && tag.is_none() && !push {
+            bail!("workspace_git requires at least one of 'commit_message', 'tag', or 'push: true'");
+        }
+        if commit_message.is_some() && paths.is_empty() {
+            bail!(
+                "workspace_git requires explicit repo-relative 'paths' when 'commit_message' is set (prevents staging unrelated dirty host files)"
+            );
+        }
+        if commit_message.is_none() && !paths.is_empty() {
+            bail!(
+                "workspace_git received 'paths' without 'commit_message'; pass 'commit_message' to commit those files or omit 'paths'"
+            );
+        }
+
+        for p in &paths {
+            if p.starts_with('/')
+                || p.starts_with('-')
+                || p.contains('\\')
+                || p.contains('\0')
+                || Path::new(p).components().any(|c| {
+                    matches!(
+                        c,
+                        std::path::Component::ParentDir
+                            | std::path::Component::RootDir
+                            | std::path::Component::Prefix(_)
+                    ) || c.as_os_str() == ".git"
+                })
+            {
+                bail!("Invalid repo-relative path '{}' in workspace_git", p);
+            }
+        }
+
+        if !paths.is_empty() {
+            let shadow_changed = env
+                .workspace
+                .changed_since_baseline()
+                .await
+                .unwrap_or_default();
+            for p in &paths {
+                if shadow_changed.iter().any(|s| s == p) {
+                    bail!(
+                        "Path '{}' still has uncommitted changes in your CoW shadow workspace; call 'workspace_commit' first before 'workspace_git'",
+                        p
+                    );
+                }
+            }
+            if let Some(msg) = self.claim_conflict_for_paths(identity, &paths).await? {
+                bail!("{}", msg);
+            }
+        }
+
+        if commit_message.is_some() {
+            let mut status_args = vec![
+                "status".to_string(),
+                "--porcelain".to_string(),
+                "--untracked-files=all".to_string(),
+                "--".to_string(),
+            ];
+            status_args.extend(paths.iter().cloned());
+            let status_out = run_sanitized_host_git(&git_bin, &host_root, &[], &status_args)?;
+            if !status_out.status.success() {
+                bail!(
+                    "git status failed on host repo '{}': {}",
+                    host_root.display(),
+                    String::from_utf8_lossy(&status_out.stderr).trim()
+                );
+            }
+            if String::from_utf8_lossy(&status_out.stdout).trim().is_empty() {
+                bail!(
+                    "No uncommitted host changes found in {:?}; nothing to commit (did you call workspace_commit first?)",
+                    paths
+                );
+            }
+        }
+
+        let head_out = run_sanitized_host_git(
+            &git_bin,
+            &host_root,
+            &[],
+            &["rev-parse".to_string(), "--verify".to_string(), "HEAD".to_string()],
+        )?;
+        let head_sha = if head_out.status.success() {
+            String::from_utf8_lossy(&head_out.stdout).trim().to_string()
+        } else {
+            "UNBORN".to_string()
+        };
+
+        if let Some(ref t) = tag {
+            if !is_safe_git_ref_name(&git_bin, &host_root, t) {
+                bail!("Invalid Git tag name '{}'", t);
+            }
+            if !force_tag {
+                let exists = run_sanitized_host_git(
+                    &git_bin,
+                    &host_root,
+                    &[],
+                    &[
+                        "rev-parse".to_string(),
+                        "-q".to_string(),
+                        "--verify".to_string(),
+                        format!("refs/tags/{t}"),
+                    ],
+                )
+                .map(|o| o.status.success())
+                .unwrap_or(false);
+                if exists {
+                    bail!(
+                        "Git tag '{}' already exists on host; pass force_tag: true to move it",
+                        t
+                    );
+                }
+            }
+        }
+
+        let mut remote_url = None;
+        let mut push_branch = None;
+        if push {
+            if !is_safe_remote_name(&remote) {
+                bail!(
+                    "Invalid Git remote name '{}' (raw URLs and flags are forbidden; use a configured remote name like 'origin')",
+                    remote
+                );
+            }
+            let url_out = run_sanitized_host_git(
+                &git_bin,
+                &host_root,
+                &[],
+                &[
+                    "remote".to_string(),
+                    "get-url".to_string(),
+                    "--".to_string(),
+                    remote.clone(),
+                ],
+            )?;
+            if !url_out.status.success() {
+                bail!(
+                    "Git remote '{}' is not configured in host repository '{}'",
+                    remote,
+                    host_root.display()
+                );
+            }
+            remote_url = Some(String::from_utf8_lossy(&url_out.stdout).trim().to_string());
+
+            push_branch = match branch_arg {
+                Some(s) if s.trim().is_empty() => {
+                    if tag.is_some() {
+                        None
+                    } else {
+                        bail!("Empty 'branch' in workspace_git push requires 'tag' to be set");
+                    }
+                }
+                Some(s) => {
+                    let b = s.trim().to_string();
+                    if !is_safe_git_ref_name(&git_bin, &host_root, &b) {
+                        bail!("Invalid Git branch name '{}'", b);
+                    }
+                    Some(b)
+                }
+                None => {
+                    let sym = run_sanitized_host_git(
+                        &git_bin,
+                        &host_root,
+                        &[],
+                        &[
+                            "symbolic-ref".to_string(),
+                            "--quiet".to_string(),
+                            "--short".to_string(),
+                            "HEAD".to_string(),
+                        ],
+                    )?;
+                    if sym.status.success() {
+                        let b = String::from_utf8_lossy(&sym.stdout).trim().to_string();
+                        (!b.is_empty()).then_some(b)
+                    } else if tag.is_some() {
+                        None
+                    } else {
+                        bail!("Host repository HEAD is detached; specify an explicit 'branch' or 'tag' to push");
+                    }
+                }
+            };
+        }
+
+        let mut file_hashes: Vec<(String, String)> = Vec::with_capacity(paths.len());
+        let mut diffs: Vec<aos_core::FileDiffEntry> = Vec::with_capacity(paths.len() + 1);
+
+        let mut plan_lines = vec![
+            format!("--- a/.git/OPERATION_PLAN"),
+            format!("+++ b/.git/OPERATION_PLAN"),
+            format!("@@ Host Git Boundary Plan @@"),
+            format!("+Repository: {}", host_root.display()),
+            format!("+Base HEAD:  {}", head_sha),
+        ];
+        if !paths.is_empty() {
+            plan_lines.push(format!("+Paths:     {}", paths.join(", ")));
+        }
+        if let Some(ref msg) = commit_message {
+            plan_lines.push(format!("+Commit:    {}", msg.lines().next().unwrap_or(msg)));
+        }
+        for t in &trailers {
+            plan_lines.push(format!("+Trailer:   {}", t));
+        }
+        if let Some(ref t) = tag {
+            plan_lines.push(format!(
+                "+Tag:       {} (force={})",
+                t, force_tag
+            ));
+        }
+        if push {
+            plan_lines.push(format!(
+                "+Push:      {} ({}) | branch={} | tag={}",
+                remote,
+                remote_url.as_deref().unwrap_or("?"),
+                push_branch.as_deref().unwrap_or("-"),
+                tag.as_deref().unwrap_or("-")
+            ));
+        }
+        diffs.push(aos_core::FileDiffEntry {
+            relative_path: ".git/OPERATION_PLAN".to_string(),
+            change_type: DiffChangeType::Modified,
+            old_size: None,
+            new_size: None,
+            preview_diff: Some(plan_lines.join("\n")),
+            old_sha256: None,
+            new_sha256: None,
+        });
+
+        for p in &paths {
+            let full = host_root.join(p);
+            let meta_opt = std::fs::symlink_metadata(&full).ok();
+            let (hash_str, change_type, new_size) = match meta_opt {
+                Some(ref m) if m.file_type().is_symlink() => {
+                    let link = std::fs::read_link(&full)?;
+                    let link_bytes = link.to_string_lossy().as_bytes().to_vec();
+                    let h = hex::encode(Sha256::digest(&link_bytes));
+                    (format!("symlink:{h}"), DiffChangeType::Modified, Some(link_bytes.len() as u64))
+                }
+                Some(ref m) if m.is_file() => {
+                    let bytes = tokio::fs::read(&full).await?;
+                    let h = hex::encode(Sha256::digest(&bytes));
+                    let ct = if head_sha == "UNBORN" {
+                        DiffChangeType::Added
+                    } else {
+                        DiffChangeType::Modified
+                    };
+                    (format!("sha256:{h}"), ct, Some(bytes.len() as u64))
+                }
+                Some(_) => {
+                    bail!(
+                        "Path '{}' is a directory; pass explicit file paths to workspace_git",
+                        p
+                    );
+                }
+                None => ("DELETED".to_string(), DiffChangeType::Deleted, Some(0)),
+            };
+            file_hashes.push((p.clone(), hash_str.clone()));
+
+            let mut preview: Option<String> = None;
+            if head_sha != "UNBORN" {
+                if let Ok(d_out) = run_sanitized_host_git(
+                    &git_bin,
+                    &host_root,
+                    &[],
+                    &[
+                        "diff".to_string(),
+                        "--no-ext-diff".to_string(),
+                        "--no-textconv".to_string(),
+                        "HEAD".to_string(),
+                        "--".to_string(),
+                        p.clone(),
+                    ],
+                ) {
+                    if d_out.status.success() {
+                        let s = String::from_utf8_lossy(&d_out.stdout).to_string();
+                        if !s.trim().is_empty() {
+                            preview = Some(s.chars().take(16 * 1024).collect());
+                        }
+                    }
+                }
+            }
+            if preview.is_none() && full.is_file() {
+                if let Ok(bytes) = tokio::fs::read(&full).await {
+                    preview = Some(match String::from_utf8(bytes) {
+                        Ok(txt) => {
+                            let lines: Vec<String> = txt
+                                .lines()
+                                .take(80)
+                                .map(|l| format!("+{l}"))
+                                .collect();
+                            format!("--- /dev/null\n+++ b/{p}\n{}", lines.join("\n"))
+                        }
+                        Err(e) => {
+                            format!("--- /dev/null\n+++ b/{p}\n+[binary {} bytes]", e.into_bytes().len())
+                        }
+                    });
+                }
+            }
+            diffs.push(aos_core::FileDiffEntry {
+                relative_path: p.clone(),
+                change_type,
+                old_size: None,
+                new_size,
+                preview_diff: preview,
+                old_sha256: None,
+                new_sha256: Some(hash_str),
+            });
+        }
+
+        let canonical_plan = serde_json::to_vec(&json!({
+            "host_root": host_root.display().to_string(),
+            "head_sha": head_sha,
+            "file_hashes": file_hashes,
+            "commit_message": commit_message,
+            "trailers": trailers,
+            "tag": tag,
+            "force_tag": force_tag,
+            "push": push,
+            "remote": remote,
+            "remote_url": remote_url,
+            "branch": push_branch,
+        }))?;
+        let evidence_hash = hex::encode(Sha256::digest(&canonical_plan));
+
+        let target_resource = if push {
+            format!(
+                "git:{}#push:{}:branch={},tag={},force_tag={}",
+                host_root.display(),
+                remote,
+                push_branch.as_deref().unwrap_or("-"),
+                tag.as_deref().unwrap_or("-"),
+                force_tag
+            )
+        } else if let Some(t) = tag.as_deref().filter(|_| force_tag) {
+            format!("git:{}#local:force_tag={}", host_root.display(), t)
+        } else {
+            format!("git:{}#local", host_root.display())
+        };
+
+        let meta = json!({
+            "host_root": host_root.display().to_string(),
+            "head_sha": head_sha,
+            "paths": paths,
+            "commit_message": commit_message,
+            "trailers": trailers,
+            "tag": tag,
+            "force_tag": force_tag,
+            "push": push,
+            "remote": push.then_some(&remote),
+            "remote_url": remote_url,
+            "branch": push_branch,
+            "evidence_hash": evidence_hash,
+        });
+
+        let plan = HostGitPlan {
+            git_bin,
+            host_root,
+            paths,
+            commit_message,
+            trailers,
+            tag,
+            force_tag,
+            push,
+            remote,
+            remote_url,
+            push_branch,
+            evidence_hash,
+        };
+        Ok((plan, target_resource, diffs, meta))
+    }
+
     pub async fn call_tool(
         &self,
         identity: &AgentIdentity,
@@ -1718,6 +2420,7 @@ impl AegisRuntimeKernel {
             Option<PathBuf>,
         )> = None;
         let mut pre_switch_plan: Option<(PathBuf, String, Option<PathBuf>)> = None;
+        let mut pre_git_plan: Option<HostGitPlan> = None;
         if tool_name == "workspace_commit" {
             let filter_paths: Option<Vec<String>> = args
                 .get("paths")
@@ -2029,6 +2732,20 @@ impl AegisRuntimeKernel {
                 obj.insert("target_org_id".to_string(), json!(new_org_id.clone()));
             }
             pre_switch_plan = Some((canon_target, new_org_id, existing_umbrella));
+        } else if tool_name == "workspace_git" {
+            let (plan, resource, diffs, meta) =
+                self.prepare_workspace_git_plan(&env, identity, &args).await?;
+            target_resource = resource;
+            if let (Some(obj), Some(meta_obj)) =
+                (audit_metadata.as_object_mut(), meta.as_object())
+            {
+                for (k, v) in meta_obj {
+                    obj.insert(k.clone(), v.clone());
+                }
+            }
+            pre_commit_diffs = Some(diffs);
+            pre_commit_evidence_hash = Some(plan.evidence_hash.clone());
+            pre_git_plan = Some(plan);
         }
         let mut resolved_cross_org_peer: Option<(String, String)> = None;
 
@@ -2110,7 +2827,10 @@ impl AegisRuntimeKernel {
                     reason,
                     suggested_lease_scope,
                 } => {
-                    if matches!(tool_name, "workspace_commit" | "fs_export_file") {
+                    if matches!(
+                        tool_name,
+                        "workspace_commit" | "fs_export_file" | "workspace_git"
+                    ) {
                         if let Some(ref diffs) = pre_commit_diffs {
                             let diff_dir = self.runtime_data_root.join("escalation_diffs");
                             let _ = tokio::fs::create_dir_all(&diff_dir).await;
@@ -2697,6 +3417,11 @@ impl AegisRuntimeKernel {
                         overwrite_binaries,
                     )
                     .await
+            }
+
+            "workspace_git" => {
+                let plan = pre_git_plan.context("Missing pre-validated workspace_git plan")?;
+                execute_workspace_git_plan(plan, identity).await
             }
 
             // ----------------------------------------------------------------
@@ -4004,6 +4729,49 @@ impl AegisRuntimeKernel {
                             }
                         },
                         "required": ["path"]
+                    }
+                },
+                {
+                    "name": "workspace_git",
+                    "description": "[Lease-Gated] Stage explicit paths, create a Git commit (with optional trailers), create/update a Git tag, and optionally push to a configured remote on the host repository after human approval. Must be called after `workspace_commit` has landed edits onto the host.",
+                    "inputSchema": {
+                        "type": "object",
+                        "properties": {
+                            "paths": {
+                                "type": "array",
+                                "items": { "type": "string" },
+                                "description": "Explicit repo-relative file paths to `git add` & commit (prevents staging unrelated dirty host files)."
+                            },
+                            "commit_message": {
+                                "type": "string",
+                                "description": "Commit message summary/body."
+                            },
+                            "trailers": {
+                                "type": "array",
+                                "items": { "type": "string" },
+                                "description": "Optional commit trailer lines (e.g. `Aegis-OS-Verified: ...`)."
+                            },
+                            "tag": {
+                                "type": "string",
+                                "description": "Optional Git tag name to create on HEAD (e.g. `v0.4.8`)."
+                            },
+                            "force_tag": {
+                                "type": "boolean",
+                                "description": "Force-move an existing tag (`git tag -f` / `git push --force`)."
+                            },
+                            "push": {
+                                "type": "boolean",
+                                "description": "Push branch and/or tag to the configured remote after commit/tag."
+                            },
+                            "remote": {
+                                "type": "string",
+                                "description": "Configured remote name (default: `origin`; raw URLs are forbidden)."
+                            },
+                            "branch": {
+                                "type": "string",
+                                "description": "Optional branch name to push (defaults to current HEAD branch)."
+                            }
+                        }
                     }
                 },
                 {
@@ -9642,6 +10410,220 @@ mod tests {
         assert_eq!(
             std::fs::read(con_env.workspace.shadow_root().join("figures/chart.png")).unwrap(),
             large_png
+        );
+    }
+
+    #[tokio::test]
+    async fn test_workspace_git_commit_tag_push_and_security_guards() {
+        std::env::set_var("AEGIS_ALLOW_NESTED_TEST_SANDBOX", "1");
+        let git_bin = resolve_system_git_binary().expect("system git required for test");
+        let temp = tempfile::tempdir().unwrap();
+        let origin_bare = temp.path().join("origin.git");
+        let host_repo = temp.path().join("repo");
+        let rt = temp.path().join("rt");
+
+        assert!(std::process::Command::new(&git_bin)
+            .args(["init", "--bare", origin_bare.to_str().unwrap()])
+            .status()
+            .unwrap()
+            .success());
+        assert!(std::process::Command::new(&git_bin)
+            .args(["init", "-b", "main", host_repo.to_str().unwrap()])
+            .status()
+            .unwrap()
+            .success());
+
+        let run_git = |args: &[&str]| {
+            let arg_vec: Vec<String> = args.iter().map(|s| s.to_string()).collect();
+            let out = run_sanitized_host_git(&git_bin, &host_repo, &[], &arg_vec).unwrap();
+            assert!(
+                out.status.success(),
+                "git {:?} failed: {}",
+                args,
+                String::from_utf8_lossy(&out.stderr)
+            );
+            String::from_utf8_lossy(&out.stdout).trim().to_string()
+        };
+
+        run_git(&["config", "user.name", "Test User"]);
+        run_git(&["config", "user.email", "test@example.com"]);
+        run_git(&["remote", "add", "origin", origin_bare.to_str().unwrap()]);
+        std::fs::write(host_repo.join("README.md"), "# initial\n").unwrap();
+        std::fs::write(host_repo.join("dirty_unrelated.txt"), "clean\n").unwrap();
+        run_git(&["add", "README.md", "dirty_unrelated.txt"]);
+        run_git(&["commit", "-m", "chore: initial commit"]);
+        run_git(&["tag", "v0.4.7"]);
+        run_git(&["push", "origin", "main", "refs/tags/v0.4.7"]);
+
+        // Simulate an unrelated dirty file on host that MUST stay untouched by workspace_git.
+        std::fs::write(host_repo.join("dirty_unrelated.txt"), "dirty host state\n").unwrap();
+
+        let vault = Arc::new(
+            OrgVaultManager::new(&rt).with_mode(aos_vfs::vault::VaultMode::Off),
+        );
+        let kernel = AegisRuntimeKernel::new_with_vault(&rt, vault).await.unwrap();
+        let agent = AgentIdentity::new("repo", "agy-1", "Lead");
+        kernel
+            .ensure_agent_environment(
+                agent.clone(),
+                &host_repo,
+                IsolationTier::NativeOsSandbox,
+                vec!["*".to_string()],
+            )
+            .await
+            .unwrap();
+
+        kernel
+            .call_tool(
+                &agent,
+                "fs_write",
+                json!({
+                    "path": "src/fix.rs",
+                    "content": "pub fn fixed() -> bool { true }\n"
+                }),
+            )
+            .await
+            .unwrap();
+
+        // Guard 1: cannot run workspace_git on files still unmerged in CoW shadow.
+        let unmerged_err = kernel
+            .call_tool(
+                &agent,
+                "workspace_git",
+                json!({
+                    "paths": ["src/fix.rs"],
+                    "commit_message": "fix: before commit"
+                }),
+            )
+            .await
+            .unwrap_err();
+        assert!(
+            unmerged_err.to_string().contains("workspace_commit"),
+            "{unmerged_err:#}"
+        );
+
+        // Land src/fix.rs onto host via workspace_commit.
+        let wc_ask = kernel
+            .call_tool(&agent, "workspace_commit", json!({ "paths": ["src/fix.rs"] }))
+            .await
+            .unwrap();
+        assert_eq!(wc_ask["status"], "approval_required");
+        let wc_esc = wc_ask["escalation_id"].as_str().unwrap();
+        kernel
+            .policy
+            .approve_escalation(wc_esc, 0, "user")
+            .await
+            .unwrap();
+        let wc_res = kernel
+            .call_tool(&agent, "workspace_commit", json!({ "paths": ["src/fix.rs"] }))
+            .await
+            .unwrap();
+        assert_eq!(wc_res["status"], "committed_to_host");
+        let trailer = wc_res["audit_receipt"]["git_trailer"]
+            .as_str()
+            .unwrap()
+            .to_string();
+
+        // Guard 2: raw URL remotes must be rejected.
+        let bad_remote = kernel
+            .call_tool(
+                &agent,
+                "workspace_git",
+                json!({
+                    "push": true,
+                    "remote": "https://evil.example/exfil.git"
+                }),
+            )
+            .await
+            .unwrap_err();
+        assert!(
+            bad_remote.to_string().contains("Invalid Git remote name"),
+            "{bad_remote:#}"
+        );
+
+        // Request commit + trailer + force_tag + push.
+        let git_args = json!({
+            "paths": ["src/fix.rs"],
+            "commit_message": "fix: test host git gateway",
+            "trailers": [trailer.clone()],
+            "tag": "v0.4.7",
+            "force_tag": true,
+            "push": true,
+            "remote": "origin"
+        });
+        let ask = kernel
+            .call_tool(&agent, "workspace_git", git_args.clone())
+            .await
+            .unwrap();
+        assert_eq!(ask["status"], "approval_required");
+        let esc_id = ask["escalation_id"].as_str().unwrap();
+        assert!(rt.join("escalation_diffs").join(format!("{esc_id}.json")).is_file());
+
+        // Approve Once (`ttl_secs = 0`, TOCTOU SHA-256 pinned).
+        kernel
+            .policy
+            .approve_escalation(esc_id, 0, "user")
+            .await
+            .unwrap();
+
+        // Guard 3 (TOCTOU): modifying host file after approval must invalidate the pinned lease.
+        std::fs::write(host_repo.join("src/fix.rs"), "pub fn backdoor() {}\n").unwrap();
+        let tampered = kernel
+            .call_tool(&agent, "workspace_git", git_args.clone())
+            .await
+            .unwrap();
+        assert_eq!(tampered["status"], "approval_required");
+
+        // Restore exact approved content and re-approve once -> executes commit + force_tag + push.
+        std::fs::write(host_repo.join("src/fix.rs"), "pub fn fixed() -> bool { true }\n").unwrap();
+        let esc2 = tampered["escalation_id"].as_str().unwrap();
+        kernel
+            .policy
+            .approve_escalation(esc2, 0, "user")
+            .await
+            .unwrap();
+
+        let done = kernel
+            .call_tool(&agent, "workspace_git", git_args)
+            .await
+            .unwrap();
+        assert_eq!(done["status"], "git_completed", "{done}");
+        assert_eq!(done["committed"], true);
+        assert_eq!(done["pushed"], true);
+        let head_sha = done["head_sha"].as_str().unwrap().to_string();
+        let pushed_refs = done["pushed_refs"].as_array().unwrap();
+        assert!(pushed_refs.iter().any(|v| v == "refs/heads/main"));
+        assert!(pushed_refs.iter().any(|v| v == "refs/tags/v0.4.7"));
+
+        // Verify origin bare repo received commit + trailer + moved tag.
+        let origin_log = run_sanitized_host_git(
+            &git_bin,
+            &origin_bare,
+            &[],
+            &["log".into(), "-1".into(), "--format=%B".into(), "refs/heads/main".into()],
+        )
+        .unwrap();
+        let origin_msg = String::from_utf8_lossy(&origin_log.stdout);
+        assert!(origin_msg.contains("fix: test host git gateway"), "{origin_msg}");
+        assert!(origin_msg.contains("Aegis-OS-Verified:"), "{origin_msg}");
+
+        let origin_tag = run_sanitized_host_git(
+            &git_bin,
+            &origin_bare,
+            &[],
+            &["rev-parse".into(), "refs/tags/v0.4.7".into()],
+        )
+        .unwrap();
+        assert_eq!(
+            String::from_utf8_lossy(&origin_tag.stdout).trim(),
+            head_sha
+        );
+
+        // Unrelated dirty host file must remain dirty and uncommitted.
+        let status_after = run_git(&["status", "--porcelain"]);
+        assert!(
+            status_after.contains("M dirty_unrelated.txt"),
+            "unrelated host file must not be staged: {status_after}"
         );
     }
 }

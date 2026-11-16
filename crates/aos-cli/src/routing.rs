@@ -482,7 +482,7 @@ pub fn sandbox_redirect_reason(cmd: &str, shadow_root: &Path, host_root: &Path) 
         .any(|s| leading_words(s).1.first().map(|w| basename(w) == "git").unwrap_or(false))
     {
         format!(
-            "\nNote: the shadow has no .git; for read-only git use `git -C {} --no-optional-locks <status|diff|log|show>` inside proc_exec.",
+            "\nNote: the shadow has no .git; for read-only git use `git -C {} --no-optional-locks <status|diff|log|show>` inside proc_exec, and for host git commit/tag/push use mcp_aegis-os_workspace_git.",
             host_root.display()
         )
     } else {
@@ -631,6 +631,74 @@ pub fn classify_run_command(cmd: &str, shadow_root: &Path, host_root: &Path) -> 
     Route::RedirectToSandbox {
         reason: sandbox_redirect_reason(trimmed, shadow_root, host_root),
     }
+}
+
+/// In enforced OS sandboxes (`aegis-os run` / Seatbelt / `bwrap`), PTY allocation, `.git/` writes,
+/// and `~/.ssh` / Keychain push credentials are blocked in `run_command` and `proc_exec`.
+/// Redirect host `git add/commit/tag/push` calls to the lease-gated `workspace_git` MCP tool on
+/// the host broker instead of failing on `HostBoundary`, while preserving all Ring-0 `Deny` checks.
+pub fn classify_enforced_git_redirect(cmd: &str, host_root: &Path) -> Option<Route> {
+    let trimmed = cmd.trim();
+    if trimmed.is_empty() || invokes_approval_cli(trimmed) {
+        return None;
+    }
+    if CREDENTIAL_MARKERS.iter().any(|m| trimmed.contains(m))
+        || RUNTIME_STATE_MARKERS.iter().any(|m| trimmed.contains(m))
+    {
+        return None;
+    }
+
+    let mut segments = split_segments(trimmed);
+    segments.extend(extract_subshell_segments(trimmed));
+
+    for seg in &segments {
+        let (_, words) = leading_words(seg);
+        if words.first().map(|w| basename(w) == "sudo").unwrap_or(false) {
+            return None;
+        }
+    }
+
+    let mut matched_sub = None;
+    for seg in &segments {
+        let (_, head_words) = leading_words(seg);
+        if head_words
+            .first()
+            .map(|w| basename(w) == "git")
+            .unwrap_or(false)
+        {
+            let all_words: Vec<String> = seg
+                .split_whitespace()
+                .map(unquote)
+                .filter(|w| !w.is_empty())
+                .collect();
+            if let Some(git_pos) = all_words.iter().position(|w| basename(w) == "git") {
+                let mut i = git_pos + 1;
+                while i < all_words.len() && all_words[i].starts_with('-') {
+                    i += if matches!(
+                        all_words[i].as_str(),
+                        "-C" | "-c" | "--git-dir" | "--work-tree" | "--namespace"
+                    ) {
+                        2
+                    } else {
+                        1
+                    };
+                }
+                if let Some(sub) = all_words.get(i).map(String::as_str) {
+                    if matches!(sub, "add" | "commit" | "push" | "tag") {
+                        matched_sub = Some(sub.to_string());
+                    }
+                }
+            }
+        }
+    }
+
+    let sub = matched_sub?;
+    Some(Route::RedirectToSandbox {
+        reason: format!(
+            "[Aegis OS routing] Host `git {sub}` cannot run inside an enforced OS sandbox (`.git` and push credentials are isolated from `run_command`/`proc_exec`). Re-issue via the lease-gated host Git MCP tool (first ensure `workspace_commit` has landed edits onto `{}`):\n  mcp_aegis-os_workspace_git {{\"paths\":[\"<repo-rel-file>\"],\"commit_message\":\"<subject>\",\"trailers\":[\"Aegis-OS-Verified: ...\"],\"push\":true,\"remote\":\"origin\"}}\nApproval opens the Web Approval Console (or inline confirmation) on the host broker and runs `git` outside the sandbox.",
+            host_root.display()
+        ),
+    })
 }
 
 /// Lexically normalize a path (resolve `.` and `..`) without touching the filesystem.
@@ -1156,5 +1224,32 @@ mod tests {
             cmd_reason.contains("mcp_aegis-os_fs_export_file"),
             "{cmd_reason}"
         );
+    }
+
+    #[test]
+    fn enforced_git_mutations_redirect_to_workspace_git_while_preserving_ring0() {
+        let host = Path::new("/repo");
+        for cmd in [
+            "git commit -m 'fix: ci'",
+            "git push origin main",
+            "git tag -f v0.4.7 && git push -f origin v0.4.7",
+            "git add crates/aos-cli/src/launcher.rs && git commit -m 'x'",
+        ] {
+            let Route::RedirectToSandbox { reason } =
+                classify_enforced_git_redirect(cmd, host).expect(cmd)
+            else {
+                panic!("expected RedirectToSandbox for {cmd}");
+            };
+            assert!(reason.contains("mcp_aegis-os_workspace_git"), "{reason}");
+        }
+
+        // Read-only git stays in proc_exec, not workspace_git redirect.
+        assert!(classify_enforced_git_redirect("git status --short", host).is_none());
+        assert!(classify_enforced_git_redirect("git diff HEAD", host).is_none());
+
+        // Ring-0 smuggling must never be downgraded to a workspace_git redirect.
+        assert!(classify_enforced_git_redirect("git push origin \"$(sudo rm -rf /)\"", host).is_none());
+        assert!(classify_enforced_git_redirect("git commit -m \"`aegis-os approve esc-1`\"", host).is_none());
+        assert!(classify_enforced_git_redirect("cat ~/.ssh/id_rsa && git push", host).is_none());
     }
 }

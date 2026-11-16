@@ -10,9 +10,10 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use aos_core::{
-    AgentIdentity, ArtifactKind, AuditEvent, Effect, EffectKind, EffectSource, IsolationTier,
-    LeaseGrant, LeaseKind, PolicyContext, PolicyDecision, ResourceLimits, Reversibility,
-    ResourceScope, SandboxConfig, SandboxDriver, TransactionalWorkspace, WorkspaceDomain,
+    AgentIdentity, ArtifactKind, AuditEvent, Effect, EffectKind, EffectSource, EscalationStatus,
+    IsolationTier, LeaseGrant, LeaseKind, PolicyContext, PolicyDecision, ResourceLimits,
+    Reversibility, ResourceScope, SandboxConfig, SandboxDriver, TransactionalWorkspace,
+    WorkspaceDomain,
 };
 use aos_mcp_gateway::{AegisRuntimeKernel, AgentEnvironment};
 use aos_sandbox::NativeOsSandboxDriver;
@@ -47,6 +48,7 @@ struct BrokerState {
     kernel: Arc<AegisRuntimeKernel>,
     effects_path: PathBuf,
     hello: RwLock<Option<Value>>,
+    web_console_addr: RwLock<Option<std::net::SocketAddr>>,
 }
 
 pub struct SessionBroker {
@@ -179,6 +181,7 @@ impl SessionBroker {
             kernel,
             effects_path: session_dir.join("effects.jsonl"),
             hello: RwLock::new(None),
+            web_console_addr: RwLock::new(None),
         });
 
         let (task, tcp_task, tcp_addr) = if expose_tcp {
@@ -465,8 +468,9 @@ where
         ("POST", "/v1/mcp") => {
             let response = state
                 .kernel
-                .handle_jsonrpc_message(&state.identity, payload)
+                .handle_jsonrpc_message(&state.identity, payload.clone())
                 .await?;
+            let response = maybe_handle_mcp_escalation(&state, &payload, response).await;
             write_json(&mut stream, "200 OK", response).await
         }
         ("POST", "/v1/adapter/hello") => {
@@ -690,6 +694,117 @@ where
     write_json(stream, "200 OK", response).await
 }
 
+async fn maybe_handle_mcp_escalation(
+    state: &Arc<BrokerState>,
+    payload: &Value,
+    mut response: Value,
+) -> Value {
+    let Some(esc_id) = crate::cloud::extract_escalation_id_from_rpc(&response) else {
+        return response;
+    };
+    let reason = response
+        .get("result")
+        .and_then(|r| r.get("content"))
+        .and_then(|c| c.as_array())
+        .and_then(|a| a.first())
+        .and_then(|item| item.get("text"))
+        .and_then(|t| t.as_str())
+        .and_then(|txt| serde_json::from_str::<Value>(txt).ok())
+        .and_then(|v| v.get("reason").and_then(|r| r.as_str()).map(str::to_string))
+        .unwrap_or_else(|| "MCP boundary escalation".to_string());
+    notify_pending_escalation(&state.session_dir, &esc_id, &reason);
+
+    if cfg!(test)
+        || std::env::var("AOS_NO_APPROVAL_WAIT").as_deref() == Ok("1")
+        || std::env::var("AOS_AUTO_OPEN_WEB_APPROVE").as_deref() == Ok("0")
+    {
+        return response;
+    }
+
+    let mut addr_opt = *state.web_console_addr.read().await;
+    if addr_opt.is_none() {
+        let mut w = state.web_console_addr.write().await;
+        if w.is_none() {
+            if let Ok(addr) = state
+                .kernel
+                .clone()
+                .start_http_daemon_with_auth(
+                    "127.0.0.1:0",
+                    PathBuf::from(&state.session.workspace),
+                    aos_mcp_gateway::DaemonAuth::Disabled,
+                )
+                .await
+            {
+                *w = Some(addr);
+            }
+        }
+        addr_opt = *w;
+    }
+
+    if let Some(addr) = addr_opt {
+        let approve_url = format!(
+            "http://{}/approve?id={}&org={}&mode=local",
+            addr, esc_id, state.identity.org_id
+        );
+        let browser_opened = crate::cloud::open_url_in_browser(&approve_url);
+        let wait_secs = crate::cloud::approval_wait_timeout_secs().min(45);
+        let force_wait = std::env::var("AOS_FORCE_APPROVAL_WAIT").as_deref() == Ok("1");
+        if (browser_opened || force_wait) && wait_secs > 0 {
+            for _ in 0..(wait_secs * 2) {
+                tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+                let list = state
+                    .kernel
+                    .policy
+                    .list_escalations(&state.identity.org_id)
+                    .await
+                    .unwrap_or_default();
+                let esc = list.iter().find(|e| e.escalation_id == esc_id);
+                if !matches!(esc.map(|e| &e.status), Some(EscalationStatus::Pending)) {
+                    let is_approved = esc.is_some_and(|e| e.status == EscalationStatus::Approved)
+                        || !state
+                            .kernel
+                            .policy
+                            .list_leases(&state.identity.org_id, Some(&state.identity.agent_id))
+                            .await
+                            .unwrap_or_default()
+                            .is_empty();
+                    if is_approved {
+                        if let Ok(retry_resp) = state
+                            .kernel
+                            .handle_jsonrpc_message(&state.identity, payload.clone())
+                            .await
+                        {
+                            return retry_resp;
+                        }
+                    }
+                    break;
+                }
+            }
+        }
+
+        if let Some(text_slot) = response
+            .get_mut("result")
+            .and_then(|r| r.get_mut("content"))
+            .and_then(|c| c.as_array_mut())
+            .and_then(|a| a.first_mut())
+            .and_then(|item| item.get_mut("text"))
+        {
+            if let Some(txt) = text_slot.as_str() {
+                if let Ok(mut inner) = serde_json::from_str::<Value>(txt) {
+                    if let Some(obj) = inner.as_object_mut() {
+                        obj.insert("approve_url".to_string(), json!(approve_url));
+                        obj.insert("browser_opened".to_string(), json!(browser_opened));
+                        if let Ok(updated_txt) = serde_json::to_string_pretty(&inner) {
+                            *text_slot = json!(updated_txt);
+                        }
+                    }
+                }
+            }
+        }
+    }
+    response
+}
+
 async fn evaluate_with_hard_guards(
     state: &BrokerState,
     effect: &Effect,
@@ -706,6 +821,16 @@ async fn evaluate_with_hard_guards(
         return Ok(PolicyDecision::Deny {
             reason: "host writes must go through workspace_commit or fs_export_file".to_string(),
         });
+    }
+    if effect.kind == EffectKind::ProcExec {
+        if let Some(crate::routing::Route::RedirectToSandbox { reason }) =
+            crate::routing::classify_enforced_git_redirect(
+                &effect.resource,
+                Path::new(&state.session.workspace),
+            )
+        {
+            return Ok(PolicyDecision::Deny { reason });
+        }
     }
     if effect.kind == EffectKind::ProcExec && is_boundary_command(&effect.resource) {
         // Host-boundary commands are not made safe by the filesystem sandbox (push/publish/SSH).
@@ -1157,5 +1282,54 @@ mod tests {
         assert!(is_boundary_command("ssh deploy@example.com"));
         assert!(!is_boundary_command("git status --short"));
         assert!(!is_boundary_command("cargo test"));
+    }
+
+    #[tokio::test]
+    async fn broker_redirects_enforced_git_mutations_to_workspace_git() {
+        let tmp = tempfile::tempdir().unwrap();
+        let runtime = tmp.path().join("runtime");
+        let session_dir = tmp.path().join("session");
+        let workspace = tmp.path().join("workspace");
+        let shadow = workspace.join("shadow");
+        let agent_home = session_dir.join("agent_home");
+        std::fs::create_dir_all(&session_dir).unwrap();
+        std::fs::create_dir_all(&shadow).unwrap();
+        std::fs::create_dir_all(&agent_home).unwrap();
+
+        let broker = SessionBroker::start(
+            &runtime,
+            &session_dir,
+            tmp.path().join("c2"),
+            BrokerSession {
+                session_id: "ses_git_redir".to_string(),
+                mode: "implement".to_string(),
+                enforcement: "enforced".to_string(),
+                workspace: workspace.display().to_string(),
+                shadow: shadow.display().to_string(),
+                agent_home: agent_home.display().to_string(),
+            },
+            AgentIdentity::new("org", "agent", "test"),
+            None,
+            false,
+        )
+        .await
+        .unwrap();
+
+        let redirected = broker_request(
+            &broker.socket_path,
+            &broker.agent_token,
+            "POST",
+            "/v1/adapter/evaluate",
+            &json!({"tool": "bash", "input": {"command": "git push origin main"}}),
+        )
+        .await;
+        assert_eq!(redirected["effect"], "deny", "{redirected}");
+        assert!(
+            redirected["reason"]
+                .as_str()
+                .unwrap_or("")
+                .contains("mcp_aegis-os_workspace_git"),
+            "{redirected}"
+        );
     }
 }
