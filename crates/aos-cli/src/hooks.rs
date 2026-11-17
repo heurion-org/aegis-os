@@ -31,7 +31,7 @@ fn hook_allow_mcp(overrides: Vec<String>) -> Value {
 }
 
 /// Normalize PreToolUse hook output for the active client schema:
-/// - Antigravity (`!is_claude`) uses top-level `decision`/`reason`/`permissionOverrides`/`injectSteps`/`overwrite`.
+/// - Antigravity (`!is_claude`) uses top-level `decision`/`reason`/`permissionOverrides`/`overwrite`.
 /// - Claude Code (`is_claude`) treats top-level `decision` as legacy `"approve"|"block"` only and
 ///   fails schema validation on `"allow"|"deny"|"ask"`, so it receives strictly `hookSpecificOutput`
 ///   for `deny`/`ask`/explicit MCP `allow`, or `{}` for transparent pass-through.
@@ -40,6 +40,7 @@ pub(crate) fn format_hook_output_json(mut val: Value, is_claude: bool) -> Value 
         if let Some(obj) = val.as_object_mut() {
             obj.remove("hookSpecificOutput");
             obj.remove("claudeExplicitAllow");
+            obj.remove("injectSteps");
         }
         return val;
     }
@@ -814,6 +815,69 @@ async fn build_boundary_approval_prompt(
     }
 }
 
+fn json_file_has_aegis_mcp_server(path: &Path) -> bool {
+    let Ok(raw) = std::fs::read_to_string(path) else {
+        return false;
+    };
+    let Ok(parsed) = serde_json::from_str::<Value>(&raw) else {
+        return false;
+    };
+    parsed
+        .get("mcpServers")
+        .and_then(|s| s.get("aegis-os"))
+        .is_some_and(Value::is_object)
+        || parsed
+            .get("servers")
+            .and_then(|s| s.get("aegis-os"))
+            .is_some_and(Value::is_object)
+}
+
+fn client_has_aegis_mcp_configured(
+    is_claude_payload: bool,
+    workspace: &Path,
+    home_dir: Option<&Path>,
+) -> bool {
+    let candidates: Vec<PathBuf> = if is_claude_payload {
+        let mut list = vec![workspace.join(".mcp.json")];
+        if let Some(home) = home_dir {
+            list.push(home.join(".claude.json"));
+        }
+        list
+    } else {
+        let mut list = vec![
+            workspace.join(".agents/mcp_config.json"),
+            workspace.join(".gemini/mcp_config.json"),
+        ];
+        if let Some(home) = home_dir {
+            list.push(home.join(".gemini/config/mcp_config.json"));
+            list.push(home.join(".gemini/antigravity-cli/mcp_config.json"));
+        }
+        list
+    };
+    candidates.into_iter().any(|p| json_file_has_aegis_mcp_server(&p))
+}
+
+fn resolve_effective_routing_mode(
+    is_claude_payload: bool,
+    workspace: &Path,
+    home_dir: Option<&Path>,
+) -> routing::RoutingMode {
+    let mode = routing::RoutingMode::from_env();
+    if mode != routing::RoutingMode::Enforce || std::env::var_os("AOS_ROUTING").is_some() {
+        return mode;
+    }
+    if std::env::var("AOS_CONTROL_SOCKET").is_ok_and(|s| !s.trim().is_empty())
+        || std::env::var("AOS_ENFORCEMENT").as_deref() == Ok("enforced")
+    {
+        return mode;
+    }
+    if client_has_aegis_mcp_configured(is_claude_payload, workspace, home_dir) {
+        routing::RoutingMode::Enforce
+    } else {
+        routing::RoutingMode::Advise
+    }
+}
+
 pub(crate) async fn handle_agy_hook(
     event: &str,
     _strict_cow: bool,
@@ -1331,7 +1395,12 @@ pub(crate) async fn handle_agy_hook(
                 return Ok(());
             }
 
-            let routing_mode = routing::RoutingMode::from_env();
+            let host_home = std::env::var_os("HOME").map(PathBuf::from);
+            let routing_mode = resolve_effective_routing_mode(
+                is_claude_payload,
+                &effective_workspace,
+                host_home.as_deref(),
+            );
 
             if matches!(tool_name, "read_file" | "view_file" | "Read") {
                 let target_path = tool_args
@@ -1576,7 +1645,11 @@ mod tests {
 
         let advise_agy = format_hook_output_json(advise, false);
         assert_eq!(advise_agy["decision"], "allow");
-        assert!(advise_agy.get("injectSteps").is_some());
+        assert!(advise_agy.get("injectSteps").is_none());
+        assert!(advise_agy["reason"]
+            .as_str()
+            .unwrap()
+            .contains("mcp_aegis-os_proc_exec"));
 
         let mcp_agy = format_hook_output_json(
             hook_allow_mcp(vec!["mcp(aegis-os/*)".to_string()]),
@@ -1586,6 +1659,49 @@ mod tests {
         assert!(mcp_agy.get("permissionOverrides").is_some());
         assert!(mcp_agy.get("claudeExplicitAllow").is_none());
         assert!(mcp_agy.get("hookSpecificOutput").is_none());
+    }
+
+    #[test]
+    fn advisory_hook_falls_back_to_advise_when_aegis_mcp_unconfigured() {
+        let tmp = tempfile::tempdir().unwrap();
+        let ws = tmp.path().join("ws");
+        let home = tmp.path().join("home");
+        std::fs::create_dir_all(&ws).unwrap();
+        std::fs::create_dir_all(home.join(".gemini/config")).unwrap();
+
+        assert!(!client_has_aegis_mcp_configured(false, &ws, Some(&home)));
+        assert!(!client_has_aegis_mcp_configured(true, &ws, Some(&home)));
+
+        std::fs::write(
+            home.join(".gemini/config/mcp_config.json"),
+            r#"{"mcpServers":{"other":{"command":"echo"}}}"#,
+        )
+        .unwrap();
+        assert!(!client_has_aegis_mcp_configured(false, &ws, Some(&home)));
+        if std::env::var_os("AOS_ROUTING").is_none()
+            && std::env::var_os("AOS_CONTROL_SOCKET").is_none()
+            && std::env::var("AOS_ENFORCEMENT").as_deref() != Ok("enforced")
+        {
+            assert_eq!(
+                resolve_effective_routing_mode(false, &ws, Some(&home)),
+                routing::RoutingMode::Advise
+            );
+        }
+
+        std::fs::write(
+            home.join(".gemini/config/mcp_config.json"),
+            r#"{"mcpServers":{"other":{"command":"echo"},"aegis-os":{"command":"aegis-os"}}}"#,
+        )
+        .unwrap();
+        assert!(client_has_aegis_mcp_configured(false, &ws, Some(&home)));
+        assert!(!client_has_aegis_mcp_configured(true, &ws, Some(&home)));
+
+        std::fs::write(
+            ws.join(".mcp.json"),
+            r#"{"mcpServers":{"aegis-os":{"command":"aegis-os"}}}"#,
+        )
+        .unwrap();
+        assert!(client_has_aegis_mcp_configured(true, &ws, Some(&home)));
     }
 }
 

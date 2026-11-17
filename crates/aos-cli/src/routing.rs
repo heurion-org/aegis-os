@@ -103,7 +103,7 @@ impl Route {
             | (Route::RedirectToMcpFs { reason }, RoutingMode::Advise) => {
                 json!({
                     "decision": "allow",
-                    "injectSteps": [{ "ephemeralMessage": reason }]
+                    "reason": reason
                 })
             }
             _ => json!({ "decision": "allow" }),

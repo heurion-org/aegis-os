@@ -410,21 +410,10 @@ impl NativeOsSandboxInstance {
             outbound_targets.push(
                 r#"(remote unix-socket (path-literal "/private/var/run/mDNSResponder"))"#.to_string(),
             );
-            let mut rules = format!(
-                "\n(deny network-bind (local ip))\n(deny network-inbound (local ip))\n(deny network-outbound)\n(allow network-outbound\n    {}\n)",
+            format!(
+                "\n(deny network-bind (local ip))\n(deny network-inbound (local ip))\n(allow network-bind (local ip \"localhost:*\"))\n(allow network-inbound (local ip \"localhost:*\"))\n(deny network-outbound)\n(allow network-outbound\n    {}\n)",
                 outbound_targets.join("\n    ")
-            );
-            if !loopback_ports.is_empty() {
-                let bind_targets: Vec<String> = loopback_ports
-                    .iter()
-                    .map(|p| format!(r#"(local ip "localhost:{p}")"#))
-                    .collect();
-                let joined = bind_targets.join("\n    ");
-                rules.push_str(&format!(
-                    "\n(allow network-bind\n    {joined}\n)\n(allow network-inbound\n    {joined}\n)"
-                ));
-            }
-            rules
+            )
         } else {
             String::new()
         };
@@ -2439,6 +2428,14 @@ mod tests {
         let profile = sbx.generate_macos_seatbelt_profile();
         assert!(profile.contains("(deny network-bind (local ip))"), "{profile}");
         assert!(profile.contains("(deny network-inbound (local ip))"), "{profile}");
+        assert!(
+            profile.contains(r#"(allow network-bind (local ip "localhost:*"))"#),
+            "{profile}"
+        );
+        assert!(
+            profile.contains(r#"(allow network-inbound (local ip "localhost:*"))"#),
+            "{profile}"
+        );
         assert!(profile.contains("(deny network-outbound)"), "{profile}");
         assert!(
             profile.contains(r#"(remote ip "localhost:18080")"#),
@@ -2449,11 +2446,11 @@ mod tests {
             "{profile}"
         );
         assert!(
-            profile.contains(r#"(local ip "localhost:51234")"#),
+            profile.contains(r#"(remote ip "localhost:51235")"#),
             "{profile}"
         );
         assert!(
-            profile.contains(r#"(local ip "localhost:51235")"#),
+            !profile.contains(r#"(remote ip "localhost:*")"#),
             "{profile}"
         );
     }
@@ -2574,6 +2571,50 @@ t.join(timeout=2)
             blocked_out.exit_code,
             Some(0),
             "connect to unallocated host loopback port must be blocked: {blocked_out:?}"
+        );
+
+        let py_ephemeral = r#"
+import socket
+s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+s.bind(("127.0.0.1", 0))
+s.listen(1)
+port = s.getsockname()[1]
+assert port > 0
+s.close()
+print("EPHEMERAL_BIND_OK")
+"#;
+        let ephem_out = sbx
+            .exec(ExecSpec {
+                command: "python3".to_string(),
+                args: vec!["-c".to_string(), py_ephemeral.to_string()],
+                cwd: None,
+                env: HashMap::new(),
+                timeout_ms: Some(10_000),
+                background: false,
+            })
+            .await
+            .unwrap();
+        assert_eq!(ephem_out.exit_code, Some(0), "ephem_out: {ephem_out:?}");
+        assert_eq!(ephem_out.stdout.trim(), "EPHEMERAL_BIND_OK");
+
+        let wan_blocked_out = sbx
+            .exec(ExecSpec {
+                command: "python3".to_string(),
+                args: vec![
+                    "-c".to_string(),
+                    "import socket; socket.create_connection(('8.8.8.8', 53), timeout=1)".to_string(),
+                ],
+                cwd: None,
+                env: HashMap::new(),
+                timeout_ms: Some(10_000),
+                background: false,
+            })
+            .await
+            .unwrap();
+        assert_ne!(
+            wan_blocked_out.exit_code,
+            Some(0),
+            "outbound WAN connect must be denied by Seatbelt: {wan_blocked_out:?}"
         );
     }
 

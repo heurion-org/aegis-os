@@ -115,6 +115,12 @@ const PERSISTED_AGENT_STATE_DIRS: &[&str] = &[
     ".claude/shell-snapshots",
     ".codex/sessions",
     ".codex/log",
+    ".gemini/antigravity-cli/brain",
+    ".gemini/antigravity/brain",
+    ".gemini/antigravity-ide/brain",
+    ".gemini/antigravity-cli/conversations",
+    ".gemini/antigravity/conversations",
+    ".gemini/antigravity-ide/conversations",
 ];
 
 /// Session databases, virtualenvs, and caches can be multi-GB; do not copy them into every session.
@@ -124,6 +130,14 @@ const SEED_SKIP_NAMES: &[&str] = &[
     "logs",
     "log",
     "brain",
+    "conversations",
+    "annotations",
+    "implicit",
+    "presence",
+    "crashes",
+    "conversation_summaries.db",
+    "conversation_summaries.db-wal",
+    "conversation_summaries.db-shm",
     "cache",
     "tmp",
     "hermes-agent",
@@ -1648,6 +1662,15 @@ pub(crate) fn sync_credentials(agent_home: &Path, host_home: &Path, command: &[S
                 }
             }
         }
+        if let Some(ses_dir) = agent_home.parent() {
+            if let Some(sessions_dir) = ses_dir.parent() {
+                if sessions_dir.file_name().and_then(|n| n.to_str()) == Some("sessions") {
+                    if let Some(runtime_dir) = sessions_dir.parent() {
+                        sync_runtime_agy_oauth_from_agent_home(runtime_dir, agent_home, command);
+                    }
+                }
+            }
+        }
         for rel_settings in [
             ".gemini/antigravity-cli/settings.json",
             ".gemini/settings.json",
@@ -1778,13 +1801,38 @@ pub(crate) fn backfill_host_agy_credentials_from_sessions(
     if host_home.join(token_rel).is_file() {
         return false;
     }
+    for dir in sorted_agy_session_dirs(runtime_dir) {
+        let ses_agent_home = dir.join("agent_home");
+        if read_sandbox_json_object_no_symlink(&ses_agent_home, token_rel, false).is_some() {
+            sync_credentials(&ses_agent_home, host_home, &["agy".to_string()]);
+            return host_home.join(token_rel).is_file();
+        }
+    }
+    false
+}
+
+const AGY_CACHE_TOKEN_PRIMARY: &str = ".gemini/antigravity-cli/antigravity-oauth-token";
+const MAX_CONVERSATION_FILE_BYTES: u64 = 512 * 1024 * 1024;
+const MAX_CONVERSATION_TOTAL_BYTES: u64 = 768 * 1024 * 1024;
+
+fn sorted_agy_session_dirs(runtime_dir: &Path) -> Vec<PathBuf> {
     let sessions_dir = runtime_dir.join("sessions");
+    if !std::fs::symlink_metadata(&sessions_dir)
+        .is_ok_and(|m| !m.file_type().is_symlink() && m.file_type().is_dir())
+    {
+        return Vec::new();
+    }
     let Ok(entries) = std::fs::read_dir(&sessions_dir) else {
-        return false;
+        return Vec::new();
     };
-    let mut candidates: Vec<(i64, PathBuf)> = Vec::new();
+    let mut hits: Vec<(i64, PathBuf)> = Vec::new();
     for entry in entries.flatten() {
         let dir = entry.path();
+        if !std::fs::symlink_metadata(&dir)
+            .is_ok_and(|m| !m.file_type().is_symlink() && m.file_type().is_dir())
+        {
+            continue;
+        }
         let Ok(raw) = std::fs::read_to_string(dir.join("session.json")) else {
             continue;
         };
@@ -1798,21 +1846,459 @@ pub(crate) fn backfill_host_agy_credentials_from_sessions(
         if !is_agy {
             continue;
         }
-        let created = value
-            .get("created_at_ms")
+        let ts = value
+            .get("updated_at_ms")
+            .or_else(|| value.get("created_at_ms"))
             .and_then(|v| v.as_i64())
             .unwrap_or(0);
-        candidates.push((created, dir));
+        hits.push((ts, dir));
     }
-    candidates.sort_by(|a, b| b.0.cmp(&a.0));
-    for (_created, dir) in candidates {
-        let ses_agent_home = dir.join("agent_home");
-        if read_sandbox_json_object_no_symlink(&ses_agent_home, token_rel, false).is_some() {
-            sync_credentials(&ses_agent_home, host_home, &["agy".to_string()]);
-            return host_home.join(token_rel).is_file();
+    hits.sort_by(|a, b| b.0.cmp(&a.0));
+    hits.into_iter().map(|(_, dir)| dir).collect()
+}
+
+fn agy_runtime_credentials_dir(runtime_dir: &Path) -> PathBuf {
+    runtime_dir.join("credentials").join("agy")
+}
+
+fn ensure_0700_dir_no_symlink(dir: &Path) -> bool {
+    use std::os::unix::fs::{DirBuilderExt, PermissionsExt};
+    match std::fs::symlink_metadata(dir) {
+        Ok(meta) => {
+            if meta.file_type().is_symlink() || !meta.file_type().is_dir() {
+                return false;
+            }
+            let _ = std::fs::set_permissions(dir, std::fs::Permissions::from_mode(0o700));
+            true
+        }
+        Err(_) => {
+            let mut builder = std::fs::DirBuilder::new();
+            builder.mode(0o700);
+            builder.create(dir).is_ok()
         }
     }
-    false
+}
+
+/// Seal active `agy` / `gemini` OAuth tokens into `<runtime_dir>/credentials/agy` (`0700` dir,
+/// `0600` atomic symlink-free files) so host Keychain sweeps cannot strand subsequent sandboxed runs.
+pub(crate) fn sync_runtime_agy_oauth_from_agent_home(
+    runtime_dir: &Path,
+    agent_home: &Path,
+    command: &[String],
+) {
+    if !is_agy_or_gemini_command(command) {
+        return;
+    }
+    if std::env::var_os("AOS_NO_CREDENTIAL_SYNC")
+        .and_then(|v| v.into_string().ok())
+        .is_some_and(|s| matches!(s.trim(), "1" | "true" | "TRUE" | "yes"))
+    {
+        return;
+    }
+    let creds_parent = runtime_dir.join("credentials");
+    if !ensure_0700_dir_no_symlink(&creds_parent) {
+        return;
+    }
+    let cache_dir = agy_runtime_credentials_dir(runtime_dir);
+    if !ensure_0700_dir_no_symlink(&cache_dir) {
+        return;
+    }
+
+    for rel in AGY_AND_GEMINI_OAUTH_STORE_FILES.iter().rev() {
+        let Some(fname) = Path::new(rel).file_name().and_then(|n| n.to_str()) else {
+            continue;
+        };
+        if let Some((_, obj)) = read_sandbox_json_object_no_symlink(agent_home, rel, false) {
+            let _ = write_host_json_0600_no_symlink(&cache_dir, fname, &obj);
+        }
+    }
+    if is_agy_command(command) {
+        for rel in AGY_USER_SCOPE_FILES.iter().rev() {
+            if let Some(scope) = read_sandbox_scope_id_no_symlink(agent_home, rel) {
+                let _ = write_host_bytes_0600_no_symlink(
+                    &cache_dir,
+                    "credential-user-scope",
+                    scope.as_bytes(),
+                );
+            }
+        }
+        if let Some((_, onb)) = read_sandbox_json_object_no_symlink(
+            agent_home,
+            ".gemini/antigravity-cli/cache/onboarding.json",
+            false,
+        ) {
+            let _ = write_host_json_0600_no_symlink(&cache_dir, "onboarding.json", &onb);
+        }
+    }
+}
+
+/// Ensure `agent_home` has `agy` / `gemini` OAuth credentials even after host `agy` sweeps
+/// `~/.gemini/antigravity-cli/antigravity-oauth-token` into macOS Keychain.
+pub(crate) fn restore_or_seed_agy_oauth_cache(
+    runtime_dir: &Path,
+    _host_home: &Path,
+    agent_home: &Path,
+    command: &[String],
+) {
+    if !is_agy_or_gemini_command(command) {
+        return;
+    }
+    if read_sandbox_json_object_no_symlink(agent_home, AGY_CACHE_TOKEN_PRIMARY, false).is_some() {
+        sync_runtime_agy_oauth_from_agent_home(runtime_dir, agent_home, command);
+        return;
+    }
+
+    for ses_dir in sorted_agy_session_dirs(runtime_dir) {
+        let Some(ses_home) = resolve_symlink_free_dir(&ses_dir, Path::new("agent_home")) else {
+            continue;
+        };
+        let Some((_, tok)) =
+            read_sandbox_json_object_no_symlink(&ses_home, AGY_CACHE_TOKEN_PRIMARY, false)
+        else {
+            continue;
+        };
+        let _ = write_host_json_0600_no_symlink(agent_home, AGY_CACHE_TOKEN_PRIMARY, &tok);
+        for rel in AGY_AND_GEMINI_OAUTH_STORE_FILES {
+            if *rel != AGY_CACHE_TOKEN_PRIMARY
+                && read_sandbox_json_object_no_symlink(agent_home, rel, false).is_none()
+            {
+                if let Some((_, obj)) = read_sandbox_json_object_no_symlink(&ses_home, rel, false) {
+                    let _ = write_host_json_0600_no_symlink(agent_home, rel, &obj);
+                }
+            }
+        }
+        if is_agy_command(command) {
+            for rel in AGY_USER_SCOPE_FILES {
+                if read_sandbox_scope_id_no_symlink(agent_home, rel).is_none() {
+                    if let Some(scope) = read_sandbox_scope_id_no_symlink(&ses_home, rel) {
+                        let _ =
+                            write_host_bytes_0600_no_symlink(agent_home, rel, scope.as_bytes());
+                    }
+                }
+            }
+            let onb_rel = ".gemini/antigravity-cli/cache/onboarding.json";
+            if read_sandbox_json_object_no_symlink(agent_home, onb_rel, false).is_none() {
+                if let Some((_, onb)) =
+                    read_sandbox_json_object_no_symlink(&ses_home, onb_rel, false)
+                {
+                    let _ = write_host_json_0600_no_symlink(agent_home, onb_rel, &onb);
+                }
+            }
+        }
+        sync_runtime_agy_oauth_from_agent_home(runtime_dir, agent_home, command);
+        return;
+    }
+
+    let cache_dir = agy_runtime_credentials_dir(runtime_dir);
+    if !std::fs::symlink_metadata(&cache_dir)
+        .is_ok_and(|m| !m.file_type().is_symlink() && m.file_type().is_dir())
+    {
+        return;
+    }
+    let Some((_, tok)) =
+        read_sandbox_json_object_no_symlink(&cache_dir, "antigravity-oauth-token", false)
+    else {
+        return;
+    };
+    let _ = write_host_json_0600_no_symlink(agent_home, AGY_CACHE_TOKEN_PRIMARY, &tok);
+    if let Some((_, oauth_creds)) =
+        read_sandbox_json_object_no_symlink(&cache_dir, "oauth_creds.json", false)
+    {
+        for rel in [
+            ".gemini/oauth_creds.json",
+            ".gemini/antigravity-cli/oauth_creds.json",
+        ] {
+            if read_sandbox_json_object_no_symlink(agent_home, rel, false).is_none() {
+                let _ = write_host_json_0600_no_symlink(agent_home, rel, &oauth_creds);
+            }
+        }
+    }
+    if let Some((_, jetski)) =
+        read_sandbox_json_object_no_symlink(&cache_dir, "jetski-standalone-oauth-token", false)
+    {
+        let rel = ".gemini/jetski-standalone-oauth-token";
+        if read_sandbox_json_object_no_symlink(agent_home, rel, false).is_none() {
+            let _ = write_host_json_0600_no_symlink(agent_home, rel, &jetski);
+        }
+    }
+    if is_agy_command(command) {
+        if let Some(scope) = read_sandbox_scope_id_no_symlink(&cache_dir, "credential-user-scope") {
+            for rel in AGY_USER_SCOPE_FILES {
+                if read_sandbox_scope_id_no_symlink(agent_home, rel).is_none() {
+                    let _ = write_host_bytes_0600_no_symlink(agent_home, rel, scope.as_bytes());
+                }
+            }
+        }
+        let onb_rel = ".gemini/antigravity-cli/cache/onboarding.json";
+        if read_sandbox_json_object_no_symlink(agent_home, onb_rel, false).is_none() {
+            if let Some((_, onb)) =
+                read_sandbox_json_object_no_symlink(&cache_dir, "onboarding.json", false)
+            {
+                let _ = write_host_json_0600_no_symlink(agent_home, onb_rel, &onb);
+            }
+        }
+    }
+}
+
+#[cfg_attr(not(target_os = "macos"), allow(dead_code))]
+pub(crate) fn extract_agy_conversation_id(command: &[String]) -> Option<String> {
+    if !is_agy_command(command) {
+        return None;
+    }
+    let mut i = 1;
+    while i < command.len() {
+        let arg = &command[i];
+        if arg == "--" {
+            break;
+        }
+        let raw_id = if let Some(val) = arg.strip_prefix("--conversation=") {
+            Some(val)
+        } else if arg == "--conversation" {
+            i += 1;
+            command.get(i).map(String::as_str)
+        } else {
+            None
+        };
+        if let Some(id) = raw_id {
+            if !id.is_empty()
+                && id.len() <= 128
+                && id
+                    .chars()
+                    .all(|c| c.is_ascii_alphanumeric() || matches!(c, '-' | '_'))
+            {
+                return Some(id.to_string());
+            }
+            return None;
+        }
+        i += 1;
+    }
+    None
+}
+
+#[cfg_attr(not(target_os = "macos"), allow(dead_code))]
+fn resolve_symlink_free_dir(root: &Path, rel: &Path) -> Option<PathBuf> {
+    let root_meta = std::fs::symlink_metadata(root).ok()?;
+    if root_meta.file_type().is_symlink() || !root_meta.file_type().is_dir() {
+        return None;
+    }
+    let mut cur = root.to_path_buf();
+    for comp in rel.components() {
+        let std::path::Component::Normal(seg) = comp else {
+            return None;
+        };
+        cur.push(seg);
+        let meta = std::fs::symlink_metadata(&cur).ok()?;
+        if meta.file_type().is_symlink() || !meta.file_type().is_dir() {
+            return None;
+        }
+    }
+    Some(cur)
+}
+
+#[cfg_attr(not(target_os = "macos"), allow(dead_code))]
+fn conversation_candidate_mtime(dir: &Path) -> std::time::SystemTime {
+    if let Some(logs_dir) = resolve_symlink_free_dir(dir, Path::new(".system_generated/logs")) {
+        let transcript = logs_dir.join("transcript.jsonl");
+        if let Ok(meta) = std::fs::symlink_metadata(&transcript) {
+            if !meta.file_type().is_symlink() && meta.file_type().is_file() {
+                if let Ok(mtime) = meta.modified() {
+                    return mtime;
+                }
+            }
+        }
+    }
+    std::fs::symlink_metadata(dir)
+        .and_then(|m| m.modified())
+        .unwrap_or(std::time::UNIX_EPOCH)
+}
+
+#[cfg_attr(not(target_os = "macos"), allow(dead_code))]
+fn copy_conversation_tree_no_symlink(
+    src: &Path,
+    dst: &Path,
+    remaining_bytes: &mut u64,
+) -> std::io::Result<()> {
+    let src_meta = std::fs::symlink_metadata(src)?;
+    if src_meta.file_type().is_symlink() || !src_meta.file_type().is_dir() {
+        return Ok(());
+    }
+    std::fs::create_dir_all(dst)?;
+    for entry in std::fs::read_dir(src)? {
+        let entry = entry?;
+        let entry_path = entry.path();
+        let name = entry.file_name();
+        let meta = std::fs::symlink_metadata(&entry_path)?;
+        if meta.file_type().is_symlink() {
+            continue;
+        }
+        if meta.file_type().is_dir() {
+            copy_conversation_tree_no_symlink(&entry_path, &dst.join(name), remaining_bytes)?;
+        } else if meta.file_type().is_file() {
+            let len = meta.len();
+            if len > MAX_CONVERSATION_FILE_BYTES || len > *remaining_bytes {
+                continue;
+            }
+            *remaining_bytes -= len;
+            std::fs::copy(&entry_path, dst.join(name))?;
+        }
+    }
+    Ok(())
+}
+
+#[cfg_attr(not(target_os = "macos"), allow(dead_code))]
+fn agent_home_chain_has_no_symlink(agent_home: &Path, segs: &[&str]) -> bool {
+    let mut check = agent_home.to_path_buf();
+    for seg in segs {
+        check.push(seg);
+        if let Ok(meta) = std::fs::symlink_metadata(&check) {
+            if meta.file_type().is_symlink() || !meta.file_type().is_dir() {
+                return false;
+            }
+        }
+    }
+    true
+}
+
+#[cfg_attr(not(target_os = "macos"), allow(dead_code))]
+fn stage_agy_conversation_db(
+    session_dirs: &[PathBuf],
+    host_home: &Path,
+    agent_home: &Path,
+    conv_id: &str,
+) {
+    use std::os::unix::fs::PermissionsExt;
+    let db_dst_dir = agent_home.join(".gemini/antigravity-cli/conversations");
+    let primary_db = format!("{conv_id}.db");
+    let primary_pb = format!("{conv_id}.pb");
+    if db_dst_dir.join(&primary_db).symlink_metadata().is_ok()
+        || db_dst_dir.join(&primary_pb).symlink_metadata().is_ok()
+    {
+        return;
+    }
+    if !agent_home_chain_has_no_symlink(agent_home, &[".gemini", "antigravity-cli", "conversations"])
+    {
+        return;
+    }
+
+    let mut conv_candidates: Vec<PathBuf> = session_dirs
+        .iter()
+        .filter_map(|dir| {
+            resolve_symlink_free_dir(dir, Path::new("agent_home/.gemini/antigravity-cli/conversations"))
+        })
+        .collect();
+    for host_root in [
+        ".gemini/antigravity-cli/conversations",
+        ".gemini/antigravity/conversations",
+        ".gemini/antigravity-ide/conversations",
+    ] {
+        if let Some(valid_dir) = resolve_symlink_free_dir(host_home, Path::new(host_root)) {
+            conv_candidates.push(valid_dir);
+        }
+    }
+
+    let valid_regular = |path: &Path| -> Option<std::time::SystemTime> {
+        let meta = std::fs::symlink_metadata(path).ok()?;
+        if meta.file_type().is_symlink()
+            || !meta.file_type().is_file()
+            || meta.len() > MAX_CONVERSATION_FILE_BYTES
+        {
+            return None;
+        }
+        Some(meta.modified().unwrap_or(std::time::UNIX_EPOCH))
+    };
+
+    let mut best: Option<(std::time::SystemTime, PathBuf)> = None;
+    for cand in conv_candidates {
+        let mtime = valid_regular(&cand.join(&primary_db))
+            .or_else(|| valid_regular(&cand.join(&primary_pb)));
+        let Some(mtime) = mtime else {
+            continue;
+        };
+        if best.as_ref().is_none_or(|(best_mtime, _)| mtime > *best_mtime) {
+            best = Some((mtime, cand));
+        }
+    }
+
+    let Some((_, src_dir)) = best else {
+        return;
+    };
+    if std::fs::create_dir_all(&db_dst_dir).is_err() {
+        return;
+    }
+    for suffix in [".db", ".db-wal", ".db-shm", ".pb"] {
+        let fname = format!("{conv_id}{suffix}");
+        let src_file = src_dir.join(&fname);
+        if valid_regular(&src_file).is_none() {
+            continue;
+        }
+        let dst_file = db_dst_dir.join(&fname);
+        if std::fs::copy(&src_file, &dst_file).is_ok() {
+            let _ = std::fs::set_permissions(&dst_file, std::fs::Permissions::from_mode(0o600));
+        }
+    }
+}
+
+/// Stage a requested `agy --conversation=<id>` directory into the session `agent_home`
+/// so resuming conversations works across isolated homes on macOS Seatbelt without copying
+/// bulk brain histories into unrelated sessions.
+#[cfg_attr(not(target_os = "macos"), allow(dead_code))]
+pub(crate) fn stage_agy_conversation_for_resume(
+    runtime_dir: &Path,
+    host_home: &Path,
+    agent_home: &Path,
+    command: &[String],
+) {
+    let Some(conv_id) = extract_agy_conversation_id(command) else {
+        return;
+    };
+    let session_dirs = sorted_agy_session_dirs(runtime_dir);
+    stage_agy_conversation_db(&session_dirs, host_home, agent_home, &conv_id);
+
+    let dst = agent_home.join(".gemini/antigravity-cli/brain").join(&conv_id);
+    if dst.symlink_metadata().is_ok() {
+        return;
+    }
+
+    let mut candidates: Vec<PathBuf> = Vec::new();
+    let brain_rel = Path::new("agent_home/.gemini/antigravity-cli/brain").join(&conv_id);
+    for dir in &session_dirs {
+        if let Some(valid_dir) = resolve_symlink_free_dir(dir, &brain_rel) {
+            candidates.push(valid_dir);
+        }
+    }
+
+    for host_root in [
+        ".gemini/antigravity-cli/brain",
+        ".gemini/antigravity/brain",
+        ".gemini/antigravity-ide/brain",
+    ] {
+        let rel = Path::new(host_root).join(&conv_id);
+        if let Some(valid_dir) = resolve_symlink_free_dir(host_home, &rel) {
+            candidates.push(valid_dir);
+        }
+    }
+
+    let mut best: Option<(std::time::SystemTime, PathBuf)> = None;
+    for cand in candidates {
+        let mtime = conversation_candidate_mtime(&cand);
+        if best.as_ref().is_none_or(|(best_mtime, _)| mtime > *best_mtime) {
+            best = Some((mtime, cand));
+        }
+    }
+
+    if let Some((_, src)) = best {
+        if !agent_home_chain_has_no_symlink(agent_home, &[".gemini", "antigravity-cli", "brain"]) {
+            return;
+        }
+        let mut remaining = MAX_CONVERSATION_TOTAL_BYTES;
+        if let Err(err) = copy_conversation_tree_no_symlink(&src, &dst, &mut remaining) {
+            eprintln!(
+                "aos run: warning: failed staging agy conversation `{conv_id}` from {}: {err}",
+                src.display()
+            );
+            let _ = std::fs::remove_dir_all(&dst);
+        }
+    }
 }
 
 fn restore_native_oauth_store_for_agent(
@@ -5398,6 +5884,7 @@ async fn run_inner(
     let _ = std::fs::set_permissions(&agent_home, std::fs::Permissions::from_mode(0o700));
     seed_agent_home(host_home, &agent_home)?;
     restore_native_oauth_store_for_agent(host_home, &agent_home, &orig_command, &harvested_secrets);
+    restore_or_seed_agy_oauth_cache(runtime_dir, host_home, &agent_home, &orig_command);
     for rel in [".run", ".cache", ".local/share", ".local/state", ".cargo/registry", ".cargo/git", ".rustup/toolchains"] {
         std::fs::create_dir_all(agent_home.join(rel))?;
     }
@@ -5865,6 +6352,8 @@ async fn run_macos_inner(
     let _ = std::fs::set_permissions(&agent_home, std::fs::Permissions::from_mode(0o700));
     seed_agent_home(host_home, &agent_home)?;
     restore_native_oauth_store_for_agent(host_home, &agent_home, command, &harvested_secrets);
+    restore_or_seed_agy_oauth_cache(runtime_dir, host_home, &agent_home, command);
+    stage_agy_conversation_for_resume(runtime_dir, host_home, &agent_home, command);
     for rel in [".run", ".cache", ".local/share", ".local/state", "tmp"] {
         std::fs::create_dir_all(agent_home.join(rel))?;
     }
@@ -8658,5 +9147,173 @@ mod tests {
             std::fs::read_to_string(host_home.join(".gemini/antigravity-cli/antigravity-oauth-token"))
                 .unwrap();
         assert!(host_tok_after.contains("ya29.existing-host"));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn stage_agy_conversation_for_resume_copies_brain_and_blocks_symlinks_and_traversal() {
+        let tmp = tempfile::tempdir().unwrap();
+        let runtime = tmp.path().join("runtime");
+        let host_home = tmp.path().join("host");
+        let agent_home = tmp.path().join("agent_home");
+        let conv_id = "3e0eb6b1-3356-4031-9b13-8a04b2afcdbe";
+
+        std::fs::create_dir_all(&runtime).unwrap();
+        std::fs::create_dir_all(&host_home).unwrap();
+        std::fs::create_dir_all(&agent_home).unwrap();
+
+        assert_eq!(
+            extract_agy_conversation_id(&[
+                "agy".to_string(),
+                format!("--conversation={conv_id}"),
+            ]),
+            Some(conv_id.to_string())
+        );
+        assert_eq!(
+            extract_agy_conversation_id(&[
+                "/Users/me/.local/bin/agy".to_string(),
+                "--conversation".to_string(),
+                conv_id.to_string(),
+            ]),
+            Some(conv_id.to_string())
+        );
+        assert_eq!(
+            extract_agy_conversation_id(&[
+                "agy".to_string(),
+                "--conversation=../escape".to_string(),
+            ]),
+            None
+        );
+        assert_eq!(
+            extract_agy_conversation_id(&[
+                "claude".to_string(),
+                format!("--conversation={conv_id}"),
+            ]),
+            None
+        );
+
+        let secret_file = host_home.join(".ssh/id_rsa");
+        std::fs::create_dir_all(secret_file.parent().unwrap()).unwrap();
+        std::fs::write(&secret_file, "SECRET_KEY").unwrap();
+
+        // Older session brain vs newer host brain (with transcript logs).
+        let ses_old = runtime.join("sessions/ses_old");
+        let ses_brain = ses_old
+            .join("agent_home/.gemini/antigravity-cli/brain")
+            .join(conv_id);
+        std::fs::create_dir_all(ses_brain.join(".system_generated/logs")).unwrap();
+        std::fs::write(
+            ses_old.join("session.json"),
+            r#"{"session_id":"ses_old","agent_id":"agy-agent","created_at_ms":1000}"#,
+        )
+        .unwrap();
+        std::fs::write(
+            ses_brain.join(".system_generated/logs/transcript.jsonl"),
+            "{\"old\":true}\n",
+        )
+        .unwrap();
+
+        // Non-agy session must be ignored even with a newer timestamp.
+        let ses_foreign = runtime.join("sessions/ses_foreign");
+        let foreign_brain = ses_foreign
+            .join("agent_home/.gemini/antigravity-cli/brain")
+            .join(conv_id);
+        std::fs::create_dir_all(&foreign_brain).unwrap();
+        std::fs::write(
+            ses_foreign.join("session.json"),
+            r#"{"session_id":"ses_foreign","agent_id":"claude-code","created_at_ms":999999}"#,
+        )
+        .unwrap();
+        std::fs::write(foreign_brain.join("poison.txt"), "foreign").unwrap();
+
+        std::thread::sleep(std::time::Duration::from_millis(20));
+
+        let host_brain = host_home
+            .join(".gemini/antigravity-cli/brain")
+            .join(conv_id);
+        let host_conv_dir = host_home.join(".gemini/antigravity-cli/conversations");
+        std::fs::create_dir_all(&host_conv_dir).unwrap();
+        std::fs::write(host_conv_dir.join(format!("{conv_id}.db")), b"SQLite_CONV_DATA").unwrap();
+        std::fs::write(host_conv_dir.join(format!("{conv_id}.db-wal")), b"WAL_DATA").unwrap();
+        std::fs::write(host_conv_dir.join("other-conv.db"), b"UNRELATED_DB").unwrap();
+        std::fs::create_dir_all(host_brain.join(".system_generated/logs")).unwrap();
+        std::fs::write(
+            host_brain.join(".system_generated/logs/transcript.jsonl"),
+            "{\"host_latest\":true}\n",
+        )
+        .unwrap();
+        std::fs::write(host_brain.join("notes.md"), "resumed notes").unwrap();
+        std::os::unix::fs::symlink(&secret_file, host_brain.join("leaked_key")).unwrap();
+
+        let cmd = vec![
+            "agy".to_string(),
+            format!("--conversation={conv_id}"),
+        ];
+        stage_agy_conversation_for_resume(&runtime, &host_home, &agent_home, &cmd);
+
+        let staged = agent_home
+            .join(".gemini/antigravity-cli/brain")
+            .join(conv_id);
+        let transcript =
+            std::fs::read_to_string(staged.join(".system_generated/logs/transcript.jsonl"))
+                .unwrap();
+        assert!(transcript.contains("host_latest"), "got: {transcript}");
+        assert_eq!(
+            std::fs::read_to_string(staged.join("notes.md")).unwrap(),
+            "resumed notes"
+        );
+        assert!(
+            !staged.join("leaked_key").exists()
+                && staged.join("leaked_key").symlink_metadata().is_err(),
+            "symlinks inside conversation dir must not be copied"
+        );
+        assert!(!staged.join("poison.txt").exists());
+
+        let staged_conv_dir = agent_home.join(".gemini/antigravity-cli/conversations");
+        assert_eq!(
+            std::fs::read(staged_conv_dir.join(format!("{conv_id}.db"))).unwrap(),
+            b"SQLite_CONV_DATA"
+        );
+        assert_eq!(
+            std::fs::read(staged_conv_dir.join(format!("{conv_id}.db-wal"))).unwrap(),
+            b"WAL_DATA"
+        );
+        assert!(
+            !staged_conv_dir.join("other-conv.db").exists(),
+            "unrelated conversation .db files must not be staged"
+        );
+
+        // SEED_SKIP_NAMES must exclude bulk conversations/ and conversation_summaries.db.
+        std::fs::write(
+            host_home.join(".gemini/antigravity-cli/conversation_summaries.db"),
+            b"SUMMARY_DB",
+        )
+        .unwrap();
+        let seeded_home = tmp.path().join("seeded_home");
+        seed_agent_home(&host_home, &seeded_home).unwrap();
+        assert!(!seeded_home.join(".gemini/antigravity-cli/conversations").exists());
+        assert!(!seeded_home
+            .join(".gemini/antigravity-cli/conversation_summaries.db")
+            .exists());
+
+        // OAuth vault fallback: rescue from a prior agy-* session, seal into runtime/credentials/agy,
+        // and restore even after host_home and all sessions/* are removed.
+        let ses_tok_path = ses_old.join("agent_home/.gemini/antigravity-cli/antigravity-oauth-token");
+        std::fs::create_dir_all(ses_tok_path.parent().unwrap()).unwrap();
+        std::fs::write(&ses_tok_path, r#"{"token":{"access_token":"ya29.sealed"}}"#).unwrap();
+        let fresh_home_1 = tmp.path().join("fresh_home_1");
+        std::fs::create_dir_all(&fresh_home_1).unwrap();
+        restore_or_seed_agy_oauth_cache(&runtime, &host_home, &fresh_home_1, &cmd);
+        assert!(fresh_home_1.join(AGY_CACHE_TOKEN_PRIMARY).is_file());
+        assert!(agy_runtime_credentials_dir(&runtime)
+            .join("antigravity-oauth-token")
+            .is_file());
+
+        std::fs::remove_dir_all(runtime.join("sessions")).unwrap();
+        let fresh_home_2 = tmp.path().join("fresh_home_2");
+        std::fs::create_dir_all(&fresh_home_2).unwrap();
+        restore_or_seed_agy_oauth_cache(&runtime, &host_home, &fresh_home_2, &cmd);
+        let restored = std::fs::read_to_string(fresh_home_2.join(AGY_CACHE_TOKEN_PRIMARY)).unwrap();
+        assert!(restored.contains("ya29.sealed"), "got: {restored}");
     }
 }
