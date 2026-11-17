@@ -64,7 +64,9 @@ aegis-os commit --expected-diff-hash <sha256>
 Enforced 模式提供：
 
 - **宿主项目只读保护 + 按组织 OS 加密落盘（`OrgVault`）**：所有写入落在 CoW 影子工作区（APFS `clonefile`、`btrfs` `FICLONE`、`ext4` 轻量工作树拷贝），默认持久化于 `~/.aegis` 下按组织隔离的加密卷（macOS 无 root APFS Encrypted `.sparsebundle`、Linux/Cloud `LUKS2 + Btrfs` 或 `gocryptfs`），具备 `AES-256-GCM` `KEK -> DEK` 信封密钥封装、`fsync` 原子刷盘与崩溃孤儿影子恢复。
-- **宿主敏感凭据与 Mach IPC 封堵**：内核级遮蔽 `$HOME` SSH/云凭据，封堵 Keychain CLI / `SecurityAgent` 弹窗、`launchctl` 与 `osascript`；对 `.claude/settings.json`、`.mcp.json`、`opencode.json`、`.gemini/antigravity-cli/settings.json`、`.hermes/config.yaml` 施加单文件只读挂载锁。
+- **宿主 `$HOME` 默认收紧隔离、凭据与 Mach IPC 封堵**：在 Linux `bwrap` 与 macOS Seatbelt 上统一启用默认最小权限 `$HOME` 读隔离（仅放行当前 Shadow/宿主工程目录、Agent 私有目录与安全工具链子目录），内核级遮蔽 SSH/云凭据与 `*/.env*`，封堵 Keychain CLI / `SecurityAgent` 弹窗、`launchctl` 与 `osascript`，并对 `.claude/settings.json`、`.mcp.json`、`opencode.json`、`.gemini/antigravity-cli/settings.json`、`.hermes/config.yaml` 施加只读锁；工作区外文件通过 SHA-256 锚定的 `fs_import_file`（默认入 `<agent_home>/imports/`）与零拷贝 `fs_export_file` 双向受控流转。
+- **受控 `127.0.0.1` 回环网络与依赖安装（`pkg_install`）**：按会话由宿主机预分配回环端口（`$AOS_DEV_PORT` / `$AOS_LOOPBACK_PORTS` 与 `proc_exec.loopback_ports`），macOS Seatbelt 仅放行已分配端口的 `localhost` 绑定与访问，Linux `bwrap` 在隔离 `lo` 命名空间内运行，阻断宿主机未授权回环服务探测与端口抢占；`pkg_install` 原生支持 `npm`/`pnpm`/`yarn`/`bun`/`pip`/`uv`/`cargo`，通过生态级官方源代理、Shadow 内 `node_modules`/`.venv` 自动解链、Manifest `#sha256:` 钉选与 `allow_scripts: true`（`pkg_install_scripts`）二次审批保障依赖安全且不污染 `workspace_diff`。
+- **宿主代理式 Git 与 GitHub 协作闭环**：提供零弹窗脱敏 `workspace_git_inspect`、支持 `auto_commit_shadow: true` 一键事务及敏感文件/强推（`[HIGH RISK: FORCE PUSH]`）拦截的 `workspace_git`，以及 `github_ci_inspect`、`github_ci_rerun`、`github_pr_inspect`、`github_pr_create`、`github_issue_inspect`（同仓库只读自动放行，跨仓库与写入强审批，统一走 `aos-egress` DLP 引擎脱敏与拦截）。
 - **双平台分离式 `.git` 视图 + `.aegis-bin/git` 加固垫片**：在 Linux 与 macOS 上均将宿主机 `.git` 对象库只读透传（500 MB 打包 Git 仓库在 APFS 上节省 **99.05%** 物理磁盘占用），配合独立会话 `GIT_INDEX_FILE` 并强制锁定 `core.fsmonitor=false` / `core.hooksPath=/dev/null`。
 - **L4/L7 双平面出站网关**：模型 API 流量经本地 L7 Base-URL 反向代理（`ANTHROPIC_BASE_URL`、`OPENAI_BASE_URL`、`GOOGLE_GEMINI_BASE_URL`）执行 64 KiB 出站 DLP 扫描并在宿主边界注入真实密钥（沙箱内仅见 `$AOS_SECRET_*` 占位符，**零 TLS MITM 证书破坏**）；常规 HTTPS 走 L4 `CONNECT` 域名白名单。
 - **双令牌权限分离 `SessionBroker` 与冻结暂存区（Frozen-Stage）SHA-256 提交门禁**：严格隔离 `agent.token` 与 `human.token`，对 Diff 中的 VT100 CSI / Unicode Bidi 控制字符进行转义防欺骗，落盘前快照至 `commit_frozen_stage` 并运行 6 大 `DomainProfile` 校验器（`code`、`docs`、`data`、`binary`、`app_state`、`memory`）。
@@ -100,7 +102,8 @@ aegis-os uninstall           # 或彻底清理: aegis-os uninstall --workspace-c
 ## 核心能力
 
 - **事务型 CoW VFS 与 `OrgVault` 加密卷** — 0.42ms 元数据派生；1,000 文件工作区 6.28ms / 15.6ms；四级 LCS 自动归并与领域预检门；按组织隔离的 `AES-256` 加密持久化（`KEK -> DEK` 信封加密）、`fsync` 崩溃一致性与孤儿影子接管恢复。
-- **内核沙箱与出站边界** — Linux `bwrap` 与 macOS Seatbelt enforced launcher；敏感凭据遮蔽；模型 API Base-URL L7 反向代理（DLP + `$AOS_SECRET_*` 注入）与 CONNECT 域名 allowlist。
+- **内核沙箱、受控回环与依赖治理** — Linux `bwrap` 与 macOS Seatbelt enforced launcher；默认 `$HOME` 读收紧配合 SHA-256 锚定的 `fs_import_file`/`fs_export_file`；会话级 `127.0.0.1` 回环端口白名单（`$AOS_DEV_PORT`）；`pkg_install`（`npm`/`pnpm`/`yarn`/`bun`/`pip`/`uv`/`cargo`）自动 CoW 解链与生命周期脚本门控；模型 API L7 反向代理 + 统一 `aos-egress` DLP 引擎。
+- **宿主代理 Git / GitHub 全闭环** — `workspace_git_inspect`、事务型 `workspace_git`（支持 `auto_commit_shadow`、投毒/强推守卫）以及 `github_ci_inspect`、`github_ci_rerun`、`github_pr_inspect`、`github_pr_create`、`github_issue_inspect`（同仓库只读免弹窗、跨仓库/写操作严格审批）。
 - **A2A IPC 与 CAS** — 同伴发现、层级任务、任务绑定文件锁、`artifact://sha256` 内容寻址接力。
 - **Cedar 策略、租约与审计** — 效果级审批、TTL / 单次租约、`evidence_hash` 锁定、哈希链审计账本，以及 `Aegis-OS-Verified` Commit/PR 审计凭证。
 - **云端 PaaS** — 多租户工作区、Git-to-PR、密码学级 Scale-to-Zero 休眠（空闲自动 `umount` + `cryptsetup close` 卸载卷密钥、删库密码学擦除）、网页审批台。
