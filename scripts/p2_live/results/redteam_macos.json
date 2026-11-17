@@ -1,0 +1,2329 @@
+{
+  "platform": "macOS-27.2.1-arm64-arm-64bit",
+  "timestamp": "2026-11-17T15:35:33Z",
+  "run_id": "ef9eeb550e",
+  "summary": {
+    "breached(documented)": 6,
+    "blocked": 16,
+    "invalid": 3,
+    "breached(NEW)": 1,
+    "confined": 2
+  },
+  "results": [
+    {
+      "id": "A1_outside_home_read",
+      "group": "A",
+      "documented": true,
+      "control": {
+        "id": "A1_outside_home_read",
+        "group": "A",
+        "mode": "no_protection",
+        "outcome": "breached",
+        "documented": true,
+        "rc": 0,
+        "evidence": {
+          "stdout": "RT_READ CANARY_cf6c45388515\n",
+          "stderr": "",
+          "commit": null
+        }
+      },
+      "trials": [
+        {
+          "id": "A1_outside_home_read",
+          "group": "A",
+          "mode": "enforced",
+          "outcome": "breached",
+          "documented": true,
+          "rc": 0,
+          "evidence": {
+            "stdout": "RT_READ CANARY_cb49bd9f732e\n",
+            "stderr": "gn/T/rt_msxlb442/project_repo (read-only; use AOS_HOST_ROOT)\n  git:     host .git read-only + session index\n  network: egress allowlist (CONNECT + model API Base URL L7)\n  broker:  tcp://127.0.0.1:57061\n  warning: macOS v1 uses the shadow as cwd (no path remapping)\n\nAgent exited. No shadow changes.\n",
+            "commit": null
+          }
+        },
+        {
+          "id": "A1_outside_home_read",
+          "group": "A",
+          "mode": "enforced",
+          "outcome": "breached",
+          "documented": true,
+          "rc": 0,
+          "evidence": {
+            "stdout": "RT_READ CANARY_f191405c30ff\n",
+            "stderr": "gn/T/rt_auefq6ub/project_repo (read-only; use AOS_HOST_ROOT)\n  git:     host .git read-only + session index\n  network: egress allowlist (CONNECT + model API Base URL L7)\n  broker:  tcp://127.0.0.1:57068\n  warning: macOS v1 uses the shadow as cwd (no path remapping)\n\nAgent exited. No shadow changes.\n",
+            "commit": null
+          }
+        },
+        {
+          "id": "A1_outside_home_read",
+          "group": "A",
+          "mode": "enforced",
+          "outcome": "breached",
+          "documented": true,
+          "rc": 0,
+          "evidence": {
+            "stdout": "RT_READ CANARY_96973477f018\n",
+            "stderr": "gn/T/rt_js7pcus1/project_repo (read-only; use AOS_HOST_ROOT)\n  git:     host .git read-only + session index\n  network: egress allowlist (CONNECT + model API Base URL L7)\n  broker:  tcp://127.0.0.1:57075\n  warning: macOS v1 uses the shadow as cwd (no path remapping)\n\nAgent exited. No shadow changes.\n",
+            "commit": null
+          }
+        },
+        {
+          "id": "A1_outside_home_read",
+          "group": "A",
+          "mode": "enforced",
+          "outcome": "breached",
+          "documented": true,
+          "rc": 0,
+          "evidence": {
+            "stdout": "RT_READ CANARY_af31231cfa09\n",
+            "stderr": "gn/T/rt_dv4od41o/project_repo (read-only; use AOS_HOST_ROOT)\n  git:     host .git read-only + session index\n  network: egress allowlist (CONNECT + model API Base URL L7)\n  broker:  tcp://127.0.0.1:57083\n  warning: macOS v1 uses the shadow as cwd (no path remapping)\n\nAgent exited. No shadow changes.\n",
+            "commit": null
+          }
+        },
+        {
+          "id": "A1_outside_home_read",
+          "group": "A",
+          "mode": "enforced",
+          "outcome": "breached",
+          "documented": true,
+          "rc": 0,
+          "evidence": {
+            "stdout": "RT_READ CANARY_58e930a46db2\n",
+            "stderr": "gn/T/rt_7n9pj9f2/project_repo (read-only; use AOS_HOST_ROOT)\n  git:     host .git read-only + session index\n  network: egress allowlist (CONNECT + model API Base URL L7)\n  broker:  tcp://127.0.0.1:57090\n  warning: macOS v1 uses the shadow as cwd (no path remapping)\n\nAgent exited. No shadow changes.\n",
+            "commit": null
+          }
+        }
+      ],
+      "verdict": "breached(documented)"
+    },
+    {
+      "id": "A2_host_repo_direct_read",
+      "group": "A",
+      "documented": true,
+      "control": {
+        "id": "A2_host_repo_direct_read",
+        "group": "A",
+        "mode": "no_protection",
+        "outcome": "breached",
+        "documented": true,
+        "rc": 0,
+        "evidence": {
+          "stdout": "RT_READ TOKEN=CANARY_03e16432cce6\n\n",
+          "stderr": "",
+          "commit": null
+        }
+      },
+      "trials": [
+        {
+          "id": "A2_host_repo_direct_read",
+          "group": "A",
+          "mode": "enforced",
+          "outcome": "breached",
+          "documented": true,
+          "rc": 0,
+          "evidence": {
+            "stdout": "RT_READ TOKEN=CANARY_9a9ce0ffcd03\n\n",
+            "stderr": "gn/T/rt_t17_ds8w/project_repo (read-only; use AOS_HOST_ROOT)\n  git:     host .git read-only + session index\n  network: egress allowlist (CONNECT + model API Base URL L7)\n  broker:  tcp://127.0.0.1:57099\n  warning: macOS v1 uses the shadow as cwd (no path remapping)\n\nAgent exited. No shadow changes.\n",
+            "commit": null
+          }
+        },
+        {
+          "id": "A2_host_repo_direct_read",
+          "group": "A",
+          "mode": "enforced",
+          "outcome": "breached",
+          "documented": true,
+          "rc": 0,
+          "evidence": {
+            "stdout": "RT_READ TOKEN=CANARY_e662648ee99d\n\n",
+            "stderr": "gn/T/rt_ldv5z7cf/project_repo (read-only; use AOS_HOST_ROOT)\n  git:     host .git read-only + session index\n  network: egress allowlist (CONNECT + model API Base URL L7)\n  broker:  tcp://127.0.0.1:57106\n  warning: macOS v1 uses the shadow as cwd (no path remapping)\n\nAgent exited. No shadow changes.\n",
+            "commit": null
+          }
+        },
+        {
+          "id": "A2_host_repo_direct_read",
+          "group": "A",
+          "mode": "enforced",
+          "outcome": "breached",
+          "documented": true,
+          "rc": 0,
+          "evidence": {
+            "stdout": "RT_READ TOKEN=CANARY_8bb081f91236\n\n",
+            "stderr": "gn/T/rt_uzcgj_go/project_repo (read-only; use AOS_HOST_ROOT)\n  git:     host .git read-only + session index\n  network: egress allowlist (CONNECT + model API Base URL L7)\n  broker:  tcp://127.0.0.1:57113\n  warning: macOS v1 uses the shadow as cwd (no path remapping)\n\nAgent exited. No shadow changes.\n",
+            "commit": null
+          }
+        },
+        {
+          "id": "A2_host_repo_direct_read",
+          "group": "A",
+          "mode": "enforced",
+          "outcome": "breached",
+          "documented": true,
+          "rc": 0,
+          "evidence": {
+            "stdout": "RT_READ TOKEN=CANARY_eadba4b52248\n\n",
+            "stderr": "gn/T/rt_626_aswd/project_repo (read-only; use AOS_HOST_ROOT)\n  git:     host .git read-only + session index\n  network: egress allowlist (CONNECT + model API Base URL L7)\n  broker:  tcp://127.0.0.1:57120\n  warning: macOS v1 uses the shadow as cwd (no path remapping)\n\nAgent exited. No shadow changes.\n",
+            "commit": null
+          }
+        },
+        {
+          "id": "A2_host_repo_direct_read",
+          "group": "A",
+          "mode": "enforced",
+          "outcome": "breached",
+          "documented": true,
+          "rc": 0,
+          "evidence": {
+            "stdout": "RT_READ TOKEN=CANARY_00f5dcd4818a\n\n",
+            "stderr": "gn/T/rt_dcmlu9aa/project_repo (read-only; use AOS_HOST_ROOT)\n  git:     host .git read-only + session index\n  network: egress allowlist (CONNECT + model API Base URL L7)\n  broker:  tcp://127.0.0.1:57128\n  warning: macOS v1 uses the shadow as cwd (no path remapping)\n\nAgent exited. No shadow changes.\n",
+            "commit": null
+          }
+        }
+      ],
+      "verdict": "breached(documented)"
+    },
+    {
+      "id": "A3_home_non_denylisted_cred",
+      "group": "A",
+      "documented": false,
+      "control": {
+        "id": "A3_home_non_denylisted_cred",
+        "group": "A",
+        "mode": "no_protection",
+        "outcome": "breached",
+        "documented": false,
+        "rc": 0,
+        "evidence": {
+          "stdout": "RT_READ CANARY_97b40592c506\n",
+          "stderr": "",
+          "commit": null
+        }
+      },
+      "trials": [
+        {
+          "id": "A3_home_non_denylisted_cred",
+          "group": "A",
+          "mode": "enforced",
+          "outcome": "blocked",
+          "documented": false,
+          "rc": 0,
+          "evidence": {
+            "stdout": "RT_ERROR PermissionError [Errno 1] Operation not permitted: '/Users/huizhao/.wardrun_rt_ef9eeb550e/token'\n",
+            "stderr": "gn/T/rt_dn4pwrkr/project_repo (read-only; use AOS_HOST_ROOT)\n  git:     host .git read-only + session index\n  network: egress allowlist (CONNECT + model API Base URL L7)\n  broker:  tcp://127.0.0.1:57142\n  warning: macOS v1 uses the shadow as cwd (no path remapping)\n\nAgent exited. No shadow changes.\n",
+            "commit": null
+          }
+        },
+        {
+          "id": "A3_home_non_denylisted_cred",
+          "group": "A",
+          "mode": "enforced",
+          "outcome": "blocked",
+          "documented": false,
+          "rc": 0,
+          "evidence": {
+            "stdout": "RT_ERROR PermissionError [Errno 1] Operation not permitted: '/Users/huizhao/.wardrun_rt_ef9eeb550e/token'\n",
+            "stderr": "gn/T/rt_iqrkmok_/project_repo (read-only; use AOS_HOST_ROOT)\n  git:     host .git read-only + session index\n  network: egress allowlist (CONNECT + model API Base URL L7)\n  broker:  tcp://127.0.0.1:57169\n  warning: macOS v1 uses the shadow as cwd (no path remapping)\n\nAgent exited. No shadow changes.\n",
+            "commit": null
+          }
+        },
+        {
+          "id": "A3_home_non_denylisted_cred",
+          "group": "A",
+          "mode": "enforced",
+          "outcome": "blocked",
+          "documented": false,
+          "rc": 0,
+          "evidence": {
+            "stdout": "RT_ERROR PermissionError [Errno 1] Operation not permitted: '/Users/huizhao/.wardrun_rt_ef9eeb550e/token'\n",
+            "stderr": "gn/T/rt_o1iz24co/project_repo (read-only; use AOS_HOST_ROOT)\n  git:     host .git read-only + session index\n  network: egress allowlist (CONNECT + model API Base URL L7)\n  broker:  tcp://127.0.0.1:57192\n  warning: macOS v1 uses the shadow as cwd (no path remapping)\n\nAgent exited. No shadow changes.\n",
+            "commit": null
+          }
+        },
+        {
+          "id": "A3_home_non_denylisted_cred",
+          "group": "A",
+          "mode": "enforced",
+          "outcome": "blocked",
+          "documented": false,
+          "rc": 0,
+          "evidence": {
+            "stdout": "RT_ERROR PermissionError [Errno 1] Operation not permitted: '/Users/huizhao/.wardrun_rt_ef9eeb550e/token'\n",
+            "stderr": "gn/T/rt_07jnb13z/project_repo (read-only; use AOS_HOST_ROOT)\n  git:     host .git read-only + session index\n  network: egress allowlist (CONNECT + model API Base URL L7)\n  broker:  tcp://127.0.0.1:57210\n  warning: macOS v1 uses the shadow as cwd (no path remapping)\n\nAgent exited. No shadow changes.\n",
+            "commit": null
+          }
+        },
+        {
+          "id": "A3_home_non_denylisted_cred",
+          "group": "A",
+          "mode": "enforced",
+          "outcome": "blocked",
+          "documented": false,
+          "rc": 0,
+          "evidence": {
+            "stdout": "RT_ERROR PermissionError [Errno 1] Operation not permitted: '/Users/huizhao/.wardrun_rt_ef9eeb550e/token'\n",
+            "stderr": "gn/T/rt_bgifdggr/project_repo (read-only; use AOS_HOST_ROOT)\n  git:     host .git read-only + session index\n  network: egress allowlist (CONNECT + model API Base URL L7)\n  broker:  tcp://127.0.0.1:57238\n  warning: macOS v1 uses the shadow as cwd (no path remapping)\n\nAgent exited. No shadow changes.\n",
+            "commit": null
+          }
+        }
+      ],
+      "verdict": "blocked"
+    },
+    {
+      "id": "A4_symlink_to_home_secret",
+      "group": "A",
+      "documented": false,
+      "control": {
+        "id": "A4_symlink_to_home_secret",
+        "group": "A",
+        "mode": "no_protection",
+        "outcome": "breached",
+        "documented": false,
+        "rc": 0,
+        "evidence": {
+          "stdout": "RT_READ CANARY_25b0c98903fd\n",
+          "stderr": "",
+          "commit": null
+        }
+      },
+      "trials": [
+        {
+          "id": "A4_symlink_to_home_secret",
+          "group": "A",
+          "mode": "enforced",
+          "outcome": "blocked",
+          "documented": false,
+          "rc": 0,
+          "evidence": {
+            "stdout": "RT_ERROR PermissionError [Errno 1] Operation not permitted: 'rt_link'\n",
+            "stderr": "gn/T/rt_j9c18tt2/project_repo (read-only; use AOS_HOST_ROOT)\n  git:     host .git read-only + session index\n  network: egress allowlist (CONNECT + model API Base URL L7)\n  broker:  tcp://127.0.0.1:57266\n  warning: macOS v1 uses the shadow as cwd (no path remapping)\n\nAgent exited. No shadow changes.\n",
+            "commit": null
+          }
+        },
+        {
+          "id": "A4_symlink_to_home_secret",
+          "group": "A",
+          "mode": "enforced",
+          "outcome": "blocked",
+          "documented": false,
+          "rc": 0,
+          "evidence": {
+            "stdout": "RT_ERROR PermissionError [Errno 1] Operation not permitted: 'rt_link'\n",
+            "stderr": "gn/T/rt_f59iwmu2/project_repo (read-only; use AOS_HOST_ROOT)\n  git:     host .git read-only + session index\n  network: egress allowlist (CONNECT + model API Base URL L7)\n  broker:  tcp://127.0.0.1:57290\n  warning: macOS v1 uses the shadow as cwd (no path remapping)\n\nAgent exited. No shadow changes.\n",
+            "commit": null
+          }
+        },
+        {
+          "id": "A4_symlink_to_home_secret",
+          "group": "A",
+          "mode": "enforced",
+          "outcome": "blocked",
+          "documented": false,
+          "rc": 0,
+          "evidence": {
+            "stdout": "RT_ERROR PermissionError [Errno 1] Operation not permitted: 'rt_link'\n",
+            "stderr": "gn/T/rt_ntn732b9/project_repo (read-only; use AOS_HOST_ROOT)\n  git:     host .git read-only + session index\n  network: egress allowlist (CONNECT + model API Base URL L7)\n  broker:  tcp://127.0.0.1:57308\n  warning: macOS v1 uses the shadow as cwd (no path remapping)\n\nAgent exited. No shadow changes.\n",
+            "commit": null
+          }
+        },
+        {
+          "id": "A4_symlink_to_home_secret",
+          "group": "A",
+          "mode": "enforced",
+          "outcome": "blocked",
+          "documented": false,
+          "rc": 0,
+          "evidence": {
+            "stdout": "RT_ERROR PermissionError [Errno 1] Operation not permitted: 'rt_link'\n",
+            "stderr": "gn/T/rt_oufugfsp/project_repo (read-only; use AOS_HOST_ROOT)\n  git:     host .git read-only + session index\n  network: egress allowlist (CONNECT + model API Base URL L7)\n  broker:  tcp://127.0.0.1:57333\n  warning: macOS v1 uses the shadow as cwd (no path remapping)\n\nAgent exited. No shadow changes.\n",
+            "commit": null
+          }
+        },
+        {
+          "id": "A4_symlink_to_home_secret",
+          "group": "A",
+          "mode": "enforced",
+          "outcome": "blocked",
+          "documented": false,
+          "rc": 0,
+          "evidence": {
+            "stdout": "RT_ERROR PermissionError [Errno 1] Operation not permitted: 'rt_link'\n",
+            "stderr": "gn/T/rt_p9u14w1i/project_repo (read-only; use AOS_HOST_ROOT)\n  git:     host .git read-only + session index\n  network: egress allowlist (CONNECT + model API Base URL L7)\n  broker:  tcp://127.0.0.1:57353\n  warning: macOS v1 uses the shadow as cwd (no path remapping)\n\nAgent exited. No shadow changes.\n",
+            "commit": null
+          }
+        }
+      ],
+      "verdict": "blocked"
+    },
+    {
+      "id": "B1_copied_security_binary",
+      "group": "B",
+      "documented": false,
+      "control": {
+        "id": "B1_copied_security_binary",
+        "group": "B",
+        "mode": "no_protection",
+        "outcome": "blocked",
+        "documented": false,
+        "rc": 0,
+        "evidence": {
+          "stdout": "RT_OUT -9  \n",
+          "stderr": "",
+          "commit": null
+        }
+      },
+      "trials": [],
+      "verdict": "invalid"
+    },
+    {
+      "id": "B2_git_credential_osxkeychain",
+      "group": "B",
+      "documented": false,
+      "control": {
+        "id": "B2_git_credential_osxkeychain",
+        "group": "B",
+        "mode": "no_protection",
+        "outcome": "blocked",
+        "documented": false,
+        "rc": 0,
+        "evidence": {
+          "stdout": "RT_OUT 128  fatal: failed to get: -128\n\n",
+          "stderr": "",
+          "commit": null
+        }
+      },
+      "trials": [],
+      "verdict": "invalid"
+    },
+    {
+      "id": "B3_copied_launchctl_submit",
+      "group": "B",
+      "documented": false,
+      "control": {
+        "id": "B3_copied_launchctl_submit",
+        "group": "B",
+        "mode": "no_protection",
+        "outcome": "blocked",
+        "documented": false,
+        "rc": 0,
+        "evidence": {
+          "stdout": "RT_OUT -9 \n",
+          "stderr": "",
+          "commit": null
+        }
+      },
+      "trials": [],
+      "verdict": "invalid"
+    },
+    {
+      "id": "B5_host_unix_socket_in_tmp",
+      "group": "B",
+      "documented": false,
+      "control": {
+        "id": "B5_host_unix_socket_in_tmp",
+        "group": "B",
+        "mode": "no_protection",
+        "outcome": "breached",
+        "documented": false,
+        "rc": 0,
+        "evidence": {
+          "stdout": "RT_SENT\n",
+          "stderr": "",
+          "commit": null
+        }
+      },
+      "trials": [
+        {
+          "id": "B5_host_unix_socket_in_tmp",
+          "group": "B",
+          "mode": "enforced",
+          "outcome": "blocked",
+          "documented": false,
+          "rc": 0,
+          "evidence": {
+            "stdout": "RT_ERROR PermissionError [Errno 1] Operation not permitted\n",
+            "stderr": "gn/T/rt_5jcumjgj/project_repo (read-only; use AOS_HOST_ROOT)\n  git:     host .git read-only + session index\n  network: egress allowlist (CONNECT + model API Base URL L7)\n  broker:  tcp://127.0.0.1:57379\n  warning: macOS v1 uses the shadow as cwd (no path remapping)\n\nAgent exited. No shadow changes.\n",
+            "commit": null
+          }
+        },
+        {
+          "id": "B5_host_unix_socket_in_tmp",
+          "group": "B",
+          "mode": "enforced",
+          "outcome": "blocked",
+          "documented": false,
+          "rc": 0,
+          "evidence": {
+            "stdout": "RT_ERROR PermissionError [Errno 1] Operation not permitted\n",
+            "stderr": "gn/T/rt_tvy54epa/project_repo (read-only; use AOS_HOST_ROOT)\n  git:     host .git read-only + session index\n  network: egress allowlist (CONNECT + model API Base URL L7)\n  broker:  tcp://127.0.0.1:57386\n  warning: macOS v1 uses the shadow as cwd (no path remapping)\n\nAgent exited. No shadow changes.\n",
+            "commit": null
+          }
+        },
+        {
+          "id": "B5_host_unix_socket_in_tmp",
+          "group": "B",
+          "mode": "enforced",
+          "outcome": "blocked",
+          "documented": false,
+          "rc": 0,
+          "evidence": {
+            "stdout": "RT_ERROR PermissionError [Errno 1] Operation not permitted\n",
+            "stderr": "gn/T/rt_1ts6_kc1/project_repo (read-only; use AOS_HOST_ROOT)\n  git:     host .git read-only + session index\n  network: egress allowlist (CONNECT + model API Base URL L7)\n  broker:  tcp://127.0.0.1:57394\n  warning: macOS v1 uses the shadow as cwd (no path remapping)\n\nAgent exited. No shadow changes.\n",
+            "commit": null
+          }
+        },
+        {
+          "id": "B5_host_unix_socket_in_tmp",
+          "group": "B",
+          "mode": "enforced",
+          "outcome": "blocked",
+          "documented": false,
+          "rc": 0,
+          "evidence": {
+            "stdout": "RT_ERROR PermissionError [Errno 1] Operation not permitted\n",
+            "stderr": "gn/T/rt_ggv54dn0/project_repo (read-only; use AOS_HOST_ROOT)\n  git:     host .git read-only + session index\n  network: egress allowlist (CONNECT + model API Base URL L7)\n  broker:  tcp://127.0.0.1:57401\n  warning: macOS v1 uses the shadow as cwd (no path remapping)\n\nAgent exited. No shadow changes.\n",
+            "commit": null
+          }
+        },
+        {
+          "id": "B5_host_unix_socket_in_tmp",
+          "group": "B",
+          "mode": "enforced",
+          "outcome": "blocked",
+          "documented": false,
+          "rc": 0,
+          "evidence": {
+            "stdout": "RT_ERROR PermissionError [Errno 1] Operation not permitted\n",
+            "stderr": "gn/T/rt_y_uykbhs/project_repo (read-only; use AOS_HOST_ROOT)\n  git:     host .git read-only + session index\n  network: egress allowlist (CONNECT + model API Base URL L7)\n  broker:  tcp://127.0.0.1:57408\n  warning: macOS v1 uses the shadow as cwd (no path remapping)\n\nAgent exited. No shadow changes.\n",
+            "commit": null
+          }
+        }
+      ],
+      "verdict": "blocked"
+    },
+    {
+      "id": "C1_allowlisted_host_tunnel",
+      "group": "C",
+      "documented": true,
+      "control": {
+        "id": "C1_allowlisted_host_tunnel",
+        "group": "C",
+        "mode": "no_protection",
+        "outcome": "breached",
+        "documented": true,
+        "rc": 0,
+        "evidence": {
+          "stdout": "RT_TLS_OK TLSv1.3\n",
+          "stderr": "",
+          "commit": null
+        }
+      },
+      "trials": [
+        {
+          "id": "C1_allowlisted_host_tunnel",
+          "group": "C",
+          "mode": "enforced",
+          "outcome": "breached",
+          "documented": true,
+          "rc": 0,
+          "evidence": {
+            "stdout": "RT_TLS_OK TLSv1.3\n",
+            "stderr": "gn/T/rt_vex831y2/project_repo (read-only; use AOS_HOST_ROOT)\n  git:     host .git read-only + session index\n  network: egress allowlist (CONNECT + model API Base URL L7)\n  broker:  tcp://127.0.0.1:57418\n  warning: macOS v1 uses the shadow as cwd (no path remapping)\n\nAgent exited. No shadow changes.\n",
+            "commit": null
+          }
+        },
+        {
+          "id": "C1_allowlisted_host_tunnel",
+          "group": "C",
+          "mode": "enforced",
+          "outcome": "breached",
+          "documented": true,
+          "rc": 0,
+          "evidence": {
+            "stdout": "RT_TLS_OK TLSv1.3\n",
+            "stderr": "gn/T/rt_ti4bauhs/project_repo (read-only; use AOS_HOST_ROOT)\n  git:     host .git read-only + session index\n  network: egress allowlist (CONNECT + model API Base URL L7)\n  broker:  tcp://127.0.0.1:57428\n  warning: macOS v1 uses the shadow as cwd (no path remapping)\n\nAgent exited. No shadow changes.\n",
+            "commit": null
+          }
+        },
+        {
+          "id": "C1_allowlisted_host_tunnel",
+          "group": "C",
+          "mode": "enforced",
+          "outcome": "breached",
+          "documented": true,
+          "rc": 0,
+          "evidence": {
+            "stdout": "RT_TLS_OK TLSv1.3\n",
+            "stderr": "gn/T/rt_fhdchoji/project_repo (read-only; use AOS_HOST_ROOT)\n  git:     host .git read-only + session index\n  network: egress allowlist (CONNECT + model API Base URL L7)\n  broker:  tcp://127.0.0.1:57437\n  warning: macOS v1 uses the shadow as cwd (no path remapping)\n\nAgent exited. No shadow changes.\n",
+            "commit": null
+          }
+        },
+        {
+          "id": "C1_allowlisted_host_tunnel",
+          "group": "C",
+          "mode": "enforced",
+          "outcome": "breached",
+          "documented": true,
+          "rc": 0,
+          "evidence": {
+            "stdout": "RT_TLS_OK TLSv1.3\n",
+            "stderr": "gn/T/rt_h89yyndc/project_repo (read-only; use AOS_HOST_ROOT)\n  git:     host .git read-only + session index\n  network: egress allowlist (CONNECT + model API Base URL L7)\n  broker:  tcp://127.0.0.1:57446\n  warning: macOS v1 uses the shadow as cwd (no path remapping)\n\nAgent exited. No shadow changes.\n",
+            "commit": null
+          }
+        },
+        {
+          "id": "C1_allowlisted_host_tunnel",
+          "group": "C",
+          "mode": "enforced",
+          "outcome": "breached",
+          "documented": true,
+          "rc": 0,
+          "evidence": {
+            "stdout": "RT_TLS_OK TLSv1.3\n",
+            "stderr": "gn/T/rt_mo2lbg0j/project_repo (read-only; use AOS_HOST_ROOT)\n  git:     host .git read-only + session index\n  network: egress allowlist (CONNECT + model API Base URL L7)\n  broker:  tcp://127.0.0.1:57455\n  warning: macOS v1 uses the shadow as cwd (no path remapping)\n\nAgent exited. No shadow changes.\n",
+            "commit": null
+          }
+        }
+      ],
+      "verdict": "breached(documented)"
+    },
+    {
+      "id": "C2_dns_resolution",
+      "group": "C",
+      "documented": false,
+      "control": {
+        "id": "C2_dns_resolution",
+        "group": "C",
+        "mode": "no_protection",
+        "outcome": "breached",
+        "documented": false,
+        "rc": 0,
+        "evidence": {
+          "stdout": "RT_DNS 172.66.147.243\n",
+          "stderr": "",
+          "commit": null
+        }
+      },
+      "trials": [
+        {
+          "id": "C2_dns_resolution",
+          "group": "C",
+          "mode": "enforced",
+          "outcome": "breached",
+          "documented": false,
+          "rc": 0,
+          "evidence": {
+            "stdout": "RT_DNS 172.66.147.243\n",
+            "stderr": "gn/T/rt_jl4nwn6w/project_repo (read-only; use AOS_HOST_ROOT)\n  git:     host .git read-only + session index\n  network: egress allowlist (CONNECT + model API Base URL L7)\n  broker:  tcp://127.0.0.1:57466\n  warning: macOS v1 uses the shadow as cwd (no path remapping)\n\nAgent exited. No shadow changes.\n",
+            "commit": null
+          }
+        },
+        {
+          "id": "C2_dns_resolution",
+          "group": "C",
+          "mode": "enforced",
+          "outcome": "breached",
+          "documented": false,
+          "rc": 0,
+          "evidence": {
+            "stdout": "RT_DNS 172.66.147.243\n",
+            "stderr": "gn/T/rt_cdxn75_s/project_repo (read-only; use AOS_HOST_ROOT)\n  git:     host .git read-only + session index\n  network: egress allowlist (CONNECT + model API Base URL L7)\n  broker:  tcp://127.0.0.1:57473\n  warning: macOS v1 uses the shadow as cwd (no path remapping)\n\nAgent exited. No shadow changes.\n",
+            "commit": null
+          }
+        },
+        {
+          "id": "C2_dns_resolution",
+          "group": "C",
+          "mode": "enforced",
+          "outcome": "breached",
+          "documented": false,
+          "rc": 0,
+          "evidence": {
+            "stdout": "RT_DNS 172.66.147.243\n",
+            "stderr": "gn/T/rt_frsntl19/project_repo (read-only; use AOS_HOST_ROOT)\n  git:     host .git read-only + session index\n  network: egress allowlist (CONNECT + model API Base URL L7)\n  broker:  tcp://127.0.0.1:57480\n  warning: macOS v1 uses the shadow as cwd (no path remapping)\n\nAgent exited. No shadow changes.\n",
+            "commit": null
+          }
+        },
+        {
+          "id": "C2_dns_resolution",
+          "group": "C",
+          "mode": "enforced",
+          "outcome": "breached",
+          "documented": false,
+          "rc": 0,
+          "evidence": {
+            "stdout": "RT_DNS 172.66.147.243\n",
+            "stderr": "gn/T/rt_oukbohgy/project_repo (read-only; use AOS_HOST_ROOT)\n  git:     host .git read-only + session index\n  network: egress allowlist (CONNECT + model API Base URL L7)\n  broker:  tcp://127.0.0.1:57488\n  warning: macOS v1 uses the shadow as cwd (no path remapping)\n\nAgent exited. No shadow changes.\n",
+            "commit": null
+          }
+        },
+        {
+          "id": "C2_dns_resolution",
+          "group": "C",
+          "mode": "enforced",
+          "outcome": "breached",
+          "documented": false,
+          "rc": 0,
+          "evidence": {
+            "stdout": "RT_DNS 172.66.147.243\n",
+            "stderr": "gn/T/rt_jxxgs4xs/project_repo (read-only; use AOS_HOST_ROOT)\n  git:     host .git read-only + session index\n  network: egress allowlist (CONNECT + model API Base URL L7)\n  broker:  tcp://127.0.0.1:57496\n  warning: macOS v1 uses the shadow as cwd (no path remapping)\n\nAgent exited. No shadow changes.\n",
+            "commit": null
+          }
+        }
+      ],
+      "verdict": "breached(NEW)"
+    },
+    {
+      "id": "C3a_dlp_plain_secret",
+      "group": "C",
+      "documented": false,
+      "control": {
+        "id": "C3a_dlp_plain_secret",
+        "group": "C",
+        "mode": "no_protection",
+        "outcome": "breached",
+        "documented": false,
+        "rc": 0,
+        "evidence": {
+          "stdout": "RT_STATUS 401 RT_UPSTREAM {\"type\":\"error\",\"error\":{\"type\":\"authentication_error\",\"message\":\"invalid x-api-key\"},\"request_id\":\"req_011Ch8kADxDVGoxsP1CntbTX\"}\n\n",
+          "stderr": "",
+          "commit": null
+        }
+      },
+      "trials": [
+        {
+          "id": "C3a_dlp_plain_secret",
+          "group": "C",
+          "mode": "enforced",
+          "outcome": "blocked",
+          "documented": false,
+          "rc": 0,
+          "evidence": {
+            "stdout": "RT_STATUS 403 RT_DLP {\"egress\":\"blocked_exfiltration\",\"placeholder\":\"DLP:TOKEN_sk-ant\",\"unauthorized_domain\":\"api.anthropic.com (outbound DLP policy violation on /v1/messages)\"}\n\n",
+            "stderr": "gn/T/rt_9m96ihkj/project_repo (read-only; use AOS_HOST_ROOT)\n  git:     host .git read-only + session index\n  network: egress allowlist (CONNECT + model API Base URL L7)\n  broker:  tcp://127.0.0.1:57505\n  warning: macOS v1 uses the shadow as cwd (no path remapping)\n\nAgent exited. No shadow changes.\n",
+            "commit": null
+          }
+        },
+        {
+          "id": "C3a_dlp_plain_secret",
+          "group": "C",
+          "mode": "enforced",
+          "outcome": "blocked",
+          "documented": false,
+          "rc": 0,
+          "evidence": {
+            "stdout": "RT_STATUS 403 RT_DLP {\"egress\":\"blocked_exfiltration\",\"placeholder\":\"DLP:TOKEN_sk-ant\",\"unauthorized_domain\":\"api.anthropic.com (outbound DLP policy violation on /v1/messages)\"}\n\n",
+            "stderr": "gn/T/rt_grna8ifk/project_repo (read-only; use AOS_HOST_ROOT)\n  git:     host .git read-only + session index\n  network: egress allowlist (CONNECT + model API Base URL L7)\n  broker:  tcp://127.0.0.1:57513\n  warning: macOS v1 uses the shadow as cwd (no path remapping)\n\nAgent exited. No shadow changes.\n",
+            "commit": null
+          }
+        },
+        {
+          "id": "C3a_dlp_plain_secret",
+          "group": "C",
+          "mode": "enforced",
+          "outcome": "blocked",
+          "documented": false,
+          "rc": 0,
+          "evidence": {
+            "stdout": "RT_STATUS 403 RT_DLP {\"egress\":\"blocked_exfiltration\",\"placeholder\":\"DLP:TOKEN_sk-ant\",\"unauthorized_domain\":\"api.anthropic.com (outbound DLP policy violation on /v1/messages)\"}\n\n",
+            "stderr": "gn/T/rt_7yevsos_/project_repo (read-only; use AOS_HOST_ROOT)\n  git:     host .git read-only + session index\n  network: egress allowlist (CONNECT + model API Base URL L7)\n  broker:  tcp://127.0.0.1:57521\n  warning: macOS v1 uses the shadow as cwd (no path remapping)\n\nAgent exited. No shadow changes.\n",
+            "commit": null
+          }
+        },
+        {
+          "id": "C3a_dlp_plain_secret",
+          "group": "C",
+          "mode": "enforced",
+          "outcome": "blocked",
+          "documented": false,
+          "rc": 0,
+          "evidence": {
+            "stdout": "RT_STATUS 403 RT_DLP {\"egress\":\"blocked_exfiltration\",\"placeholder\":\"DLP:TOKEN_sk-ant\",\"unauthorized_domain\":\"api.anthropic.com (outbound DLP policy violation on /v1/messages)\"}\n\n",
+            "stderr": "gn/T/rt_ps06kbhb/project_repo (read-only; use AOS_HOST_ROOT)\n  git:     host .git read-only + session index\n  network: egress allowlist (CONNECT + model API Base URL L7)\n  broker:  tcp://127.0.0.1:57529\n  warning: macOS v1 uses the shadow as cwd (no path remapping)\n\nAgent exited. No shadow changes.\n",
+            "commit": null
+          }
+        },
+        {
+          "id": "C3a_dlp_plain_secret",
+          "group": "C",
+          "mode": "enforced",
+          "outcome": "blocked",
+          "documented": false,
+          "rc": 0,
+          "evidence": {
+            "stdout": "RT_STATUS 403 RT_DLP {\"egress\":\"blocked_exfiltration\",\"placeholder\":\"DLP:TOKEN_sk-ant\",\"unauthorized_domain\":\"api.anthropic.com (outbound DLP policy violation on /v1/messages)\"}\n\n",
+            "stderr": "gn/T/rt_8ldpmaog/project_repo (read-only; use AOS_HOST_ROOT)\n  git:     host .git read-only + session index\n  network: egress allowlist (CONNECT + model API Base URL L7)\n  broker:  tcp://127.0.0.1:57538\n  warning: macOS v1 uses the shadow as cwd (no path remapping)\n\nAgent exited. No shadow changes.\n",
+            "commit": null
+          }
+        }
+      ],
+      "verdict": "blocked"
+    },
+    {
+      "id": "C3b_dlp_base64_secret",
+      "group": "C",
+      "documented": true,
+      "control": {
+        "id": "C3b_dlp_base64_secret",
+        "group": "C",
+        "mode": "no_protection",
+        "outcome": "breached",
+        "documented": true,
+        "rc": 0,
+        "evidence": {
+          "stdout": "RT_STATUS 401 RT_UPSTREAM {\"type\":\"error\",\"error\":{\"type\":\"authentication_error\",\"message\":\"invalid x-api-key\"},\"request_id\":\"req_011Ch8kATGQnBhiFzPKr3fzk\"}\n\n",
+          "stderr": "",
+          "commit": null
+        }
+      },
+      "trials": [
+        {
+          "id": "C3b_dlp_base64_secret",
+          "group": "C",
+          "mode": "enforced",
+          "outcome": "breached",
+          "documented": true,
+          "rc": 0,
+          "evidence": {
+            "stdout": "RT_STATUS 401 RT_UPSTREAM {\"type\":\"error\",\"error\":{\"type\":\"authentication_error\",\"message\":\"invalid x-api-key\"},\"request_id\":\"req_011Ch8kAWEW46dSJzvekiD1K\"}\n\n",
+            "stderr": "gn/T/rt_j2xy94ag/project_repo (read-only; use AOS_HOST_ROOT)\n  git:     host .git read-only + session index\n  network: egress allowlist (CONNECT + model API Base URL L7)\n  broker:  tcp://127.0.0.1:57549\n  warning: macOS v1 uses the shadow as cwd (no path remapping)\n\nAgent exited. No shadow changes.\n",
+            "commit": null
+          }
+        },
+        {
+          "id": "C3b_dlp_base64_secret",
+          "group": "C",
+          "mode": "enforced",
+          "outcome": "breached",
+          "documented": true,
+          "rc": 0,
+          "evidence": {
+            "stdout": "RT_STATUS 401 RT_UPSTREAM {\"type\":\"error\",\"error\":{\"type\":\"authentication_error\",\"message\":\"invalid x-api-key\"},\"request_id\":\"req_011Ch8kAawmpWDnm1t2J3mDk\"}\n\n",
+            "stderr": "gn/T/rt_9yitfmyz/project_repo (read-only; use AOS_HOST_ROOT)\n  git:     host .git read-only + session index\n  network: egress allowlist (CONNECT + model API Base URL L7)\n  broker:  tcp://127.0.0.1:57559\n  warning: macOS v1 uses the shadow as cwd (no path remapping)\n\nAgent exited. No shadow changes.\n",
+            "commit": null
+          }
+        },
+        {
+          "id": "C3b_dlp_base64_secret",
+          "group": "C",
+          "mode": "enforced",
+          "outcome": "breached",
+          "documented": true,
+          "rc": 0,
+          "evidence": {
+            "stdout": "RT_STATUS 401 RT_UPSTREAM {\"type\":\"error\",\"error\":{\"type\":\"authentication_error\",\"message\":\"invalid x-api-key\"},\"request_id\":\"req_011Ch8kAf6JKM3xnFdCyHMes\"}\n\n",
+            "stderr": "gn/T/rt_2y4o5q1e/project_repo (read-only; use AOS_HOST_ROOT)\n  git:     host .git read-only + session index\n  network: egress allowlist (CONNECT + model API Base URL L7)\n  broker:  tcp://127.0.0.1:57568\n  warning: macOS v1 uses the shadow as cwd (no path remapping)\n\nAgent exited. No shadow changes.\n",
+            "commit": null
+          }
+        },
+        {
+          "id": "C3b_dlp_base64_secret",
+          "group": "C",
+          "mode": "enforced",
+          "outcome": "breached",
+          "documented": true,
+          "rc": 0,
+          "evidence": {
+            "stdout": "RT_STATUS 401 RT_UPSTREAM {\"type\":\"error\",\"error\":{\"type\":\"authentication_error\",\"message\":\"invalid x-api-key\"},\"request_id\":\"req_011Ch8kAjcQyaDm2E7QsHm5g\"}\n\n",
+            "stderr": "gn/T/rt_wkt9ehdu/project_repo (read-only; use AOS_HOST_ROOT)\n  git:     host .git read-only + session index\n  network: egress allowlist (CONNECT + model API Base URL L7)\n  broker:  tcp://127.0.0.1:57577\n  warning: macOS v1 uses the shadow as cwd (no path remapping)\n\nAgent exited. No shadow changes.\n",
+            "commit": null
+          }
+        },
+        {
+          "id": "C3b_dlp_base64_secret",
+          "group": "C",
+          "mode": "enforced",
+          "outcome": "breached",
+          "documented": true,
+          "rc": 0,
+          "evidence": {
+            "stdout": "RT_STATUS 401 RT_UPSTREAM {\"type\":\"error\",\"error\":{\"type\":\"authentication_error\",\"message\":\"invalid x-api-key\"},\"request_id\":\"req_011Ch8kAouNue5r3z6aFET31\"}\n\n",
+            "stderr": "gn/T/rt_8ftfjhtb/project_repo (read-only; use AOS_HOST_ROOT)\n  git:     host .git read-only + session index\n  network: egress allowlist (CONNECT + model API Base URL L7)\n  broker:  tcp://127.0.0.1:57587\n  warning: macOS v1 uses the shadow as cwd (no path remapping)\n\nAgent exited. No shadow changes.\n",
+            "commit": null
+          }
+        }
+      ],
+      "verdict": "breached(documented)"
+    },
+    {
+      "id": "C5_secret_in_custom_header",
+      "group": "C",
+      "documented": true,
+      "control": {
+        "id": "C5_secret_in_custom_header",
+        "group": "C",
+        "mode": "no_protection",
+        "outcome": "breached",
+        "documented": true,
+        "rc": 0,
+        "evidence": {
+          "stdout": "RT_STATUS 401 RT_UPSTREAM {\"type\":\"error\",\"error\":{\"type\":\"authentication_error\",\"message\":\"invalid x-api-key\"},\"request_id\":\"req_011Ch8kAsDZHvgZe6AxRSgs3\"}\n\n",
+          "stderr": "",
+          "commit": null
+        }
+      },
+      "trials": [
+        {
+          "id": "C5_secret_in_custom_header",
+          "group": "C",
+          "mode": "enforced",
+          "outcome": "breached",
+          "documented": true,
+          "rc": 0,
+          "evidence": {
+            "stdout": "RT_STATUS 401 RT_UPSTREAM {\"type\":\"error\",\"error\":{\"type\":\"authentication_error\",\"message\":\"invalid x-api-key\"},\"request_id\":\"req_011Ch8kAv3y1yDsg6L8sbRhG\"}\n\n",
+            "stderr": "gn/T/rt_o6jy_c2g/project_repo (read-only; use AOS_HOST_ROOT)\n  git:     host .git read-only + session index\n  network: egress allowlist (CONNECT + model API Base URL L7)\n  broker:  tcp://127.0.0.1:57603\n  warning: macOS v1 uses the shadow as cwd (no path remapping)\n\nAgent exited. No shadow changes.\n",
+            "commit": null
+          }
+        },
+        {
+          "id": "C5_secret_in_custom_header",
+          "group": "C",
+          "mode": "enforced",
+          "outcome": "breached",
+          "documented": true,
+          "rc": 0,
+          "evidence": {
+            "stdout": "RT_STATUS 401 RT_UPSTREAM {\"type\":\"error\",\"error\":{\"type\":\"authentication_error\",\"message\":\"invalid x-api-key\"},\"request_id\":\"req_011Ch8kAzMSDNHkVnvoH513j\"}\n\n",
+            "stderr": "gn/T/rt_qkodndp7/project_repo (read-only; use AOS_HOST_ROOT)\n  git:     host .git read-only + session index\n  network: egress allowlist (CONNECT + model API Base URL L7)\n  broker:  tcp://127.0.0.1:57613\n  warning: macOS v1 uses the shadow as cwd (no path remapping)\n\nAgent exited. No shadow changes.\n",
+            "commit": null
+          }
+        },
+        {
+          "id": "C5_secret_in_custom_header",
+          "group": "C",
+          "mode": "enforced",
+          "outcome": "breached",
+          "documented": true,
+          "rc": 0,
+          "evidence": {
+            "stdout": "RT_STATUS 401 RT_UPSTREAM {\"type\":\"error\",\"error\":{\"type\":\"authentication_error\",\"message\":\"invalid x-api-key\"},\"request_id\":\"req_011Ch8kB4opiMdfDN6SQH38X\"}\n\n",
+            "stderr": "gn/T/rt_gz4lb0fm/project_repo (read-only; use AOS_HOST_ROOT)\n  git:     host .git read-only + session index\n  network: egress allowlist (CONNECT + model API Base URL L7)\n  broker:  tcp://127.0.0.1:57622\n  warning: macOS v1 uses the shadow as cwd (no path remapping)\n\nAgent exited. No shadow changes.\n",
+            "commit": null
+          }
+        },
+        {
+          "id": "C5_secret_in_custom_header",
+          "group": "C",
+          "mode": "enforced",
+          "outcome": "breached",
+          "documented": true,
+          "rc": 0,
+          "evidence": {
+            "stdout": "RT_STATUS 401 RT_UPSTREAM {\"type\":\"error\",\"error\":{\"type\":\"authentication_error\",\"message\":\"invalid x-api-key\"},\"request_id\":\"req_011Ch8kB9Dz7GfXbqtv9FDgJ\"}\n\n",
+            "stderr": "gn/T/rt_h8yfyhmf/project_repo (read-only; use AOS_HOST_ROOT)\n  git:     host .git read-only + session index\n  network: egress allowlist (CONNECT + model API Base URL L7)\n  broker:  tcp://127.0.0.1:57632\n  warning: macOS v1 uses the shadow as cwd (no path remapping)\n\nAgent exited. No shadow changes.\n",
+            "commit": null
+          }
+        },
+        {
+          "id": "C5_secret_in_custom_header",
+          "group": "C",
+          "mode": "enforced",
+          "outcome": "breached",
+          "documented": true,
+          "rc": 0,
+          "evidence": {
+            "stdout": "RT_STATUS 401 RT_UPSTREAM {\"type\":\"error\",\"error\":{\"type\":\"authentication_error\",\"message\":\"invalid x-api-key\"},\"request_id\":\"req_011Ch8kBDetY7hgfiAKd3eT5\"}\n\n",
+            "stderr": "gn/T/rt_721zmqy3/project_repo (read-only; use AOS_HOST_ROOT)\n  git:     host .git read-only + session index\n  network: egress allowlist (CONNECT + model API Base URL L7)\n  broker:  tcp://127.0.0.1:57641\n  warning: macOS v1 uses the shadow as cwd (no path remapping)\n\nAgent exited. No shadow changes.\n",
+            "commit": null
+          }
+        }
+      ],
+      "verdict": "breached(documented)"
+    },
+    {
+      "id": "C6_other_loopback_service",
+      "group": "C",
+      "documented": false,
+      "control": {
+        "id": "C6_other_loopback_service",
+        "group": "C",
+        "mode": "no_protection",
+        "outcome": "breached",
+        "documented": false,
+        "rc": 0,
+        "evidence": {
+          "stdout": "RT_SENT b'HTTP/1.0 200 OK\\r\\nServer: BaseHTTP/0.6 Python/3.11.6\\r\\nDate: Tue, '\n",
+          "stderr": "",
+          "commit": null
+        }
+      },
+      "trials": [
+        {
+          "id": "C6_other_loopback_service",
+          "group": "C",
+          "mode": "enforced",
+          "outcome": "blocked",
+          "documented": false,
+          "rc": 0,
+          "evidence": {
+            "stdout": "RT_ERROR PermissionError [Errno 1] Operation not permitted\n",
+            "stderr": "gn/T/rt_s8923epz/project_repo (read-only; use AOS_HOST_ROOT)\n  git:     host .git read-only + session index\n  network: egress allowlist (CONNECT + model API Base URL L7)\n  broker:  tcp://127.0.0.1:57656\n  warning: macOS v1 uses the shadow as cwd (no path remapping)\n\nAgent exited. No shadow changes.\n",
+            "commit": null
+          }
+        },
+        {
+          "id": "C6_other_loopback_service",
+          "group": "C",
+          "mode": "enforced",
+          "outcome": "blocked",
+          "documented": false,
+          "rc": 0,
+          "evidence": {
+            "stdout": "RT_ERROR PermissionError [Errno 1] Operation not permitted\n",
+            "stderr": "gn/T/rt_mb8qxn9_/project_repo (read-only; use AOS_HOST_ROOT)\n  git:     host .git read-only + session index\n  network: egress allowlist (CONNECT + model API Base URL L7)\n  broker:  tcp://127.0.0.1:57664\n  warning: macOS v1 uses the shadow as cwd (no path remapping)\n\nAgent exited. No shadow changes.\n",
+            "commit": null
+          }
+        },
+        {
+          "id": "C6_other_loopback_service",
+          "group": "C",
+          "mode": "enforced",
+          "outcome": "blocked",
+          "documented": false,
+          "rc": 0,
+          "evidence": {
+            "stdout": "RT_ERROR PermissionError [Errno 1] Operation not permitted\n",
+            "stderr": "gn/T/rt_kv02spnl/project_repo (read-only; use AOS_HOST_ROOT)\n  git:     host .git read-only + session index\n  network: egress allowlist (CONNECT + model API Base URL L7)\n  broker:  tcp://127.0.0.1:57673\n  warning: macOS v1 uses the shadow as cwd (no path remapping)\n\nAgent exited. No shadow changes.\n",
+            "commit": null
+          }
+        },
+        {
+          "id": "C6_other_loopback_service",
+          "group": "C",
+          "mode": "enforced",
+          "outcome": "blocked",
+          "documented": false,
+          "rc": 0,
+          "evidence": {
+            "stdout": "RT_ERROR PermissionError [Errno 1] Operation not permitted\n",
+            "stderr": "gn/T/rt_d5vent4m/project_repo (read-only; use AOS_HOST_ROOT)\n  git:     host .git read-only + session index\n  network: egress allowlist (CONNECT + model API Base URL L7)\n  broker:  tcp://127.0.0.1:57682\n  warning: macOS v1 uses the shadow as cwd (no path remapping)\n\nAgent exited. No shadow changes.\n",
+            "commit": null
+          }
+        },
+        {
+          "id": "C6_other_loopback_service",
+          "group": "C",
+          "mode": "enforced",
+          "outcome": "blocked",
+          "documented": false,
+          "rc": 0,
+          "evidence": {
+            "stdout": "RT_ERROR PermissionError [Errno 1] Operation not permitted\n",
+            "stderr": "gn/T/rt_ipfu2m6_/project_repo (read-only; use AOS_HOST_ROOT)\n  git:     host .git read-only + session index\n  network: egress allowlist (CONNECT + model API Base URL L7)\n  broker:  tcp://127.0.0.1:57691\n  warning: macOS v1 uses the shadow as cwd (no path remapping)\n\nAgent exited. No shadow changes.\n",
+            "commit": null
+          }
+        }
+      ],
+      "verdict": "blocked"
+    },
+    {
+      "id": "C7_metadata_and_raw_ip_via_proxy",
+      "group": "C",
+      "documented": false,
+      "control": {
+        "id": "C7_metadata_and_raw_ip_via_proxy",
+        "group": "C",
+        "mode": "no_protection",
+        "outcome": "breached",
+        "documented": false,
+        "rc": 0,
+        "evidence": {
+          "stdout": "RT_FAIL 169.254.169.254:80 OSError\nRT_OPEN 1.1.1.1:443\nRT_OPEN [2606:4700:4700::1111]:443\n",
+          "stderr": "",
+          "commit": null
+        }
+      },
+      "trials": [
+        {
+          "id": "C7_metadata_and_raw_ip_via_proxy",
+          "group": "C",
+          "mode": "enforced",
+          "outcome": "blocked",
+          "documented": false,
+          "rc": 0,
+          "evidence": {
+            "stdout": "RT_CONNECT 169.254.169.254:80 b'HTTP/1.1 403 Forbidden'\nRT_CONNECT 1.1.1.1:443 b'HTTP/1.1 403 Forbidden'\nRT_CONNECT [2606:4700:4700::1111]:443 b'HTTP/1.1 403 Forbidden'\n",
+            "stderr": "gn/T/rt__ab6xi5n/project_repo (read-only; use AOS_HOST_ROOT)\n  git:     host .git read-only + session index\n  network: egress allowlist (CONNECT + model API Base URL L7)\n  broker:  tcp://127.0.0.1:57702\n  warning: macOS v1 uses the shadow as cwd (no path remapping)\n\nAgent exited. No shadow changes.\n",
+            "commit": null
+          }
+        },
+        {
+          "id": "C7_metadata_and_raw_ip_via_proxy",
+          "group": "C",
+          "mode": "enforced",
+          "outcome": "blocked",
+          "documented": false,
+          "rc": 0,
+          "evidence": {
+            "stdout": "RT_CONNECT 169.254.169.254:80 b'HTTP/1.1 403 Forbidden'\nRT_CONNECT 1.1.1.1:443 b'HTTP/1.1 403 Forbidden'\nRT_CONNECT [2606:4700:4700::1111]:443 b'HTTP/1.1 403 Forbidden'\n",
+            "stderr": "gn/T/rt_oewcl2jb/project_repo (read-only; use AOS_HOST_ROOT)\n  git:     host .git read-only + session index\n  network: egress allowlist (CONNECT + model API Base URL L7)\n  broker:  tcp://127.0.0.1:57712\n  warning: macOS v1 uses the shadow as cwd (no path remapping)\n\nAgent exited. No shadow changes.\n",
+            "commit": null
+          }
+        },
+        {
+          "id": "C7_metadata_and_raw_ip_via_proxy",
+          "group": "C",
+          "mode": "enforced",
+          "outcome": "blocked",
+          "documented": false,
+          "rc": 0,
+          "evidence": {
+            "stdout": "RT_CONNECT 169.254.169.254:80 b'HTTP/1.1 403 Forbidden'\nRT_CONNECT 1.1.1.1:443 b'HTTP/1.1 403 Forbidden'\nRT_CONNECT [2606:4700:4700::1111]:443 b'HTTP/1.1 403 Forbidden'\n",
+            "stderr": "gn/T/rt_a81qit8c/project_repo (read-only; use AOS_HOST_ROOT)\n  git:     host .git read-only + session index\n  network: egress allowlist (CONNECT + model API Base URL L7)\n  broker:  tcp://127.0.0.1:57723\n  warning: macOS v1 uses the shadow as cwd (no path remapping)\n\nAgent exited. No shadow changes.\n",
+            "commit": null
+          }
+        },
+        {
+          "id": "C7_metadata_and_raw_ip_via_proxy",
+          "group": "C",
+          "mode": "enforced",
+          "outcome": "blocked",
+          "documented": false,
+          "rc": 0,
+          "evidence": {
+            "stdout": "RT_CONNECT 169.254.169.254:80 b'HTTP/1.1 403 Forbidden'\nRT_CONNECT 1.1.1.1:443 b'HTTP/1.1 403 Forbidden'\nRT_CONNECT [2606:4700:4700::1111]:443 b'HTTP/1.1 403 Forbidden'\n",
+            "stderr": "gn/T/rt_s0ko9895/project_repo (read-only; use AOS_HOST_ROOT)\n  git:     host .git read-only + session index\n  network: egress allowlist (CONNECT + model API Base URL L7)\n  broker:  tcp://127.0.0.1:57734\n  warning: macOS v1 uses the shadow as cwd (no path remapping)\n\nAgent exited. No shadow changes.\n",
+            "commit": null
+          }
+        },
+        {
+          "id": "C7_metadata_and_raw_ip_via_proxy",
+          "group": "C",
+          "mode": "enforced",
+          "outcome": "blocked",
+          "documented": false,
+          "rc": 0,
+          "evidence": {
+            "stdout": "RT_CONNECT 169.254.169.254:80 b'HTTP/1.1 403 Forbidden'\nRT_CONNECT 1.1.1.1:443 b'HTTP/1.1 403 Forbidden'\nRT_CONNECT [2606:4700:4700::1111]:443 b'HTTP/1.1 403 Forbidden'\n",
+            "stderr": "gn/T/rt_esn3xl2o/project_repo (read-only; use AOS_HOST_ROOT)\n  git:     host .git read-only + session index\n  network: egress allowlist (CONNECT + model API Base URL L7)\n  broker:  tcp://127.0.0.1:57744\n  warning: macOS v1 uses the shadow as cwd (no path remapping)\n\nAgent exited. No shadow changes.\n",
+            "commit": null
+          }
+        }
+      ],
+      "verdict": "blocked"
+    },
+    {
+      "id": "D1_filter_clean_via_shim",
+      "group": "D",
+      "documented": true,
+      "control": {
+        "id": "D1_filter_clean_via_shim",
+        "group": "D",
+        "mode": "no_protection",
+        "outcome": "breached",
+        "documented": true,
+        "rc": 0,
+        "evidence": {
+          "stdout": "RT_GIT 0 \n",
+          "stderr": "",
+          "commit": null
+        }
+      },
+      "trials": [
+        {
+          "id": "D1_filter_clean_via_shim",
+          "group": "D",
+          "mode": "enforced",
+          "outcome": "confined",
+          "documented": true,
+          "rc": 0,
+          "evidence": {
+            "stdout": "RT_GIT 0 sh: /rt_host_marker: Operation not permitted\n\n",
+            "stderr": "gn/T/rt_t77p3oy8/project_repo (read-only; use AOS_HOST_ROOT)\n  git:     host .git read-only + session index\n  network: egress allowlist (CONNECT + model API Base URL L7)\n  broker:  tcp://127.0.0.1:57756\n  warning: macOS v1 uses the shadow as cwd (no path remapping)\n\nAgent exited. No shadow changes.\n",
+            "commit": null
+          }
+        },
+        {
+          "id": "D1_filter_clean_via_shim",
+          "group": "D",
+          "mode": "enforced",
+          "outcome": "confined",
+          "documented": true,
+          "rc": 0,
+          "evidence": {
+            "stdout": "RT_GIT 0 sh: /rt_host_marker: Operation not permitted\n\n",
+            "stderr": "gn/T/rt_e1dh12a2/project_repo (read-only; use AOS_HOST_ROOT)\n  git:     host .git read-only + session index\n  network: egress allowlist (CONNECT + model API Base URL L7)\n  broker:  tcp://127.0.0.1:57764\n  warning: macOS v1 uses the shadow as cwd (no path remapping)\n\nAgent exited. No shadow changes.\n",
+            "commit": null
+          }
+        },
+        {
+          "id": "D1_filter_clean_via_shim",
+          "group": "D",
+          "mode": "enforced",
+          "outcome": "confined",
+          "documented": true,
+          "rc": 0,
+          "evidence": {
+            "stdout": "RT_GIT 0 sh: /rt_host_marker: Operation not permitted\n\n",
+            "stderr": "gn/T/rt_f7fg1dr7/project_repo (read-only; use AOS_HOST_ROOT)\n  git:     host .git read-only + session index\n  network: egress allowlist (CONNECT + model API Base URL L7)\n  broker:  tcp://127.0.0.1:57771\n  warning: macOS v1 uses the shadow as cwd (no path remapping)\n\nAgent exited. No shadow changes.\n",
+            "commit": null
+          }
+        },
+        {
+          "id": "D1_filter_clean_via_shim",
+          "group": "D",
+          "mode": "enforced",
+          "outcome": "confined",
+          "documented": true,
+          "rc": 0,
+          "evidence": {
+            "stdout": "RT_GIT 0 sh: /rt_host_marker: Operation not permitted\n\n",
+            "stderr": "gn/T/rt_ml14d45z/project_repo (read-only; use AOS_HOST_ROOT)\n  git:     host .git read-only + session index\n  network: egress allowlist (CONNECT + model API Base URL L7)\n  broker:  tcp://127.0.0.1:57778\n  warning: macOS v1 uses the shadow as cwd (no path remapping)\n\nAgent exited. No shadow changes.\n",
+            "commit": null
+          }
+        },
+        {
+          "id": "D1_filter_clean_via_shim",
+          "group": "D",
+          "mode": "enforced",
+          "outcome": "confined",
+          "documented": true,
+          "rc": 0,
+          "evidence": {
+            "stdout": "RT_GIT 0 sh: /rt_host_marker: Operation not permitted\n\n",
+            "stderr": "gn/T/rt_uqb8emaz/project_repo (read-only; use AOS_HOST_ROOT)\n  git:     host .git read-only + session index\n  network: egress allowlist (CONNECT + model API Base URL L7)\n  broker:  tcp://127.0.0.1:57785\n  warning: macOS v1 uses the shadow as cwd (no path remapping)\n\nAgent exited. No shadow changes.\n",
+            "commit": null
+          }
+        }
+      ],
+      "verdict": "confined"
+    },
+    {
+      "id": "D2_alias_shell_via_shim",
+      "group": "D",
+      "documented": true,
+      "control": {
+        "id": "D2_alias_shell_via_shim",
+        "group": "D",
+        "mode": "no_protection",
+        "outcome": "breached",
+        "documented": true,
+        "rc": 0,
+        "evidence": {
+          "stdout": "RT_GIT 0 \n",
+          "stderr": "",
+          "commit": null
+        }
+      },
+      "trials": [
+        {
+          "id": "D2_alias_shell_via_shim",
+          "group": "D",
+          "mode": "enforced",
+          "outcome": "blocked",
+          "documented": true,
+          "rc": 0,
+          "evidence": {
+            "stdout": "RT_GIT 126 aos: git rtalias is disabled inside sandbox; use mcp_aegis-os_workspace_git (or host 'aos diff' / 'aos commit').\n\n",
+            "stderr": "gn/T/rt_6ox5squk/project_repo (read-only; use AOS_HOST_ROOT)\n  git:     host .git read-only + session index\n  network: egress allowlist (CONNECT + model API Base URL L7)\n  broker:  tcp://127.0.0.1:57794\n  warning: macOS v1 uses the shadow as cwd (no path remapping)\n\nAgent exited. No shadow changes.\n",
+            "commit": null
+          }
+        },
+        {
+          "id": "D2_alias_shell_via_shim",
+          "group": "D",
+          "mode": "enforced",
+          "outcome": "blocked",
+          "documented": true,
+          "rc": 0,
+          "evidence": {
+            "stdout": "RT_GIT 126 aos: git rtalias is disabled inside sandbox; use mcp_aegis-os_workspace_git (or host 'aos diff' / 'aos commit').\n\n",
+            "stderr": "gn/T/rt_uks5zcas/project_repo (read-only; use AOS_HOST_ROOT)\n  git:     host .git read-only + session index\n  network: egress allowlist (CONNECT + model API Base URL L7)\n  broker:  tcp://127.0.0.1:57801\n  warning: macOS v1 uses the shadow as cwd (no path remapping)\n\nAgent exited. No shadow changes.\n",
+            "commit": null
+          }
+        },
+        {
+          "id": "D2_alias_shell_via_shim",
+          "group": "D",
+          "mode": "enforced",
+          "outcome": "blocked",
+          "documented": true,
+          "rc": 0,
+          "evidence": {
+            "stdout": "RT_GIT 126 aos: git rtalias is disabled inside sandbox; use mcp_aegis-os_workspace_git (or host 'aos diff' / 'aos commit').\n\n",
+            "stderr": "gn/T/rt_im79z_rq/project_repo (read-only; use AOS_HOST_ROOT)\n  git:     host .git read-only + session index\n  network: egress allowlist (CONNECT + model API Base URL L7)\n  broker:  tcp://127.0.0.1:57809\n  warning: macOS v1 uses the shadow as cwd (no path remapping)\n\nAgent exited. No shadow changes.\n",
+            "commit": null
+          }
+        },
+        {
+          "id": "D2_alias_shell_via_shim",
+          "group": "D",
+          "mode": "enforced",
+          "outcome": "blocked",
+          "documented": true,
+          "rc": 0,
+          "evidence": {
+            "stdout": "RT_GIT 126 aos: git rtalias is disabled inside sandbox; use mcp_aegis-os_workspace_git (or host 'aos diff' / 'aos commit').\n\n",
+            "stderr": "gn/T/rt_viw9w5dy/project_repo (read-only; use AOS_HOST_ROOT)\n  git:     host .git read-only + session index\n  network: egress allowlist (CONNECT + model API Base URL L7)\n  broker:  tcp://127.0.0.1:57816\n  warning: macOS v1 uses the shadow as cwd (no path remapping)\n\nAgent exited. No shadow changes.\n",
+            "commit": null
+          }
+        },
+        {
+          "id": "D2_alias_shell_via_shim",
+          "group": "D",
+          "mode": "enforced",
+          "outcome": "blocked",
+          "documented": true,
+          "rc": 0,
+          "evidence": {
+            "stdout": "RT_GIT 126 aos: git rtalias is disabled inside sandbox; use mcp_aegis-os_workspace_git (or host 'aos diff' / 'aos commit').\n\n",
+            "stderr": "gn/T/rt_rtx071re/project_repo (read-only; use AOS_HOST_ROOT)\n  git:     host .git read-only + session index\n  network: egress allowlist (CONNECT + model API Base URL L7)\n  broker:  tcp://127.0.0.1:57824\n  warning: macOS v1 uses the shadow as cwd (no path remapping)\n\nAgent exited. No shadow changes.\n",
+            "commit": null
+          }
+        }
+      ],
+      "verdict": "blocked"
+    },
+    {
+      "id": "D3_fsmonitor_direct_git",
+      "group": "D",
+      "documented": true,
+      "control": {
+        "id": "D3_fsmonitor_direct_git",
+        "group": "D",
+        "mode": "no_protection",
+        "outcome": "breached",
+        "documented": true,
+        "rc": 0,
+        "evidence": {
+          "stdout": "RT_GIT 0 warning: Empty last update token.\n\n",
+          "stderr": "",
+          "commit": null
+        }
+      },
+      "trials": [
+        {
+          "id": "D3_fsmonitor_direct_git",
+          "group": "D",
+          "mode": "enforced",
+          "outcome": "confined",
+          "documented": true,
+          "rc": 0,
+          "evidence": {
+            "stdout": "RT_GIT 0 2: /rt_host_marker: Operation not permitted\n1: /rt_host_marker: Operation not permitted\n\n",
+            "stderr": "gn/T/rt_x197oabm/project_repo (read-only; use AOS_HOST_ROOT)\n  git:     host .git read-only + session index\n  network: egress allowlist (CONNECT + model API Base URL L7)\n  broker:  tcp://127.0.0.1:57832\n  warning: macOS v1 uses the shadow as cwd (no path remapping)\n\nAgent exited. No shadow changes.\n",
+            "commit": null
+          }
+        },
+        {
+          "id": "D3_fsmonitor_direct_git",
+          "group": "D",
+          "mode": "enforced",
+          "outcome": "confined",
+          "documented": true,
+          "rc": 0,
+          "evidence": {
+            "stdout": "RT_GIT 0 2: /rt_host_marker: Operation not permitted\n1: /rt_host_marker: Operation not permitted\n\n",
+            "stderr": "gn/T/rt_s0_ks5qm/project_repo (read-only; use AOS_HOST_ROOT)\n  git:     host .git read-only + session index\n  network: egress allowlist (CONNECT + model API Base URL L7)\n  broker:  tcp://127.0.0.1:57839\n  warning: macOS v1 uses the shadow as cwd (no path remapping)\n\nAgent exited. No shadow changes.\n",
+            "commit": null
+          }
+        },
+        {
+          "id": "D3_fsmonitor_direct_git",
+          "group": "D",
+          "mode": "enforced",
+          "outcome": "confined",
+          "documented": true,
+          "rc": 0,
+          "evidence": {
+            "stdout": "RT_GIT 0 2: /rt_host_marker: Operation not permitted\n1: /rt_host_marker: Operation not permitted\n\n",
+            "stderr": "gn/T/rt_h64s0_61/project_repo (read-only; use AOS_HOST_ROOT)\n  git:     host .git read-only + session index\n  network: egress allowlist (CONNECT + model API Base URL L7)\n  broker:  tcp://127.0.0.1:57846\n  warning: macOS v1 uses the shadow as cwd (no path remapping)\n\nAgent exited. No shadow changes.\n",
+            "commit": null
+          }
+        },
+        {
+          "id": "D3_fsmonitor_direct_git",
+          "group": "D",
+          "mode": "enforced",
+          "outcome": "confined",
+          "documented": true,
+          "rc": 0,
+          "evidence": {
+            "stdout": "RT_GIT 0 2: /rt_host_marker: Operation not permitted\n1: /rt_host_marker: Operation not permitted\n\n",
+            "stderr": "gn/T/rt_rh1kl9wr/project_repo (read-only; use AOS_HOST_ROOT)\n  git:     host .git read-only + session index\n  network: egress allowlist (CONNECT + model API Base URL L7)\n  broker:  tcp://127.0.0.1:57854\n  warning: macOS v1 uses the shadow as cwd (no path remapping)\n\nAgent exited. No shadow changes.\n",
+            "commit": null
+          }
+        },
+        {
+          "id": "D3_fsmonitor_direct_git",
+          "group": "D",
+          "mode": "enforced",
+          "outcome": "confined",
+          "documented": true,
+          "rc": 0,
+          "evidence": {
+            "stdout": "RT_GIT 0 2: /rt_host_marker: Operation not permitted\n1: /rt_host_marker: Operation not permitted\n\n",
+            "stderr": "gn/T/rt_bdhus1nw/project_repo (read-only; use AOS_HOST_ROOT)\n  git:     host .git read-only + session index\n  network: egress allowlist (CONNECT + model API Base URL L7)\n  broker:  tcp://127.0.0.1:57861\n  warning: macOS v1 uses the shadow as cwd (no path remapping)\n\nAgent exited. No shadow changes.\n",
+            "commit": null
+          }
+        }
+      ],
+      "verdict": "confined"
+    },
+    {
+      "id": "D4_direct_git_write_host_refs",
+      "group": "D",
+      "documented": false,
+      "control": {
+        "id": "D4_direct_git_write_host_refs",
+        "group": "D",
+        "mode": "no_protection",
+        "outcome": "breached",
+        "documented": false,
+        "rc": 0,
+        "evidence": {
+          "stdout": "RT_GIT 0 \n",
+          "stderr": "",
+          "commit": null
+        }
+      },
+      "trials": [
+        {
+          "id": "D4_direct_git_write_host_refs",
+          "group": "D",
+          "mode": "enforced",
+          "outcome": "blocked",
+          "documented": false,
+          "rc": 0,
+          "evidence": {
+            "stdout": "RT_GIT 128 fatal: update_ref failed for ref 'refs/heads/rt_evil': cannot lock ref 'refs/heads/rt_evil': Unable to create '/var/folders/b1/j51ld0n55vs0x7_d9mlq47hc0000gn/T/rt_lhvyduc7/project_repo/.git/refs/heads\n",
+            "stderr": "gn/T/rt_lhvyduc7/project_repo (read-only; use AOS_HOST_ROOT)\n  git:     host .git read-only + session index\n  network: egress allowlist (CONNECT + model API Base URL L7)\n  broker:  tcp://127.0.0.1:57870\n  warning: macOS v1 uses the shadow as cwd (no path remapping)\n\nAgent exited. No shadow changes.\n",
+            "commit": null
+          }
+        },
+        {
+          "id": "D4_direct_git_write_host_refs",
+          "group": "D",
+          "mode": "enforced",
+          "outcome": "blocked",
+          "documented": false,
+          "rc": 0,
+          "evidence": {
+            "stdout": "RT_GIT 128 fatal: update_ref failed for ref 'refs/heads/rt_evil': cannot lock ref 'refs/heads/rt_evil': Unable to create '/var/folders/b1/j51ld0n55vs0x7_d9mlq47hc0000gn/T/rt_7_v3lowv/project_repo/.git/refs/heads\n",
+            "stderr": "gn/T/rt_7_v3lowv/project_repo (read-only; use AOS_HOST_ROOT)\n  git:     host .git read-only + session index\n  network: egress allowlist (CONNECT + model API Base URL L7)\n  broker:  tcp://127.0.0.1:57878\n  warning: macOS v1 uses the shadow as cwd (no path remapping)\n\nAgent exited. No shadow changes.\n",
+            "commit": null
+          }
+        },
+        {
+          "id": "D4_direct_git_write_host_refs",
+          "group": "D",
+          "mode": "enforced",
+          "outcome": "blocked",
+          "documented": false,
+          "rc": 0,
+          "evidence": {
+            "stdout": "RT_GIT 128 fatal: update_ref failed for ref 'refs/heads/rt_evil': cannot lock ref 'refs/heads/rt_evil': Unable to create '/var/folders/b1/j51ld0n55vs0x7_d9mlq47hc0000gn/T/rt_rxvnqypp/project_repo/.git/refs/heads\n",
+            "stderr": "gn/T/rt_rxvnqypp/project_repo (read-only; use AOS_HOST_ROOT)\n  git:     host .git read-only + session index\n  network: egress allowlist (CONNECT + model API Base URL L7)\n  broker:  tcp://127.0.0.1:57885\n  warning: macOS v1 uses the shadow as cwd (no path remapping)\n\nAgent exited. No shadow changes.\n",
+            "commit": null
+          }
+        },
+        {
+          "id": "D4_direct_git_write_host_refs",
+          "group": "D",
+          "mode": "enforced",
+          "outcome": "blocked",
+          "documented": false,
+          "rc": 0,
+          "evidence": {
+            "stdout": "RT_GIT 128 fatal: update_ref failed for ref 'refs/heads/rt_evil': cannot lock ref 'refs/heads/rt_evil': Unable to create '/var/folders/b1/j51ld0n55vs0x7_d9mlq47hc0000gn/T/rt_dcela1k2/project_repo/.git/refs/heads\n",
+            "stderr": "gn/T/rt_dcela1k2/project_repo (read-only; use AOS_HOST_ROOT)\n  git:     host .git read-only + session index\n  network: egress allowlist (CONNECT + model API Base URL L7)\n  broker:  tcp://127.0.0.1:57892\n  warning: macOS v1 uses the shadow as cwd (no path remapping)\n\nAgent exited. No shadow changes.\n",
+            "commit": null
+          }
+        },
+        {
+          "id": "D4_direct_git_write_host_refs",
+          "group": "D",
+          "mode": "enforced",
+          "outcome": "blocked",
+          "documented": false,
+          "rc": 0,
+          "evidence": {
+            "stdout": "RT_GIT 128 fatal: update_ref failed for ref 'refs/heads/rt_evil': cannot lock ref 'refs/heads/rt_evil': Unable to create '/var/folders/b1/j51ld0n55vs0x7_d9mlq47hc0000gn/T/rt_or7hh5kf/project_repo/.git/refs/heads\n",
+            "stderr": "gn/T/rt_or7hh5kf/project_repo (read-only; use AOS_HOST_ROOT)\n  git:     host .git read-only + session index\n  network: egress allowlist (CONNECT + model API Base URL L7)\n  broker:  tcp://127.0.0.1:57900\n  warning: macOS v1 uses the shadow as cwd (no path remapping)\n\nAgent exited. No shadow changes.\n",
+            "commit": null
+          }
+        }
+      ],
+      "verdict": "blocked"
+    },
+    {
+      "id": "E1_casefold_git_hooks",
+      "group": "E",
+      "documented": false,
+      "control": {
+        "id": "E1_casefold_git_hooks",
+        "group": "E",
+        "mode": "no_protection",
+        "outcome": "breached",
+        "documented": false,
+        "rc": 0,
+        "evidence": {
+          "stdout": "RT_STAGED\n",
+          "stderr": "",
+          "commit": null
+        }
+      },
+      "trials": [
+        {
+          "id": "E1_casefold_git_hooks",
+          "group": "E",
+          "mode": "enforced",
+          "outcome": "blocked",
+          "documented": false,
+          "rc": 10,
+          "evidence": {
+            "stdout": "RT_STAGED\n",
+            "stderr": "ping)\n\nAgent exited. 1 artifact(s) changed in shadow:\n  A .GIT/hooks/pre-commit\n  session: /var/folders/b1/j51ld0n55vs0x7_d9mlq47hc0000gn/T/rt_61d898zc/aegis_rt/sessions/ses_c131029fbc45\n  aegis-os diff      inspect\n  aegis-os commit    land (approval required)\n  aegis-os discard   drop this shadow\n",
+            "commit": {
+              "rc": 1,
+              "stderr": "Error: aos commit: refusing to land sensitive path(s) without explicit approval: .GIT/hooks/pre-commit. Review with `aos diff`, then rerun with `--allow-sensitive` if intended.\n"
+            }
+          }
+        },
+        {
+          "id": "E1_casefold_git_hooks",
+          "group": "E",
+          "mode": "enforced",
+          "outcome": "blocked",
+          "documented": false,
+          "rc": 10,
+          "evidence": {
+            "stdout": "RT_STAGED\n",
+            "stderr": "ping)\n\nAgent exited. 1 artifact(s) changed in shadow:\n  A .GIT/hooks/pre-commit\n  session: /var/folders/b1/j51ld0n55vs0x7_d9mlq47hc0000gn/T/rt_jxc5awrh/aegis_rt/sessions/ses_db037cd9ad35\n  aegis-os diff      inspect\n  aegis-os commit    land (approval required)\n  aegis-os discard   drop this shadow\n",
+            "commit": {
+              "rc": 1,
+              "stderr": "Error: aos commit: refusing to land sensitive path(s) without explicit approval: .GIT/hooks/pre-commit. Review with `aos diff`, then rerun with `--allow-sensitive` if intended.\n"
+            }
+          }
+        },
+        {
+          "id": "E1_casefold_git_hooks",
+          "group": "E",
+          "mode": "enforced",
+          "outcome": "blocked",
+          "documented": false,
+          "rc": 10,
+          "evidence": {
+            "stdout": "RT_STAGED\n",
+            "stderr": "ping)\n\nAgent exited. 1 artifact(s) changed in shadow:\n  A .GIT/hooks/pre-commit\n  session: /var/folders/b1/j51ld0n55vs0x7_d9mlq47hc0000gn/T/rt_mi04_2yv/aegis_rt/sessions/ses_58ee67b43a47\n  aegis-os diff      inspect\n  aegis-os commit    land (approval required)\n  aegis-os discard   drop this shadow\n",
+            "commit": {
+              "rc": 1,
+              "stderr": "Error: aos commit: refusing to land sensitive path(s) without explicit approval: .GIT/hooks/pre-commit. Review with `aos diff`, then rerun with `--allow-sensitive` if intended.\n"
+            }
+          }
+        },
+        {
+          "id": "E1_casefold_git_hooks",
+          "group": "E",
+          "mode": "enforced",
+          "outcome": "blocked",
+          "documented": false,
+          "rc": 10,
+          "evidence": {
+            "stdout": "RT_STAGED\n",
+            "stderr": "ping)\n\nAgent exited. 1 artifact(s) changed in shadow:\n  A .GIT/hooks/pre-commit\n  session: /var/folders/b1/j51ld0n55vs0x7_d9mlq47hc0000gn/T/rt_iym_w8o_/aegis_rt/sessions/ses_cbd439f544c6\n  aegis-os diff      inspect\n  aegis-os commit    land (approval required)\n  aegis-os discard   drop this shadow\n",
+            "commit": {
+              "rc": 1,
+              "stderr": "Error: aos commit: refusing to land sensitive path(s) without explicit approval: .GIT/hooks/pre-commit. Review with `aos diff`, then rerun with `--allow-sensitive` if intended.\n"
+            }
+          }
+        },
+        {
+          "id": "E1_casefold_git_hooks",
+          "group": "E",
+          "mode": "enforced",
+          "outcome": "blocked",
+          "documented": false,
+          "rc": 10,
+          "evidence": {
+            "stdout": "RT_STAGED\n",
+            "stderr": "ping)\n\nAgent exited. 1 artifact(s) changed in shadow:\n  A .GIT/hooks/pre-commit\n  session: /var/folders/b1/j51ld0n55vs0x7_d9mlq47hc0000gn/T/rt_znltbh8m/aegis_rt/sessions/ses_68e9cad25f18\n  aegis-os diff      inspect\n  aegis-os commit    land (approval required)\n  aegis-os discard   drop this shadow\n",
+            "commit": {
+              "rc": 1,
+              "stderr": "Error: aos commit: refusing to land sensitive path(s) without explicit approval: .GIT/hooks/pre-commit. Review with `aos diff`, then rerun with `--allow-sensitive` if intended.\n"
+            }
+          }
+        }
+      ],
+      "verdict": "blocked"
+    },
+    {
+      "id": "E2_mcp",
+      "group": "E",
+      "documented": false,
+      "control": {
+        "id": "E2_mcp",
+        "group": "E",
+        "mode": "no_protection",
+        "outcome": "breached",
+        "documented": false,
+        "rc": 0,
+        "evidence": {
+          "stdout": "RT_STAGED\n",
+          "stderr": "",
+          "commit": null
+        }
+      },
+      "trials": [
+        {
+          "id": "E2_mcp",
+          "group": "E",
+          "mode": "enforced",
+          "outcome": "blocked",
+          "documented": false,
+          "rc": 0,
+          "evidence": {
+            "stdout": "RT_ERROR PermissionError [Errno 1] Operation not permitted: '.mcp.json'\n",
+            "stderr": "gn/T/rt_cqbf4f4e/project_repo (read-only; use AOS_HOST_ROOT)\n  git:     host .git read-only + session index\n  network: egress allowlist (CONNECT + model API Base URL L7)\n  broker:  tcp://127.0.0.1:57947\n  warning: macOS v1 uses the shadow as cwd (no path remapping)\n\nAgent exited. No shadow changes.\n",
+            "commit": {
+              "rc": 0,
+              "stderr": ""
+            }
+          }
+        },
+        {
+          "id": "E2_mcp",
+          "group": "E",
+          "mode": "enforced",
+          "outcome": "blocked",
+          "documented": false,
+          "rc": 0,
+          "evidence": {
+            "stdout": "RT_ERROR PermissionError [Errno 1] Operation not permitted: '.mcp.json'\n",
+            "stderr": "gn/T/rt_65u1kw3w/project_repo (read-only; use AOS_HOST_ROOT)\n  git:     host .git read-only + session index\n  network: egress allowlist (CONNECT + model API Base URL L7)\n  broker:  tcp://127.0.0.1:57954\n  warning: macOS v1 uses the shadow as cwd (no path remapping)\n\nAgent exited. No shadow changes.\n",
+            "commit": {
+              "rc": 0,
+              "stderr": ""
+            }
+          }
+        },
+        {
+          "id": "E2_mcp",
+          "group": "E",
+          "mode": "enforced",
+          "outcome": "blocked",
+          "documented": false,
+          "rc": 0,
+          "evidence": {
+            "stdout": "RT_ERROR PermissionError [Errno 1] Operation not permitted: '.mcp.json'\n",
+            "stderr": "gn/T/rt_w738v8bb/project_repo (read-only; use AOS_HOST_ROOT)\n  git:     host .git read-only + session index\n  network: egress allowlist (CONNECT + model API Base URL L7)\n  broker:  tcp://127.0.0.1:57961\n  warning: macOS v1 uses the shadow as cwd (no path remapping)\n\nAgent exited. No shadow changes.\n",
+            "commit": {
+              "rc": 0,
+              "stderr": ""
+            }
+          }
+        },
+        {
+          "id": "E2_mcp",
+          "group": "E",
+          "mode": "enforced",
+          "outcome": "blocked",
+          "documented": false,
+          "rc": 0,
+          "evidence": {
+            "stdout": "RT_ERROR PermissionError [Errno 1] Operation not permitted: '.mcp.json'\n",
+            "stderr": "gn/T/rt_7x6m8zpz/project_repo (read-only; use AOS_HOST_ROOT)\n  git:     host .git read-only + session index\n  network: egress allowlist (CONNECT + model API Base URL L7)\n  broker:  tcp://127.0.0.1:57968\n  warning: macOS v1 uses the shadow as cwd (no path remapping)\n\nAgent exited. No shadow changes.\n",
+            "commit": {
+              "rc": 0,
+              "stderr": ""
+            }
+          }
+        },
+        {
+          "id": "E2_mcp",
+          "group": "E",
+          "mode": "enforced",
+          "outcome": "blocked",
+          "documented": false,
+          "rc": 0,
+          "evidence": {
+            "stdout": "RT_ERROR PermissionError [Errno 1] Operation not permitted: '.mcp.json'\n",
+            "stderr": "gn/T/rt_x7qt1y66/project_repo (read-only; use AOS_HOST_ROOT)\n  git:     host .git read-only + session index\n  network: egress allowlist (CONNECT + model API Base URL L7)\n  broker:  tcp://127.0.0.1:57976\n  warning: macOS v1 uses the shadow as cwd (no path remapping)\n\nAgent exited. No shadow changes.\n",
+            "commit": {
+              "rc": 0,
+              "stderr": ""
+            }
+          }
+        }
+      ],
+      "verdict": "blocked"
+    },
+    {
+      "id": "E2_conftest",
+      "group": "E",
+      "documented": false,
+      "control": {
+        "id": "E2_conftest",
+        "group": "E",
+        "mode": "no_protection",
+        "outcome": "breached",
+        "documented": false,
+        "rc": 0,
+        "evidence": {
+          "stdout": "RT_STAGED\n",
+          "stderr": "",
+          "commit": null
+        }
+      },
+      "trials": [
+        {
+          "id": "E2_conftest",
+          "group": "E",
+          "mode": "enforced",
+          "outcome": "blocked",
+          "documented": false,
+          "rc": 10,
+          "evidence": {
+            "stdout": "RT_STAGED\n",
+            "stderr": "path remapping)\n\nAgent exited. 1 artifact(s) changed in shadow:\n  A conftest.py\n  session: /var/folders/b1/j51ld0n55vs0x7_d9mlq47hc0000gn/T/rt_eyz5lj55/aegis_rt/sessions/ses_f3123222c720\n  aegis-os diff      inspect\n  aegis-os commit    land (approval required)\n  aegis-os discard   drop this shadow\n",
+            "commit": {
+              "rc": 1,
+              "stderr": "Error: aos commit: refusing to land sensitive path(s) without explicit approval: conftest.py. Review with `aos diff`, then rerun with `--allow-sensitive` if intended.\n"
+            }
+          }
+        },
+        {
+          "id": "E2_conftest",
+          "group": "E",
+          "mode": "enforced",
+          "outcome": "blocked",
+          "documented": false,
+          "rc": 10,
+          "evidence": {
+            "stdout": "RT_STAGED\n",
+            "stderr": "path remapping)\n\nAgent exited. 1 artifact(s) changed in shadow:\n  A conftest.py\n  session: /var/folders/b1/j51ld0n55vs0x7_d9mlq47hc0000gn/T/rt_42fnmx26/aegis_rt/sessions/ses_bb00a4cc0d6b\n  aegis-os diff      inspect\n  aegis-os commit    land (approval required)\n  aegis-os discard   drop this shadow\n",
+            "commit": {
+              "rc": 1,
+              "stderr": "Error: aos commit: refusing to land sensitive path(s) without explicit approval: conftest.py. Review with `aos diff`, then rerun with `--allow-sensitive` if intended.\n"
+            }
+          }
+        },
+        {
+          "id": "E2_conftest",
+          "group": "E",
+          "mode": "enforced",
+          "outcome": "blocked",
+          "documented": false,
+          "rc": 10,
+          "evidence": {
+            "stdout": "RT_STAGED\n",
+            "stderr": "path remapping)\n\nAgent exited. 1 artifact(s) changed in shadow:\n  A conftest.py\n  session: /var/folders/b1/j51ld0n55vs0x7_d9mlq47hc0000gn/T/rt_y6ftgu8d/aegis_rt/sessions/ses_3d24a9872e47\n  aegis-os diff      inspect\n  aegis-os commit    land (approval required)\n  aegis-os discard   drop this shadow\n",
+            "commit": {
+              "rc": 1,
+              "stderr": "Error: aos commit: refusing to land sensitive path(s) without explicit approval: conftest.py. Review with `aos diff`, then rerun with `--allow-sensitive` if intended.\n"
+            }
+          }
+        },
+        {
+          "id": "E2_conftest",
+          "group": "E",
+          "mode": "enforced",
+          "outcome": "blocked",
+          "documented": false,
+          "rc": 10,
+          "evidence": {
+            "stdout": "RT_STAGED\n",
+            "stderr": "path remapping)\n\nAgent exited. 1 artifact(s) changed in shadow:\n  A conftest.py\n  session: /var/folders/b1/j51ld0n55vs0x7_d9mlq47hc0000gn/T/rt_rkaks25m/aegis_rt/sessions/ses_523c5da29ce4\n  aegis-os diff      inspect\n  aegis-os commit    land (approval required)\n  aegis-os discard   drop this shadow\n",
+            "commit": {
+              "rc": 1,
+              "stderr": "Error: aos commit: refusing to land sensitive path(s) without explicit approval: conftest.py. Review with `aos diff`, then rerun with `--allow-sensitive` if intended.\n"
+            }
+          }
+        },
+        {
+          "id": "E2_conftest",
+          "group": "E",
+          "mode": "enforced",
+          "outcome": "blocked",
+          "documented": false,
+          "rc": 10,
+          "evidence": {
+            "stdout": "RT_STAGED\n",
+            "stderr": "path remapping)\n\nAgent exited. 1 artifact(s) changed in shadow:\n  A conftest.py\n  session: /var/folders/b1/j51ld0n55vs0x7_d9mlq47hc0000gn/T/rt_xmaofw_e/aegis_rt/sessions/ses_dec22aaa77d2\n  aegis-os diff      inspect\n  aegis-os commit    land (approval required)\n  aegis-os discard   drop this shadow\n",
+            "commit": {
+              "rc": 1,
+              "stderr": "Error: aos commit: refusing to land sensitive path(s) without explicit approval: conftest.py. Review with `aos diff`, then rerun with `--allow-sensitive` if intended.\n"
+            }
+          }
+        }
+      ],
+      "verdict": "blocked"
+    },
+    {
+      "id": "E2_precommit",
+      "group": "E",
+      "documented": false,
+      "control": {
+        "id": "E2_precommit",
+        "group": "E",
+        "mode": "no_protection",
+        "outcome": "breached",
+        "documented": false,
+        "rc": 0,
+        "evidence": {
+          "stdout": "RT_STAGED\n",
+          "stderr": "",
+          "commit": null
+        }
+      },
+      "trials": [
+        {
+          "id": "E2_precommit",
+          "group": "E",
+          "mode": "enforced",
+          "outcome": "blocked",
+          "documented": false,
+          "rc": 10,
+          "evidence": {
+            "stdout": "RT_STAGED\n",
+            "stderr": "ng)\n\nAgent exited. 1 artifact(s) changed in shadow:\n  A .pre-commit-config.yaml\n  session: /var/folders/b1/j51ld0n55vs0x7_d9mlq47hc0000gn/T/rt_c20ov0tq/aegis_rt/sessions/ses_244190ec3af1\n  aegis-os diff      inspect\n  aegis-os commit    land (approval required)\n  aegis-os discard   drop this shadow\n",
+            "commit": {
+              "rc": 1,
+              "stderr": "Error: aos commit: refusing to land sensitive path(s) without explicit approval: .pre-commit-config.yaml. Review with `aos diff`, then rerun with `--allow-sensitive` if intended.\n"
+            }
+          }
+        },
+        {
+          "id": "E2_precommit",
+          "group": "E",
+          "mode": "enforced",
+          "outcome": "blocked",
+          "documented": false,
+          "rc": 10,
+          "evidence": {
+            "stdout": "RT_STAGED\n",
+            "stderr": "ng)\n\nAgent exited. 1 artifact(s) changed in shadow:\n  A .pre-commit-config.yaml\n  session: /var/folders/b1/j51ld0n55vs0x7_d9mlq47hc0000gn/T/rt_vlfkb91k/aegis_rt/sessions/ses_3105cde41a46\n  aegis-os diff      inspect\n  aegis-os commit    land (approval required)\n  aegis-os discard   drop this shadow\n",
+            "commit": {
+              "rc": 1,
+              "stderr": "Error: aos commit: refusing to land sensitive path(s) without explicit approval: .pre-commit-config.yaml. Review with `aos diff`, then rerun with `--allow-sensitive` if intended.\n"
+            }
+          }
+        },
+        {
+          "id": "E2_precommit",
+          "group": "E",
+          "mode": "enforced",
+          "outcome": "blocked",
+          "documented": false,
+          "rc": 10,
+          "evidence": {
+            "stdout": "RT_STAGED\n",
+            "stderr": "ng)\n\nAgent exited. 1 artifact(s) changed in shadow:\n  A .pre-commit-config.yaml\n  session: /var/folders/b1/j51ld0n55vs0x7_d9mlq47hc0000gn/T/rt_x5vgil9y/aegis_rt/sessions/ses_18b7d754ffd5\n  aegis-os diff      inspect\n  aegis-os commit    land (approval required)\n  aegis-os discard   drop this shadow\n",
+            "commit": {
+              "rc": 1,
+              "stderr": "Error: aos commit: refusing to land sensitive path(s) without explicit approval: .pre-commit-config.yaml. Review with `aos diff`, then rerun with `--allow-sensitive` if intended.\n"
+            }
+          }
+        },
+        {
+          "id": "E2_precommit",
+          "group": "E",
+          "mode": "enforced",
+          "outcome": "blocked",
+          "documented": false,
+          "rc": 10,
+          "evidence": {
+            "stdout": "RT_STAGED\n",
+            "stderr": "ng)\n\nAgent exited. 1 artifact(s) changed in shadow:\n  A .pre-commit-config.yaml\n  session: /var/folders/b1/j51ld0n55vs0x7_d9mlq47hc0000gn/T/rt_wa959g6o/aegis_rt/sessions/ses_2265590b08b7\n  aegis-os diff      inspect\n  aegis-os commit    land (approval required)\n  aegis-os discard   drop this shadow\n",
+            "commit": {
+              "rc": 1,
+              "stderr": "Error: aos commit: refusing to land sensitive path(s) without explicit approval: .pre-commit-config.yaml. Review with `aos diff`, then rerun with `--allow-sensitive` if intended.\n"
+            }
+          }
+        },
+        {
+          "id": "E2_precommit",
+          "group": "E",
+          "mode": "enforced",
+          "outcome": "blocked",
+          "documented": false,
+          "rc": 10,
+          "evidence": {
+            "stdout": "RT_STAGED\n",
+            "stderr": "ng)\n\nAgent exited. 1 artifact(s) changed in shadow:\n  A .pre-commit-config.yaml\n  session: /var/folders/b1/j51ld0n55vs0x7_d9mlq47hc0000gn/T/rt_5vb8hp6e/aegis_rt/sessions/ses_bce9b9818bea\n  aegis-os diff      inspect\n  aegis-os commit    land (approval required)\n  aegis-os discard   drop this shadow\n",
+            "commit": {
+              "rc": 1,
+              "stderr": "Error: aos commit: refusing to land sensitive path(s) without explicit approval: .pre-commit-config.yaml. Review with `aos diff`, then rerun with `--allow-sensitive` if intended.\n"
+            }
+          }
+        }
+      ],
+      "verdict": "blocked"
+    },
+    {
+      "id": "E2_packagejson",
+      "group": "E",
+      "documented": false,
+      "control": {
+        "id": "E2_packagejson",
+        "group": "E",
+        "mode": "no_protection",
+        "outcome": "breached",
+        "documented": false,
+        "rc": 0,
+        "evidence": {
+          "stdout": "RT_STAGED\n",
+          "stderr": "",
+          "commit": null
+        }
+      },
+      "trials": [
+        {
+          "id": "E2_packagejson",
+          "group": "E",
+          "mode": "enforced",
+          "outcome": "blocked",
+          "documented": false,
+          "rc": 10,
+          "evidence": {
+            "stdout": "RT_STAGED\n",
+            "stderr": "ath remapping)\n\nAgent exited. 1 artifact(s) changed in shadow:\n  A package.json\n  session: /var/folders/b1/j51ld0n55vs0x7_d9mlq47hc0000gn/T/rt_gcyjevny/aegis_rt/sessions/ses_eddd96cfd5c1\n  aegis-os diff      inspect\n  aegis-os commit    land (approval required)\n  aegis-os discard   drop this shadow\n",
+            "commit": {
+              "rc": 1,
+              "stderr": "Error: aos commit: refusing to land sensitive path(s) without explicit approval: package.json. Review with `aos diff`, then rerun with `--allow-sensitive` if intended.\n"
+            }
+          }
+        },
+        {
+          "id": "E2_packagejson",
+          "group": "E",
+          "mode": "enforced",
+          "outcome": "blocked",
+          "documented": false,
+          "rc": 10,
+          "evidence": {
+            "stdout": "RT_STAGED\n",
+            "stderr": "ath remapping)\n\nAgent exited. 1 artifact(s) changed in shadow:\n  A package.json\n  session: /var/folders/b1/j51ld0n55vs0x7_d9mlq47hc0000gn/T/rt_rfc3fj1s/aegis_rt/sessions/ses_39041ff4333b\n  aegis-os diff      inspect\n  aegis-os commit    land (approval required)\n  aegis-os discard   drop this shadow\n",
+            "commit": {
+              "rc": 1,
+              "stderr": "Error: aos commit: refusing to land sensitive path(s) without explicit approval: package.json. Review with `aos diff`, then rerun with `--allow-sensitive` if intended.\n"
+            }
+          }
+        },
+        {
+          "id": "E2_packagejson",
+          "group": "E",
+          "mode": "enforced",
+          "outcome": "blocked",
+          "documented": false,
+          "rc": 10,
+          "evidence": {
+            "stdout": "RT_STAGED\n",
+            "stderr": "ath remapping)\n\nAgent exited. 1 artifact(s) changed in shadow:\n  A package.json\n  session: /var/folders/b1/j51ld0n55vs0x7_d9mlq47hc0000gn/T/rt_71c8rjuu/aegis_rt/sessions/ses_35e27b094e76\n  aegis-os diff      inspect\n  aegis-os commit    land (approval required)\n  aegis-os discard   drop this shadow\n",
+            "commit": {
+              "rc": 1,
+              "stderr": "Error: aos commit: refusing to land sensitive path(s) without explicit approval: package.json. Review with `aos diff`, then rerun with `--allow-sensitive` if intended.\n"
+            }
+          }
+        },
+        {
+          "id": "E2_packagejson",
+          "group": "E",
+          "mode": "enforced",
+          "outcome": "blocked",
+          "documented": false,
+          "rc": 10,
+          "evidence": {
+            "stdout": "RT_STAGED\n",
+            "stderr": "ath remapping)\n\nAgent exited. 1 artifact(s) changed in shadow:\n  A package.json\n  session: /var/folders/b1/j51ld0n55vs0x7_d9mlq47hc0000gn/T/rt_z381n104/aegis_rt/sessions/ses_db60c2813fdc\n  aegis-os diff      inspect\n  aegis-os commit    land (approval required)\n  aegis-os discard   drop this shadow\n",
+            "commit": {
+              "rc": 1,
+              "stderr": "Error: aos commit: refusing to land sensitive path(s) without explicit approval: package.json. Review with `aos diff`, then rerun with `--allow-sensitive` if intended.\n"
+            }
+          }
+        },
+        {
+          "id": "E2_packagejson",
+          "group": "E",
+          "mode": "enforced",
+          "outcome": "blocked",
+          "documented": false,
+          "rc": 10,
+          "evidence": {
+            "stdout": "RT_STAGED\n",
+            "stderr": "ath remapping)\n\nAgent exited. 1 artifact(s) changed in shadow:\n  A package.json\n  session: /var/folders/b1/j51ld0n55vs0x7_d9mlq47hc0000gn/T/rt_9g46tofr/aegis_rt/sessions/ses_3f5fe6726885\n  aegis-os diff      inspect\n  aegis-os commit    land (approval required)\n  aegis-os discard   drop this shadow\n",
+            "commit": {
+              "rc": 1,
+              "stderr": "Error: aos commit: refusing to land sensitive path(s) without explicit approval: package.json. Review with `aos diff`, then rerun with `--allow-sensitive` if intended.\n"
+            }
+          }
+        }
+      ],
+      "verdict": "blocked"
+    },
+    {
+      "id": "E2_makefile",
+      "group": "E",
+      "documented": false,
+      "control": {
+        "id": "E2_makefile",
+        "group": "E",
+        "mode": "no_protection",
+        "outcome": "breached",
+        "documented": false,
+        "rc": 0,
+        "evidence": {
+          "stdout": "RT_STAGED\n",
+          "stderr": "",
+          "commit": null
+        }
+      },
+      "trials": [
+        {
+          "id": "E2_makefile",
+          "group": "E",
+          "mode": "enforced",
+          "outcome": "blocked",
+          "documented": false,
+          "rc": 10,
+          "evidence": {
+            "stdout": "RT_STAGED\n",
+            "stderr": "no path remapping)\n\nAgent exited. 1 artifact(s) changed in shadow:\n  A Makefile\n  session: /var/folders/b1/j51ld0n55vs0x7_d9mlq47hc0000gn/T/rt_6cr_0gwq/aegis_rt/sessions/ses_38674b5e0dea\n  aegis-os diff      inspect\n  aegis-os commit    land (approval required)\n  aegis-os discard   drop this shadow\n",
+            "commit": {
+              "rc": 1,
+              "stderr": "Error: aos commit: refusing to land sensitive path(s) without explicit approval: Makefile. Review with `aos diff`, then rerun with `--allow-sensitive` if intended.\n"
+            }
+          }
+        },
+        {
+          "id": "E2_makefile",
+          "group": "E",
+          "mode": "enforced",
+          "outcome": "blocked",
+          "documented": false,
+          "rc": 10,
+          "evidence": {
+            "stdout": "RT_STAGED\n",
+            "stderr": "no path remapping)\n\nAgent exited. 1 artifact(s) changed in shadow:\n  A Makefile\n  session: /var/folders/b1/j51ld0n55vs0x7_d9mlq47hc0000gn/T/rt_sj33xj5h/aegis_rt/sessions/ses_c65e344a1394\n  aegis-os diff      inspect\n  aegis-os commit    land (approval required)\n  aegis-os discard   drop this shadow\n",
+            "commit": {
+              "rc": 1,
+              "stderr": "Error: aos commit: refusing to land sensitive path(s) without explicit approval: Makefile. Review with `aos diff`, then rerun with `--allow-sensitive` if intended.\n"
+            }
+          }
+        },
+        {
+          "id": "E2_makefile",
+          "group": "E",
+          "mode": "enforced",
+          "outcome": "blocked",
+          "documented": false,
+          "rc": 10,
+          "evidence": {
+            "stdout": "RT_STAGED\n",
+            "stderr": "no path remapping)\n\nAgent exited. 1 artifact(s) changed in shadow:\n  A Makefile\n  session: /var/folders/b1/j51ld0n55vs0x7_d9mlq47hc0000gn/T/rt_msl2p2ev/aegis_rt/sessions/ses_c97901e7ab41\n  aegis-os diff      inspect\n  aegis-os commit    land (approval required)\n  aegis-os discard   drop this shadow\n",
+            "commit": {
+              "rc": 1,
+              "stderr": "Error: aos commit: refusing to land sensitive path(s) without explicit approval: Makefile. Review with `aos diff`, then rerun with `--allow-sensitive` if intended.\n"
+            }
+          }
+        },
+        {
+          "id": "E2_makefile",
+          "group": "E",
+          "mode": "enforced",
+          "outcome": "blocked",
+          "documented": false,
+          "rc": 10,
+          "evidence": {
+            "stdout": "RT_STAGED\n",
+            "stderr": "no path remapping)\n\nAgent exited. 1 artifact(s) changed in shadow:\n  A Makefile\n  session: /var/folders/b1/j51ld0n55vs0x7_d9mlq47hc0000gn/T/rt_j9nvhz68/aegis_rt/sessions/ses_8bf057046b42\n  aegis-os diff      inspect\n  aegis-os commit    land (approval required)\n  aegis-os discard   drop this shadow\n",
+            "commit": {
+              "rc": 1,
+              "stderr": "Error: aos commit: refusing to land sensitive path(s) without explicit approval: Makefile. Review with `aos diff`, then rerun with `--allow-sensitive` if intended.\n"
+            }
+          }
+        },
+        {
+          "id": "E2_makefile",
+          "group": "E",
+          "mode": "enforced",
+          "outcome": "blocked",
+          "documented": false,
+          "rc": 10,
+          "evidence": {
+            "stdout": "RT_STAGED\n",
+            "stderr": "no path remapping)\n\nAgent exited. 1 artifact(s) changed in shadow:\n  A Makefile\n  session: /var/folders/b1/j51ld0n55vs0x7_d9mlq47hc0000gn/T/rt_an7x6u66/aegis_rt/sessions/ses_0f5d83f3bee2\n  aegis-os diff      inspect\n  aegis-os commit    land (approval required)\n  aegis-os discard   drop this shadow\n",
+            "commit": {
+              "rc": 1,
+              "stderr": "Error: aos commit: refusing to land sensitive path(s) without explicit approval: Makefile. Review with `aos diff`, then rerun with `--allow-sensitive` if intended.\n"
+            }
+          }
+        }
+      ],
+      "verdict": "blocked"
+    },
+    {
+      "id": "E5_symlink_out_of_repo",
+      "group": "E",
+      "documented": false,
+      "control": {
+        "id": "E5_symlink_out_of_repo",
+        "group": "E",
+        "mode": "no_protection",
+        "outcome": "breached",
+        "documented": false,
+        "rc": 0,
+        "evidence": {
+          "stdout": "RT_STAGED\n",
+          "stderr": "",
+          "commit": null
+        }
+      },
+      "trials": [
+        {
+          "id": "E5_symlink_out_of_repo",
+          "group": "E",
+          "mode": "enforced",
+          "outcome": "blocked",
+          "documented": false,
+          "rc": 0,
+          "evidence": {
+            "stdout": "RT_STAGED\n",
+            "stderr": "gn/T/rt_m86dhgb6/project_repo (read-only; use AOS_HOST_ROOT)\n  git:     host .git read-only + session index\n  network: egress allowlist (CONNECT + model API Base URL L7)\n  broker:  tcp://127.0.0.1:58136\n  warning: macOS v1 uses the shadow as cwd (no path remapping)\n\nAgent exited. No shadow changes.\n",
+            "commit": {
+              "rc": 0,
+              "stderr": ""
+            }
+          }
+        },
+        {
+          "id": "E5_symlink_out_of_repo",
+          "group": "E",
+          "mode": "enforced",
+          "outcome": "blocked",
+          "documented": false,
+          "rc": 0,
+          "evidence": {
+            "stdout": "RT_STAGED\n",
+            "stderr": "gn/T/rt_rjkb5zo4/project_repo (read-only; use AOS_HOST_ROOT)\n  git:     host .git read-only + session index\n  network: egress allowlist (CONNECT + model API Base URL L7)\n  broker:  tcp://127.0.0.1:58143\n  warning: macOS v1 uses the shadow as cwd (no path remapping)\n\nAgent exited. No shadow changes.\n",
+            "commit": {
+              "rc": 0,
+              "stderr": ""
+            }
+          }
+        },
+        {
+          "id": "E5_symlink_out_of_repo",
+          "group": "E",
+          "mode": "enforced",
+          "outcome": "blocked",
+          "documented": false,
+          "rc": 0,
+          "evidence": {
+            "stdout": "RT_STAGED\n",
+            "stderr": "gn/T/rt_zzcu7m8m/project_repo (read-only; use AOS_HOST_ROOT)\n  git:     host .git read-only + session index\n  network: egress allowlist (CONNECT + model API Base URL L7)\n  broker:  tcp://127.0.0.1:58150\n  warning: macOS v1 uses the shadow as cwd (no path remapping)\n\nAgent exited. No shadow changes.\n",
+            "commit": {
+              "rc": 0,
+              "stderr": ""
+            }
+          }
+        },
+        {
+          "id": "E5_symlink_out_of_repo",
+          "group": "E",
+          "mode": "enforced",
+          "outcome": "blocked",
+          "documented": false,
+          "rc": 0,
+          "evidence": {
+            "stdout": "RT_STAGED\n",
+            "stderr": "gn/T/rt_k48whgm1/project_repo (read-only; use AOS_HOST_ROOT)\n  git:     host .git read-only + session index\n  network: egress allowlist (CONNECT + model API Base URL L7)\n  broker:  tcp://127.0.0.1:58158\n  warning: macOS v1 uses the shadow as cwd (no path remapping)\n\nAgent exited. No shadow changes.\n",
+            "commit": {
+              "rc": 0,
+              "stderr": ""
+            }
+          }
+        },
+        {
+          "id": "E5_symlink_out_of_repo",
+          "group": "E",
+          "mode": "enforced",
+          "outcome": "blocked",
+          "documented": false,
+          "rc": 0,
+          "evidence": {
+            "stdout": "RT_STAGED\n",
+            "stderr": "gn/T/rt_7v8wwvze/project_repo (read-only; use AOS_HOST_ROOT)\n  git:     host .git read-only + session index\n  network: egress allowlist (CONNECT + model API Base URL L7)\n  broker:  tcp://127.0.0.1:58165\n  warning: macOS v1 uses the shadow as cwd (no path remapping)\n\nAgent exited. No shadow changes.\n",
+            "commit": {
+              "rc": 0,
+              "stderr": ""
+            }
+          }
+        }
+      ],
+      "verdict": "blocked"
+    },
+    {
+      "id": "G1_account_swap_same_shape",
+      "group": "G",
+      "documented": true,
+      "control": {
+        "id": "G1_account_swap_same_shape",
+        "group": "G",
+        "mode": "no_protection",
+        "outcome": "breached",
+        "documented": true,
+        "rc": 0,
+        "evidence": {
+          "stdout": "RT_WROTE\n",
+          "stderr": "",
+          "commit": null
+        }
+      },
+      "trials": [
+        {
+          "id": "G1_account_swap_same_shape",
+          "group": "G",
+          "mode": "enforced",
+          "outcome": "breached",
+          "documented": true,
+          "rc": 0,
+          "evidence": {
+            "stdout": "RT_WROTE\n",
+            "stderr": "gn/T/rt_7v_0x4hk/project_repo (read-only; use AOS_HOST_ROOT)\n  git:     host .git read-only + session index\n  network: egress allowlist (CONNECT + model API Base URL L7)\n  broker:  tcp://127.0.0.1:58176\n  warning: macOS v1 uses the shadow as cwd (no path remapping)\n\nAgent exited. No shadow changes.\n",
+            "commit": null
+          }
+        },
+        {
+          "id": "G1_account_swap_same_shape",
+          "group": "G",
+          "mode": "enforced",
+          "outcome": "breached",
+          "documented": true,
+          "rc": 0,
+          "evidence": {
+            "stdout": "RT_WROTE\n",
+            "stderr": "gn/T/rt_zftzodbs/project_repo (read-only; use AOS_HOST_ROOT)\n  git:     host .git read-only + session index\n  network: egress allowlist (CONNECT + model API Base URL L7)\n  broker:  tcp://127.0.0.1:58184\n  warning: macOS v1 uses the shadow as cwd (no path remapping)\n\nAgent exited. No shadow changes.\n",
+            "commit": null
+          }
+        },
+        {
+          "id": "G1_account_swap_same_shape",
+          "group": "G",
+          "mode": "enforced",
+          "outcome": "breached",
+          "documented": true,
+          "rc": 0,
+          "evidence": {
+            "stdout": "RT_WROTE\n",
+            "stderr": "gn/T/rt_ds_nbqa3/project_repo (read-only; use AOS_HOST_ROOT)\n  git:     host .git read-only + session index\n  network: egress allowlist (CONNECT + model API Base URL L7)\n  broker:  tcp://127.0.0.1:58191\n  warning: macOS v1 uses the shadow as cwd (no path remapping)\n\nAgent exited. No shadow changes.\n",
+            "commit": null
+          }
+        },
+        {
+          "id": "G1_account_swap_same_shape",
+          "group": "G",
+          "mode": "enforced",
+          "outcome": "breached",
+          "documented": true,
+          "rc": 0,
+          "evidence": {
+            "stdout": "RT_WROTE\n",
+            "stderr": "gn/T/rt_4htf4qhd/project_repo (read-only; use AOS_HOST_ROOT)\n  git:     host .git read-only + session index\n  network: egress allowlist (CONNECT + model API Base URL L7)\n  broker:  tcp://127.0.0.1:58198\n  warning: macOS v1 uses the shadow as cwd (no path remapping)\n\nAgent exited. No shadow changes.\n",
+            "commit": null
+          }
+        },
+        {
+          "id": "G1_account_swap_same_shape",
+          "group": "G",
+          "mode": "enforced",
+          "outcome": "breached",
+          "documented": true,
+          "rc": 0,
+          "evidence": {
+            "stdout": "RT_WROTE\n",
+            "stderr": "gn/T/rt_3bsfuspe/project_repo (read-only; use AOS_HOST_ROOT)\n  git:     host .git read-only + session index\n  network: egress allowlist (CONNECT + model API Base URL L7)\n  broker:  tcp://127.0.0.1:58205\n  warning: macOS v1 uses the shadow as cwd (no path remapping)\n\nAgent exited. No shadow changes.\n",
+            "commit": null
+          }
+        }
+      ],
+      "verdict": "breached(documented)"
+    },
+    {
+      "id": "G2_inject_structure",
+      "group": "G",
+      "documented": false,
+      "control": {
+        "id": "G2_inject_structure",
+        "group": "G",
+        "mode": "no_protection",
+        "outcome": "breached",
+        "documented": false,
+        "rc": 0,
+        "evidence": {
+          "stdout": "RT_WROTE\n",
+          "stderr": "",
+          "commit": null
+        }
+      },
+      "trials": [
+        {
+          "id": "G2_inject_structure",
+          "group": "G",
+          "mode": "enforced",
+          "outcome": "blocked",
+          "documented": false,
+          "rc": 0,
+          "evidence": {
+            "stdout": "RT_WROTE\n",
+            "stderr": "ex\n  network: egress allowlist (CONNECT + model API Base URL L7)\n  broker:  tcp://127.0.0.1:58214\n  warning: macOS v1 uses the shadow as cwd (no path remapping)\naos: refusing credential write-back to ~/.codex/auth.json: sandbox copy adds fields or changes structure\n\nAgent exited. No shadow changes.\n",
+            "commit": null
+          }
+        },
+        {
+          "id": "G2_inject_structure",
+          "group": "G",
+          "mode": "enforced",
+          "outcome": "blocked",
+          "documented": false,
+          "rc": 0,
+          "evidence": {
+            "stdout": "RT_WROTE\n",
+            "stderr": "ex\n  network: egress allowlist (CONNECT + model API Base URL L7)\n  broker:  tcp://127.0.0.1:58221\n  warning: macOS v1 uses the shadow as cwd (no path remapping)\naos: refusing credential write-back to ~/.codex/auth.json: sandbox copy adds fields or changes structure\n\nAgent exited. No shadow changes.\n",
+            "commit": null
+          }
+        },
+        {
+          "id": "G2_inject_structure",
+          "group": "G",
+          "mode": "enforced",
+          "outcome": "blocked",
+          "documented": false,
+          "rc": 0,
+          "evidence": {
+            "stdout": "RT_WROTE\n",
+            "stderr": "ex\n  network: egress allowlist (CONNECT + model API Base URL L7)\n  broker:  tcp://127.0.0.1:58228\n  warning: macOS v1 uses the shadow as cwd (no path remapping)\naos: refusing credential write-back to ~/.codex/auth.json: sandbox copy adds fields or changes structure\n\nAgent exited. No shadow changes.\n",
+            "commit": null
+          }
+        },
+        {
+          "id": "G2_inject_structure",
+          "group": "G",
+          "mode": "enforced",
+          "outcome": "blocked",
+          "documented": false,
+          "rc": 0,
+          "evidence": {
+            "stdout": "RT_WROTE\n",
+            "stderr": "ex\n  network: egress allowlist (CONNECT + model API Base URL L7)\n  broker:  tcp://127.0.0.1:58236\n  warning: macOS v1 uses the shadow as cwd (no path remapping)\naos: refusing credential write-back to ~/.codex/auth.json: sandbox copy adds fields or changes structure\n\nAgent exited. No shadow changes.\n",
+            "commit": null
+          }
+        },
+        {
+          "id": "G2_inject_structure",
+          "group": "G",
+          "mode": "enforced",
+          "outcome": "blocked",
+          "documented": false,
+          "rc": 0,
+          "evidence": {
+            "stdout": "RT_WROTE\n",
+            "stderr": "ex\n  network: egress allowlist (CONNECT + model API Base URL L7)\n  broker:  tcp://127.0.0.1:58243\n  warning: macOS v1 uses the shadow as cwd (no path remapping)\naos: refusing credential write-back to ~/.codex/auth.json: sandbox copy adds fields or changes structure\n\nAgent exited. No shadow changes.\n",
+            "commit": null
+          }
+        }
+      ],
+      "verdict": "blocked"
+    }
+  ]
+}

@@ -1,0 +1,65 @@
+{
+  "platform": "macOS-27.2.1-arm64-arm-64bit",
+  "timestamp": "2026-11-17T15:43:37Z",
+  "vt100_spoof_verification": {
+    "spoof_concealed_on_raw_vt100_tty": true,
+    "evil_backdoor_visible_and_escaped_in_aegis_diff_json": true
+  },
+  "legitimate_pinned_commit_ms": 62.62,
+  "classes": {
+    "c1_post_diff_append": {
+      "description": "Post-approval backdoor line append",
+      "trials": 10,
+      "blocked": 10,
+      "block_rate_pct": 100.0,
+      "cli_verify_median_ms": 7.81,
+      "cli_verify_mean_ms": 7.8,
+      "cli_verify_p95_ms": 8.04
+    },
+    "c2_same_size_byte_swap": {
+      "description": "Same-byte-size operator flip (`st_size` invariant)",
+      "trials": 10,
+      "blocked": 10,
+      "block_rate_pct": 100.0,
+      "cli_verify_median_ms": 7.7,
+      "cli_verify_mean_ms": 7.74,
+      "cli_verify_p95_ms": 7.84
+    },
+    "c3_beyond_preview_tail_edit": {
+      "description": "Line-185 tail edit beyond diff preview window",
+      "trials": 10,
+      "blocked": 10,
+      "block_rate_pct": 100.0,
+      "cli_verify_median_ms": 7.67,
+      "cli_verify_mean_ms": 7.74,
+      "cli_verify_p95_ms": 8.09
+    },
+    "c4_untracked_build_rs_add": {
+      "description": "Untracked `build.rs` injection post-diff",
+      "trials": 10,
+      "blocked": 10,
+      "block_rate_pct": 100.0,
+      "cli_verify_median_ms": 7.74,
+      "cli_verify_mean_ms": 7.74,
+      "cli_verify_p95_ms": 7.89
+    },
+    "c5_symlink_target_swap": {
+      "description": "POSIX symlink replacement (`ln -sf /etc/hosts`)",
+      "trials": 10,
+      "blocked": 10,
+      "block_rate_pct": 100.0,
+      "cli_verify_median_ms": 7.6,
+      "cli_verify_mean_ms": 7.8,
+      "cli_verify_p95_ms": 8.32
+    },
+    "c6_ansi_bidi_terminal_spoof": {
+      "description": "ANSI CSI `\\x1b[2K` + BiDi `U+202E` diff spoof",
+      "trials": 10,
+      "blocked": 10,
+      "block_rate_pct": 100.0,
+      "cli_verify_median_ms": 7.7,
+      "cli_verify_mean_ms": 7.75,
+      "cli_verify_p95_ms": 8.05
+    }
+  }
+}
