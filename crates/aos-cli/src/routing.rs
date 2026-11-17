@@ -547,13 +547,32 @@ pub fn sandbox_redirect_reason(cmd: &str, shadow_root: &Path, host_root: &Path) 
     } else {
         ""
     };
+    let pkg_hint = if segments.iter().any(|s| {
+        let (_, words) = leading_words(s);
+        let cmd_name = words.first().map(|w| basename(w));
+        let sub = words.get(1).map(|w| w.as_str());
+        match cmd_name {
+            Some("npm" | "pnpm" | "yarn" | "bun") => {
+                matches!(sub, Some("install" | "i" | "ci" | "add"))
+            }
+            Some("pip" | "pip3") => matches!(sub, Some("install")),
+            Some("uv") => matches!(sub, Some("pip" | "add" | "sync")),
+            Some("cargo") => matches!(sub, Some("fetch" | "add")),
+            _ => false,
+        }
+    }) {
+        "\nTip: registry traffic (`registry.npmjs.org` / `pypi.org` / `crates.io`) is blocked inside `proc_exec` without explicit approval; use mcp_aegis-os_pkg_install {\"manager\":\"<npm|pip|uv|cargo|...>\",\"packages\":[...]} via the host broker."
+    } else {
+        ""
+    };
     format!(
-        "[Aegis OS routing] Native shell is disabled for in-repo work in this workspace. Re-issue it via MCP (zero prompts, kernel-sandboxed):\n  mcp_aegis-os_proc_exec {{\"command\":\"sh\",\"args\":[\"-c\",{}]}}\ncwd = your CoW shadow workspace ({}); host files stay readable by absolute path; writes land in the shadow and reach the host only via workspace_commit.{}{}{}",
+        "[Aegis OS routing] Native shell is disabled for in-repo work in this workspace. Re-issue it via MCP (zero prompts, kernel-sandboxed):\n  mcp_aegis-os_proc_exec {{\"command\":\"sh\",\"args\":[\"-c\",{}]}}\ncwd = your CoW shadow workspace ({}); host files stay readable by absolute path; writes land in the shadow and reach the host only via workspace_commit.{}{}{}{}",
         json_str(cmd),
         shadow_root.display(),
         git_hint,
         export_hint,
-        ci_hint
+        ci_hint,
+        pkg_hint
     )
 }
 
@@ -1078,6 +1097,10 @@ mod tests {
             panic!()
         };
         assert!(gh_ask_reason.contains("mcp_aegis-os_github_ci_inspect"), "{gh_ask_reason}");
+        let pkg_reason = sandbox_redirect_reason("npm install express", &shadow(), Path::new("/repo"));
+        assert!(pkg_reason.contains("mcp_aegis-os_pkg_install"), "{pkg_reason}");
+        let pip_reason = sandbox_redirect_reason("pip install requests", &shadow(), Path::new("/repo"));
+        assert!(pip_reason.contains("mcp_aegis-os_pkg_install"), "{pip_reason}");
     }
 
     #[test]

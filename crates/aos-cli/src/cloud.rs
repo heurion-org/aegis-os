@@ -2878,6 +2878,7 @@ pub async fn serve_unified_stdio(
                             | "workspace_git"
                             | "github_ci_rerun"
                             | "github_pr_create"
+                            | "pkg_install"
                     )
                         && consume_hook_commit_ticket(&runtime_dir, &identity.org_id)
                     {
@@ -2894,7 +2895,9 @@ pub async fn serve_unified_stdio(
                                     e.escalation_id == eid
                                         && matches!(
                                             e.action.as_str(),
-                                            "workspace_commit_sensitive" | "workspace_git_sensitive"
+                                            "workspace_commit_sensitive"
+                                                | "workspace_git_sensitive"
+                                                | "pkg_install_scripts"
                                         )
                                 });
                             if is_sensitive {

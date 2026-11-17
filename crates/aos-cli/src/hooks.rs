@@ -357,6 +357,21 @@ async fn has_inline_approval_lease(
                 && l.action_pattern == "*"
         });
     }
+    if sub_tool == "pkg_install" {
+        let allow_scripts = inner_args
+            .get("allow_scripts")
+            .and_then(|v| v.as_bool())
+            .unwrap_or(false);
+        if allow_scripts {
+            return false;
+        }
+        return leases.iter().any(|l| {
+            !l.resource_pattern.contains("#sha256:")
+                && !l.resource_pattern.starts_with("sha256:")
+                && (l.action_pattern == "*" || l.action_pattern == "pkg_install")
+                && l.resource_pattern == "*"
+        });
+    }
     if sub_tool == "fs_export_file" {
         let raw_dst = inner_args
             .get("dst_host_path")
@@ -494,6 +509,39 @@ async fn build_boundary_approval_prompt(
         return format!(
             "[Aegis OS GitHub PR Creation Approval]\n  • What this does: Open GitHub Pull Request (`{}` -> `{}`) titled \"{}\" via agent `{}/{}`.\n  • Approval scope: Clicking Allow triggers PR creation via the host broker after DLP scanning.",
             head, base, title, identity.org_id, identity.agent_id
+        );
+    }
+
+    if sub_tool == "pkg_install" {
+        let manager = inner_args
+            .get("manager")
+            .and_then(|v| v.as_str())
+            .unwrap_or("pkg");
+        let pkgs: Vec<&str> = inner_args
+            .get("packages")
+            .and_then(|v| v.as_array())
+            .map(|a| a.iter().filter_map(|x| x.as_str()).collect())
+            .unwrap_or_default();
+        let pkg_list = if pkgs.is_empty() {
+            "<manifest dependencies>".to_string()
+        } else {
+            pkgs.join(", ")
+        };
+        let allow_scripts = inner_args
+            .get("allow_scripts")
+            .and_then(|v| v.as_bool())
+            .unwrap_or(false);
+        let offline = inner_args
+            .get("offline")
+            .and_then(|v| v.as_bool())
+            .unwrap_or(false);
+        let dir = inner_args
+            .get("dir")
+            .and_then(|v| v.as_str())
+            .unwrap_or(".");
+        return format!(
+            "[Aegis OS Package Install Approval]\n  • What this does: Install `{}` via `{}` in `{}` (offline={}, allow_scripts={}) through the registry-restricted proxy for agent `{}/{}`.\n  • Approval scope: Clicking Allow authorizes this exact dependency plan (locked to `#sha256:` manifest state); lifecycle scripts (`allow_scripts=true`) always require explicit approval.",
+            pkg_list, manager, dir, offline, allow_scripts, identity.org_id, identity.agent_id
         );
     }
 
@@ -1023,6 +1071,7 @@ pub(crate) async fn handle_agy_hook(
                             | "workspace_git"
                             | "github_ci_rerun"
                             | "github_pr_create"
+                            | "pkg_install"
                     )
                         && use_inline_hook
                         && cloud::resolve_active_cloud_binding(&cli.runtime_dir, &effective_workspace)
@@ -1128,6 +1177,7 @@ pub(crate) async fn handle_agy_hook(
                         | "workspace_git"
                         | "github_ci_rerun"
                         | "github_pr_create"
+                        | "pkg_install"
                 )
                     && use_inline_hook
                     && cloud::resolve_active_cloud_binding(&cli.runtime_dir, &effective_workspace)

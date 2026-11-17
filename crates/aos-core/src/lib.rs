@@ -119,6 +119,12 @@ pub struct SandboxConfig {
     /// Enforce default-deny read isolation over host `$HOME` subdirectories (aligned with Linux `bwrap`).
     #[serde(default = "default_tighten_home_read")]
     pub tighten_home_read: bool,
+    /// Host-allocated `127.0.0.1:<port>` loopback ports allowed for local bind/inbound/outbound inside the sandbox.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub allowed_loopback_ports: Vec<u16>,
+    /// Enforce isolated loopback networking even when `egress_proxy_addr` is `None`.
+    #[serde(default)]
+    pub isolate_loopback_only: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -151,6 +157,11 @@ pub trait SandboxInstance: Send + Sync {
 
     /// Generate the underlying OS/VM confinement profile for inspection & auditing.
     fn confinement_profile(&self) -> String;
+
+    /// Returns the host-allocated `127.0.0.1` loopback ports accessible inside this sandbox instance.
+    fn allocated_loopback_ports(&self) -> Vec<u16> {
+        self.config().allowed_loopback_ports.clone()
+    }
 
     /// Pause sandbox for Scale-to-Zero idle hibernation.
     async fn pause(&self) -> anyhow::Result<()>;

@@ -4288,6 +4288,8 @@ async fn run_verify_for_session(
             egress_proxy_addr: None,
             host_source_dir: Some(PathBuf::from(workspace)),
             tighten_home_read: true,
+            allowed_loopback_ports: aos_sandbox::allocate_loopback_ports(2, &[]),
+            isolate_loopback_only: true,
         })
         .await?;
     let out = sandbox
@@ -5855,6 +5857,30 @@ async fn run_macos_inner(
         .join(&identity.agent_id);
     std::fs::create_dir_all(&org_shared)?;
     std::fs::create_dir_all(&org_pub)?;
+    let mut excluded_loopback_ports: Vec<u16> = [hermes_pinned_port, opencode_pinned_port]
+        .into_iter()
+        .flatten()
+        .collect();
+    if let Some(port) = proxy
+        .rsplit(':')
+        .next()
+        .and_then(|p| p.trim_end_matches('/').parse::<u16>().ok())
+    {
+        excluded_loopback_ports.push(port);
+    }
+    if let Some(addr) = broker.tcp_addr {
+        excluded_loopback_ports.push(addr.port());
+    }
+    let dev_loopback_ports = aos_sandbox::allocate_loopback_ports(2, &excluded_loopback_ports);
+    let mut allowed_loopback_ports = dev_loopback_ports.clone();
+    for pinned_port in [hermes_pinned_port, opencode_pinned_port]
+        .into_iter()
+        .flatten()
+    {
+        if !allowed_loopback_ports.contains(&pinned_port) {
+            allowed_loopback_ports.push(pinned_port);
+        }
+    }
     let sandbox = NativeOsSandboxDriver
         .create_sandbox(SandboxConfig {
             identity: identity.clone(),
@@ -5867,6 +5893,8 @@ async fn run_macos_inner(
             egress_proxy_addr: Some(proxy.clone()),
             host_source_dir: Some(project.to_path_buf()),
             tighten_home_read: true,
+            allowed_loopback_ports,
+            isolate_loopback_only: true,
         })
         .await?;
     let mut seatbelt = sandbox.confinement_profile();
@@ -5939,6 +5967,15 @@ async fn run_macos_inner(
         envs.push((key.to_string(), value));
     };
     push(&mut envs, "HOME", agent_home.display().to_string());
+    if !dev_loopback_ports.is_empty() {
+        let csv = dev_loopback_ports
+            .iter()
+            .map(u16::to_string)
+            .collect::<Vec<_>>()
+            .join(",");
+        push(&mut envs, "AOS_LOOPBACK_PORTS", csv);
+        push(&mut envs, "AOS_DEV_PORT", dev_loopback_ports[0].to_string());
+    }
     push(&mut envs, "TMPDIR", agent_home.join("tmp").display().to_string());
     push(&mut envs, "CLAUDE_CODE_TMPDIR", agent_home.join("tmp").display().to_string());
     push(&mut envs, "HERMES_HOME", agent_home.join(".hermes").display().to_string());

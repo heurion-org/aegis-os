@@ -695,6 +695,8 @@ async fn run_exp2_live_redteam_attacks() -> anyhow::Result<Vec<Exp2RedTeamResult
             egress_proxy_addr: None,
             host_source_dir: None,
             tighten_home_read: true,
+            allowed_loopback_ports: Vec::new(),
+            isolate_loopback_only: false,
         })
         .await?;
 
@@ -835,6 +837,8 @@ async fn run_exp2_live_redteam_attacks() -> anyhow::Result<Vec<Exp2RedTeamResult
             egress_proxy_addr: Some(format!("http://{}", proxy_addr)),
             host_source_dir: None,
             tighten_home_read: true,
+            allowed_loopback_ports: Vec::new(),
+            isolate_loopback_only: false,
         })
         .await?;
 
@@ -1643,6 +1647,8 @@ async fn run_exp3_live_cow_and_daemon_latencies() -> anyhow::Result<(Vec<Exp3Cow
             egress_proxy_addr: None,
             host_source_dir: None,
             tighten_home_read: true,
+            allowed_loopback_ports: Vec::new(),
+            isolate_loopback_only: false,
         })
         .await?;
     let mut sbx_us = Vec::with_capacity(30);

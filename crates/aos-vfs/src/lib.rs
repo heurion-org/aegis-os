@@ -553,6 +553,151 @@ impl CoWWorkspace {
         }
     }
 
+    fn clone_raw_dep_tree_cow(src: &Path, dst: &Path) -> anyhow::Result<()> {
+        if let Ok(meta) = std::fs::symlink_metadata(dst) {
+            if meta.file_type().is_symlink() || meta.file_type().is_file() {
+                std::fs::remove_file(dst)?;
+            } else if meta.file_type().is_dir() {
+                std::fs::remove_dir_all(dst)?;
+            }
+        }
+        if let Some(parent) = dst.parent() {
+            std::fs::create_dir_all(parent)?;
+        }
+
+        #[cfg(target_os = "macos")]
+        {
+            use std::ffi::CString;
+            use std::os::unix::ffi::OsStrExt;
+            if let (Ok(c_src), Ok(c_dst)) = (
+                CString::new(src.as_os_str().as_bytes()),
+                CString::new(dst.as_os_str().as_bytes()),
+            ) {
+                if unsafe { libc::clonefile(c_src.as_ptr(), c_dst.as_ptr(), 0) } == 0 {
+                    return Ok(());
+                }
+            }
+        }
+
+        std::fs::create_dir_all(dst)?;
+        let canon_src_root = std::fs::canonicalize(src).unwrap_or_else(|_| src.to_path_buf());
+        let mut allow_reflink = true;
+        let mut stack = vec![(src.to_path_buf(), dst.to_path_buf())];
+        while let Some((cur_src, cur_dst)) = stack.pop() {
+            let Ok(rd) = std::fs::read_dir(&cur_src) else {
+                continue;
+            };
+            for entry in rd.flatten() {
+                let name = entry.file_name().to_string_lossy().to_string();
+                if name == ".git" {
+                    continue;
+                }
+                let entry_src = entry.path();
+                let entry_dst = cur_dst.join(&name);
+                let Ok(ft) = entry.file_type() else {
+                    continue;
+                };
+                if ft.is_symlink() {
+                    #[cfg(unix)]
+                    if let Ok(link_target) = std::fs::read_link(&entry_src) {
+                        if link_target.is_relative() {
+                            let _ = std::os::unix::fs::symlink(&link_target, &entry_dst);
+                        } else if let Ok(rel_in_src) = link_target
+                            .strip_prefix(src)
+                            .or_else(|_| link_target.strip_prefix(&canon_src_root))
+                        {
+                            let _ = std::os::unix::fs::symlink(dst.join(rel_in_src), &entry_dst);
+                        }
+                    }
+                    continue;
+                }
+                if ft.is_dir() {
+                    if let Err(e) = std::fs::create_dir(&entry_dst) {
+                        if e.kind() != std::io::ErrorKind::AlreadyExists {
+                            return Err(e.into());
+                        }
+                    }
+                    stack.push((entry_src, entry_dst));
+                } else if ft.is_file() {
+                    Self::cow_clone_file_inner(&entry_src, &entry_dst, true, &mut allow_reflink)?;
+                }
+            }
+        }
+        Ok(())
+    }
+
+    /// Breaks any host-pointing dependency symlink (`node_modules`, `.venv`, `venv`) at
+    /// `shadow_subdir/<dep_name>` so package installation writes strictly into the shadow tree
+    /// without mutating `host_root` or triggering Seatbelt cross-root write denials.
+    ///
+    /// For `node_modules`, pre-existing host packages are Copy-on-Write cloned into the shadow so
+    /// incremental `npm install` preserves prior dependencies without full re-downloads.
+    /// For `.venv` / `venv`, the symlink is unlinked without cloning (Python venv console scripts
+    /// hardcode absolute shebangs to `host_root/.venv/bin/python`).
+    pub fn isolate_shadow_dependency_dir(
+        host_root: &Path,
+        shadow_root: &Path,
+        shadow_subdir: &Path,
+        dep_name: &str,
+    ) -> anyhow::Result<PathBuf> {
+        if !matches!(dep_name, "node_modules" | ".venv" | "venv") {
+            bail!(
+                "Unsupported dependency directory name '{}'; expected 'node_modules', '.venv', or 'venv'",
+                dep_name
+            );
+        }
+        let rel = shadow_subdir.strip_prefix(shadow_root).with_context(|| {
+            format!(
+                "Shadow subdirectory '{}' must be inside '{}'",
+                shadow_subdir.display(),
+                shadow_root.display()
+            )
+        })?;
+        let mut cur = shadow_root.to_path_buf();
+        for comp in rel.components() {
+            match comp {
+                std::path::Component::Normal(seg) => {
+                    cur.push(seg);
+                    if let Ok(meta) = std::fs::symlink_metadata(&cur) {
+                        if meta.file_type().is_symlink() || !meta.is_dir() {
+                            bail!(
+                                "Refusing dependency isolation across non-directory or symlink '{}'",
+                                cur.display()
+                            );
+                        }
+                    }
+                }
+                std::path::Component::CurDir => {}
+                _ => bail!(
+                    "Invalid relative path component in '{}'",
+                    shadow_subdir.display()
+                ),
+            }
+        }
+
+        let target_dep = shadow_subdir.join(dep_name);
+        match std::fs::symlink_metadata(&target_dep) {
+            Ok(meta) if meta.file_type().is_symlink() => {
+                std::fs::remove_file(&target_dep)?;
+                if dep_name == "node_modules" {
+                    let host_dep = host_root.join(rel).join("node_modules");
+                    if host_dep.is_dir() {
+                        Self::clone_raw_dep_tree_cow(&host_dep, &target_dep)?;
+                    } else {
+                        std::fs::create_dir_all(&target_dep)?;
+                    }
+                }
+            }
+            Ok(_) => {}
+            Err(_) => {
+                if dep_name == "node_modules" {
+                    std::fs::create_dir_all(&target_dep)?;
+                }
+            }
+        }
+        Ok(target_dep)
+    }
+
     /// Clones a single file using zero-copy OS copy-on-write syscalls:
     /// - macOS (APFS): `libc::clonefile(src, dst, 0)`
     /// - Linux (Btrfs / XFS / OCFS2): `libc::ioctl(dst_fd, FICLONE, src_fd)` (`0x40049409`)
@@ -2441,5 +2586,83 @@ mod tests {
         assert!(merged.contains("use std::path::PathBuf;"));
         assert!(merged.contains("pub mod hooks;"));
         assert!(merged.contains("pub fn run() {}"));
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn test_isolate_shadow_dependency_dir_unlinks_host_and_keeps_diff_clean() {
+        let temp = tempfile::tempdir().unwrap();
+        let host_dir = temp.path().join("host_project");
+        std::fs::create_dir_all(host_dir.join("node_modules/a/node_modules/b")).unwrap();
+        std::fs::create_dir_all(host_dir.join("node_modules/.bin")).unwrap();
+        std::fs::create_dir_all(host_dir.join(".venv/bin")).unwrap();
+        std::fs::write(host_dir.join("package.json"), r#"{"name":"demo"}"#).unwrap();
+        std::fs::write(host_dir.join("node_modules/a/index.js"), "exports.a = 1;\n").unwrap();
+        std::fs::write(
+            host_dir.join("node_modules/a/node_modules/b/index.js"),
+            "exports.b = 2;\n",
+        )
+        .unwrap();
+        std::os::unix::fs::symlink(
+            "../a/index.js",
+            host_dir.join("node_modules/.bin/tool"),
+        )
+        .unwrap();
+        std::fs::write(host_dir.join(".venv/bin/python"), "#!/bin/sh\n").unwrap();
+
+        let cow_dir = temp.path().join("cow_ws");
+        let ws = CoWWorkspace::init(&host_dir, &cow_dir).await.unwrap();
+        assert!(std::fs::symlink_metadata(ws.shadow_root().join("node_modules"))
+            .unwrap()
+            .file_type()
+            .is_symlink());
+        assert!(std::fs::symlink_metadata(ws.shadow_root().join(".venv"))
+            .unwrap()
+            .file_type()
+            .is_symlink());
+
+        // 1. Isolate `node_modules`: unlinks symlink, CoW-clones nested tree, preserves host untouched.
+        let iso_nm = CoWWorkspace::isolate_shadow_dependency_dir(
+            &host_dir,
+            ws.shadow_root(),
+            ws.shadow_root(),
+            "node_modules",
+        )
+        .unwrap();
+        assert!(
+            !std::fs::symlink_metadata(&iso_nm)
+                .unwrap()
+                .file_type()
+                .is_symlink()
+        );
+        assert!(iso_nm.join("a/node_modules/b/index.js").is_file());
+        assert!(iso_nm.join(".bin/tool").exists());
+
+        std::fs::create_dir_all(iso_nm.join("new_pkg")).unwrap();
+        std::fs::write(iso_nm.join("new_pkg/index.js"), "exports.new = true;\n").unwrap();
+        assert!(!host_dir.join("node_modules/new_pkg").exists());
+
+        // 2. Isolate `.venv`: unlinks symlink without cloning host venv.
+        let iso_venv = CoWWorkspace::isolate_shadow_dependency_dir(
+            &host_dir,
+            ws.shadow_root(),
+            ws.shadow_root(),
+            ".venv",
+        )
+        .unwrap();
+        assert!(std::fs::symlink_metadata(&iso_venv).is_err());
+        std::fs::create_dir_all(iso_venv.join("lib")).unwrap();
+        std::fs::write(iso_venv.join("lib/bar.py"), "x = 1\n").unwrap();
+        assert!(!host_dir.join(".venv/lib/bar.py").exists());
+
+        // 3. Modify package.json in shadow -> diff_dirs must show ONLY `package.json`, never dep dirs.
+        std::fs::write(
+            ws.shadow_root().join("package.json"),
+            r#"{"name":"demo","dependencies":{"new_pkg":"1.0.0"}}"#,
+        )
+        .unwrap();
+        let diffs = ws.diff(None).await.unwrap();
+        assert_eq!(diffs.len(), 1, "unexpected diffs: {diffs:?}");
+        assert_eq!(diffs[0].relative_path, "package.json");
     }
 }

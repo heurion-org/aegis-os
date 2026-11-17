@@ -1972,6 +1972,373 @@ async fn execute_github_pr_create(plan: GitHubPrCreatePlan) -> anyhow::Result<Va
     .await?
 }
 
+const PKG_MANIFEST_FILES: &[&str] = &[
+    "package.json",
+    "package-lock.json",
+    "pnpm-lock.yaml",
+    "yarn.lock",
+    "bun.lockb",
+    "bun.lock",
+    "pyproject.toml",
+    "requirements.txt",
+    "uv.lock",
+    "Cargo.toml",
+    "Cargo.lock",
+];
+
+#[derive(Debug, Clone)]
+struct PkgInstallPlan {
+    manager: String,
+    packages: Vec<String>,
+    cwd_rel: String,
+    target_dir: PathBuf,
+    shadow_root: PathBuf,
+    host_root: PathBuf,
+    agent_home_dir: PathBuf,
+    org_shared_ro_dir: PathBuf,
+    org_agent_pub_dir: PathBuf,
+    dev: bool,
+    allow_scripts: bool,
+    offline: bool,
+    timeout_ms: u64,
+    registry_domains: Vec<String>,
+    pre_manifest_hashes: std::collections::BTreeMap<String, String>,
+    evidence_hash: String,
+}
+
+struct ProxyAbortGuard(Option<tokio::task::JoinHandle<()>>);
+
+impl Drop for ProxyAbortGuard {
+    fn drop(&mut self) {
+        if let Some(handle) = self.0.take() {
+            handle.abort();
+        }
+    }
+}
+
+fn is_safe_package_spec(spec: &str) -> bool {
+    if spec.is_empty() || spec.len() > 160 || spec.trim() != spec {
+        return false;
+    }
+    let Some(first) = spec.chars().next() else {
+        return false;
+    };
+    if !(first.is_ascii_alphanumeric() || first == '@') {
+        return false;
+    }
+    if spec.contains("..")
+        || spec.contains("://")
+        || spec.contains("git+")
+        || spec.contains("file:")
+        || spec.contains("ssh:")
+    {
+        return false;
+    }
+    spec.chars().all(|c| {
+        c.is_ascii()
+            && !c.is_control()
+            && !c.is_whitespace()
+            && !matches!(
+                c,
+                ';' | '|' | '&' | '$' | '`' | '(' | ')' | '{' | '}' | '<' | '>' | '\\' | '\'' | '"' | '?' | '#'
+            )
+    })
+}
+
+fn hash_pkg_manifests(target_dir: &Path) -> anyhow::Result<std::collections::BTreeMap<String, String>> {
+    let mut hashes = std::collections::BTreeMap::new();
+    for name in PKG_MANIFEST_FILES {
+        let p = target_dir.join(name);
+        match std::fs::symlink_metadata(&p) {
+            Ok(meta) if meta.file_type().is_symlink() => {
+                bail!(
+                    "Refusing package operation: manifest '{}' is a symlink",
+                    p.display()
+                );
+            }
+            Ok(meta) if meta.is_file() => {
+                let bytes = std::fs::read(&p)?;
+                hashes.insert((*name).to_string(), format!("sha256:{}", hex::encode(Sha256::digest(&bytes))));
+            }
+            Ok(_) => {
+                hashes.insert((*name).to_string(), "NON_FILE".to_string());
+            }
+            Err(_) => {
+                hashes.insert((*name).to_string(), "ABSENT".to_string());
+            }
+        }
+    }
+    Ok(hashes)
+}
+
+async fn execute_pkg_install(
+    identity: &AgentIdentity,
+    plan: PkgInstallPlan,
+) -> anyhow::Result<Value> {
+    let current_hashes = hash_pkg_manifests(&plan.target_dir)?;
+    if current_hashes != plan.pre_manifest_hashes {
+        bail!(
+            "TOCTOU integrity error: package manifest/lockfile state in '{}' changed after approval",
+            plan.cwd_rel
+        );
+    }
+
+    let cache_root = plan.agent_home_dir.join("deps/cache");
+    tokio::fs::create_dir_all(&cache_root).await?;
+
+    let mut env = HashMap::new();
+    let (cmd, cmd_args): (String, Vec<String>) = match plan.manager.as_str() {
+        "npm" | "pnpm" | "yarn" | "bun" => {
+            CoWWorkspace::isolate_shadow_dependency_dir(
+                &plan.host_root,
+                &plan.shadow_root,
+                &plan.target_dir,
+                "node_modules",
+            )?;
+            if plan.target_dir != plan.shadow_root {
+                CoWWorkspace::isolate_shadow_dependency_dir(
+                    &plan.host_root,
+                    &plan.shadow_root,
+                    &plan.shadow_root,
+                    "node_modules",
+                )?;
+            }
+            let mgr_cache = cache_root.join(&plan.manager);
+            tokio::fs::create_dir_all(&mgr_cache).await?;
+            let cache_str = mgr_cache.display().to_string();
+            env.insert("NPM_CONFIG_USERCONFIG".to_string(), "/dev/null".to_string());
+            env.insert("NPM_CONFIG_CACHE".to_string(), cache_str.clone());
+            env.insert("npm_config_cache".to_string(), cache_str);
+            env.insert(
+                "npm_config_registry".to_string(),
+                "https://registry.npmjs.org/".to_string(),
+            );
+            env.insert("COREPACK_ENABLE_STRICT".to_string(), "0".to_string());
+            env.insert("CI".to_string(), "true".to_string());
+            if !plan.allow_scripts {
+                env.insert("YARN_ENABLE_SCRIPTS".to_string(), "false".to_string());
+            }
+
+            let mut mgr_args: Vec<String> = match plan.manager.as_str() {
+                "npm" => {
+                    let mut a = vec![
+                        "install".to_string(),
+                        "--no-audit".to_string(),
+                        "--no-fund".to_string(),
+                    ];
+                    if plan.dev && !plan.packages.is_empty() {
+                        a.push("--save-dev".to_string());
+                    }
+                    a
+                }
+                _ => {
+                    if plan.packages.is_empty() {
+                        vec!["install".to_string()]
+                    } else {
+                        let mut a = vec!["add".to_string()];
+                        if plan.dev {
+                            a.push("-D".to_string());
+                        }
+                        a
+                    }
+                }
+            };
+            if !plan.allow_scripts {
+                mgr_args.push("--ignore-scripts".to_string());
+            }
+            if plan.offline {
+                mgr_args.push("--offline".to_string());
+            }
+            mgr_args.extend(plan.packages.iter().cloned());
+
+            let mut sh_args = vec![
+                "-c".to_string(),
+                r#"cmd="$1"; shift; exec "$cmd" "$@""#.to_string(),
+                "aegis-pkg".to_string(),
+                plan.manager.clone(),
+            ];
+            sh_args.extend(mgr_args);
+            ("sh".to_string(), sh_args)
+        }
+        "pip" | "uv" => {
+            CoWWorkspace::isolate_shadow_dependency_dir(
+                &plan.host_root,
+                &plan.shadow_root,
+                &plan.target_dir,
+                ".venv",
+            )?;
+            let mgr_cache = cache_root.join(&plan.manager);
+            tokio::fs::create_dir_all(&mgr_cache).await?;
+            let cache_str = mgr_cache.display().to_string();
+            env.insert("PIP_CONFIG_FILE".to_string(), "/dev/null".to_string());
+            env.insert("PIP_CACHE_DIR".to_string(), cache_str.clone());
+            env.insert("UV_CACHE_DIR".to_string(), cache_str);
+            env.insert("UV_NO_CONFIG".to_string(), "1".to_string());
+            env.insert(
+                "PIP_INDEX_URL".to_string(),
+                "https://pypi.org/simple".to_string(),
+            );
+            env.insert(
+                "UV_INDEX_URL".to_string(),
+                "https://pypi.org/simple".to_string(),
+            );
+
+            let mut py_args = Vec::new();
+            let script = if plan.manager == "pip" {
+                if plan.offline {
+                    py_args.push("--no-index".to_string());
+                }
+                if !plan.allow_scripts {
+                    py_args.push("--only-binary=:all:".to_string());
+                }
+                if plan.packages.is_empty() {
+                    if plan.target_dir.join("requirements.txt").is_file() {
+                        py_args.extend(["-r".to_string(), "requirements.txt".to_string()]);
+                    } else {
+                        py_args.push(".".to_string());
+                    }
+                } else {
+                    py_args.extend(plan.packages.iter().cloned());
+                }
+                "if [ ! -x .venv/bin/python ]; then python3 -m venv .venv; fi; exec .venv/bin/pip install \"$@\""
+            } else {
+                if plan.offline {
+                    py_args.push("--offline".to_string());
+                }
+                if plan.packages.is_empty() {
+                    if plan.target_dir.join("requirements.txt").is_file() {
+                        py_args.extend([
+                            "--python".to_string(),
+                            ".venv/bin/python".to_string(),
+                            "-r".to_string(),
+                            "requirements.txt".to_string(),
+                        ]);
+                        "if [ ! -x .venv/bin/python ]; then uv venv .venv; fi; exec uv pip install \"$@\""
+                    } else {
+                        "if [ ! -x .venv/bin/python ]; then uv venv .venv; fi; exec uv sync \"$@\""
+                    }
+                } else {
+                    py_args.extend(["--python".to_string(), ".venv/bin/python".to_string()]);
+                    py_args.extend(plan.packages.iter().cloned());
+                    "if [ ! -x .venv/bin/python ]; then uv venv .venv; fi; exec uv pip install \"$@\""
+                }
+            };
+            let mut sh_args = vec!["-c".to_string(), script.to_string(), "aegis-pkg".to_string()];
+            sh_args.extend(py_args);
+            ("sh".to_string(), sh_args)
+        }
+        "cargo" => {
+            let cargo_home = plan.agent_home_dir.join("deps/cargo_home");
+            tokio::fs::create_dir_all(cargo_home.join("registry")).await?;
+            tokio::fs::create_dir_all(cargo_home.join("git")).await?;
+            env.insert("CARGO_HOME".to_string(), cargo_home.display().to_string());
+            env.insert("CARGO_NET_GIT_FETCH_WITH_CLI".to_string(), "false".to_string());
+
+            let mut sh_args = Vec::new();
+            let script = if plan.packages.is_empty() {
+                if plan.offline {
+                    sh_args.push("--offline".to_string());
+                }
+                r#"exec cargo fetch "$@""#
+            } else {
+                if plan.dev {
+                    sh_args.push("--dev".to_string());
+                }
+                if plan.offline {
+                    sh_args.push("--offline".to_string());
+                }
+                sh_args.extend(plan.packages.iter().cloned());
+                if plan.offline {
+                    r#"cargo add "$@" && cargo fetch --offline"#
+                } else {
+                    r#"cargo add "$@" && cargo fetch"#
+                }
+            };
+            let mut full_args = vec!["-c".to_string(), script.to_string(), "aegis-pkg".to_string()];
+            full_args.extend(sh_args);
+            ("sh".to_string(), full_args)
+        }
+        other => bail!("Unsupported package manager '{}'", other),
+    };
+
+    let (_proxy_guard, egress_proxy_addr) = if !plan.offline {
+        let egress = Arc::new(AegisEgressGateway::new());
+        egress
+            .allow_domains(&identity.org_id, plan.registry_domains.clone())
+            .await;
+        let (addr, handle) = egress
+            .start_local_proxy_abortable("127.0.0.1:0", Some(identity.clone()))
+            .await?;
+        (
+            Some(ProxyAbortGuard(Some(handle))),
+            Some(format!("http://{}", addr)),
+        )
+    } else {
+        (None, None)
+    };
+
+    let sbx = NativeOsSandboxDriver
+        .create_sandbox(SandboxConfig {
+            identity: identity.clone(),
+            tier: IsolationTier::NativeOsSandbox,
+            limits: ResourceLimits::default(),
+            workspace_dir: plan.shadow_root.clone(),
+            agent_home_dir: plan.agent_home_dir.clone(),
+            org_shared_ro_dir: plan.org_shared_ro_dir.clone(),
+            org_agent_pub_dir: plan.org_agent_pub_dir.clone(),
+            egress_proxy_addr,
+            host_source_dir: Some(plan.host_root.clone()),
+            tighten_home_read: true,
+            allowed_loopback_ports: Vec::new(),
+            isolate_loopback_only: true,
+        })
+        .await?;
+
+    let out = sbx
+        .exec(ExecSpec {
+            command: cmd,
+            args: cmd_args,
+            cwd: Some(plan.target_dir.clone()),
+            env,
+            timeout_ms: Some(plan.timeout_ms),
+            background: false,
+        })
+        .await?;
+
+    let post_hashes = hash_pkg_manifests(&plan.target_dir).unwrap_or_default();
+    let changed_manifests: Vec<String> = post_hashes
+        .iter()
+        .filter_map(|(k, v)| {
+            if plan.pre_manifest_hashes.get(k) != Some(v) {
+                Some(k.clone())
+            } else {
+                None
+            }
+        })
+        .collect();
+    let (stdout_redacted, _) = redact_dlp_secrets(&out.stdout);
+    let (stderr_redacted, _) = redact_dlp_secrets(&out.stderr);
+    let succeeded = out.exit_code == Some(0);
+
+    Ok(json!({
+        "status": if succeeded { "pkg_installed" } else { "pkg_install_failed" },
+        "manager": plan.manager,
+        "cwd": plan.cwd_rel,
+        "packages": plan.packages,
+        "exit_code": out.exit_code,
+        "duration_ms": out.duration_ms,
+        "sandbox_profile_used": out.sandbox_profile_used,
+        "registry_domains": if plan.offline { Vec::<String>::new() } else { plan.registry_domains },
+        "allow_scripts": plan.allow_scripts,
+        "offline": plan.offline,
+        "changed_manifests": changed_manifests,
+        "host_modified": false,
+        "stdout": stdout_redacted,
+        "stderr": stderr_redacted,
+        "evidence_hash": plan.evidence_hash,
+    }))
+}
+
 /// Tools that mint leases. They stay callable in-process (CLI `aegis-os policy approve`, dashboard,
 /// benches) but are never exposed to agents over MCP: an agent must not approve its own escalation.
 pub const HUMAN_ONLY_TOOLS: &[&str] = &["policy_approve_escalation", "policy_grant_lease"];
@@ -2006,6 +2373,7 @@ pub const TOOL_ANNOTATIONS: &[(&str, bool, bool, bool, bool)] = &[
     ("github_pr_create", false, false, false, true),
     // Arbitrary sandboxed commands; network policy depends on the sandbox profile.
     ("proc_exec", false, true, false, true),
+    ("pkg_install", false, false, false, true),
     ("org_artifact_publish", false, false, true, false),
     ("org_artifact_fetch", true, false, true, false),
     ("org_kv_put", false, false, false, false),
@@ -2942,6 +3310,8 @@ impl AegisRuntimeKernel {
             egress_proxy_addr: None,
             host_source_dir: Some(ws.host_source_root().to_path_buf()),
             tighten_home_read: true,
+            allowed_loopback_ports: aos_sandbox::allocate_loopback_ports(2, &[]),
+            isolate_loopback_only: true,
         };
 
         let driver: Box<dyn SandboxDriver> = match tier {
@@ -4133,6 +4503,157 @@ impl AegisRuntimeKernel {
         Ok((plan, resource, vec![preview_diff], meta))
     }
 
+    fn prepare_pkg_install_plan(
+        env: &AgentEnvironment,
+        args: &Value,
+    ) -> anyhow::Result<(PkgInstallPlan, String, Vec<aos_core::FileDiffEntry>, Value)> {
+        let manager = args
+            .get("manager")
+            .and_then(|v| v.as_str())
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .context("Missing 'manager' (expected npm, pnpm, yarn, bun, pip, uv, or cargo)")?
+            .to_ascii_lowercase();
+        let registry_slice = aos_egress::registry_domains_for_ecosystem(&manager)
+            .filter(|_| matches!(manager.as_str(), "npm" | "pnpm" | "yarn" | "bun" | "pip" | "uv" | "cargo"))
+            .with_context(|| {
+                format!(
+                    "Unsupported package manager '{}'; expected npm, pnpm, yarn, bun, pip, uv, or cargo",
+                    manager
+                )
+            })?;
+        let registry_domains: Vec<String> = registry_slice.iter().map(|s| (*s).to_string()).collect();
+
+        let raw_packages: Vec<String> = match args.get("packages") {
+            Some(v) if !v.is_null() => serde_json::from_value(v.clone())
+                .context("'packages' must be an array of strings")?,
+            _ => Vec::new(),
+        };
+        if raw_packages.len() > 64 {
+            bail!("Too many package specs ({}); maximum is 64 per call", raw_packages.len());
+        }
+        for spec in &raw_packages {
+            if !is_safe_package_spec(spec) {
+                bail!(
+                    "Invalid or unsafe package specifier '{}': flags, shell metacharacters, path traversal, and custom URLs are forbidden",
+                    spec
+                );
+            }
+        }
+
+        let shadow_root = env.workspace.shadow_root().to_path_buf();
+        let raw_cwd = args
+            .get("cwd")
+            .and_then(|v| v.as_str())
+            .map(str::trim)
+            .unwrap_or(".");
+        let (cwd_rel, target_dir) = if raw_cwd.is_empty() || raw_cwd == "." || raw_cwd == "/" {
+            (".".to_string(), shadow_root.clone())
+        } else {
+            let rel_path = shadow_relative(raw_cwd)?;
+            let mut cur = shadow_root.clone();
+            for comp in rel_path.components() {
+                let std::path::Component::Normal(seg) = comp else {
+                    bail!("Invalid 'cwd' path component '{}'", raw_cwd);
+                };
+                cur.push(seg);
+                let meta = std::fs::symlink_metadata(&cur)
+                    .with_context(|| format!("Package cwd '{}' not found in CoW shadow", cur.display()))?;
+                if meta.file_type().is_symlink() || !meta.is_dir() {
+                    bail!(
+                        "Refusing pkg_install cwd through symlink or non-directory '{}'",
+                        cur.display()
+                    );
+                }
+            }
+            (rel_path.to_string_lossy().replace('\\', "/"), cur)
+        };
+
+        let dev = args.get("dev").and_then(|v| v.as_bool()).unwrap_or(false);
+        let allow_scripts = args
+            .get("allow_scripts")
+            .and_then(|v| v.as_bool())
+            .unwrap_or(false);
+        let offline = args.get("offline").and_then(|v| v.as_bool()).unwrap_or(false);
+        let timeout_ms = args
+            .get("timeout_ms")
+            .and_then(|v| v.as_u64())
+            .unwrap_or(180_000)
+            .clamp(1_000, 600_000);
+
+        let pre_manifest_hashes = hash_pkg_manifests(&target_dir)?;
+        let canonical = serde_json::to_vec(&json!({
+            "manager": manager,
+            "cwd_rel": cwd_rel,
+            "packages": raw_packages,
+            "dev": dev,
+            "allow_scripts": allow_scripts,
+            "offline": offline,
+            "pre_manifest_hashes": pre_manifest_hashes,
+        }))?;
+        let evidence_hash = hex::encode(Sha256::digest(&canonical));
+
+        let pkg_label = if raw_packages.is_empty() {
+            "manifest".to_string()
+        } else {
+            raw_packages.join("+")
+        };
+        let resource = format!("pkg:{}:{}#{}", manager, cwd_rel, pkg_label);
+        let registry_label = if offline {
+            "<offline>".to_string()
+        } else {
+            registry_domains.join(", ")
+        };
+        let preview_diff = aos_core::FileDiffEntry {
+            relative_path: ".aegis/PKG_INSTALL_PLAN".to_string(),
+            change_type: DiffChangeType::Added,
+            old_size: None,
+            new_size: Some(canonical.len() as u64),
+            preview_diff: Some(format!(
+                "+Manager:       {}\n+Cwd (shadow):  {}\n+Packages:      {}\n+Dev:           {}\n+Allow Scripts: {}\n+Offline:       {}\n+Registries:    {}",
+                manager,
+                cwd_rel,
+                if raw_packages.is_empty() { "<from lockfile/manifest>".to_string() } else { raw_packages.join(" ") },
+                dev,
+                allow_scripts,
+                offline,
+                registry_label
+            )),
+            old_sha256: None,
+            new_sha256: Some(format!("sha256:{}", evidence_hash)),
+        };
+        let meta = json!({
+            "manager": manager,
+            "cwd": cwd_rel,
+            "packages": raw_packages,
+            "dev": dev,
+            "allow_scripts": allow_scripts,
+            "offline": offline,
+            "registry_domains": if offline { Vec::<String>::new() } else { registry_domains.clone() },
+            "evidence_hash": evidence_hash,
+        });
+        let sbx_cfg = env.sandbox.config();
+        let plan = PkgInstallPlan {
+            manager,
+            packages: raw_packages,
+            cwd_rel,
+            target_dir,
+            shadow_root,
+            host_root: env.workspace.host_source_root().to_path_buf(),
+            agent_home_dir: sbx_cfg.agent_home_dir.clone(),
+            org_shared_ro_dir: sbx_cfg.org_shared_ro_dir.clone(),
+            org_agent_pub_dir: sbx_cfg.org_agent_pub_dir.clone(),
+            dev,
+            allow_scripts,
+            offline,
+            timeout_ms,
+            registry_domains,
+            pre_manifest_hashes,
+            evidence_hash,
+        };
+        Ok((plan, resource, vec![preview_diff], meta))
+    }
+
     pub async fn call_tool(
         &self,
         identity: &AgentIdentity,
@@ -4190,6 +4711,7 @@ impl AegisRuntimeKernel {
         let mut pre_import_plan: Option<ImportFilePlan> = None;
         let mut pre_ci_rerun_plan: Option<GitHubCiRerunPlan> = None;
         let mut pre_pr_create_plan: Option<GitHubPrCreatePlan> = None;
+        let mut pre_pkg_install_plan: Option<PkgInstallPlan> = None;
         if tool_name == "workspace_commit" {
             let filter_paths: Option<Vec<String>> = args
                 .get("paths")
@@ -4573,6 +5095,19 @@ impl AegisRuntimeKernel {
             pre_commit_diffs = Some(diffs);
             pre_commit_evidence_hash = Some(plan.evidence_hash.clone());
             pre_pr_create_plan = Some(plan);
+        } else if tool_name == "pkg_install" {
+            let (plan, resource, diffs, meta) = Self::prepare_pkg_install_plan(&env, &args)?;
+            target_resource = resource;
+            if let (Some(obj), Some(meta_obj)) =
+                (audit_metadata.as_object_mut(), meta.as_object())
+            {
+                for (k, v) in meta_obj {
+                    obj.insert(k.clone(), v.clone());
+                }
+            }
+            pre_commit_diffs = Some(diffs);
+            pre_commit_evidence_hash = Some(plan.evidence_hash.clone());
+            pre_pkg_install_plan = Some(plan);
         }
         let mut resolved_cross_org_peer: Option<(String, String)> = None;
 
@@ -4661,6 +5196,7 @@ impl AegisRuntimeKernel {
                             | "fs_import_file"
                             | "workspace_git"
                             | "github_pr_create"
+                            | "pkg_install"
                     ) {
                         if let Some(ref diffs) = pre_commit_diffs {
                             let diff_dir = self.runtime_data_root.join("escalation_diffs");
@@ -5316,6 +5852,11 @@ impl AegisRuntimeKernel {
                 execute_github_pr_create(plan).await
             }
 
+            "pkg_install" => {
+                let plan = pre_pkg_install_plan.context("Missing pre-validated pkg_install plan")?;
+                execute_pkg_install(identity, plan).await
+            }
+
             // ----------------------------------------------------------------
             // 2. Sandboxed Command Execution Tools (Zero-Prompt in Sandbox)
             // ----------------------------------------------------------------
@@ -5378,6 +5919,18 @@ impl AegisRuntimeKernel {
                     .get("background")
                     .and_then(|v| v.as_bool())
                     .unwrap_or(false);
+                let loopback_ports = args
+                    .get("loopback_ports")
+                    .and_then(|v| v.as_u64())
+                    .unwrap_or(0)
+                    .min(8);
+                let mut exec_env = HashMap::new();
+                if loopback_ports > 0 {
+                    exec_env.insert(
+                        "AOS_REQUEST_LOOPBACK_PORTS".to_string(),
+                        loopback_ports.to_string(),
+                    );
+                }
 
                 let out = env
                     .sandbox
@@ -5385,12 +5938,18 @@ impl AegisRuntimeKernel {
                         command,
                         args: cmd_args,
                         cwd,
-                        env: HashMap::new(),
+                        env: exec_env,
                         timeout_ms: args.get("timeout_ms").and_then(|v| v.as_u64()),
                         background,
                     })
                     .await?;
                 let mut out_val = serde_json::to_value(out)?;
+                let active_ports = env.sandbox.allocated_loopback_ports();
+                if !active_ports.is_empty() {
+                    if let Some(obj) = out_val.as_object_mut() {
+                        obj.insert("allocated_loopback_ports".to_string(), json!(active_ports));
+                    }
+                }
                 if !background {
                     if let Ok(changed) = env.workspace.changed_since_baseline().await {
                         if let Ok(Some(conflict_msg)) =
@@ -6901,7 +7460,7 @@ impl AegisRuntimeKernel {
                 },
                 {
                     "name": "proc_exec",
-                    "description": "[Zero-Prompt] PREFERRED over native shell tools (run_command/Bash): execute a command (e.g. `sh -c \"grep -rn foo crates | head\"`, `cargo test`) kernel-confined inside the Agent's OS sandbox. cwd = your CoW shadow workspace (with host `node_modules`/`.venv` auto-linked read-only); writes stay in the shadow until workspace_commit. For long-running tasks (>2m, e.g. online LLM benchmarks), pass `background: true` and poll status/output with `poll_pid`.",
+                    "description": "[Zero-Prompt] PREFERRED over native shell tools (run_command/Bash): execute a command (e.g. `sh -c \"grep -rn foo crates | head\"`, `cargo test`) kernel-confined inside the Agent's OS sandbox. cwd = your CoW shadow workspace (with host `node_modules`/`.venv` auto-linked read-only); writes stay in the shadow until workspace_commit. Isolated 127.0.0.1 dev ports are exposed via `$AOS_DEV_PORT` and `$AOS_LOOPBACK_PORTS` (pass `loopback_ports` to reserve extra ports). For long-running tasks (>2m, e.g. online LLM benchmarks), pass `background: true` and poll status/output with `poll_pid`.",
                     "inputSchema": {
                         "type": "object",
                         "properties": {
@@ -6910,8 +7469,52 @@ impl AegisRuntimeKernel {
                             "cwd": { "type": "string" },
                             "timeout_ms": { "type": "integer" },
                             "background": { "type": "boolean" },
-                            "poll_pid": { "type": "integer" }
+                            "poll_pid": { "type": "integer" },
+                            "loopback_ports": {
+                                "type": "integer",
+                                "description": "Optional count of isolated 127.0.0.1 loopback ports (0..=8) to allocate for local dev/mock servers (exposed via $AOS_DEV_PORT and $AOS_LOOPBACK_PORTS)."
+                            }
                         }
+                    }
+                },
+                {
+                    "name": "pkg_install",
+                    "description": "[Lease-Gated] Install packages into the isolated CoW shadow workspace (`npm`/`pnpm`/`yarn`/`bun`/`pip`/`uv`/`cargo`) with unlinked dependency dirs (host stays untouched, CoW diff tracks only manifests/lockfiles) and an ephemeral registry-allowlisted egress proxy. Lifecycle scripts stay disabled by default (`allow_scripts: false`).",
+                    "inputSchema": {
+                        "type": "object",
+                        "properties": {
+                            "manager": {
+                                "type": "string",
+                                "enum": ["npm", "pnpm", "yarn", "bun", "pip", "uv", "cargo"],
+                                "description": "Package manager ecosystem to run inside the isolated CoW shadow."
+                            },
+                            "packages": {
+                                "type": "array",
+                                "items": { "type": "string" },
+                                "description": "Optional package specifiers (e.g. [\"zod@^3.23.0\"]); omit or pass [] to install from existing lockfile/manifest."
+                            },
+                            "cwd": {
+                                "type": "string",
+                                "description": "Optional CoW shadow relative subdirectory (defaults to workspace root `.`)."
+                            },
+                            "dev": {
+                                "type": "boolean",
+                                "description": "Install as devDependency (JS/Rust)."
+                            },
+                            "allow_scripts": {
+                                "type": "boolean",
+                                "description": "Allow package lifecycle/build scripts (default false; true triggers elevated `pkg_install_scripts` approval)."
+                            },
+                            "offline": {
+                                "type": "boolean",
+                                "description": "Run strictly offline (`--offline` / `--no-index`) with zero egress proxy."
+                            },
+                            "timeout_ms": {
+                                "type": "integer",
+                                "description": "Optional execution timeout in milliseconds (default 180000)."
+                            }
+                        },
+                        "required": ["manager"]
                     }
                 },
                 {
@@ -13185,5 +13788,117 @@ mod tests {
             .unwrap_err()
             .to_string();
         assert!(dlp_err.contains("DLP policy"), "{dlp_err}");
+    }
+
+    #[tokio::test]
+    async fn test_pkg_install_validation_pinning_and_host_symlink_isolation() {
+        use std::os::unix::fs::PermissionsExt;
+
+        std::env::set_var("AEGIS_ALLOW_NESTED_TEST_SANDBOX", "1");
+        let tmp = tempfile::tempdir().unwrap();
+        let rt = tmp.path().join("rt");
+        let host_proj = tmp.path().join("host_proj");
+        std::fs::create_dir_all(host_proj.join("node_modules/.bin")).unwrap();
+        std::fs::write(host_proj.join("package.json"), r#"{"name":"demo","version":"1.0.0"}"#).unwrap();
+
+        let fake_npm = host_proj.join("node_modules/.bin/npm");
+        std::fs::write(
+            &fake_npm,
+            "#!/bin/sh\nset -eu\necho \"$*\" > .npm_invoked_args.txt\nmkdir -p node_modules/fake-pkg\necho 'exports.ok = true;' > node_modules/fake-pkg/index.js\n",
+        )
+        .unwrap();
+        std::fs::set_permissions(&fake_npm, std::fs::Permissions::from_mode(0o755)).unwrap();
+
+        let kernel = AegisRuntimeKernel::new(&rt).await.unwrap();
+        let agent = AgentIdentity::new("aegis-os", "agy-agent", "Engineer");
+        let env = kernel
+            .ensure_agent_environment(agent.clone(), &host_proj, IsolationTier::NativeOsSandbox, vec![])
+            .await
+            .unwrap();
+
+        // Shadow initially symlinks host `node_modules`.
+        assert!(
+            std::fs::symlink_metadata(env.workspace.shadow_root().join("node_modules"))
+                .unwrap()
+                .file_type()
+                .is_symlink()
+        );
+
+        // 1. Unsafe package specifiers / URLs / flags are rejected pre-escalation.
+        for bad in ["--registry=https://evil.org", "https://evil.org/pkg.tgz", "pkg;rm -rf /", "../escape"] {
+            let err = kernel
+                .call_tool(
+                    &agent,
+                    "pkg_install",
+                    json!({ "manager": "npm", "packages": [bad], "offline": true }),
+                )
+                .await
+                .unwrap_err()
+                .to_string();
+            assert!(err.contains("Invalid or unsafe package specifier"), "{bad}: {err}");
+        }
+
+        // 2. `allow_scripts: true` escalates to `pkg_install_scripts`.
+        let ask_scripts = kernel
+            .call_tool(
+                &agent,
+                "pkg_install",
+                json!({ "manager": "npm", "packages": ["fake-pkg"], "allow_scripts": true, "offline": true }),
+            )
+            .await
+            .unwrap();
+        assert_eq!(ask_scripts["status"], "approval_required");
+        assert!(ask_scripts["reason"].as_str().unwrap().contains("LIFECYCLE SCRIPTS"));
+
+        // 3. Safe install (`allow_scripts: false`, `offline: true`) pins `#sha256:` & detects TOCTOU drift.
+        let args = json!({
+            "manager": "npm",
+            "packages": ["fake-pkg"],
+            "allow_scripts": false,
+            "offline": true
+        });
+        let ask_ok = kernel.call_tool(&agent, "pkg_install", args.clone()).await.unwrap();
+        assert_eq!(ask_ok["status"], "approval_required");
+        let esc1 = ask_ok["escalation_id"].as_str().unwrap().to_string();
+        kernel.policy.approve_escalation(&esc1, 0, "user").await.unwrap();
+
+        std::fs::write(
+            env.workspace.shadow_root().join("package.json"),
+            r#"{"name":"demo","version":"1.0.1"}"#,
+        )
+        .unwrap();
+        let drifted = kernel.call_tool(&agent, "pkg_install", args.clone()).await.unwrap();
+        assert_eq!(
+            drifted["status"], "approval_required",
+            "Manifest mutation after approval must invalidate pinned lease: {drifted}"
+        );
+
+        let esc2 = drifted["escalation_id"].as_str().unwrap().to_string();
+        kernel.policy.approve_escalation(&esc2, 0, "user").await.unwrap();
+        let res = kernel.call_tool(&agent, "pkg_install", args).await.unwrap();
+        assert_eq!(res["status"], "pkg_installed", "{res}");
+        assert_eq!(res["host_modified"], false);
+
+        // Verify shadow `node_modules` was unlinked from host symlink & host repo stayed untouched.
+        assert!(
+            !std::fs::symlink_metadata(env.workspace.shadow_root().join("node_modules"))
+                .unwrap()
+                .file_type()
+                .is_symlink(),
+            "shadow node_modules must no longer be a host symlink after install"
+        );
+        assert!(env
+            .workspace
+            .shadow_root()
+            .join("node_modules/fake-pkg/index.js")
+            .is_file());
+        assert!(!host_proj.join("node_modules/fake-pkg").exists());
+        let invoked = std::fs::read_to_string(
+            env.workspace.shadow_root().join(".npm_invoked_args.txt"),
+        )
+        .unwrap();
+        assert!(invoked.contains("--ignore-scripts"), "{invoked}");
+        assert!(invoked.contains("--offline"), "{invoked}");
+        assert!(invoked.contains("fake-pkg"), "{invoked}");
     }
 }

@@ -961,6 +961,48 @@ impl PolicyEngine for AegisPolicyKernel {
             }
         }
 
+        // 2d. Package Manager Lifecycle Script Guard (`pkg_install_scripts`):
+        // Even if a general `pkg_install` lease exists, `allow_scripts: true` runs arbitrary
+        // build/postinstall code and always requires explicit `pkg_install_scripts` escalation.
+        if ctx.action == "pkg_install"
+            && ctx
+                .metadata
+                .get("allow_scripts")
+                .and_then(|v| v.as_bool())
+                .unwrap_or(false)
+        {
+            let scripts_ctx = PolicyContext {
+                principal: ctx.principal.clone(),
+                action: "pkg_install_scripts".to_string(),
+                target_org_id: ctx.target_org_id.clone(),
+                target_resource: ctx.target_resource.clone(),
+                metadata: ctx.metadata.clone(),
+            };
+            if let Some(lease) = self.check_active_lease(&scripts_ctx).await {
+                return Ok(PolicyDecision::Allow {
+                    matched_rule: format!("session_lease:{}", lease.lease_id),
+                });
+            }
+            let manager = ctx
+                .metadata
+                .get("manager")
+                .and_then(|v| v.as_str())
+                .unwrap_or("pkg");
+            return self
+                .record_escalation(
+                    &scripts_ctx,
+                    format!(
+                        "[HIGH RISK: LIFECYCLE SCRIPTS ENABLED] Agent '{}' requests '{}' package install on '{}' with lifecycle scripts enabled (bypasses general pkg_install lease)",
+                        ctx.principal.agent_id, manager, ctx.target_resource
+                    ),
+                    format!(
+                        "action=pkg_install_scripts, resource={}",
+                        ctx.target_resource
+                    ),
+                )
+                .await;
+        }
+
         // 3. Check if an active Session Lease already covers this action + resource:
         if let Some(lease) = self.check_active_lease(ctx).await {
             return Ok(PolicyDecision::Allow {
@@ -1376,6 +1418,41 @@ impl PolicyEngine for AegisPolicyKernel {
                 .await
             }
 
+            "pkg_install" => {
+                let manager = ctx
+                    .metadata
+                    .get("manager")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("pkg");
+                let offline = ctx
+                    .metadata
+                    .get("offline")
+                    .and_then(|v| v.as_bool())
+                    .unwrap_or(false);
+                let pkgs: String = ctx
+                    .metadata
+                    .get("packages")
+                    .and_then(|v| v.as_array())
+                    .map(|arr| {
+                        let items: Vec<&str> = arr.iter().filter_map(|x| x.as_str()).collect();
+                        if items.is_empty() {
+                            "<manifest dependencies>".to_string()
+                        } else {
+                            items.join(", ")
+                        }
+                    })
+                    .unwrap_or_else(|| "<manifest dependencies>".to_string());
+                self.record_escalation(
+                    ctx,
+                    format!(
+                        "Agent '{}' requests {} package install ({}) [{} , offline={}]",
+                        ctx.principal.agent_id, manager, ctx.target_resource, pkgs, offline
+                    ),
+                    format!("action=pkg_install, resource={}", ctx.target_resource),
+                )
+                .await
+            }
+
             "egress_unlisted_domain" => {
                 self.record_escalation(
                     ctx,
@@ -1512,6 +1589,8 @@ impl PolicyEngine for AegisPolicyKernel {
                 | "github_ci_inspect"
                 | "github_pr_inspect"
                 | "github_issue_inspect"
+                | "pkg_install"
+                | "pkg_install_scripts"
                 | "egress_unlisted_domain"
                 | "mcp_mount_server"
                 | "org_artifact_fetch"
@@ -1635,6 +1714,19 @@ impl PolicyEngine for AegisPolicyKernel {
                     agent_id: target.agent_id,
                     action_pattern: companion_action,
                     resource_pattern: companion_resource,
+                    expires_at_ms,
+                    granted_by: approved_by.to_string(),
+                    kind,
+                    task_id,
+                });
+            } else if target.action == "pkg_install_scripts" {
+                leases.push(lease.clone());
+                leases.push(LeaseGrant {
+                    lease_id: format!("lease-{}", &Uuid::new_v4().to_string()[..8]),
+                    org_id: target.org_id,
+                    agent_id: target.agent_id,
+                    action_pattern: "pkg_install".to_string(),
+                    resource_pattern: lease.resource_pattern.clone(),
                     expires_at_ms,
                     granted_by: approved_by.to_string(),
                     kind,
@@ -2643,6 +2735,98 @@ mod tests {
         assert!(
             matches!(kernel.evaluate(&sensitive_git).await.unwrap(), PolicyDecision::Allow { .. }),
             "Single approval of workspace_git_sensitive must also authorize companion workspace_git"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_pkg_install_policy_pinning_and_lifecycle_scripts_escalation() {
+        let kernel = AegisPolicyKernel::with_state_file(None);
+        let agent = AgentIdentity::new("aegis-os", "agy-agent", "Coder");
+        let pkg_res = "pkg:npm:.#chalk";
+
+        // 1. Standard `pkg_install` escalates and pins `#sha256:` on one-shot approval, rejecting tampering.
+        let install_ctx = PolicyContext {
+            principal: agent.clone(),
+            action: "pkg_install".to_string(),
+            target_org_id: "aegis-os".to_string(),
+            target_resource: pkg_res.to_string(),
+            metadata: json!({
+                "manager": "npm",
+                "packages": ["chalk"],
+                "allow_scripts": false,
+                "offline": false,
+                "evidence_hash": "pkghash1"
+            }),
+        };
+        let esc_id = match kernel.evaluate(&install_ctx).await.unwrap() {
+            PolicyDecision::Ask { escalation_id, .. } => escalation_id,
+            other => panic!("Expected pkg_install Ask, got {other:?}"),
+        };
+        let lease = kernel.approve_escalation(&esc_id, 0, "user").await.unwrap();
+        assert_eq!(lease.resource_pattern, "pkg:npm:.#chalk#sha256:pkghash1");
+
+        let tampered_ctx = PolicyContext {
+            metadata: json!({
+                "manager": "npm",
+                "packages": ["chalk"],
+                "allow_scripts": false,
+                "offline": false,
+                "evidence_hash": "tampered"
+            }),
+            ..install_ctx.clone()
+        };
+        assert!(
+            matches!(kernel.evaluate(&tampered_ctx).await.unwrap(), PolicyDecision::Ask { .. }),
+            "Tampered package install evidence must invalidate one-shot lease"
+        );
+        assert!(
+            matches!(kernel.evaluate(&install_ctx).await.unwrap(), PolicyDecision::Allow { .. }),
+            "Matching one-shot lease should still allow exact plan"
+        );
+
+        // 2. Grant general TTL `pkg_install` lease -> `allow_scripts: true` still escalates to `pkg_install_scripts`.
+        kernel
+            .grant_lease(LeaseGrant {
+                lease_id: "lease-pkg-ttl".to_string(),
+                org_id: "aegis-os".to_string(),
+                agent_id: "agy-agent".to_string(),
+                action_pattern: "pkg_install".to_string(),
+                resource_pattern: "*".to_string(),
+                expires_at_ms: Utc::now().timestamp_millis() + 600_000,
+                granted_by: "user".to_string(),
+                kind: LeaseKind::Ttl,
+                task_id: None,
+            })
+            .await
+            .unwrap();
+
+        let scripts_ctx = PolicyContext {
+            principal: agent,
+            action: "pkg_install".to_string(),
+            target_org_id: "aegis-os".to_string(),
+            target_resource: "pkg:npm:.#esbuild".to_string(),
+            metadata: json!({
+                "manager": "npm",
+                "packages": ["esbuild"],
+                "allow_scripts": true,
+                "offline": false,
+                "evidence_hash": "scriptshash1"
+            }),
+        };
+        let esc_scripts = match kernel.evaluate(&scripts_ctx).await.unwrap() {
+            PolicyDecision::Ask { escalation_id, reason, .. } => {
+                assert!(reason.contains("LIFECYCLE SCRIPTS"), "{reason}");
+                escalation_id
+            }
+            other => panic!("Expected pkg_install_scripts Ask, got {other:?}"),
+        };
+        kernel
+            .approve_escalation(&esc_scripts, 0, "user")
+            .await
+            .unwrap();
+        assert!(
+            matches!(kernel.evaluate(&scripts_ctx).await.unwrap(), PolicyDecision::Allow { .. }),
+            "Single approval of pkg_install_scripts must authorize retry"
         );
     }
 }

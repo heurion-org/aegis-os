@@ -308,6 +308,18 @@ pub fn redact_dlp_secrets(text: &str) -> (String, Vec<&'static str>) {
     (out, hits)
 }
 
+/// Official package registry domain allowlist presets for controlled `pkg_install` egress.
+pub fn registry_domains_for_ecosystem(ecosystem: &str) -> Option<&'static [&'static str]> {
+    match ecosystem.trim().to_ascii_lowercase().as_str() {
+        "npm" | "pnpm" | "yarn" | "bun" | "node" => {
+            Some(&["registry.npmjs.org", "registry.yarnpkg.com"])
+        }
+        "pip" | "uv" | "python" => Some(&["pypi.org", "files.pythonhosted.org"]),
+        "cargo" | "rust" => Some(&["crates.io", "static.crates.io", "index.crates.io"]),
+        _ => None,
+    }
+}
+
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct SecretScopeRule {
     pub allowed_methods: Vec<String>,
@@ -970,11 +982,24 @@ impl AegisEgressGateway {
         bind_addr: &str,
         pinned_identity: Option<AgentIdentity>,
     ) -> anyhow::Result<SocketAddr> {
+        let (addr, _handle) = self
+            .start_local_proxy_abortable(bind_addr, pinned_identity)
+            .await?;
+        Ok(addr)
+    }
+
+    /// Variant of [`Self::start_local_proxy_with_bound_identity`] that also returns the background
+    /// accept-loop task handle so short-lived package-install sandboxes can abort it on teardown.
+    pub async fn start_local_proxy_abortable(
+        self: Arc<Self>,
+        bind_addr: &str,
+        pinned_identity: Option<AgentIdentity>,
+    ) -> anyhow::Result<(SocketAddr, tokio::task::JoinHandle<()>)> {
         let listener = TcpListener::bind(bind_addr).await?;
         let local_addr = listener.local_addr()?;
         let gw = self.clone();
 
-        tokio::spawn(async move {
+        let handle = tokio::spawn(async move {
             loop {
                 let Ok((mut stream, _)) = listener.accept().await else {
                     break;
@@ -1573,7 +1598,7 @@ impl AegisEgressGateway {
             }
         });
 
-        Ok(local_addr)
+        Ok((local_addr, handle))
     }
 }
 
@@ -2268,5 +2293,64 @@ mod tests {
         assert!(redacted.contains("Bearer [REDACTED_BY_AEGIS_DLP]"), "{redacted}");
         assert!(redacted.contains("https://[REDACTED_BY_AEGIS_DLP]@github.com/org/repo.git"), "{redacted}");
         assert!(redacted.contains("safe=cargo test passed (中文)"), "{redacted}");
+    }
+
+    #[tokio::test]
+    async fn test_registry_domains_for_ecosystem_and_isolation() {
+        assert_eq!(
+            registry_domains_for_ecosystem("npm").unwrap(),
+            &["registry.npmjs.org", "registry.yarnpkg.com"]
+        );
+        assert_eq!(
+            registry_domains_for_ecosystem("uv").unwrap(),
+            &["pypi.org", "files.pythonhosted.org"]
+        );
+        assert_eq!(
+            registry_domains_for_ecosystem("cargo").unwrap(),
+            &["crates.io", "static.crates.io", "index.crates.io"]
+        );
+        assert!(registry_domains_for_ecosystem("unknown-pkg").is_none());
+
+        let gw = AegisEgressGateway::new();
+        let npm_domains: Vec<String> = registry_domains_for_ecosystem("npm")
+            .unwrap()
+            .iter()
+            .map(|s| (*s).to_string())
+            .collect();
+        gw.allow_domains("acme", npm_domains).await;
+        let agent = AgentIdentity::new("acme", "coder-1", "Engineer");
+
+        let ok = gw
+            .inspect_and_inject(
+                &agent,
+                &OutboundRequestSpec {
+                    target_domain: "registry.npmjs.org".to_string(),
+                    method: "GET".to_string(),
+                    path: "/chalk".to_string(),
+                    headers: HashMap::new(),
+                },
+            )
+            .await
+            .unwrap();
+        assert!(matches!(ok, EgressVerdict::AllowedAndSanitized { .. }), "{ok:?}");
+
+        for blocked_domain in ["evil.example.com", "api.github.com"] {
+            let blocked = gw
+                .inspect_and_inject(
+                    &agent,
+                    &OutboundRequestSpec {
+                        target_domain: blocked_domain.to_string(),
+                        method: "GET".to_string(),
+                        path: "/".to_string(),
+                        headers: HashMap::new(),
+                    },
+                )
+                .await
+                .unwrap();
+            assert!(
+                matches!(blocked, EgressVerdict::RequiresEscalation { .. }),
+                "{blocked_domain} should require escalation: {blocked:?}"
+            );
+        }
     }
 }

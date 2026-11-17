@@ -175,6 +175,12 @@ impl SessionBroker {
         std::fs::create_dir_all(&org_shared_ro)?;
         std::fs::create_dir_all(&org_agent_pub)?;
         std::fs::create_dir_all(&session.agent_home)?;
+        let exclude_loopback_ports: Vec<u16> = egress_proxy
+            .as_deref()
+            .and_then(|s| s.rsplit(':').next())
+            .and_then(|p| p.trim_end_matches('/').parse::<u16>().ok())
+            .into_iter()
+            .collect();
         let sandbox = NativeOsSandboxDriver
             .create_sandbox(SandboxConfig {
                 identity: identity.clone(),
@@ -187,6 +193,11 @@ impl SessionBroker {
                 egress_proxy_addr: egress_proxy,
                 host_source_dir: Some(PathBuf::from(&session.workspace)),
                 tighten_home_read: true,
+                allowed_loopback_ports: aos_sandbox::allocate_loopback_ports(
+                    2,
+                    &exclude_loopback_ports,
+                ),
+                isolate_loopback_only: true,
             })
             .await?;
         kernel

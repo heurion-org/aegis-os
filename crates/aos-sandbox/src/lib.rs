@@ -264,11 +264,44 @@ async fn run_foreground_tracked(
 // Tier 1: Native OS Sandbox Instance (macOS Seatbelt / Linux Bubblewrap)
 // ============================================================================
 
+pub const MAX_DYNAMIC_LOOPBACK_PORTS: usize = 16;
+
+/// Reserves up to `count` (clamped to `0..=8`) currently-unbound `127.0.0.1` ports by holding all
+/// temporary listeners open simultaneously so the OS does not assign duplicates, skipping any
+/// port in `exclude`. Degrades gracefully to an empty `Vec` if ephemeral binds are blocked.
+pub fn allocate_loopback_ports(count: usize, exclude: &[u16]) -> Vec<u16> {
+    let want = count.min(8);
+    if want == 0 {
+        return Vec::new();
+    }
+    let mut held: Vec<std::net::TcpListener> = Vec::with_capacity(want);
+    let mut ports: Vec<u16> = Vec::with_capacity(want);
+    for _ in 0..(want * 3) {
+        if ports.len() >= want {
+            break;
+        }
+        let Ok(listener) = std::net::TcpListener::bind("127.0.0.1:0") else {
+            break;
+        };
+        if let Ok(addr) = listener.local_addr() {
+            let port = addr.port();
+            if port != 0 && !exclude.contains(&port) && !ports.contains(&port) {
+                ports.push(port);
+                held.push(listener);
+            }
+        }
+    }
+    drop(held);
+    ports.sort_unstable();
+    ports
+}
+
 pub struct NativeOsSandboxInstance {
     instance_id: String,
     config: SandboxConfig,
     paused: AtomicBool,
     active_pgids: Arc<Mutex<std::collections::HashSet<u32>>>,
+    dynamic_loopback_ports: Mutex<Vec<u16>>,
 }
 
 impl NativeOsSandboxInstance {
@@ -278,7 +311,30 @@ impl NativeOsSandboxInstance {
             config,
             paused: AtomicBool::new(false),
             active_pgids: Arc::new(Mutex::new(std::collections::HashSet::new())),
+            dynamic_loopback_ports: Mutex::new(Vec::new()),
         }
+    }
+
+    fn effective_loopback_ports(&self, extra: &[u16]) -> Vec<u16> {
+        let mut set = std::collections::BTreeSet::new();
+        for &p in &self.config.allowed_loopback_ports {
+            if p != 0 {
+                set.insert(p);
+            }
+        }
+        if let Ok(guard) = self.dynamic_loopback_ports.lock() {
+            for &p in guard.iter() {
+                if p != 0 {
+                    set.insert(p);
+                }
+            }
+        }
+        for &p in extra {
+            if p != 0 {
+                set.insert(p);
+            }
+        }
+        set.into_iter().collect()
     }
 
     fn canonical_or_orig(p: &Path) -> String {
@@ -306,30 +362,52 @@ impl NativeOsSandboxInstance {
     /// `SAFE_TOOLCHAIN_SUBDIRS`), explicitly denies host credential directories and dotenv secrets
     /// (`*/.env*`), and restricts network-outbound to localhost egress proxy when configured.
     pub fn generate_macos_seatbelt_profile(&self) -> String {
+        self.generate_macos_seatbelt_profile_with_ports(&[])
+    }
+
+    pub fn generate_macos_seatbelt_profile_with_ports(&self, extra_loopback_ports: &[u16]) -> String {
         let ws = Self::sbpl_path(&self.config.workspace_dir);
         let home = Self::sbpl_path(&self.config.agent_home_dir);
         let shared_ro_sbpl = Self::sbpl_path(&self.config.org_shared_ro_dir);
         let pub_dir = Self::sbpl_path(&self.config.org_agent_pub_dir);
 
-        let net_rules = if !aos_core::ablated("net_isolation") {
+        let loopback_ports = self.effective_loopback_ports(extra_loopback_ports);
+        let net_enforced = !aos_core::ablated("net_isolation")
+            && (self.config.egress_proxy_addr.is_some()
+                || self.config.isolate_loopback_only
+                || !loopback_ports.is_empty());
+        let net_rules = if net_enforced {
+            let mut outbound_targets = Vec::new();
             if let Some(ref proxy_str) = self.config.egress_proxy_addr {
                 let port_pattern = proxy_str
                     .rsplit_once(':')
                     .map(|(_, port)| port.trim_end_matches('/'))
                     .filter(|p| p.chars().all(|c| c.is_ascii_digit()) && !p.is_empty())
                     .unwrap_or("*");
-                format!(
-                    r#"
-(deny network-outbound)
-(allow network-outbound
-    (remote ip "localhost:{port_pattern}")
-    (remote unix-socket (subpath "{home}"))
-    (remote unix-socket (path-literal "/private/var/run/mDNSResponder"))
-)"#
-                )
-            } else {
-                String::new()
+                outbound_targets.push(format!(r#"(remote ip "localhost:{port_pattern}")"#));
             }
+            for port in &loopback_ports {
+                outbound_targets.push(format!(r#"(remote ip "localhost:{port}")"#));
+            }
+            outbound_targets.push(format!(r#"(remote unix-socket (subpath "{home}"))"#));
+            outbound_targets.push(
+                r#"(remote unix-socket (path-literal "/private/var/run/mDNSResponder"))"#.to_string(),
+            );
+            let mut rules = format!(
+                "\n(deny network-bind (local ip))\n(deny network-inbound (local ip))\n(deny network-outbound)\n(allow network-outbound\n    {}\n)",
+                outbound_targets.join("\n    ")
+            );
+            if !loopback_ports.is_empty() {
+                let bind_targets: Vec<String> = loopback_ports
+                    .iter()
+                    .map(|p| format!(r#"(local ip "localhost:{p}")"#))
+                    .collect();
+                let joined = bind_targets.join("\n    ");
+                rules.push_str(&format!(
+                    "\n(allow network-bind\n    {joined}\n)\n(allow network-inbound\n    {joined}\n)"
+                ));
+            }
+            rules
         } else {
             String::new()
         };
@@ -856,7 +934,9 @@ impl NativeOsSandboxInstance {
                 }
             }
         }
-        if self.config.egress_proxy_addr.is_none() || aos_core::ablated("net_isolation") {
+        if (self.config.egress_proxy_addr.is_none() && !self.config.isolate_loopback_only)
+            || aos_core::ablated("net_isolation")
+        {
             args.push("--share-net".to_string());
         }
         args
@@ -1074,6 +1154,10 @@ impl SandboxInstance for NativeOsSandboxInstance {
         }
     }
 
+    fn allocated_loopback_ports(&self) -> Vec<u16> {
+        self.effective_loopback_ports(&[])
+    }
+
     async fn exec(&self, spec: ExecSpec) -> anyhow::Result<ExecOutput> {
         if self.paused.load(Ordering::SeqCst) {
             bail!(
@@ -1086,6 +1170,38 @@ impl SandboxInstance for NativeOsSandboxInstance {
         tokio::fs::create_dir_all(&self.config.agent_home_dir).await?;
         tokio::fs::create_dir_all(&self.config.org_shared_ro_dir).await?;
         tokio::fs::create_dir_all(&self.config.org_agent_pub_dir).await?;
+
+        let requested_ports = spec
+            .env
+            .get("AOS_REQUEST_LOOPBACK_PORTS")
+            .and_then(|s| s.trim().parse::<usize>().ok())
+            .unwrap_or(0)
+            .min(8);
+        if requested_ports > 0 {
+            let mut exclude = self.effective_loopback_ports(&[]);
+            if let Some(proxy_port) = self
+                .config
+                .egress_proxy_addr
+                .as_deref()
+                .and_then(|s| s.rsplit_once(':'))
+                .and_then(|(_, p)| p.trim_end_matches('/').parse::<u16>().ok())
+            {
+                exclude.push(proxy_port);
+            }
+            let fresh = allocate_loopback_ports(requested_ports, &exclude);
+            if !fresh.is_empty() {
+                if let Ok(mut guard) = self.dynamic_loopback_ports.lock() {
+                    for p in fresh {
+                        if guard.len() >= MAX_DYNAMIC_LOOPBACK_PORTS {
+                            break;
+                        }
+                        if !guard.contains(&p) {
+                            guard.push(p);
+                        }
+                    }
+                }
+            }
+        }
 
         let work_dir = spec
             .cwd
@@ -1190,11 +1306,16 @@ impl SandboxInstance for NativeOsSandboxInstance {
         // (registry cache, installed toolchains) and Node/Python virtualenvs inside `proc_exec`.
         // Expose them read-only by path; Seatbelt still denies writes outside the CoW roots.
         let host_home = std::env::var("HOME").ok().map(PathBuf::from);
-        let cargo_home = std::env::var("CARGO_HOME")
-            .ok()
-            .map(PathBuf::from)
-            .or_else(|| host_home.as_ref().map(|h| h.join(".cargo")))
-            .filter(|p| p.is_dir());
+        let isolated_deps_cargo = self.config.agent_home_dir.join("deps/cargo_home");
+        let cargo_home = if isolated_deps_cargo.is_dir() {
+            Some(isolated_deps_cargo)
+        } else {
+            std::env::var("CARGO_HOME")
+                .ok()
+                .map(PathBuf::from)
+                .or_else(|| host_home.as_ref().map(|h| h.join(".cargo")))
+                .filter(|p| p.is_dir())
+        };
         let rustup_home = std::env::var("RUSTUP_HOME")
             .ok()
             .map(PathBuf::from)
@@ -1243,6 +1364,16 @@ impl SandboxInstance for NativeOsSandboxInstance {
             cmd.env("HTTP_PROXY", proxy).env("HTTPS_PROXY", proxy);
         }
 
+        let active_loopback_ports = self.allocated_loopback_ports();
+        if let Some(&first_port) = active_loopback_ports.first() {
+            let joined: Vec<String> = active_loopback_ports
+                .iter()
+                .map(ToString::to_string)
+                .collect();
+            cmd.env("AOS_LOOPBACK_PORTS", joined.join(","))
+                .env("AOS_DEV_PORT", first_port.to_string());
+        }
+
         for (k, v) in &spec.env {
             let ku = k.to_ascii_uppercase();
             if matches!(
@@ -1257,6 +1388,7 @@ impl SandboxInstance for NativeOsSandboxInstance {
                     | "AOS_ORG_SHARED_RO"
                     | "AOS_ORG_AGENT_PUB"
                     | "AOS_ADMIN_SECRET"
+                    | "AOS_REQUEST_LOOPBACK_PORTS"
                     | "SSH_AUTH_SOCK"
                     | "SSH_AGENT_PID"
                     | "LD_PRELOAD"
@@ -1379,7 +1511,19 @@ impl SandboxInstance for NativeOsSandboxInstance {
             if let Some(ref proxy) = self.config.egress_proxy_addr {
                 fallback.env("HTTP_PROXY", proxy).env("HTTPS_PROXY", proxy);
             }
+            if let Some(&first_port) = active_loopback_ports.first() {
+                let joined: Vec<String> = active_loopback_ports
+                    .iter()
+                    .map(ToString::to_string)
+                    .collect();
+                fallback
+                    .env("AOS_LOOPBACK_PORTS", joined.join(","))
+                    .env("AOS_DEV_PORT", first_port.to_string());
+            }
             for (k, v) in &spec.env {
+                if k.eq_ignore_ascii_case("AOS_REQUEST_LOOPBACK_PORTS") {
+                    continue;
+                }
                 fallback.env(k, v);
             }
             let fb_out =
@@ -1505,6 +1649,10 @@ impl SandboxInstance for MicroVmSandboxInstance {
         .to_string()
     }
 
+    fn allocated_loopback_ports(&self) -> Vec<u16> {
+        self.inner.allocated_loopback_ports()
+    }
+
     async fn exec(&self, spec: ExecSpec) -> anyhow::Result<ExecOutput> {
         if self.inner.paused.load(Ordering::SeqCst) {
             bail!("MicroVM '{}' is paused", self.instance_id);
@@ -1591,6 +1739,8 @@ mod tests {
             egress_proxy_addr: None,
             host_source_dir: None,
             tighten_home_read: true,
+            allowed_loopback_ports: Vec::new(),
+            isolate_loopback_only: false,
         };
         let args = NativeOsSandboxInstance::new(driver_cfg).generate_linux_bwrap_args();
         let tmpfs_pos = args.windows(2).position(|w| w == ["--tmpfs", "/tmp"]).unwrap();
@@ -1620,6 +1770,8 @@ mod tests {
             egress_proxy_addr: None,
             host_source_dir: None,
             tighten_home_read: true,
+            allowed_loopback_ports: Vec::new(),
+            isolate_loopback_only: false,
         };
         let args = NativeOsSandboxInstance::new(driver_cfg).generate_linux_bwrap_args();
         let rt_tmpfs_pos = args
@@ -1715,6 +1867,8 @@ mod tests {
             egress_proxy_addr: Some("http://127.0.0.1:18080".to_string()),
             host_source_dir: None,
             tighten_home_read: true,
+            allowed_loopback_ports: Vec::new(),
+            isolate_loopback_only: false,
         };
 
         let sbx = driver.create_sandbox(config).await.unwrap();
@@ -1819,6 +1973,8 @@ mod tests {
             egress_proxy_addr: None,
             host_source_dir: None,
             tighten_home_read: true,
+            allowed_loopback_ports: Vec::new(),
+            isolate_loopback_only: false,
         };
         let profile = NativeOsSandboxInstance::new(cfg).generate_macos_seatbelt_profile();
         assert!(profile.contains(r#"ws\")) (allow file-write* (subpath \"/"#), "{profile}");
@@ -1864,6 +2020,8 @@ mod tests {
                 egress_proxy_addr: None,
                 host_source_dir: None,
                 tighten_home_read: true,
+                allowed_loopback_ports: Vec::new(),
+                isolate_loopback_only: false,
             })
             .await
             .unwrap();
@@ -1911,6 +2069,8 @@ mod tests {
                 egress_proxy_addr: None,
                 host_source_dir: None,
                 tighten_home_read: true,
+                allowed_loopback_ports: Vec::new(),
+                isolate_loopback_only: false,
             })
             .await
             .unwrap();
@@ -1967,6 +2127,8 @@ mod tests {
             egress_proxy_addr: None,
             host_source_dir: None,
             tighten_home_read: true,
+            allowed_loopback_ports: Vec::new(),
+            isolate_loopback_only: false,
         };
         let sbx = driver.create_sandbox(config).await.unwrap();
 
@@ -2103,6 +2265,8 @@ mod tests {
             egress_proxy_addr: None,
             host_source_dir: Some(host_src.clone()),
             tighten_home_read: true,
+            allowed_loopback_ports: Vec::new(),
+            isolate_loopback_only: false,
         };
         let profile = NativeOsSandboxInstance::new(cfg.clone()).generate_macos_seatbelt_profile();
         if Path::new("/Users").is_dir() {
@@ -2148,5 +2312,255 @@ mod tests {
             missing_home,
         ]);
         assert_eq!(filtered, vec![fake_home]);
+    }
+
+    #[test]
+    fn seatbelt_loopback_port_rules_allow_allocated_and_deny_arbitrary_ip_binds() {
+        let tmp = tempfile::tempdir().unwrap();
+        let cfg = SandboxConfig {
+            identity: AgentIdentity::new("acme", "coder-1", "Engineer"),
+            tier: IsolationTier::NativeOsSandbox,
+            limits: ResourceLimits::default(),
+            workspace_dir: tmp.path().join("ws"),
+            agent_home_dir: tmp.path().join("home"),
+            org_shared_ro_dir: tmp.path().join("ro"),
+            org_agent_pub_dir: tmp.path().join("pub"),
+            egress_proxy_addr: Some("http://127.0.0.1:18080".to_string()),
+            host_source_dir: None,
+            tighten_home_read: true,
+            allowed_loopback_ports: vec![51234, 51235],
+            isolate_loopback_only: true,
+        };
+        let sbx = NativeOsSandboxInstance::new(cfg);
+        assert_eq!(sbx.allocated_loopback_ports(), vec![51234, 51235]);
+        let profile = sbx.generate_macos_seatbelt_profile();
+        assert!(profile.contains("(deny network-bind (local ip))"), "{profile}");
+        assert!(profile.contains("(deny network-inbound (local ip))"), "{profile}");
+        assert!(profile.contains("(deny network-outbound)"), "{profile}");
+        assert!(
+            profile.contains(r#"(remote ip "localhost:18080")"#),
+            "{profile}"
+        );
+        assert!(
+            profile.contains(r#"(remote ip "localhost:51234")"#),
+            "{profile}"
+        );
+        assert!(
+            profile.contains(r#"(local ip "localhost:51234")"#),
+            "{profile}"
+        );
+        assert!(
+            profile.contains(r#"(local ip "localhost:51235")"#),
+            "{profile}"
+        );
+    }
+
+    #[test]
+    fn bwrap_isolate_loopback_only_omits_share_net() {
+        let tmp = tempfile::tempdir().unwrap();
+        let cfg = SandboxConfig {
+            identity: AgentIdentity::new("acme", "coder-1", "Engineer"),
+            tier: IsolationTier::NativeOsSandbox,
+            limits: ResourceLimits::default(),
+            workspace_dir: tmp.path().join("ws"),
+            agent_home_dir: tmp.path().join("home"),
+            org_shared_ro_dir: tmp.path().join("ro"),
+            org_agent_pub_dir: tmp.path().join("pub"),
+            egress_proxy_addr: None,
+            host_source_dir: None,
+            tighten_home_read: true,
+            allowed_loopback_ports: Vec::new(),
+            isolate_loopback_only: true,
+        };
+        let args = NativeOsSandboxInstance::new(cfg).generate_linux_bwrap_args();
+        assert!(args.iter().any(|a| a == "--unshare-all"), "{args:?}");
+        assert!(
+            !args.iter().any(|a| a == "--share-net"),
+            "isolate_loopback_only must keep private netns (omit --share-net): {args:?}"
+        );
+    }
+
+    #[cfg(target_os = "macos")]
+    #[tokio::test]
+    async fn seatbelt_live_loopback_roundtrip_and_unallocated_block() {
+        if nested_in_aegis_sandbox() || !Path::new("/usr/bin/sandbox-exec").exists() {
+            return;
+        }
+        let host_secret = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let secret_port = host_secret.local_addr().unwrap().port();
+        let ports = allocate_loopback_ports(1, &[secret_port]);
+        assert_eq!(ports.len(), 1);
+        let dev_port = ports[0];
+        let _secret_srv = std::thread::spawn(move || {
+            while let Ok((mut s, _)) = host_secret.accept() {
+                use std::io::Write;
+                let _ = s.write_all(b"HOST_SECRET_DATA");
+            }
+        });
+
+        let tmp = tempfile::tempdir().unwrap();
+        let sbx = NativeOsSandboxDriver
+            .create_sandbox(SandboxConfig {
+                identity: AgentIdentity::new("acme", "coder-1", "Engineer"),
+                tier: IsolationTier::NativeOsSandbox,
+                limits: ResourceLimits::default(),
+                workspace_dir: tmp.path().join("ws"),
+                agent_home_dir: tmp.path().join("home"),
+                org_shared_ro_dir: tmp.path().join("ro"),
+                org_agent_pub_dir: tmp.path().join("pub"),
+                egress_proxy_addr: None,
+                host_source_dir: None,
+                tighten_home_read: true,
+                allowed_loopback_ports: vec![dev_port],
+                isolate_loopback_only: true,
+            })
+            .await
+            .unwrap();
+
+        let py_roundtrip = r#"
+import os, socket, threading
+port = int(os.environ["AOS_DEV_PORT"])
+srv = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+srv.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+srv.bind(("127.0.0.1", port))
+srv.listen(1)
+def serve():
+    c, _ = srv.accept()
+    c.sendall(b"LOOPBACK_OK")
+    c.close()
+    srv.close()
+t = threading.Thread(target=serve, daemon=True)
+t.start()
+cli = socket.create_connection(("127.0.0.1", port), timeout=2)
+print(cli.recv(64).decode())
+cli.close()
+t.join(timeout=2)
+"#;
+        let ok_out = sbx
+            .exec(ExecSpec {
+                command: "python3".to_string(),
+                args: vec!["-c".to_string(), py_roundtrip.to_string()],
+                cwd: None,
+                env: HashMap::new(),
+                timeout_ms: Some(10_000),
+                background: false,
+            })
+            .await
+            .unwrap();
+        assert_eq!(ok_out.exit_code, Some(0), "ok_out: {ok_out:?}");
+        assert_eq!(ok_out.stdout.trim(), "LOOPBACK_OK");
+
+        let blocked_out = sbx
+            .exec(ExecSpec {
+                command: "python3".to_string(),
+                args: vec![
+                    "-c".to_string(),
+                    format!(
+                        "import socket; socket.create_connection(('127.0.0.1', {}), timeout=2)",
+                        secret_port
+                    ),
+                ],
+                cwd: None,
+                env: HashMap::new(),
+                timeout_ms: Some(10_000),
+                background: false,
+            })
+            .await
+            .unwrap();
+        assert_ne!(
+            blocked_out.exit_code,
+            Some(0),
+            "connect to unallocated host loopback port must be blocked: {blocked_out:?}"
+        );
+    }
+
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn bwrap_live_isolated_loopback_roundtrip_and_host_ssrf_block() {
+        if nested_in_aegis_sandbox() {
+            return;
+        }
+        let host_secret = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let secret_port = host_secret.local_addr().unwrap().port();
+        let _secret_srv = std::thread::spawn(move || {
+            while let Ok((mut s, _)) = host_secret.accept() {
+                use std::io::Write;
+                let _ = s.write_all(b"HOST_SECRET_DATA");
+            }
+        });
+
+        let tmp = tempfile::tempdir().unwrap();
+        let sbx = NativeOsSandboxDriver
+            .create_sandbox(SandboxConfig {
+                identity: AgentIdentity::new("acme", "coder-1", "Engineer"),
+                tier: IsolationTier::NativeOsSandbox,
+                limits: ResourceLimits::default(),
+                workspace_dir: tmp.path().join("ws"),
+                agent_home_dir: tmp.path().join("home"),
+                org_shared_ro_dir: tmp.path().join("ro"),
+                org_agent_pub_dir: tmp.path().join("pub"),
+                egress_proxy_addr: None,
+                host_source_dir: None,
+                tighten_home_read: true,
+                allowed_loopback_ports: Vec::new(),
+                isolate_loopback_only: true,
+            })
+            .await
+            .unwrap();
+
+        let py_roundtrip = r#"
+import socket, threading
+srv = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+srv.bind(("127.0.0.1", 0))
+port = srv.getsockname()[1]
+srv.listen(1)
+def serve():
+    c, _ = srv.accept()
+    c.sendall(b"LOOPBACK_OK")
+    c.close()
+    srv.close()
+t = threading.Thread(target=serve, daemon=True)
+t.start()
+cli = socket.create_connection(("127.0.0.1", port), timeout=2)
+print(cli.recv(64).decode())
+cli.close()
+t.join(timeout=2)
+"#;
+        let ok_out = sbx
+            .exec(ExecSpec {
+                command: "python3".to_string(),
+                args: vec!["-c".to_string(), py_roundtrip.to_string()],
+                cwd: None,
+                env: HashMap::new(),
+                timeout_ms: Some(10_000),
+                background: false,
+            })
+            .await
+            .unwrap();
+        assert_eq!(ok_out.exit_code, Some(0), "ok_out: {ok_out:?}");
+        assert_eq!(ok_out.stdout.trim(), "LOOPBACK_OK");
+
+        let blocked_out = sbx
+            .exec(ExecSpec {
+                command: "python3".to_string(),
+                args: vec![
+                    "-c".to_string(),
+                    format!(
+                        "import socket; s = socket.create_connection(('127.0.0.1', {}), timeout=2); print(s.recv(64))",
+                        secret_port
+                    ),
+                ],
+                cwd: None,
+                env: HashMap::new(),
+                timeout_ms: Some(10_000),
+                background: false,
+            })
+            .await
+            .unwrap();
+        assert_ne!(
+            blocked_out.exit_code,
+            Some(0),
+            "host loopback service must not be reachable inside --unshare-net bwrap: {blocked_out:?}"
+        );
     }
 }

@@ -4327,7 +4327,7 @@ async fn inspect_policy_escalation(
     let (parsed_host, mut parsed_files) = extract_host_and_files_from_reason(&esc.reason);
     let is_sensitive_commit_or_git = matches!(
         esc.action.as_str(),
-        "workspace_commit_sensitive" | "workspace_git_sensitive"
+        "workspace_commit_sensitive" | "workspace_git_sensitive" | "pkg_install_scripts"
     );
     if is_sensitive_commit_or_git && parsed_files.is_empty() {
         parsed_files.push(esc.target_resource.clone());
@@ -4526,7 +4526,10 @@ async fn inspect_policy_escalation(
         println!("\x1b[90m──────────────────────────────────────────────────────────────────────────────\x1b[0m");
     } else if matches!(
         esc.action.as_str(),
-        "workspace_commit" | "workspace_commit_sensitive" | "workspace_git_sensitive"
+        "workspace_commit"
+            | "workspace_commit_sensitive"
+            | "workspace_git_sensitive"
+            | "pkg_install_scripts"
     ) {
         println!(
             "\n\x1b[90mℹ No uncommitted file diffs remain in shadow workspace (escalation status: {:?}).\x1b[0m",
