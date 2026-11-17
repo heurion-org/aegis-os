@@ -15,17 +15,29 @@ concurrency:
 
 jobs:
   build:
-    name: build (${{ matrix.triple }})
+    name: build (${{ matrix.label }})
     runs-on: ${{ matrix.runner }}
     strategy:
-      fail-fast: true
+      fail-fast: false
       matrix:
         include:
-          - { runner: macos-15, triple: aarch64-apple-darwin, asset: aegis-os-darwin-arm64, test: true }
-          - { runner: macos-15, triple: x86_64-apple-darwin, asset: aegis-os-darwin-x86_64, test: false }
+          # Build both Darwin architectures on a single macOS runner to halve macOS arm64 pool queue pressure.
+          - runner: macos-15
+            label: apple-darwin
+            targets: "aarch64-apple-darwin:aegis-os-darwin-arm64 x86_64-apple-darwin:aegis-os-darwin-x86_64"
+            artifact: aegis-os-darwin
+            test: true
           # Ubuntu 22.04 runners: glibc 2.35 keeps binaries runnable on 22.04 servers.
-          - { runner: ubuntu-22.04, triple: x86_64-unknown-linux-gnu, asset: aegis-os-linux-x86_64, test: true }
-          - { runner: ubuntu-22.04-arm, triple: aarch64-unknown-linux-gnu, asset: aegis-os-linux-aarch64, test: true }
+          - runner: ubuntu-22.04
+            label: x86_64-unknown-linux-gnu
+            targets: "x86_64-unknown-linux-gnu:aegis-os-linux-x86_64"
+            artifact: aegis-os-linux-x86_64
+            test: true
+          - runner: ubuntu-22.04-arm
+            label: aarch64-unknown-linux-gnu
+            targets: "aarch64-unknown-linux-gnu:aegis-os-linux-aarch64"
+            artifact: aegis-os-linux-aarch64
+            test: true
     env:
       MACOSX_DEPLOYMENT_TARGET: "11.0"
     steps:
@@ -37,7 +49,9 @@ jobs:
           export PATH="$HOME/.cargo/bin:$PATH"
           echo "$HOME/.cargo/bin" >> "$GITHUB_PATH"
           rustup show active-toolchain >/dev/null 2>&1 || rustup default stable
-          rustup target add ${{ matrix.triple }}
+          for pair in ${{ matrix.targets }}; do
+            rustup target add "${pair%%:*}"
+          done
 
       - name: Install bubblewrap (Linux sandbox tests)
         if: runner.os == 'Linux'
@@ -50,19 +64,27 @@ jobs:
         run: cargo test --workspace --locked
 
       - name: Build
-        run: cargo build --release --locked -p aos-cli --target ${{ matrix.triple }}
+        run: |
+          for pair in ${{ matrix.targets }}; do
+            triple="${pair%%:*}"
+            cargo build --release --locked -p aos-cli --target "$triple"
+          done
 
       - name: Package
         run: |
           mkdir -p out
-          bin="target/${{ matrix.triple }}/release/aegis-os"
-          cp "$bin" "out/${{ matrix.asset }}"
-          tar -czf "out/aegis-os-${GITHUB_REF_NAME}-${{ matrix.triple }}.tar.gz" \
-            -C "$(dirname "$bin")" aegis-os -C "$GITHUB_WORKSPACE" README.md Formula/aegis-os.rb
+          for pair in ${{ matrix.targets }}; do
+            triple="${pair%%:*}"
+            asset="${pair#*:}"
+            bin="target/${triple}/release/aegis-os"
+            cp "$bin" "out/${asset}"
+            tar -czf "out/aegis-os-${GITHUB_REF_NAME}-${triple}.tar.gz" \
+              -C "$(dirname "$bin")" aegis-os -C "$GITHUB_WORKSPACE" README.md Formula/aegis-os.rb
+          done
 
       - uses: actions/upload-artifact@v4
         with:
-          name: ${{ matrix.asset }}
+          name: ${{ matrix.artifact }}
           path: out/*
           if-no-files-found: error
 
