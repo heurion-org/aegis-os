@@ -686,6 +686,39 @@ pub fn can_open_browser() -> bool {
 
 /// Opens `url` in the system default browser unless running in tests, headless SSH (`SSH_CONNECTION` / `SSH_TTY`),
 /// headless Linux (no `DISPLAY` / `WAYLAND_DISPLAY`), or `AOS_NO_BROWSER=1`.
+/// Starts a loopback `/approve` console that **requires** the console's operator credential
+/// (never `DaemonAuth::Disabled`), and returns `(browser_url, public_url)`.
+///
+/// `browser_url` carries the credential in the URL fragment (`#key=`), which browsers never send
+/// to the server or in `Referer`, and which the page strips from history immediately. Only the
+/// human's browser receives it; `public_url` (no secret) is the only form that may be printed or
+/// returned to an agent. Without the credential, `/v1/approvals/decide` rejects the request, so a
+/// local process that discovers the port (or a DNS-rebinding web page) cannot approve.
+pub(crate) async fn start_local_approval_console(
+    kernel: std::sync::Arc<AegisRuntimeKernel>,
+    workspace: PathBuf,
+    esc_id: &str,
+    org_id: &str,
+) -> anyhow::Result<(String, String)> {
+    let addr = kernel
+        .clone()
+        .start_http_daemon_with_auth("127.0.0.1:0", workspace, aos_mcp_gateway::DaemonAuth::Required)
+        .await?;
+    Ok(approval_console_urls(addr, &kernel.operator_token(), esc_id, org_id))
+}
+
+/// `(browser_url_with_secret_fragment, public_url_without_secret)` for an already-running console.
+pub(crate) fn approval_console_urls(
+    addr: std::net::SocketAddr,
+    operator_token: &str,
+    esc_id: &str,
+    org_id: &str,
+) -> (String, String) {
+    let public_url = format!("http://{addr}/approve?id={esc_id}&org={org_id}&mode=local");
+    let browser_url = format!("{public_url}#key={operator_token}");
+    (browser_url, public_url)
+}
+
 pub fn open_url_in_browser(url: &str) -> bool {
     if !can_open_browser() {
         return false;
@@ -1707,19 +1740,14 @@ pub async fn handle_unified_approve(
     };
 
     if web {
-        let addr = kernel
-            .clone()
-            .start_http_daemon_with_auth(
-                "127.0.0.1:0",
-                canon.clone(),
-                aos_mcp_gateway::DaemonAuth::Disabled,
-            )
-            .await?;
-        let url = format!(
-            "http://{}/approve?id={}&org={}&mode=local",
-            addr, resolved_esc_id, identity.org_id
-        );
-        let opened = open_url_in_browser(&url);
+        let (browser_url, url) = start_local_approval_console(
+            kernel.clone(),
+            canon.clone(),
+            &resolved_esc_id,
+            &identity.org_id,
+        )
+        .await?;
+        let opened = open_url_in_browser(&browser_url);
         println!(
             "{}",
             serde_json::to_string_pretty(&json!({
@@ -2945,20 +2973,15 @@ pub async fn serve_unified_stdio(
                         let wait_secs = approval_wait_timeout_secs();
                         if wait_secs > 0 {
                             let mut browser_opened = false;
-                            if let Ok(addr) = kernel
-                                .clone()
-                                .start_http_daemon_with_auth(
-                                    "127.0.0.1:0",
-                                    active_workspace.clone(),
-                                    aos_mcp_gateway::DaemonAuth::Disabled,
-                                )
-                                .await
+                            if let Ok((browser_url, _public_url)) = start_local_approval_console(
+                                kernel.clone(),
+                                active_workspace.clone(),
+                                &esc_id,
+                                &identity.org_id,
+                            )
+                            .await
                             {
-                                let url = format!(
-                                    "http://{}/approve?id={}&org={}&mode=local",
-                                    addr, esc_id, identity.org_id
-                                );
-                                browser_opened = open_url_in_browser(&url);
+                                browser_opened = open_url_in_browser(&browser_url);
                             }
                             let force_wait =
                                 std::env::var("AOS_FORCE_APPROVAL_WAIT").as_deref() == Ok("1");

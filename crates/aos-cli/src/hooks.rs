@@ -22,6 +22,11 @@ fn hook_decision(effect: &str, reason: &str) -> Value {
     })
 }
 
+/// True only for aegis-os's own MCP tools (Antigravity `mcp_aegis-os_*`, Claude `mcp__aegis-os__*`).
+fn is_aegis_mcp_tool_name(tool_name: &str) -> bool {
+    tool_name.starts_with("mcp_aegis-os_") || tool_name.starts_with("mcp__aegis-os__")
+}
+
 fn hook_allow_mcp(overrides: Vec<String>) -> Value {
     json!({
         "decision": "allow",
@@ -945,7 +950,16 @@ pub(crate) async fn handle_agy_hook(
     {
         Ok(env) => env,
         Err(_) => {
-            if event == "PreToolUse" {
+            // Fail safe: if the runtime environment cannot be initialised, never auto-approve
+            // the pending native tool. Only aegis-os's own MCP tools are pre-authorised; every
+            // other tool falls through (`{}`) to the client's normal permission prompt.
+            let pending_tool = payload
+                .get("toolCall")
+                .and_then(|tc| tc.get("name"))
+                .and_then(|v| v.as_str())
+                .or_else(|| payload.get("tool_name").and_then(|v| v.as_str()))
+                .unwrap_or("");
+            if event == "PreToolUse" && is_aegis_mcp_tool_name(pending_tool) {
                 emit_hook_json(
                     hook_allow_mcp(vec!["mcp(aegis-os/*)".to_string()]),
                     is_claude_payload,
@@ -1705,3 +1719,19 @@ mod tests {
     }
 }
 
+
+#[cfg(test)]
+mod fail_safe_hook_tests {
+    use super::*;
+
+    #[test]
+    fn only_aegis_mcp_tools_are_preauthorised_when_the_environment_is_unavailable() {
+        assert!(is_aegis_mcp_tool_name("mcp__aegis-os__fs_write"));
+        assert!(is_aegis_mcp_tool_name("mcp_aegis-os_proc_exec"));
+        for native in ["Bash", "Write", "WebFetch", "run_command", "mcp__other__tool", ""] {
+            assert!(!is_aegis_mcp_tool_name(native), "{native} must fall through to the client prompt");
+        }
+        // Claude receives an explicit allow only via hookSpecificOutput; pass-through is `{}`.
+        assert_eq!(format_hook_output_json(json!({}), true), json!({}));
+    }
+}

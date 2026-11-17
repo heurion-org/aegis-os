@@ -10280,15 +10280,11 @@ impl AegisRuntimeKernel {
                                             Err(e) => Err(e.to_string()),
                                         }
                                     }
-                                } else if local_addr.ip().is_loopback() {
-                                    if ttl_secs > 0 {
-                                        ttl_secs = ttl_secs.clamp(60, MAX_TOOL_LEASE_TTL_SECS);
-                                    } else {
-                                        ttl_secs = 0;
-                                    }
-                                    actor = format!("web-console:{}", esc.org_id);
-                                    Ok(())
                                 } else {
+                                    // No anonymous approvals, not even from loopback: any local
+                                    // process (or a DNS-rebinding page) can reach a loopback port.
+                                    // The local `/approve` console authenticates with the operator
+                                    // credential delivered in its URL fragment instead.
                                     Err("Approvals require an operator token or a tenant key with an approver code".to_string())
                                 }
                             } else {
@@ -10682,6 +10678,36 @@ mod tests {
         }
         let step = approver::totp_step(chrono::Utc::now().timestamp()) + step_offset;
         format!("{:06}", approver::hotp(&bytes, step as u64))
+    }
+
+    #[tokio::test]
+    async fn loopback_console_rejects_anonymous_approvals_without_an_enrolled_approver() {
+        let temp = tempfile::tempdir().unwrap();
+        let repo = temp.path().join("repo");
+        tokio::fs::create_dir_all(&repo).await.unwrap();
+        let kernel = Arc::new(AegisRuntimeKernel::new(&temp.path().join("rt")).await.unwrap());
+        let addr = kernel.clone().start_http_daemon("127.0.0.1:0", repo).await.unwrap();
+        assert!(addr.ip().is_loopback());
+        let op = kernel.operator_token();
+        let (_, v) = raw_http(addr, "POST", "/v1/approvals/simulate", Some(&op), Some(json!({ "org_id": "solo", "agent_id": "coder" }))).await;
+        let esc = v["escalation_id"].as_str().unwrap().to_string();
+
+        // Any local process can reach the loopback port; without the operator credential it must
+        // not be able to approve, even though org `solo` has no TOTP approver enrolled.
+        let (head, _) = raw_http(addr, "POST", "/v1/approvals/decide", None, Some(json!({ "escalation_id": esc, "ttl_secs": 86400 }))).await;
+        assert!(head.contains("403"), "anonymous loopback approval must be rejected: {head}");
+        let still_pending = kernel
+            .policy
+            .list_escalations("solo")
+            .await
+            .unwrap()
+            .into_iter()
+            .any(|e| e.escalation_id == esc && e.status == aos_core::EscalationStatus::Pending);
+        assert!(still_pending, "escalation must remain pending after the rejected attempt");
+
+        // The human's browser (operator credential from the URL fragment) can still decide.
+        let (head, _) = raw_http(addr, "POST", "/v1/approvals/decide", Some(&op), Some(json!({ "escalation_id": esc }))).await;
+        assert!(head.contains("200"), "operator approval must succeed: {head}");
     }
 
     #[tokio::test]

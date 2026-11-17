@@ -378,9 +378,15 @@ impl AegisPolicyKernel {
     /// (`build.rs`, `Makefile`, `package.json`, `.cargo/config.toml`, `.vscode/tasks.json`).
     pub fn is_commit_poisoning_path(p: &str) -> bool {
         let p = Self::strip_nested_test_tmpdir(p);
-        let norm = p.trim_start_matches("./").trim_start_matches('/');
+        // Case-fold before matching: on case-insensitive filesystems (APFS/HFS+ default, NTFS)
+        // `.GIT/hooks/x` or `.GitHub/Workflows/x.yml` lands on the real `.git/hooks/x` /
+        // `.github/workflows/x.yml`. All literals below are therefore lowercase.
+        let folded = p.trim_start_matches("./").trim_start_matches('/').to_lowercase();
+        let norm = folded.as_str();
         let file_name = norm.rsplit('/').next().unwrap_or(norm);
-        norm.starts_with(".git/")
+        // A bare `.git` *file* (gitlink: `gitdir: <path>`) can redirect Git to another directory.
+        file_name == ".git"
+            || norm.starts_with(".git/")
             || norm.contains("/.git/")
             || norm == ".gitmodules"
             || norm.ends_with(".envrc")
@@ -410,9 +416,9 @@ impl AegisPolicyKernel {
             || norm.starts_with(".opencode/")
             || norm.contains("/.opencode/")
             || file_name == "build.rs"
-            || file_name == "Makefile"
-            || file_name == "GNUmakefile"
-            || file_name == "CMakeLists.txt"
+            || file_name == "makefile"
+            || file_name == "gnumakefile"
+            || file_name == "cmakelists.txt"
             || file_name == "package.json"
             || file_name == "setup.py"
             // Also execute code on routine dev commands (git hooks, test runners, build scripts).
@@ -425,14 +431,14 @@ impl AegisPolicyKernel {
             || file_name == "conftest.py"
             || file_name == "noxfile.py"
             || file_name == "tox.ini"
-            || file_name == "Cargo.toml"
+            || file_name == "cargo.toml"
             || file_name == "rust-toolchain.toml"
             || file_name == "rust-toolchain"
             || file_name == "build.gradle"
             || file_name == "build.gradle.kts"
             || file_name == "pom.xml"
-            || file_name.eq_ignore_ascii_case("justfile")
-            || file_name == "Rakefile"
+            || file_name == "justfile"
+            || file_name == "rakefile"
             || file_name == ".npmrc"
     }
 
@@ -454,7 +460,8 @@ impl AegisPolicyKernel {
     /// that must never be imported via `fs_import_file`.
     pub fn is_forbidden_import_source(p: &str) -> bool {
         let res = Self::strip_nested_test_tmpdir(p);
-        let norm = res.replace('\\', "/");
+        // Case-fold: `~/.SSH/id_rsa` names the same file as `~/.ssh/id_rsa` on APFS/NTFS.
+        let norm = res.replace('\\', "/").to_lowercase();
         let file_name = norm.rsplit('/').next().unwrap_or(&norm);
         if (file_name == ".env" || file_name.starts_with(".env."))
             && !matches!(
@@ -490,7 +497,8 @@ impl AegisPolicyKernel {
             "/etc/master.passwd",
         ]
         .iter()
-        .any(|marker| norm.contains(marker) || norm.ends_with(marker.trim_end_matches('/')))
+        .map(|marker| marker.to_lowercase())
+        .any(|marker| norm.contains(&marker) || norm.ends_with(marker.trim_end_matches('/')))
     }
 
     async fn has_active_sensitive_lease(
@@ -737,10 +745,11 @@ impl PolicyEngine for AegisPolicyKernel {
         // import credentials / dotenv secrets).
         if ctx.action == "fs_export_file" {
             let res = Self::strip_nested_test_tmpdir(ctx.target_resource.as_str());
+            let res_folded = res.to_lowercase();
             let poisoned = Self::is_commit_poisoning_path(res)
                 || Self::PROTECTED_CLIENT_CONFIG_MARKERS
                     .iter()
-                    .any(|marker| res.contains(marker));
+                    .any(|marker| res_folded.contains(marker));
             if poisoned {
                 return Ok(PolicyDecision::Deny {
                     reason: format!(
@@ -768,7 +777,8 @@ impl PolicyEngine for AegisPolicyKernel {
             }
             if ctx.metadata.get("import_to").and_then(|v| v.as_str()) == Some("shadow") {
                 if let Some(dst_rel) = ctx.metadata.get("dst_path").and_then(|v| v.as_str()) {
-                    let slash_norm = format!("/{}", dst_rel.trim_start_matches("./").trim_start_matches('/'));
+                    let slash_norm = format!("/{}", dst_rel.trim_start_matches("./").trim_start_matches('/'))
+                        .to_lowercase();
                     if Self::is_commit_poisoning_path(dst_rel)
                         || Self::PROTECTED_CLIENT_CONFIG_MARKERS
                             .iter()
@@ -2956,5 +2966,41 @@ mod tests {
         };
         assert!(matches!(kernel.evaluate(&tampered_m).await.unwrap(), PolicyDecision::Ask { .. }));
         assert!(matches!(kernel.evaluate(&merge_ctx).await.unwrap(), PolicyDecision::Allow { .. }));
+    }
+}
+
+#[cfg(test)]
+mod casefold_guard_tests {
+    use super::AegisPolicyKernel as K;
+
+    #[test]
+    fn commit_poisoning_guard_is_case_insensitive() {
+        // On APFS/NTFS these land on the real `.git/hooks`, workflows, agent configs, ...
+        for p in [
+            ".GIT/hooks/pre-commit",
+            "sub/.Git/hooks/post-checkout",
+            ".GitHub/Workflows/x.yml",
+            ".Claude/settings.json",
+            ".Agents/hooks.json",
+            ".ENVRC",
+            "MAKEFILE",
+            "Build.RS",
+            ".VSCode/tasks.json",
+            "Cargo.TOML",
+            "vendor/.git",
+        ] {
+            assert!(K::is_commit_poisoning_path(p), "{p} must be treated as sensitive");
+        }
+        for p in ["src/main.rs", "docs/makefile-notes.md", "README.md"] {
+            assert!(!K::is_commit_poisoning_path(p), "{p} must not be treated as sensitive");
+        }
+    }
+
+    #[test]
+    fn import_source_denylist_is_case_insensitive() {
+        assert!(K::is_forbidden_import_source("/Users/x/.SSH/id_rsa"));
+        assert!(K::is_forbidden_import_source("/Users/x/library/keychains/login.keychain-db"));
+        assert!(K::is_forbidden_import_source("/Users/x/proj/.ENV"));
+        assert!(!K::is_forbidden_import_source("/Users/x/proj/.env.example"));
     }
 }

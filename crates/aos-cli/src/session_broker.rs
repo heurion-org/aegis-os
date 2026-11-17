@@ -142,16 +142,9 @@ impl SessionBroker {
         let socket_path = control_dir.join("control.sock");
         let _ = std::fs::remove_file(&socket_path);
 
-        let agent_token = format!(
-            "{}{}",
-            aos_sandbox::bridge::new_token(),
-            aos_sandbox::bridge::new_token()
-        );
-        let human_token = format!(
-            "{}{}",
-            aos_sandbox::bridge::new_token(),
-            aos_sandbox::bridge::new_token()
-        );
+        // Full 256-bit CSPRNG secrets (two UUIDv4s would carry only 244 random bits).
+        let agent_token = aos_sandbox::bridge::new_secret_token()?;
+        let human_token = aos_sandbox::bridge::new_secret_token()?;
         write_token(&session_dir.join("agent.token"), &agent_token)?;
         write_token(&session_dir.join("human.token"), &human_token)?;
 
@@ -784,7 +777,9 @@ async fn maybe_handle_mcp_escalation(
                 .start_http_daemon_with_auth(
                     "127.0.0.1:0",
                     PathBuf::from(&state.session.workspace),
-                    aos_mcp_gateway::DaemonAuth::Disabled,
+                    // Never `Disabled`: decisions must carry the console's operator credential,
+                    // which only the human's browser receives (URL fragment, see below).
+                    aos_mcp_gateway::DaemonAuth::Required,
                 )
                 .await
             {
@@ -795,11 +790,14 @@ async fn maybe_handle_mcp_escalation(
     }
 
     if let Some(addr) = addr_opt {
-        let approve_url = format!(
-            "http://{}/approve?id={}&org={}&mode=local",
-            addr, esc_id, state.identity.org_id
+        // `approve_url` (no secret) is what the agent may see; only the browser gets the credential.
+        let (browser_url, approve_url) = crate::cloud::approval_console_urls(
+            addr,
+            &state.kernel.operator_token(),
+            &esc_id,
+            &state.identity.org_id,
         );
-        let browser_opened = crate::cloud::open_url_in_browser(&approve_url);
+        let browser_opened = crate::cloud::open_url_in_browser(&browser_url);
         let wait_secs = crate::cloud::approval_wait_timeout_secs().min(45);
         let force_wait = std::env::var("AOS_FORCE_APPROVAL_WAIT").as_deref() == Ok("1");
         if (browser_opened || force_wait) && wait_secs > 0 {

@@ -1511,6 +1511,69 @@ fn write_host_bytes_0600_no_symlink(host_home: &Path, rel: &str, bytes: &[u8]) -
     true
 }
 
+/// True when `new` introduces no structure that `old` lacks: every object key of `new` exists in
+/// `old` with a value of the same JSON shape, and arrays carry only scalars. Lets rotated OAuth
+/// tokens (same keys, new string values) flow back while rejecting injected fields such as hooks,
+/// plugin/MCP configuration, endpoints, or nested objects.
+fn json_shape_within(new: &Value, old: &Value) -> bool {
+    match (new, old) {
+        (Value::Object(n), Value::Object(o)) => n
+            .iter()
+            .all(|(k, v)| o.get(k).is_some_and(|ov| json_shape_within(v, ov))),
+        (Value::Array(n), Value::Array(_)) => n
+            .iter()
+            .all(|v| matches!(v, Value::String(_) | Value::Number(_) | Value::Bool(_) | Value::Null)),
+        (Value::String(_), Value::String(_))
+        | (Value::Number(_), Value::Number(_))
+        | (Value::Bool(_), Value::Bool(_)) => true,
+        (Value::Null, _) => true,
+        (Value::String(_) | Value::Number(_) | Value::Bool(_), Value::Null) => true,
+        _ => false,
+    }
+}
+
+/// Whole-file credential write-back from a sandbox-writable `agent_home` to the host `$HOME`.
+///
+/// The sandbox controls these bytes, so they are only accepted when they do not *expand* the
+/// host file's structure (see [`json_shape_within`]). A missing host file may be created only for
+/// pure OAuth token stores (`allow_create`), never for free-form files such as plugin secrets or
+/// client state. Note: this cannot detect a well-formed token for a *different* account
+/// (account swap); that residual risk is documented.
+fn write_back_credential_object(
+    host_home: &Path,
+    rel: &str,
+    sandbox_obj: &serde_json::Map<String, Value>,
+    allow_create: bool,
+) -> bool {
+    let host_exists = std::fs::symlink_metadata(host_home.join(rel)).is_ok();
+    match read_existing_json_object_with_limit_no_symlink(
+        host_home,
+        rel,
+        true,
+        true,
+        MAX_CREDENTIAL_SYNC_BYTES,
+    ) {
+        Some((_, existing)) => {
+            if !json_shape_within(
+                &Value::Object(sandbox_obj.clone()),
+                &Value::Object(existing),
+            ) {
+                eprintln!(
+                    "aos: refusing credential write-back to ~/{rel}: sandbox copy adds fields or changes structure"
+                );
+                return false;
+            }
+        }
+        None => {
+            // Unreadable / oversized / non-object host file, or no file and creation not allowed.
+            if host_exists || !allow_create {
+                return false;
+            }
+        }
+    }
+    write_host_json_0600_no_symlink(host_home, rel, sandbox_obj)
+}
+
 fn write_host_json_0600_no_symlink(
     host_home: &Path,
     rel: &str,
@@ -1570,10 +1633,11 @@ pub(crate) fn sync_credentials(agent_home: &Path, host_home: &Path, command: &[S
         if let Some((_, cred_obj)) =
             read_sandbox_json_object_no_symlink(agent_home, ".claude/.credentials.json", false)
         {
-            let _ = write_host_json_0600_no_symlink(
+            let _ = write_back_credential_object(
                 host_home,
                 ".claude/.credentials.json",
                 &cred_obj,
+                true,
             );
         }
         if let Some((_, agent_obj)) = read_sandbox_json_object_with_limit_no_symlink(
@@ -1603,13 +1667,13 @@ pub(crate) fn sync_credentials(agent_home: &Path, host_home: &Path, command: &[S
         if let Some((_, auth_obj)) =
             read_sandbox_json_object_no_symlink(agent_home, ".codex/auth.json", false)
         {
-            let _ = write_host_json_0600_no_symlink(host_home, ".codex/auth.json", &auth_obj);
+            let _ = write_back_credential_object(host_home, ".codex/auth.json", &auth_obj, true);
         }
     } else if is_hermes_command(command) {
         if let Some((_, auth_obj)) =
             read_sandbox_json_object_no_symlink(agent_home, ".hermes/auth.json", false)
         {
-            let _ = write_host_json_0600_no_symlink(host_home, ".hermes/auth.json", &auth_obj);
+            let _ = write_back_credential_object(host_home, ".hermes/auth.json", &auth_obj, true);
         }
     } else if is_agy_or_gemini_command(command) {
         for rel in AGY_AND_GEMINI_OAUTH_STORE_FILES.iter().copied().chain([
@@ -1621,7 +1685,9 @@ pub(crate) fn sync_credentials(agent_home: &Path, host_home: &Path, command: &[S
             if let Some((_, cred_obj)) =
                 read_sandbox_json_object_no_symlink(agent_home, rel, false)
             {
-                let _ = write_host_json_0600_no_symlink(host_home, rel, &cred_obj);
+                // Token stores may be created on first login; free-form client state may not.
+                let allow_create = !rel.ends_with("state.json");
+                let _ = write_back_credential_object(host_home, rel, &cred_obj, allow_create);
             }
         }
         if is_agy_command(command) {
@@ -1629,7 +1695,9 @@ pub(crate) fn sync_credentials(agent_home: &Path, host_home: &Path, command: &[S
                 if let Some((_, secrets_obj)) =
                     read_sandbox_json_object_no_symlink(agent_home, rel, false)
                 {
-                    let _ = write_host_json_0600_no_symlink(host_home, rel, &secrets_obj);
+                    // Plugin secrets are free-form plugin configuration: never created from the
+                    // sandbox, and only updated without structural expansion.
+                    let _ = write_back_credential_object(host_home, rel, &secrets_obj, false);
                 }
             }
             for rel in AGY_USER_SCOPE_FILES {
@@ -3041,10 +3109,43 @@ pub(crate) async fn commit_with_expected_hash(
         );
     }
 
-    let mut staged_actions = ws.stage_commit(paths, false).await?;
-    for action in &mut staged_actions {
-        if let aos_vfs::StagedCommitAction::CloneFromShadow { rel, shadow_path } = action {
-            *shadow_path = frozen_stage.join(&*rel);
+    // From here on, only the frozen snapshot is consulted. Content-domain checks run on the exact
+    // bytes that will land (the pre-freeze check above only gives early feedback).
+    let frozen_changed: Vec<String> = verify_diffs
+        .iter()
+        .map(|d| d.relative_path.clone())
+        .collect();
+    if let Err(reason) = dom_profile.verify_workspace_changes(&frozen_stage, &frozen_changed) {
+        let _ = std::fs::remove_dir_all(&frozen_stage);
+        bail!("aos commit: {reason}");
+    }
+    // Clones, three-way merges, and deletions are all computed from the frozen snapshot, never
+    // from the live shadow that a lingering sandbox process could still mutate.
+    let staged_actions = match ws.stage_commit_frozen(&frozen_stage, paths, false).await {
+        Ok(actions) => actions,
+        Err(e) => {
+            let _ = std::fs::remove_dir_all(&frozen_stage);
+            return Err(e);
+        }
+    };
+    // Every host mutation must correspond to a path in the approved, re-verified evidence.
+    let approved: std::collections::BTreeSet<&str> =
+        frozen_changed.iter().map(String::as_str).collect();
+    for action in &staged_actions {
+        let (rel, is_delete) = match action {
+            aos_vfs::StagedCommitAction::CloneFromShadow { rel, .. }
+            | aos_vfs::StagedCommitAction::WriteMerged { rel, .. } => (rel.as_str(), false),
+            aos_vfs::StagedCommitAction::DeleteFile { rel } => (rel.as_str(), true),
+        };
+        // Deleting a file the host no longer has is a no-op and need not appear in the evidence.
+        if is_delete && !Path::new(workspace).join(rel).exists() {
+            continue;
+        }
+        if !approved.contains(rel) {
+            let _ = std::fs::remove_dir_all(&frozen_stage);
+            bail!(
+                "aos commit: staged change to '{rel}' is not part of the approved diff; review again with `aos diff`"
+            );
         }
     }
     let committed_res = ws.apply_staged_actions(staged_actions).await;
@@ -9315,5 +9416,59 @@ mod tests {
         restore_or_seed_agy_oauth_cache(&runtime, &host_home, &fresh_home_2, &cmd);
         let restored = std::fs::read_to_string(fresh_home_2.join(AGY_CACHE_TOKEN_PRIMARY)).unwrap();
         assert!(restored.contains("ya29.sealed"), "got: {restored}");
+    }
+}
+
+#[cfg(test)]
+mod credential_write_back_tests {
+    use super::*;
+
+    fn write(root: &Path, rel: &str, v: Value) {
+        let p = root.join(rel);
+        std::fs::create_dir_all(p.parent().unwrap()).unwrap();
+        std::fs::write(&p, serde_json::to_vec(&v).unwrap()).unwrap();
+    }
+    fn read(root: &Path, rel: &str) -> Value {
+        serde_json::from_slice(&std::fs::read(root.join(rel)).unwrap()).unwrap()
+    }
+
+    #[test]
+    fn rotated_tokens_flow_back_but_injected_structure_is_refused() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (agent, host) = (tmp.path().join("agent"), tmp.path().join("host"));
+        let rel = ".codex/auth.json";
+        write(&host, rel, json!({"tokens": {"access_token": "old", "refresh_token": "r0"}, "last_refresh": "t0"}));
+
+        // Legitimate rotation: same keys, new values.
+        write(&agent, rel, json!({"tokens": {"access_token": "new", "refresh_token": "r1"}, "last_refresh": "t1"}));
+        sync_credentials(&agent, &host, &["codex".to_string()]);
+        assert_eq!(read(&host, rel)["tokens"]["access_token"], "new");
+
+        // Injection: a new top-level field and a nested object where a string was.
+        write(&agent, rel, json!({"tokens": {"access_token": {"cmd": "x"}}, "hooks": {"PreToolUse": []}}));
+        sync_credentials(&agent, &host, &["codex".to_string()]);
+        let after = read(&host, rel);
+        assert_eq!(after["tokens"]["access_token"], "new", "host file must be unchanged");
+        assert!(after.get("hooks").is_none());
+    }
+
+    #[test]
+    fn free_form_plugin_secrets_are_never_created_from_the_sandbox() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (agent, host) = (tmp.path().join("agent"), tmp.path().join("host"));
+        let rel = ".config/antigravity/plugin-secrets.json";
+        std::fs::create_dir_all(&host).unwrap();
+        write(&agent, rel, json!({"evil-plugin": {"endpoint": "https://attacker.example"}}));
+        sync_credentials(&agent, &host, &["agy".to_string()]);
+        assert!(!host.join(rel).exists(), "plugin secrets must not be created from sandbox state");
+    }
+
+    #[test]
+    fn json_shape_within_rules() {
+        assert!(json_shape_within(&json!({"a": "x"}), &json!({"a": "y", "b": 1})));
+        assert!(!json_shape_within(&json!({"c": "x"}), &json!({"a": "y"})));
+        assert!(!json_shape_within(&json!({"a": {"k": 1}}), &json!({"a": "y"})));
+        assert!(json_shape_within(&json!({"s": ["a", "b"]}), &json!({"s": []})));
+        assert!(!json_shape_within(&json!({"s": [{"k": 1}]}), &json!({"s": []})));
     }
 }

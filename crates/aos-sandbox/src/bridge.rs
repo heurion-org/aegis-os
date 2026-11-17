@@ -49,6 +49,16 @@ pub fn new_token() -> String {
     uuid::Uuid::new_v4().simple().to_string()
 }
 
+/// 256-bit secret drawn directly from the OS CSPRNG (`/dev/urandom`), hex-encoded (64 chars).
+/// Used for principal credentials (`agent.token`, `human.token`) where the full 256 bits of
+/// entropy are claimed; fails closed instead of falling back to a weaker source.
+pub fn new_secret_token() -> std::io::Result<String> {
+    use std::io::Read;
+    let mut buf = [0u8; 32];
+    std::fs::File::open("/dev/urandom")?.read_exact(&mut buf)?;
+    Ok(buf.iter().map(|b| format!("{b:02x}")).collect())
+}
+
 /// Constant-time comparison of two equal-length byte strings.
 fn token_eq(a: &[u8], b: &[u8]) -> bool {
     a.len() == b.len() && a.iter().zip(b).fold(0u8, |acc, (x, y)| acc | (x ^ y)) == 0
@@ -95,6 +105,52 @@ pub fn spawn_host_bridge(
     }))
 }
 
+/// Connects (as the unconfined host) to a Unix socket that sits in a sandbox-writable directory
+/// without following a sandbox-planted symlink or non-socket.
+///
+/// The sandbox could otherwise replace the socket with a symlink to any socket the host user can
+/// reach (`docker.sock`, `$SSH_AUTH_SOCK`, another session's control socket) and turn the host
+/// bridge into a confused deputy. On Linux the path is opened with `O_PATH|O_NOFOLLOW`, verified to
+/// be a socket owned by the current uid, and connected through `/proc/self/fd/N`, so the inode that
+/// is checked is the inode that is connected (no check/use race). Elsewhere, `lstat` rejects
+/// symlinks and non-sockets before connecting.
+pub(crate) async fn connect_sandbox_socket_nofollow(sock: &Path) -> std::io::Result<UnixStream> {
+    use std::os::unix::fs::{FileTypeExt, MetadataExt};
+    let not_socket = || {
+        std::io::Error::new(
+            std::io::ErrorKind::PermissionDenied,
+            "preview socket is not a socket owned by the current user",
+        )
+    };
+    // SAFETY: `getuid` has no preconditions.
+    let uid = unsafe { libc::getuid() };
+    #[cfg(target_os = "linux")]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        use std::os::unix::io::AsRawFd;
+        let handle = std::fs::OpenOptions::new()
+            .read(true)
+            .custom_flags(libc::O_PATH | libc::O_NOFOLLOW | libc::O_CLOEXEC)
+            .open(sock)?;
+        let meta = handle.metadata()?;
+        if !meta.file_type().is_socket() || meta.uid() != uid {
+            return Err(not_socket());
+        }
+        let via_fd = format!("/proc/self/fd/{}", handle.as_raw_fd());
+        let stream = UnixStream::connect(&via_fd).await;
+        drop(handle);
+        stream
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        let meta = std::fs::symlink_metadata(sock)?;
+        if !meta.file_type().is_socket() || meta.uid() != uid {
+            return Err(not_socket());
+        }
+        UnixStream::connect(sock).await
+    }
+}
+
 /// Host side (preview): listens strictly on `127.0.0.1:<host_port>` and relays every
 /// connection inward to the in-sandbox `UnixListener` at `unix_sock`, authenticating with the
 /// 32-byte `token` prefix.
@@ -120,7 +176,8 @@ pub fn spawn_host_preview_bridge(
             let sock = unix_sock.clone();
             let token = token.clone();
             tokio::spawn(async move {
-                if let Ok(mut unix) = UnixStream::connect(&sock).await {
+                // `sock` lives in a directory the sandbox can write: never follow it by path.
+                if let Ok(mut unix) = connect_sandbox_socket_nofollow(&sock).await {
                     if unix.write_all(token.as_bytes()).await.is_ok() {
                         let _ = copy_bidirectional(&mut tcp, &mut unix).await;
                     }

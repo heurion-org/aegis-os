@@ -220,7 +220,9 @@ impl CoWWorkspace {
                     let base_path = self.baseline_root.join(&rel);
                     Self::atomic_write_str(&host_dst, &merged_content).await?;
                     Self::atomic_write_str(&base_path, &merged_content).await?;
-                    Self::atomic_write_str(&shadow_path, &merged_content).await?;
+                    // Mirroring into the shadow is best-effort: the host write above already landed,
+                    // and a missing shadow parent must not turn this into a half-applied commit.
+                    let _ = Self::atomic_write_str(&shadow_path, &merged_content).await;
                     committed.push(rel);
                 }
                 StagedCommitAction::DeleteFile { rel } => {
@@ -1456,16 +1458,45 @@ impl CoWWorkspace {
         filter_paths: Option<Vec<String>>,
         overwrite_binaries: bool,
     ) -> anyhow::Result<Vec<StagedCommitAction>> {
+        let src_root = self.shadow_root.clone();
+        self.stage_commit_inner(&src_root, filter_paths, overwrite_binaries, true)
+            .await
+    }
+
+    /// Like [`Self::stage_commit`], but computes the *entire* staged batch (clones, three-way
+    /// merges, and deletions) from an immutable out-of-sandbox snapshot `frozen_root` taken after
+    /// the reviewed diff hash was re-verified. It never reads the live shadow and never runs
+    /// `refresh_from_host` (which would mutate the live shadow after the freeze), so a lingering
+    /// sandbox process cannot influence what lands on the host.
+    pub async fn stage_commit_frozen(
+        &self,
+        frozen_root: &Path,
+        filter_paths: Option<Vec<String>>,
+        overwrite_binaries: bool,
+    ) -> anyhow::Result<Vec<StagedCommitAction>> {
+        self.stage_commit_inner(frozen_root, filter_paths, overwrite_binaries, false)
+            .await
+    }
+
+    async fn stage_commit_inner(
+        &self,
+        src_root: &Path,
+        filter_paths: Option<Vec<String>>,
+        overwrite_binaries: bool,
+        refresh_first: bool,
+    ) -> anyhow::Result<Vec<StagedCommitAction>> {
         // First auto-rebase onto the current host tree so any files modified by peers that this
         // Agent did NOT touch (including regenerated binary artifacts) are fast-forwarded automatically.
-        let _ = self.refresh_from_host().await?;
+        if refresh_first {
+            let _ = self.refresh_from_host().await?;
+        }
 
         // Compute diff relative to this Agent's own `baseline_root` so we only touch files this Agent actually changed!
         let base_files: BTreeMap<String, PathBuf> = Self::collect_files(&self.baseline_root)
             .await?
             .into_iter()
             .collect();
-        let shadow_files: BTreeMap<String, PathBuf> = Self::collect_files(&self.shadow_root)
+        let shadow_files: BTreeMap<String, PathBuf> = Self::collect_files(src_root)
             .await?
             .into_iter()
             .collect();
@@ -1546,7 +1577,9 @@ impl CoWWorkspace {
                                         Ok(merged_str) => {
                                             staged_actions.push(StagedCommitAction::WriteMerged {
                                                 rel: rel.clone(),
-                                                shadow_path: shadow_path.clone(),
+                                                // Merged bytes are mirrored into the live shadow
+                                                // (never into a frozen snapshot, which is discarded).
+                                                shadow_path: self.shadow_root.join(rel),
                                                 merged_content: merged_str,
                                             });
                                             continue;
@@ -1603,7 +1636,8 @@ impl CoWWorkspace {
         }
 
         // Write any Phase-1 merged contents into `shadow_path` so pre-commit verification commands see the merged code.
-        for action in &staged_actions {
+        // (Skipped for frozen staging: verification already ran, and the live shadow is untrusted.)
+        for action in staged_actions.iter().filter(|_| refresh_first) {
             if let StagedCommitAction::WriteMerged {
                 shadow_path,
                 merged_content,
@@ -2664,5 +2698,47 @@ mod tests {
         let diffs = ws.diff(None).await.unwrap();
         assert_eq!(diffs.len(), 1, "unexpected diffs: {diffs:?}");
         assert_eq!(diffs[0].relative_path, "package.json");
+    }
+}
+
+#[cfg(test)]
+mod frozen_stage_tests {
+    use super::*;
+
+    fn rel_of(a: &StagedCommitAction) -> &str {
+        match a {
+            StagedCommitAction::CloneFromShadow { rel, .. }
+            | StagedCommitAction::WriteMerged { rel, .. }
+            | StagedCommitAction::DeleteFile { rel } => rel.as_str(),
+        }
+    }
+
+    #[tokio::test]
+    async fn frozen_staging_ignores_post_freeze_shadow_mutations() {
+        let tmp = tempfile::tempdir().unwrap();
+        let host = tmp.path().join("host");
+        std::fs::create_dir_all(&host).unwrap();
+        std::fs::write(host.join("keep.txt"), "keep\n").unwrap();
+        std::fs::write(host.join("edit.txt"), "v1\n").unwrap();
+        let ws = CoWWorkspace::init(&host, tmp.path().join("rt")).await.unwrap();
+
+        // Reviewed change, then the freeze.
+        std::fs::write(ws.shadow_root().join("edit.txt"), "v2\n").unwrap();
+        let frozen = tmp.path().join("frozen");
+        CoWWorkspace::cow_sync_dir(ws.shadow_root(), &frozen).await.unwrap();
+
+        // A lingering sandbox process tampers with the live shadow after the freeze.
+        std::fs::remove_file(ws.shadow_root().join("keep.txt")).unwrap();
+        std::fs::write(ws.shadow_root().join("edit.txt"), "evil\n").unwrap();
+        std::fs::write(ws.shadow_root().join("new.txt"), "evil\n").unwrap();
+
+        let actions = ws.stage_commit_frozen(&frozen, None, false).await.unwrap();
+        let rels: Vec<&str> = actions.iter().map(rel_of).collect();
+        assert_eq!(rels, vec!["edit.txt"], "only the reviewed change may be staged");
+
+        ws.apply_staged_actions(actions).await.unwrap();
+        assert_eq!(std::fs::read_to_string(host.join("edit.txt")).unwrap(), "v2\n");
+        assert!(host.join("keep.txt").exists(), "post-freeze deletion must not reach the host");
+        assert!(!host.join("new.txt").exists(), "post-freeze addition must not reach the host");
     }
 }
