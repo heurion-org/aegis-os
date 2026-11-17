@@ -316,6 +316,7 @@ pub fn registry_domains_for_ecosystem(ecosystem: &str) -> Option<&'static [&'sta
         }
         "pip" | "uv" | "python" => Some(&["pypi.org", "files.pythonhosted.org"]),
         "cargo" | "rust" => Some(&["crates.io", "static.crates.io", "index.crates.io"]),
+        "go" | "golang" => Some(&["proxy.golang.org", "sum.golang.org", "storage.googleapis.com"]),
         _ => None,
     }
 }
@@ -2308,6 +2309,10 @@ mod tests {
         assert_eq!(
             registry_domains_for_ecosystem("cargo").unwrap(),
             &["crates.io", "static.crates.io", "index.crates.io"]
+        );
+        assert_eq!(
+            registry_domains_for_ecosystem("go").unwrap(),
+            &["proxy.golang.org", "sum.golang.org", "storage.googleapis.com"]
         );
         assert!(registry_domains_for_ecosystem("unknown-pkg").is_none());
 

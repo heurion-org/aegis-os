@@ -188,6 +188,20 @@ impl Drop for EgressGuard {
     }
 }
 
+struct PreviewGuard {
+    handles: Vec<tokio::task::JoinHandle<()>>,
+    dir: PathBuf,
+}
+
+impl Drop for PreviewGuard {
+    fn drop(&mut self) {
+        for handle in self.handles.drain(..) {
+            handle.abort();
+        }
+        let _ = std::fs::remove_dir_all(&self.dir);
+    }
+}
+
 struct LauncherPlan {
     bwrap: PathBuf,
     project: PathBuf,
@@ -5442,6 +5456,61 @@ async fn run_inner(
     };
     let _egress_guard = egress_guard;
 
+    let exclude_preview_ports: Vec<u16> = proxy
+        .as_deref()
+        .and_then(|s| s.rsplit(':').next())
+        .and_then(|p| p.trim_end_matches('/').parse::<u16>().ok())
+        .into_iter()
+        .collect();
+    let dev_loopback_ports = aos_sandbox::allocate_loopback_ports(2, &exclude_preview_ports);
+    let (preview_guard, preview_token, preview_dir_host, preview_flags) = if egress_enabled
+        && !dev_loopback_ports.is_empty()
+    {
+        let pdir = PathBuf::from(format!(
+            "/tmp/aos-lprv-{}",
+            &uuid::Uuid::new_v4().simple().to_string()[..12]
+        ));
+        std::fs::create_dir_all(&pdir)?;
+        let _ = std::fs::set_permissions(&pdir, std::fs::Permissions::from_mode(0o700));
+        let ptoken = aos_sandbox::bridge::new_token();
+        let mut handles = Vec::new();
+        let mut flags = Vec::new();
+        for &port in &dev_loopback_ports {
+            let host_sock = pdir.join(format!("p{port}.s"));
+            let sandbox_sock = format!("/run/aegis/preview/p{port}.s");
+            if let Ok((_bound, h)) =
+                aos_sandbox::bridge::spawn_host_preview_bridge(port, host_sock, ptoken.clone())
+            {
+                handles.push(h);
+                flags.push("--preview".to_string());
+                flags.push(format!("{port}:{sandbox_sock}"));
+            }
+        }
+        if handles.is_empty() {
+            let _ = std::fs::remove_dir_all(&pdir);
+            (None, None, None, Vec::new())
+        } else {
+            (
+                Some(PreviewGuard {
+                    handles,
+                    dir: pdir.clone(),
+                }),
+                Some(ptoken),
+                Some(pdir),
+                flags,
+            )
+        }
+    } else {
+        (None, None, None, Vec::new())
+    };
+    let _preview_guard = preview_guard;
+    let mut command = command;
+    if !preview_flags.is_empty() {
+        if let Some(sep_pos) = command.iter().position(|a| a == "--") {
+            command.splice(sep_pos..sep_pos, preview_flags);
+        }
+    }
+
     // Per-session broker: the agent gets a token and a Unix control socket. The broker runs on
     // the host side, uses the same policy_state as `aos policy`, and exposes adapter.evaluate /
     // effect / heartbeat plus human-only escalation and lease routes. MCP `proc_exec` receives
@@ -5484,6 +5553,9 @@ async fn run_inner(
             "/run/aegis/egress",
             true,
         )?);
+        if let Some(ref pdir) = preview_dir_host {
+            fds.push(fd_mount(pdir, "/run/aegis/preview", false)?);
+        }
         let exe_dir = exe.parent().context("aegis-os binary has no parent directory")?;
         fds.push(fd_mount(exe_dir, "/run/aegis/bin", true)?);
         // Existing client configs often embed the absolute host binary path. Re-expose the same
@@ -5590,6 +5662,21 @@ async fn run_inner(
         envs.push(("NO_PROXY".to_string(), "127.0.0.1,localhost".to_string()));
         envs.push(("no_proxy".to_string(), "127.0.0.1,localhost".to_string()));
         envs.push(("AOS_BRIDGE_TOKEN".to_string(), bridge_token.clone()));
+    }
+    if !dev_loopback_ports.is_empty() {
+        let csv = dev_loopback_ports
+            .iter()
+            .map(u16::to_string)
+            .collect::<Vec<_>>()
+            .join(",");
+        envs.push(("AOS_LOOPBACK_PORTS".to_string(), csv));
+        envs.push(("AOS_DEV_PORT".to_string(), dev_loopback_ports[0].to_string()));
+    }
+    if let Some(ref ptoken) = preview_token {
+        envs.push((
+            aos_sandbox::bridge::PREVIEW_TOKEN_ENV.to_string(),
+            ptoken.clone(),
+        ));
     }
     envs.push((
         "AOS_EGRESS".to_string(),

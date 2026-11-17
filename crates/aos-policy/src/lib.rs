@@ -1418,6 +1418,68 @@ impl PolicyEngine for AegisPolicyKernel {
                 .await
             }
 
+            "github_comment_create" => {
+                let repo = ctx
+                    .metadata
+                    .get("repo")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("<repo>");
+                let number = ctx
+                    .metadata
+                    .get("number")
+                    .and_then(|v| v.as_u64())
+                    .unwrap_or(0);
+                let body_preview: String = ctx
+                    .metadata
+                    .get("body")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("")
+                    .chars()
+                    .take(72)
+                    .collect();
+                self.record_escalation(
+                    ctx,
+                    format!(
+                        "Agent '{}' requests to post GitHub comment on '{}#{}': \"{}\"",
+                        ctx.principal.agent_id, repo, number, body_preview
+                    ),
+                    format!("action=github_comment_create, resource={}", ctx.target_resource),
+                )
+                .await
+            }
+
+            "github_pr_merge" => {
+                let repo = ctx
+                    .metadata
+                    .get("repo")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("<repo>");
+                let pr_number = ctx
+                    .metadata
+                    .get("pr_number")
+                    .and_then(|v| v.as_u64())
+                    .unwrap_or(0);
+                let method = ctx
+                    .metadata
+                    .get("method")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("squash");
+                let delete_branch = ctx
+                    .metadata
+                    .get("delete_branch")
+                    .and_then(|v| v.as_bool())
+                    .unwrap_or(false);
+                self.record_escalation(
+                    ctx,
+                    format!(
+                        "[DESTRUCTIVE] Agent '{}' requests to {}-merge GitHub PR '{}#{}' (delete_branch={})",
+                        ctx.principal.agent_id, method, repo, pr_number, delete_branch
+                    ),
+                    format!("action=github_pr_merge, resource={}", ctx.target_resource),
+                )
+                .await
+            }
+
             "pkg_install" => {
                 let manager = ctx
                     .metadata
@@ -1586,6 +1648,8 @@ impl PolicyEngine for AegisPolicyKernel {
                 | "workspace_git"
                 | "github_ci_rerun"
                 | "github_pr_create"
+                | "github_comment_create"
+                | "github_pr_merge"
                 | "github_ci_inspect"
                 | "github_pr_inspect"
                 | "github_issue_inspect"
@@ -2828,5 +2892,69 @@ mod tests {
             matches!(kernel.evaluate(&scripts_ctx).await.unwrap(), PolicyDecision::Allow { .. }),
             "Single approval of pkg_install_scripts must authorize retry"
         );
+    }
+
+    #[tokio::test]
+    async fn test_github_comment_and_pr_merge_escalation_and_pinning() {
+        let kernel = AegisPolicyKernel::with_state_file(None);
+        let agent = AgentIdentity::new("aegis-os", "agy-agent", "Coder");
+
+        let comment_ctx = PolicyContext {
+            principal: agent.clone(),
+            action: "github_comment_create".to_string(),
+            target_org_id: "aegis-os".to_string(),
+            target_resource: "heurion-org/aegis-os#comment:42".to_string(),
+            metadata: json!({
+                "repo": "heurion-org/aegis-os",
+                "number": 42,
+                "body": "CI is now green.",
+                "evidence_hash": "commenthash1"
+            }),
+        };
+        let esc_c = match kernel.evaluate(&comment_ctx).await.unwrap() {
+            PolicyDecision::Ask { escalation_id, reason, .. } => {
+                assert!(reason.contains("#42"), "{reason}");
+                escalation_id
+            }
+            other => panic!("Expected comment Ask, got {other:?}"),
+        };
+        let lease_c = kernel.approve_escalation(&esc_c, 0, "user").await.unwrap();
+        assert_eq!(lease_c.resource_pattern, "heurion-org/aegis-os#comment:42#sha256:commenthash1");
+        let tampered_c = PolicyContext {
+            metadata: json!({ "repo": "heurion-org/aegis-os", "number": 42, "body": "evil", "evidence_hash": "tampered" }),
+            ..comment_ctx.clone()
+        };
+        assert!(matches!(kernel.evaluate(&tampered_c).await.unwrap(), PolicyDecision::Ask { .. }));
+        assert!(matches!(kernel.evaluate(&comment_ctx).await.unwrap(), PolicyDecision::Allow { .. }));
+
+        let merge_ctx = PolicyContext {
+            principal: agent,
+            action: "github_pr_merge".to_string(),
+            target_org_id: "aegis-os".to_string(),
+            target_resource: "heurion-org/aegis-os#pr:42:merge".to_string(),
+            metadata: json!({
+                "repo": "heurion-org/aegis-os",
+                "pr_number": 42,
+                "method": "squash",
+                "delete_branch": true,
+                "evidence_hash": "mergehash1"
+            }),
+        };
+        let esc_m = match kernel.evaluate(&merge_ctx).await.unwrap() {
+            PolicyDecision::Ask { escalation_id, reason, .. } => {
+                assert!(reason.contains("[DESTRUCTIVE]"), "{reason}");
+                assert!(reason.contains("squash-merge"), "{reason}");
+                escalation_id
+            }
+            other => panic!("Expected merge Ask, got {other:?}"),
+        };
+        let lease_m = kernel.approve_escalation(&esc_m, 0, "user").await.unwrap();
+        assert_eq!(lease_m.resource_pattern, "heurion-org/aegis-os#pr:42:merge#sha256:mergehash1");
+        let tampered_m = PolicyContext {
+            metadata: json!({ "repo": "heurion-org/aegis-os", "pr_number": 42, "method": "merge", "delete_branch": false, "evidence_hash": "tampered" }),
+            ..merge_ctx.clone()
+        };
+        assert!(matches!(kernel.evaluate(&tampered_m).await.unwrap(), PolicyDecision::Ask { .. }));
+        assert!(matches!(kernel.evaluate(&merge_ctx).await.unwrap(), PolicyDecision::Allow { .. }));
     }
 }

@@ -174,6 +174,8 @@ pub async fn install_global_clients(
         "github_pr_inspect",
         "github_issue_inspect",
         "github_pr_create",
+        "github_comment_create",
+        "github_pr_merge",
         "runtime_configure_mode",
     ];
 
@@ -297,6 +299,8 @@ pub async fn install_global_clients(
         "mcp(aegis-os/github_pr_inspect)",
         "mcp(aegis-os/github_issue_inspect)",
         "mcp(aegis-os/github_pr_create)",
+        "mcp(aegis-os/github_comment_create)",
+        "mcp(aegis-os/github_pr_merge)",
         "mcp(aegis-os/runtime_configure_mode)",
     ];
     const AGY_MCP_ASK_RULES: &[&str] = &[
@@ -360,7 +364,7 @@ You are running inside the **Aegis OS Runtime (`aegis-os`)** with an isolated Co
 | Intent | REQUIRED Tool (`aegis-os` MCP) | Forbidden / Gated Native Tool |
 |---|---|---|
 | Build / test / lint / git status / scripts | `proc_exec` (`mcp_aegis-os_proc_exec`; `loopback_ports` / `$AOS_DEV_PORT` / `$AOS_LOOPBACK_PORTS` for `127.0.0.1` servers) | `run_command` (denied for in-repo work) |
-| Install npm / Python / Rust packages | `pkg_install` (registry-restricted proxy; `allow_scripts` gated) | `npm install` / `pip install` without registry egress approval |
+| Install npm / Python / Rust / Go packages | `pkg_install` (registry-restricted proxy; `allow_scripts` gated) | `npm install` / `pip install` without registry egress approval |
 | Read / write / edit / delete repo files | `fs_read`, `fs_write`, `fs_edit`, `fs_delete`, `fs_glob` | `write_file` / `edit_file` (denied for repo files) |
 | Claim / release files when collaborating | `coord_claim`, `coord_release` | Uncoordinated overlapping edits |
 | Multi-agent messaging & task handoff | `ipc_list_peers`, `ipc_send`, `ipc_request`, `ipc_reply`, `ipc_recv`, `ipc_ack`, `ipc_wait`, `ipc_task_get`, `ipc_task_list`, `ipc_task_update` | Manual user relay |
@@ -370,7 +374,7 @@ You are running inside the **Aegis OS Runtime (`aegis-os`)** with an isolated Co
 | Switch active project directory | `workspace_switch` | Cross-directory native `write_file` / `run_command` |
 | Inspect host Git status / branches / logs | `workspace_git_inspect` (zero-prompt, DLP-redacted) | Native `.git` guessing |
 | Land shadow / commit / tag / branch / push | `workspace_git` (supports one-click `auto_commit_shadow: true`) | Native `git commit` / `git push` in `run_command` |
-| Inspect & rerun CI, PRs, Issues | `github_ci_inspect`, `github_ci_rerun`, `github_pr_inspect`, `github_pr_create`, `github_issue_inspect` | Native `gh run/pr/issue` / unauthenticated curl |
+| Inspect & rerun CI, PRs, Issues | `github_ci_inspect`, `github_ci_rerun`, `github_pr_inspect`, `github_pr_create`, `github_comment_create`, `github_pr_merge`, `github_issue_inspect` | Native `gh run/pr/issue` / unauthenticated curl |
 | Switch Cloud vs. Local execution mode | `runtime_configure_mode` (`mode: "cloud" \| "local"`) | Manual CLI configuration |
 <!-- AEGIS-OS-RUNTIME-END -->
 "#;
@@ -480,6 +484,8 @@ You are running inside the **Aegis OS Runtime (`aegis-os`)** with an isolated Co
         "github_pr_inspect",
         "github_issue_inspect",
         "github_pr_create",
+        "github_comment_create",
+        "github_pr_merge",
     ];
 
     merge_json_file(
@@ -2806,7 +2812,7 @@ You are operating inside **Aegis OS Runtime** (`{role}`) within Organization **`
 | Intent | REQUIRED Tool (`aegis-os` MCP) | Forbidden / Gated Native Tool |
 |---|---|---|
 | Build / test / lint / git status / scripts | `proc_exec` (`mcp_aegis-os_proc_exec`; `loopback_ports` / `$AOS_DEV_PORT` / `$AOS_LOOPBACK_PORTS` for `127.0.0.1` servers) | `run_command` (denied for in-repo work) |
-| Install npm / Python / Rust packages | `pkg_install` (registry-restricted proxy; `allow_scripts` gated) | `npm install` / `pip install` without registry egress approval |
+| Install npm / Python / Rust / Go packages | `pkg_install` (registry-restricted proxy; `allow_scripts` gated) | `npm install` / `pip install` without registry egress approval |
 | Read / write / edit / delete repo files | `fs_read`, `fs_write`, `fs_edit`, `fs_delete`, `fs_glob` | `write_file` / `edit_file` (denied for repo files) |
 | Claim / release files when collaborating | `coord_claim`, `coord_release` | Uncoordinated overlapping edits |
 | Multi-agent messaging & task handoff | `ipc_list_peers`, `ipc_send`, `ipc_request`, `ipc_reply`, `ipc_recv`, `ipc_ack`, `ipc_wait`, `ipc_task_get`, `ipc_task_list`, `ipc_task_update` | Manual user relay |
@@ -2816,7 +2822,7 @@ You are operating inside **Aegis OS Runtime** (`{role}`) within Organization **`
 | Switch active project directory | `workspace_switch` | Cross-directory native `write_file` / `run_command` |
 | Inspect host Git status / branches / logs | `workspace_git_inspect` (zero-prompt, DLP-redacted) | Native `.git` guessing |
 | Land shadow / commit / tag / branch / push | `workspace_git` (supports one-click `auto_commit_shadow: true`) | Native `git commit` / `git push` in `run_command` |
-| Inspect & rerun CI, PRs, Issues | `github_ci_inspect`, `github_ci_rerun`, `github_pr_inspect`, `github_pr_create`, `github_issue_inspect` | Native `gh run/pr/issue` / unauthenticated curl |
+| Inspect & rerun CI, PRs, Issues | `github_ci_inspect`, `github_ci_rerun`, `github_pr_inspect`, `github_pr_create`, `github_comment_create`, `github_pr_merge`, `github_issue_inspect` | Native `gh run/pr/issue` / unauthenticated curl |
 
 ## Commit & Pull Request Audit Attribution
 When creating a Git commit or Pull Request after `workspace_commit` (or `aegis-os commit`), attach the returned `audit_receipt.git_trailer` (`Aegis-OS-Verified: ...`) in the commit trailer and `audit_receipt.pr_markdown_badge` in the PR description so reviewers can verify the CoW merge and evidence hash.

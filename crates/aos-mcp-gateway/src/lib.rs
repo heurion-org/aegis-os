@@ -601,6 +601,42 @@ struct GitHubPrCreatePlan {
     evidence_hash: String,
 }
 
+struct GitHubCommentCreatePlan {
+    repo: String,
+    number: u64,
+    body: String,
+    evidence_hash: String,
+}
+
+struct GitHubPrMergePlan {
+    repo: String,
+    pr_number: u64,
+    method: String,
+    delete_branch: bool,
+    subject: Option<String>,
+    body: Option<String>,
+    evidence_hash: String,
+}
+
+fn ensure_no_dlp_secrets(fields: &[&str], context_label: &str) -> anyhow::Result<()> {
+    let mut combined = Vec::new();
+    for field in fields {
+        for hit in detect_dlp_patterns(field) {
+            if !combined.contains(&hit) {
+                combined.push(hit);
+            }
+        }
+    }
+    if !combined.is_empty() {
+        bail!(
+            "Blocked by Aegis OS DLP policy: {} contains sensitive secret pattern(s): {:?}",
+            context_label,
+            combined
+        );
+    }
+    Ok(())
+}
+
 fn resolve_workspace_verify_config(
     host_root: &Path,
     args: &Value,
@@ -1972,6 +2008,93 @@ async fn execute_github_pr_create(plan: GitHubPrCreatePlan) -> anyhow::Result<Va
     .await?
 }
 
+async fn execute_github_comment_create(plan: GitHubCommentCreatePlan) -> anyhow::Result<Value> {
+    tokio::task::spawn_blocking(move || -> anyhow::Result<Value> {
+        let gh = resolve_system_gh_binary()
+            .context("System `gh` CLI binary is required to comment on GitHub issues/PRs")?;
+        let num_str = plan.number.to_string();
+        let gh_args = [
+            "issue",
+            "comment",
+            num_str.as_str(),
+            "-R",
+            plan.repo.as_str(),
+            "--body",
+            plan.body.as_str(),
+        ];
+        let out = run_sanitized_gh(&gh, &gh_args)?;
+        if !out.status.success() {
+            bail!(
+                "gh issue comment #{} on '{}' failed: {}",
+                plan.number,
+                plan.repo,
+                redact_ci_log_secrets(String::from_utf8_lossy(&out.stderr).trim())
+            );
+        }
+        let url = redact_ci_log_secrets(String::from_utf8_lossy(&out.stdout).trim());
+        Ok(json!({
+            "status": "comment_created",
+            "repo": plan.repo,
+            "number": plan.number,
+            "url": url,
+            "evidence_hash": plan.evidence_hash,
+        }))
+    })
+    .await?
+}
+
+async fn execute_github_pr_merge(plan: GitHubPrMergePlan) -> anyhow::Result<Value> {
+    tokio::task::spawn_blocking(move || -> anyhow::Result<Value> {
+        let gh = resolve_system_gh_binary()
+            .context("System `gh` CLI binary is required to merge GitHub Pull Requests")?;
+        let pr_str = plan.pr_number.to_string();
+        let method_flag = match plan.method.as_str() {
+            "merge" => "--merge",
+            "rebase" => "--rebase",
+            _ => "--squash",
+        };
+        let mut gh_args = vec![
+            "pr",
+            "merge",
+            pr_str.as_str(),
+            "-R",
+            plan.repo.as_str(),
+            method_flag,
+        ];
+        if plan.delete_branch {
+            gh_args.push("--delete-branch");
+        }
+        if let Some(ref subject) = plan.subject {
+            gh_args.push("--subject");
+            gh_args.push(subject.as_str());
+        }
+        if let Some(ref body) = plan.body {
+            gh_args.push("--body");
+            gh_args.push(body.as_str());
+        }
+        let out = run_sanitized_gh(&gh, &gh_args)?;
+        if !out.status.success() {
+            bail!(
+                "gh pr merge #{} on '{}' failed: {}",
+                plan.pr_number,
+                plan.repo,
+                redact_ci_log_secrets(String::from_utf8_lossy(&out.stderr).trim())
+            );
+        }
+        let msg = redact_ci_log_secrets(String::from_utf8_lossy(&out.stdout).trim());
+        Ok(json!({
+            "status": "pr_merged",
+            "repo": plan.repo,
+            "pr_number": plan.pr_number,
+            "method": plan.method,
+            "delete_branch": plan.delete_branch,
+            "message": msg,
+            "evidence_hash": plan.evidence_hash,
+        }))
+    })
+    .await?
+}
+
 const PKG_MANIFEST_FILES: &[&str] = &[
     "package.json",
     "package-lock.json",
@@ -1984,6 +2107,8 @@ const PKG_MANIFEST_FILES: &[&str] = &[
     "uv.lock",
     "Cargo.toml",
     "Cargo.lock",
+    "go.mod",
+    "go.sum",
 ];
 
 #[derive(Debug, Clone)]
@@ -2258,6 +2383,50 @@ async fn execute_pkg_install(
             full_args.extend(sh_args);
             ("sh".to_string(), full_args)
         }
+        "go" => {
+            let go_path = plan.agent_home_dir.join("deps/go_path");
+            let go_mod_cache = go_path.join("pkg/mod");
+            let go_cache = cache_root.join("go-build");
+            tokio::fs::create_dir_all(&go_mod_cache).await?;
+            tokio::fs::create_dir_all(&go_cache).await?;
+            env.insert("GOPATH".to_string(), go_path.display().to_string());
+            env.insert("GOMODCACHE".to_string(), go_mod_cache.display().to_string());
+            env.insert("GOCACHE".to_string(), go_cache.display().to_string());
+            env.insert("GOTOOLCHAIN".to_string(), "local".to_string());
+            env.insert(
+                "GOPROXY".to_string(),
+                if plan.offline {
+                    "off".to_string()
+                } else {
+                    "https://proxy.golang.org,direct".to_string()
+                },
+            );
+            env.insert(
+                "GOSUMDB".to_string(),
+                if plan.offline {
+                    "off".to_string()
+                } else {
+                    "sum.golang.org".to_string()
+                },
+            );
+
+            let mut go_args = Vec::new();
+            if plan.packages.is_empty() {
+                go_args.push("mod".to_string());
+                go_args.push("download".to_string());
+            } else {
+                go_args.push("get".to_string());
+                go_args.extend(plan.packages.iter().cloned());
+            }
+            let mut sh_args = vec![
+                "-c".to_string(),
+                r#"cmd="$1"; shift; exec "$cmd" "$@""#.to_string(),
+                "aegis-pkg".to_string(),
+                "go".to_string(),
+            ];
+            sh_args.extend(go_args);
+            ("sh".to_string(), sh_args)
+        }
         other => bail!("Unsupported package manager '{}'", other),
     };
 
@@ -2371,6 +2540,8 @@ pub const TOOL_ANNOTATIONS: &[(&str, bool, bool, bool, bool)] = &[
     ("github_pr_inspect", true, false, true, true),
     ("github_issue_inspect", true, false, true, true),
     ("github_pr_create", false, false, false, true),
+    ("github_comment_create", false, false, false, true),
+    ("github_pr_merge", false, true, false, true),
     // Arbitrary sandboxed commands; network policy depends on the sandbox profile.
     ("proc_exec", false, true, false, true),
     ("pkg_install", false, false, false, true),
@@ -4065,6 +4236,22 @@ impl AegisRuntimeKernel {
             "remote_url": remote_url,
             "branch": push_branch,
             "evidence_hash": evidence_hash,
+            "evidence": {
+                "host_root": host_root.display().to_string(),
+                "paths": paths,
+                "shadow_paths": shadow_paths,
+                "auto_commit_shadow": auto_commit_shadow,
+                "checkout_branch": checkout_branch,
+                "create_branch": create_branch,
+                "sync": sync_mode,
+                "commit_message": commit_message,
+                "tag": tag,
+                "force_tag": force_tag,
+                "push": push,
+                "force_push": force_push,
+                "branch": push_branch,
+                "evidence_hash": evidence_hash,
+            },
         });
 
         let plan = HostGitPlan {
@@ -4296,6 +4483,15 @@ impl AegisRuntimeKernel {
             "dst_path": clean_dst_rel,
             "overwrite": overwrite,
             "evidence_hash": evidence_hash,
+            "evidence": {
+                "src_host_path": target_resource,
+                "src_sha256": src_sha256,
+                "size_bytes": bytes.len(),
+                "import_to": import_to,
+                "dst_path": clean_dst_rel,
+                "overwrite": overwrite,
+                "evidence_hash": evidence_hash,
+            },
         });
         let plan = ImportFilePlan {
             canon_src,
@@ -4372,6 +4568,13 @@ impl AegisRuntimeKernel {
             "failed_only": failed_only,
             "job_id": job_id,
             "evidence_hash": evidence_hash,
+            "evidence": {
+                "repo": repo,
+                "run_id": run_id,
+                "failed_only": failed_only,
+                "job_id": job_id,
+                "evidence_hash": evidence_hash,
+            },
         });
         let plan = GitHubCiRerunPlan {
             repo,
@@ -4406,20 +4609,7 @@ impl AegisRuntimeKernel {
         if body.contains('\0') || body.len() > 32 * 1024 {
             bail!("Invalid PR 'body' (exceeds 32 KB limit or contains NUL byte)");
         }
-        let dlp_title = detect_dlp_patterns(&title);
-        let dlp_body = detect_dlp_patterns(&body);
-        if !dlp_title.is_empty() || !dlp_body.is_empty() {
-            let mut combined = dlp_title;
-            for hit in dlp_body {
-                if !combined.contains(&hit) {
-                    combined.push(hit);
-                }
-            }
-            bail!(
-                "Blocked by Aegis OS DLP policy: PR title/body contains sensitive secret pattern(s): {:?}",
-                combined
-            );
-        }
+        ensure_no_dlp_secrets(&[&title, &body], "PR title/body")?;
 
         let base = match args
             .get("base")
@@ -4490,6 +4680,14 @@ impl AegisRuntimeKernel {
             "head": head,
             "draft": draft,
             "evidence_hash": evidence_hash,
+            "evidence": {
+                "repo": repo,
+                "title": title,
+                "base": base,
+                "head": head,
+                "draft": draft,
+                "evidence_hash": evidence_hash,
+            },
         });
         let plan = GitHubPrCreatePlan {
             repo,
@@ -4498,6 +4696,169 @@ impl AegisRuntimeKernel {
             base,
             head,
             draft,
+            evidence_hash,
+        };
+        Ok((plan, resource, vec![preview_diff], meta))
+    }
+
+    fn prepare_github_comment_create_plan(
+        host_root: &Path,
+        args: &Value,
+    ) -> anyhow::Result<(GitHubCommentCreatePlan, String, Vec<aos_core::FileDiffEntry>, Value)> {
+        let repo = resolve_github_repo_arg(host_root, args)?;
+        let number = args
+            .get("number")
+            .and_then(|v| v.as_u64())
+            .filter(|&n| n > 0)
+            .context("Missing positive integer 'number' (PR or Issue number) for github_comment_create")?;
+        let body = args
+            .get("body")
+            .and_then(|v| v.as_str())
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .context("Missing non-empty 'body' for github_comment_create")?
+            .to_string();
+        if body.contains('\0') || body.len() > 32 * 1024 {
+            bail!("Invalid comment 'body' (exceeds 32 KB limit or contains NUL byte)");
+        }
+        ensure_no_dlp_secrets(&[&body], "comment body")?;
+
+        let canonical = serde_json::to_vec(&json!({
+            "repo": repo,
+            "number": number,
+            "body": body,
+        }))?;
+        let evidence_hash = hex::encode(Sha256::digest(&canonical));
+        let resource = format!("{repo}#comment:{number}");
+        let preview_diff = aos_core::FileDiffEntry {
+            relative_path: ".github/COMMENT_PLAN".to_string(),
+            change_type: DiffChangeType::Added,
+            old_size: None,
+            new_size: Some(body.len() as u64),
+            preview_diff: Some(format!("+Repo:   {}\n+Number: #{}\n\n{}", repo, number, body)),
+            old_sha256: None,
+            new_sha256: Some(format!("sha256:{}", evidence_hash)),
+        };
+        let meta = json!({
+            "repo": repo,
+            "number": number,
+            "body": body,
+            "evidence_hash": evidence_hash,
+            "evidence": {
+                "repo": repo,
+                "number": number,
+                "body_len": body.len(),
+                "evidence_hash": evidence_hash,
+            },
+        });
+        let plan = GitHubCommentCreatePlan {
+            repo,
+            number,
+            body,
+            evidence_hash,
+        };
+        Ok((plan, resource, vec![preview_diff], meta))
+    }
+
+    fn prepare_github_pr_merge_plan(
+        host_root: &Path,
+        args: &Value,
+    ) -> anyhow::Result<(GitHubPrMergePlan, String, Vec<aos_core::FileDiffEntry>, Value)> {
+        let repo = resolve_github_repo_arg(host_root, args)?;
+        let pr_number = args
+            .get("pr_number")
+            .and_then(|v| v.as_u64())
+            .filter(|&n| n > 0)
+            .context("Missing positive integer 'pr_number' for github_pr_merge")?;
+        let method = match args
+            .get("method")
+            .and_then(|v| v.as_str())
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .unwrap_or("squash")
+        {
+            s @ ("merge" | "squash" | "rebase") => s.to_string(),
+            other => bail!("Invalid merge 'method' '{}'; expected merge|squash|rebase", other),
+        };
+        let delete_branch = args
+            .get("delete_branch")
+            .and_then(|v| v.as_bool())
+            .unwrap_or(false);
+        let subject = args
+            .get("subject")
+            .and_then(|v| v.as_str())
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .map(str::to_string);
+        if let Some(ref s) = subject {
+            if s.contains('\0') || s.len() > 256 {
+                bail!("Invalid PR merge 'subject' (exceeds 256 bytes or contains NUL byte)");
+            }
+            ensure_no_dlp_secrets(&[s], "PR merge subject")?;
+        }
+        let body = args
+            .get("body")
+            .and_then(|v| v.as_str())
+            .map(str::to_string)
+            .filter(|s| !s.trim().is_empty());
+        if let Some(ref b) = body {
+            if b.contains('\0') || b.len() > 16 * 1024 {
+                bail!("Invalid PR merge 'body' (exceeds 16 KB limit or contains NUL byte)");
+            }
+            ensure_no_dlp_secrets(&[b], "PR merge body")?;
+        }
+
+        let canonical = serde_json::to_vec(&json!({
+            "repo": repo,
+            "pr_number": pr_number,
+            "method": method,
+            "delete_branch": delete_branch,
+            "subject": subject,
+            "body": body,
+        }))?;
+        let evidence_hash = hex::encode(Sha256::digest(&canonical));
+        let resource = format!("{repo}#pr:{pr_number}:merge");
+        let preview_diff = aos_core::FileDiffEntry {
+            relative_path: ".github/PR_MERGE_PLAN".to_string(),
+            change_type: DiffChangeType::Added,
+            old_size: None,
+            new_size: Some(canonical.len() as u64),
+            preview_diff: Some(format!(
+                "+Repo:          {}\n+PR Number:     #{}\n+Method:        {}\n+Delete Branch: {}\n+Subject:       {}\n\n{}",
+                repo,
+                pr_number,
+                method,
+                delete_branch,
+                subject.as_deref().unwrap_or("<default>"),
+                body.as_deref().unwrap_or("")
+            )),
+            old_sha256: None,
+            new_sha256: Some(format!("sha256:{}", evidence_hash)),
+        };
+        let meta = json!({
+            "repo": repo,
+            "pr_number": pr_number,
+            "method": method,
+            "delete_branch": delete_branch,
+            "subject": subject,
+            "body": body,
+            "evidence_hash": evidence_hash,
+            "evidence": {
+                "repo": repo,
+                "pr_number": pr_number,
+                "method": method,
+                "delete_branch": delete_branch,
+                "subject": subject,
+                "evidence_hash": evidence_hash,
+            },
+        });
+        let plan = GitHubPrMergePlan {
+            repo,
+            pr_number,
+            method,
+            delete_branch,
+            subject,
+            body,
             evidence_hash,
         };
         Ok((plan, resource, vec![preview_diff], meta))
@@ -4512,13 +4873,13 @@ impl AegisRuntimeKernel {
             .and_then(|v| v.as_str())
             .map(str::trim)
             .filter(|s| !s.is_empty())
-            .context("Missing 'manager' (expected npm, pnpm, yarn, bun, pip, uv, or cargo)")?
+            .context("Missing 'manager' (expected npm, pnpm, yarn, bun, pip, uv, cargo, or go)")?
             .to_ascii_lowercase();
         let registry_slice = aos_egress::registry_domains_for_ecosystem(&manager)
-            .filter(|_| matches!(manager.as_str(), "npm" | "pnpm" | "yarn" | "bun" | "pip" | "uv" | "cargo"))
+            .filter(|_| matches!(manager.as_str(), "npm" | "pnpm" | "yarn" | "bun" | "pip" | "uv" | "cargo" | "go"))
             .with_context(|| {
                 format!(
-                    "Unsupported package manager '{}'; expected npm, pnpm, yarn, bun, pip, uv, or cargo",
+                    "Unsupported package manager '{}'; expected npm, pnpm, yarn, bun, pip, uv, cargo, or go",
                     manager
                 )
             })?;
@@ -4538,6 +4899,21 @@ impl AegisRuntimeKernel {
                     "Invalid or unsafe package specifier '{}': flags, shell metacharacters, path traversal, and custom URLs are forbidden",
                     spec
                 );
+            }
+            if manager == "go" {
+                let first_seg = spec
+                    .split('@')
+                    .next()
+                    .unwrap_or(spec)
+                    .split('/')
+                    .next()
+                    .unwrap_or("");
+                if first_seg.is_empty() || !first_seg.contains('.') {
+                    bail!(
+                        "Invalid Go module specifier '{}': must begin with a qualified domain module path (e.g. github.com/pkg/errors@v0.9.1)",
+                        spec
+                    );
+                }
             }
         }
 
@@ -4622,6 +4998,11 @@ impl AegisRuntimeKernel {
             old_sha256: None,
             new_sha256: Some(format!("sha256:{}", evidence_hash)),
         };
+        let registries_val = if offline {
+            Vec::<String>::new()
+        } else {
+            registry_domains.clone()
+        };
         let meta = json!({
             "manager": manager,
             "cwd": cwd_rel,
@@ -4629,8 +5010,18 @@ impl AegisRuntimeKernel {
             "dev": dev,
             "allow_scripts": allow_scripts,
             "offline": offline,
-            "registry_domains": if offline { Vec::<String>::new() } else { registry_domains.clone() },
+            "registry_domains": registries_val,
             "evidence_hash": evidence_hash,
+            "evidence": {
+                "manager": manager,
+                "cwd": cwd_rel,
+                "packages": raw_packages,
+                "dev": dev,
+                "allow_scripts": allow_scripts,
+                "offline": offline,
+                "registry_domains": registries_val,
+                "evidence_hash": evidence_hash,
+            },
         });
         let sbx_cfg = env.sandbox.config();
         let plan = PkgInstallPlan {
@@ -4711,6 +5102,8 @@ impl AegisRuntimeKernel {
         let mut pre_import_plan: Option<ImportFilePlan> = None;
         let mut pre_ci_rerun_plan: Option<GitHubCiRerunPlan> = None;
         let mut pre_pr_create_plan: Option<GitHubPrCreatePlan> = None;
+        let mut pre_comment_create_plan: Option<GitHubCommentCreatePlan> = None;
+        let mut pre_pr_merge_plan: Option<GitHubPrMergePlan> = None;
         let mut pre_pkg_install_plan: Option<PkgInstallPlan> = None;
         if tool_name == "workspace_commit" {
             let filter_paths: Option<Vec<String>> = args
@@ -5095,6 +5488,34 @@ impl AegisRuntimeKernel {
             pre_commit_diffs = Some(diffs);
             pre_commit_evidence_hash = Some(plan.evidence_hash.clone());
             pre_pr_create_plan = Some(plan);
+        } else if tool_name == "github_comment_create" {
+            let (plan, resource, diffs, meta) =
+                Self::prepare_github_comment_create_plan(env.workspace.host_source_root(), &args)?;
+            target_resource = resource;
+            if let (Some(obj), Some(meta_obj)) =
+                (audit_metadata.as_object_mut(), meta.as_object())
+            {
+                for (k, v) in meta_obj {
+                    obj.insert(k.clone(), v.clone());
+                }
+            }
+            pre_commit_diffs = Some(diffs);
+            pre_commit_evidence_hash = Some(plan.evidence_hash.clone());
+            pre_comment_create_plan = Some(plan);
+        } else if tool_name == "github_pr_merge" {
+            let (plan, resource, diffs, meta) =
+                Self::prepare_github_pr_merge_plan(env.workspace.host_source_root(), &args)?;
+            target_resource = resource;
+            if let (Some(obj), Some(meta_obj)) =
+                (audit_metadata.as_object_mut(), meta.as_object())
+            {
+                for (k, v) in meta_obj {
+                    obj.insert(k.clone(), v.clone());
+                }
+            }
+            pre_commit_diffs = Some(diffs);
+            pre_commit_evidence_hash = Some(plan.evidence_hash.clone());
+            pre_pr_merge_plan = Some(plan);
         } else if tool_name == "pkg_install" {
             let (plan, resource, diffs, meta) = Self::prepare_pkg_install_plan(&env, &args)?;
             target_resource = resource;
@@ -5196,6 +5617,8 @@ impl AegisRuntimeKernel {
                             | "fs_import_file"
                             | "workspace_git"
                             | "github_pr_create"
+                            | "github_comment_create"
+                            | "github_pr_merge"
                             | "pkg_install"
                     ) {
                         if let Some(ref diffs) = pre_commit_diffs {
@@ -5850,6 +6273,18 @@ impl AegisRuntimeKernel {
             "github_pr_create" => {
                 let plan = pre_pr_create_plan.context("Missing pre-validated github_pr_create plan")?;
                 execute_github_pr_create(plan).await
+            }
+
+            "github_comment_create" => {
+                let plan = pre_comment_create_plan
+                    .context("Missing pre-validated github_comment_create plan")?;
+                execute_github_comment_create(plan).await
+            }
+
+            "github_pr_merge" => {
+                let plan = pre_pr_merge_plan
+                    .context("Missing pre-validated github_pr_merge plan")?;
+                execute_github_pr_merge(plan).await
             }
 
             "pkg_install" => {
@@ -7459,6 +7894,63 @@ impl AegisRuntimeKernel {
                     }
                 },
                 {
+                    "name": "github_comment_create",
+                    "description": "[Lease-Gated] Post a GitHub Pull Request or Issue comment after outbound DLP secret scanning and human approval (SHA-256 pinned to repo/number/body).",
+                    "inputSchema": {
+                        "type": "object",
+                        "properties": {
+                            "number": {
+                                "type": "integer",
+                                "description": "Target Pull Request or Issue number."
+                            },
+                            "body": {
+                                "type": "string",
+                                "description": "Markdown comment body (checked fail-closed by DLP)."
+                            },
+                            "repo": {
+                                "type": "string",
+                                "description": "GitHub repository slug (`owner/name`); defaults to host `origin`."
+                            }
+                        },
+                        "required": ["number", "body"]
+                    }
+                },
+                {
+                    "name": "github_pr_merge",
+                    "description": "[Lease-Gated · Destructive] Merge an approved GitHub Pull Request via the host broker after explicit human approval (SHA-256 pinned to pr_number/method/delete_branch/subject/body).",
+                    "inputSchema": {
+                        "type": "object",
+                        "properties": {
+                            "pr_number": {
+                                "type": "integer",
+                                "description": "Pull Request number to merge."
+                            },
+                            "method": {
+                                "type": "string",
+                                "enum": ["merge", "squash", "rebase"],
+                                "description": "Merge strategy (default: 'squash')."
+                            },
+                            "delete_branch": {
+                                "type": "boolean",
+                                "description": "Whether to delete the remote head branch after merge (default: false)."
+                            },
+                            "subject": {
+                                "type": "string",
+                                "description": "Optional custom merge commit subject (checked fail-closed by DLP)."
+                            },
+                            "body": {
+                                "type": "string",
+                                "description": "Optional custom merge commit message body (checked fail-closed by DLP)."
+                            },
+                            "repo": {
+                                "type": "string",
+                                "description": "GitHub repository slug (`owner/name`); defaults to host `origin`."
+                            }
+                        },
+                        "required": ["pr_number"]
+                    }
+                },
+                {
                     "name": "proc_exec",
                     "description": "[Zero-Prompt] PREFERRED over native shell tools (run_command/Bash): execute a command (e.g. `sh -c \"grep -rn foo crates | head\"`, `cargo test`) kernel-confined inside the Agent's OS sandbox. cwd = your CoW shadow workspace (with host `node_modules`/`.venv` auto-linked read-only); writes stay in the shadow until workspace_commit. Isolated 127.0.0.1 dev ports are exposed via `$AOS_DEV_PORT` and `$AOS_LOOPBACK_PORTS` (pass `loopback_ports` to reserve extra ports). For long-running tasks (>2m, e.g. online LLM benchmarks), pass `background: true` and poll status/output with `poll_pid`.",
                     "inputSchema": {
@@ -7479,13 +7971,13 @@ impl AegisRuntimeKernel {
                 },
                 {
                     "name": "pkg_install",
-                    "description": "[Lease-Gated] Install packages into the isolated CoW shadow workspace (`npm`/`pnpm`/`yarn`/`bun`/`pip`/`uv`/`cargo`) with unlinked dependency dirs (host stays untouched, CoW diff tracks only manifests/lockfiles) and an ephemeral registry-allowlisted egress proxy. Lifecycle scripts stay disabled by default (`allow_scripts: false`).",
+                    "description": "[Lease-Gated] Install packages into the isolated CoW shadow workspace (`npm`/`pnpm`/`yarn`/`bun`/`pip`/`uv`/`cargo`/`go`) with unlinked dependency dirs (host stays untouched, CoW diff tracks only manifests/lockfiles) and an ephemeral registry-allowlisted egress proxy. Lifecycle scripts stay disabled by default (`allow_scripts: false`).",
                     "inputSchema": {
                         "type": "object",
                         "properties": {
                             "manager": {
                                 "type": "string",
-                                "enum": ["npm", "pnpm", "yarn", "bun", "pip", "uv", "cargo"],
+                                "enum": ["npm", "pnpm", "yarn", "bun", "pip", "uv", "cargo", "go"],
                                 "description": "Package manager ecosystem to run inside the isolated CoW shadow."
                             },
                             "packages": {
@@ -13837,6 +14329,26 @@ mod tests {
                 .to_string();
             assert!(err.contains("Invalid or unsafe package specifier"), "{bad}: {err}");
         }
+        let go_bad = kernel
+            .call_tool(
+                &agent,
+                "pkg_install",
+                json!({ "manager": "go", "packages": ["localpkg"], "offline": true }),
+            )
+            .await
+            .unwrap_err()
+            .to_string();
+        assert!(go_bad.contains("qualified domain module path"), "{go_bad}");
+        let go_rel = kernel
+            .call_tool(
+                &agent,
+                "pkg_install",
+                json!({ "manager": "go", "packages": ["./localpkg"], "offline": true }),
+            )
+            .await
+            .unwrap_err()
+            .to_string();
+        assert!(go_rel.contains("Invalid or unsafe package specifier"), "{go_rel}");
 
         // 2. `allow_scripts: true` escalates to `pkg_install_scripts`.
         let ask_scripts = kernel
@@ -13900,5 +14412,99 @@ mod tests {
         assert!(invoked.contains("--ignore-scripts"), "{invoked}");
         assert!(invoked.contains("--offline"), "{invoked}");
         assert!(invoked.contains("fake-pkg"), "{invoked}");
+    }
+
+    #[tokio::test]
+    async fn test_github_comment_pr_merge_dlp_pinning_and_structured_evidence() {
+        let temp = tempfile::tempdir().unwrap();
+        let host_proj = temp.path().join("gh_proj");
+        std::fs::create_dir_all(host_proj.join(".git")).unwrap();
+        std::fs::write(
+            host_proj.join(".git/config"),
+            "[remote \"origin\"]\n\turl = git@github.com:heurion-org/demo-repo.git\n",
+        )
+        .unwrap();
+        std::fs::write(host_proj.join("README.md"), "# Demo\n").unwrap();
+
+        let kernel = AegisRuntimeKernel::new(temp.path().join("rt")).await.unwrap();
+        let agent = AgentIdentity::new("aegis-os", "agy-agent", "Coder");
+        kernel
+            .ensure_agent_environment(agent.clone(), &host_proj, IsolationTier::NativeOsSandbox, vec![])
+            .await
+            .unwrap();
+
+        // 1. DLP blocks leaked secrets in comment body & PR merge subject/body
+        let bad_comment = kernel
+            .call_tool(
+                &agent,
+                "github_comment_create",
+                json!({ "number": 12, "body": "Token ghp_RealSecretToken1234567890abcdef" }),
+            )
+            .await
+            .unwrap_err()
+            .to_string();
+        assert!(bad_comment.contains("DLP policy"), "{bad_comment}");
+
+        let bad_merge = kernel
+            .call_tool(
+                &agent,
+                "github_pr_merge",
+                json!({
+                    "pr_number": 12,
+                    "method": "squash",
+                    "subject": "Merge PR with AKIAIOSFODNN7EXAMPLE"
+                }),
+            )
+            .await
+            .unwrap_err()
+            .to_string();
+        assert!(bad_merge.contains("DLP policy"), "{bad_merge}");
+
+        // 2. github_comment_create populates PendingEscalation.evidence and #sha256: pins
+        let ask_comment = kernel
+            .call_tool(
+                &agent,
+                "github_comment_create",
+                json!({ "number": 12, "body": "Verified CI pass." }),
+            )
+            .await
+            .unwrap();
+        assert_eq!(ask_comment["status"], "approval_required");
+        let esc_c = ask_comment["escalation_id"].as_str().unwrap().to_string();
+        let escalations = kernel.policy.list_escalations("aegis-os").await.unwrap();
+        let rec_c = escalations.iter().find(|e| e.escalation_id == esc_c).unwrap();
+        let ev_c = rec_c.evidence.as_ref().expect("comment escalation must include evidence");
+        assert_eq!(ev_c["repo"], "heurion-org/demo-repo");
+        assert_eq!(ev_c["number"], 12);
+        let lease_c = kernel.policy.approve_escalation(&esc_c, 0, "user").await.unwrap();
+        assert!(lease_c.resource_pattern.contains("#sha256:"));
+
+        // 3. github_pr_merge populates structured evidence
+        let ask_merge = kernel
+            .call_tool(
+                &agent,
+                "github_pr_merge",
+                json!({ "pr_number": 12, "method": "squash", "delete_branch": true }),
+            )
+            .await
+            .unwrap();
+        assert_eq!(ask_merge["status"], "approval_required");
+        let esc_m = ask_merge["escalation_id"].as_str().unwrap().to_string();
+        let escalations = kernel.policy.list_escalations("aegis-os").await.unwrap();
+        let rec_m = escalations.iter().find(|e| e.escalation_id == esc_m).unwrap();
+        let ev_m = rec_m.evidence.as_ref().expect("merge escalation must include evidence");
+        assert_eq!(ev_m["pr_number"], 12);
+        assert_eq!(ev_m["method"], "squash");
+        assert_eq!(ev_m["delete_branch"], true);
+
+        // 4. Web approval templates render structured cards and forbid emojis on dashboard
+        assert!(approver::APPROVE_PAGE_HTML.contains("pkg_install_scripts"));
+        assert!(approver::APPROVE_PAGE_HTML.contains("github_pr_merge"));
+        assert!(approver::APPROVE_PAGE_HTML.contains("isHighRisk"));
+        let dash = paas::render_dashboard_html(&host_proj);
+        assert!(dash.contains("pkg_install_scripts"));
+        assert!(dash.contains("github_pr_merge"));
+        assert!(dash.contains("isHighRisk"));
+        assert!(!dash.chars().any(|c| ('\u{1F300}'..='\u{1FAFF}').contains(&c)));
     }
 }

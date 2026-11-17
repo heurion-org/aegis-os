@@ -2878,6 +2878,8 @@ pub async fn serve_unified_stdio(
                             | "workspace_git"
                             | "github_ci_rerun"
                             | "github_pr_create"
+                            | "github_comment_create"
+                            | "github_pr_merge"
                             | "pkg_install"
                     )
                         && consume_hook_commit_ticket(&runtime_dir, &identity.org_id)
@@ -2885,27 +2887,33 @@ pub async fn serve_unified_stdio(
                         let mut cur_esc = Some(esc_id);
                         for _ in 0..8 {
                             let Some(eid) = cur_esc.take() else { break };
-                            let is_sensitive = kernel
+                            let pending_action = kernel
                                 .policy
                                 .list_escalations(&identity.org_id)
                                 .await
                                 .unwrap_or_default()
-                                .iter()
-                                .any(|e| {
-                                    e.escalation_id == eid
-                                        && matches!(
-                                            e.action.as_str(),
-                                            "workspace_commit_sensitive"
-                                                | "workspace_git_sensitive"
-                                                | "pkg_install_scripts"
-                                        )
-                                });
+                                .into_iter()
+                                .find(|e| e.escalation_id == eid)
+                                .map(|e| e.action);
+                            let is_sensitive = matches!(
+                                pending_action.as_deref(),
+                                Some(
+                                    "workspace_commit_sensitive"
+                                        | "workspace_git_sensitive"
+                                        | "pkg_install_scripts"
+                                )
+                            );
                             if is_sensitive {
                                 break;
                             }
+                            let ttl_secs = if pending_action.as_deref() == Some("github_pr_merge") {
+                                0
+                            } else {
+                                900
+                            };
                             if kernel
                                 .policy
-                                .approve_escalation(&eid, 900, "ide-pretooluse-hook")
+                                .approve_escalation(&eid, ttl_secs, "ide-pretooluse-hook")
                                 .await
                                 .is_err()
                             {

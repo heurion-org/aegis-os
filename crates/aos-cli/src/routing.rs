@@ -400,6 +400,8 @@ fn host_boundary_reason(words: &[String], full_cmd: &str, host_root: &Path) -> O
                 ("run", "rerun") => "\n  • Tip: Use lease-gated MCP tool `mcp_aegis-os_github_ci_rerun` ({\"run_id\":<id>,\"failed_only\":true}) to rerun CI workflows via the host broker.",
                 ("run" | "workflow", _) => "\n  • Tip: Use zero-prompt MCP tool `mcp_aegis-os_github_ci_inspect` ({\"run_id\":<id>,\"failed_only\":true}) to inspect CI runs and failed logs safely without host `gh` execution.",
                 ("pr", "create") => "\n  • Tip: Use DLP-guarded MCP tool `mcp_aegis-os_github_pr_create` ({\"title\":...,\"body\":...}) to open Pull Requests via the host broker.",
+                ("pr", "merge") => "\n  • Tip: Use one-shot approved MCP tool `mcp_aegis-os_github_pr_merge` ({\"pr_number\":<id>,\"method\":\"squash\"}) to merge Pull Requests via the host broker.",
+                ("pr", "comment") | ("issue", "comment") => "\n  • Tip: Use DLP-guarded MCP tool `mcp_aegis-os_github_comment_create` ({\"number\":<id>,\"body\":...}) to comment on PRs or Issues via the host broker.",
                 ("pr", _) => "\n  • Tip: Use MCP tool `mcp_aegis-os_github_pr_inspect` ({\"pr_number\":<id>}) to list or inspect Pull Requests, checks, and diffs safely.",
                 ("issue", _) => "\n  • Tip: Use MCP tool `mcp_aegis-os_github_issue_inspect` ({\"issue_number\":<id>}) to list or inspect Issues safely.",
                 _ => "",
@@ -543,7 +545,7 @@ pub fn sandbox_redirect_reason(cmd: &str, shadow_root: &Path, host_root: &Path) 
                 .get(1)
                 .is_some_and(|sub| matches!(sub.as_str(), "pr" | "issue"))
     }) {
-        "\nTip: `~/.config/gh` and Keychain tokens are masked inside sandboxes; use mcp_aegis-os_github_pr_inspect / mcp_aegis-os_github_pr_create / mcp_aegis-os_github_issue_inspect via the host broker."
+        "\nTip: `~/.config/gh` and Keychain tokens are masked inside sandboxes; use mcp_aegis-os_github_pr_inspect / mcp_aegis-os_github_pr_create / mcp_aegis-os_github_comment_create / mcp_aegis-os_github_pr_merge / mcp_aegis-os_github_issue_inspect via the host broker."
     } else {
         ""
     };
@@ -558,10 +560,11 @@ pub fn sandbox_redirect_reason(cmd: &str, shadow_root: &Path, host_root: &Path) 
             Some("pip" | "pip3") => matches!(sub, Some("install")),
             Some("uv") => matches!(sub, Some("pip" | "add" | "sync")),
             Some("cargo") => matches!(sub, Some("fetch" | "add")),
+            Some("go") => matches!(sub, Some("get" | "mod")),
             _ => false,
         }
     }) {
-        "\nTip: registry traffic (`registry.npmjs.org` / `pypi.org` / `crates.io`) is blocked inside `proc_exec` without explicit approval; use mcp_aegis-os_pkg_install {\"manager\":\"<npm|pip|uv|cargo|...>\",\"packages\":[...]} via the host broker."
+        "\nTip: registry traffic (`registry.npmjs.org` / `pypi.org` / `crates.io` / `proxy.golang.org`) is blocked inside `proc_exec` without explicit approval; use mcp_aegis-os_pkg_install {\"manager\":\"<npm|pip|uv|cargo|go|...>\",\"packages\":[...]} via the host broker."
     } else {
         ""
     };
@@ -1101,6 +1104,8 @@ mod tests {
         assert!(pkg_reason.contains("mcp_aegis-os_pkg_install"), "{pkg_reason}");
         let pip_reason = sandbox_redirect_reason("pip install requests", &shadow(), Path::new("/repo"));
         assert!(pip_reason.contains("mcp_aegis-os_pkg_install"), "{pip_reason}");
+        let go_reason = sandbox_redirect_reason("go get github.com/spf13/cobra@v1.8.1", &shadow(), Path::new("/repo"));
+        assert!(go_reason.contains("mcp_aegis-os_pkg_install"), "{go_reason}");
     }
 
     #[test]

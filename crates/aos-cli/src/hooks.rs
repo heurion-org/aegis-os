@@ -22,13 +22,67 @@ fn hook_decision(effect: &str, reason: &str) -> Value {
     })
 }
 
-fn emit_hook_json(mut val: Value, is_claude: bool) -> anyhow::Result<()> {
+fn hook_allow_mcp(overrides: Vec<String>) -> Value {
+    json!({
+        "decision": "allow",
+        "permissionOverrides": overrides,
+        "claudeExplicitAllow": true
+    })
+}
+
+/// Normalize PreToolUse hook output for the active client schema:
+/// - Antigravity (`!is_claude`) uses top-level `decision`/`reason`/`permissionOverrides`/`injectSteps`/`overwrite`.
+/// - Claude Code (`is_claude`) treats top-level `decision` as legacy `"approve"|"block"` only and
+///   fails schema validation on `"allow"|"deny"|"ask"`, so it receives strictly `hookSpecificOutput`
+///   for `deny`/`ask`/explicit MCP `allow`, or `{}` for transparent pass-through.
+pub(crate) fn format_hook_output_json(mut val: Value, is_claude: bool) -> Value {
     if !is_claude {
         if let Some(obj) = val.as_object_mut() {
             obj.remove("hookSpecificOutput");
+            obj.remove("claudeExplicitAllow");
         }
+        return val;
     }
-    println!("{}", serde_json::to_string(&val)?);
+
+    let effect = val
+        .pointer("/hookSpecificOutput/permissionDecision")
+        .and_then(|v| v.as_str())
+        .or_else(|| val.get("decision").and_then(|v| v.as_str()))
+        .map(str::to_string);
+    let reason = val
+        .pointer("/hookSpecificOutput/permissionDecisionReason")
+        .and_then(|v| v.as_str())
+        .or_else(|| val.get("reason").and_then(|v| v.as_str()))
+        .unwrap_or("")
+        .to_string();
+    let explicit_allow = val
+        .get("claudeExplicitAllow")
+        .and_then(|v| v.as_bool())
+        .unwrap_or(false);
+
+    match effect.as_deref() {
+        Some("deny") | Some("ask") => json!({
+            "hookSpecificOutput": {
+                "hookEventName": "PreToolUse",
+                "permissionDecision": effect.unwrap_or_default(),
+                "permissionDecisionReason": reason
+            }
+        }),
+        Some("allow") if explicit_allow => json!({
+            "hookSpecificOutput": {
+                "hookEventName": "PreToolUse",
+                "permissionDecision": "allow"
+            }
+        }),
+        _ => json!({}),
+    }
+}
+
+fn emit_hook_json(val: Value, is_claude: bool) -> anyhow::Result<()> {
+    println!(
+        "{}",
+        serde_json::to_string(&format_hook_output_json(val, is_claude))?
+    );
     Ok(())
 }
 
@@ -350,12 +404,18 @@ async fn has_inline_approval_lease(
                 || (pat.ends_with('*') && canon_src.starts_with(pat.trim_end_matches('*')))
         });
     }
-    if matches!(sub_tool, "github_ci_rerun" | "github_pr_create") {
+    if matches!(
+        sub_tool,
+        "github_ci_rerun" | "github_pr_create" | "github_comment_create"
+    ) {
         return leases.iter().any(|l| {
             !l.resource_pattern.contains("#sha256:")
                 && !l.resource_pattern.starts_with("sha256:")
                 && l.action_pattern == "*"
         });
+    }
+    if sub_tool == "github_pr_merge" {
+        return false;
     }
     if sub_tool == "pkg_install" {
         let allow_scripts = inner_args
@@ -509,6 +569,40 @@ async fn build_boundary_approval_prompt(
         return format!(
             "[Aegis OS GitHub PR Creation Approval]\n  • What this does: Open GitHub Pull Request (`{}` -> `{}`) titled \"{}\" via agent `{}/{}`.\n  • Approval scope: Clicking Allow triggers PR creation via the host broker after DLP scanning.",
             head, base, title, identity.org_id, identity.agent_id
+        );
+    }
+
+    if sub_tool == "github_comment_create" {
+        let number = inner_args.get("number").and_then(|v| v.as_u64()).unwrap_or(0);
+        let preview: String = inner_args
+            .get("body")
+            .and_then(|v| v.as_str())
+            .unwrap_or("")
+            .chars()
+            .take(80)
+            .collect();
+        return format!(
+            "[Aegis OS GitHub Comment Approval]\n  • What this does: Post comment on GitHub Issue/PR `#{}` (\"{}\") via agent `{}/{}`.\n  • Approval scope: Clicking Allow posts this exact DLP-scanned comment via the host broker.",
+            number, preview, identity.org_id, identity.agent_id
+        );
+    }
+
+    if sub_tool == "github_pr_merge" {
+        let pr_number = inner_args
+            .get("pr_number")
+            .and_then(|v| v.as_u64())
+            .unwrap_or(0);
+        let method = inner_args
+            .get("method")
+            .and_then(|v| v.as_str())
+            .unwrap_or("squash");
+        let delete_branch = inner_args
+            .get("delete_branch")
+            .and_then(|v| v.as_bool())
+            .unwrap_or(false);
+        return format!(
+            "[DESTRUCTIVE: Aegis OS GitHub PR Merge Approval]\n  • What this does: {}-merge GitHub PR `#{}` (delete_branch={}) via agent `{}/{}`.\n  • Approval scope: One-shot approval (`#sha256:` pinned to PR/method/subject); merges the pull request on GitHub.",
+            method, pr_number, delete_branch, identity.org_id, identity.agent_id
         );
     }
 
@@ -772,6 +866,8 @@ pub(crate) async fn handle_agy_hook(
         &cli.runtime_dir,
     );
 
+    let is_claude_payload =
+        payload.get("tool_name").is_some() || cli.client.eq_ignore_ascii_case("claude");
     let session_key = aos_core::session::client_session_key();
     let kernel = AegisRuntimeKernel::new(&cli.runtime_dir).await?;
     let env = match kernel
@@ -786,13 +882,10 @@ pub(crate) async fn handle_agy_hook(
         Ok(env) => env,
         Err(_) => {
             if event == "PreToolUse" {
-                println!(
-                    "{}",
-                    serde_json::to_string(&json!({
-                        "decision": "allow",
-                        "permissionOverrides": ["mcp(aegis-os/*)"]
-                    }))?
-                );
+                emit_hook_json(
+                    hook_allow_mcp(vec!["mcp(aegis-os/*)".to_string()]),
+                    is_claude_payload,
+                )?;
             } else {
                 println!("{{}}");
             }
@@ -938,8 +1031,6 @@ pub(crate) async fn handle_agy_hook(
                     return Ok(());
                 }
             }
-            let is_claude_payload =
-                payload.get("tool_name").is_some() || cli.client.eq_ignore_ascii_case("claude");
             let tool_name = payload
                 .get("toolCall")
                 .and_then(|tc| tc.get("name"))
@@ -1071,6 +1162,8 @@ pub(crate) async fn handle_agy_hook(
                             | "workspace_git"
                             | "github_ci_rerun"
                             | "github_pr_create"
+                            | "github_comment_create"
+                            | "github_pr_merge"
                             | "pkg_install"
                     )
                         && use_inline_hook
@@ -1131,16 +1224,13 @@ pub(crate) async fn handle_agy_hook(
                         emit_hook_json(hook_decision("ask", &reason), is_claude_payload)?;
                         return Ok(());
                     }
-                    println!(
-                        "{}",
-                        serde_json::to_string(&json!({
-                            "decision": "allow",
-                            "permissionOverrides": [
-                                "mcp(aegis-os/*)",
-                                format!("mcp(aegis-os/{})", sub_tool)
-                            ]
-                        }))?
-                    );
+                    emit_hook_json(
+                        hook_allow_mcp(vec![
+                            "mcp(aegis-os/*)".to_string(),
+                            format!("mcp(aegis-os/{})", sub_tool),
+                        ]),
+                        is_claude_payload,
+                    )?;
                     return Ok(());
                 }
             }
@@ -1177,6 +1267,8 @@ pub(crate) async fn handle_agy_hook(
                         | "workspace_git"
                         | "github_ci_rerun"
                         | "github_pr_create"
+                        | "github_comment_create"
+                        | "github_pr_merge"
                         | "pkg_install"
                 )
                     && use_inline_hook
@@ -1229,16 +1321,13 @@ pub(crate) async fn handle_agy_hook(
                     emit_hook_json(hook_decision("ask", &reason), is_claude_payload)?;
                     return Ok(());
                 }
-                println!(
-                    "{}",
-                    serde_json::to_string(&json!({
-                        "decision": "allow",
-                        "permissionOverrides": [
-                            "mcp(aegis-os/*)",
-                            format!("mcp(aegis-os/{})", short_name)
-                        ]
-                    }))?
-                );
+                emit_hook_json(
+                    hook_allow_mcp(vec![
+                        "mcp(aegis-os/*)".to_string(),
+                        format!("mcp(aegis-os/{})", short_name),
+                    ]),
+                    is_claude_payload,
+                )?;
                 return Ok(());
             }
 
@@ -1293,7 +1382,7 @@ pub(crate) async fn handle_agy_hook(
                         || target_path.contains("/cow_workspace/")
                         || target_path.contains("/upper_workspace/")
                     {
-                        println!("{}", serde_json::to_string(&json!({ "decision": "allow" }))?);
+                        emit_hook_json(json!({ "decision": "allow" }), is_claude_payload)?;
                         return Ok(());
                     }
                     if let Ok(rel) = Path::new(target_path).strip_prefix(&effective_workspace) {
@@ -1301,18 +1390,18 @@ pub(crate) async fn handle_agy_hook(
                         if let Some(parent) = shadow_target.parent() {
                             let _ = std::fs::create_dir_all(parent);
                         }
-                        println!(
-                            "{}",
-                            serde_json::to_string(&json!({
+                        emit_hook_json(
+                            json!({
                                 "decision": "allow",
                                 "overwrite": {
                                     "Path": shadow_target.to_string_lossy().to_string()
                                 }
-                            }))?
-                        );
+                            }),
+                            is_claude_payload,
+                        )?;
                         return Ok(());
                     }
-                    println!("{}", serde_json::to_string(&json!({ "decision": "allow" }))?);
+                    emit_hook_json(json!({ "decision": "allow" }), is_claude_payload)?;
                     return Ok(());
                 }
 
@@ -1356,9 +1445,8 @@ pub(crate) async fn handle_agy_hook(
                 {
                     let shadow_dir = env.workspace.shadow_root().display();
                     let wrapped_cmd = format!("cd \"{}\" && {}", shadow_dir, cmd_line);
-                    println!(
-                        "{}",
-                        serde_json::to_string(&json!({
+                    emit_hook_json(
+                        json!({
                             "decision": "allow",
                             "permissionOverrides": [
                                 format!("command({})", wrapped_cmd),
@@ -1367,8 +1455,9 @@ pub(crate) async fn handle_agy_hook(
                             "overwrite": {
                                 "CommandLine": wrapped_cmd
                             }
-                        }))?
-                    );
+                        }),
+                        is_claude_payload,
+                    )?;
                     return Ok(());
                 }
 
@@ -1424,7 +1513,7 @@ pub(crate) async fn handle_agy_hook(
                 return Ok(());
             }
 
-            println!("{}", serde_json::to_string(&json!({ "decision": "allow" }))?);
+            emit_hook_json(json!({ "decision": "allow" }), is_claude_payload)?;
         }
 
         _ => {
@@ -1433,5 +1522,70 @@ pub(crate) async fn handle_agy_hook(
     }
 
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn claude_hook_output_omits_legacy_decision_and_agy_fields() {
+        let shadow = PathBuf::from("/tmp/cow_shadow");
+        let workspace = PathBuf::from("/tmp/repo");
+
+        let deny = routing::classify_run_command("ls", &shadow, &workspace)
+            .to_hook_decision(routing::RoutingMode::Enforce);
+        let deny_claude = format_hook_output_json(deny.clone(), true);
+        assert!(deny_claude.get("decision").is_none());
+        assert!(deny_claude.get("reason").is_none());
+        assert_eq!(deny_claude["hookSpecificOutput"]["hookEventName"], "PreToolUse");
+        assert_eq!(deny_claude["hookSpecificOutput"]["permissionDecision"], "deny");
+        assert!(deny_claude["hookSpecificOutput"]["permissionDecisionReason"]
+            .as_str()
+            .unwrap()
+            .contains("mcp_aegis-os_proc_exec"));
+
+        let ask = routing::classify_run_command("git push", &shadow, &workspace)
+            .to_hook_decision(routing::RoutingMode::Enforce);
+        let ask_claude = format_hook_output_json(ask.clone(), true);
+        assert!(ask_claude.get("decision").is_none());
+        assert!(ask_claude.get("reason").is_none());
+        assert_eq!(ask_claude["hookSpecificOutput"]["permissionDecision"], "ask");
+
+        let advise = routing::classify_run_command("ls", &shadow, &workspace)
+            .to_hook_decision(routing::RoutingMode::Advise);
+        let advise_claude = format_hook_output_json(advise.clone(), true);
+        assert_eq!(advise_claude, json!({}));
+
+        let pass_claude = format_hook_output_json(json!({ "decision": "allow" }), true);
+        assert_eq!(pass_claude, json!({}));
+
+        let mcp_allow = format_hook_output_json(
+            hook_allow_mcp(vec!["mcp(aegis-os/*)".to_string()]),
+            true,
+        );
+        assert!(mcp_allow.get("decision").is_none());
+        assert!(mcp_allow.get("permissionOverrides").is_none());
+        assert!(mcp_allow.get("claudeExplicitAllow").is_none());
+        assert_eq!(mcp_allow["hookSpecificOutput"]["permissionDecision"], "allow");
+
+        // AGY mode keeps top-level fields and strips Claude-only keys.
+        let deny_agy = format_hook_output_json(deny, false);
+        assert_eq!(deny_agy["decision"], "deny");
+        assert!(deny_agy.get("hookSpecificOutput").is_none());
+
+        let advise_agy = format_hook_output_json(advise, false);
+        assert_eq!(advise_agy["decision"], "allow");
+        assert!(advise_agy.get("injectSteps").is_some());
+
+        let mcp_agy = format_hook_output_json(
+            hook_allow_mcp(vec!["mcp(aegis-os/*)".to_string()]),
+            false,
+        );
+        assert_eq!(mcp_agy["decision"], "allow");
+        assert!(mcp_agy.get("permissionOverrides").is_some());
+        assert!(mcp_agy.get("claudeExplicitAllow").is_none());
+        assert!(mcp_agy.get("hookSpecificOutput").is_none());
+    }
 }
 

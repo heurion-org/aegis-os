@@ -449,9 +449,10 @@ pub const APPROVE_PAGE_HTML: &str = r##"<!doctype html>
   code, pre { font-family: var(--mono); font-size: 0.8rem; }
   code { background: var(--code-bg); padding: 2px 6px; border: 1px solid var(--line); word-break: break-all; }
   pre { background: #151C19; color: #F4F1EA; padding: 14px; border: 1px solid #151C19; overflow-x: auto; margin: 10px 0; }
-  .meta { display: grid; grid-template-columns: 130px 1fr; gap: 8px 14px; font-size: 0.85rem; margin: 14px 0; padding: 14px 16px; background: var(--bg); border: 1px solid var(--line); }
+  .meta { display: grid; grid-template-columns: 150px 1fr; gap: 8px 14px; font-size: 0.85rem; margin: 14px 0; padding: 14px 16px; background: var(--bg); border: 1px solid var(--line); }
   .meta dt { font-family: var(--mono); font-size: 0.72rem; letter-spacing: 0.08em; text-transform: uppercase; color: var(--ink-muted); }
   .meta dd { margin: 0; font-family: var(--mono); font-size: 0.8rem; color: var(--fg); word-break: break-all; }
+  .risk-banner { margin: 12px 0; padding: 10px 14px; background: rgba(161, 44, 44, 0.06); border: 1px solid rgba(161, 44, 44, 0.35); border-left: 3px solid #A12C2C; color: #7F1D1D; font: 500 0.84rem/1.45 var(--sans); }
   .row { display: flex; flex-wrap: wrap; gap: 10px; align-items: center; margin-top: 16px; }
   input[type="text"], input[type="password"], input[type="email"] {
     background: var(--bg); color: var(--fg); border: 1px solid var(--line); border-radius: 0;
@@ -721,16 +722,60 @@ pub const APPROVE_PAGE_HTML: &str = r##"<!doctype html>
     }
   }
 
+  function formatApprovalTitle(action) {
+    const titles = {
+      workspace_commit: 'Approve Host Workspace Commit',
+      workspace_commit_sensitive: 'HIGH RISK: Approve Sensitive Host Commit',
+      workspace_git: 'Approve Host Git Transaction',
+      workspace_git_sensitive: 'HIGH RISK: Approve Sensitive Git Transaction',
+      fs_import_file: 'Approve Host File Import',
+      fs_export_file: 'Approve Host File Export',
+      pkg_install: 'Approve Sandbox Package Install',
+      pkg_install_scripts: 'HIGH RISK: Approve Package Install With Lifecycle Scripts',
+      github_pr_create: 'Approve GitHub Pull Request Creation',
+      github_pr_merge: 'DESTRUCTIVE: Approve GitHub Pull Request Merge',
+      github_comment_create: 'Approve GitHub Issue / PR Comment',
+      github_ci_rerun: 'Approve GitHub Actions Workflow Rerun'
+    };
+    return titles[action] || ('Approve Boundary Action: ' + (action || 'syscall'));
+  }
+
   function renderEscalation(esc) {
     const card = document.createElement('div');
     card.className = 'card';
     card.id = 'card-' + esc.escalation_id;
 
+    const ev = esc.evidence || esc.metadata || {};
+    const isHighRisk = [
+      'workspace_commit_sensitive',
+      'workspace_git_sensitive',
+      'pkg_install_scripts',
+      'github_pr_merge'
+    ].includes(esc.action) || !!ev.allow_scripts || !!ev.force_push || !!ev.force_tag;
+
     const h = document.createElement('h1');
-    h.textContent = esc.action === 'workspace_commit'
-      ? 'Approve Host Workspace Commit'
-      : 'Approve Boundary Action: ' + esc.action;
+    if (isHighRisk) h.className = 'err';
+    h.textContent = formatApprovalTitle(esc.action);
     card.appendChild(h);
+
+    if (isHighRisk) {
+      const warn = document.createElement('div');
+      warn.className = 'risk-banner';
+      const reasons = [];
+      if (esc.action === 'pkg_install_scripts' || ev.allow_scripts) {
+        reasons.push('Lifecycle build/postinstall scripts execute arbitrary code');
+      }
+      if (esc.action === 'workspace_commit_sensitive' || esc.action === 'workspace_git_sensitive') {
+        reasons.push('Targets sensitive configuration, hook, or credential-adjacent paths');
+      }
+      if (ev.force_push) reasons.push('Includes destructive git force push');
+      if (ev.force_tag) reasons.push('Includes force tag overwrite');
+      if (esc.action === 'github_pr_merge') reasons.push('Destructive PR merge on remote repository');
+      warn.textContent = 'HIGH RISK · ONE-SHOT APPROVAL ONLY: ' +
+        (reasons.length ? reasons.join('; ') : 'Elevated security boundary review required') +
+        '. Time-window leases (15m / 1h) are disabled.';
+      card.appendChild(warn);
+    }
 
     const p = document.createElement('p');
     p.textContent = esc.reason || 'Human approval required by Aegis OS policy kernel.';
@@ -750,10 +795,40 @@ pub const APPROVE_PAGE_HTML: &str = r##"<!doctype html>
     if (esc.evidence_hash) {
       fields.push(['Evidence SHA-256', esc.evidence_hash]);
     }
-    const ev = esc.evidence || esc.metadata || {};
+    if (ev.manager) {
+      fields.push(['Package Manager', ev.manager]);
+      fields.push(['Target Subdir', ev.cwd || '.']);
+      fields.push(['Packages', Array.isArray(ev.packages) && ev.packages.length ? ev.packages.join(', ') : '<from manifest/lockfile>']);
+      fields.push(['Allow Scripts', ev.allow_scripts ? 'true (LIFECYCLE SCRIPTS ENABLED)' : 'false']);
+      fields.push(['Offline Mode', String(!!ev.offline)]);
+      if (Array.isArray(ev.registry_domains) && ev.registry_domains.length) {
+        fields.push(['Registries', ev.registry_domains.join(', ')]);
+      }
+    }
+    if (ev.repo) fields.push(['Repository', ev.repo]);
+    if (ev.pr_number !== undefined && ev.pr_number !== null) fields.push(['PR Number', '#' + ev.pr_number]);
+    if (ev.number !== undefined && ev.number !== null) fields.push(['Issue / PR', '#' + ev.number]);
+    if (ev.title) fields.push(['PR Title', ev.title]);
+    if (ev.head || ev.base) fields.push(['Branch Flow', (ev.head || '<current>') + ' -> ' + (ev.base || '<default>')]);
+    if (ev.draft !== undefined) fields.push(['Draft PR', String(!!ev.draft)]);
+    if (ev.method) fields.push(['Merge Method', ev.method]);
+    if (ev.delete_branch !== undefined) fields.push(['Delete Branch', String(!!ev.delete_branch)]);
+    if (ev.run_id !== undefined && ev.run_id !== null) fields.push(['Workflow Run', '#' + ev.run_id + (ev.failed_only ? ' (failed jobs)' : '')]);
+    if (ev.src_host_path) fields.push(['Host Source', ev.src_host_path]);
+    if (ev.import_to) fields.push(['Import Target', ev.import_to + ' -> ' + (ev.dst_path || '')]);
+    if (ev.dst_path && !ev.import_to) fields.push(['Destination', ev.dst_path]);
+    if (ev.size_bytes !== undefined && ev.size_bytes !== null) fields.push(['Size (bytes)', String(ev.size_bytes)]);
+    if (ev.src_sha256 || ev.sha256) fields.push(['Artifact SHA-256', ev.src_sha256 || ev.sha256]);
     if (Array.isArray(ev.paths) && ev.paths.length > 0) {
       fields.push(['Changed Files', ev.paths.join(', ')]);
     }
+    if (Array.isArray(ev.shadow_paths) && ev.shadow_paths.length > 0) {
+      fields.push(['Shadow Files', ev.shadow_paths.join(', ')]);
+    }
+    if (ev.branch) fields.push(['Target Branch', ev.branch]);
+    if (ev.commit_message) fields.push(['Commit Message', ev.commit_message]);
+    if (ev.tag) fields.push(['Git Tag', ev.tag + (ev.force_tag ? ' (FORCE TAG)' : '')]);
+    if (ev.push !== undefined) fields.push(['Git Push', String(!!ev.push) + (ev.force_push ? ' (FORCE PUSH)' : '')]);
     if (ev.host_root) {
       fields.push(['Host Repo', ev.host_root]);
     }
@@ -782,17 +857,19 @@ pub const APPROVE_PAGE_HTML: &str = r##"<!doctype html>
     btnOnce.onclick = () => decide(esc.escalation_id, 'approve', 0);
     row.appendChild(btnOnce);
 
-    const btn15m = document.createElement('button');
-    btn15m.className = 'secondary';
-    btn15m.textContent = 'Approve 15m';
-    btn15m.onclick = () => decide(esc.escalation_id, 'approve', 900);
-    row.appendChild(btn15m);
+    if (!isHighRisk) {
+      const btn15m = document.createElement('button');
+      btn15m.className = 'secondary';
+      btn15m.textContent = 'Approve 15m';
+      btn15m.onclick = () => decide(esc.escalation_id, 'approve', 900);
+      row.appendChild(btn15m);
 
-    const btnHour = document.createElement('button');
-    btnHour.className = 'secondary';
-    btnHour.textContent = 'Approve 1h';
-    btnHour.onclick = () => decide(esc.escalation_id, 'approve', 3600);
-    row.appendChild(btnHour);
+      const btnHour = document.createElement('button');
+      btnHour.className = 'secondary';
+      btnHour.textContent = 'Approve 1h';
+      btnHour.onclick = () => decide(esc.escalation_id, 'approve', 3600);
+      row.appendChild(btnHour);
+    }
 
     const btnDiff = document.createElement('button');
     btnDiff.className = 'secondary';

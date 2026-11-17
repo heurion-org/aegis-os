@@ -320,6 +320,16 @@
     }
     .esc-meta dt { color: var(--ink-muted); text-transform: uppercase; font-size: 0.68rem; }
     .esc-meta dd { margin: 0; color: var(--ink); word-break: break-all; }
+    .esc-risk-banner {
+      margin: 0.55rem 0;
+      padding: 0.55rem 0.85rem;
+      background: rgba(161, 44, 44, 0.06);
+      border: 1px solid rgba(161, 44, 44, 0.32);
+      border-left: 3px solid var(--danger);
+      color: var(--danger);
+      font-size: 0.78rem;
+      font-weight: 500;
+    }
     .diff-drawer {
       margin-top: 0.65rem;
       padding: 0.75rem 0.95rem;
@@ -1240,19 +1250,71 @@
       root.innerHTML = '';
 
       for (const esc of pageItems) {
+        const ev = esc.evidence || esc.metadata || {};
+        const isHighRisk = [
+          'workspace_commit_sensitive',
+          'workspace_git_sensitive',
+          'pkg_install_scripts',
+          'github_pr_merge'
+        ].includes(esc.action) || !!ev.allow_scripts || !!ev.force_push || !!ev.force_tag;
+
         const box = document.createElement('div');
         box.className = 'esc-card';
+        if (isHighRisk) {
+          box.style.borderLeftColor = 'var(--danger)';
+        }
 
         const title = document.createElement('div');
         title.style.cssText = 'display:flex; justify-content:space-between; align-items:center; gap:0.75rem; flex-wrap:wrap;';
-        title.innerHTML =
-          '<strong style="font-size:0.95rem; color:var(--ink);">' +
-            (esc.action === 'workspace_commit'
-              ? (currentLang === 'zh' ? '请求落盘合并至宿主机仓库 (workspace_commit)' : 'Approve Host Workspace Commit (workspace_commit)')
-              : (currentLang === 'zh' ? '请求执行受控动作：' : 'Approve Boundary Action: ') + (esc.action || 'syscall')) +
-          '</strong>' +
-          '<span class="badge badge-warn">' + (esc.escalation_id || '') + '</span>';
+        const titleMapZh = {
+          workspace_commit: '请求落盘合并至宿主机仓库 (workspace_commit)',
+          workspace_commit_sensitive: '高危：请求提交敏感或配置路径变更 (workspace_commit_sensitive)',
+          workspace_git: '请求执行宿主 Git 事务 (workspace_git)',
+          workspace_git_sensitive: '高危：请求执行含敏感路径或强推的 Git 事务 (workspace_git_sensitive)',
+          fs_import_file: '请求受控导入宿主机外部文件 (fs_import_file)',
+          fs_export_file: '请求受控导出产物到宿主机 (fs_export_file)',
+          pkg_install: '请求在隔离 Shadow 中安装依赖包 (pkg_install)',
+          pkg_install_scripts: '高危：请求启用生命周期脚本安装依赖包 (pkg_install_scripts)',
+          github_pr_create: '请求创建 GitHub Pull Request (github_pr_create)',
+          github_pr_merge: '高危破坏性操作：请求合并 GitHub PR (github_pr_merge)',
+          github_comment_create: '请求发表 GitHub Issue / PR 评论 (github_comment_create)',
+          github_ci_rerun: '请求重跑 GitHub Actions 工作流 (github_ci_rerun)'
+        };
+        const titleMapEn = {
+          workspace_commit: 'Approve Host Workspace Commit (workspace_commit)',
+          workspace_commit_sensitive: 'HIGH RISK: Approve Sensitive Host Commit',
+          workspace_git: 'Approve Host Git Transaction (workspace_git)',
+          workspace_git_sensitive: 'HIGH RISK: Approve Sensitive Git Transaction',
+          fs_import_file: 'Approve Host File Import (fs_import_file)',
+          fs_export_file: 'Approve Host File Export (fs_export_file)',
+          pkg_install: 'Approve Sandbox Package Install (pkg_install)',
+          pkg_install_scripts: 'HIGH RISK: Package Install With Lifecycle Scripts',
+          github_pr_create: 'Approve GitHub PR Creation (github_pr_create)',
+          github_pr_merge: 'DESTRUCTIVE: Approve GitHub PR Merge (github_pr_merge)',
+          github_comment_create: 'Approve GitHub Issue / PR Comment',
+          github_ci_rerun: 'Approve GitHub Actions CI Rerun'
+        };
+        const headingStrong = document.createElement('strong');
+        headingStrong.style.cssText = 'font-size:0.95rem; color:' + (isHighRisk ? 'var(--danger)' : 'var(--ink)') + ';';
+        headingStrong.textContent = currentLang === 'zh'
+          ? (titleMapZh[esc.action] || ('请求执行受控动作：' + (esc.action || 'syscall')))
+          : (titleMapEn[esc.action] || ('Approve Boundary Action: ' + (esc.action || 'syscall')));
+        title.appendChild(headingStrong);
+
+        const escBadge = document.createElement('span');
+        escBadge.className = 'badge badge-warn';
+        escBadge.textContent = esc.escalation_id || '';
+        title.appendChild(escBadge);
         box.appendChild(title);
+
+        if (isHighRisk) {
+          const warnBanner = document.createElement('div');
+          warnBanner.className = 'esc-risk-banner';
+          warnBanner.textContent = currentLang === 'zh'
+            ? '高危操作 · 仅限单次锁定审批（SHA-256 Pinned）：涉及生命周期脚本、敏感路径、强制推送或 PR 合并，已禁用 15m/1h 租约快捷放行。'
+            : 'HIGH RISK · ONE-SHOT APPROVAL ONLY: Lifecycle scripts, sensitive paths, force-push, or PR merge. 15m/1h window leases are disabled.';
+          box.appendChild(warnBanner);
+        }
 
         const dl = document.createElement('dl');
         dl.className = 'esc-meta';
@@ -1267,10 +1329,39 @@
         if (esc.evidence_hash) {
           rows.push(['SHA-256', esc.evidence_hash]);
         }
-        const ev = esc.evidence || esc.metadata || {};
+        if (ev.manager) {
+          rows.push([currentLang === 'zh' ? '包管理器' : 'Manager', ev.manager]);
+          rows.push([currentLang === 'zh' ? '目标目录' : 'Cwd', ev.cwd || '.']);
+          rows.push([currentLang === 'zh' ? '依赖包列表' : 'Packages', Array.isArray(ev.packages) && ev.packages.length ? ev.packages.join(', ') : '<manifest/lockfile>']);
+          rows.push([currentLang === 'zh' ? '生命周期脚本' : 'Allow Scripts', ev.allow_scripts ? 'true (HIGH RISK)' : 'false']);
+          rows.push([currentLang === 'zh' ? '离线模式' : 'Offline', String(!!ev.offline)]);
+          if (Array.isArray(ev.registry_domains) && ev.registry_domains.length) {
+            rows.push([currentLang === 'zh' ? '允许源域名' : 'Registries', ev.registry_domains.join(', ')]);
+          }
+        }
+        if (ev.repo) rows.push([currentLang === 'zh' ? '目标仓库' : 'Repository', ev.repo]);
+        if (ev.pr_number !== undefined && ev.pr_number !== null) rows.push(['PR', '#' + ev.pr_number]);
+        if (ev.number !== undefined && ev.number !== null) rows.push(['Issue / PR', '#' + ev.number]);
+        if (ev.title) rows.push([currentLang === 'zh' ? 'PR 标题' : 'PR Title', ev.title]);
+        if (ev.head || ev.base) rows.push([currentLang === 'zh' ? '分支流向' : 'Branches', (ev.head || '<current>') + ' -> ' + (ev.base || '<default>')]);
+        if (ev.draft !== undefined) rows.push(['Draft', String(!!ev.draft)]);
+        if (ev.method) rows.push([currentLang === 'zh' ? '合并方式' : 'Merge Method', ev.method]);
+        if (ev.delete_branch !== undefined) rows.push([currentLang === 'zh' ? '删除源分支' : 'Delete Branch', String(!!ev.delete_branch)]);
+        if (ev.run_id !== undefined && ev.run_id !== null) rows.push(['Run ID', '#' + ev.run_id]);
+        if (ev.src_host_path) rows.push([currentLang === 'zh' ? '宿主机源文件' : 'Host Source', ev.src_host_path]);
+        if (ev.import_to) rows.push([currentLang === 'zh' ? '导入目标' : 'Import To', ev.import_to + ' -> ' + (ev.dst_path || '')]);
+        if (ev.size_bytes !== undefined && ev.size_bytes !== null) rows.push([currentLang === 'zh' ? '文件大小(B)' : 'Size (bytes)', String(ev.size_bytes)]);
+        if (ev.src_sha256 || ev.sha256) rows.push(['Artifact SHA-256', ev.src_sha256 || ev.sha256]);
         if (Array.isArray(ev.paths) && ev.paths.length) {
           rows.push(['Files', ev.paths.join(', ')]);
         }
+        if (Array.isArray(ev.shadow_paths) && ev.shadow_paths.length) {
+          rows.push(['Shadow Files', ev.shadow_paths.join(', ')]);
+        }
+        if (ev.branch) rows.push(['Branch', ev.branch]);
+        if (ev.commit_message) rows.push(['Commit Msg', ev.commit_message]);
+        if (ev.tag) rows.push(['Tag', ev.tag + (ev.force_tag ? ' (FORCE)' : '')]);
+        if (ev.push !== undefined) rows.push(['Push', String(!!ev.push) + (ev.force_push ? ' (FORCE)' : '')]);
         if (esc.reason) {
           rows.push(['Reason', esc.reason]);
         }
@@ -1302,17 +1393,19 @@
         bOnce.onclick = () => decideEscalation(esc.escalation_id, 'approve', 0);
         actions.appendChild(bOnce);
 
-        const b15m = document.createElement('button');
-        b15m.className = 'btn btn-ghost';
-        b15m.textContent = currentLang === 'zh' ? '批准 15 分钟' : 'Approve 15m';
-        b15m.onclick = () => decideEscalation(esc.escalation_id, 'approve', 900);
-        actions.appendChild(b15m);
+        if (!isHighRisk) {
+          const b15m = document.createElement('button');
+          b15m.className = 'btn btn-ghost';
+          b15m.textContent = currentLang === 'zh' ? '批准 15 分钟' : 'Approve 15m';
+          b15m.onclick = () => decideEscalation(esc.escalation_id, 'approve', 900);
+          actions.appendChild(b15m);
 
-        const bHour = document.createElement('button');
-        bHour.className = 'btn btn-ghost';
-        bHour.textContent = currentLang === 'zh' ? '批准 1 小时' : 'Approve 1h';
-        bHour.onclick = () => decideEscalation(esc.escalation_id, 'approve', 3600);
-        actions.appendChild(bHour);
+          const bHour = document.createElement('button');
+          bHour.className = 'btn btn-ghost';
+          bHour.textContent = currentLang === 'zh' ? '批准 1 小时' : 'Approve 1h';
+          bHour.onclick = () => decideEscalation(esc.escalation_id, 'approve', 3600);
+          actions.appendChild(bHour);
+        }
 
         const bDiff = document.createElement('button');
         bDiff.className = 'btn btn-ghost';

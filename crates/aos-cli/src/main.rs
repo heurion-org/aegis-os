@@ -729,17 +729,21 @@ enum Commands {
     /// Run a complete end-to-end simulation of heterogeneous Agents (`agy` + `claude` + `codex`) collaborating
     Demo,
 
-    /// [Internal] Linux in-sandbox egress shim: relays a loopback proxy port to the host egress
-    /// bridge over a Unix socket, then runs a command. Spawned by `aos-sandbox`, not for direct use.
+    /// [Internal] Linux in-sandbox egress & preview shim: relays loopback proxy/preview ports over
+    /// Unix sockets between host and sandbox netns, then runs a command. Spawned by `aos-sandbox`
+    /// or `aos run`, not for direct use.
     #[command(hide = true)]
     EgressShim {
-        /// Loopback `host:port` to listen on inside the sandbox network namespace
+        /// Optional loopback `host:port` to listen on inside the sandbox network namespace
         #[arg(long)]
-        listen: String,
-        /// Unix socket of the host-side egress bridge
+        listen: Option<String>,
+        /// Optional Unix socket of the host-side egress bridge
         #[arg(long)]
-        unix: PathBuf,
-        /// Command (and arguments) to run once the relay is listening
+        unix: Option<PathBuf>,
+        /// Optional host->sandbox preview relays (`<port>:<unix_sock_path>`)
+        #[arg(long = "preview")]
+        preview: Vec<String>,
+        /// Command (and arguments) to run once the relays are listening
         #[arg(trailing_var_arg = true, allow_hyphen_values = true, required = true)]
         cmd: Vec<String>,
     },
@@ -2537,8 +2541,30 @@ async fn main() -> anyhow::Result<()> {
     let mut cli = Cli::parse();
     // The in-sandbox shim must not resolve identities or touch runtime state; it only relays a port
     // and runs the user's command, then exits with that command's status.
-    if let Commands::EgressShim { listen, unix, cmd } = &cli.command {
-        let code = aos_sandbox::bridge::run_shim(listen, unix, cmd).await?;
+    if let Commands::EgressShim {
+        listen,
+        unix,
+        preview,
+        cmd,
+    } = &cli.command
+    {
+        let mut parsed_previews = Vec::with_capacity(preview.len());
+        for spec in preview {
+            let Some((port_str, sock_str)) = spec.split_once(':') else {
+                anyhow::bail!("egress-shim: invalid --preview specifier '{spec}' (expected <port>:<sock>)");
+            };
+            let port: u16 = port_str
+                .parse()
+                .map_err(|e| anyhow::anyhow!("egress-shim: invalid preview port '{port_str}': {e}"))?;
+            parsed_previews.push((port, PathBuf::from(sock_str)));
+        }
+        let code = aos_sandbox::bridge::run_shim_with_previews(
+            listen.as_deref(),
+            unix.as_deref(),
+            &parsed_previews,
+            cmd,
+        )
+        .await?;
         std::process::exit(code);
     }
     if let Commands::McpBridge = &cli.command {

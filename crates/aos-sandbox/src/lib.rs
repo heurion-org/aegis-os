@@ -41,6 +41,23 @@ impl Drop for EgressBridge {
     }
 }
 
+/// Host-side half of inward host->sandbox `127.0.0.1` preview port relays on Linux (`bwrap --unshare-net`).
+struct PreviewBridge {
+    handles: Vec<tokio::task::JoinHandle<()>>,
+    token: String,
+    relays: Vec<(u16, PathBuf)>,
+    temp_dir: PathBuf,
+}
+
+impl Drop for PreviewBridge {
+    fn drop(&mut self) {
+        for handle in &self.handles {
+            handle.abort();
+        }
+        let _ = std::fs::remove_dir_all(&self.temp_dir);
+    }
+}
+
 /// Bubblewrap is looked up only at fixed system paths; resolving it through `PATH` would let
 /// whoever controls the server's environment substitute an unconfined `bwrap`.
 pub fn linux_bwrap_path() -> Option<&'static str> {
@@ -703,6 +720,59 @@ impl NativeOsSandboxInstance {
         }
     }
 
+    fn start_preview_bridge(&self, ports: &[u16]) -> Option<(PreviewBridge, PathBuf)> {
+        if ports.is_empty() {
+            return None;
+        }
+        let exe = std::env::current_exe().ok()?;
+        let exe_name = exe.file_name()?.to_string_lossy();
+        if !matches!(exe_name.as_ref(), "aegis-os" | "aos" | "aegis-os.exe")
+            && !exe_name.starts_with("aegis-os-")
+        {
+            return None;
+        }
+        let dir = PathBuf::from(format!(
+            "/tmp/aos-prv-{}",
+            &Uuid::new_v4().simple().to_string()[..12]
+        ));
+        std::fs::create_dir_all(&dir).ok()?;
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let _ = std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o700));
+        }
+        let token = bridge::new_token();
+        let mut handles = Vec::new();
+        let mut relays = Vec::new();
+        for &port in ports {
+            let sock = dir.join(format!("p{port}.s"));
+            match bridge::spawn_host_preview_bridge(port, sock.clone(), token.clone()) {
+                Ok((_, h)) => {
+                    handles.push(h);
+                    relays.push((port, sock));
+                }
+                Err(err) => {
+                    eprintln!(
+                        "[aos-sandbox] skipping host preview forward for 127.0.0.1:{port}: {err}"
+                    );
+                }
+            }
+        }
+        if handles.is_empty() {
+            let _ = std::fs::remove_dir_all(&dir);
+            return None;
+        }
+        Some((
+            PreviewBridge {
+                handles,
+                token,
+                relays,
+                temp_dir: dir,
+            },
+            exe,
+        ))
+    }
+
     /// Safe read-only compiler/toolchain subdirectories re-exposed after masking a host `$HOME` with `--tmpfs`.
     /// Note that `.cargo/credentials.toml`, `.cargo/credentials`, and sensitive `.local/share` subtrees
     /// (such as `keyrings`, `kwalletd`, shell histories) are intentionally excluded.
@@ -1215,8 +1285,10 @@ impl SandboxInstance for NativeOsSandboxInstance {
         let kernel_sandbox_disabled = aos_core::ablated("kernel_sandbox");
 
         let start = Instant::now();
-        // Kept alive until this call returns so the relay outlives the sandboxed command.
+        // Kept alive until this call returns (or background child exits) so relays outlive the command.
         let mut egress_bridge: Option<EgressBridge> = None;
+        let mut preview_bridge: Option<PreviewBridge> = None;
+        let active_loopback_ports = self.allocated_loopback_ports();
         let nested_bg_inherited = spec.background
             && std::env::var("AEGIS_ALLOW_NESTED_TEST_SANDBOX").as_deref() == Ok("1")
             && std::env::var("AOS_SANDBOX_ID").is_ok();
@@ -1234,9 +1306,11 @@ impl SandboxInstance for NativeOsSandboxInstance {
         {
             let mut bwrap_args = self.generate_linux_bwrap_args();
             let mut shim_prefix: Vec<std::ffi::OsString> = Vec::new();
-            // `--unshare-net` also cuts the sandbox off from its own proxy; relay through the
-            // Unix-socket bridge so it can reach exactly that proxy and nothing else.
+            // `--unshare-net` cuts the sandbox off from its proxy and isolates loopback `lo`;
+            // relay outbound proxy traffic and inward allocated preview ports through `egress-shim`.
             if !aos_core::ablated("net_isolation") {
+                let mut shim_exe: Option<PathBuf> = None;
+                let mut shim_args: Vec<std::ffi::OsString> = Vec::new();
                 if let Some(proxy) = self.config.egress_proxy_addr.as_deref() {
                     if let Some((guard, exe)) = self.start_egress_bridge(proxy) {
                         if let Some(ref dir) = guard.temp_dir {
@@ -1249,16 +1323,40 @@ impl SandboxInstance for NativeOsSandboxInstance {
                                 d,
                             ]);
                         }
-                        shim_prefix.extend([
-                            exe.into_os_string(),
-                            "egress-shim".into(),
+                        shim_args.extend([
                             "--listen".into(),
                             bridge::proxy_host_port(proxy).into(),
                             "--unix".into(),
                             guard.sock.clone().into_os_string(),
-                            "--".into(),
                         ]);
+                        shim_exe = Some(exe);
                         egress_bridge = Some(guard);
+                    }
+                }
+                if let Some((pguard, exe)) = self.start_preview_bridge(&active_loopback_ports) {
+                    let d = pguard.temp_dir.display().to_string();
+                    bwrap_args.extend([
+                        "--dir".to_string(),
+                        d.clone(),
+                        "--bind".to_string(),
+                        d.clone(),
+                        d,
+                    ]);
+                    for (port, sock) in &pguard.relays {
+                        shim_args.push("--preview".into());
+                        shim_args.push(format!("{port}:{}", sock.display()).into());
+                    }
+                    if shim_exe.is_none() {
+                        shim_exe = Some(exe);
+                    }
+                    preview_bridge = Some(pguard);
+                }
+                if !shim_args.is_empty() {
+                    if let Some(exe) = shim_exe {
+                        shim_prefix.push(exe.into_os_string());
+                        shim_prefix.push("egress-shim".into());
+                        shim_prefix.extend(shim_args);
+                        shim_prefix.push("--".into());
                     }
                 }
             }
@@ -1364,7 +1462,6 @@ impl SandboxInstance for NativeOsSandboxInstance {
             cmd.env("HTTP_PROXY", proxy).env("HTTPS_PROXY", proxy);
         }
 
-        let active_loopback_ports = self.allocated_loopback_ports();
         if let Some(&first_port) = active_loopback_ports.first() {
             let joined: Vec<String> = active_loopback_ports
                 .iter()
@@ -1389,6 +1486,8 @@ impl SandboxInstance for NativeOsSandboxInstance {
                     | "AOS_ORG_AGENT_PUB"
                     | "AOS_ADMIN_SECRET"
                     | "AOS_REQUEST_LOOPBACK_PORTS"
+                    | "AOS_BRIDGE_TOKEN"
+                    | "AOS_PREVIEW_TOKEN"
                     | "SSH_AUTH_SOCK"
                     | "SSH_AGENT_PID"
                     | "LD_PRELOAD"
@@ -1404,6 +1503,9 @@ impl SandboxInstance for NativeOsSandboxInstance {
 
         if let Some(ref guard) = egress_bridge {
             cmd.env(bridge::BRIDGE_TOKEN_ENV, &guard.token);
+        }
+        if let Some(ref pguard) = preview_bridge {
+            cmd.env(bridge::PREVIEW_TOKEN_ENV, &pguard.token);
         }
 
         if spec.background {
@@ -1436,6 +1538,7 @@ impl SandboxInstance for NativeOsSandboxInstance {
             let active_pgids = self.active_pgids.clone();
             tokio::spawn(async move {
                 let _keep_bridge = egress_bridge;
+                let _keep_preview = preview_bridge;
                 if let Ok(status) = child.wait().await {
                     let code = status.code().unwrap_or(-1);
                     let _ = tokio::fs::write(&pid_exit, code.to_string()).await;

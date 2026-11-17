@@ -135,9 +135,9 @@ Measured multi-agent auto-merge: **98.7%** without human intervention; the remai
 
 ## 7. Sandbox and egress
 
-- **Linux enforced launcher** — `bwrap >= 0.10` (`--bind-fd`) with a read-only root view (`--ro-bind / /`), `$HOME`/system-directory `--tmpfs` masking (including `/run`; DNS is resolved host-side by the egress bridge), read-only toolchains, layered CLI runtime state mounts with single-file `--ro-bind` config locks, Git read-only object pass-through + per-session `GIT_INDEX_FILE`, `--unshare-net` Unix-bridge egress (with `isolate_loopback_only` omitting `--share-net` even when no proxy is configured so local `lo` stays isolated), and process-group lifecycle.
+- **Linux enforced launcher** — `bwrap >= 0.10` (`--bind-fd`) with a read-only root view (`--ro-bind / /`), `$HOME`/system-directory `--tmpfs` masking (including `/run`; DNS is resolved host-side by the egress bridge), read-only toolchains, layered CLI runtime state mounts with single-file `--ro-bind` config locks, Git read-only object pass-through + per-session `GIT_INDEX_FILE`, `--unshare-net` Unix-bridge egress (with `isolate_loopback_only` omitting `--share-net` even when no proxy is configured so local `lo` stays isolated, plus an inward token-authenticated `egress-shim --preview` relay for host browser preview of `127.0.0.1:$AOS_DEV_PORT`), and process-group lifecycle.
 - **macOS enforced launcher & `proc_exec`** — Seatbelt (`sandbox-exec`) confines both `aegis-os run` and `proc_exec`: shadow `cwd`, read-only host project, canonicalized Darwin runtime/temp paths, default-tightened host `$HOME` read isolation (`tighten_home_read: true`, re-exposing only active shadow/host project roots, `agent_home`, `org_shared_ro`/`org_agent_pub`, and `SAFE_TOOLCHAIN_SUBDIRS`) paired with explicit `file-read*`/`file-write*` deny rules on `~/.ssh`, `~/.aws`, `~/.gnupg`, `~/.kube`, `*/.env*`, `~/.aegis/**/human.token`, `~/.config/aegis-os/master.kek`, `vaults/*.dek.enc.json`, vault backing images, and volume utilities (`hdiutil` / `diskutil`), scoped `127.0.0.1` loopback port allowlisting (`(deny network-bind (local ip))`, `(deny network-inbound (local ip))`, `(deny network-outbound)` + per-port `localhost:<port>` rules surfaced via `$AOS_DEV_PORT` / `$AOS_LOOPBACK_PORTS` and `proc_exec.loopback_ports`), read-only `.aegis-bin` Git shim (`core.fsmonitor=false`, `core.hooksPath=/dev/null`), and PTY forwarding. Full macOS VFS path-remapping at the original host path remains Phase 4.
-- **Egress & package installation (`pkg_install`)** — identity-pinned L4 `CONNECT` proxy + domain allowlist for general HTTPS (host loopback is unreachable), a **Model API Base-URL L7 reverse proxy** (`ANTHROPIC_BASE_URL`, `OPENAI_BASE_URL`, `GOOGLE_GEMINI_BASE_URL`, with `AOS_UPSTREAM_*_URL` routing) enforcing method/path allowlists, L7 request-body DLP, zero-buffered SSE streaming (`+0.221 ms` TTFT overhead), and `$AOS_SECRET_*` boundary secret injection, plus **ephemeral registry-allowlisted proxies for `pkg_install`** (`npm`/`pnpm`/`yarn`/`bun`/`pip`/`uv`/`cargo` via `registry_domains_for_ecosystem`, CoW dependency directory unlinking via `isolate_shadow_dependency_dir`, `#sha256:` manifest pinning, and `pkg_install_scripts` escalation when `allow_scripts: true`). All external Git/GitHub responses and logs pass through the unified `aos-egress` `inspect_payload_dlp` / `redact_dlp_secrets` engine.
+- **Egress & package installation (`pkg_install`)** — identity-pinned L4 `CONNECT` proxy + domain allowlist for general HTTPS (host loopback is unreachable), a **Model API Base-URL L7 reverse proxy** (`ANTHROPIC_BASE_URL`, `OPENAI_BASE_URL`, `GOOGLE_GEMINI_BASE_URL`, with `AOS_UPSTREAM_*_URL` routing) enforcing method/path allowlists, L7 request-body DLP, zero-buffered SSE streaming (`+0.221 ms` TTFT overhead), and `$AOS_SECRET_*` boundary secret injection, plus **ephemeral registry-allowlisted proxies for `pkg_install`** (`npm`/`pnpm`/`yarn`/`bun`/`pip`/`uv`/`cargo`/`go` via `registry_domains_for_ecosystem`, CoW dependency directory unlinking via `isolate_shadow_dependency_dir`, `#sha256:` manifest pinning, and `pkg_install_scripts` escalation when `allow_scripts: true`). All external Git/GitHub responses and logs pass through the unified `aos-egress` `inspect_payload_dlp` / `redact_dlp_secrets` engine.
 - **Egress Phase 2 remaining** — opt-in MITM CA inspection for arbitrary non-model third-party HTTPS endpoints.
 - **Process lifecycle** — active sandbox process groups support real `SIGSTOP` / `SIGCONT` / `SIGKILL` for pause/resume/destroy.
 
@@ -156,19 +156,19 @@ Policy is evaluated over **effects × scope × reversibility**, not client tool 
 | **R3** | Declarative Cedar green-zone auto-allow; zero prompts. |
 | **R4** | Human-readable escalation with a 30-minute ticket TTL. |
 
-Approvals are available through the local CLI, the web console (`/approve`, `/dashboard`), and cloud TOTP (tenant key + authenticator code). Human-only tools (`policy_approve_escalation`, `policy_grant_lease`) are never exposed over MCP.
+Approvals are available through the local CLI, the web console (`/approve`, `/dashboard`, which renders structured approval cards from `PendingEscalation.evidence` and enforces one-shot SHA-256 approval by disabling 15m/1h leases for high-risk actions such as `pkg_install_scripts`, `workspace_commit_sensitive`, `workspace_git_sensitive`, and `github_pr_merge`), and cloud TOTP (tenant key + authenticator code). Human-only tools (`policy_approve_escalation`, `policy_grant_lease`) are never exposed over MCP.
 
 ---
 
 ## 9. MCP and A2A surface
 
-Aegis exposes **50 MCP tools** plus **7 dynamic URI resources**. Grouped by subsystem:
+Aegis exposes **52 MCP tools** plus **7 dynamic URI resources**. Grouped by subsystem:
 
 | Subsystem | Tools |
 |---|---|
 | Transactional VFS & host bridge (9) | `fs_read`, `fs_write`, `fs_edit`, `fs_delete`, `fs_glob`, `fs_export_file`, `fs_import_file`, `workspace_status`, `workspace_sync` |
 | Snapshots / merge / PR / switch (6) | `workspace_snapshot`, `workspace_diff`, `workspace_rollback`, `workspace_commit`, `workspace_export_pr`, `workspace_switch` |
-| Git & GitHub host broker (7) | `workspace_git_inspect`, `workspace_git`, `github_ci_inspect`, `github_ci_rerun`, `github_pr_inspect`, `github_issue_inspect`, `github_pr_create` |
+| Git & GitHub host broker (9) | `workspace_git_inspect`, `workspace_git`, `github_ci_inspect`, `github_ci_rerun`, `github_pr_inspect`, `github_issue_inspect`, `github_pr_create`, `github_comment_create`, `github_pr_merge` |
 | Sandbox & packages (2) | `proc_exec`, `pkg_install` |
 | IPC / claims (11) | `ipc_send`, `ipc_recv`, `ipc_request`, `ipc_reply`, `ipc_ack`, `ipc_wait`, `ipc_publish`, `ipc_subscribe`, `ipc_list_peers`, `coord_claim`, `coord_release` |
 | A2A (4 + HTTP) | `ipc_update_card`, `ipc_task_update`, `ipc_task_get`, `ipc_task_list`; `GET /.well-known/agent.json`, `POST /a2a`, `POST /v1/a2a` |
