@@ -185,6 +185,8 @@ impl SessionBroker {
                 org_shared_ro_dir: org_shared_ro,
                 org_agent_pub_dir: org_agent_pub,
                 egress_proxy_addr: egress_proxy,
+                host_source_dir: Some(PathBuf::from(&session.workspace)),
+                tighten_home_read: true,
             })
             .await?;
         kernel

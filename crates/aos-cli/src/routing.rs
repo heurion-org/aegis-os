@@ -394,8 +394,16 @@ fn host_boundary_reason(words: &[String], full_cmd: &str, host_root: &Path) -> O
         _ => false,
     };
     hit.then(|| {
-        let ci_tip = if cmd == "gh" && matches!(sub, "run" | "workflow") {
-            "\n  • Tip: Use zero-prompt MCP tool `mcp_aegis-os_github_ci_inspect` ({\"run_id\":<id>,\"failed_only\":true}) to inspect CI runs and failed logs safely without host `gh` execution."
+        let ci_tip = if cmd == "gh" {
+            let sub2 = words.get(2).map(|s| s.as_str()).unwrap_or("");
+            match (sub, sub2) {
+                ("run", "rerun") => "\n  • Tip: Use lease-gated MCP tool `mcp_aegis-os_github_ci_rerun` ({\"run_id\":<id>,\"failed_only\":true}) to rerun CI workflows via the host broker.",
+                ("run" | "workflow", _) => "\n  • Tip: Use zero-prompt MCP tool `mcp_aegis-os_github_ci_inspect` ({\"run_id\":<id>,\"failed_only\":true}) to inspect CI runs and failed logs safely without host `gh` execution.",
+                ("pr", "create") => "\n  • Tip: Use DLP-guarded MCP tool `mcp_aegis-os_github_pr_create` ({\"title\":...,\"body\":...}) to open Pull Requests via the host broker.",
+                ("pr", _) => "\n  • Tip: Use MCP tool `mcp_aegis-os_github_pr_inspect` ({\"pr_number\":<id>}) to list or inspect Pull Requests, checks, and diffs safely.",
+                ("issue", _) => "\n  • Tip: Use MCP tool `mcp_aegis-os_github_issue_inspect` ({\"issue_number\":<id>}) to list or inspect Issues safely.",
+                _ => "",
+            }
         } else {
             ""
         };
@@ -488,7 +496,7 @@ pub fn sandbox_redirect_reason(cmd: &str, shadow_root: &Path, host_root: &Path) 
         .any(|s| leading_words(s).1.first().map(|w| basename(w) == "git").unwrap_or(false))
     {
         format!(
-            "\nNote: the shadow has no .git; for read-only git use `git -C {} --no-optional-locks <status|diff|log|show>` inside proc_exec, and for host git commit/tag/push use mcp_aegis-os_workspace_git.",
+            "\nNote: the shadow has no .git; for read-only git use mcp_aegis-os_workspace_git_inspect {{\"mode\":\"status\"}} (or `git -C {} --no-optional-locks <status|diff|log|show>` inside proc_exec), and for host git branch/sync/commit/tag/push (even single-approval `auto_commit_shadow: true`) use mcp_aegis-os_workspace_git.",
             host_root.display()
         )
     } else {
@@ -516,7 +524,7 @@ pub fn sandbox_redirect_reason(cmd: &str, shadow_root: &Path, host_root: &Path) 
             .unwrap_or(false)
     }) || cmd.to_ascii_lowercase().contains(".pdf")
     {
-        "\nTip: to export a compiled binary/PDF from the shadow workspace to an external host path in zero tokens, call mcp_aegis-os_fs_export_file {\"src_path\":\"<rel_in_shadow>\",\"dst_host_path\":\"/abs/host/path\"} (or switch active workspace via mcp_aegis-os_workspace_switch {\"path\":\"/abs/project/dir\"})."
+        "\nTip: to export a compiled binary/PDF from the shadow workspace to an external host path in zero tokens, call mcp_aegis-os_fs_export_file {\"src_path\":\"<rel_in_shadow>\",\"dst_host_path\":\"/abs/host/path\"} (or import external files via mcp_aegis-os_fs_import_file {\"src_host_path\":\"/abs/host/file\"}, or switch active workspace via mcp_aegis-os_workspace_switch {\"path\":\"/abs/project/dir\"})."
     } else {
         ""
     };
@@ -527,7 +535,15 @@ pub fn sandbox_redirect_reason(cmd: &str, shadow_root: &Path, host_root: &Path) 
                 .get(1)
                 .is_some_and(|sub| matches!(sub.as_str(), "run" | "workflow"))
     }) {
-        "\nTip: `~/.config/gh` and Keychain tokens are masked inside sandboxes; use mcp_aegis-os_github_ci_inspect {\"run_id\":<id>,\"failed_only\":true} (or {} to list recent runs) to inspect CI status and logs via the host broker."
+        "\nTip: `~/.config/gh` and Keychain tokens are masked inside sandboxes; use mcp_aegis-os_github_ci_inspect {\"run_id\":<id>,\"failed_only\":true} (or {} to list recent runs) to inspect CI status and logs via the host broker, or mcp_aegis-os_github_ci_rerun to rerun workflows."
+    } else if segments.iter().any(|s| {
+        let (_, words) = leading_words(s);
+        words.first().is_some_and(|w| basename(w) == "gh")
+            && words
+                .get(1)
+                .is_some_and(|sub| matches!(sub.as_str(), "pr" | "issue"))
+    }) {
+        "\nTip: `~/.config/gh` and Keychain tokens are masked inside sandboxes; use mcp_aegis-os_github_pr_inspect / mcp_aegis-os_github_pr_create / mcp_aegis-os_github_issue_inspect via the host broker."
     } else {
         ""
     };
@@ -702,7 +718,10 @@ pub fn classify_enforced_git_redirect(cmd: &str, host_root: &Path) -> Option<Rou
                     };
                 }
                 if let Some(sub) = all_words.get(i).map(String::as_str) {
-                    if matches!(sub, "add" | "commit" | "push" | "tag") {
+                    if matches!(
+                        sub,
+                        "add" | "commit" | "push" | "tag" | "checkout" | "switch" | "fetch" | "pull"
+                    ) {
                         matched_sub = Some(sub.to_string());
                     }
                 }
@@ -713,7 +732,7 @@ pub fn classify_enforced_git_redirect(cmd: &str, host_root: &Path) -> Option<Rou
     let sub = matched_sub?;
     Some(Route::RedirectToSandbox {
         reason: format!(
-            "[Aegis OS routing] Host `git {sub}` cannot run inside an enforced OS sandbox (`.git` and push credentials are isolated from `run_command`/`proc_exec`). Re-issue via the lease-gated host Git MCP tool (first ensure `workspace_commit` has landed edits onto `{}`):\n  mcp_aegis-os_workspace_git {{\"paths\":[\"<repo-rel-file>\"],\"commit_message\":\"<subject>\",\"trailers\":[\"Aegis-OS-Verified: ...\"],\"push\":true,\"remote\":\"origin\"}}\nApproval opens the Web Approval Console (or inline confirmation) on the host broker and runs `git` outside the sandbox.",
+            "[Aegis OS routing] Host `git {sub}` cannot run inside an enforced OS sandbox (`.git` and push credentials are isolated from `run_command`/`proc_exec`). Re-issue via the lease-gated host Git MCP tool (you can land shadow edits in one shot via `auto_commit_shadow: true`, or switch/sync branches on `{}`):\n  mcp_aegis-os_workspace_git {{\"auto_commit_shadow\":true,\"paths\":[\"<repo-rel-file>\"],\"commit_message\":\"<subject>\",\"push\":true,\"remote\":\"origin\"}}\nApproval opens the Web Approval Console (or inline confirmation) on the host broker and runs `git` outside the sandbox.",
             host_root.display()
         ),
     })
@@ -1261,6 +1280,8 @@ mod tests {
         for cmd in [
             "git commit -m 'fix: ci'",
             "git push origin main",
+            "git checkout -b feat/new",
+            "git pull --ff-only origin main",
             "git tag -f v0.4.7 && git push -f origin v0.4.7",
             "git add crates/aos-cli/src/launcher.rs && git commit -m 'x'",
         ] {
@@ -1271,6 +1292,20 @@ mod tests {
             };
             assert!(reason.contains("mcp_aegis-os_workspace_git"), "{reason}");
         }
+
+        // GH PR / Issue / Rerun hints map cleanly.
+        let Route::HostBoundary { reason: pr_reason } =
+            classify_run_command("gh pr create --title x", host, host)
+        else {
+            panic!();
+        };
+        assert!(pr_reason.contains("mcp_aegis-os_github_pr_create"), "{pr_reason}");
+        let Route::HostBoundary { reason: rerun_reason } =
+            classify_run_command("gh run rerun 12345", host, host)
+        else {
+            panic!();
+        };
+        assert!(rerun_reason.contains("mcp_aegis-os_github_ci_rerun"), "{rerun_reason}");
 
         // Read-only git stays in proc_exec, not workspace_git redirect.
         assert!(classify_enforced_git_redirect("git status --short", host).is_none());

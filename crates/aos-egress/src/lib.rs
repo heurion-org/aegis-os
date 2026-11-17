@@ -69,6 +69,245 @@ const MAX_PROXY_BODY_BYTES: usize = 16 * 1024 * 1024;
 trait ProxyStream: AsyncRead + AsyncWrite + Unpin + Send {}
 impl<T: AsyncRead + AsyncWrite + Unpin + Send> ProxyStream for T {}
 
+const DLP_TOKEN_PREFIXES: &[(&str, &str, usize)] = &[
+    ("github_pat_", "DLP:TOKEN_github_pat", 8),
+    ("github_oauth_", "DLP:TOKEN_github_oauth", 8),
+    ("ghp_", "DLP:TOKEN_ghp", 8),
+    ("gho_", "DLP:TOKEN_gho", 8),
+    ("ghu_", "DLP:TOKEN_ghu", 8),
+    ("ghs_", "DLP:TOKEN_ghs", 8),
+    ("ghr_", "DLP:TOKEN_ghr", 8),
+    ("sk-ant-", "DLP:TOKEN_sk-ant", 8),
+    ("sk-proj-", "DLP:TOKEN_sk-proj", 8),
+    ("sk-live-", "DLP:TOKEN_sk-live", 8),
+    ("xoxb-", "DLP:TOKEN_xoxb", 8),
+    ("glpat-", "DLP:TOKEN_glpat", 8),
+    ("npm_", "DLP:TOKEN_npm", 16),
+];
+
+fn dlp_token_span_bytes(s: &str, allow_extra_base64_chars: bool) -> usize {
+    let mut end = 0usize;
+    for (idx, ch) in s.char_indices() {
+        let ok = ch.is_ascii_alphanumeric()
+            || ch == '_'
+            || ch == '-'
+            || (allow_extra_base64_chars && matches!(ch, '.' | '=' | '+' | '/'));
+        if !ok {
+            break;
+        }
+        end = idx + ch.len_utf8();
+    }
+    end
+}
+
+fn find_next_dlp_span(text: &str) -> Option<(usize, usize, String, &'static str)> {
+    // `(match_start, match_end, replacement, rule_label)`
+    let mut best: Option<(usize, usize, String, &'static str)> = None;
+    let mut consider = |start: usize, end: usize, repl: String, label: &'static str| {
+        if best
+            .as_ref()
+            .is_none_or(|(b_start, ..)| start < *b_start)
+        {
+            best = Some((start, end, repl, label));
+        }
+    };
+
+    // 1. Virtual `$AOS_SECRET_*` placeholders.
+    if let Some(idx) = text.find("$AOS_SECRET_") {
+        let tail = &text[idx + "$AOS_SECRET_".len()..];
+        let mut ext = 0usize;
+        for (i, ch) in tail.char_indices() {
+            if ch.is_ascii_alphanumeric() || ch == '_' {
+                ext = i + ch.len_utf8();
+            } else {
+                break;
+            }
+        }
+        consider(
+            idx,
+            idx + "$AOS_SECRET_".len() + ext,
+            "[REDACTED_BY_AEGIS_DLP:AOS_SECRET]".to_string(),
+            "$AOS_SECRET_* (outbound DLP)",
+        );
+    }
+
+    // 2. PEM private keys (`-----BEGIN ... PRIVATE KEY-----` ... optional `-----END ... PRIVATE KEY-----`).
+    let mut search_from = 0usize;
+    while let Some(rel) = text[search_from..].find("-----BEGIN ") {
+        let start = search_from + rel;
+        let rest = &text[start..];
+        let header_line_end = rest.find('\n').unwrap_or(rest.len());
+        let header_line = &rest[..header_line_end];
+        let pk_marker = "PRIVATE KEY-----";
+        if let Some(pk_pos) = header_line.find(pk_marker) {
+            let min_end = start + pk_pos + pk_marker.len();
+            let full_end = if let Some(end_rel) = text[min_end..].find("-----END ") {
+                let end_start = min_end + end_rel;
+                let end_rest = &text[end_start..];
+                let end_line_end = end_rest.find('\n').unwrap_or(end_rest.len());
+                if let Some(end_pk_pos) = end_rest[..end_line_end].find(pk_marker) {
+                    end_start + end_pk_pos + pk_marker.len()
+                } else {
+                    min_end
+                }
+            } else {
+                min_end
+            };
+            consider(
+                start,
+                full_end,
+                "[REDACTED_BY_AEGIS_DLP:PEM_PRIVATE_KEY]".to_string(),
+                "DLP:PEM_PRIVATE_KEY",
+            );
+            break;
+        }
+        search_from = start + "-----BEGIN ".len();
+    }
+
+    // 3. AWS Access Key IDs (`AKIA` + >=12 uppercase/digits).
+    let mut akia_from = 0usize;
+    while let Some(rel) = text[akia_from..].find("AKIA") {
+        let start = akia_from + rel;
+        let tail = &text[start + 4..];
+        let mut ext = 0usize;
+        let mut count = 0usize;
+        for (i, ch) in tail.char_indices() {
+            if ch.is_ascii_uppercase() || ch.is_ascii_digit() {
+                ext = i + ch.len_utf8();
+                count += 1;
+            } else {
+                break;
+            }
+        }
+        if count >= 12 {
+            consider(
+                start,
+                start + 4 + ext,
+                "[REDACTED_BY_AEGIS_DLP]".to_string(),
+                "DLP:AWS_ACCESS_KEY",
+            );
+            break;
+        }
+        akia_from = start + 4;
+    }
+
+    // 4. Known provider token prefixes.
+    for &(prefix, label, min_len) in DLP_TOKEN_PREFIXES {
+        let mut from = 0usize;
+        while let Some(rel) = text[from..].find(prefix) {
+            let start = from + rel;
+            let tail = &text[start + prefix.len()..];
+            let span = dlp_token_span_bytes(tail, false);
+            if tail[..span].chars().count() >= min_len {
+                consider(
+                    start,
+                    start + prefix.len() + span,
+                    "[REDACTED_BY_AEGIS_DLP]".to_string(),
+                    label,
+                );
+                break;
+            }
+            from = start + prefix.len();
+        }
+    }
+
+    // 5. HTTP `Bearer <token>` / `Authorization: token <token>`.
+    for marker in ["Bearer ", "Authorization: token ", "authorization: token "] {
+        let mut from = 0usize;
+        while let Some(rel) = text[from..].find(marker) {
+            let start = from + rel;
+            let tail = &text[start + marker.len()..];
+            let span = dlp_token_span_bytes(tail, true);
+            if tail[..span].chars().count() >= 8 {
+                consider(
+                    start,
+                    start + marker.len() + span,
+                    format!("{marker}[REDACTED_BY_AEGIS_DLP]"),
+                    "DLP:AUTH_HEADER_TOKEN",
+                );
+                break;
+            }
+            from = start + marker.len();
+        }
+    }
+
+    // 6. HTTP(S) URL embedded userinfo secrets (`https://user:secret@host`).
+    for scheme in ["https://", "http://"] {
+        let mut from = 0usize;
+        while let Some(rel) = text[from..].find(scheme) {
+            let start = from + rel;
+            let after_scheme = start + scheme.len();
+            let tail = &text[after_scheme..];
+            let authority_end = tail
+                .find(|c: char| matches!(c, '/' | '?' | '#' | '\'' | '"') || c.is_whitespace())
+                .unwrap_or(tail.len());
+            let authority = &tail[..authority_end];
+            if let Some(at_pos) = authority.find('@') {
+                let userinfo = &authority[..at_pos];
+                if let Some((_user, secret)) = userinfo.split_once(':') {
+                    if secret.len() >= 8 {
+                        consider(
+                            after_scheme,
+                            after_scheme + at_pos + 1,
+                            "[REDACTED_BY_AEGIS_DLP]@".to_string(),
+                            "DLP:URL_USERINFO_SECRET",
+                        );
+                        break;
+                    }
+                }
+            }
+            from = after_scheme;
+        }
+    }
+
+    best
+}
+
+/// Inspects a payload for secret/key signatures without requiring vault state.
+/// Shared by outbound Egress DLP, MCP Gateway tool sanitization, and pre-publish PR gates.
+pub fn detect_dlp_patterns(text: &str) -> Vec<&'static str> {
+    if text.is_empty() {
+        return Vec::new();
+    }
+    let mut hits = Vec::new();
+    let mut rest = text;
+    while let Some((_start, end, _repl, label)) = find_next_dlp_span(rest) {
+        if !hits.contains(&label) {
+            hits.push(label);
+        }
+        if end == 0 || end >= rest.len() {
+            break;
+        }
+        rest = &rest[end..];
+    }
+    hits
+}
+
+/// Redacts all detected secret/key signatures in `text`, returning the scrubbed text
+/// along with the deduplicated rule labels that triggered.
+pub fn redact_dlp_secrets(text: &str) -> (String, Vec<&'static str>) {
+    if text.is_empty() {
+        return (String::new(), Vec::new());
+    }
+    let mut out = String::with_capacity(text.len());
+    let mut hits = Vec::new();
+    let mut rest = text;
+    while let Some((start, end, repl, label)) = find_next_dlp_span(rest) {
+        out.push_str(&rest[..start]);
+        out.push_str(&repl);
+        if !hits.contains(&label) {
+            hits.push(label);
+        }
+        if end == 0 || end >= rest.len() {
+            rest = "";
+            break;
+        }
+        rest = &rest[end..];
+    }
+    out.push_str(rest);
+    (out, hits)
+}
+
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct SecretScopeRule {
     pub allowed_methods: Vec<String>,
@@ -249,32 +488,10 @@ impl AegisEgressGateway {
                 return Some(format!("{} (outbound DLP)", secret_entry.placeholder));
             }
         }
-        if text.contains("-----BEGIN ") && text.contains("PRIVATE KEY-----") {
-            return Some("DLP:PEM_PRIVATE_KEY".to_string());
-        }
-        if let Some(idx) = text.find("AKIA") {
-            let tail = &text[idx + 4..];
-            let alnum_len = tail
-                .chars()
-                .take_while(|c| c.is_ascii_uppercase() || c.is_ascii_digit())
-                .count();
-            if alnum_len >= 12 {
-                return Some("DLP:AWS_ACCESS_KEY".to_string());
-            }
-        }
-        for prefix in ["ghp_", "github_pat_", "sk-ant-", "sk-proj-", "sk-live-", "xoxb-"] {
-            if let Some(idx) = text.find(prefix) {
-                let tail = &text[idx + prefix.len()..];
-                let token_len = tail
-                    .chars()
-                    .take_while(|c| c.is_ascii_alphanumeric() || *c == '_' || *c == '-')
-                    .count();
-                if token_len >= 8 {
-                    return Some(format!("DLP:TOKEN_{}", prefix.trim_end_matches(['_', '-'])));
-                }
-            }
-        }
-        None
+        detect_dlp_patterns(text)
+            .into_iter()
+            .next()
+            .map(str::to_string)
     }
 
     pub async fn inspect_and_inject(
@@ -2012,5 +2229,44 @@ mod tests {
         bad_tunnel.read_to_end(&mut bad_resp).await.unwrap();
         let bad_str = String::from_utf8_lossy(&bad_resp);
         assert!(bad_str.contains("403 Forbidden"), "bad_str: {bad_str}");
+    }
+
+    #[test]
+    fn test_unified_dlp_detect_and_redact_all_patterns() {
+        let sample = concat!(
+            "hdr Authorization: Bearer s3cr3tTok3nValu3\n",
+            "gh=ghp_1234567890abcdefghijklmnoprstuv\n",
+            "pat=github_pat_11AAAAA0123456789abcdef\n",
+            "aws=AKIAIOSFODNN7EXAMPLE\n",
+            "ant=sk-ant-api03-abcdef12345678\n",
+            "url=https://x-access-token:secretpass1234@github.com/org/repo.git\n",
+            "placeholder=$AOS_SECRET_GH\n",
+            "{\"k\":\"-----BEGIN OPENSSH PRIVATE KEY-----\\nabc\\n-----END OPENSSH PRIVATE KEY-----\"}\n",
+            "safe=cargo test passed (中文)\n"
+        );
+        let hits = detect_dlp_patterns(sample);
+        assert!(hits.contains(&"DLP:AUTH_HEADER_TOKEN"), "{hits:?}");
+        assert!(hits.contains(&"DLP:TOKEN_ghp"), "{hits:?}");
+        assert!(hits.contains(&"DLP:TOKEN_github_pat"), "{hits:?}");
+        assert!(hits.contains(&"DLP:AWS_ACCESS_KEY"), "{hits:?}");
+        assert!(hits.contains(&"DLP:TOKEN_sk-ant"), "{hits:?}");
+        assert!(hits.contains(&"DLP:URL_USERINFO_SECRET"), "{hits:?}");
+        assert!(hits.contains(&"$AOS_SECRET_* (outbound DLP)"), "{hits:?}");
+        assert!(hits.contains(&"DLP:PEM_PRIVATE_KEY"), "{hits:?}");
+
+        let (redacted, r_hits) = redact_dlp_secrets(sample);
+        assert_eq!(hits, r_hits);
+        assert!(!redacted.contains("s3cr3tTok3nValu3"), "{redacted}");
+        assert!(!redacted.contains("ghp_1234567890"), "{redacted}");
+        assert!(!redacted.contains("github_pat_11"), "{redacted}");
+        assert!(!redacted.contains("AKIAIOSFODNN7EXAMPLE"), "{redacted}");
+        assert!(!redacted.contains("sk-ant-api03"), "{redacted}");
+        assert!(!redacted.contains("secretpass1234"), "{redacted}");
+        assert!(!redacted.contains("$AOS_SECRET_GH"), "{redacted}");
+        assert!(!redacted.contains("OPENSSH PRIVATE KEY"), "{redacted}");
+        assert!(redacted.contains(r#"{"k":"[REDACTED_BY_AEGIS_DLP:PEM_PRIVATE_KEY]"}"#), "{redacted}");
+        assert!(redacted.contains("Bearer [REDACTED_BY_AEGIS_DLP]"), "{redacted}");
+        assert!(redacted.contains("https://[REDACTED_BY_AEGIS_DLP]@github.com/org/repo.git"), "{redacted}");
+        assert!(redacted.contains("safe=cargo test passed (中文)"), "{redacted}");
     }
 }

@@ -2870,7 +2870,15 @@ pub async fn serve_unified_stdio(
                     // 1. If the user already approved `workspace_commit` inside the IDE chat window
                     //    via the `PreToolUse` hook (`decision: "ask"`), consume the ticket and complete
                     //    all `workspace_commit_sensitive` + `workspace_commit` escalations in this batch!
-                    if matches!(tool_name, "workspace_commit" | "fs_export_file" | "workspace_git")
+                    if matches!(
+                        tool_name,
+                        "workspace_commit"
+                            | "fs_export_file"
+                            | "fs_import_file"
+                            | "workspace_git"
+                            | "github_ci_rerun"
+                            | "github_pr_create"
+                    )
                         && consume_hook_commit_ticket(&runtime_dir, &identity.org_id)
                     {
                         let mut cur_esc = Some(esc_id);
@@ -2884,7 +2892,10 @@ pub async fn serve_unified_stdio(
                                 .iter()
                                 .any(|e| {
                                     e.escalation_id == eid
-                                        && e.action == "workspace_commit_sensitive"
+                                        && matches!(
+                                            e.action.as_str(),
+                                            "workspace_commit_sensitive" | "workspace_git_sensitive"
+                                        )
                                 });
                             if is_sensitive {
                                 break;

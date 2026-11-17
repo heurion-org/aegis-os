@@ -693,6 +693,8 @@ async fn run_exp2_live_redteam_attacks() -> anyhow::Result<Vec<Exp2RedTeamResult
             org_shared_ro_dir: temp.path().join("aegis_org_ro"),
             org_agent_pub_dir: temp.path().join("aegis_org_pub"),
             egress_proxy_addr: None,
+            host_source_dir: None,
+            tighten_home_read: true,
         })
         .await?;
 
@@ -831,6 +833,8 @@ async fn run_exp2_live_redteam_attacks() -> anyhow::Result<Vec<Exp2RedTeamResult
             org_shared_ro_dir: temp.path().join("aegis_org_ro_net"),
             org_agent_pub_dir: temp.path().join("aegis_org_pub_net"),
             egress_proxy_addr: Some(format!("http://{}", proxy_addr)),
+            host_source_dir: None,
+            tighten_home_read: true,
         })
         .await?;
 
@@ -1637,6 +1641,8 @@ async fn run_exp3_live_cow_and_daemon_latencies() -> anyhow::Result<(Vec<Exp3Cow
             org_shared_ro_dir: sbx_temp.path().join("ro"),
             org_agent_pub_dir: sbx_temp.path().join("pub"),
             egress_proxy_addr: None,
+            host_source_dir: None,
+            tighten_home_read: true,
         })
         .await?;
     let mut sbx_us = Vec::with_capacity(30);

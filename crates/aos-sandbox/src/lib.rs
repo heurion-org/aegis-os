@@ -301,12 +301,14 @@ impl NativeOsSandboxInstance {
     /// - The Agent's private persistent Home (`agent_home_dir`)
     /// - The Agent's organization publish directory (`org_agent_pub_dir`)
     ///
-    /// And explicitly denies reading sensitive host credential directories (`~/.ssh`, `~/.aws`, `~/.gnupg`,
-    /// `~/.kube`, `~/.config/gh`, `~/.npmrc`, `~/.pypirc`, `~/Library/Keychains`).
-    /// When `egress_proxy_addr` is set, also enforces `(deny network-outbound)` except to localhost proxy.
+    /// When `tighten_home_read` is enabled, also applies default-deny `file-read-data` across host
+    /// `$HOME` directories (re-exposing only active session roots, optional `host_source_dir`, and
+    /// `SAFE_TOOLCHAIN_SUBDIRS`), explicitly denies host credential directories and dotenv secrets
+    /// (`*/.env*`), and restricts network-outbound to localhost egress proxy when configured.
     pub fn generate_macos_seatbelt_profile(&self) -> String {
         let ws = Self::sbpl_path(&self.config.workspace_dir);
         let home = Self::sbpl_path(&self.config.agent_home_dir);
+        let shared_ro_sbpl = Self::sbpl_path(&self.config.org_shared_ro_dir);
         let pub_dir = Self::sbpl_path(&self.config.org_agent_pub_dir);
 
         let net_rules = if !aos_core::ablated("net_isolation") {
@@ -332,8 +334,66 @@ impl NativeOsSandboxInstance {
             String::new()
         };
 
+        let home_rules = if self.config.tighten_home_read && !aos_core::ablated("cred_mask") {
+            let mac_homes = Self::macos_candidate_homes();
+            if mac_homes.is_empty() {
+                String::new()
+            } else {
+                let mut rules = String::from("\n(deny file-read-data");
+                for h in &mac_homes {
+                    rules.push_str(&format!("\n    (subpath \"{}\")", Self::sbpl_path(h)));
+                }
+                rules.push_str("\n)\n(allow file-read-data");
+                rules.push_str(&format!(
+                    "\n    (subpath \"{ws}\")\n    (subpath \"{home}\")\n    (subpath \"{shared_ro_sbpl}\")\n    (subpath \"{pub_dir}\")"
+                ));
+                if let Some(ref host_src) = self.config.host_source_dir {
+                    rules.push_str(&format!("\n    (subpath \"{}\")", Self::sbpl_path(host_src)));
+                }
+                let cur_exe = std::env::current_exe().ok();
+                for h in &mac_homes {
+                    for sub in Self::SAFE_TOOLCHAIN_SUBDIRS {
+                        let p = h.join(sub);
+                        if p.exists() {
+                            rules.push_str(&format!("\n    (subpath \"{}\")", Self::sbpl_path(&p)));
+                        }
+                    }
+                    for cfg in [".cargo/config.toml", ".cargo/config"] {
+                        let p = h.join(cfg);
+                        if p.is_file() {
+                            rules.push_str(&format!("\n    (literal \"{}\")", Self::sbpl_path(&p)));
+                        }
+                    }
+                    if let Some(ref exe) = cur_exe {
+                        if exe.starts_with(h) && exe.is_file() {
+                            rules.push_str(&format!("\n    (literal \"{}\")", Self::sbpl_path(exe)));
+                        }
+                    }
+                }
+                rules.push_str("\n)");
+                rules
+            }
+        } else {
+            String::new()
+        };
+
         let cred_rules = if !aos_core::ablated("cred_mask") {
-            r#"
+            let mut env_allows = String::new();
+            for root in [
+                Some(&self.config.workspace_dir),
+                Some(&self.config.agent_home_dir),
+                self.config.host_source_dir.as_ref(),
+            ]
+            .into_iter()
+            .flatten()
+            {
+                env_allows.push_str(&format!(
+                    "\n(allow file-read* (require-all (subpath \"{}\") (regex #\".*/\\.env\\.(example|sample|template|dist|schema)$\")))",
+                    Self::sbpl_path(root)
+                ));
+            }
+            format!(
+                r##"
 (deny process-exec (literal "/usr/bin/security"))
 (deny mach-lookup
     (global-name "com.apple.security.agent")
@@ -356,14 +416,16 @@ impl NativeOsSandboxInstance {
     (regex #".*/\.vault-token$")
     (regex #".*/\.cargo/credentials(\.toml)?$")
     (regex #".*/(custom_vault|\.secrets)(/.*)?$")
+    (regex #".*/\.env(\.[^/]+)?$")
     (regex #".*/Library/Keychains(/.*)?$")
     (regex #".*/com\.apple\.launchd\.[^/]+/Listeners$")
     (regex #".*/var/run/docker\.sock$")
     (regex #".*/(\.orbstack|\.colima|\.lima)(/.*)?$")
     (literal "/etc/shadow")
-)"#
+){env_allows}"##
+            )
         } else {
-            ""
+            String::new()
         };
 
         // Runtime state lives under `<runtime>/` next to `orgs/`: policy/IPC/PaaS state (incl. unclaimed
@@ -438,7 +500,7 @@ impl NativeOsSandboxInstance {
     (literal "/dev/random")
     (literal "/dev/urandom")
     (literal "/dev/tty")
-){launch_rules}{tenant_rules}{cred_rules}{net_rules}
+){launch_rules}{home_rules}{tenant_rules}{cred_rules}{net_rules}
 "#
         )
     }
@@ -580,7 +642,65 @@ impl NativeOsSandboxInstance {
         ".local/share/fnm",
         ".local/share/pyenv",
         ".local/share/virtualenv",
+        ".local/share/claude",
+        ".bun/bin",
+        ".bun/install",
+        ".volta/bin",
+        ".volta/tools",
+        ".nvm/versions",
+        ".npm/_cacache",
+        ".npm-global",
+        ".pyenv/shims",
+        ".pyenv/versions",
+        "go/bin",
+        "go/pkg",
+        ".config/opencode/node_modules",
+        ".opencode/bin",
+        ".hermes/hermes-agent",
+        ".hermes/runtime",
+        ".hermes/tools",
+        ".antigravity",
+        "Library/pnpm",
     ];
+
+    fn macos_candidate_homes() -> Vec<PathBuf> {
+        let mut homes: Vec<PathBuf> = Vec::new();
+        if let Ok(h) = std::env::var("HOME") {
+            let p = PathBuf::from(h);
+            // Inside nested/agent runs `HOME` points to `.../agent_home`; don't add that sub-root.
+            if p.parent() == Some(Path::new("/Users")) {
+                homes.push(p);
+            }
+        }
+        if let Ok(rd) = std::fs::read_dir("/Users") {
+            homes.extend(
+                rd.flatten()
+                    .map(|e| e.path())
+                    .filter(|p| p.is_dir() && p.file_name().is_none_or(|n| n != "Shared")),
+            );
+        }
+        if let Ok(extra) = std::env::var("AOS_EXTRA_CREDENTIAL_HOMES") {
+            homes.extend(extra.split(':').filter(|s| !s.is_empty()).map(PathBuf::from));
+        }
+        Self::macos_candidate_homes_for(&homes)
+    }
+
+    fn macos_candidate_homes_for(homes: &[PathBuf]) -> Vec<PathBuf> {
+        let mut seen = std::collections::BTreeSet::new();
+        homes
+            .iter()
+            .filter(|h| {
+                h.is_dir()
+                    && *h != Path::new("/")
+                    && !h.starts_with("/tmp")
+                    && !h.starts_with("/private/tmp")
+                    && !h.starts_with("/var/folders")
+                    && !h.starts_with("/private/var/folders")
+                    && seen.insert((*h).clone())
+            })
+            .cloned()
+            .collect()
+    }
 
     fn candidate_homes() -> Vec<PathBuf> {
         let mut homes: Vec<PathBuf> = Vec::new();
@@ -1469,6 +1589,8 @@ mod tests {
             org_shared_ro_dir: tmp.path().join("ro"),
             org_agent_pub_dir: tmp.path().join("pub"),
             egress_proxy_addr: None,
+            host_source_dir: None,
+            tighten_home_read: true,
         };
         let args = NativeOsSandboxInstance::new(driver_cfg).generate_linux_bwrap_args();
         let tmpfs_pos = args.windows(2).position(|w| w == ["--tmpfs", "/tmp"]).unwrap();
@@ -1496,6 +1618,8 @@ mod tests {
             org_shared_ro_dir: org.join("shared_ro"),
             org_agent_pub_dir: org.join("pub/coder-1"),
             egress_proxy_addr: None,
+            host_source_dir: None,
+            tighten_home_read: true,
         };
         let args = NativeOsSandboxInstance::new(driver_cfg).generate_linux_bwrap_args();
         let rt_tmpfs_pos = args
@@ -1589,6 +1713,8 @@ mod tests {
             org_shared_ro_dir: temp.path().join("org_ro"),
             org_agent_pub_dir: temp.path().join("org_pub"),
             egress_proxy_addr: Some("http://127.0.0.1:18080".to_string()),
+            host_source_dir: None,
+            tighten_home_read: true,
         };
 
         let sbx = driver.create_sandbox(config).await.unwrap();
@@ -1691,6 +1817,8 @@ mod tests {
             org_shared_ro_dir: tmp.path().join("ro"),
             org_agent_pub_dir: tmp.path().join("pub"),
             egress_proxy_addr: None,
+            host_source_dir: None,
+            tighten_home_read: true,
         };
         let profile = NativeOsSandboxInstance::new(cfg).generate_macos_seatbelt_profile();
         assert!(profile.contains(r#"ws\")) (allow file-write* (subpath \"/"#), "{profile}");
@@ -1734,6 +1862,8 @@ mod tests {
                 org_shared_ro_dir: org.join("shared_ro"),
                 org_agent_pub_dir: org.join("pub/coder-1"),
                 egress_proxy_addr: None,
+                host_source_dir: None,
+                tighten_home_read: true,
             })
             .await
             .unwrap();
@@ -1779,6 +1909,8 @@ mod tests {
                 org_shared_ro_dir: tmp.path().join("ro"),
                 org_agent_pub_dir: tmp.path().join("pub"),
                 egress_proxy_addr: None,
+                host_source_dir: None,
+                tighten_home_read: true,
             })
             .await
             .unwrap();
@@ -1833,6 +1965,8 @@ mod tests {
             org_shared_ro_dir: temp.path().join("org_ro"),
             org_agent_pub_dir: temp.path().join("org_pub"),
             egress_proxy_addr: None,
+            host_source_dir: None,
+            tighten_home_read: true,
         };
         let sbx = driver.create_sandbox(config).await.unwrap();
 
@@ -1950,5 +2084,65 @@ mod tests {
             !entries_with_brew_rustc.contains(&tc_bin),
             "{entries_with_brew_rustc:?}"
         );
+    }
+
+    #[test]
+    fn seatbelt_tightens_host_home_read_preserves_host_source_and_protects_dotenv() {
+        let tmp = tempfile::tempdir().unwrap();
+        let host_src = tmp.path().join("host_project");
+        std::fs::create_dir_all(&host_src).unwrap();
+
+        let cfg = SandboxConfig {
+            identity: AgentIdentity::new("acme", "coder-1", "Engineer"),
+            tier: IsolationTier::NativeOsSandbox,
+            limits: ResourceLimits::default(),
+            workspace_dir: tmp.path().join("ws"),
+            agent_home_dir: tmp.path().join("home"),
+            org_shared_ro_dir: tmp.path().join("ro"),
+            org_agent_pub_dir: tmp.path().join("pub"),
+            egress_proxy_addr: None,
+            host_source_dir: Some(host_src.clone()),
+            tighten_home_read: true,
+        };
+        let profile = NativeOsSandboxInstance::new(cfg.clone()).generate_macos_seatbelt_profile();
+        if Path::new("/Users").is_dir() {
+            assert!(
+                profile.contains("(deny file-read-data"),
+                "expected macOS $HOME default-deny file-read-data rule: {profile}"
+            );
+            let canon_src = NativeOsSandboxInstance::canonical_or_orig(&host_src);
+            assert!(
+                profile.contains(&format!("(subpath \"{}\")", canon_src)),
+                "expected host_source_dir allow rule: {profile}"
+            );
+        }
+        assert!(
+            profile.contains(r#"(regex #".*/\.env(\.[^/]+)?$")"#),
+            "expected dotenv deny regex: {profile}"
+        );
+        assert!(
+            profile.contains(r#"(regex #".*/\.env\.(example|sample|template|dist|schema)$")"#),
+            "expected .env.example allow rule: {profile}"
+        );
+
+        let untightened = SandboxConfig {
+            tighten_home_read: false,
+            ..cfg
+        };
+        let open_profile = NativeOsSandboxInstance::new(untightened).generate_macos_seatbelt_profile();
+        assert!(
+            !open_profile.contains("\n(deny file-read-data\n"),
+            "tighten_home_read=false should omit host $HOME deny block: {open_profile}"
+        );
+
+        let fake_root = tmp.path().join("users");
+        let u1 = fake_root.join("alice");
+        std::fs::create_dir_all(&u1).unwrap();
+        let filtered = NativeOsSandboxInstance::macos_candidate_homes_for(&[
+            u1.clone(),
+            PathBuf::from("/"),
+            PathBuf::from("/tmp"),
+        ]);
+        assert_eq!(filtered, vec![u1]);
     }
 }

@@ -14,7 +14,7 @@ use aos_core::{
     ResourceLimits, SandboxConfig, SandboxDriver, SandboxInstance, SnapshotMeta,
     TransactionalWorkspace,
 };
-use aos_egress::{AegisEgressGateway, SecretVaultEntry};
+use aos_egress::{detect_dlp_patterns, redact_dlp_secrets, AegisEgressGateway, SecretVaultEntry};
 use aos_ipc::AegisIpcBus;
 use aos_memory::MemoryAction;
 use aos_policy::AegisPolicyKernel;
@@ -535,19 +535,141 @@ async fn export_file_atomic_from_cas_or_bytes(
     .await?
 }
 
+struct ImportFilePlan {
+    canon_src: PathBuf,
+    src_sha256: String,
+    import_to: String,
+    clean_dst_rel: String,
+    dst_full_path: PathBuf,
+    evidence_hash: String,
+}
+
+fn expand_home_tilde(raw: &str) -> PathBuf {
+    if raw == "~" {
+        if let Some(h) = std::env::var_os("HOME") {
+            return PathBuf::from(h);
+        }
+    } else if let Some(rest) = raw.strip_prefix("~/") {
+        if let Some(h) = std::env::var_os("HOME") {
+            return PathBuf::from(h).join(rest);
+        }
+    }
+    PathBuf::from(raw)
+}
+
 struct HostGitPlan {
     git_bin: PathBuf,
     host_root: PathBuf,
     paths: Vec<String>,
+    shadow_paths: Vec<String>,
+    auto_commit_shadow: bool,
+    verify_cmd: Option<String>,
+    verify_timeout_ms: Option<u64>,
+    overwrite_binaries: bool,
+    skip_verify: bool,
+    shadow_evidence_hash: Option<String>,
+    checkout_branch: Option<String>,
+    create_branch: bool,
+    sync_mode: Option<String>,
     commit_message: Option<String>,
     trailers: Vec<String>,
     tag: Option<String>,
     force_tag: bool,
     push: bool,
+    force_push: bool,
     remote: String,
     remote_url: Option<String>,
     push_branch: Option<String>,
     evidence_hash: String,
+}
+
+struct GitHubCiRerunPlan {
+    repo: String,
+    run_id: u64,
+    failed_only: bool,
+    job_id: Option<u64>,
+    evidence_hash: String,
+}
+
+struct GitHubPrCreatePlan {
+    repo: String,
+    title: String,
+    body: String,
+    base: Option<String>,
+    head: Option<String>,
+    draft: bool,
+    evidence_hash: String,
+}
+
+fn resolve_workspace_verify_config(
+    host_root: &Path,
+    args: &Value,
+    skip_verify: bool,
+) -> (Option<String>, Option<String>, Option<u64>) {
+    let host_verify_cfg: Option<Value> = std::fs::read(host_root.join(".aegis/verify.json"))
+        .ok()
+        .and_then(|bytes| serde_json::from_slice(&bytes).ok());
+    let configured_verify_cmd = std::env::var("AOS_VERIFY_CMD")
+        .ok()
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty())
+        .or_else(|| {
+            host_verify_cfg
+                .as_ref()
+                .and_then(|cfg| cfg.get("verify_cmd"))
+                .and_then(|v| v.as_str())
+                .map(|s| s.trim().to_string())
+                .filter(|s| !s.is_empty())
+        });
+    let verify_cmd = if skip_verify {
+        None
+    } else {
+        args.get("verify_cmd")
+            .and_then(|v| v.as_str())
+            .map(|s| s.trim().to_string())
+            .filter(|s| !s.is_empty())
+            .or_else(|| configured_verify_cmd.clone())
+    };
+    let timeout_ms = args
+        .get("verify_timeout_ms")
+        .and_then(|v| v.as_u64())
+        .or_else(|| {
+            host_verify_cfg
+                .as_ref()
+                .and_then(|cfg| cfg.get("timeout_ms"))
+                .and_then(|v| v.as_u64())
+        })
+        .or(Some(30_000));
+    (configured_verify_cmd, verify_cmd, timeout_ms)
+}
+
+fn validate_repo_relative_paths(raw_paths: Vec<String>, context_name: &str) -> anyhow::Result<Vec<String>> {
+    let mut paths = Vec::new();
+    for p in raw_paths {
+        let norm = p.trim().trim_start_matches("./").to_string();
+        if norm.is_empty() {
+            continue;
+        }
+        if norm.starts_with('/')
+            || norm.starts_with('-')
+            || norm.contains('\\')
+            || norm.contains('\0')
+            || Path::new(&norm).components().any(|c| {
+                matches!(
+                    c,
+                    std::path::Component::ParentDir
+                        | std::path::Component::RootDir
+                        | std::path::Component::Prefix(_)
+                ) || c.as_os_str() == ".git"
+            })
+        {
+            bail!("Invalid repo-relative path '{}' in {}", norm, context_name);
+        }
+        if !paths.contains(&norm) {
+            paths.push(norm);
+        }
+    }
+    Ok(paths)
 }
 
 fn resolve_system_git_binary() -> anyhow::Result<PathBuf> {
@@ -633,12 +755,174 @@ fn is_safe_git_ref_name(git_bin: &Path, repo_root: &Path, ref_name: &str) -> boo
 }
 
 async fn execute_workspace_git_plan(
-    plan: HostGitPlan,
+    gateway: &AegisRuntimeKernel,
+    env: &AgentEnvironment,
+    mut plan: HostGitPlan,
     identity: &AgentIdentity,
 ) -> anyhow::Result<Value> {
+    let mut shadow_committed = Vec::new();
+    let mut verified_shadow = false;
+
+    if plan.auto_commit_shadow && !plan.shadow_paths.is_empty() {
+        let _ = env.workspace.refresh_from_host().await?;
+        let pre_verify_epoch = env.workspace.read_host_commit_epoch();
+        if !plan.skip_verify {
+            if let Some(ref cmd) = plan.verify_cmd {
+                let verify_out = env
+                    .sandbox
+                    .exec(ExecSpec {
+                        command: "sh".to_string(),
+                        args: vec!["-c".to_string(), cmd.clone()],
+                        cwd: Some(env.workspace.shadow_root().to_path_buf()),
+                        env: HashMap::new(),
+                        timeout_ms: plan.verify_timeout_ms.or(Some(30_000)),
+                        background: false,
+                    })
+                    .await?;
+                if verify_out.exit_code != Some(0) {
+                    let diag = if !verify_out.stderr.trim().is_empty() {
+                        verify_out.stderr.trim()
+                    } else {
+                        verify_out.stdout.trim()
+                    };
+                    bail!(
+                        "Pre-commit verification gate '{}' failed in shadow workspace (exit code {:?}; host & git untouched): {}",
+                        cmd,
+                        verify_out.exit_code,
+                        diag
+                    );
+                }
+                verified_shadow = true;
+            }
+        }
+        let _host_commit_lock = env.workspace.acquire_host_commit_lock().await?;
+        if env.workspace.read_host_commit_epoch() != pre_verify_epoch {
+            let retry_refresh = env.workspace.refresh_from_host().await?;
+            if !retry_refresh.conflicts.is_empty() {
+                bail!(
+                    "3-Way Merge Conflict detected against concurrent peer commit on {:?}: {:?}",
+                    retry_refresh.conflicts,
+                    retry_refresh.conflict_details
+                );
+            }
+        }
+        let base_dir = env
+            .workspace
+            .shadow_root()
+            .parent()
+            .map(|p| p.join("baseline_snapshot"))
+            .filter(|p| p.exists())
+            .unwrap_or_else(|| env.workspace.host_source_root().to_path_buf());
+        let current_diffs = CoWWorkspace::diff_dirs(
+            &base_dir,
+            env.workspace.shadow_root(),
+            Some(&plan.shadow_paths),
+        )
+        .await?;
+        let (_, recomputed_shadow_hash) = aos_core::compute_diff_evidence(
+            &current_diffs,
+            plan.overwrite_binaries,
+            plan.skip_verify,
+        );
+        if plan.shadow_evidence_hash.as_deref() != Some(recomputed_shadow_hash.as_str()) {
+            bail!(
+                "TOCTOU integrity error: CoW shadow changes drifted after approval; re-request workspace_git approval before landing"
+            );
+        }
+        if let Some(msg) = gateway
+            .claim_conflict_for_paths(identity, &plan.shadow_paths)
+            .await?
+        {
+            bail!("{}", msg);
+        }
+        shadow_committed = env
+            .workspace
+            .commit_to_host_with_options(Some(plan.shadow_paths.clone()), plan.overwrite_binaries)
+            .await?;
+        let _ = env.workspace.bump_host_commit_epoch().await;
+        if !shadow_committed.is_empty() {
+            let _ = gateway
+                .release_claims_matching_committed_paths(identity, &shadow_committed)
+                .await;
+            if !plan
+                .trailers
+                .iter()
+                .any(|t| t.starts_with("Aegis-OS-Verified:"))
+            {
+                let short_ev = &recomputed_shadow_hash[..recomputed_shadow_hash.len().min(12)];
+                plan.trailers.push(format!(
+                    "Aegis-OS-Verified: principal={}/{} files={} evidence=sha256:{} verify={}",
+                    identity.org_id,
+                    identity.agent_id,
+                    shadow_committed.len(),
+                    short_ev,
+                    if verified_shadow { "passed" } else { "cow-3way" }
+                ));
+            }
+        }
+    }
+
+    let need_shadow_refresh = plan.sync_mode.is_some() || plan.checkout_branch.is_some();
     let identity_org = identity.org_id.clone();
     let identity_agent = identity.agent_id.clone();
-    tokio::task::spawn_blocking(move || {
+    let git_result = tokio::task::spawn_blocking(move || {
+        let mut checked_out_branch = None;
+        if let Some(ref branch_name) = plan.checkout_branch {
+            let co_args = if plan.create_branch {
+                vec!["checkout".to_string(), "-b".to_string(), branch_name.clone()]
+            } else {
+                vec!["checkout".to_string(), branch_name.clone()]
+            };
+            let co_out = run_sanitized_host_git(&plan.git_bin, &plan.host_root, &[], &co_args)?;
+            if !co_out.status.success() {
+                bail!(
+                    "git checkout '{}' failed: {}",
+                    branch_name,
+                    String::from_utf8_lossy(&co_out.stderr).trim()
+                );
+            }
+            checked_out_branch = Some(branch_name.clone());
+        }
+
+        let mut synced_mode = None;
+        if let Some(ref mode) = plan.sync_mode {
+            let mut sync_args = match mode.as_str() {
+                "fetch" => vec![
+                    "fetch".to_string(),
+                    "--prune".to_string(),
+                    "--".to_string(),
+                    plan.remote.clone(),
+                ],
+                "pull_ff_only" => vec![
+                    "pull".to_string(),
+                    "--ff-only".to_string(),
+                    "--".to_string(),
+                    plan.remote.clone(),
+                ],
+                "pull_rebase" => vec![
+                    "pull".to_string(),
+                    "--rebase".to_string(),
+                    "--".to_string(),
+                    plan.remote.clone(),
+                ],
+                other => bail!("Unsupported sync mode '{}'", other),
+            };
+            if mode != "fetch" {
+                if let Some(ref b) = plan.push_branch {
+                    sync_args.push(b.clone());
+                }
+            }
+            let sync_out = run_sanitized_host_git(&plan.git_bin, &plan.host_root, &[], &sync_args)?;
+            if !sync_out.status.success() {
+                bail!(
+                    "git {} failed: {}",
+                    mode,
+                    String::from_utf8_lossy(&sync_out.stderr).trim()
+                );
+            }
+            synced_mode = Some(mode.clone());
+        }
+
         let mut author_cfg: Vec<(String, String)> = Vec::new();
         if plan.commit_message.is_some() {
             let has_name = run_sanitized_host_git(
@@ -737,12 +1021,11 @@ async fn execute_workspace_git_plan(
         if plan.push {
             if let Some(ref branch) = plan.push_branch {
                 let refspec = format!("refs/heads/{branch}:refs/heads/{branch}");
-                let push_args = vec![
-                    "push".to_string(),
-                    "--".to_string(),
-                    plan.remote.clone(),
-                    refspec,
-                ];
+                let mut push_args = vec!["push".to_string()];
+                if plan.force_push {
+                    push_args.push("--force-with-lease".to_string());
+                }
+                push_args.extend(["--".to_string(), plan.remote.clone(), refspec]);
                 let push_out =
                     run_sanitized_host_git(&plan.git_bin, &plan.host_root, &[], &push_args)?;
                 if !push_out.status.success() {
@@ -779,18 +1062,165 @@ async fn execute_workspace_git_plan(
             "status": "git_completed",
             "host_root": plan.host_root,
             "head_sha": new_head_sha,
+            "shadow_committed_files": shadow_committed,
+            "verified_shadow": verified_shadow,
+            "checked_out_branch": checked_out_branch,
+            "synced": synced_mode,
             "committed": plan.commit_message.is_some(),
             "committed_files": plan.paths,
             "tag": plan.tag,
             "force_tag": plan.force_tag,
+            "force_push": plan.force_push,
             "pushed": plan.push,
-            "remote": plan.push.then_some(plan.remote),
+            "remote": (plan.push || plan.sync_mode.is_some()).then_some(plan.remote),
             "remote_url": plan.remote_url,
             "pushed_refs": pushed_refs,
             "evidence_hash": plan.evidence_hash,
         }))
     })
-    .await?
+    .await?;
+
+    if need_shadow_refresh && git_result.is_ok() {
+        let _ = env.workspace.refresh_from_host().await;
+    }
+    git_result
+}
+
+fn is_safe_git_rev_arg(rev: &str) -> bool {
+    !rev.is_empty()
+        && rev.len() <= 128
+        && !rev.starts_with('-')
+        && !rev.contains('\0')
+        && !rev.chars().any(|c| c.is_whitespace() || c.is_control())
+}
+
+fn truncate_utf8_bytes(s: &str, max_bytes: usize) -> (String, bool) {
+    if s.len() <= max_bytes {
+        return (s.to_string(), false);
+    }
+    let mut end = max_bytes;
+    while end > 0 && !s.is_char_boundary(end) {
+        end -= 1;
+    }
+    (s[..end].to_string(), true)
+}
+
+async fn execute_workspace_git_inspect(
+    env: &AgentEnvironment,
+    args: &Value,
+) -> anyhow::Result<Value> {
+    let host_root = std::fs::canonicalize(env.workspace.host_source_root())
+        .unwrap_or_else(|_| env.workspace.host_source_root().to_path_buf());
+    if !host_root.join(".git").exists() {
+        bail!("Host workspace '{}' is not a Git repository", host_root.display());
+    }
+    let git_bin = resolve_system_git_binary()?;
+    let mode = args
+        .get("mode")
+        .and_then(|v| v.as_str())
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .unwrap_or("status")
+        .to_string();
+    let limit = args
+        .get("limit")
+        .and_then(|v| v.as_u64())
+        .unwrap_or(20)
+        .clamp(1, 100) as usize;
+    let rev = match args
+        .get("rev")
+        .and_then(|v| v.as_str())
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+    {
+        Some(r) => {
+            if !is_safe_git_rev_arg(r) {
+                bail!("Invalid Git revision/range '{}'", r);
+            }
+            Some(r.to_string())
+        }
+        None => None,
+    };
+    let paths_raw: Vec<String> = args
+        .get("paths")
+        .and_then(|v| serde_json::from_value(v.clone()).ok())
+        .unwrap_or_default();
+    let paths = validate_repo_relative_paths(paths_raw, "workspace_git_inspect")?;
+
+    let shadow_uncommitted = env
+        .workspace
+        .changed_since_baseline()
+        .await
+        .unwrap_or_default();
+
+    let mode_clone = mode.clone();
+    let host_root_clone = host_root.clone();
+    let (raw_output, truncated) = tokio::task::spawn_blocking(move || -> anyhow::Result<(String, bool)> {
+        let mut git_args: Vec<String> = match mode_clone.as_str() {
+            "status" => vec!["status".to_string(), "--short".to_string(), "--branch".to_string()],
+            "branch" => vec!["branch".to_string(), "-vv".to_string(), "--all".to_string()],
+            "log" => vec![
+                "log".to_string(),
+                "-n".to_string(),
+                limit.to_string(),
+                "--oneline".to_string(),
+                "--decorate".to_string(),
+            ],
+            "diff" => vec![
+                "diff".to_string(),
+                "--no-ext-diff".to_string(),
+                "--no-textconv".to_string(),
+            ],
+            "tag" => vec![
+                "tag".to_string(),
+                "-l".to_string(),
+                "--sort=-creatordate".to_string(),
+            ],
+            "remote" => vec!["remote".to_string(), "-v".to_string()],
+            "show" => vec![
+                "show".to_string(),
+                "--stat".to_string(),
+                "--no-ext-diff".to_string(),
+                "--no-textconv".to_string(),
+            ],
+            other => bail!(
+                "Unsupported workspace_git_inspect mode '{}'; expected one of status, branch, log, diff, tag, remote, show",
+                other
+            ),
+        };
+        if matches!(mode_clone.as_str(), "log" | "diff" | "show") {
+            if let Some(ref r) = rev {
+                git_args.push(r.clone());
+            } else if mode_clone == "show" {
+                git_args.push("HEAD".to_string());
+            }
+        }
+        if !paths.is_empty() && matches!(mode_clone.as_str(), "status" | "log" | "diff" | "show") {
+            git_args.push("--".to_string());
+            git_args.extend(paths);
+        }
+        let out = run_sanitized_host_git(&git_bin, &host_root_clone, &[], &git_args)?;
+        if !out.status.success() {
+            bail!(
+                "git {} failed: {}",
+                mode_clone,
+                redact_dlp_secrets(String::from_utf8_lossy(&out.stderr).trim()).0
+            );
+        }
+        let stdout_s = String::from_utf8_lossy(&out.stdout);
+        let (scrubbed, _) = redact_dlp_secrets(&stdout_s);
+        Ok(truncate_utf8_bytes(&scrubbed, 64 * 1024))
+    })
+    .await??;
+
+    Ok(json!({
+        "status": "ok",
+        "mode": mode,
+        "host_root": host_root,
+        "truncated": truncated,
+        "output": raw_output,
+        "shadow_uncommitted_files": shadow_uncommitted,
+    }))
 }
 
 fn is_valid_github_repo_slug(slug: &str) -> bool {
@@ -868,54 +1298,51 @@ fn is_valid_ci_branch_name(branch: &str) -> bool {
 }
 
 fn redact_ci_log_secrets(text: &str) -> String {
-    const PREFIXES: &[&str] = &[
-        "github_pat_",
-        "ghp_",
-        "gho_",
-        "ghu_",
-        "ghs_",
-        "sk-ant-",
-        "sk-proj-",
-        "AKIA",
-        "Bearer ",
-    ];
-    let is_tok_char = |c: char| c.is_ascii_alphanumeric() || matches!(c, '_' | '-' | '.' | '=' | '+' | '/');
-    let mut out = String::with_capacity(text.len());
-    let mut rest = text;
-    while !rest.is_empty() {
-        let mut earliest: Option<(usize, &str)> = None;
-        for &pat in PREFIXES {
-            if let Some(idx) = rest.find(pat) {
-                if earliest.is_none_or(|(best_idx, _)| idx < best_idx) {
-                    earliest = Some((idx, pat));
-                }
+    redact_dlp_secrets(text).0
+}
+
+fn redact_json_strings(val: &mut Value) {
+    match val {
+        Value::String(s) => {
+            let (scrubbed, hits) = redact_dlp_secrets(s);
+            if !hits.is_empty() {
+                *s = scrubbed;
             }
         }
-        let Some((idx, pat)) = earliest else {
-            out.push_str(rest);
-            break;
-        };
-        out.push_str(&rest[..idx]);
-        let after_idx = idx + pat.len();
-        let tail = &rest[after_idx..];
-        let tok_len = tail
-            .char_indices()
-            .take_while(|&(_, ch)| is_tok_char(ch))
-            .last()
-            .map(|(off, ch)| off + ch.len_utf8())
-            .unwrap_or(0);
-        if tok_len >= 6 {
-            if pat == "Bearer " {
-                out.push_str("Bearer ");
+        Value::Array(arr) => {
+            for item in arr.iter_mut() {
+                redact_json_strings(item);
             }
-            out.push_str("[REDACTED_BY_AEGIS_DLP]");
-            rest = &tail[tok_len..];
-        } else {
-            out.push_str(pat);
-            rest = tail;
         }
+        Value::Object(map) => {
+            for (_k, v) in map.iter_mut() {
+                redact_json_strings(v);
+            }
+        }
+        _ => {}
     }
-    out
+}
+
+fn resolve_github_repo_arg(host_root: &Path, args: &Value) -> anyhow::Result<String> {
+    match args
+        .get("repo")
+        .and_then(|v| v.as_str())
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+    {
+        Some(explicit) => {
+            if !is_valid_github_repo_slug(explicit) {
+                bail!(
+                    "Invalid GitHub repository slug '{}'; expected `owner/repo`",
+                    explicit
+                );
+            }
+            Ok(explicit.to_string())
+        }
+        None => detect_github_repo_from_git_config(host_root).context(
+            "Could not auto-detect GitHub `owner/repo` from host `.git/config`; pass `repo` explicitly",
+        ),
+    }
 }
 
 fn tail_ci_lines(text: &str, max_lines: usize) -> (String, usize, bool) {
@@ -984,25 +1411,7 @@ fn github_rest_get_json(url: &str) -> anyhow::Result<Value> {
 }
 
 async fn execute_github_ci_inspect(host_root: &Path, args: &Value) -> anyhow::Result<Value> {
-    let repo = match args
-        .get("repo")
-        .and_then(|v| v.as_str())
-        .map(str::trim)
-        .filter(|s| !s.is_empty())
-    {
-        Some(explicit) => {
-            if !is_valid_github_repo_slug(explicit) {
-                bail!(
-                    "Invalid GitHub repository slug '{}'; expected `owner/repo`",
-                    explicit
-                );
-            }
-            explicit.to_string()
-        }
-        None => detect_github_repo_from_git_config(host_root).context(
-            "Could not auto-detect GitHub `owner/repo` from host `.git/config`; pass `repo` explicitly",
-        )?,
-    };
+    let repo = resolve_github_repo_arg(host_root, args)?;
 
     let run_id = args.get("run_id").and_then(|v| v.as_u64());
     let job_id = args.get("job_id").and_then(|v| v.as_u64());
@@ -1035,7 +1444,7 @@ async fn execute_github_ci_inspect(host_root: &Path, args: &Value) -> anyhow::Re
         .unwrap_or(120)
         .clamp(1, 400) as usize;
 
-    tokio::task::spawn_blocking(move || -> anyhow::Result<Value> {
+    let mut val = tokio::task::spawn_blocking(move || -> anyhow::Result<Value> {
         let gh_bin = resolve_system_gh_binary();
 
         if let Some(jid) = job_id {
@@ -1220,6 +1629,346 @@ async fn execute_github_ci_inspect(host_root: &Path, args: &Value) -> anyhow::Re
             "runs": runs,
         }))
     })
+    .await??;
+    redact_json_strings(&mut val);
+    Ok(val)
+}
+
+async fn execute_github_ci_rerun(plan: GitHubCiRerunPlan) -> anyhow::Result<Value> {
+    tokio::task::spawn_blocking(move || -> anyhow::Result<Value> {
+        let gh = resolve_system_gh_binary()
+            .context("System `gh` CLI binary is required to rerun GitHub Actions workflows")?;
+        let rid_str = plan.run_id.to_string();
+        let jid_str = plan.job_id.map(|j| j.to_string());
+        let mut gh_args = vec!["run", "rerun", rid_str.as_str(), "-R", plan.repo.as_str()];
+        if let Some(ref j) = jid_str {
+            gh_args.push("--job");
+            gh_args.push(j.as_str());
+        } else if plan.failed_only {
+            gh_args.push("--failed");
+        }
+        let out = run_sanitized_gh(&gh, &gh_args)?;
+        if !out.status.success() {
+            bail!(
+                "gh run rerun {} on '{}' failed: {}",
+                plan.run_id,
+                plan.repo,
+                redact_ci_log_secrets(String::from_utf8_lossy(&out.stderr).trim())
+            );
+        }
+        Ok(json!({
+            "status": "ci_rerun_triggered",
+            "repo": plan.repo,
+            "run_id": plan.run_id,
+            "failed_only": plan.failed_only,
+            "job_id": plan.job_id,
+            "message": redact_ci_log_secrets(String::from_utf8_lossy(&out.stdout).trim()),
+            "evidence_hash": plan.evidence_hash,
+        }))
+    })
+    .await?
+}
+
+async fn execute_github_pr_inspect(host_root: &Path, args: &Value) -> anyhow::Result<Value> {
+    let repo = resolve_github_repo_arg(host_root, args)?;
+    let pr_number = args.get("pr_number").and_then(|v| v.as_u64());
+    let state = match args
+        .get("state")
+        .and_then(|v| v.as_str())
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .unwrap_or("open")
+    {
+        s @ ("open" | "closed" | "merged" | "all") => s.to_string(),
+        other => bail!("Invalid PR state '{}'; expected open|closed|merged|all", other),
+    };
+    let limit = args
+        .get("limit")
+        .and_then(|v| v.as_u64())
+        .unwrap_or(10)
+        .clamp(1, 30) as usize;
+    let include_comments = args
+        .get("include_comments")
+        .and_then(|v| v.as_bool())
+        .unwrap_or(true);
+    let include_checks = args
+        .get("include_checks")
+        .and_then(|v| v.as_bool())
+        .unwrap_or(true);
+    let include_diff = args
+        .get("include_diff")
+        .and_then(|v| v.as_bool())
+        .unwrap_or(false);
+
+    let mut val = tokio::task::spawn_blocking(move || -> anyhow::Result<Value> {
+        let gh_bin = resolve_system_gh_binary();
+        if let Some(num) = pr_number {
+            if let Some(ref gh) = gh_bin {
+                let num_s = num.to_string();
+                let mut fields = String::from(
+                    "number,title,body,state,isDraft,author,baseRefName,headRefName,mergeable,reviewDecision,url,createdAt,updatedAt",
+                );
+                if include_comments {
+                    fields.push_str(",comments");
+                }
+                if include_checks {
+                    fields.push_str(",statusCheckRollup");
+                }
+                if let Ok(out) = run_sanitized_gh(
+                    gh,
+                    &["pr", "view", &num_s, "-R", &repo, "--json", &fields],
+                ) {
+                    if out.status.success() {
+                        let pr: Value =
+                            serde_json::from_slice(&out.stdout).unwrap_or_else(|_| json!({}));
+                        let mut diff_text: Option<String> = None;
+                        let mut diff_truncated = false;
+                        if include_diff {
+                            if let Ok(d_out) =
+                                run_sanitized_gh(gh, &["pr", "diff", &num_s, "-R", &repo])
+                            {
+                                if d_out.status.success() {
+                                    let raw_d = String::from_utf8_lossy(&d_out.stdout);
+                                    let (scrubbed, _) = redact_dlp_secrets(&raw_d);
+                                    let (capped, trunc) = truncate_utf8_bytes(&scrubbed, 32 * 1024);
+                                    diff_text = Some(capped);
+                                    diff_truncated = trunc;
+                                }
+                            }
+                        }
+                        return Ok(json!({
+                            "source": "gh_cli",
+                            "repo": repo,
+                            "pr_number": num,
+                            "pr": pr,
+                            "diff": diff_text,
+                            "diff_truncated": diff_truncated,
+                        }));
+                    }
+                }
+            }
+            let pr = github_rest_get_json(&format!(
+                "https://api.github.com/repos/{repo}/pulls/{num}"
+            ))?;
+            let comments = if include_comments {
+                github_rest_get_json(&format!(
+                    "https://api.github.com/repos/{repo}/issues/{num}/comments?per_page=30"
+                ))
+                .unwrap_or_else(|_| json!([]))
+            } else {
+                json!([])
+            };
+            return Ok(json!({
+                "source": "github_rest_api_public",
+                "repo": repo,
+                "pr_number": num,
+                "pr": pr,
+                "comments": comments,
+            }));
+        }
+
+        if let Some(ref gh) = gh_bin {
+            let lim_s = limit.to_string();
+            if let Ok(out) = run_sanitized_gh(
+                gh,
+                &[
+                    "pr",
+                    "list",
+                    "-R",
+                    &repo,
+                    "--state",
+                    &state,
+                    "-L",
+                    &lim_s,
+                    "--json",
+                    "number,title,state,isDraft,author,headRefName,baseRefName,url,updatedAt",
+                ],
+            ) {
+                if out.status.success() {
+                    let prs: Value =
+                        serde_json::from_slice(&out.stdout).unwrap_or_else(|_| json!([]));
+                    return Ok(json!({
+                        "source": "gh_cli",
+                        "repo": repo,
+                        "state": state,
+                        "pulls": prs,
+                    }));
+                }
+            }
+        }
+        let rest_state = if state == "merged" { "closed" } else { state.as_str() };
+        let prs = github_rest_get_json(&format!(
+            "https://api.github.com/repos/{repo}/pulls?state={rest_state}&per_page={limit}"
+        ))?;
+        Ok(json!({
+            "source": "github_rest_api_public",
+            "repo": repo,
+            "state": state,
+            "pulls": prs,
+        }))
+    })
+    .await??;
+    redact_json_strings(&mut val);
+    Ok(val)
+}
+
+async fn execute_github_issue_inspect(host_root: &Path, args: &Value) -> anyhow::Result<Value> {
+    let repo = resolve_github_repo_arg(host_root, args)?;
+    let issue_number = args.get("issue_number").and_then(|v| v.as_u64());
+    let state = match args
+        .get("state")
+        .and_then(|v| v.as_str())
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .unwrap_or("open")
+    {
+        s @ ("open" | "closed" | "all") => s.to_string(),
+        other => bail!("Invalid issue state '{}'; expected open|closed|all", other),
+    };
+    let limit = args
+        .get("limit")
+        .and_then(|v| v.as_u64())
+        .unwrap_or(10)
+        .clamp(1, 30) as usize;
+    let include_comments = args
+        .get("include_comments")
+        .and_then(|v| v.as_bool())
+        .unwrap_or(true);
+
+    let mut val = tokio::task::spawn_blocking(move || -> anyhow::Result<Value> {
+        let gh_bin = resolve_system_gh_binary();
+        if let Some(num) = issue_number {
+            if let Some(ref gh) = gh_bin {
+                let num_s = num.to_string();
+                let mut fields = String::from("number,title,body,state,author,labels,url,createdAt,updatedAt");
+                if include_comments {
+                    fields.push_str(",comments");
+                }
+                if let Ok(out) = run_sanitized_gh(
+                    gh,
+                    &["issue", "view", &num_s, "-R", &repo, "--json", &fields],
+                ) {
+                    if out.status.success() {
+                        let issue: Value =
+                            serde_json::from_slice(&out.stdout).unwrap_or_else(|_| json!({}));
+                        return Ok(json!({
+                            "source": "gh_cli",
+                            "repo": repo,
+                            "issue_number": num,
+                            "issue": issue,
+                        }));
+                    }
+                }
+            }
+            let issue = github_rest_get_json(&format!(
+                "https://api.github.com/repos/{repo}/issues/{num}"
+            ))?;
+            let comments = if include_comments {
+                github_rest_get_json(&format!(
+                    "https://api.github.com/repos/{repo}/issues/{num}/comments?per_page=30"
+                ))
+                .unwrap_or_else(|_| json!([]))
+            } else {
+                json!([])
+            };
+            return Ok(json!({
+                "source": "github_rest_api_public",
+                "repo": repo,
+                "issue_number": num,
+                "issue": issue,
+                "comments": comments,
+            }));
+        }
+
+        if let Some(ref gh) = gh_bin {
+            let lim_s = limit.to_string();
+            if let Ok(out) = run_sanitized_gh(
+                gh,
+                &[
+                    "issue",
+                    "list",
+                    "-R",
+                    &repo,
+                    "--state",
+                    &state,
+                    "-L",
+                    &lim_s,
+                    "--json",
+                    "number,title,state,author,labels,url,updatedAt",
+                ],
+            ) {
+                if out.status.success() {
+                    let issues: Value =
+                        serde_json::from_slice(&out.stdout).unwrap_or_else(|_| json!([]));
+                    return Ok(json!({
+                        "source": "gh_cli",
+                        "repo": repo,
+                        "state": state,
+                        "issues": issues,
+                    }));
+                }
+            }
+        }
+        let issues = github_rest_get_json(&format!(
+            "https://api.github.com/repos/{repo}/issues?state={state}&per_page={limit}"
+        ))?;
+        Ok(json!({
+            "source": "github_rest_api_public",
+            "repo": repo,
+            "state": state,
+            "issues": issues,
+        }))
+    })
+    .await??;
+    redact_json_strings(&mut val);
+    Ok(val)
+}
+
+async fn execute_github_pr_create(plan: GitHubPrCreatePlan) -> anyhow::Result<Value> {
+    tokio::task::spawn_blocking(move || -> anyhow::Result<Value> {
+        let gh = resolve_system_gh_binary()
+            .context("System `gh` CLI binary is required to create GitHub Pull Requests")?;
+        let mut gh_args = vec![
+            "pr",
+            "create",
+            "-R",
+            plan.repo.as_str(),
+            "--title",
+            plan.title.as_str(),
+            "--body",
+            plan.body.as_str(),
+        ];
+        if let Some(ref base) = plan.base {
+            gh_args.push("--base");
+            gh_args.push(base.as_str());
+        }
+        if let Some(ref head) = plan.head {
+            gh_args.push("--head");
+            gh_args.push(head.as_str());
+        }
+        if plan.draft {
+            gh_args.push("--draft");
+        }
+        let out = run_sanitized_gh(&gh, &gh_args)?;
+        if !out.status.success() {
+            bail!(
+                "gh pr create on '{}' failed: {}",
+                plan.repo,
+                redact_ci_log_secrets(String::from_utf8_lossy(&out.stderr).trim())
+            );
+        }
+        let url = redact_ci_log_secrets(String::from_utf8_lossy(&out.stdout).trim());
+        Ok(json!({
+            "status": "pr_created",
+            "repo": plan.repo,
+            "title": plan.title,
+            "base": plan.base,
+            "head": plan.head,
+            "draft": plan.draft,
+            "url": url,
+            "evidence_hash": plan.evidence_hash,
+        }))
+    })
     .await?
 }
 
@@ -1238,6 +1987,7 @@ pub const TOOL_ANNOTATIONS: &[(&str, bool, bool, bool, bool)] = &[
     ("fs_delete", false, true, true, false),
     ("fs_glob", true, false, true, false),
     ("fs_export_file", false, true, true, false),
+    ("fs_import_file", false, false, true, false),
     // Auto-rebases the shadow onto the host before reporting.
     ("workspace_status", false, false, true, false),
     ("workspace_sync", false, false, true, false),
@@ -1247,8 +1997,13 @@ pub const TOOL_ANNOTATIONS: &[(&str, bool, bool, bool, bool)] = &[
     ("workspace_commit", false, true, false, false),
     ("workspace_export_pr", false, false, false, false),
     ("workspace_switch", false, false, true, false),
+    ("workspace_git_inspect", true, false, true, false),
     ("workspace_git", false, true, false, true),
     ("github_ci_inspect", true, false, true, true),
+    ("github_ci_rerun", false, false, false, true),
+    ("github_pr_inspect", true, false, true, true),
+    ("github_issue_inspect", true, false, true, true),
+    ("github_pr_create", false, false, false, true),
     // Arbitrary sandboxed commands; network policy depends on the sandbox profile.
     ("proc_exec", false, true, false, true),
     ("org_artifact_publish", false, false, true, false),
@@ -2185,6 +2940,8 @@ impl AegisRuntimeKernel {
             org_shared_ro_dir: org_shared_ro,
             org_agent_pub_dir: org_agent_pub,
             egress_proxy_addr: None,
+            host_source_dir: Some(ws.host_source_root().to_path_buf()),
+            tighten_home_read: true,
         };
 
         let driver: Box<dyn SandboxDriver> = match tier {
@@ -2375,13 +3132,73 @@ impl AegisRuntimeKernel {
             .get("paths")
             .and_then(|v| serde_json::from_value(v.clone()).ok())
             .unwrap_or_default();
-        let mut paths = Vec::new();
-        for p in raw_paths {
-            let norm = p.trim().trim_start_matches("./").to_string();
-            if !norm.is_empty() && !paths.contains(&norm) {
-                paths.push(norm);
+        let mut paths = validate_repo_relative_paths(raw_paths, "workspace_git")?;
+
+        let auto_commit_shadow = args
+            .get("auto_commit_shadow")
+            .and_then(|v| v.as_bool())
+            .unwrap_or(false);
+        let overwrite_binaries = args
+            .get("overwrite_binaries")
+            .and_then(|v| v.as_bool())
+            .unwrap_or(false);
+        let skip_verify = args
+            .get("skip_verify")
+            .and_then(|v| v.as_bool())
+            .unwrap_or(false);
+        let (configured_verify_cmd, verify_cmd, verify_timeout_ms) =
+            resolve_workspace_verify_config(&host_root, args, skip_verify);
+
+        let checkout_branch = args
+            .get("checkout_branch")
+            .and_then(|v| v.as_str())
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .map(str::to_string);
+        let create_branch = args
+            .get("create_branch")
+            .and_then(|v| v.as_bool())
+            .unwrap_or(false);
+        if let Some(ref cb) = checkout_branch {
+            if !is_safe_git_ref_name(&git_bin, &host_root, cb) {
+                bail!("Invalid Git checkout branch name '{}'", cb);
+            }
+            if create_branch {
+                let exists = run_sanitized_host_git(
+                    &git_bin,
+                    &host_root,
+                    &[],
+                    &[
+                        "rev-parse".to_string(),
+                        "-q".to_string(),
+                        "--verify".to_string(),
+                        format!("refs/heads/{cb}"),
+                    ],
+                )
+                .map(|o| o.status.success())
+                .unwrap_or(false);
+                if exists {
+                    bail!(
+                        "Branch '{}' already exists on host; omit create_branch or set create_branch: false to switch to it",
+                        cb
+                    );
+                }
             }
         }
+
+        let sync_mode = match args
+            .get("sync")
+            .and_then(|v| v.as_str())
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+        {
+            Some(s @ ("fetch" | "pull_ff_only" | "pull_rebase")) => Some(s.to_string()),
+            Some(other) => bail!(
+                "Invalid workspace_git sync mode '{}'; expected 'fetch', 'pull_ff_only', or 'pull_rebase'",
+                other
+            ),
+            None => None,
+        };
 
         let commit_message = match args.get("commit_message").and_then(|v| v.as_str()) {
             Some(raw) => {
@@ -2420,6 +3237,13 @@ impl AegisRuntimeKernel {
             .and_then(|v| v.as_bool())
             .unwrap_or(false);
         let push = args.get("push").and_then(|v| v.as_bool()).unwrap_or(false);
+        let force_push = args
+            .get("force_push")
+            .and_then(|v| v.as_bool())
+            .unwrap_or(false);
+        if force_push && !push {
+            bail!("'force_push: true' requires 'push: true'");
+        }
         let remote = args
             .get("remote")
             .and_then(|v| v.as_str())
@@ -2429,65 +3253,106 @@ impl AegisRuntimeKernel {
             .to_string();
         let branch_arg = args.get("branch").and_then(|v| v.as_str());
 
-        if commit_message.is_none() && tag.is_none() && !push {
-            bail!("workspace_git requires at least one of 'commit_message', 'tag', or 'push: true'");
+        if auto_commit_shadow {
+            let _ = env.workspace.refresh_from_host().await;
+        }
+        let shadow_changed = env
+            .workspace
+            .changed_since_baseline()
+            .await
+            .unwrap_or_default();
+        if auto_commit_shadow && paths.is_empty() && commit_message.is_some() && !shadow_changed.is_empty() {
+            paths = shadow_changed.clone();
+        }
+
+        if !auto_commit_shadow
+            && checkout_branch.is_none()
+            && sync_mode.is_none()
+            && commit_message.is_none()
+            && tag.is_none()
+            && !push
+        {
+            bail!("workspace_git requires at least one of 'commit_message', 'tag', 'push: true', 'checkout_branch', 'sync', or 'auto_commit_shadow: true'");
         }
         if commit_message.is_some() && paths.is_empty() {
             bail!(
-                "workspace_git requires explicit repo-relative 'paths' when 'commit_message' is set (prevents staging unrelated dirty host files)"
+                "workspace_git requires explicit repo-relative 'paths' (or uncommitted CoW edits with auto_commit_shadow: true) when 'commit_message' is set"
             );
         }
-        if commit_message.is_none() && !paths.is_empty() {
+        if commit_message.is_none() && !paths.is_empty() && !auto_commit_shadow {
             bail!(
                 "workspace_git received 'paths' without 'commit_message'; pass 'commit_message' to commit those files or omit 'paths'"
             );
         }
 
-        for p in &paths {
-            if p.starts_with('/')
-                || p.starts_with('-')
-                || p.contains('\\')
-                || p.contains('\0')
-                || Path::new(p).components().any(|c| {
-                    matches!(
-                        c,
-                        std::path::Component::ParentDir
-                            | std::path::Component::RootDir
-                            | std::path::Component::Prefix(_)
-                    ) || c.as_os_str() == ".git"
-                })
-            {
-                bail!("Invalid repo-relative path '{}' in workspace_git", p);
+        let shadow_paths: Vec<String> = if auto_commit_shadow {
+            if !paths.is_empty() {
+                paths
+                    .iter()
+                    .filter(|p| shadow_changed.iter().any(|s| s == *p))
+                    .cloned()
+                    .collect()
+            } else {
+                shadow_changed.clone()
             }
-        }
-
-        if !paths.is_empty() {
-            let shadow_changed = env
-                .workspace
-                .changed_since_baseline()
-                .await
-                .unwrap_or_default();
+        } else {
             for p in &paths {
                 if shadow_changed.iter().any(|s| s == p) {
                     bail!(
-                        "Path '{}' still has uncommitted changes in your CoW shadow workspace; call 'workspace_commit' first before 'workspace_git'",
+                        "Path '{}' still has uncommitted changes in your CoW shadow workspace; call 'workspace_commit' first (or pass auto_commit_shadow: true) before 'workspace_git'",
                         p
                     );
                 }
             }
-            if let Some(msg) = self.claim_conflict_for_paths(identity, &paths).await? {
+            Vec::new()
+        };
+
+        let mut claim_check_paths = paths.clone();
+        for sp in &shadow_paths {
+            if !claim_check_paths.contains(sp) {
+                claim_check_paths.push(sp.clone());
+            }
+        }
+        if !claim_check_paths.is_empty() {
+            if let Some(msg) = self.claim_conflict_for_paths(identity, &claim_check_paths).await? {
                 bail!("{}", msg);
             }
         }
 
-        if commit_message.is_some() {
+        let mut shadow_diffs: Vec<aos_core::FileDiffEntry> = Vec::new();
+        let mut shadow_evidence_hash: Option<String> = None;
+        if auto_commit_shadow && !shadow_paths.is_empty() {
+            let base_dir = env
+                .workspace
+                .shadow_root()
+                .parent()
+                .map(|p| p.join("baseline_snapshot"))
+                .filter(|p| p.exists())
+                .unwrap_or_else(|| env.workspace.host_source_root().to_path_buf());
+            let sd = CoWWorkspace::diff_dirs(
+                &base_dir,
+                env.workspace.shadow_root(),
+                Some(&shadow_paths),
+            )
+            .await?;
+            let (_, ev_h) = aos_core::compute_diff_evidence(&sd, overwrite_binaries, skip_verify);
+            shadow_diffs = sd;
+            shadow_evidence_hash = Some(ev_h);
+        }
+
+        let host_only_paths: Vec<String> = paths
+            .iter()
+            .filter(|p| !shadow_paths.contains(p))
+            .cloned()
+            .collect();
+        if commit_message.is_some() && !host_only_paths.is_empty() {
             let mut status_args = vec![
                 "status".to_string(),
                 "--porcelain".to_string(),
                 "--untracked-files=all".to_string(),
                 "--".to_string(),
             ];
-            status_args.extend(paths.iter().cloned());
+            status_args.extend(host_only_paths.iter().cloned());
             let status_out = run_sanitized_host_git(&git_bin, &host_root, &[], &status_args)?;
             if !status_out.status.success() {
                 bail!(
@@ -2498,8 +3363,8 @@ impl AegisRuntimeKernel {
             }
             if String::from_utf8_lossy(&status_out.stdout).trim().is_empty() {
                 bail!(
-                    "No uncommitted host changes found in {:?}; nothing to commit (did you call workspace_commit first?)",
-                    paths
+                    "No uncommitted host changes found in {:?}; nothing to commit (did you call workspace_commit or pass auto_commit_shadow: true?)",
+                    host_only_paths
                 );
             }
         }
@@ -2545,7 +3410,7 @@ impl AegisRuntimeKernel {
 
         let mut remote_url = None;
         let mut push_branch = None;
-        if push {
+        if push || sync_mode.is_some() {
             if !is_safe_remote_name(&remote) {
                 bail!(
                     "Invalid Git remote name '{}' (raw URLs and flags are forbidden; use a configured remote name like 'origin')",
@@ -2574,7 +3439,7 @@ impl AegisRuntimeKernel {
 
             push_branch = match branch_arg {
                 Some(s) if s.trim().is_empty() => {
-                    if tag.is_some() {
+                    if !push || tag.is_some() {
                         None
                     } else {
                         bail!("Empty 'branch' in workspace_git push requires 'tag' to be set");
@@ -2588,39 +3453,58 @@ impl AegisRuntimeKernel {
                     Some(b)
                 }
                 None => {
-                    let sym = run_sanitized_host_git(
-                        &git_bin,
-                        &host_root,
-                        &[],
-                        &[
-                            "symbolic-ref".to_string(),
-                            "--quiet".to_string(),
-                            "--short".to_string(),
-                            "HEAD".to_string(),
-                        ],
-                    )?;
-                    if sym.status.success() {
-                        let b = String::from_utf8_lossy(&sym.stdout).trim().to_string();
-                        (!b.is_empty()).then_some(b)
-                    } else if tag.is_some() {
-                        None
+                    if let Some(ref cb) = checkout_branch {
+                        Some(cb.clone())
                     } else {
-                        bail!("Host repository HEAD is detached; specify an explicit 'branch' or 'tag' to push");
+                        let sym = run_sanitized_host_git(
+                            &git_bin,
+                            &host_root,
+                            &[],
+                            &[
+                                "symbolic-ref".to_string(),
+                                "--quiet".to_string(),
+                                "--short".to_string(),
+                                "HEAD".to_string(),
+                            ],
+                        )?;
+                        if sym.status.success() {
+                            let b = String::from_utf8_lossy(&sym.stdout).trim().to_string();
+                            (!b.is_empty()).then_some(b)
+                        } else if !push || tag.is_some() {
+                            None
+                        } else {
+                            bail!("Host repository HEAD is detached; specify an explicit 'branch' or 'tag' to push");
+                        }
                     }
                 }
             };
         }
 
         let mut file_hashes: Vec<(String, String)> = Vec::with_capacity(paths.len());
-        let mut diffs: Vec<aos_core::FileDiffEntry> = Vec::with_capacity(paths.len() + 1);
+        let mut diffs: Vec<aos_core::FileDiffEntry> =
+            Vec::with_capacity(shadow_diffs.len() + paths.len() + 1);
 
         let mut plan_lines = vec![
-            format!("--- a/.git/OPERATION_PLAN"),
-            format!("+++ b/.git/OPERATION_PLAN"),
-            format!("@@ Host Git Boundary Plan @@"),
+            "--- a/.git/OPERATION_PLAN".to_string(),
+            "+++ b/.git/OPERATION_PLAN".to_string(),
+            "@@ Host Git Boundary Plan @@".to_string(),
             format!("+Repository: {}", host_root.display()),
             format!("+Base HEAD:  {}", head_sha),
         ];
+        if auto_commit_shadow {
+            plan_lines.push(format!(
+                "+AutoShadow: true ({} file(s), skip_verify={}, verify_cmd={})",
+                shadow_paths.len(),
+                skip_verify,
+                verify_cmd.as_deref().unwrap_or("<none>")
+            ));
+        }
+        if let Some(ref cb) = checkout_branch {
+            plan_lines.push(format!("+Checkout:  {} (create={})", cb, create_branch));
+        }
+        if let Some(ref sm) = sync_mode {
+            plan_lines.push(format!("+Sync:      {} ({})", sm, remote));
+        }
         if !paths.is_empty() {
             plan_lines.push(format!("+Paths:     {}", paths.join(", ")));
         }
@@ -2631,18 +3515,16 @@ impl AegisRuntimeKernel {
             plan_lines.push(format!("+Trailer:   {}", t));
         }
         if let Some(ref t) = tag {
-            plan_lines.push(format!(
-                "+Tag:       {} (force={})",
-                t, force_tag
-            ));
+            plan_lines.push(format!("+Tag:       {} (force={})", t, force_tag));
         }
         if push {
             plan_lines.push(format!(
-                "+Push:      {} ({}) | branch={} | tag={}",
+                "+Push:      {} ({}) | branch={} | tag={} | force_push={}",
                 remote,
                 remote_url.as_deref().unwrap_or("?"),
                 push_branch.as_deref().unwrap_or("-"),
-                tag.as_deref().unwrap_or("-")
+                tag.as_deref().unwrap_or("-"),
+                force_push
             ));
         }
         diffs.push(aos_core::FileDiffEntry {
@@ -2654,8 +3536,9 @@ impl AegisRuntimeKernel {
             old_sha256: None,
             new_sha256: None,
         });
+        diffs.extend(shadow_diffs);
 
-        for p in &paths {
+        for p in &host_only_paths {
             let full = host_root.join(p);
             let meta_opt = std::fs::symlink_metadata(&full).ok();
             let (hash_str, change_type, new_size) = match meta_opt {
@@ -2740,42 +3623,75 @@ impl AegisRuntimeKernel {
             "host_root": host_root.display().to_string(),
             "head_sha": head_sha,
             "file_hashes": file_hashes,
+            "auto_commit_shadow": auto_commit_shadow,
+            "shadow_paths": shadow_paths,
+            "shadow_evidence_hash": shadow_evidence_hash,
+            "overwrite_binaries": overwrite_binaries,
+            "skip_verify": skip_verify,
+            "verify_cmd": verify_cmd,
+            "checkout_branch": checkout_branch,
+            "create_branch": create_branch,
+            "sync_mode": sync_mode,
             "commit_message": commit_message,
             "trailers": trailers,
             "tag": tag,
             "force_tag": force_tag,
             "push": push,
+            "force_push": force_push,
             "remote": remote,
             "remote_url": remote_url,
             "branch": push_branch,
         }))?;
         let evidence_hash = hex::encode(Sha256::digest(&canonical_plan));
 
-        let target_resource = if push {
-            format!(
+        let mut target_resource = if push {
+            let base = format!(
                 "git:{}#push:{}:branch={},tag={},force_tag={}",
                 host_root.display(),
                 remote,
                 push_branch.as_deref().unwrap_or("-"),
                 tag.as_deref().unwrap_or("-"),
                 force_tag
-            )
+            );
+            if force_push {
+                format!("{base},force_push=true")
+            } else {
+                base
+            }
         } else if let Some(t) = tag.as_deref().filter(|_| force_tag) {
             format!("git:{}#local:force_tag={}", host_root.display(), t)
+        } else if let Some(ref sm) = sync_mode {
+            format!("git:{}#sync:{}:{}", host_root.display(), remote, sm)
+        } else if let Some(ref cb) = checkout_branch {
+            format!("git:{}#checkout:{}", host_root.display(), cb)
         } else {
             format!("git:{}#local", host_root.display())
         };
+        if !push && auto_commit_shadow && !shadow_paths.is_empty() && sync_mode.is_none() && checkout_branch.is_none() && tag.is_none() {
+            // Keep clean `#local` prefix with explicit shadow indicator only when needed.
+            target_resource = format!("git:{}#local:auto_shadow", host_root.display());
+        }
 
         let meta = json!({
             "host_root": host_root.display().to_string(),
             "head_sha": head_sha,
             "paths": paths,
+            "shadow_paths": shadow_paths,
+            "auto_commit_shadow": auto_commit_shadow,
+            "verify_cmd": verify_cmd,
+            "has_configured_verify_cmd": configured_verify_cmd.is_some(),
+            "overwrite_binaries": overwrite_binaries,
+            "skip_verify": skip_verify,
+            "checkout_branch": checkout_branch,
+            "create_branch": create_branch,
+            "sync": sync_mode,
             "commit_message": commit_message,
             "trailers": trailers,
             "tag": tag,
             "force_tag": force_tag,
             "push": push,
-            "remote": push.then_some(&remote),
+            "force_push": force_push,
+            "remote": (push || sync_mode.is_some()).then_some(&remote),
             "remote_url": remote_url,
             "branch": push_branch,
             "evidence_hash": evidence_hash,
@@ -2785,17 +3701,436 @@ impl AegisRuntimeKernel {
             git_bin,
             host_root,
             paths,
+            shadow_paths,
+            auto_commit_shadow,
+            verify_cmd,
+            verify_timeout_ms,
+            overwrite_binaries,
+            skip_verify,
+            shadow_evidence_hash,
+            checkout_branch,
+            create_branch,
+            sync_mode,
             commit_message,
             trailers,
             tag,
             force_tag,
             push,
+            force_push,
             remote,
             remote_url,
             push_branch,
             evidence_hash,
         };
         Ok((plan, target_resource, diffs, meta))
+    }
+
+    async fn prepare_fs_import_file_plan(
+        &self,
+        env: &AgentEnvironment,
+        identity: &AgentIdentity,
+        args: &Value,
+    ) -> anyhow::Result<(ImportFilePlan, String, Vec<aos_core::FileDiffEntry>, Value)> {
+        let raw_src = args
+            .get("src_host_path")
+            .and_then(|v| v.as_str())
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .context("Missing 'src_host_path'")?;
+        if raw_src.contains('\0') {
+            bail!("Invalid 'src_host_path' containing NUL byte");
+        }
+        let expanded = expand_home_tilde(raw_src);
+        if !expanded.is_absolute() {
+            bail!("'src_host_path' must be an absolute path (or ~/...): '{}'", raw_src);
+        }
+        if expanded
+            .components()
+            .any(|c| matches!(c, std::path::Component::ParentDir | std::path::Component::Prefix(_)))
+        {
+            bail!("Path traversal ('..') is forbidden in 'src_host_path': '{}'", raw_src);
+        }
+        let expanded_s = expanded.to_string_lossy().to_string();
+        if AegisPolicyKernel::is_forbidden_import_source(raw_src)
+            || AegisPolicyKernel::is_forbidden_import_source(&expanded_s)
+        {
+            bail!(
+                "Blocked by Aegis OS policy: importing protected credential or dotenv secret '{}' is forbidden",
+                raw_src
+            );
+        }
+
+        let sym_meta = std::fs::symlink_metadata(&expanded)
+            .with_context(|| format!("Host source file '{}' not found", expanded.display()))?;
+        if sym_meta.file_type().is_symlink() {
+            bail!(
+                "Refusing to import trailing symlink '{}' from host",
+                expanded.display()
+            );
+        }
+        if !sym_meta.is_file() {
+            bail!(
+                "Host source '{}' is not a regular file",
+                expanded.display()
+            );
+        }
+        if sym_meta.len() > MAX_BINARY_EXPORT_BYTES {
+            bail!(
+                "Host source file '{}' ({} bytes) exceeds maximum import size ({} bytes)",
+                expanded.display(),
+                sym_meta.len(),
+                MAX_BINARY_EXPORT_BYTES
+            );
+        }
+
+        let canon_src = std::fs::canonicalize(&expanded)
+            .with_context(|| format!("Canonicalizing host source '{}'", expanded.display()))?;
+        let canon_src_s = canon_src.to_string_lossy().to_string();
+        if AegisPolicyKernel::is_forbidden_import_source(&canon_src_s) {
+            bail!(
+                "Blocked by Aegis OS policy: canonical source '{}' is a protected credential/secret path",
+                canon_src.display()
+            );
+        }
+        let canon_rt = std::fs::canonicalize(&self.runtime_data_root)
+            .unwrap_or_else(|_| self.runtime_data_root.clone());
+        if canon_src.starts_with(&canon_rt) {
+            bail!(
+                "Blocked by Aegis OS Ring-0 policy: importing directly from Aegis runtime directory '{}' is forbidden",
+                canon_src.display()
+            );
+        }
+
+        let import_to = match args
+            .get("import_to")
+            .and_then(|v| v.as_str())
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .unwrap_or("imports")
+        {
+            s @ ("imports" | "shadow") => s.to_string(),
+            other => bail!("Invalid 'import_to' '{}'; expected 'imports' or 'shadow'", other),
+        };
+        let overwrite = args
+            .get("overwrite")
+            .and_then(|v| v.as_bool())
+            .unwrap_or(true);
+
+        let default_name = canon_src
+            .file_name()
+            .and_then(|n| n.to_str())
+            .filter(|n| !n.is_empty())
+            .context("Host source path has no valid file name")?
+            .to_string();
+        let raw_dst = args
+            .get("dst_path")
+            .and_then(|v| v.as_str())
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .unwrap_or(&default_name);
+        let rel_dst = shadow_relative(raw_dst)?;
+        let clean_dst_rel = rel_dst.to_string_lossy().replace('\\', "/");
+
+        let dst_full_path = if import_to == "shadow" {
+            if AegisPolicyKernel::is_commit_poisoning_path(&clean_dst_rel) {
+                bail!(
+                    "Blocked by Aegis OS policy: cannot import external file directly onto sensitive build/hook path '{}'",
+                    clean_dst_rel
+                );
+            }
+            if let Some(msg) = self
+                .claim_conflict_for_paths(identity, std::slice::from_ref(&clean_dst_rel))
+                .await?
+            {
+                bail!("{}", msg);
+            }
+            let (_clean, full) = shadow_path_for_write(env.workspace.shadow_root(), &clean_dst_rel)?;
+            full
+        } else {
+            env.sandbox.config().agent_home_dir.join("imports").join(&rel_dst)
+        };
+
+        if let Ok(dst_meta) = std::fs::symlink_metadata(&dst_full_path) {
+            if dst_meta.file_type().is_symlink() || dst_meta.is_dir() {
+                bail!(
+                    "Import destination '{}' is a symlink or directory",
+                    dst_full_path.display()
+                );
+            }
+            if !overwrite {
+                bail!(
+                    "Import destination '{}' already exists and overwrite=false",
+                    dst_full_path.display()
+                );
+            }
+        }
+
+        let bytes = tokio::fs::read(&canon_src).await?;
+        if (bytes.len() as u64) > MAX_BINARY_EXPORT_BYTES {
+            bail!(
+                "Host source '{}' exceeded maximum import size while reading",
+                canon_src.display()
+            );
+        }
+        let src_sha256 = hex::encode(Sha256::digest(&bytes));
+        let preview = match std::str::from_utf8(&bytes) {
+            Ok(txt) => {
+                let (scrubbed, _) = redact_dlp_secrets(txt);
+                let snippet: String = scrubbed.lines().take(60).collect::<Vec<_>>().join("\n");
+                let (capped, _) = truncate_utf8_bytes(&snippet, 8 * 1024);
+                format!(
+                    "Authorized Host Import ({} bytes, sha256:{})\n{}",
+                    bytes.len(),
+                    &src_sha256[..16],
+                    capped
+                )
+            }
+            Err(_) => format!(
+                "Authorized Host Binary Import -> {} ({} bytes, sha256:{})",
+                clean_dst_rel,
+                bytes.len(),
+                &src_sha256[..16]
+            ),
+        };
+
+        let canonical_plan = serde_json::to_vec(&json!({
+            "src_host_path": canon_src.display().to_string(),
+            "src_sha256": src_sha256,
+            "size_bytes": bytes.len(),
+            "import_to": import_to,
+            "dst_path": clean_dst_rel,
+            "overwrite": overwrite,
+        }))?;
+        let evidence_hash = hex::encode(Sha256::digest(&canonical_plan));
+
+        let diff_entry = aos_core::FileDiffEntry {
+            relative_path: format!("{import_to}:{clean_dst_rel}"),
+            change_type: if dst_full_path.exists() {
+                DiffChangeType::Modified
+            } else {
+                DiffChangeType::Added
+            },
+            old_size: None,
+            new_size: Some(bytes.len() as u64),
+            preview_diff: Some(preview),
+            old_sha256: Some(format!("sha256:{src_sha256}")),
+            new_sha256: Some(format!("sha256:{src_sha256}")),
+        };
+
+        let target_resource = canon_src.display().to_string();
+        let meta = json!({
+            "src_host_path": target_resource,
+            "src_sha256": src_sha256,
+            "size_bytes": bytes.len(),
+            "import_to": import_to,
+            "dst_path": clean_dst_rel,
+            "overwrite": overwrite,
+            "evidence_hash": evidence_hash,
+        });
+        let plan = ImportFilePlan {
+            canon_src,
+            src_sha256,
+            import_to,
+            clean_dst_rel,
+            dst_full_path,
+            evidence_hash,
+        };
+        Ok((plan, target_resource, vec![diff_entry], meta))
+    }
+
+    fn prepare_github_inspect_context(
+        host_root: &Path,
+        args: &Value,
+    ) -> anyhow::Result<(String, Value)> {
+        let origin_repo = detect_github_repo_from_git_config(host_root);
+        let explicit_repo = args
+            .get("repo")
+            .and_then(|v| v.as_str())
+            .map(str::trim)
+            .filter(|s| !s.is_empty());
+        let effective_repo = resolve_github_repo_arg(host_root, args)?;
+        let cross_repo = match (&origin_repo, explicit_repo) {
+            (Some(orig), None) => {
+                let _ = orig;
+                false
+            }
+            (Some(orig), Some(req)) => !orig.eq_ignore_ascii_case(req),
+            (None, _) => true,
+        };
+        let evidence_hash = hex::encode(Sha256::digest(
+            serde_json::to_vec(&json!({
+                "repo": effective_repo,
+                "origin_repo": origin_repo,
+                "cross_repo": cross_repo,
+            }))?
+        ));
+        let meta = json!({
+            "repo": effective_repo,
+            "origin_repo": origin_repo,
+            "cross_repo": cross_repo,
+            "evidence_hash": evidence_hash,
+        });
+        Ok((effective_repo, meta))
+    }
+
+    fn prepare_github_ci_rerun_plan(
+        host_root: &Path,
+        args: &Value,
+    ) -> anyhow::Result<(GitHubCiRerunPlan, String, Value)> {
+        let repo = resolve_github_repo_arg(host_root, args)?;
+        let run_id = args
+            .get("run_id")
+            .and_then(|v| v.as_u64())
+            .filter(|&id| id > 0)
+            .context("Missing positive integer 'run_id' for github_ci_rerun")?;
+        let failed_only = args
+            .get("failed_only")
+            .and_then(|v| v.as_bool())
+            .unwrap_or(true);
+        let job_id = args.get("job_id").and_then(|v| v.as_u64()).filter(|&id| id > 0);
+        let canonical = serde_json::to_vec(&json!({
+            "repo": repo,
+            "run_id": run_id,
+            "failed_only": failed_only,
+            "job_id": job_id,
+        }))?;
+        let evidence_hash = hex::encode(Sha256::digest(&canonical));
+        let resource = format!("{repo}#run:{run_id}");
+        let meta = json!({
+            "repo": repo,
+            "run_id": run_id,
+            "failed_only": failed_only,
+            "job_id": job_id,
+            "evidence_hash": evidence_hash,
+        });
+        let plan = GitHubCiRerunPlan {
+            repo,
+            run_id,
+            failed_only,
+            job_id,
+            evidence_hash,
+        };
+        Ok((plan, resource, meta))
+    }
+
+    fn prepare_github_pr_create_plan(
+        host_root: &Path,
+        args: &Value,
+    ) -> anyhow::Result<(GitHubPrCreatePlan, String, Vec<aos_core::FileDiffEntry>, Value)> {
+        let repo = resolve_github_repo_arg(host_root, args)?;
+        let title = args
+            .get("title")
+            .and_then(|v| v.as_str())
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .context("Missing non-empty 'title' for github_pr_create")?
+            .to_string();
+        if title.contains('\0') || title.len() > 256 {
+            bail!("Invalid PR 'title' length or NUL byte");
+        }
+        let body = args
+            .get("body")
+            .and_then(|v| v.as_str())
+            .unwrap_or("")
+            .to_string();
+        if body.contains('\0') || body.len() > 32 * 1024 {
+            bail!("Invalid PR 'body' (exceeds 32 KB limit or contains NUL byte)");
+        }
+        let dlp_title = detect_dlp_patterns(&title);
+        let dlp_body = detect_dlp_patterns(&body);
+        if !dlp_title.is_empty() || !dlp_body.is_empty() {
+            let mut combined = dlp_title;
+            for hit in dlp_body {
+                if !combined.contains(&hit) {
+                    combined.push(hit);
+                }
+            }
+            bail!(
+                "Blocked by Aegis OS DLP policy: PR title/body contains sensitive secret pattern(s): {:?}",
+                combined
+            );
+        }
+
+        let base = match args
+            .get("base")
+            .and_then(|v| v.as_str())
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+        {
+            Some(b) => {
+                if !is_valid_ci_branch_name(b) {
+                    bail!("Invalid base branch name '{}'", b);
+                }
+                Some(b.to_string())
+            }
+            None => None,
+        };
+        let head = match args
+            .get("head")
+            .and_then(|v| v.as_str())
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+        {
+            Some(h) => {
+                if !is_valid_ci_branch_name(h) {
+                    bail!("Invalid head branch name '{}'", h);
+                }
+                Some(h.to_string())
+            }
+            None => None,
+        };
+        let draft = args.get("draft").and_then(|v| v.as_bool()).unwrap_or(false);
+
+        let canonical = serde_json::to_vec(&json!({
+            "repo": repo,
+            "title": title,
+            "body": body,
+            "base": base,
+            "head": head,
+            "draft": draft,
+        }))?;
+        let evidence_hash = hex::encode(Sha256::digest(&canonical));
+        let resource = format!(
+            "{}:{}=>{}",
+            repo,
+            head.as_deref().unwrap_or("HEAD"),
+            base.as_deref().unwrap_or("default")
+        );
+        let preview_diff = aos_core::FileDiffEntry {
+            relative_path: ".github/PULL_REQUEST_PLAN".to_string(),
+            change_type: DiffChangeType::Added,
+            old_size: None,
+            new_size: Some((title.len() + body.len()) as u64),
+            preview_diff: Some(format!(
+                "+Repo:  {}\n+Head:  {}\n+Base:  {}\n+Draft: {}\n+Title: {}\n\n{}",
+                repo,
+                head.as_deref().unwrap_or("<current>"),
+                base.as_deref().unwrap_or("<default>"),
+                draft,
+                title,
+                body
+            )),
+            old_sha256: None,
+            new_sha256: Some(format!("sha256:{}", evidence_hash)),
+        };
+        let meta = json!({
+            "repo": repo,
+            "title": title,
+            "base": base,
+            "head": head,
+            "draft": draft,
+            "evidence_hash": evidence_hash,
+        });
+        let plan = GitHubPrCreatePlan {
+            repo,
+            title,
+            body,
+            base,
+            head,
+            draft,
+            evidence_hash,
+        };
+        Ok((plan, resource, vec![preview_diff], meta))
     }
 
     pub async fn call_tool(
@@ -2852,6 +4187,9 @@ impl AegisRuntimeKernel {
         )> = None;
         let mut pre_switch_plan: Option<(PathBuf, String, Option<PathBuf>)> = None;
         let mut pre_git_plan: Option<HostGitPlan> = None;
+        let mut pre_import_plan: Option<ImportFilePlan> = None;
+        let mut pre_ci_rerun_plan: Option<GitHubCiRerunPlan> = None;
+        let mut pre_pr_create_plan: Option<GitHubPrCreatePlan> = None;
         if tool_name == "workspace_commit" {
             let filter_paths: Option<Vec<String>> = args
                 .get("paths")
@@ -3177,6 +4515,64 @@ impl AegisRuntimeKernel {
             pre_commit_diffs = Some(diffs);
             pre_commit_evidence_hash = Some(plan.evidence_hash.clone());
             pre_git_plan = Some(plan);
+        } else if tool_name == "fs_import_file" {
+            let (plan, resource, diffs, meta) =
+                self.prepare_fs_import_file_plan(&env, identity, &args).await?;
+            target_resource = resource;
+            if let (Some(obj), Some(meta_obj)) =
+                (audit_metadata.as_object_mut(), meta.as_object())
+            {
+                for (k, v) in meta_obj {
+                    obj.insert(k.clone(), v.clone());
+                }
+            }
+            pre_commit_diffs = Some(diffs);
+            pre_commit_evidence_hash = Some(plan.evidence_hash.clone());
+            pre_import_plan = Some(plan);
+        } else if matches!(
+            tool_name,
+            "github_ci_inspect" | "github_pr_inspect" | "github_issue_inspect"
+        ) {
+            let (resource, meta) =
+                Self::prepare_github_inspect_context(env.workspace.host_source_root(), &args)?;
+            target_resource = resource;
+            if let (Some(obj), Some(meta_obj)) =
+                (audit_metadata.as_object_mut(), meta.as_object())
+            {
+                for (k, v) in meta_obj {
+                    obj.insert(k.clone(), v.clone());
+                }
+            }
+            if let Some(ev) = audit_metadata.get("evidence_hash").and_then(|v| v.as_str()) {
+                pre_commit_evidence_hash = Some(ev.to_string());
+            }
+        } else if tool_name == "github_ci_rerun" {
+            let (plan, resource, meta) =
+                Self::prepare_github_ci_rerun_plan(env.workspace.host_source_root(), &args)?;
+            target_resource = resource;
+            if let (Some(obj), Some(meta_obj)) =
+                (audit_metadata.as_object_mut(), meta.as_object())
+            {
+                for (k, v) in meta_obj {
+                    obj.insert(k.clone(), v.clone());
+                }
+            }
+            pre_commit_evidence_hash = Some(plan.evidence_hash.clone());
+            pre_ci_rerun_plan = Some(plan);
+        } else if tool_name == "github_pr_create" {
+            let (plan, resource, diffs, meta) =
+                Self::prepare_github_pr_create_plan(env.workspace.host_source_root(), &args)?;
+            target_resource = resource;
+            if let (Some(obj), Some(meta_obj)) =
+                (audit_metadata.as_object_mut(), meta.as_object())
+            {
+                for (k, v) in meta_obj {
+                    obj.insert(k.clone(), v.clone());
+                }
+            }
+            pre_commit_diffs = Some(diffs);
+            pre_commit_evidence_hash = Some(plan.evidence_hash.clone());
+            pre_pr_create_plan = Some(plan);
         }
         let mut resolved_cross_org_peer: Option<(String, String)> = None;
 
@@ -3260,7 +4656,11 @@ impl AegisRuntimeKernel {
                 } => {
                     if matches!(
                         tool_name,
-                        "workspace_commit" | "fs_export_file" | "workspace_git"
+                        "workspace_commit"
+                            | "fs_export_file"
+                            | "fs_import_file"
+                            | "workspace_git"
+                            | "github_pr_create"
                     ) {
                         if let Some(ref diffs) = pre_commit_diffs {
                             let diff_dir = self.runtime_data_root.join("escalation_diffs");
@@ -3394,6 +4794,43 @@ impl AegisRuntimeKernel {
                     "sha256": sha256,
                     "artifact_uri": artifact_uri,
                     "evidence_hash": evidence_hash,
+                }))
+            }
+
+            "fs_import_file" => {
+                let plan = pre_import_plan.context("Missing pre-staged fs_import_file plan")?;
+                let sym = std::fs::symlink_metadata(&plan.canon_src)
+                    .with_context(|| format!("Host source '{}' disappeared", plan.canon_src.display()))?;
+                if sym.file_type().is_symlink() || !sym.is_file() {
+                    bail!(
+                        "Refusing import: host source '{}' is no longer a regular file",
+                        plan.canon_src.display()
+                    );
+                }
+                let bytes = tokio::fs::read(&plan.canon_src).await?;
+                let actual_sha = hex::encode(Sha256::digest(&bytes));
+                if actual_sha != plan.src_sha256 {
+                    bail!(
+                        "TOCTOU integrity error: host source file '{}' changed after approval (expected sha256:{}, got sha256:{})",
+                        plan.canon_src.display(),
+                        plan.src_sha256,
+                        actual_sha
+                    );
+                }
+                if let Some(parent) = plan.dst_full_path.parent() {
+                    tokio::fs::create_dir_all(parent).await?;
+                }
+                let byte_len = bytes.len();
+                aos_core::session::write_bytes_atomic_synced_async(&plan.dst_full_path, bytes).await?;
+                Ok(json!({
+                    "status": "imported_from_host",
+                    "src_host_path": plan.canon_src,
+                    "import_to": plan.import_to,
+                    "dst_path": plan.clean_dst_rel,
+                    "dst_full_path": plan.dst_full_path,
+                    "size_bytes": byte_len,
+                    "sha256": plan.src_sha256,
+                    "evidence_hash": plan.evidence_hash,
                 }))
             }
 
@@ -3850,13 +5287,33 @@ impl AegisRuntimeKernel {
                     .await
             }
 
+            "workspace_git_inspect" => execute_workspace_git_inspect(&env, &args).await,
+
             "workspace_git" => {
                 let plan = pre_git_plan.context("Missing pre-validated workspace_git plan")?;
-                execute_workspace_git_plan(plan, identity).await
+                execute_workspace_git_plan(self, &env, plan, identity).await
             }
 
             "github_ci_inspect" => {
                 execute_github_ci_inspect(env.workspace.host_source_root(), &args).await
+            }
+
+            "github_ci_rerun" => {
+                let plan = pre_ci_rerun_plan.context("Missing pre-validated github_ci_rerun plan")?;
+                execute_github_ci_rerun(plan).await
+            }
+
+            "github_pr_inspect" => {
+                execute_github_pr_inspect(env.workspace.host_source_root(), &args).await
+            }
+
+            "github_issue_inspect" => {
+                execute_github_issue_inspect(env.workspace.host_source_root(), &args).await
+            }
+
+            "github_pr_create" => {
+                let plan = pre_pr_create_plan.context("Missing pre-validated github_pr_create plan")?;
+                execute_github_pr_create(plan).await
             }
 
             // ----------------------------------------------------------------
@@ -5059,6 +6516,37 @@ impl AegisRuntimeKernel {
                     }
                 },
                 {
+                    "name": "fs_import_file",
+                    "description": "[Lease-Gated] Request human approval (SHA-256 pinned) to import a regular host file from outside the workspace (e.g. ~/Documents, ~/Downloads) into `<agent_home>/imports/` (default, keeps git diff clean) or explicitly into your CoW shadow (`import_to: 'shadow'`). Credential paths and `.env*` secrets are strictly blocked.",
+                    "inputSchema": {
+                        "type": "object",
+                        "properties": {
+                            "src_host_path": {
+                                "type": "string",
+                                "description": "Absolute host file path (or ~/...) to import."
+                            },
+                            "dst_path": {
+                                "type": "string",
+                                "description": "Optional relative filename/subpath at destination (defaults to source file basename)."
+                            },
+                            "import_to": {
+                                "type": "string",
+                                "enum": ["imports", "shadow"],
+                                "description": "Destination root: 'imports' writes to `<agent_home>/imports/<dst_path>` (default); 'shadow' writes into the CoW shadow workspace."
+                            },
+                            "overwrite": {
+                                "type": "boolean",
+                                "description": "Overwrite existing destination file if present (default: true)."
+                            },
+                            "totp": {
+                                "type": "string",
+                                "description": "Optional 6-digit TOTP authenticator code for Cloud mode approval."
+                            }
+                        },
+                        "required": ["src_host_path"]
+                    }
+                },
+                {
                     "name": "workspace_status",
                     "description": "[Zero-Prompt] Get full status of the CoW shadow workspace, snapshots, unread IPC messages, and pending escalations.",
                     "inputSchema": { "type": "object", "properties": {} }
@@ -5167,15 +6655,75 @@ impl AegisRuntimeKernel {
                     }
                 },
                 {
-                    "name": "workspace_git",
-                    "description": "[Lease-Gated] Stage explicit paths, create a Git commit (with optional trailers), create/update a Git tag, and optionally push to a configured remote on the host repository after human approval. Must be called after `workspace_commit` has landed edits onto the host.",
+                    "name": "workspace_git_inspect",
+                    "description": "[Zero-Prompt Read-Only] Inspect host Git repository status (plus pending CoW shadow file count), branches, recent commits, diffs, tags, remotes, or commit metadata safely with DLP secret redaction.",
                     "inputSchema": {
                         "type": "object",
                         "properties": {
+                            "mode": {
+                                "type": "string",
+                                "enum": ["status", "branch", "log", "diff", "tag", "remote", "show"],
+                                "description": "Read-only Git query mode (default: 'status')."
+                            },
+                            "limit": {
+                                "type": "integer",
+                                "description": "Maximum log entries to return in 'log' mode (1..=100, default 20)."
+                            },
+                            "rev": {
+                                "type": "string",
+                                "description": "Optional safe commit/ref/range for 'log', 'diff', or 'show'."
+                            },
                             "paths": {
                                 "type": "array",
                                 "items": { "type": "string" },
-                                "description": "Explicit repo-relative file paths to `git add` & commit (prevents staging unrelated dirty host files)."
+                                "description": "Optional repo-relative path filters for 'status', 'log', 'diff', or 'show'."
+                            }
+                        }
+                    }
+                },
+                {
+                    "name": "workspace_git",
+                    "description": "[Lease-Gated] Single-approval host Git transaction: optionally verify & land CoW shadow changes (`auto_commit_shadow: true`), switch/create branches (`checkout_branch`), sync (`fetch`/`pull_ff_only`/`pull_rebase`), stage & commit explicit paths (with trailers), tag, and push (or `--force-with-lease` with sensitive escalation).",
+                    "inputSchema": {
+                        "type": "object",
+                        "properties": {
+                            "auto_commit_shadow": {
+                                "type": "boolean",
+                                "description": "If true, verify (`verify_cmd`) and land uncommitted CoW shadow changes to host atomically BEFORE `git add/commit` under a single SHA-256-pinned approval."
+                            },
+                            "verify_cmd": {
+                                "type": "string",
+                                "description": "Optional sandboxed verification command before landing shadow changes when `auto_commit_shadow: true`."
+                            },
+                            "verify_timeout_ms": {
+                                "type": "integer",
+                                "description": "Optional timeout in milliseconds for `verify_cmd` (default: 30000)."
+                            },
+                            "skip_verify": {
+                                "type": "boolean",
+                                "description": "Skip configured repo verify gate during `auto_commit_shadow` (escalates as sensitive if configured)."
+                            },
+                            "overwrite_binaries": {
+                                "type": "boolean",
+                                "description": "Allow shadow binary overwrite during `auto_commit_shadow` (escalates as sensitive)."
+                            },
+                            "checkout_branch": {
+                                "type": "string",
+                                "description": "Optional validated branch name to checkout on the host repo."
+                            },
+                            "create_branch": {
+                                "type": "boolean",
+                                "description": "Create `checkout_branch` (`git checkout -b`) instead of switching to an existing branch."
+                            },
+                            "sync": {
+                                "type": "string",
+                                "enum": ["fetch", "pull_ff_only", "pull_rebase"],
+                                "description": "Optional remote sync operation (`fetch`, `pull_ff_only`, or `pull_rebase`) followed by CoW shadow refresh."
+                            },
+                            "paths": {
+                                "type": "array",
+                                "items": { "type": "string" },
+                                "description": "Explicit repo-relative file paths to stage & commit (auto-populated from CoW shadow when omitted with `auto_commit_shadow: true` + `commit_message`)."
                             },
                             "commit_message": {
                                 "type": "string",
@@ -5192,11 +6740,15 @@ impl AegisRuntimeKernel {
                             },
                             "force_tag": {
                                 "type": "boolean",
-                                "description": "Force-move an existing tag (`git tag -f` / `git push --force`)."
+                                "description": "Force-move an existing tag (`git tag -f` / `git push --force`; escalates as sensitive)."
                             },
                             "push": {
                                 "type": "boolean",
                                 "description": "Push branch and/or tag to the configured remote after commit/tag."
+                            },
+                            "force_push": {
+                                "type": "boolean",
+                                "description": "Force-push branch using `--force-with-lease` (requires `push: true`; escalates as HIGH RISK sensitive)."
                             },
                             "remote": {
                                 "type": "string",
@@ -5204,20 +6756,20 @@ impl AegisRuntimeKernel {
                             },
                             "branch": {
                                 "type": "string",
-                                "description": "Optional branch name to push (defaults to current HEAD branch)."
+                                "description": "Optional branch name to push (defaults to `checkout_branch` or current HEAD branch)."
                             }
                         }
                     }
                 },
                 {
                     "name": "github_ci_inspect",
-                    "description": "[Zero-Prompt Read-Only] Inspect GitHub Actions workflow runs, job steps, and failed CI logs via the host broker without exposing `~/.config/gh` or Keychain tokens inside the sandbox.",
+                    "description": "[Zero-Prompt Same-Repo / Approval Cross-Repo] Inspect GitHub Actions workflow runs, job steps, and DLP-redacted failed CI logs via the host broker.",
                     "inputSchema": {
                         "type": "object",
                         "properties": {
                             "repo": {
                                 "type": "string",
-                                "description": "GitHub repository slug (`owner/name`); auto-detected from host `.git/config` `origin` remote when omitted."
+                                "description": "GitHub repository slug (`owner/name`); auto-detected from host `.git/config` `origin` remote when omitted (cross-repo queries require approval)."
                             },
                             "run_id": {
                                 "type": "integer",
@@ -5244,6 +6796,107 @@ impl AegisRuntimeKernel {
                                 "description": "Maximum trailing log lines to return after DLP secret redaction (1..=400, default 120)."
                             }
                         }
+                    }
+                },
+                {
+                    "name": "github_ci_rerun",
+                    "description": "[Lease-Gated] Rerun failed jobs (or entire workflow / single job) for a GitHub Actions workflow run via the host broker after human approval.",
+                    "inputSchema": {
+                        "type": "object",
+                        "properties": {
+                            "run_id": {
+                                "type": "integer",
+                                "description": "GitHub Actions workflow run ID to rerun."
+                            },
+                            "repo": {
+                                "type": "string",
+                                "description": "GitHub repository slug (`owner/name`); defaults to host `origin`."
+                            },
+                            "failed_only": {
+                                "type": "boolean",
+                                "description": "Rerun only failed jobs (`--failed`, default true)."
+                            },
+                            "job_id": {
+                                "type": "integer",
+                                "description": "Optional specific job ID to rerun."
+                            }
+                        },
+                        "required": ["run_id"]
+                    }
+                },
+                {
+                    "name": "github_pr_inspect",
+                    "description": "[Zero-Prompt Same-Repo / Approval Cross-Repo] List or inspect GitHub Pull Requests, review status, checks, comments, and DLP-redacted diff via the host broker.",
+                    "inputSchema": {
+                        "type": "object",
+                        "properties": {
+                            "pr_number": {
+                                "type": "integer",
+                                "description": "Pull Request number to inspect (lists PRs when omitted)."
+                            },
+                            "state": {
+                                "type": "string",
+                                "enum": ["open", "closed", "merged", "all"],
+                                "description": "Filter PR state when listing (default: 'open')."
+                            },
+                            "limit": {
+                                "type": "integer",
+                                "description": "Maximum PRs to return when listing (1..=30, default 10)."
+                            },
+                            "include_comments": { "type": "boolean" },
+                            "include_checks": { "type": "boolean" },
+                            "include_diff": { "type": "boolean" },
+                            "repo": {
+                                "type": "string",
+                                "description": "GitHub repository slug (`owner/name`); defaults to host `origin`."
+                            }
+                        }
+                    }
+                },
+                {
+                    "name": "github_issue_inspect",
+                    "description": "[Zero-Prompt Same-Repo / Approval Cross-Repo] List or inspect GitHub Issues and comments with DLP secret redaction via the host broker.",
+                    "inputSchema": {
+                        "type": "object",
+                        "properties": {
+                            "issue_number": {
+                                "type": "integer",
+                                "description": "Issue number to inspect (lists issues when omitted)."
+                            },
+                            "state": {
+                                "type": "string",
+                                "enum": ["open", "closed", "all"],
+                                "description": "Filter issue state when listing (default: 'open')."
+                            },
+                            "limit": {
+                                "type": "integer",
+                                "description": "Maximum issues to return when listing (1..=30, default 10)."
+                            },
+                            "include_comments": { "type": "boolean" },
+                            "repo": {
+                                "type": "string",
+                                "description": "GitHub repository slug (`owner/name`); defaults to host `origin`."
+                            }
+                        }
+                    }
+                },
+                {
+                    "name": "github_pr_create",
+                    "description": "[Lease-Gated] Create a GitHub Pull Request after outbound DLP secret scanning and human approval (SHA-256 pinned to title/body/head/base).",
+                    "inputSchema": {
+                        "type": "object",
+                        "properties": {
+                            "title": { "type": "string" },
+                            "body": { "type": "string" },
+                            "base": { "type": "string" },
+                            "head": { "type": "string" },
+                            "draft": { "type": "boolean" },
+                            "repo": {
+                                "type": "string",
+                                "description": "GitHub repository slug (`owner/name`); defaults to host `origin`."
+                            }
+                        },
+                        "required": ["title"]
                     }
                 },
                 {
@@ -11174,5 +12827,363 @@ mod tests {
             matches!(decision, PolicyDecision::Allow { .. }),
             "expected Cedar auto-permit for github_ci_inspect, got {decision:?}"
         );
+    }
+
+    #[tokio::test]
+    async fn test_fs_import_file_modes_guards_and_toctou_pinning() {
+        std::env::set_var("AEGIS_ALLOW_NESTED_TEST_SANDBOX", "1");
+        let tmp = tempfile::tempdir().unwrap();
+        let rt = tmp.path().join("rt");
+        let repo = tmp.path().join("repo");
+        let external = tmp.path().join("external");
+        let cred_dir = external.join(".ssh");
+        std::fs::create_dir_all(repo.join(".git")).unwrap();
+        std::fs::create_dir_all(&cred_dir).unwrap();
+        std::fs::write(cred_dir.join("id_ed25519"), "SECRET_KEY").unwrap();
+        std::fs::write(external.join(".env.production"), "DB_PASS=123").unwrap();
+        let spec_file = external.join("spec.md");
+        std::fs::write(&spec_file, "design notes v1\ntoken=ghp_1234567890abcdefgh\n").unwrap();
+        #[cfg(unix)]
+        std::os::unix::fs::symlink(&spec_file, external.join("link_spec.md")).unwrap();
+
+        let kernel = Arc::new(AegisRuntimeKernel::new(&rt).await.unwrap());
+        let agent = AgentIdentity::new("aegis-os", "coder-1", "Engineer");
+        let env = kernel
+            .ensure_agent_environment(
+                agent.clone(),
+                &repo,
+                IsolationTier::NativeOsSandbox,
+                vec!["*".to_string()],
+            )
+            .await
+            .unwrap();
+
+        // 1. Credential, dotenv, symlink, and poisoning shadow destination are hard-blocked.
+        assert!(kernel
+            .call_tool(
+                &agent,
+                "fs_import_file",
+                json!({ "src_host_path": cred_dir.join("id_ed25519") })
+            )
+            .await
+            .is_err());
+        assert!(kernel
+            .call_tool(
+                &agent,
+                "fs_import_file",
+                json!({ "src_host_path": external.join(".env.production") })
+            )
+            .await
+            .is_err());
+        #[cfg(unix)]
+        assert!(kernel
+            .call_tool(
+                &agent,
+                "fs_import_file",
+                json!({ "src_host_path": external.join("link_spec.md") })
+            )
+            .await
+            .is_err());
+        assert!(kernel
+            .call_tool(
+                &agent,
+                "fs_import_file",
+                json!({
+                    "src_host_path": &spec_file,
+                    "import_to": "shadow",
+                    "dst_path": ".github/workflows/evil.yml"
+                })
+            )
+            .await
+            .is_err());
+
+        // 2. Default mode imports into `<agent_home>/imports/` after SHA-256-pinned approval.
+        let import_args = json!({ "src_host_path": &spec_file, "dst_path": "docs/spec.md" });
+        let ask = kernel
+            .call_tool(&agent, "fs_import_file", import_args.clone())
+            .await
+            .unwrap();
+        assert_eq!(ask["status"], "approval_required");
+        let esc_id = ask["escalation_id"].as_str().unwrap().to_string();
+        assert!(rt.join("escalation_diffs").join(format!("{esc_id}.json")).is_file());
+        // Preview saved to escalation_diffs must DLP-redact secrets!
+        let saved_diff = std::fs::read_to_string(
+            rt.join("escalation_diffs").join(format!("{esc_id}.json")),
+        )
+        .unwrap();
+        assert!(!saved_diff.contains("ghp_1234567890"), "{saved_diff}");
+
+        kernel.policy.approve_escalation(&esc_id, 0, "user").await.unwrap();
+
+        // Mutating host file after approval must invalidate OneShot `#sha256:` pin.
+        std::fs::write(&spec_file, "tampered bytes!").unwrap();
+        let drifted = kernel
+            .call_tool(&agent, "fs_import_file", import_args.clone())
+            .await
+            .unwrap();
+        assert_eq!(drifted["status"], "approval_required");
+        let esc2 = drifted["escalation_id"].as_str().unwrap().to_string();
+        kernel.policy.approve_escalation(&esc2, 0, "user").await.unwrap();
+
+        let done = kernel
+            .call_tool(&agent, "fs_import_file", import_args)
+            .await
+            .unwrap();
+        assert_eq!(done["status"], "imported_from_host", "{done}");
+        assert_eq!(done["import_to"], "imports");
+        assert_eq!(
+            std::fs::read_to_string(env.sandbox.config().agent_home_dir.join("imports/docs/spec.md"))
+                .unwrap(),
+            "tampered bytes!"
+        );
+        // Host workspace and CoW shadow stay untouched in default `"imports"` mode!
+        assert!(!env.workspace.shadow_root().join("docs/spec.md").exists());
+
+        // 3. Explicit `import_to: "shadow"` lands inside CoW shadow after approval.
+        let shadow_args = json!({
+            "src_host_path": &spec_file,
+            "import_to": "shadow",
+            "dst_path": "ref/notes.md"
+        });
+        let ask_s = kernel
+            .call_tool(&agent, "fs_import_file", shadow_args.clone())
+            .await
+            .unwrap();
+        kernel
+            .policy
+            .approve_escalation(ask_s["escalation_id"].as_str().unwrap(), 0, "user")
+            .await
+            .unwrap();
+        let done_s = kernel
+            .call_tool(&agent, "fs_import_file", shadow_args)
+            .await
+            .unwrap();
+        assert_eq!(done_s["import_to"], "shadow");
+        assert_eq!(
+            std::fs::read_to_string(env.workspace.shadow_root().join("ref/notes.md")).unwrap(),
+            "tampered bytes!"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_workspace_git_inspect_auto_commit_shadow_branch_and_cross_repo_guards() {
+        std::env::set_var("AEGIS_ALLOW_NESTED_TEST_SANDBOX", "1");
+        let git_bin = resolve_system_git_binary().expect("system git required for test");
+        let temp = tempfile::tempdir().unwrap();
+        let origin_bare = temp.path().join("origin.git");
+        let host_repo = temp.path().join("repo");
+        let rt = temp.path().join("rt");
+
+        assert!(std::process::Command::new(&git_bin)
+            .args(["init", "--bare", origin_bare.to_str().unwrap()])
+            .status()
+            .unwrap()
+            .success());
+        std::fs::create_dir_all(&host_repo).unwrap();
+        for cmd_args in [
+            vec!["init", "-b", "main"],
+            vec!["config", "user.name", "Tester"],
+            vec!["config", "user.email", "tester@example.com"],
+            vec![
+                "remote",
+                "add",
+                "origin",
+                "https://x-access-token:secretTok3n9999@github.com/heurion-org/aegis-os.git",
+            ],
+        ] {
+            assert!(run_sanitized_host_git(
+                &git_bin,
+                &host_repo,
+                &[],
+                &cmd_args.into_iter().map(String::from).collect::<Vec<_>>()
+            )
+            .unwrap()
+            .status
+            .success());
+        }
+        std::fs::write(host_repo.join("README.md"), "init\n").unwrap();
+        assert!(run_sanitized_host_git(
+            &git_bin,
+            &host_repo,
+            &[],
+            &["add".into(), "README.md".into()]
+        )
+        .unwrap()
+        .status
+        .success());
+        assert!(run_sanitized_host_git(
+            &git_bin,
+            &host_repo,
+            &[],
+            &["commit".into(), "-m".into(), "init".into()]
+        )
+        .unwrap()
+        .status
+        .success());
+
+        // Point actual remote URL to bare repo while keeping second remote `secret_remote` for DLP test.
+        assert!(run_sanitized_host_git(
+            &git_bin,
+            &host_repo,
+            &[],
+            &[
+                "remote".into(),
+                "add".into(),
+                "leak".into(),
+                "https://x-access-token:secretTok3n9999@github.com/heurion-org/aegis-os.git".into(),
+            ]
+        )
+        .unwrap()
+        .status
+        .success());
+        assert!(run_sanitized_host_git(
+            &git_bin,
+            &host_repo,
+            &[],
+            &[
+                "remote".into(),
+                "set-url".into(),
+                "origin".into(),
+                origin_bare.to_str().unwrap().to_string(),
+            ]
+        )
+        .unwrap()
+        .status
+        .success());
+
+        let kernel = Arc::new(AegisRuntimeKernel::new(&rt).await.unwrap());
+        let agent = AgentIdentity::new("aegis-os", "release-bot", "Release Engineer");
+        kernel
+            .ensure_agent_environment(
+                agent.clone(),
+                &host_repo,
+                IsolationTier::NativeOsSandbox,
+                vec!["*".to_string()],
+            )
+            .await
+            .unwrap();
+
+        // 1. Write edits ONLY in CoW shadow (do NOT call `workspace_commit`).
+        kernel
+            .call_tool(
+                &agent,
+                "fs_write",
+                json!({ "path": "src/new_feat.rs", "content": "pub fn feat() -> u32 { 42 }\n" }),
+            )
+            .await
+            .unwrap();
+
+        // Zero-prompt `workspace_git_inspect` reports pending shadow file count & scrubs remote URLs!
+        let status = kernel
+            .call_tool(&agent, "workspace_git_inspect", json!({ "mode": "status" }))
+            .await
+            .unwrap();
+        assert_eq!(status["status"], "ok");
+        assert!(
+            status["shadow_uncommitted_files"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|v| v == "src/new_feat.rs"),
+            "{status}"
+        );
+        let remotes = kernel
+            .call_tool(&agent, "workspace_git_inspect", json!({ "mode": "remote" }))
+            .await
+            .unwrap();
+        let rem_out = remotes["output"].as_str().unwrap();
+        assert!(!rem_out.contains("secretTok3n9999"), "{rem_out}");
+        assert!(rem_out.contains("[REDACTED_BY_AEGIS_DLP]"), "{rem_out}");
+
+        // 2. Single-approval `workspace_git` with `auto_commit_shadow: true` + `verify_cmd` + `checkout_branch` + `push`!
+        let tx_args = json!({
+            "auto_commit_shadow": true,
+            "verify_cmd": "test -f src/new_feat.rs",
+            "checkout_branch": "feat/one-click",
+            "create_branch": true,
+            "commit_message": "feat: one-click shadow + git",
+            "tag": "v0.9.0-test",
+            "push": true,
+            "remote": "origin"
+        });
+        let ask_tx = kernel
+            .call_tool(&agent, "workspace_git", tx_args.clone())
+            .await
+            .unwrap();
+        assert_eq!(ask_tx["status"], "approval_required");
+        let esc_tx = ask_tx["escalation_id"].as_str().unwrap().to_string();
+        kernel.policy.approve_escalation(&esc_tx, 0, "user").await.unwrap();
+
+        // TOCTOU check: mutating CoW shadow after approval must invalidate the pinned OneShot lease.
+        kernel
+            .call_tool(
+                &agent,
+                "fs_write",
+                json!({ "path": "src/new_feat.rs", "content": "pub fn evil() {}\n" }),
+            )
+            .await
+            .unwrap();
+        let drifted_tx = kernel
+            .call_tool(&agent, "workspace_git", tx_args.clone())
+            .await
+            .unwrap();
+        assert_eq!(drifted_tx["status"], "approval_required");
+        kernel
+            .policy
+            .approve_escalation(drifted_tx["escalation_id"].as_str().unwrap(), 0, "user")
+            .await
+            .unwrap();
+
+        let done_tx = kernel
+            .call_tool(&agent, "workspace_git", tx_args)
+            .await
+            .unwrap();
+        assert_eq!(done_tx["status"], "git_completed", "{done_tx}");
+        assert_eq!(done_tx["verified_shadow"], true);
+        assert_eq!(done_tx["checked_out_branch"], "feat/one-click");
+        assert_eq!(done_tx["pushed"], true);
+        assert!(host_repo.join("src/new_feat.rs").is_file());
+
+        // Verify bare remote received `refs/heads/feat/one-click` and `refs/tags/v0.9.0-test`.
+        let show_ref = run_sanitized_host_git(&git_bin, &origin_bare, &[], &["show-ref".into()])
+            .unwrap();
+        let refs_txt = String::from_utf8_lossy(&show_ref.stdout);
+        assert!(refs_txt.contains("refs/heads/feat/one-click"), "{refs_txt}");
+        assert!(refs_txt.contains("refs/tags/v0.9.0-test"), "{refs_txt}");
+
+        // 3. `force_push: true` triggers `workspace_git_sensitive` escalation (HIGH RISK).
+        let force_args = json!({ "push": true, "force_push": true, "branch": "feat/one-click" });
+        let ask_fp = kernel
+            .call_tool(&agent, "workspace_git", force_args)
+            .await
+            .unwrap();
+        assert_eq!(ask_fp["status"], "approval_required");
+        assert!(
+            ask_fp["reason"].as_str().unwrap().contains("force_push"),
+            "{ask_fp}"
+        );
+
+        // 4. `github_ci_inspect` with non-GitHub origin (bare path) triggers cross-repo escalation;
+        //    `github_pr_create` blocks secret patterns via DLP BEFORE creating an escalation.
+        let ask_ci = kernel
+            .call_tool(&agent, "github_ci_inspect", json!({ "repo": "heurion-org/aegis-os" }))
+            .await
+            .unwrap();
+        assert_eq!(ask_ci["status"], "approval_required", "{ask_ci}");
+
+        let dlp_err = kernel
+            .call_tool(
+                &agent,
+                "github_pr_create",
+                json!({
+                    "repo": "heurion-org/aegis-os",
+                    "title": "fix auth",
+                    "body": "accidentally pasted ghp_1234567890abcdefghijklmnop"
+                }),
+            )
+            .await
+            .unwrap_err()
+            .to_string();
+        assert!(dlp_err.contains("DLP policy"), "{dlp_err}");
     }
 }

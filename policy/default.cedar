@@ -15,7 +15,10 @@ permit (
         Action::"workspace_diff",
         Action::"workspace_rollback",
         Action::"workspace_sync",
-        Action::"github_ci_inspect"
+        Action::"workspace_git_inspect",
+        Action::"github_ci_inspect",
+        Action::"github_pr_inspect",
+        Action::"github_issue_inspect"
     ],
     resource is WorkspaceResource
 ) when {

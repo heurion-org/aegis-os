@@ -94,6 +94,10 @@ impl Default for ResourceLimits {
     }
 }
 
+fn default_tighten_home_read() -> bool {
+    true
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SandboxConfig {
     pub identity: AgentIdentity,
@@ -109,6 +113,12 @@ pub struct SandboxConfig {
     pub org_agent_pub_dir: PathBuf,
     /// Optional local Egress Proxy address (`host:port` or Unix socket)
     pub egress_proxy_addr: Option<String>,
+    /// Optional host source directory backing the CoW workspace, granted read-only data access when `$HOME` is tightened on macOS.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub host_source_dir: Option<PathBuf>,
+    /// Enforce default-deny read isolation over host `$HOME` subdirectories (aligned with Linux `bwrap`).
+    #[serde(default = "default_tighten_home_read")]
+    pub tighten_home_read: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

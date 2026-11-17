@@ -286,7 +286,23 @@ async fn has_inline_approval_lease(
             .get("force_tag")
             .and_then(|v| v.as_bool())
             .unwrap_or(false);
-        if push || force_tag {
+        let force_push = inner_args
+            .get("force_push")
+            .and_then(|v| v.as_bool())
+            .unwrap_or(false);
+        let auto_commit_shadow = inner_args
+            .get("auto_commit_shadow")
+            .and_then(|v| v.as_bool())
+            .unwrap_or(false);
+        let has_sync = inner_args
+            .get("sync")
+            .and_then(|v| v.as_str())
+            .is_some_and(|s| !s.trim().is_empty());
+        let has_checkout = inner_args
+            .get("checkout_branch")
+            .and_then(|v| v.as_str())
+            .is_some_and(|s| !s.trim().is_empty());
+        if push || force_tag || force_push || auto_commit_shadow || has_sync || has_checkout {
             return false;
         }
         let canon_ws = routing::canonicalize_lossy(effective_workspace);
@@ -299,6 +315,46 @@ async fn has_inline_approval_lease(
                 && (l.resource_pattern == "*"
                     || l.resource_pattern == expected_local
                     || l.resource_pattern == raw_local)
+        });
+    }
+    if sub_tool == "fs_import_file" {
+        let raw_src = inner_args
+            .get("src_host_path")
+            .and_then(|v| v.as_str())
+            .map(str::trim)
+            .unwrap_or("");
+        if raw_src.is_empty() {
+            return false;
+        }
+        let expanded_src = if let Some(rest) = raw_src.strip_prefix("~/") {
+            std::env::var("HOME")
+                .map(|h| PathBuf::from(h).join(rest))
+                .unwrap_or_else(|_| PathBuf::from(raw_src))
+        } else {
+            PathBuf::from(raw_src)
+        };
+        let canon_src = routing::canonicalize_lossy(&expanded_src)
+            .to_string_lossy()
+            .into_owned();
+        return leases.iter().any(|l| {
+            if l.action_pattern != "*" && l.action_pattern != "fs_import_file" {
+                return false;
+            }
+            let pat = l.resource_pattern.as_str();
+            if pat.contains("#sha256:") || pat.starts_with("sha256:") {
+                return false;
+            }
+            pat == "*"
+                || pat == raw_src
+                || pat == canon_src
+                || (pat.ends_with('*') && canon_src.starts_with(pat.trim_end_matches('*')))
+        });
+    }
+    if matches!(sub_tool, "github_ci_rerun" | "github_pr_create") {
+        return leases.iter().any(|l| {
+            !l.resource_pattern.contains("#sha256:")
+                && !l.resource_pattern.starts_with("sha256:")
+                && l.action_pattern == "*"
         });
     }
     if sub_tool == "fs_export_file" {
@@ -384,6 +440,63 @@ async fn build_boundary_approval_prompt(
         );
     }
 
+    if sub_tool == "fs_import_file" {
+        let src_path = inner_args
+            .get("src_host_path")
+            .and_then(|v| v.as_str())
+            .unwrap_or("<unspecified>");
+        let import_to = inner_args
+            .get("import_to")
+            .and_then(|v| v.as_str())
+            .unwrap_or("imports");
+        let dst_path = inner_args
+            .get("dst_path")
+            .and_then(|v| v.as_str())
+            .unwrap_or("<basename>");
+        return format!(
+            "[Aegis OS Host File Import Approval]\n  • What this does: Copy host file `{}` into agent `{}/{}`'s isolated destination `{}` (`{}`).\n  • Approval scope: Clicking Allow grants an inline ticket pinned to this source file.",
+            src_path,
+            identity.org_id,
+            identity.agent_id,
+            import_to,
+            dst_path
+        );
+    }
+
+    if sub_tool == "github_ci_rerun" {
+        let run_id = inner_args
+            .get("run_id")
+            .and_then(|v| v.as_u64())
+            .unwrap_or(0);
+        let failed_only = inner_args
+            .get("failed_only")
+            .and_then(|v| v.as_bool())
+            .unwrap_or(true);
+        return format!(
+            "[Aegis OS GitHub CI Rerun Approval]\n  • What this does: Rerun GitHub Actions run `{}` (failed_only={}) via the host broker for agent `{}/{}`.\n  • Approval scope: Clicking Allow triggers this workflow rerun on the host.",
+            run_id, failed_only, identity.org_id, identity.agent_id
+        );
+    }
+
+    if sub_tool == "github_pr_create" {
+        let title = inner_args
+            .get("title")
+            .and_then(|v| v.as_str())
+            .unwrap_or("<untitled>");
+        let base = inner_args
+            .get("base")
+            .and_then(|v| v.as_str())
+            .unwrap_or("<default>");
+        let head = inner_args
+            .get("head")
+            .and_then(|v| v.as_str())
+            .unwrap_or("<current>");
+        return format!(
+            "[Aegis OS GitHub PR Creation Approval]\n  • What this does: Open GitHub Pull Request (`{}` -> `{}`) titled \"{}\" via agent `{}/{}`.\n  • Approval scope: Clicking Allow triggers PR creation via the host broker after DLP scanning.",
+            head, base, title, identity.org_id, identity.agent_id
+        );
+    }
+
     if sub_tool == "workspace_git" {
         let paths_count = inner_args
             .get("paths")
@@ -402,19 +515,39 @@ async fn build_boundary_approval_prompt(
             .get("push")
             .and_then(|v| v.as_bool())
             .unwrap_or(false);
+        let force_push = inner_args
+            .get("force_push")
+            .and_then(|v| v.as_bool())
+            .unwrap_or(false);
+        let auto_commit_shadow = inner_args
+            .get("auto_commit_shadow")
+            .and_then(|v| v.as_bool())
+            .unwrap_or(false);
+        let checkout_branch = inner_args
+            .get("checkout_branch")
+            .and_then(|v| v.as_str())
+            .unwrap_or("-");
+        let sync = inner_args
+            .get("sync")
+            .and_then(|v| v.as_str())
+            .unwrap_or("-");
         let remote = inner_args
             .get("remote")
             .and_then(|v| v.as_str())
             .unwrap_or("origin");
         return format!(
-            "[Aegis OS Host Git Boundary Approval]\n  • What this does: Execute host Git operation on `{}` via agent `{}/{}`.\n  • Commit {} file(s): \"{}\"\n  • Tag: {} | Push: {} (remote: {})\n  • Approval scope: Clicking Allow grants an inline ticket for this host Git operation.",
+            "[Aegis OS Host Git Boundary Approval]\n  • What this does: Execute host Git operation on `{}` via agent `{}/{}` (auto_commit_shadow={}, branch={}, sync={}).\n  • Commit {} file(s): \"{}\"\n  • Tag: {} | Push: {} (force_push={}, remote: {})\n  • Approval scope: Clicking Allow grants an inline ticket for this host Git operation.",
             host_dir,
             identity.org_id,
             identity.agent_id,
+            auto_commit_shadow,
+            checkout_branch,
+            sync,
             paths_count,
             msg.lines().next().unwrap_or(msg),
             tag,
             push,
+            force_push,
             remote
         );
     }
@@ -882,7 +1015,15 @@ pub(crate) async fn handle_agy_hook(
                     }
                     let use_inline_hook =
                         std::env::var("AOS_HOOK_INLINE_APPROVE").as_deref() == Ok("1");
-                    if matches!(sub_tool, "workspace_commit" | "fs_export_file" | "workspace_git")
+                    if matches!(
+                        sub_tool,
+                        "workspace_commit"
+                            | "fs_export_file"
+                            | "fs_import_file"
+                            | "workspace_git"
+                            | "github_ci_rerun"
+                            | "github_pr_create"
+                    )
                         && use_inline_hook
                         && cloud::resolve_active_cloud_binding(&cli.runtime_dir, &effective_workspace)
                             .is_none()
@@ -979,7 +1120,15 @@ pub(crate) async fn handle_agy_hook(
                 }
                 let use_inline_hook =
                     std::env::var("AOS_HOOK_INLINE_APPROVE").as_deref() == Ok("1");
-                if matches!(short_name, "workspace_commit" | "fs_export_file" | "workspace_git")
+                if matches!(
+                    short_name,
+                    "workspace_commit"
+                        | "fs_export_file"
+                        | "fs_import_file"
+                        | "workspace_git"
+                        | "github_ci_rerun"
+                        | "github_pr_create"
+                )
                     && use_inline_hook
                     && cloud::resolve_active_cloud_binding(&cli.runtime_dir, &effective_workspace)
                         .is_none()

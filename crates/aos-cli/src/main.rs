@@ -4325,10 +4325,14 @@ async fn inspect_policy_escalation(
     let baseline_dir = cow_base.join("baseline_snapshot");
 
     let (parsed_host, mut parsed_files) = extract_host_and_files_from_reason(&esc.reason);
-    if esc.action == "workspace_commit_sensitive" && parsed_files.is_empty() {
+    let is_sensitive_commit_or_git = matches!(
+        esc.action.as_str(),
+        "workspace_commit_sensitive" | "workspace_git_sensitive"
+    );
+    if is_sensitive_commit_or_git && parsed_files.is_empty() {
         parsed_files.push(esc.target_resource.clone());
     }
-    let filter_paths: Option<Vec<String>> = if esc.action == "workspace_commit_sensitive" {
+    let filter_paths: Option<Vec<String>> = if is_sensitive_commit_or_git {
         Some(vec![esc.target_resource.clone()])
     } else if !parsed_files.is_empty() && !esc.reason.contains(" more)") {
         Some(parsed_files.clone())
@@ -4522,7 +4526,7 @@ async fn inspect_policy_escalation(
         println!("\x1b[90m──────────────────────────────────────────────────────────────────────────────\x1b[0m");
     } else if matches!(
         esc.action.as_str(),
-        "workspace_commit" | "workspace_commit_sensitive"
+        "workspace_commit" | "workspace_commit_sensitive" | "workspace_git_sensitive"
     ) {
         println!(
             "\n\x1b[90mℹ No uncommitted file diffs remain in shadow workspace (escalation status: {:?}).\x1b[0m",

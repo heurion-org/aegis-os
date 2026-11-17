@@ -164,9 +164,15 @@ pub async fn install_global_clients(
         "org_kv_put",
         "org_kv_get",
         "fs_export_file",
+        "fs_import_file",
         "workspace_switch",
+        "workspace_git_inspect",
         "workspace_git",
         "github_ci_inspect",
+        "github_ci_rerun",
+        "github_pr_inspect",
+        "github_issue_inspect",
+        "github_pr_create",
         "runtime_configure_mode",
     ];
 
@@ -280,9 +286,15 @@ pub async fn install_global_clients(
         "mcp(aegis-os/ipc_subscribe)",
         "mcp(aegis-os/ipc_publish)",
         "mcp(aegis-os/fs_export_file)",
+        "mcp(aegis-os/fs_import_file)",
         "mcp(aegis-os/workspace_switch)",
+        "mcp(aegis-os/workspace_git_inspect)",
         "mcp(aegis-os/workspace_git)",
         "mcp(aegis-os/github_ci_inspect)",
+        "mcp(aegis-os/github_ci_rerun)",
+        "mcp(aegis-os/github_pr_inspect)",
+        "mcp(aegis-os/github_issue_inspect)",
+        "mcp(aegis-os/github_pr_create)",
         "mcp(aegis-os/runtime_configure_mode)",
     ];
     const AGY_MCP_ASK_RULES: &[&str] = &[
@@ -351,10 +363,11 @@ You are running inside the **Aegis OS Runtime (`aegis-os`)** with an isolated Co
 | Multi-agent messaging & task handoff | `ipc_list_peers`, `ipc_send`, `ipc_request`, `ipc_reply`, `ipc_recv`, `ipc_ack`, `ipc_wait`, `ipc_task_get`, `ipc_task_list`, `ipc_task_update` | Manual user relay |
 | Land shadow changes onto host repo | `workspace_diff` -> `workspace_commit` | Direct host mutation |
 | Export binary/PDF artifacts to host | `fs_export_file` (zero-token copy from shadow) | Chunked hex/ASCII `write_file` workarounds |
+| Import external host files safely | `fs_import_file` (SHA-256 pinned import into `<agent_home>/imports/`) | Direct host `$HOME` reads bypassing isolation |
 | Switch active project directory | `workspace_switch` | Cross-directory native `write_file` / `run_command` |
-| Git commit / tag / push on host repo | `workspace_git` (lease-gated via host broker) | Native `git commit` / `git push` in `run_command` |
-| Inspect GitHub Actions CI & failed logs | `github_ci_inspect` (`mcp_aegis-os_github_ci_inspect`) | Native `gh run view` / unauthenticated curl guessing |
-| Inspect GitHub Actions CI & failed logs | `github_ci_inspect` (`mcp_aegis-os_github_ci_inspect`) | Native `gh run view` / unauthenticated curl guessing |
+| Inspect host Git status / branches / logs | `workspace_git_inspect` (zero-prompt, DLP-redacted) | Native `.git` guessing |
+| Land shadow / commit / tag / branch / push | `workspace_git` (supports one-click `auto_commit_shadow: true`) | Native `git commit` / `git push` in `run_command` |
+| Inspect & rerun CI, PRs, Issues | `github_ci_inspect`, `github_ci_rerun`, `github_pr_inspect`, `github_pr_create`, `github_issue_inspect` | Native `gh run/pr/issue` / unauthenticated curl |
 | Switch Cloud vs. Local execution mode | `runtime_configure_mode` (`mode: "cloud" \| "local"`) | Manual CLI configuration |
 <!-- AEGIS-OS-RUNTIME-END -->
 "#;
@@ -454,9 +467,15 @@ You are running inside the **Aegis OS Runtime (`aegis-os`)** with an isolated Co
         "ipc_subscribe",
         "ipc_publish",
         "fs_export_file",
+        "fs_import_file",
         "workspace_switch",
+        "workspace_git_inspect",
         "workspace_git",
         "github_ci_inspect",
+        "github_ci_rerun",
+        "github_pr_inspect",
+        "github_issue_inspect",
+        "github_pr_create",
     ];
 
     merge_json_file(
@@ -2788,9 +2807,11 @@ You are operating inside **Aegis OS Runtime** (`{role}`) within Organization **`
 | Multi-agent messaging & task handoff | `ipc_list_peers`, `ipc_send`, `ipc_request`, `ipc_reply`, `ipc_recv`, `ipc_ack`, `ipc_wait`, `ipc_task_get`, `ipc_task_list`, `ipc_task_update` | Manual user relay |
 | Land shadow changes onto host repo | `workspace_diff` -> `workspace_commit` | Direct host mutation |
 | Export binary/PDF artifacts to host | `fs_export_file` (zero-token copy from shadow) | Chunked hex/ASCII `write_file` workarounds |
+| Import external host files safely | `fs_import_file` (SHA-256 pinned import into `<agent_home>/imports/`) | Direct host `$HOME` reads bypassing isolation |
 | Switch active project directory | `workspace_switch` | Cross-directory native `write_file` / `run_command` |
-| Git commit / tag / push on host repo | `workspace_git` (lease-gated via host broker) | Native `git commit` / `git push` in `run_command` |
-| Inspect GitHub Actions CI & failed logs | `github_ci_inspect` (`mcp_aegis-os_github_ci_inspect`) | Native `gh run view` / unauthenticated curl guessing |
+| Inspect host Git status / branches / logs | `workspace_git_inspect` (zero-prompt, DLP-redacted) | Native `.git` guessing |
+| Land shadow / commit / tag / branch / push | `workspace_git` (supports one-click `auto_commit_shadow: true`) | Native `git commit` / `git push` in `run_command` |
+| Inspect & rerun CI, PRs, Issues | `github_ci_inspect`, `github_ci_rerun`, `github_pr_inspect`, `github_pr_create`, `github_issue_inspect` | Native `gh run/pr/issue` / unauthenticated curl |
 
 ## Commit & Pull Request Audit Attribution
 When creating a Git commit or Pull Request after `workspace_commit` (or `aegis-os commit`), attach the returned `audit_receipt.git_trailer` (`Aegis-OS-Verified: ...`) in the commit trailer and `audit_receipt.pr_markdown_badge` in the PR description so reviewers can verify the CoW merge and evidence hash.

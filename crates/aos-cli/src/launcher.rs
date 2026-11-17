@@ -4286,6 +4286,8 @@ async fn run_verify_for_session(
             org_shared_ro_dir: org_shared,
             org_agent_pub_dir: org_pub,
             egress_proxy_addr: None,
+            host_source_dir: Some(PathBuf::from(workspace)),
+            tighten_home_read: true,
         })
         .await?;
     let out = sandbox
@@ -5863,6 +5865,8 @@ async fn run_macos_inner(
             org_shared_ro_dir: org_shared,
             org_agent_pub_dir: org_pub,
             egress_proxy_addr: Some(proxy.clone()),
+            host_source_dir: Some(project.to_path_buf()),
+            tighten_home_read: true,
         })
         .await?;
     let mut seatbelt = sandbox.confinement_profile();

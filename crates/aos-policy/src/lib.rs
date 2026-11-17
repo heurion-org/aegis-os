@@ -436,6 +436,79 @@ impl AegisPolicyKernel {
             || file_name == ".npmrc"
     }
 
+    const PROTECTED_CLIENT_CONFIG_MARKERS: &'static [&'static str] = &[
+        "/.git/",
+        "/.gemini/",
+        "/.claude/",
+        "/.codex/",
+        "/.cursor/",
+        "/.opencode/",
+        "/.hermes/",
+        "/.aegis/",
+        "/.agents/hooks.json",
+        "/hooks.json",
+        "/mcp_config.json",
+    ];
+
+    /// Returns true when a host path points to credentials, runtime internals, or dotenv secrets
+    /// that must never be imported via `fs_import_file`.
+    pub fn is_forbidden_import_source(p: &str) -> bool {
+        let res = Self::strip_nested_test_tmpdir(p);
+        let norm = res.replace('\\', "/");
+        let file_name = norm.rsplit('/').next().unwrap_or(&norm);
+        if (file_name == ".env" || file_name.starts_with(".env."))
+            && !matches!(
+                file_name,
+                ".env.example" | ".env.sample" | ".env.template" | ".env.dist" | ".env.schema"
+            )
+        {
+            return true;
+        }
+        [
+            "/.ssh/",
+            "/.aws/",
+            "/.gnupg/",
+            "/.kube/",
+            "/.docker/",
+            "/.config/gh/",
+            "/.config/gcloud/",
+            "/.config/aegis-os/",
+            "/.azure/",
+            "/.netrc",
+            "/.npmrc",
+            "/.pypirc",
+            "/.git-credentials",
+            "/.vault-token",
+            "/.cargo/credentials",
+            "/Library/Keychains/",
+            "/.aegis/",
+            "/.orbstack/",
+            "/.colima/",
+            "/.lima/",
+            "/dek.envelope.json",
+            "/etc/shadow",
+            "/etc/master.passwd",
+        ]
+        .iter()
+        .any(|marker| norm.contains(marker) || norm.ends_with(marker.trim_end_matches('/')))
+    }
+
+    async fn has_active_sensitive_lease(
+        &self,
+        ctx: &PolicyContext,
+        sensitive_action: &str,
+        resource: &str,
+    ) -> bool {
+        let sensitive_ctx = PolicyContext {
+            principal: ctx.principal.clone(),
+            action: sensitive_action.to_string(),
+            target_org_id: ctx.target_org_id.clone(),
+            target_resource: resource.to_string(),
+            metadata: ctx.metadata.clone(),
+        };
+        self.check_active_lease(&sensitive_ctx).await.is_some()
+    }
+
     /// Matches an already-built policy context against active leases using the same semantics as
     /// `evaluate` (org/agent/action/resource/task/evidence pin). A matching OneShot lease is
     /// consumed, which is the desired fail-closed behaviour for a one-shot approval.
@@ -659,26 +732,15 @@ impl PolicyEngine for AegisPolicyKernel {
             }
         }
 
-        // 2a. Hard Red-Line & Poisoning Guard for `fs_export_file` (runs before lease matching so
-        // even a wildcard lease can never export over git hooks, client configs, or build scripts).
+        // 2a. Hard Red-Line & Poisoning Guard for `fs_export_file` and `fs_import_file` (runs before
+        // lease matching so even a wildcard lease can never export over git hooks/client configs or
+        // import credentials / dotenv secrets).
         if ctx.action == "fs_export_file" {
             let res = Self::strip_nested_test_tmpdir(ctx.target_resource.as_str());
             let poisoned = Self::is_commit_poisoning_path(res)
-                || [
-                    "/.git/",
-                    "/.gemini/",
-                    "/.claude/",
-                    "/.codex/",
-                    "/.cursor/",
-                    "/.opencode/",
-                    "/.hermes/",
-                    "/.aegis/",
-                    "/.agents/hooks.json",
-                    "/hooks.json",
-                    "/mcp_config.json",
-                ]
-                .iter()
-                .any(|marker| res.contains(marker));
+                || Self::PROTECTED_CLIENT_CONFIG_MARKERS
+                    .iter()
+                    .any(|marker| res.contains(marker));
             if poisoned {
                 return Ok(PolicyDecision::Deny {
                     reason: format!(
@@ -686,6 +748,40 @@ impl PolicyEngine for AegisPolicyKernel {
                         ctx.target_resource
                     ),
                 });
+            }
+        }
+        if ctx.action == "fs_import_file" {
+            let src_path = ctx
+                .metadata
+                .get("src_host_path")
+                .and_then(|v| v.as_str())
+                .unwrap_or(&ctx.target_resource);
+            if Self::is_forbidden_import_source(&ctx.target_resource)
+                || Self::is_forbidden_import_source(src_path)
+            {
+                return Ok(PolicyDecision::Deny {
+                    reason: format!(
+                        "Importing protected host credential or secret file '{}' is strictly forbidden by Aegis OS policy",
+                        src_path
+                    ),
+                });
+            }
+            if ctx.metadata.get("import_to").and_then(|v| v.as_str()) == Some("shadow") {
+                if let Some(dst_rel) = ctx.metadata.get("dst_path").and_then(|v| v.as_str()) {
+                    let slash_norm = format!("/{}", dst_rel.trim_start_matches("./").trim_start_matches('/'));
+                    if Self::is_commit_poisoning_path(dst_rel)
+                        || Self::PROTECTED_CLIENT_CONFIG_MARKERS
+                            .iter()
+                            .any(|marker| slash_norm.contains(marker))
+                    {
+                        return Ok(PolicyDecision::Deny {
+                            reason: format!(
+                                "Importing external file directly into sensitive workspace path '{}' is strictly forbidden by Aegis OS policy",
+                                dst_rel
+                            ),
+                        });
+                    }
+                }
             }
         }
 
@@ -783,6 +879,88 @@ impl PolicyEngine for AegisPolicyKernel {
             }
         }
 
+        // 2c. Sensitive Guard for `workspace_git`: poisoning paths, force-push, force-tag, and
+        // `skip_verify` / `overwrite_binaries` (under `auto_commit_shadow`) require explicit
+        // `workspace_git_sensitive` escalation and cannot ride on a general `workspace_git` lease.
+        if ctx.action == "workspace_git" && !aos_core::ablated("commit_guard") {
+            let mut unleased_sensitive: Vec<String> = Vec::new();
+            for key in ["paths", "shadow_paths"] {
+                if let Some(arr) = ctx.metadata.get(key).and_then(|v| v.as_array()) {
+                    for p in arr.iter().filter_map(|x| x.as_str()) {
+                        if Self::is_commit_poisoning_path(p)
+                            && !unleased_sensitive.iter().any(|s| s == p)
+                            && !self
+                                .has_active_sensitive_lease(ctx, "workspace_git_sensitive", p)
+                                .await
+                        {
+                            unleased_sensitive.push(p.to_string());
+                        }
+                    }
+                }
+            }
+            for (meta_key, flag_res) in [
+                ("force_push", "flag:force_push"),
+                ("force_tag", "flag:force_tag"),
+                ("overwrite_binaries", "flag:overwrite_binaries"),
+            ] {
+                if ctx.metadata.get(meta_key).and_then(|v| v.as_bool()) == Some(true)
+                    && !self
+                        .has_active_sensitive_lease(ctx, "workspace_git_sensitive", flag_res)
+                        .await
+                {
+                    unleased_sensitive.push(flag_res.to_string());
+                }
+            }
+            if ctx.metadata.get("skip_verify").and_then(|v| v.as_bool()) == Some(true)
+                && ctx
+                    .metadata
+                    .get("has_configured_verify_cmd")
+                    .and_then(|v| v.as_bool())
+                    == Some(true)
+                && !self
+                    .has_active_sensitive_lease(ctx, "workspace_git_sensitive", "flag:skip_verify")
+                    .await
+            {
+                unleased_sensitive.push("flag:skip_verify".to_string());
+            }
+            if !unleased_sensitive.is_empty() {
+                let combined_resource = unleased_sensitive.join(", ");
+                let mut sensitive_meta = ctx.metadata.clone();
+                if let Some(obj) = sensitive_meta.as_object_mut() {
+                    let ev_entry = obj
+                        .entry("evidence".to_string())
+                        .or_insert_with(|| serde_json::json!({}));
+                    if let Some(ev_obj) = ev_entry.as_object_mut() {
+                        ev_obj.insert(
+                            "git_target_resource".to_string(),
+                            serde_json::json!(ctx.target_resource.clone()),
+                        );
+                    }
+                }
+                let batch_ctx = PolicyContext {
+                    principal: ctx.principal.clone(),
+                    action: "workspace_git_sensitive".to_string(),
+                    target_org_id: ctx.target_org_id.clone(),
+                    target_resource: combined_resource.clone(),
+                    metadata: sensitive_meta,
+                };
+                let reason = format!(
+                    "[HIGH RISK] Git operation touches sensitive target(s)/flags '{}' (bypasses general session lease)",
+                    combined_resource
+                );
+                return self
+                    .record_escalation(
+                        &batch_ctx,
+                        reason,
+                        format!(
+                            "action=workspace_git_sensitive, resource={}",
+                            combined_resource
+                        ),
+                    )
+                    .await;
+            }
+        }
+
         // 3. Check if an active Session Lease already covers this action + resource:
         if let Some(lease) = self.check_active_lease(ctx).await {
             return Ok(PolicyDecision::Allow {
@@ -801,6 +979,33 @@ impl PolicyEngine for AegisPolicyKernel {
             return Ok(PolicyDecision::Allow {
                 matched_rule: "aegis:umbrella:child_workspace_switch_allow".to_string(),
             });
+        }
+
+        // 3c. Cross-repo / unconfigured-origin GitHub read gate (runs before Cedar auto-permit):
+        if matches!(
+            ctx.action.as_str(),
+            "github_ci_inspect" | "github_pr_inspect" | "github_issue_inspect"
+        ) && ctx
+            .metadata
+            .get("cross_repo")
+            .and_then(|v| v.as_bool())
+            == Some(true)
+        {
+            let origin_label = ctx
+                .metadata
+                .get("origin_repo")
+                .and_then(|v| v.as_str())
+                .unwrap_or("<no GitHub origin>");
+            return self
+                .record_escalation(
+                    ctx,
+                    format!(
+                        "Agent '{}' requests cross-repo GitHub inspect '{}' on '{}' (workspace origin: {})",
+                        ctx.principal.agent_id, ctx.action, ctx.target_resource, origin_label
+                    ),
+                    format!("action={}, resource={}", ctx.action, ctx.target_resource),
+                )
+                .await;
         }
 
         // 4. Evaluate Declarative Cedar `permit` Rules (`policy/default.cedar` + custom Cedar policies):
@@ -956,7 +1161,69 @@ impl PolicyEngine for AegisPolicyKernel {
                 let remote = ctx.metadata.get("remote").and_then(|v| v.as_str());
                 let branch = ctx.metadata.get("branch").and_then(|v| v.as_str());
 
+                let auto_commit_shadow = ctx
+                    .metadata
+                    .get("auto_commit_shadow")
+                    .and_then(|v| v.as_bool())
+                    .unwrap_or(false);
+                let shadow_count = ctx
+                    .metadata
+                    .get("shadow_paths")
+                    .and_then(|v| v.as_array())
+                    .map(|a| a.len())
+                    .unwrap_or(0);
+                let checkout_branch = ctx
+                    .metadata
+                    .get("checkout_branch")
+                    .and_then(|v| v.as_str())
+                    .map(str::trim)
+                    .filter(|s| !s.is_empty());
+                let create_branch = ctx
+                    .metadata
+                    .get("create_branch")
+                    .and_then(|v| v.as_bool())
+                    .unwrap_or(false);
+                let sync_op = ctx
+                    .metadata
+                    .get("sync")
+                    .and_then(|v| v.as_str())
+                    .map(str::trim)
+                    .filter(|s| !s.is_empty());
+                let force_push = ctx
+                    .metadata
+                    .get("force_push")
+                    .and_then(|v| v.as_bool())
+                    .unwrap_or(false);
+                let has_verify = ctx
+                    .metadata
+                    .get("verify_cmd")
+                    .and_then(|v| v.as_str())
+                    .is_some_and(|s| !s.trim().is_empty())
+                    || ctx
+                        .metadata
+                        .get("has_configured_verify_cmd")
+                        .and_then(|v| v.as_bool())
+                        == Some(true);
+
                 let mut ops = Vec::new();
+                if auto_commit_shadow {
+                    let verify_tag = if has_verify { " + verify" } else { "" };
+                    ops.push(format!(
+                        "land {} shadow file(s){}",
+                        shadow_count.max(paths_count),
+                        verify_tag
+                    ));
+                }
+                if let Some(cb) = checkout_branch {
+                    if create_branch {
+                        ops.push(format!("create & switch branch '{}'", cb));
+                    } else {
+                        ops.push(format!("switch branch '{}'", cb));
+                    }
+                }
+                if let Some(s) = sync_op {
+                    ops.push(format!("sync '{}' ({})", remote.unwrap_or("origin"), s));
+                }
                 if let Some(msg) = commit_message {
                     let first_line = msg.lines().next().unwrap_or(msg).trim();
                     let headline: String = first_line.chars().take(72).collect();
@@ -970,8 +1237,14 @@ impl PolicyEngine for AegisPolicyKernel {
                     }
                 }
                 if push {
+                    let push_verb = if force_push {
+                        "FORCE-PUSH (with-lease)"
+                    } else {
+                        "push"
+                    };
                     ops.push(format!(
-                        "push to '{}' (branch: {}, tag: {})",
+                        "{} to '{}' (branch: {}, tag: {})",
+                        push_verb,
                         remote.unwrap_or("origin"),
                         branch.filter(|s| !s.is_empty()).unwrap_or("-"),
                         tag.unwrap_or("-")
@@ -990,6 +1263,115 @@ impl PolicyEngine for AegisPolicyKernel {
                         ctx.principal.agent_id, host_root, summary
                     ),
                     format!("action=workspace_git, resource={}", ctx.target_resource),
+                )
+                .await
+            }
+
+            "fs_import_file" => {
+                let src_label = ctx
+                    .metadata
+                    .get("src_host_path")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or(&ctx.target_resource);
+                let size_bytes = ctx
+                    .metadata
+                    .get("size_bytes")
+                    .and_then(|v| v.as_u64())
+                    .unwrap_or(0);
+                let import_to = ctx
+                    .metadata
+                    .get("import_to")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("imports");
+                let dst_label = ctx
+                    .metadata
+                    .get("dst_path")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("imported_file");
+                self.record_escalation(
+                    ctx,
+                    format!(
+                        "Agent '{}' requests to import host file '{}' ({} bytes) into '{}' ('{}')",
+                        ctx.principal.agent_id, src_label, size_bytes, import_to, dst_label
+                    ),
+                    format!("action=fs_import_file, resource={}", ctx.target_resource),
+                )
+                .await
+            }
+
+            "github_ci_rerun" => {
+                let repo = ctx
+                    .metadata
+                    .get("repo")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or(&ctx.target_resource);
+                let run_id = ctx
+                    .metadata
+                    .get("run_id")
+                    .and_then(|v| v.as_u64())
+                    .unwrap_or(0);
+                let failed_only = ctx
+                    .metadata
+                    .get("failed_only")
+                    .and_then(|v| v.as_bool())
+                    .unwrap_or(true);
+                let job_id = ctx.metadata.get("job_id").and_then(|v| v.as_u64());
+                let scope_desc = if let Some(j) = job_id {
+                    format!("job {}", j)
+                } else if failed_only {
+                    "failed jobs only".to_string()
+                } else {
+                    "entire workflow run".to_string()
+                };
+                self.record_escalation(
+                    ctx,
+                    format!(
+                        "Agent '{}' requests to rerun GitHub Actions run {} ({}) on '{}'",
+                        ctx.principal.agent_id, run_id, scope_desc, repo
+                    ),
+                    format!("action=github_ci_rerun, resource={}", ctx.target_resource),
+                )
+                .await
+            }
+
+            "github_pr_create" => {
+                let repo = ctx
+                    .metadata
+                    .get("repo")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or(&ctx.target_resource);
+                let head = ctx
+                    .metadata
+                    .get("head")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("<current>");
+                let base = ctx
+                    .metadata
+                    .get("base")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("<default>");
+                let title = ctx
+                    .metadata
+                    .get("title")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("");
+                let draft = ctx
+                    .metadata
+                    .get("draft")
+                    .and_then(|v| v.as_bool())
+                    .unwrap_or(false);
+                self.record_escalation(
+                    ctx,
+                    format!(
+                        "Agent '{}' requests to create {}GitHub PR on '{}' ({} -> {}): \"{}\"",
+                        ctx.principal.agent_id,
+                        if draft { "draft " } else { "" },
+                        repo,
+                        head,
+                        base,
+                        title.chars().take(72).collect::<String>()
+                    ),
+                    format!("action=github_pr_create, resource={}", ctx.target_resource),
                 )
                 .await
             }
@@ -1117,15 +1499,24 @@ impl PolicyEngine for AegisPolicyKernel {
         } else {
             now_ms + (ttl_secs * 1000)
         };
-        let base_resource_pattern = if target.action == "workspace_commit_sensitive"
-            || target.action == "fs_export_file"
-            || target.action == "workspace_switch"
-            || target.action == "workspace_git"
-            || target.action == "egress_unlisted_domain"
-            || target.action == "mcp_mount_server"
-            || target.action == "org_artifact_fetch"
-            || target.action == "org_kv_get"
-            || target.action.starts_with("memory.")
+        let base_resource_pattern = if matches!(
+            target.action.as_str(),
+            "workspace_commit_sensitive"
+                | "workspace_git_sensitive"
+                | "fs_export_file"
+                | "fs_import_file"
+                | "workspace_switch"
+                | "workspace_git"
+                | "github_ci_rerun"
+                | "github_pr_create"
+                | "github_ci_inspect"
+                | "github_pr_inspect"
+                | "github_issue_inspect"
+                | "egress_unlisted_domain"
+                | "mcp_mount_server"
+                | "org_artifact_fetch"
+                | "org_kv_get"
+        ) || target.action.starts_with("memory.")
         {
             target.target_resource.clone()
         } else {
@@ -1169,10 +1560,13 @@ impl PolicyEngine for AegisPolicyKernel {
         let mut primary_lease = lease.clone();
         {
             let mut leases = self.leases.write().await;
-            // When approving a sensitive commit escalation (which may batch multiple sensitive files
-            // like `"Cargo.toml, package.json"`), ensure each individual sensitive target and a
-            // companion one-shot `workspace_commit` lease are granted in a single approval click.
-            if target.action == "workspace_commit_sensitive" {
+            // When approving a sensitive commit or git escalation (which may batch multiple
+            // targets like `"Cargo.toml, flag:force_push"`), split per-target sensitive leases and
+            // mint the matching companion base lease in a single approval click.
+            if matches!(
+                target.action.as_str(),
+                "workspace_commit_sensitive" | "workspace_git_sensitive"
+            ) {
                 let parts: Vec<&str> = target
                     .target_resource
                     .split(',')
@@ -1194,7 +1588,7 @@ impl PolicyEngine for AegisPolicyKernel {
                             lease_id: format!("lease-{}", &Uuid::new_v4().to_string()[..8]),
                             org_id: target.org_id.clone(),
                             agent_id: target.agent_id.clone(),
-                            action_pattern: "workspace_commit_sensitive".to_string(),
+                            action_pattern: target.action.clone(),
                             resource_pattern: part_pattern,
                             expires_at_ms,
                             granted_by: approved_by.to_string(),
@@ -1210,30 +1604,40 @@ impl PolicyEngine for AegisPolicyKernel {
                     // One combined target is already represented by `lease`.
                     leases.push(lease.clone());
                 }
-                let companion_resource = if is_oneshot {
-                    target
-                        .evidence_hash
-                        .as_ref()
-                        .map(|h| format!("sha256:{}", h))
-                        .unwrap_or_else(|| "*".to_string())
+                let (companion_action, companion_base) = if target.action == "workspace_commit_sensitive" {
+                    ("workspace_commit".to_string(), "*".to_string())
                 } else {
-                    "*".to_string()
+                    let git_res = target
+                        .evidence
+                        .as_ref()
+                        .and_then(|ev| ev.get("git_target_resource"))
+                        .and_then(|v| v.as_str())
+                        .unwrap_or("*")
+                        .to_string();
+                    ("workspace_git".to_string(), git_res)
+                };
+                let companion_resource = if is_oneshot {
+                    if let Some(ref ev_hash) = target.evidence_hash {
+                        if companion_base == "*" {
+                            format!("sha256:{}", ev_hash)
+                        } else {
+                            format!("{}#sha256:{}", companion_base, ev_hash)
+                        }
+                    } else {
+                        companion_base
+                    }
+                } else {
+                    companion_base
                 };
                 leases.push(LeaseGrant {
                     lease_id: format!("lease-{}", &Uuid::new_v4().to_string()[..8]),
                     org_id: target.org_id,
                     agent_id: target.agent_id,
-                    action_pattern: "workspace_commit".to_string(),
+                    action_pattern: companion_action,
                     resource_pattern: companion_resource,
-                    expires_at_ms: now_ms + 900_000,
+                    expires_at_ms,
                     granted_by: approved_by.to_string(),
-                    kind: if is_oneshot {
-                        LeaseKind::OneShot
-                    } else if task_id.is_some() {
-                        LeaseKind::TaskScoped
-                    } else {
-                        LeaseKind::Ttl
-                    },
+                    kind,
                     task_id,
                 });
             } else {
@@ -2103,5 +2507,142 @@ mod tests {
             kernel.evaluate(&push_ctx).await.unwrap(),
             PolicyDecision::Ask { .. }
         ));
+    }
+
+    #[tokio::test]
+    async fn test_github_cross_repo_fs_import_and_git_sensitive_guards() {
+        let kernel = AegisPolicyKernel::new();
+        let agent = AgentIdentity::new("aegis-os", "agy-agent", "Lead");
+
+        // 1. Same-repo `github_ci_inspect` auto-permits via Cedar; cross-repo escalates & pins.
+        let same_ci = PolicyContext {
+            principal: agent.clone(),
+            action: "github_ci_inspect".to_string(),
+            target_org_id: "aegis-os".to_string(),
+            target_resource: "heurion-org/aegis-os".to_string(),
+            metadata: json!({ "repo": "heurion-org/aegis-os", "origin_repo": "heurion-org/aegis-os", "cross_repo": false }),
+        };
+        assert!(matches!(
+            kernel.evaluate(&same_ci).await.unwrap(),
+            PolicyDecision::Allow { .. }
+        ));
+
+        let cross_ci = PolicyContext {
+            principal: agent.clone(),
+            action: "github_ci_inspect".to_string(),
+            target_org_id: "aegis-os".to_string(),
+            target_resource: "other-org/private-repo".to_string(),
+            metadata: json!({
+                "repo": "other-org/private-repo",
+                "origin_repo": "heurion-org/aegis-os",
+                "cross_repo": true,
+                "evidence_hash": "cihash1"
+            }),
+        };
+        let esc_ci = match kernel.evaluate(&cross_ci).await.unwrap() {
+            PolicyDecision::Ask { escalation_id, reason, .. } => {
+                assert!(reason.contains("cross-repo"), "{reason}");
+                escalation_id
+            }
+            other => panic!("Expected cross-repo Ask, got {other:?}"),
+        };
+        let ci_lease = kernel.approve_escalation(&esc_ci, 0, "user").await.unwrap();
+        assert_eq!(ci_lease.resource_pattern, "other-org/private-repo#sha256:cihash1");
+        assert!(matches!(
+            kernel.evaluate(&cross_ci).await.unwrap(),
+            PolicyDecision::Allow { .. }
+        ));
+
+        // 2. `fs_import_file` denies `.ssh` and `.env.production`, allows `.env.example` ask, denies shadow `.git/hooks`.
+        let ssh_import = PolicyContext {
+            principal: agent.clone(),
+            action: "fs_import_file".to_string(),
+            target_org_id: "aegis-os".to_string(),
+            target_resource: "/Users/alice/.ssh/id_ed25519".to_string(),
+            metadata: json!({ "src_host_path": "/Users/alice/.ssh/id_ed25519", "import_to": "imports", "dst_path": "id_ed25519" }),
+        };
+        assert!(matches!(kernel.evaluate(&ssh_import).await.unwrap(), PolicyDecision::Deny { .. }));
+
+        let env_import = PolicyContext {
+            principal: agent.clone(),
+            action: "fs_import_file".to_string(),
+            target_org_id: "aegis-os".to_string(),
+            target_resource: "/Users/alice/app/.env.production".to_string(),
+            metadata: json!({ "src_host_path": "/Users/alice/app/.env.production", "import_to": "imports", "dst_path": ".env.production" }),
+        };
+        assert!(matches!(kernel.evaluate(&env_import).await.unwrap(), PolicyDecision::Deny { .. }));
+
+        let hook_shadow_import = PolicyContext {
+            principal: agent.clone(),
+            action: "fs_import_file".to_string(),
+            target_org_id: "aegis-os".to_string(),
+            target_resource: "/Users/alice/Downloads/script.sh".to_string(),
+            metadata: json!({ "src_host_path": "/Users/alice/Downloads/script.sh", "import_to": "shadow", "dst_path": ".git/hooks/pre-commit" }),
+        };
+        assert!(matches!(kernel.evaluate(&hook_shadow_import).await.unwrap(), PolicyDecision::Deny { .. }));
+
+        let example_import = PolicyContext {
+            principal: agent.clone(),
+            action: "fs_import_file".to_string(),
+            target_org_id: "aegis-os".to_string(),
+            target_resource: "/Users/alice/Downloads/.env.example".to_string(),
+            metadata: json!({
+                "src_host_path": "/Users/alice/Downloads/.env.example",
+                "import_to": "imports",
+                "dst_path": ".env.example",
+                "size_bytes": 128,
+                "evidence_hash": "imphash1"
+            }),
+        };
+        let esc_imp = match kernel.evaluate(&example_import).await.unwrap() {
+            PolicyDecision::Ask { escalation_id, .. } => escalation_id,
+            other => panic!("Expected Ask for .env.example import, got {other:?}"),
+        };
+        let imp_lease = kernel.approve_escalation(&esc_imp, 0, "user").await.unwrap();
+        assert_eq!(imp_lease.resource_pattern, "/Users/alice/Downloads/.env.example#sha256:imphash1");
+        assert!(matches!(kernel.evaluate(&example_import).await.unwrap(), PolicyDecision::Allow { .. }));
+
+        // 3. `workspace_git_sensitive` bypasses general `workspace_git` TTL lease & grants companion lease in one click.
+        let general_res = "git:/repo#push:origin:branch=main,tag=-,force_tag=false";
+        kernel
+            .grant_lease(LeaseGrant {
+                lease_id: "lease-general-git".to_string(),
+                org_id: "aegis-os".to_string(),
+                agent_id: "agy-agent".to_string(),
+                action_pattern: "workspace_git".to_string(),
+                resource_pattern: general_res.to_string(),
+                expires_at_ms: Utc::now().timestamp_millis() + 600_000,
+                granted_by: "user".to_string(),
+                kind: LeaseKind::Ttl,
+                task_id: None,
+            })
+            .await
+            .unwrap();
+
+        let sensitive_git = PolicyContext {
+            principal: agent,
+            action: "workspace_git".to_string(),
+            target_org_id: "aegis-os".to_string(),
+            target_resource: general_res.to_string(),
+            metadata: json!({
+                "host_root": "/repo",
+                "paths": [".github/workflows/ci.yml"],
+                "force_push": true,
+                "push": true,
+                "evidence_hash": "gitsens1"
+            }),
+        };
+        let esc_git = match kernel.evaluate(&sensitive_git).await.unwrap() {
+            PolicyDecision::Ask { escalation_id, reason, .. } => {
+                assert!(reason.contains("HIGH RISK") && reason.contains("force_push"), "{reason}");
+                escalation_id
+            }
+            other => panic!("Expected workspace_git_sensitive Ask, got {other:?}"),
+        };
+        kernel.approve_escalation(&esc_git, 0, "user").await.unwrap();
+        assert!(
+            matches!(kernel.evaluate(&sensitive_git).await.unwrap(), PolicyDecision::Allow { .. }),
+            "Single approval of workspace_git_sensitive must also authorize companion workspace_git"
+        );
     }
 }
