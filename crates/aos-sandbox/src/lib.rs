@@ -2135,14 +2135,18 @@ mod tests {
             "tighten_home_read=false should omit host $HOME deny block: {open_profile}"
         );
 
-        let fake_root = tmp.path().join("users");
-        let u1 = fake_root.join("alice");
-        std::fs::create_dir_all(&u1).unwrap();
+        let fake_home = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+        let missing_home = fake_home.join("__nonexistent_aos_test_home__");
         let filtered = NativeOsSandboxInstance::macos_candidate_homes_for(&[
-            u1.clone(),
+            fake_home.clone(),
+            fake_home.clone(),
             PathBuf::from("/"),
             PathBuf::from("/tmp"),
+            PathBuf::from("/private/tmp"),
+            PathBuf::from("/var/folders"),
+            PathBuf::from("/private/var/folders"),
+            missing_home,
         ]);
-        assert_eq!(filtered, vec![u1]);
+        assert_eq!(filtered, vec![fake_home]);
     }
 }
