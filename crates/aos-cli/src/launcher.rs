@@ -8649,6 +8649,7 @@ mod tests {
             "enforced",
             &command,
             &home,
+            &RunEgressOptions::default(),
         )
         .await
         .unwrap();
