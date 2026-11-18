@@ -2111,6 +2111,87 @@ const PKG_MANIFEST_FILES: &[&str] = &[
     "go.sum",
 ];
 
+#[derive(Clone)]
+pub struct HostExecBrokerConfig {
+    pub session_dir: PathBuf,
+    pub host_home: PathBuf,
+    pub clean_host_path: String,
+    pub host_workspace_root: PathBuf,
+    pub on_run_finished: Option<Arc<dyn Fn() + Send + Sync>>,
+}
+
+impl std::fmt::Debug for HostExecBrokerConfig {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("HostExecBrokerConfig")
+            .field("session_dir", &self.session_dir)
+            .field("host_home", &self.host_home)
+            .field("host_workspace_root", &self.host_workspace_root)
+            .finish_non_exhaustive()
+    }
+}
+
+#[derive(Debug, Clone)]
+struct HostExecStagedInput {
+    sha256: String,
+    executable: bool,
+}
+
+#[derive(Debug, Clone)]
+struct HostExecPlan {
+    config: HostExecBrokerConfig,
+    resolved_program: PathBuf,
+    script_rel: Option<String>,
+    args: Vec<String>,
+    inputs: std::collections::BTreeMap<String, HostExecStagedInput>,
+    output_files: Vec<String>,
+    pass_env_kv: std::collections::BTreeMap<String, String>,
+    timeout_ms: u64,
+    frozen_dir: PathBuf,
+    evidence_hash: String,
+}
+
+struct HostExecRunGuard {
+    active_runs: Arc<std::sync::atomic::AtomicUsize>,
+    paas: Arc<PaasControlPlane>,
+    on_run_finished: Option<Arc<dyn Fn() + Send + Sync>>,
+}
+
+impl Drop for HostExecRunGuard {
+    fn drop(&mut self) {
+        let new_op = format!("aop_{}{}", Uuid::new_v4().simple(), Uuid::new_v4().simple());
+        self.paas.set_secrets(&new_op, &self.paas.webhook_secret());
+        if let Some(ref cb) = self.on_run_finished {
+            cb();
+        }
+        self.active_runs
+            .fetch_sub(1, std::sync::atomic::Ordering::SeqCst);
+    }
+}
+
+#[cfg(unix)]
+struct ProcessGroupReaper(Option<libc::pid_t>);
+
+#[cfg(unix)]
+impl Drop for ProcessGroupReaper {
+    fn drop(&mut self) {
+        if let Some(pgid) = self.0.take() {
+            if pgid > 0 {
+                unsafe {
+                    let _ = libc::killpg(pgid, libc::SIGKILL);
+                }
+            }
+        }
+    }
+}
+
+struct RunDirCleanupGuard(PathBuf);
+
+impl Drop for RunDirCleanupGuard {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_dir_all(&self.0);
+    }
+}
+
 #[derive(Debug, Clone)]
 struct PkgInstallPlan {
     manager: String,
@@ -2508,6 +2589,498 @@ async fn execute_pkg_install(
     }))
 }
 
+const MAX_HOST_EXEC_FILE_BYTES: usize = 8 * 1024 * 1024;
+const MAX_HOST_EXEC_TOTAL_INPUT_BYTES: usize = 16 * 1024 * 1024;
+const MAX_HOST_EXEC_OUTPUT_HARVEST_BYTES: u64 = 16 * 1024 * 1024;
+const MAX_HOST_EXEC_PIPE_BYTES: usize = 65_536;
+
+fn is_forbidden_host_exec_program_name(bin: &str) -> bool {
+    matches!(bin, "sudo" | "su" | "doas" | "pkexec" | "env")
+}
+
+fn is_interpreter_program(resolved: &Path) -> bool {
+    let name = resolved
+        .file_name()
+        .and_then(|n| n.to_str())
+        .unwrap_or("")
+        .to_ascii_lowercase();
+    name == "python"
+        || name.starts_with("python3")
+        || name.starts_with("python2")
+        || matches!(
+            name.as_str(),
+            "node" | "nodejs" | "deno" | "bun" | "sh" | "bash" | "zsh" | "dash" | "ksh" | "ruby" | "perl" | "php"
+        )
+}
+
+fn has_disallowed_interpreter_flags(raw_args: &[String]) -> Option<String> {
+    for arg in raw_args {
+        if arg == "--" {
+            break;
+        }
+        if matches!(
+            arg.as_str(),
+            "-c" | "-e" | "--eval" | "--print" | "-m" | "-"
+        ) || arg.starts_with("--eval=")
+            || arg.starts_with("--print=")
+        {
+            return Some(arg.clone());
+        }
+        if arg.starts_with('-')
+            && !arg.starts_with("--")
+            && arg.chars().skip(1).any(|c| matches!(c, 'c' | 'e' | 'm'))
+        {
+            return Some(arg.clone());
+        }
+    }
+    None
+}
+
+fn is_forbidden_host_exec_env_key(key: &str) -> bool {
+    if key.is_empty()
+        || key.len() > 64
+        || !key.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'_')
+        || key.as_bytes()[0].is_ascii_digit()
+    {
+        return true;
+    }
+    let up = key.to_ascii_uppercase();
+    if matches!(
+        up.as_str(),
+        "PYTHONPATH"
+            | "PYTHONSTARTUP"
+            | "PYTHONHOME"
+            | "NODE_OPTIONS"
+            | "NODE_PATH"
+            | "BASH_ENV"
+            | "ENV"
+            | "ZDOTDIR"
+            | "HOME"
+            | "PATH"
+            | "TMPDIR"
+            | "SHELL"
+            | "USER"
+            | "LOGNAME"
+            | "IFS"
+            | "LD_PRELOAD"
+            | "LD_LIBRARY_PATH"
+    ) {
+        return true;
+    }
+    const FORBIDDEN_PREFIXES: &[&str] = &[
+        "AOS_",
+        "AEGIS_",
+        "SSH_",
+        "AWS_",
+        "GITHUB_",
+        "GH_",
+        "ANTHROPIC_",
+        "OPENAI_",
+        "GEMINI_",
+        "GOOGLE_",
+        "LD_",
+        "DYLD_",
+        "HTTP_PROXY",
+        "HTTPS_PROXY",
+        "ALL_PROXY",
+        "NO_PROXY",
+    ];
+    if FORBIDDEN_PREFIXES.iter().any(|p| up.starts_with(p)) {
+        return true;
+    }
+    const FORBIDDEN_TERMS: &[&str] = &[
+        "KEY",
+        "TOKEN",
+        "SECRET",
+        "PASSWORD",
+        "PASSWD",
+        "CREDENTIAL",
+        "AUTH",
+        "COOKIE",
+        "PROXY",
+        "SESSION",
+    ];
+    FORBIDDEN_TERMS.iter().any(|t| up.contains(t))
+}
+
+fn is_protected_client_config_rel(norm_rel: &str) -> bool {
+    let wrapped = format!("/{}/", norm_rel.trim_matches('/').to_lowercase());
+    [
+        "/.git/",
+        "/.aegis/",
+        "/.claude/",
+        "/.gemini/",
+        "/.codex/",
+        "/.cursor/",
+        "/.opencode/",
+        "/.hermes/",
+        "/.agents/hooks.json",
+        "/hooks.json",
+        "/mcp_config.json",
+    ]
+    .iter()
+    .any(|m| wrapped.contains(m))
+}
+
+fn validate_host_exec_binary_candidate(
+    cand: &Path,
+    canon_shadow: &Path,
+    canon_agent_home: &Path,
+) -> Option<PathBuf> {
+    let raw_s = cand.to_string_lossy();
+    if raw_s.contains(".aegis-bin") || raw_s.contains("/.aegis/bin") {
+        return None;
+    }
+    let canon = std::fs::canonicalize(cand).ok()?;
+    if canon.starts_with(canon_shadow) || canon.starts_with(canon_agent_home) {
+        return None;
+    }
+    let canon_s = canon.to_string_lossy();
+    if canon_s.contains(".aegis-bin") || canon_s.contains("/.aegis/bin") {
+        return None;
+    }
+    let meta = std::fs::metadata(&canon).ok()?;
+    if !meta.is_file() {
+        return None;
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        if (meta.permissions().mode() & 0o111) == 0 {
+            return None;
+        }
+    }
+    Some(canon)
+}
+
+fn resolve_host_program(
+    raw_program: &str,
+    clean_host_path: &str,
+    shadow_root: &Path,
+    agent_home_dir: &Path,
+) -> anyhow::Result<PathBuf> {
+    let raw = raw_program.trim();
+    if raw.is_empty() || raw.len() > 256 {
+        bail!("Invalid host_exec 'program': expected non-empty binary name or path (<= 256 chars)");
+    }
+    if raw.chars().any(|c| {
+        c.is_control()
+            || c.is_whitespace()
+            || matches!(
+                c,
+                ';' | '|' | '&' | '$' | '`' | '>' | '<' | '*' | '?' | '~' | '(' | ')' | '{' | '}' | '[' | ']' | '\\'
+            )
+    }) {
+        bail!("Invalid host_exec 'program' '{}': control chars, whitespace, and shell metacharacters are forbidden", raw);
+    }
+    let raw_bin = Path::new(raw)
+        .file_name()
+        .and_then(|n| n.to_str())
+        .unwrap_or(raw)
+        .to_ascii_lowercase();
+    if is_forbidden_host_exec_program_name(&raw_bin) {
+        bail!("Privilege escalation or wrapper binary '{}' is forbidden for host_exec", raw);
+    }
+
+    let canon_shadow =
+        std::fs::canonicalize(shadow_root).unwrap_or_else(|_| shadow_root.to_path_buf());
+    let canon_agent_home =
+        std::fs::canonicalize(agent_home_dir).unwrap_or_else(|_| agent_home_dir.to_path_buf());
+
+    let resolved = if raw.contains('/') {
+        if !raw.starts_with('/') {
+            bail!(
+                "Relative path '{}' is not allowed for host_exec 'program'; pass a bare command name or absolute host binary path",
+                raw
+            );
+        }
+        validate_host_exec_binary_candidate(Path::new(raw), &canon_shadow, &canon_agent_home)
+            .with_context(|| format!("Executable host binary '{}' not found or resolves into sandbox", raw))?
+    } else {
+        clean_host_path
+            .split(':')
+            .filter(|dir| !dir.is_empty() && !dir.contains(".aegis-bin") && !dir.contains("/.aegis/bin"))
+            .find_map(|dir| {
+                validate_host_exec_binary_candidate(
+                    &Path::new(dir).join(raw),
+                    &canon_shadow,
+                    &canon_agent_home,
+                )
+            })
+            .with_context(|| format!("Executable '{}' not found on clean host PATH", raw))?
+    };
+
+    let resolved_bin = resolved
+        .file_name()
+        .and_then(|n| n.to_str())
+        .unwrap_or("")
+        .to_ascii_lowercase();
+    if is_forbidden_host_exec_program_name(&resolved_bin) {
+        bail!("Resolved binary '{}' is forbidden for host_exec", resolved.display());
+    }
+    Ok(resolved)
+}
+
+fn read_workspace_file_for_host_exec(
+    shadow_root: &Path,
+    host_root: &Path,
+    rel: &Path,
+) -> anyhow::Result<(Vec<u8>, bool)> {
+    let canon_shadow = std::fs::canonicalize(shadow_root)
+        .with_context(|| format!("Shadow root '{}' is unavailable", shadow_root.display()))?;
+    let mut cur = canon_shadow;
+    let mut shadow_missing = false;
+    for comp in rel.components() {
+        let std::path::Component::Normal(seg) = comp else {
+            bail!("Invalid relative path component in '{}'", rel.display());
+        };
+        cur.push(seg);
+        match std::fs::symlink_metadata(&cur) {
+            Ok(meta) => {
+                if meta.file_type().is_symlink() {
+                    bail!(
+                        "Refusing host_exec input '{}' through symlink '{}' in CoW shadow",
+                        rel.display(),
+                        cur.display()
+                    );
+                }
+            }
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                shadow_missing = true;
+                break;
+            }
+            Err(e) => {
+                return Err(anyhow::Error::new(e)
+                    .context(format!("Inspecting CoW shadow path '{}'", cur.display())));
+            }
+        }
+    }
+
+    let (canon_file, bytes) = if !shadow_missing {
+        open_and_read_no_symlink(shadow_root, rel)?
+    } else {
+        open_and_read_no_symlink(host_root, rel)?
+    };
+    if bytes.len() > MAX_HOST_EXEC_FILE_BYTES {
+        bail!(
+            "host_exec input '{}' ({} bytes) exceeds 8 MiB per-file limit",
+            rel.display(),
+            bytes.len()
+        );
+    }
+    #[cfg(unix)]
+    let executable = {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::symlink_metadata(&canon_file)
+            .map(|m| (m.permissions().mode() & 0o111) != 0)
+            .unwrap_or(false)
+    };
+    #[cfg(not(unix))]
+    let executable = false;
+    Ok((bytes, executable))
+}
+
+fn ensure_host_exec_dir_0700(dir: &Path) -> anyhow::Result<()> {
+    std::fs::create_dir_all(dir)?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let _ = std::fs::set_permissions(dir, std::fs::Permissions::from_mode(0o700));
+    }
+    Ok(())
+}
+
+fn write_frozen_file_0444(
+    frozen_dir: &Path,
+    rel: &str,
+    bytes: &[u8],
+    expected_sha256: &str,
+) -> anyhow::Result<()> {
+    let rel_path = shadow_relative(rel)?;
+    let dst = frozen_dir.join(&rel_path);
+    if let Some(parent) = dst.parent() {
+        ensure_host_exec_dir_0700(parent)?;
+    }
+    if let Ok(meta) = std::fs::symlink_metadata(&dst) {
+        if meta.file_type().is_symlink() || !meta.file_type().is_file() {
+            bail!("Refusing non-regular or symlink frozen artifact '{}'", dst.display());
+        }
+        let existing = std::fs::read(&dst)?;
+        let actual = hex::encode(Sha256::digest(&existing));
+        if actual != expected_sha256 {
+            bail!(
+                "Frozen bundle integrity mismatch for '{}': expected {}, got {}",
+                rel,
+                expected_sha256,
+                actual
+            );
+        }
+        return Ok(());
+    }
+    std::fs::write(&dst, bytes)?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let _ = std::fs::set_permissions(&dst, std::fs::Permissions::from_mode(0o444));
+    }
+    Ok(())
+}
+
+async fn read_bounded_pipe<R: tokio::io::AsyncRead + Unpin>(
+    mut reader: Option<R>,
+) -> (Vec<u8>, bool) {
+    use tokio::io::AsyncReadExt;
+    let Some(ref mut r) = reader else {
+        return (Vec::new(), false);
+    };
+    let mut out = Vec::new();
+    let mut buf = [0u8; 4096];
+    let mut truncated = false;
+    loop {
+        match r.read(&mut buf).await {
+            Ok(0) => break,
+            Ok(n) => {
+                if out.len() < MAX_HOST_EXEC_PIPE_BYTES {
+                    let take = (MAX_HOST_EXEC_PIPE_BYTES - out.len()).min(n);
+                    out.extend_from_slice(&buf[..take]);
+                    if take < n {
+                        truncated = true;
+                    }
+                } else {
+                    truncated = true;
+                }
+            }
+            Err(_) => break,
+        }
+    }
+    (out, truncated)
+}
+
+fn harvest_host_exec_outputs(
+    work_dir: &Path,
+    shadow_root: &Path,
+    output_files: &[String],
+) -> anyhow::Result<Vec<Value>> {
+    use std::io::Read;
+    let canon_work = std::fs::canonicalize(work_dir)?;
+    let canon_shadow = std::fs::canonicalize(shadow_root)?;
+    let mut harvested = Vec::new();
+    for rel in output_files {
+        let rel_path = shadow_relative(rel)?;
+        let mut src_cur = canon_work.clone();
+        let mut missing = false;
+        for comp in rel_path.components() {
+            let std::path::Component::Normal(seg) = comp else {
+                bail!("Invalid output_files component '{}'", rel);
+            };
+            src_cur.push(seg);
+            match std::fs::symlink_metadata(&src_cur) {
+                Ok(m) => {
+                    if m.file_type().is_symlink() {
+                        bail!("Refusing to harvest host_exec output through symlink '{}'", rel);
+                    }
+                }
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                    missing = true;
+                    break;
+                }
+                Err(e) => return Err(e.into()),
+            }
+        }
+        if missing {
+            continue;
+        }
+        let meta = std::fs::symlink_metadata(&src_cur)?;
+        if meta.file_type().is_symlink() || !meta.file_type().is_file() {
+            continue;
+        }
+        if meta.len() > MAX_HOST_EXEC_OUTPUT_HARVEST_BYTES {
+            bail!(
+                "host_exec output '{}' ({} bytes) exceeds 16 MiB harvest limit",
+                rel,
+                meta.len()
+            );
+        }
+        let mut opts = std::fs::OpenOptions::new();
+        opts.read(true);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::OpenOptionsExt;
+            opts.custom_flags(libc::O_NOFOLLOW);
+        }
+        let f = opts.open(&src_cur)?;
+        let mut bytes = Vec::with_capacity(meta.len() as usize);
+        f.take(MAX_HOST_EXEC_OUTPUT_HARVEST_BYTES + 1)
+            .read_to_end(&mut bytes)?;
+        if (bytes.len() as u64) > MAX_HOST_EXEC_OUTPUT_HARVEST_BYTES {
+            bail!("host_exec output '{}' exceeded 16 MiB while reading", rel);
+        }
+
+        // Write safely into shadow_root verifying no symlink components on destination.
+        let mut dst_cur = canon_shadow.clone();
+        let comps: Vec<_> = rel_path.components().collect();
+        for comp in &comps[..comps.len().saturating_sub(1)] {
+            let std::path::Component::Normal(seg) = comp else {
+                bail!("Invalid output destination '{}'", rel);
+            };
+            dst_cur.push(seg);
+            match std::fs::symlink_metadata(&dst_cur) {
+                Ok(m) => {
+                    if m.file_type().is_symlink() || !m.file_type().is_dir() {
+                        bail!(
+                            "Refusing to harvest output through symlink or non-directory '{}'",
+                            dst_cur.display()
+                        );
+                    }
+                }
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                    std::fs::create_dir(&dst_cur)?;
+                }
+                Err(e) => return Err(e.into()),
+            }
+        }
+        let dst_file = shadow_root.join(&rel_path);
+        if let Ok(m) = std::fs::symlink_metadata(&dst_file) {
+            if m.file_type().is_symlink() || m.file_type().is_dir() {
+                bail!(
+                    "Refusing to overwrite symlink or directory '{}' in shadow",
+                    rel
+                );
+            }
+        }
+        std::fs::write(&dst_file, &bytes)?;
+        harvested.push(json!({
+            "path": rel,
+            "bytes": bytes.len(),
+            "sha256": format!("sha256:{}", hex::encode(Sha256::digest(&bytes))),
+        }));
+    }
+    Ok(harvested)
+}
+
+fn scrub_host_exec_output(
+    raw: &[u8],
+    truncated: bool,
+    extra_secrets: &[String],
+) -> (String, Vec<String>) {
+    let mut text = String::from_utf8_lossy(raw).to_string();
+    if truncated {
+        text.push_str("\n...[output truncated at 64 KiB]");
+    }
+    let (mut scrubbed, hits) = redact_dlp_secrets(&text);
+    let mut labels: Vec<String> = hits.into_iter().map(str::to_string).collect();
+    for secret in extra_secrets {
+        let s = secret.trim();
+        if s.len() >= 12 && scrubbed.contains(s) {
+            scrubbed = scrubbed.replace(s, "[REDACTED_BY_AEGIS_DLP]");
+            if !labels.iter().any(|l| l == "DLP:SESSION_CONTROL_TOKEN") {
+                labels.push("DLP:SESSION_CONTROL_TOKEN".to_string());
+            }
+        }
+    }
+    (scrubbed, labels)
+}
+
 /// Tools that mint leases. They stay callable in-process (CLI `aegis-os policy approve`, dashboard,
 /// benches) but are never exposed to agents over MCP: an agent must not approve its own escalation.
 pub const HUMAN_ONLY_TOOLS: &[&str] = &["policy_approve_escalation", "policy_grant_lease"];
@@ -2545,6 +3118,7 @@ pub const TOOL_ANNOTATIONS: &[(&str, bool, bool, bool, bool)] = &[
     // Arbitrary sandboxed commands; network policy depends on the sandbox profile.
     ("proc_exec", false, true, false, true),
     ("pkg_install", false, false, false, true),
+    ("host_exec", false, false, false, true),
     ("org_artifact_publish", false, false, true, false),
     ("org_artifact_fetch", true, false, true, false),
     ("org_kv_put", false, false, false, false),
@@ -2712,6 +3286,8 @@ pub struct AegisRuntimeKernel {
     memory_task_secret: Option<String>,
     agents: Arc<RwLock<HashMap<String, Arc<AgentEnvironment>>>>,
     mounted_mcp_servers: Arc<RwLock<Vec<MountedMcpServer>>>,
+    active_host_exec_runs: Arc<std::sync::atomic::AtomicUsize>,
+    host_exec_config: RwLock<Option<HostExecBrokerConfig>>,
 }
 
 impl AegisRuntimeKernel {
@@ -2764,7 +3340,24 @@ impl AegisRuntimeKernel {
                 .filter(|value| !value.is_empty()),
             agents: Arc::new(RwLock::new(HashMap::new())),
             mounted_mcp_servers: Arc::new(RwLock::new(Vec::new())),
+            active_host_exec_runs: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+            host_exec_config: RwLock::new(None),
         })
+    }
+
+    pub fn active_host_exec_runs(&self) -> usize {
+        self.active_host_exec_runs
+            .load(std::sync::atomic::Ordering::SeqCst)
+    }
+
+    pub async fn set_host_exec_config(&self, cfg: HostExecBrokerConfig) {
+        *self.host_exec_config.write().await = Some(cfg);
+    }
+
+    pub fn rotate_operator_token(&self) -> String {
+        let fresh = format!("aop_{}{}", Uuid::new_v4().simple(), Uuid::new_v4().simple());
+        self.paas.set_secrets(&fresh, &self.paas.webhook_secret());
+        fresh
     }
 
     pub async fn ensure_org_vault(&self, org_id: &str) -> anyhow::Result<VaultStatus> {
@@ -5045,6 +5638,518 @@ impl AegisRuntimeKernel {
         Ok((plan, resource, vec![preview_diff], meta))
     }
 
+    async fn prepare_host_exec_plan(
+        &self,
+        env: &AgentEnvironment,
+        args: &Value,
+    ) -> anyhow::Result<(HostExecPlan, String, Vec<aos_core::FileDiffEntry>, Value)> {
+        let cfg = self
+            .host_exec_config
+            .read()
+            .await
+            .clone()
+            .context("host_exec is only available inside an enforced Aegis OS session (`aegis-os run`); run your command directly in a host terminal when using Advisory mode")?;
+
+        let raw_program = args
+            .get("program")
+            .and_then(|v| v.as_str())
+            .context("Missing 'program' for host_exec")?;
+        let shadow_root = env.workspace.shadow_root().to_path_buf();
+        let host_root = env.workspace.host_source_root().to_path_buf();
+        let sbx_cfg = env.sandbox.config();
+        let resolved_program = resolve_host_program(
+            raw_program,
+            &cfg.clean_host_path,
+            &shadow_root,
+            &sbx_cfg.agent_home_dir,
+        )?;
+        let resolved_program_str = resolved_program.display().to_string();
+
+        let raw_args: Vec<String> = match args.get("args") {
+            Some(v) if !v.is_null() => serde_json::from_value(v.clone())
+                .context("'args' must be an array of strings")?,
+            _ => Vec::new(),
+        };
+        if raw_args.len() > 64 {
+            bail!("Too many host_exec args ({}); maximum is 64", raw_args.len());
+        }
+        if raw_args.iter().any(|a| a.contains('\0')) {
+            bail!("NUL byte in host_exec 'args' is forbidden");
+        }
+
+        let is_interp = is_interpreter_program(&resolved_program);
+        let script_rel = match args.get("script").and_then(|v| v.as_str()).map(str::trim) {
+            Some(s) if !s.is_empty() => {
+                let rel = shadow_relative(s)?;
+                Some(rel.to_string_lossy().replace('\\', "/"))
+            }
+            _ => None,
+        };
+        if is_interp {
+            if script_rel.is_none() {
+                bail!(
+                    "Interpreter '{}' requires a workspace-relative 'script' path (inline code is forbidden)",
+                    resolved_program_str
+                );
+            }
+            if let Some(flag) = has_disallowed_interpreter_flags(&raw_args) {
+                bail!(
+                    "Inline interpreter flag '{}' is forbidden for host_exec on '{}'; put code in a workspace 'script' file",
+                    flag,
+                    resolved_program_str
+                );
+            }
+        }
+
+        let extra_inputs: Vec<String> = match args.get("inputs") {
+            Some(v) if !v.is_null() => serde_json::from_value(v.clone())
+                .context("'inputs' must be an array of strings")?,
+            _ => Vec::new(),
+        };
+        if extra_inputs.len() > 64 {
+            bail!("Too many host_exec inputs ({}); maximum is 64", extra_inputs.len());
+        }
+
+        let mut ordered_input_paths = std::collections::BTreeSet::new();
+        if let Some(ref s) = script_rel {
+            ordered_input_paths.insert(s.clone());
+        }
+        for inp in &extra_inputs {
+            let trimmed = inp.trim();
+            if !trimmed.is_empty() {
+                let rel = shadow_relative(trimmed)?;
+                ordered_input_paths.insert(rel.to_string_lossy().replace('\\', "/"));
+            }
+        }
+
+        let mut staged_inputs = std::collections::BTreeMap::new();
+        let mut staged_bytes: std::collections::BTreeMap<String, Vec<u8>> =
+            std::collections::BTreeMap::new();
+        let mut digest_map: std::collections::BTreeMap<String, String> =
+            std::collections::BTreeMap::new();
+        let mut total_input_bytes = 0usize;
+        for rel_str in ordered_input_paths {
+            let rel_path = PathBuf::from(&rel_str);
+            let (bytes, executable) =
+                read_workspace_file_for_host_exec(&shadow_root, &host_root, &rel_path)?;
+            total_input_bytes = total_input_bytes.saturating_add(bytes.len());
+            if total_input_bytes > MAX_HOST_EXEC_TOTAL_INPUT_BYTES {
+                bail!("Cumulative host_exec input bundle exceeds 16 MiB limit");
+            }
+            let digest = hex::encode(Sha256::digest(&bytes));
+            digest_map.insert(
+                rel_str.clone(),
+                format!(
+                    "{}:{}",
+                    if executable { "0555" } else { "0444" },
+                    digest
+                ),
+            );
+            staged_inputs.insert(
+                rel_str.clone(),
+                HostExecStagedInput {
+                    sha256: digest,
+                    executable,
+                },
+            );
+            staged_bytes.insert(rel_str, bytes);
+        }
+
+        let raw_outputs: Vec<String> = match args.get("output_files") {
+            Some(v) if !v.is_null() => serde_json::from_value(v.clone())
+                .context("'output_files' must be an array of strings")?,
+            _ => Vec::new(),
+        };
+        if raw_outputs.len() > 32 {
+            bail!("Too many output_files ({}); maximum is 32", raw_outputs.len());
+        }
+        let mut output_files = Vec::new();
+        let mut seen_outputs = std::collections::BTreeSet::new();
+        for out in raw_outputs {
+            let trimmed = out.trim();
+            if trimmed.is_empty() {
+                continue;
+            }
+            let rel = shadow_relative(trimmed)?;
+            let norm = rel.to_string_lossy().replace('\\', "/");
+            if AegisPolicyKernel::is_commit_poisoning_path(&norm)
+                || is_protected_client_config_rel(&norm)
+            {
+                bail!(
+                    "Refusing sensitive or build/hook-poisoning path '{}' in host_exec output_files",
+                    norm
+                );
+            }
+            if staged_inputs.contains_key(&norm) {
+                bail!(
+                    "host_exec output_files entry '{}' collides with a read-only input/script path",
+                    norm
+                );
+            }
+            if seen_outputs.insert(norm.clone()) {
+                output_files.push(norm);
+            }
+        }
+
+        let raw_pass_env: Vec<String> = match args.get("pass_env") {
+            Some(v) if !v.is_null() => serde_json::from_value(v.clone())
+                .context("'pass_env' must be an array of env variable names")?,
+            _ => Vec::new(),
+        };
+        if raw_pass_env.len() > 16 {
+            bail!("Too many pass_env variables ({}); maximum is 16", raw_pass_env.len());
+        }
+        let mut pass_env_kv = std::collections::BTreeMap::new();
+        let mut pass_env_keys = Vec::new();
+        for key in raw_pass_env {
+            let k = key.trim();
+            if is_forbidden_host_exec_env_key(k) {
+                bail!(
+                    "Environment variable '{}' is forbidden in host_exec pass_env (sensitive/loader/Aegis internals cannot be forwarded)",
+                    k
+                );
+            }
+            if let Ok(val) = std::env::var(k) {
+                pass_env_kv.insert(k.to_string(), val);
+            }
+            if !pass_env_keys.iter().any(|existing| existing == k) {
+                pass_env_keys.push(k.to_string());
+            }
+        }
+        pass_env_keys.sort();
+
+        let timeout_ms = args
+            .get("timeout_ms")
+            .and_then(|v| v.as_u64())
+            .unwrap_or(120_000)
+            .clamp(1_000, 900_000);
+
+        let canonical = serde_json::to_vec(&json!({
+            "resolved_program": resolved_program_str,
+            "script": script_rel,
+            "args": raw_args,
+            "inputs": digest_map,
+            "output_files": output_files,
+            "pass_env": pass_env_kv,
+            "timeout_ms": timeout_ms,
+        }))?;
+        let evidence_hash = hex::encode(Sha256::digest(&canonical));
+
+        let frozen_base = cfg.session_dir.join("host_exec_frozen");
+        ensure_host_exec_dir_0700(&frozen_base)?;
+        let frozen_dir = frozen_base.join(&evidence_hash);
+        ensure_host_exec_dir_0700(&frozen_dir)?;
+        for (rel_str, bytes) in &staged_bytes {
+            let staged = &staged_inputs[rel_str];
+            write_frozen_file_0444(&frozen_dir, rel_str, bytes, &staged.sha256)?;
+        }
+
+        let resource = format!(
+            "host_exec:{}{}",
+            resolved_program_str,
+            script_rel
+                .as_deref()
+                .map(|s| format!(":{s}"))
+                .unwrap_or_default()
+        );
+        let command_summary = match script_rel.as_deref() {
+            Some(s) if !raw_args.is_empty() => format!("{} {} {}", resolved_program_str, s, raw_args.join(" ")),
+            Some(s) => format!("{} {}", resolved_program_str, s),
+            None if !raw_args.is_empty() => format!("{} {}", resolved_program_str, raw_args.join(" ")),
+            None => resolved_program_str.clone(),
+        };
+
+        let mut diffs = Vec::new();
+        let manifest_preview = format!(
+            "+[UNSANDBOXED HOST SIBLING EXECUTION]\n+Program:      {}\n+Script:       {}\n+Args:         {}\n+Pass Env:     {}\n+Outputs:      {}\n+Timeout (ms): {}\n+Bundle Hash:  sha256:{}",
+            resolved_program_str,
+            script_rel.as_deref().unwrap_or("<none>"),
+            if raw_args.is_empty() { "<none>".to_string() } else { raw_args.join(" ") },
+            if pass_env_keys.is_empty() { "<none>".to_string() } else { pass_env_keys.join(", ") },
+            if output_files.is_empty() { "<none>".to_string() } else { output_files.join(", ") },
+            timeout_ms,
+            evidence_hash
+        );
+        diffs.push(aos_core::FileDiffEntry {
+            relative_path: ".aegis/HOST_EXEC_MANIFEST".to_string(),
+            change_type: DiffChangeType::Added,
+            old_size: None,
+            new_size: Some(canonical.len() as u64),
+            preview_diff: Some(manifest_preview),
+            old_sha256: None,
+            new_sha256: Some(format!("sha256:{}", evidence_hash)),
+        });
+        for (rel_str, bytes) in &staged_bytes {
+            let staged = &staged_inputs[rel_str];
+            let preview_raw = String::from_utf8_lossy(&bytes[..bytes.len().min(65_536)]);
+            let (scrubbed_preview, _) = redact_dlp_secrets(&preview_raw);
+            let mut udiff = scrubbed_preview
+                .lines()
+                .map(|l| format!("+{l}"))
+                .collect::<Vec<_>>()
+                .join("\n");
+            if bytes.len() > 65_536 {
+                udiff.push_str("\n+...[truncated preview at 64 KiB]");
+            }
+            diffs.push(aos_core::FileDiffEntry {
+                relative_path: rel_str.clone(),
+                change_type: DiffChangeType::Added,
+                old_size: None,
+                new_size: Some(bytes.len() as u64),
+                preview_diff: Some(udiff),
+                old_sha256: None,
+                new_sha256: Some(format!("sha256:{}", staged.sha256)),
+            });
+        }
+
+        let meta = json!({
+            "enforced_session_broker": true,
+            "evidence_hash": evidence_hash,
+            "program": resolved_program_str,
+            "script": script_rel,
+            "args": raw_args,
+            "output_files": output_files,
+            "pass_env_keys": pass_env_keys,
+            "timeout_ms": timeout_ms,
+            "command_summary": command_summary,
+            "evidence": {
+                "program": resolved_program_str,
+                "script": script_rel,
+                "args": raw_args,
+                "inputs": digest_map,
+                "output_files": output_files,
+                "pass_env_keys": pass_env_keys,
+                "timeout_ms": timeout_ms,
+                "evidence_hash": evidence_hash,
+            },
+        });
+        let plan = HostExecPlan {
+            config: cfg,
+            resolved_program,
+            script_rel,
+            args: raw_args,
+            inputs: staged_inputs,
+            output_files,
+            pass_env_kv,
+            timeout_ms,
+            frozen_dir,
+            evidence_hash,
+        };
+        Ok((plan, resource, diffs, meta))
+    }
+
+    async fn execute_host_exec(
+        &self,
+        env: &AgentEnvironment,
+        plan: HostExecPlan,
+    ) -> anyhow::Result<Value> {
+        use std::process::Stdio;
+
+        self.active_host_exec_runs
+            .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        let run_guard = HostExecRunGuard {
+            active_runs: self.active_host_exec_runs.clone(),
+            paas: self.paas.clone(),
+            on_run_finished: plan.config.on_run_finished.clone(),
+        };
+
+        let runs_base = plan.config.session_dir.join("host_exec_runs");
+        ensure_host_exec_dir_0700(&runs_base)?;
+        let run_root = runs_base.join(Uuid::new_v4().simple().to_string());
+        let work_dir = run_root.join("work");
+        let tmp_dir = run_root.join("tmp");
+        ensure_host_exec_dir_0700(&run_root)?;
+        ensure_host_exec_dir_0700(&work_dir)?;
+        ensure_host_exec_dir_0700(&tmp_dir)?;
+        let cleanup_guard = RunDirCleanupGuard(run_root.clone());
+
+        // Copy every frozen input into `work_dir` after re-verifying its SHA-256 digest.
+        for (rel_str, staged) in &plan.inputs {
+            let rel_path = shadow_relative(rel_str)?;
+            let src = plan.frozen_dir.join(&rel_path);
+            let meta = std::fs::symlink_metadata(&src)
+                .with_context(|| format!("Missing frozen input '{}'", rel_str))?;
+            if meta.file_type().is_symlink() || !meta.file_type().is_file() {
+                bail!("Refusing non-regular or symlink frozen input '{}'", rel_str);
+            }
+            let bytes = std::fs::read(&src)?;
+            let actual = hex::encode(Sha256::digest(&bytes));
+            if actual != staged.sha256 {
+                bail!(
+                    "TOCTOU integrity error: frozen input '{}' hash mismatch (expected {}, got {})",
+                    rel_str,
+                    staged.sha256,
+                    actual
+                );
+            }
+            let dst = work_dir.join(&rel_path);
+            if let Some(parent) = dst.parent() {
+                ensure_host_exec_dir_0700(parent)?;
+            }
+            std::fs::write(&dst, &bytes)?;
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::PermissionsExt;
+                let mode = if staged.executable { 0o555 } else { 0o444 };
+                let _ = std::fs::set_permissions(&dst, std::fs::Permissions::from_mode(mode));
+            }
+        }
+        for out_rel in &plan.output_files {
+            let rel_path = shadow_relative(out_rel)?;
+            if let Some(parent) = work_dir.join(&rel_path).parent() {
+                ensure_host_exec_dir_0700(parent)?;
+            }
+        }
+
+        let mut std_cmd = std::process::Command::new(&plan.resolved_program);
+        if let Some(ref script_rel) = plan.script_rel {
+            std_cmd.arg(work_dir.join(script_rel));
+        }
+        std_cmd.args(&plan.args);
+        std_cmd.current_dir(&work_dir);
+        std_cmd.env_clear();
+        std_cmd.env("HOME", &plan.config.host_home);
+        std_cmd.env("PATH", &plan.config.clean_host_path);
+        std_cmd.env("TMPDIR", &tmp_dir);
+        std_cmd.env(
+            "USER",
+            std::env::var("USER").unwrap_or_else(|_| "user".to_string()),
+        );
+        std_cmd.env(
+            "LOGNAME",
+            std::env::var("LOGNAME").unwrap_or_else(|_| "user".to_string()),
+        );
+        std_cmd.env(
+            "SHELL",
+            std::env::var("SHELL").unwrap_or_else(|_| "/bin/sh".to_string()),
+        );
+        std_cmd.env("LANG", "en_US.UTF-8");
+        std_cmd.env("TERM", "xterm-256color");
+        std_cmd.env("AOS_HOST_ROOT", &plan.config.host_workspace_root);
+        std_cmd.env("PYTHONSAFEPATH", "1");
+        std_cmd.env("PYTHONDONTWRITEBYTECODE", "1");
+        for (k, v) in &plan.pass_env_kv {
+            std_cmd.env(k, v);
+        }
+        #[cfg(unix)]
+        {
+            use std::os::unix::process::CommandExt;
+            std_cmd.process_group(0);
+        }
+        std_cmd
+            .stdin(Stdio::null())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped());
+
+        let started = std::time::Instant::now();
+        let mut child = tokio::process::Command::from(std_cmd)
+            .spawn()
+            .with_context(|| {
+                format!(
+                    "Spawning host_exec sibling '{}'",
+                    plan.resolved_program.display()
+                )
+            })?;
+        #[cfg(unix)]
+        let pgid = child.id().map(|p| p as libc::pid_t);
+        #[cfg(unix)]
+        let mut reaper = ProcessGroupReaper(pgid);
+
+        let out_task = tokio::spawn(read_bounded_pipe(child.stdout.take()));
+        let err_task = tokio::spawn(read_bounded_pipe(child.stderr.take()));
+
+        let wait_res =
+            tokio::time::timeout(std::time::Duration::from_millis(plan.timeout_ms), child.wait())
+                .await;
+        let duration_ms = started.elapsed().as_millis() as u64;
+
+        let (timed_out, exit_code) = match wait_res {
+            Ok(Ok(status)) => (false, status.code()),
+            Ok(Err(e)) => return Err(e.into()),
+            Err(_) => {
+                #[cfg(unix)]
+                if let Some(p) = pgid {
+                    if p > 0 {
+                        unsafe {
+                            let _ = libc::killpg(p, libc::SIGKILL);
+                        }
+                    }
+                }
+                let _ = child.kill().await;
+                let _ = child.wait().await;
+                (true, None)
+            }
+        };
+
+        // Always reap any leftover background grandchild processes in the process group before
+        // harvesting outputs or releasing `active_host_exec_runs`.
+        #[cfg(unix)]
+        {
+            if let Some(p) = pgid {
+                if p > 0 {
+                    unsafe {
+                        let _ = libc::killpg(p, libc::SIGKILL);
+                    }
+                }
+            }
+            reaper.0 = None;
+        }
+
+        let (raw_out, out_trunc) = tokio::time::timeout(
+            std::time::Duration::from_millis(500),
+            out_task,
+        )
+        .await
+        .ok()
+        .and_then(|r| r.ok())
+        .unwrap_or((Vec::new(), false));
+        let (raw_err, err_trunc) = tokio::time::timeout(
+            std::time::Duration::from_millis(500),
+            err_task,
+        )
+        .await
+        .ok()
+        .and_then(|r| r.ok())
+        .unwrap_or((Vec::new(), false));
+
+        let harvested_outputs = harvest_host_exec_outputs(
+            &work_dir,
+            env.workspace.shadow_root(),
+            &plan.output_files,
+        )?;
+
+        let mut extra_secrets = vec![self.paas.admin_secret()];
+        if let Ok(tok) = std::fs::read_to_string(plan.config.session_dir.join("agent.token")) {
+            extra_secrets.push(tok);
+        }
+        if let Ok(tok) = std::fs::read_to_string(plan.config.session_dir.join("human.token")) {
+            extra_secrets.push(tok);
+        }
+        let (clean_stdout, mut dlp_hits) = scrub_host_exec_output(&raw_out, out_trunc, &extra_secrets);
+        let (clean_stderr, err_hits) = scrub_host_exec_output(&raw_err, err_trunc, &extra_secrets);
+        for h in err_hits {
+            if !dlp_hits.contains(&h) {
+                dlp_hits.push(h);
+            }
+        }
+
+        drop(cleanup_guard);
+        drop(run_guard);
+
+        Ok(json!({
+            "status": if timed_out { "timed_out" } else { "completed" },
+            "exit_code": exit_code,
+            "duration_ms": duration_ms,
+            "evidence_hash": plan.evidence_hash,
+            "program": plan.resolved_program.display().to_string(),
+            "script": plan.script_rel,
+            "stdout": clean_stdout,
+            "stderr": clean_stderr,
+            "harvested_outputs": harvested_outputs,
+            "dlp_redactions": dlp_hits,
+        }))
+    }
+
     pub async fn call_tool(
         &self,
         identity: &AgentIdentity,
@@ -5105,6 +6210,7 @@ impl AegisRuntimeKernel {
         let mut pre_comment_create_plan: Option<GitHubCommentCreatePlan> = None;
         let mut pre_pr_merge_plan: Option<GitHubPrMergePlan> = None;
         let mut pre_pkg_install_plan: Option<PkgInstallPlan> = None;
+        let mut pre_host_exec_plan: Option<HostExecPlan> = None;
         if tool_name == "workspace_commit" {
             let filter_paths: Option<Vec<String>> = args
                 .get("paths")
@@ -5529,6 +6635,19 @@ impl AegisRuntimeKernel {
             pre_commit_diffs = Some(diffs);
             pre_commit_evidence_hash = Some(plan.evidence_hash.clone());
             pre_pkg_install_plan = Some(plan);
+        } else if tool_name == "host_exec" {
+            let (plan, resource, diffs, meta) = self.prepare_host_exec_plan(&env, &args).await?;
+            target_resource = resource;
+            if let (Some(obj), Some(meta_obj)) =
+                (audit_metadata.as_object_mut(), meta.as_object())
+            {
+                for (k, v) in meta_obj {
+                    obj.insert(k.clone(), v.clone());
+                }
+            }
+            pre_commit_diffs = Some(diffs);
+            pre_commit_evidence_hash = Some(plan.evidence_hash.clone());
+            pre_host_exec_plan = Some(plan);
         }
         let mut resolved_cross_org_peer: Option<(String, String)> = None;
 
@@ -5620,6 +6739,7 @@ impl AegisRuntimeKernel {
                             | "github_comment_create"
                             | "github_pr_merge"
                             | "pkg_install"
+                            | "host_exec"
                     ) {
                         if let Some(ref diffs) = pre_commit_diffs {
                             let diff_dir = self.runtime_data_root.join("escalation_diffs");
@@ -6290,6 +7410,11 @@ impl AegisRuntimeKernel {
             "pkg_install" => {
                 let plan = pre_pkg_install_plan.context("Missing pre-validated pkg_install plan")?;
                 execute_pkg_install(identity, plan).await
+            }
+
+            "host_exec" => {
+                let plan = pre_host_exec_plan.context("Missing pre-validated host_exec plan")?;
+                self.execute_host_exec(&env, plan).await
             }
 
             // ----------------------------------------------------------------
@@ -8010,6 +9135,56 @@ impl AegisRuntimeKernel {
                     }
                 },
                 {
+                    "name": "host_exec",
+                    "description": "[HIGH RISK · SHA-256 Frozen Approval] Execute an unsandboxed host-brokered sibling process from an enforced SessionBroker (e.g. WardRun/sandbox benchmarks, containers, or simulators) with inputs frozen read-only, environment scrubbed, process group reaped, output files harvested into shadow, and outputs DLP-redacted.",
+                    "inputSchema": {
+                        "type": "object",
+                        "properties": {
+                            "program": {
+                                "type": "string",
+                                "description": "Host binary path or executable name resolved on clean host PATH (inline -c/-e flags and privilege escalation binaries are rejected)."
+                            },
+                            "script": {
+                                "type": "string",
+                                "description": "Workspace-relative script path (required for interpreters like python3/bash/node); frozen read-only and SHA-256 pinned before human approval."
+                            },
+                            "args": {
+                                "type": "array",
+                                "items": { "type": "string" },
+                                "description": "Additional command-line arguments passed after script."
+                            },
+                            "inputs": {
+                                "type": "array",
+                                "items": { "type": "string" },
+                                "description": "Optional extra workspace-relative files/modules to freeze into the read-only execution bundle."
+                            },
+                            "output_files": {
+                                "type": "array",
+                                "items": { "type": "string" },
+                                "description": "Optional relative artifact/report paths to harvest back into CoW shadow after execution."
+                            },
+                            "pass_env": {
+                                "type": "array",
+                                "items": { "type": "string" },
+                                "description": "Optional non-sensitive host environment variable names to forward explicitly."
+                            },
+                            "timeout_ms": {
+                                "type": "integer",
+                                "description": "Execution timeout in milliseconds (default 120000, max 900000)."
+                            },
+                            "rationale": {
+                                "type": "string",
+                                "description": "Reason why host-brokered sibling execution outside the OS sandbox is needed."
+                            },
+                            "totp": {
+                                "type": "string",
+                                "description": "Optional 6-digit TOTP authenticator code for Cloud mode approval."
+                            }
+                        },
+                        "required": ["program"]
+                    }
+                },
+                {
                     "name": "org_artifact_publish",
                     "description": "[Zero-Prompt Intra-Org] Publish an immutable artifact (UTF-8 text, base64 payload, or sandbox file via `source_path`) to the Organization's CAS store for peer Agents.",
                     "inputSchema": {
@@ -8280,7 +9455,7 @@ impl AegisRuntimeKernel {
                 },
                 {
                     "name": "egress_http_request",
-                    "description": "[Boundary-Sanitized] Inspect an outbound HTTP request against the Organization domain allowlist and inject `$AOS_SECRET_*` tokens at the boundary.",
+                    "description": "[Boundary-Sanitized] Inspect an outbound HTTP request against the Organization domain allowlist and inject secret vault placeholders at the boundary.",
                     "inputSchema": {
                         "type": "object",
                         "properties": {
@@ -8399,7 +9574,7 @@ impl AegisRuntimeKernel {
                 },
                 {
                     "name": "app_call_tool",
-                    "description": "[AAP-1.0 Proxy] Invoke an MCP tool on an AAP-1.0 application (e.g. `heurion`) over `POST /api/aegis/mcp` with automatic injection of `Authorization: Bearer aegis_at_<app_id>.*`, `X-Aegis-Agent-Id`, `X-Aegis-Session-Id`, and Policy Kernel `X-Aegis-Lease-Token` for `lease_gated` tools.",
+                    "description": "[AAP-1.0 Proxy] Invoke an MCP tool on an AAP-1.0 application (e.g. `heurion`) over `POST /api/aegis/mcp` with automatic AAP-1.0 app token header injection, `X-Aegis-Agent-Id`, `X-Aegis-Session-Id`, and Policy Kernel `X-Aegis-Lease-Token` for `lease_gated` tools.",
                     "inputSchema": {
                         "type": "object",
                         "properties": {
@@ -10216,9 +11391,42 @@ impl AegisRuntimeKernel {
                             .and_then(|v| v.as_str())
                             .unwrap_or("mission-control-dashboard")
                             .to_string();
+                        let lock_err: Option<&'static str> = if k.active_host_exec_runs() > 0 {
+                            let found_esc_lock = k
+                                .policy
+                                .list_escalations("*")
+                                .await
+                                .unwrap_or_default()
+                                .into_iter()
+                                .find(|e| e.escalation_id == esc_id);
+                            let code = payload.get("totp").and_then(|v| v.as_str()).unwrap_or("");
+                            let totp_verified = if let Some(ref esc) = found_esc_lock {
+                                let enrolled = k
+                                    .paas
+                                    .approver_status(&esc.org_id)
+                                    .await
+                                    .get("enrolled")
+                                    .and_then(|v| v.as_bool())
+                                    .unwrap_or(false);
+                                enrolled
+                                    && !code.is_empty()
+                                    && k.paas.verify_approver_code(&esc.org_id, code).await.is_ok()
+                            } else {
+                                false
+                            };
+                            if !totp_verified {
+                                Some("Approval decisions are locked while an unsandboxed host_exec process is active")
+                            } else {
+                                None
+                            }
+                        } else {
+                            None
+                        };
                         // Tenant approvals: the escalation must belong to the key's org and the
                         // request must carry that org's approver code. Leases stay bounded.
-                        let tenant_check: Result<(), String> = if is_operator || auth_mode == DaemonAuth::Disabled {
+                        let tenant_check: Result<(), String> = if lock_err.is_some() {
+                            Ok(())
+                        } else if is_operator || auth_mode == DaemonAuth::Disabled {
                             Ok(())
                         } else if let Some(own) = key_org.clone() {
                             let in_org = k
@@ -10292,7 +11500,9 @@ impl AegisRuntimeKernel {
                             }
                         };
                         let actor = actor.as_str();
-                        if let Err(reason) = tenant_check {
+                        if let Some(msg) = lock_err {
+                            ("HTTP/1.1 423 Locked", json!({ "error": msg }).to_string())
+                        } else if let Err(reason) = tenant_check {
                             ("HTTP/1.1 403 Forbidden", json!({ "error": reason }).to_string())
                         } else if decision.eq_ignore_ascii_case("deny") || decision.eq_ignore_ascii_case("reject") {
                             match k.policy.deny_escalation(esc_id, actor).await {
@@ -14525,6 +15735,7 @@ mod tests {
 
         // 4. Web approval templates render structured cards and forbid emojis on dashboard
         assert!(approver::APPROVE_PAGE_HTML.contains("pkg_install_scripts"));
+        assert!(approver::APPROVE_PAGE_HTML.contains("host_exec"));
         assert!(approver::APPROVE_PAGE_HTML.contains("github_pr_merge"));
         assert!(approver::APPROVE_PAGE_HTML.contains("isHighRisk"));
         let dash = paas::render_dashboard_html(&host_proj);
@@ -14532,5 +15743,337 @@ mod tests {
         assert!(dash.contains("github_pr_merge"));
         assert!(dash.contains("isHighRisk"));
         assert!(!dash.chars().any(|c| ('\u{1F300}'..='\u{1FAFF}').contains(&c)));
+    }
+
+    #[tokio::test]
+    async fn test_mcp_tools_list_and_prompts_never_trigger_egress_dlp() {
+        let rt = tempfile::tempdir().unwrap();
+        let kernel = AegisRuntimeKernel::new(rt.path()).await.unwrap();
+        let agent = AgentIdentity::new("acme", "coder-1", "Engineer");
+        let resp = kernel
+            .handle_jsonrpc_message(
+                &agent,
+                json!({
+                    "jsonrpc": "2.0",
+                    "id": 1,
+                    "method": "tools/list",
+                    "params": {}
+                }),
+            )
+            .await
+            .unwrap();
+        let raw = serde_json::to_string(&resp).unwrap();
+        let hits = aos_egress::detect_dlp_patterns(&raw);
+        assert!(
+            hits.is_empty(),
+            "tools/list schema must never trigger outbound DLP: {hits:?}"
+        );
+        assert_eq!(
+            aos_egress::AegisEgressGateway::inspect_payload_dlp(&raw, &[], "acme"),
+            None,
+            "inspect_payload_dlp must allow tools/list schema in LLM /v1/messages body"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_host_exec_frozen_bundle_ttl_hash_pinning_env_scrub_killpg_and_output_harvest() {
+        let rt = tempfile::tempdir().unwrap();
+        let host_proj = tempfile::tempdir().unwrap();
+        let host_home = tempfile::tempdir().unwrap();
+        let session_dir = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(host_proj.path().join("scripts")).unwrap();
+        std::fs::write(
+            host_proj.path().join("scripts/helper.py"),
+            "MARKER = 'v1-ok'\n",
+        )
+        .unwrap();
+        std::fs::write(
+            host_proj.path().join("scripts/bench_probe.py"),
+            r#"import json, os
+from pathlib import Path
+
+helper_txt = Path(__file__).with_name("helper.py").read_text()
+# Verify env_clear stripped all Rust/cargo/session control env vars and left only clean minimal env.
+leaked = [k for k in os.environ if k.startswith(("CARGO_", "RUSTUP_", "AOS_SESSION", "AOS_CONTROL", "AOS_SANDBOX", "OPENAI_", "ANTHROPIC_"))]
+print("HELPER:", helper_txt.strip())
+print("CLEAN_ENV:", len(leaked) == 0, "SAFE_PATH:", os.environ.get("PYTHONSAFEPATH"))
+# Emit a synthetic secret + operator token candidate to verify DLP scrubbing before returning to LLM.
+print("LEAK_TEST:", "ghp_1234567890abcdefghijklmnoprstuv")
+Path("reports").mkdir(exist_ok=True)
+Path("reports/out.json").write_text(json.dumps({"helper": "v1-ok", "leaked": leaked}))
+"#,
+        )
+        .unwrap();
+
+        let kernel = AegisRuntimeKernel::new(rt.path()).await.unwrap();
+        let agent = AgentIdentity::new("aegis-os", "agy-agent", "Coder");
+        let cow = CoWWorkspace::init(host_proj.path(), rt.path().join("cow_host_exec"))
+            .await
+            .unwrap();
+        let shadow_root = cow.shadow_root().to_path_buf();
+        let sbx_home = rt.path().join("sbx_home");
+        std::fs::create_dir_all(&sbx_home).unwrap();
+        let sandbox = NativeOsSandboxDriver
+            .create_sandbox(SandboxConfig {
+                identity: agent.clone(),
+                tier: IsolationTier::NativeOsSandbox,
+                limits: ResourceLimits::default(),
+                workspace_dir: shadow_root.clone(),
+                agent_home_dir: sbx_home,
+                org_shared_ro_dir: rt.path().join("ro"),
+                org_agent_pub_dir: rt.path().join("pub"),
+                egress_proxy_addr: None,
+                host_source_dir: Some(host_proj.path().to_path_buf()),
+                tighten_home_read: true,
+                allowed_loopback_ports: Vec::new(),
+                isolate_loopback_only: true,
+            })
+            .await
+            .unwrap();
+        kernel
+            .attach_agent_environment(
+                &agent,
+                AgentEnvironment {
+                    identity: agent.clone(),
+                    workspace: Arc::new(cow),
+                    sandbox,
+                },
+            )
+            .await;
+
+        // 1. Without HostExecBrokerConfig (Advisory mode), `host_exec` must be refused.
+        let non_broker_err = kernel
+            .call_tool(
+                &agent,
+                "host_exec",
+                json!({ "program": "python3", "script": "scripts/bench_probe.py" }),
+            )
+            .await
+            .unwrap_err()
+            .to_string();
+        assert!(non_broker_err.contains("enforced Aegis OS"), "{non_broker_err}");
+
+        // Attach SessionBroker HostExecBrokerConfig.
+        kernel
+            .set_host_exec_config(HostExecBrokerConfig {
+                session_dir: session_dir.path().to_path_buf(),
+                host_home: host_home.path().to_path_buf(),
+                clean_host_path: "/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin".to_string(),
+                host_workspace_root: host_proj.path().to_path_buf(),
+                on_run_finished: None,
+            })
+            .await;
+
+        // 2. Reject inline `-c` code, symlink inputs, secret `pass_env`, and sensitive `output_files`.
+        assert!(kernel
+            .call_tool(
+                &agent,
+                "host_exec",
+                json!({ "program": "python3", "script": "scripts/bench_probe.py", "args": ["-c", "print(1)"] }),
+            )
+            .await
+            .is_err());
+        #[cfg(unix)]
+        {
+            std::os::unix::fs::symlink("/etc/hosts", shadow_root.join("scripts/sym_link.txt")).unwrap();
+            let sym_err = kernel
+                .call_tool(
+                    &agent,
+                    "host_exec",
+                    json!({
+                        "program": "python3",
+                        "script": "scripts/bench_probe.py",
+                        "inputs": ["scripts/sym_link.txt"]
+                    }),
+                )
+                .await
+                .unwrap_err()
+                .to_string();
+            assert!(sym_err.contains("symlink"), "{sym_err}");
+            let _ = std::fs::remove_file(shadow_root.join("scripts/sym_link.txt"));
+        }
+        assert!(kernel
+            .call_tool(
+                &agent,
+                "host_exec",
+                json!({
+                    "program": "python3",
+                    "script": "scripts/bench_probe.py",
+                    "pass_env": ["OPENAI_API_KEY"]
+                }),
+            )
+            .await
+            .is_err());
+        assert!(kernel
+            .call_tool(
+                &agent,
+                "host_exec",
+                json!({
+                    "program": "python3",
+                    "script": "scripts/bench_probe.py",
+                    "output_files": [".git/hooks/pre-commit"]
+                }),
+            )
+            .await
+            .is_err());
+
+        // 3. First valid request returns `approval_required` with frozen bundle SHA-256 & diff preview.
+        let valid_args = json!({
+            "program": "python3",
+            "script": "scripts/bench_probe.py",
+            "inputs": ["scripts/helper.py"],
+            "output_files": ["reports/out.json"],
+            "rationale": "Run unconfounded probe"
+        });
+        let ask = kernel.call_tool(&agent, "host_exec", valid_args.clone()).await.unwrap();
+        assert_eq!(ask["status"], "approval_required", "{ask}");
+        let esc_id = ask["escalation_id"].as_str().unwrap().to_string();
+        let ev_hash = ask["evidence_hash"].as_str().unwrap().to_string();
+        let diff_file = rt.path().join("escalation_diffs").join(format!("{esc_id}.json"));
+        let diff_txt = std::fs::read_to_string(&diff_file).unwrap();
+        assert!(diff_txt.contains(".aegis/HOST_EXEC_MANIFEST"), "{diff_txt}");
+        assert!(diff_txt.contains("scripts/bench_probe.py"), "{diff_txt}");
+        assert!(diff_txt.contains("scripts/helper.py"), "{diff_txt}");
+
+        // Approve with 3600s TTL -> verify execution, env cleanliness, DLP redaction, and output harvest.
+        kernel.policy.approve_escalation(&esc_id, 3600, "human").await.unwrap();
+        let run1 = kernel.call_tool(&agent, "host_exec", valid_args.clone()).await.unwrap();
+        assert_eq!(run1["status"], "completed", "{run1}");
+        assert_eq!(run1["exit_code"], 0, "{run1}");
+        let stdout1 = run1["stdout"].as_str().unwrap();
+        assert!(stdout1.contains("HELPER: MARKER = 'v1-ok'"), "{stdout1}");
+        assert!(stdout1.contains("CLEAN_ENV: True SAFE_PATH: 1"), "{stdout1}");
+        assert!(!stdout1.contains("ghp_1234567890"), "{stdout1}");
+        assert!(stdout1.contains("[REDACTED_BY_AEGIS_DLP]"), "{stdout1}");
+        let harvested_txt = std::fs::read_to_string(shadow_root.join("reports/out.json")).unwrap();
+        assert!(harvested_txt.contains("\"helper\": \"v1-ok\""), "{harvested_txt}");
+
+        // Identical rerun succeeds under 3600s TTL lease.
+        let run2 = kernel.call_tool(&agent, "host_exec", valid_args.clone()).await.unwrap();
+        assert_eq!(run2["status"], "completed", "{run2}");
+        assert_eq!(run2["evidence_hash"].as_str().unwrap(), ev_hash);
+
+        // Mutating 1 byte of frozen dependency immediately invalidates the TTL lease!
+        std::fs::write(shadow_root.join("scripts/helper.py"), "MARKER = 'v2-ok'\n").unwrap();
+        let drift_ask = kernel.call_tool(&agent, "host_exec", valid_args).await.unwrap();
+        assert_eq!(
+            drift_ask["status"],
+            "approval_required",
+            "1-byte edit must force re-approval: {drift_ask}"
+        );
+
+        // 4. Timeout reaps the entire grandchild process group via killpg(SIGKILL).
+        #[cfg(unix)]
+        {
+            std::fs::write(
+                shadow_root.join("scripts/sleeper.py"),
+                r#"import subprocess, time
+from pathlib import Path
+p = subprocess.Popen(["sleep", "60"])
+Path("reports").mkdir(exist_ok=True)
+Path("reports/child_pid.txt").write_text(str(p.pid))
+time.sleep(60)
+"#,
+            )
+            .unwrap();
+            let sleep_args = json!({
+                "program": "python3",
+                "script": "scripts/sleeper.py",
+                "output_files": ["reports/child_pid.txt"],
+                "timeout_ms": 1_000
+            });
+            let sleep_ask = kernel.call_tool(&agent, "host_exec", sleep_args.clone()).await.unwrap();
+            let sleep_esc = sleep_ask["escalation_id"].as_str().unwrap();
+            kernel.policy.approve_escalation(sleep_esc, 0, "human").await.unwrap();
+            let sleep_res = kernel.call_tool(&agent, "host_exec", sleep_args).await.unwrap();
+            assert_eq!(sleep_res["status"], "timed_out", "{sleep_res}");
+            let pid_str = std::fs::read_to_string(shadow_root.join("reports/child_pid.txt")).unwrap();
+            let child_pid: i32 = pid_str.trim().parse().unwrap();
+            tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+            let alive = unsafe { libc::kill(child_pid, 0) } == 0;
+            assert!(!alive, "grandchild sleep pid {} must be reaped by killpg", child_pid);
+        }
+    }
+
+    #[tokio::test]
+    async fn test_local_ui_token_blocks_anonymous_loopback_self_approval_and_locks_during_host_exec() {
+        let rt = tempfile::tempdir().unwrap();
+        let proj = tempfile::tempdir().unwrap();
+        let kernel = Arc::new(AegisRuntimeKernel::new(rt.path()).await.unwrap());
+        let bind_addr = match std::env::var("AOS_DEV_PORT") {
+            Ok(p) if !p.trim().is_empty() => format!("127.0.0.1:{}", p.trim()),
+            _ => "127.0.0.1:0".to_string(),
+        };
+        let addr = match kernel
+            .clone()
+            .start_http_daemon_with_auth(&bind_addr, proj.path().to_path_buf(), DaemonAuth::Required)
+            .await
+        {
+            Ok(a) => a,
+            Err(_) => kernel
+                .clone()
+                .start_http_daemon_with_auth("127.0.0.1:0", proj.path().to_path_buf(), DaemonAuth::Required)
+                .await
+                .unwrap(),
+        };
+
+        let agent = AgentIdentity::new("acme", "coder-1", "Engineer");
+        let esc1 = match kernel
+            .policy
+            .evaluate(&PolicyContext {
+                principal: agent.clone(),
+                action: "workspace_commit".to_string(),
+                target_org_id: "acme".to_string(),
+                target_resource: "/workspace/foo.rs".to_string(),
+                metadata: json!({ "paths": ["foo.rs"] }),
+            })
+            .await
+            .unwrap()
+        {
+            PolicyDecision::Ask { escalation_id, .. } => escalation_id,
+            other => panic!("expected Ask, got {other:?}"),
+        };
+
+        // Anonymous loopback POST /v1/approvals/decide MUST be rejected with 403 Forbidden!
+        let (head_anon, _) = raw_http(
+            addr,
+            "POST",
+            "/v1/approvals/decide",
+            None,
+            Some(json!({ "escalation_id": esc1, "decision": "approve", "ttl_secs": 0 })),
+        )
+        .await;
+        assert!(head_anon.contains("403 Forbidden"), "{head_anon}");
+
+        // Active host_exec run locks POST /v1/approvals/decide with 423 Locked even with operator token!
+        let op_tok = kernel.operator_token();
+        assert!(!op_tok.is_empty());
+        kernel
+            .active_host_exec_runs
+            .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        let (head_locked, _) = raw_http(
+            addr,
+            "POST",
+            "/v1/approvals/decide",
+            Some(&op_tok),
+            Some(json!({ "escalation_id": esc1, "decision": "approve", "ttl_secs": 0 })),
+        )
+        .await;
+        assert!(head_locked.contains("423 Locked"), "{head_locked}");
+        kernel
+            .active_host_exec_runs
+            .fetch_sub(1, std::sync::atomic::Ordering::SeqCst);
+
+        // Once unlocked and presented with valid operator token (from browser #key=), approval succeeds.
+        let (head_ok, body_ok) = raw_http(
+            addr,
+            "POST",
+            "/v1/approvals/decide",
+            Some(&op_tok),
+            Some(json!({ "escalation_id": esc1, "decision": "approve", "ttl_secs": 0 })),
+        )
+        .await;
+        assert!(head_ok.contains("200 OK"), "{head_ok}: {body_ok}");
+        assert_eq!(body_ok["status"], "approved", "{body_ok}");
     }
 }

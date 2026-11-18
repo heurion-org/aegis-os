@@ -221,6 +221,10 @@ pub struct AegisPolicyKernel {
     state_mutex: Arc<tokio::sync::Mutex<()>>,
     leases: Arc<RwLock<Vec<LeaseGrant>>>,
     escalations: Arc<RwLock<Vec<PendingEscalation>>>,
+    /// Unforgeable in-memory lease registry for `host_exec`. Never persisted or hydrated from
+    /// `policy_state.json`, preventing an unsandboxed same-UID child from forging disk leases.
+    in_memory_host_exec_leases:
+        Arc<RwLock<std::collections::HashMap<String, (String, String, String)>>>,
     forbidden_host_prefixes: Vec<String>,
     cedar_policies: CedarPolicySet,
 }
@@ -261,6 +265,7 @@ impl AegisPolicyKernel {
             state_mutex: Arc::new(tokio::sync::Mutex::new(())),
             leases: Arc::new(RwLock::new(initial_leases)),
             escalations: Arc::new(RwLock::new(initial_escalations)),
+            in_memory_host_exec_leases: Arc::new(RwLock::new(std::collections::HashMap::new())),
             forbidden_host_prefixes: vec![
                 "~/.ssh".to_string(),
                 "~/.aws".to_string(),
@@ -528,6 +533,9 @@ impl AegisPolicyKernel {
     }
 
     async fn check_active_lease(&self, ctx: &PolicyContext) -> Option<LeaseGrant> {
+        if ctx.action == "host_exec" {
+            return None;
+        }
         let _guard = self.state_mutex.lock().await;
         let _file_lock = self.acquire_state_lock().await.ok().flatten();
         self.reload_from_disk().await;
@@ -585,6 +593,103 @@ impl AegisPolicyKernel {
             }
         }
         matched_lease
+    }
+
+    async fn check_verified_host_exec_lease(
+        &self,
+        ctx: &PolicyContext,
+        ev_hash: &str,
+    ) -> Option<LeaseGrant> {
+        let _guard = self.state_mutex.lock().await;
+        let _file_lock = self.acquire_state_lock().await.ok().flatten();
+        self.reload_from_disk().await;
+        let now_ms = Utc::now().timestamp_millis();
+        let ctx_task_id = ctx
+            .metadata
+            .get("task_id")
+            .and_then(|value| value.as_str());
+        let expected_resource_pattern = format!("{}#sha256:{}", ctx.target_resource, ev_hash);
+        let in_mem = self.in_memory_host_exec_leases.read().await;
+        let mut matched_idx = None;
+        let mut matched_lease = None;
+        {
+            let leases = self.leases.read().await;
+            for (idx, lease) in leases.iter().enumerate() {
+                let kind = if lease.kind == LeaseKind::Ttl && lease.expires_at_ms == -1 {
+                    LeaseKind::OneShot
+                } else {
+                    lease.kind
+                };
+                let valid = match kind {
+                    LeaseKind::OneShot => true,
+                    LeaseKind::Ttl | LeaseKind::TaskScoped => lease.expires_at_ms > now_ms,
+                };
+                let task_ok = match kind {
+                    LeaseKind::TaskScoped => {
+                        ctx_task_id.is_some() && lease.task_id.as_deref() == ctx_task_id
+                    }
+                    LeaseKind::Ttl | LeaseKind::OneShot => true,
+                };
+                let mem_verified = in_mem.get(&lease.lease_id).is_some_and(|(o, a, r)| {
+                    o == &lease.org_id && a == &lease.agent_id && r == &lease.resource_pattern
+                });
+                if valid
+                    && task_ok
+                    && mem_verified
+                    && lease.org_id == ctx.principal.org_id
+                    && lease.agent_id == ctx.principal.agent_id
+                    && lease.action_pattern == "host_exec"
+                    && lease.resource_pattern == expected_resource_pattern
+                {
+                    matched_idx = Some(idx);
+                    matched_lease = Some(lease.clone());
+                    break;
+                }
+            }
+        }
+        drop(in_mem);
+        if let (Some(idx), Some(ref l)) = (matched_idx, &matched_lease) {
+            let kind = if l.kind == LeaseKind::Ttl && l.expires_at_ms == -1 {
+                LeaseKind::OneShot
+            } else {
+                l.kind
+            };
+            if kind == LeaseKind::OneShot {
+                self.leases.write().await.remove(idx);
+                self.in_memory_host_exec_leases
+                    .write()
+                    .await
+                    .remove(&l.lease_id);
+                let _ = self.flush_to_disk_unlocked().await;
+            }
+        }
+        matched_lease
+    }
+
+    fn is_loopback_or_link_local_target(target: &str) -> bool {
+        let trimmed = target.trim().to_ascii_lowercase();
+        let host = if trimmed.starts_with('[') {
+            trimmed
+                .trim_start_matches('[')
+                .split(']')
+                .next()
+                .unwrap_or("")
+        } else if trimmed.matches(':').count() == 1 {
+            trimmed.split(':').next().unwrap_or("")
+        } else {
+            trimmed.as_str()
+        };
+        let host = host.trim_end_matches('.');
+        host == "localhost"
+            || host == "127.0.0.1"
+            || host == "::1"
+            || host == "::"
+            || host == "0.0.0.0"
+            || host == "169.254.169.254"
+            || host.starts_with("127.")
+            || host.starts_with("169.254.")
+            || host.contains("::ffff:127.")
+            || host.ends_with(".localhost")
     }
 
     async fn record_escalation(
@@ -718,7 +823,18 @@ impl PolicyEngine for AegisPolicyKernel {
             });
         }
 
-        // 2. Hard Red-Line Sensitive Host Resource Check:
+        // 2. Hard Red-Line Sensitive Host Resource Check & Loopback SSRF Gate:
+        if ctx.action == "egress_unlisted_domain"
+            && Self::is_loopback_or_link_local_target(&ctx.target_resource)
+        {
+            return Ok(PolicyDecision::Deny {
+                reason: format!(
+                    "Outbound egress escalation to loopback or link-local address '{}' is strictly forbidden by Aegis OS SSRF policy",
+                    ctx.target_resource
+                ),
+            });
+        }
+
         let redline_target = Self::strip_nested_test_tmpdir(&ctx.target_resource);
         for forbidden in &self.forbidden_host_prefixes {
             if redline_target.starts_with(forbidden)
@@ -1008,6 +1124,60 @@ impl PolicyEngine for AegisPolicyKernel {
                     format!(
                         "action=pkg_install_scripts, resource={}",
                         ctx.target_resource
+                    ),
+                )
+                .await;
+        }
+
+        // 2e. Hard Guard for `host_exec` (Unsandboxed Host Sibling Execution):
+        // Runs before generic leases and Cedar `permit` rules. Rejects wildcard leases, rejects
+        // unverified on-disk leases, requires Enforced SessionBroker mode, and pins every lease
+        // (even TTL) to the frozen bundle `evidence_hash`.
+        if ctx.action == "host_exec" {
+            if ctx
+                .metadata
+                .get("enforced_session_broker")
+                .and_then(|v| v.as_bool())
+                != Some(true)
+            {
+                return Ok(PolicyDecision::Deny {
+                    reason: "host_exec is restricted to enforced SessionBroker sessions"
+                        .to_string(),
+                });
+            }
+            let Some(ev_hash) = ctx
+                .metadata
+                .get("evidence_hash")
+                .and_then(|v| v.as_str())
+                .filter(|h| h.len() == 64 && h.bytes().all(|b| b.is_ascii_hexdigit()))
+            else {
+                return Ok(PolicyDecision::Deny {
+                    reason: "host_exec requires a 64-char SHA-256 frozen bundle evidence_hash"
+                        .to_string(),
+                });
+            };
+            if let Some(lease) = self.check_verified_host_exec_lease(ctx, ev_hash).await {
+                return Ok(PolicyDecision::Allow {
+                    matched_rule: format!("session_lease:{}", lease.lease_id),
+                });
+            }
+            let summary = ctx
+                .metadata
+                .get("command_summary")
+                .and_then(|v| v.as_str())
+                .unwrap_or(&ctx.target_resource);
+            return self
+                .record_escalation(
+                    ctx,
+                    format!(
+                        "[HIGH RISK: UNSANDBOXED HOST EXEC] Agent '{}' requests unsandboxed host execution '{}' (frozen bundle sha256: {}...)",
+                        ctx.principal.agent_id,
+                        summary,
+                        &ev_hash[..12]
+                    ),
+                    format!(
+                        "action=host_exec, resource={}#sha256:{}",
+                        ctx.target_resource, ev_hash
                     ),
                 )
                 .await;
@@ -1566,6 +1736,11 @@ impl PolicyEngine for AegisPolicyKernel {
     }
 
     async fn grant_lease(&self, lease: LeaseGrant) -> anyhow::Result<LeaseGrant> {
+        if lease.action_pattern == "host_exec" || lease.action_pattern.starts_with("host_exec") {
+            anyhow::bail!(
+                "Direct grant_lease for 'host_exec' is forbidden; approve a SHA-256 pinned escalation instead"
+            );
+        }
         let _guard = self.state_mutex.lock().await;
         let _file_lock = self.acquire_state_lock().await?;
         self.reload_from_disk().await;
@@ -1665,6 +1840,7 @@ impl PolicyEngine for AegisPolicyKernel {
                 | "github_issue_inspect"
                 | "pkg_install"
                 | "pkg_install_scripts"
+                | "host_exec"
                 | "egress_unlisted_domain"
                 | "mcp_mount_server"
                 | "org_artifact_fetch"
@@ -1675,7 +1851,14 @@ impl PolicyEngine for AegisPolicyKernel {
         } else {
             "*".to_string()
         };
-        let resource_pattern = if is_oneshot {
+        let resource_pattern = if target.action == "host_exec" {
+            let ev_hash = target
+                .evidence_hash
+                .as_deref()
+                .filter(|h| h.len() == 64 && h.bytes().all(|b| b.is_ascii_hexdigit()))
+                .context("host_exec escalation missing 64-char SHA-256 evidence_hash")?;
+            format!("{}#sha256:{}", base_resource_pattern, ev_hash)
+        } else if is_oneshot {
             if let Some(ref ev_hash) = target.evidence_hash {
                 if base_resource_pattern == "*" {
                     format!("sha256:{}", ev_hash)
@@ -1810,6 +1993,16 @@ impl PolicyEngine for AegisPolicyKernel {
                 leases.push(lease.clone());
             }
         }
+        if target.action == "host_exec" {
+            self.in_memory_host_exec_leases.write().await.insert(
+                primary_lease.lease_id.clone(),
+                (
+                    primary_lease.org_id.clone(),
+                    primary_lease.agent_id.clone(),
+                    primary_lease.resource_pattern.clone(),
+                ),
+            );
+        }
         self.flush_to_disk_unlocked().await?;
         Ok(primary_lease)
     }
@@ -1818,12 +2011,23 @@ impl PolicyEngine for AegisPolicyKernel {
         let _guard = self.state_mutex.lock().await;
         let _file_lock = self.acquire_state_lock().await?;
         self.reload_from_disk().await;
-        let removed = {
+        let (removed_ids, removed) = {
             let mut leases = self.leases.write().await;
             let before = leases.len();
+            let removed_ids: Vec<String> = leases
+                .iter()
+                .filter(|lease| lease.task_id.as_deref() == Some(task_id))
+                .map(|lease| lease.lease_id.clone())
+                .collect();
             leases.retain(|lease| lease.task_id.as_deref() != Some(task_id));
-            before - leases.len()
+            (removed_ids, before - leases.len())
         };
+        if !removed_ids.is_empty() {
+            let mut in_mem = self.in_memory_host_exec_leases.write().await;
+            for id in &removed_ids {
+                in_mem.remove(id);
+            }
+        }
         if removed > 0 {
             self.flush_to_disk_unlocked().await?;
         }
@@ -1834,6 +2038,10 @@ impl PolicyEngine for AegisPolicyKernel {
         let _guard = self.state_mutex.lock().await;
         let _file_lock = self.acquire_state_lock().await?;
         self.reload_from_disk().await;
+        self.in_memory_host_exec_leases
+            .write()
+            .await
+            .remove(lease_id);
         let removed = {
             let mut leases = self.leases.write().await;
             let before = leases.len();
@@ -2966,6 +3174,155 @@ mod tests {
         };
         assert!(matches!(kernel.evaluate(&tampered_m).await.unwrap(), PolicyDecision::Ask { .. }));
         assert!(matches!(kernel.evaluate(&merge_ctx).await.unwrap(), PolicyDecision::Allow { .. }));
+    }
+
+    #[tokio::test]
+    async fn test_host_exec_hard_guards_in_memory_leases_ttl_pinning_and_loopback_ssrf() {
+        let tmp_dir = std::env::temp_dir().join(format!("aos-policy-test-{}", Uuid::new_v4()));
+        std::fs::create_dir_all(&tmp_dir).unwrap();
+        let state_path = tmp_dir.join("policy_state.json");
+        let mut kernel = AegisPolicyKernel::with_state_file(Some(state_path.clone()));
+        let agent = AgentIdentity::new("aegis-os", "agy-agent", "Coder");
+
+        // 1. Loopback & link-local SSRF targets are hard-denied on `egress_unlisted_domain`.
+        for target in [
+            "127.0.0.1:8080",
+            "localhost",
+            "sub.localhost:9000",
+            "[::1]:8443",
+            "169.254.169.254",
+            "0.0.0.0",
+        ] {
+            let ssrf_ctx = PolicyContext {
+                principal: agent.clone(),
+                action: "egress_unlisted_domain".to_string(),
+                target_org_id: "aegis-os".to_string(),
+                target_resource: target.to_string(),
+                metadata: serde_json::json!({}),
+            };
+            assert!(
+                matches!(kernel.evaluate(&ssrf_ctx).await.unwrap(), PolicyDecision::Deny { .. }),
+                "loopback/metadata target '{target}' must be denied"
+            );
+        }
+
+        // 2. Wildcard leases and broad Cedar `permit` rules must NEVER authorize `host_exec`.
+        kernel.add_cedar_policies("permit(principal, action, resource);");
+        kernel
+            .grant_lease(LeaseGrant {
+                lease_id: "lease-wild".to_string(),
+                org_id: "aegis-os".to_string(),
+                agent_id: "*".to_string(),
+                action_pattern: "*".to_string(),
+                resource_pattern: "*".to_string(),
+                expires_at_ms: Utc::now().timestamp_millis() + 3_600_000,
+                granted_by: "test".to_string(),
+                kind: LeaseKind::Ttl,
+                task_id: None,
+            })
+            .await
+            .unwrap();
+        assert!(
+            kernel
+                .grant_lease(LeaseGrant {
+                    lease_id: "lease-direct".to_string(),
+                    org_id: "aegis-os".to_string(),
+                    agent_id: "agy-agent".to_string(),
+                    action_pattern: "host_exec".to_string(),
+                    resource_pattern: "*".to_string(),
+                    expires_at_ms: Utc::now().timestamp_millis() + 3_600_000,
+                    granted_by: "test".to_string(),
+                    kind: LeaseKind::Ttl,
+                    task_id: None,
+                })
+                .await
+                .is_err(),
+            "direct grant_lease for host_exec must fail"
+        );
+
+        let hash_v1 = "a".repeat(64);
+        let hash_v2 = format!("{}b", "a".repeat(63));
+        // Missing enforced_session_broker -> Deny
+        let non_broker = PolicyContext {
+            principal: agent.clone(),
+            action: "host_exec".to_string(),
+            target_org_id: "aegis-os".to_string(),
+            target_resource: "host_exec:/usr/bin/python3:scripts/bench.py".to_string(),
+            metadata: serde_json::json!({ "evidence_hash": hash_v1 }),
+        };
+        assert!(matches!(
+            kernel.evaluate(&non_broker).await.unwrap(),
+            PolicyDecision::Deny { .. }
+        ));
+
+        let ctx_v1 = PolicyContext {
+            principal: agent.clone(),
+            action: "host_exec".to_string(),
+            target_org_id: "aegis-os".to_string(),
+            target_resource: "host_exec:/usr/bin/python3:scripts/bench.py".to_string(),
+            metadata: serde_json::json!({
+                "enforced_session_broker": true,
+                "evidence_hash": hash_v1,
+                "command_summary": "python3 scripts/bench.py"
+            }),
+        };
+        let esc_id = match kernel.evaluate(&ctx_v1).await.unwrap() {
+            PolicyDecision::Ask { escalation_id, reason, .. } => {
+                assert!(reason.contains("UNSANDBOXED HOST EXEC"), "{reason}");
+                escalation_id
+            }
+            other => panic!("wildcard/Cedar must not bypass host_exec Ask, got {other:?}"),
+        };
+
+        // 3. Forging a `host_exec` lease directly into `policy_state.json` on disk must be ignored
+        // because `in_memory_host_exec_leases` does not contain it.
+        let disk_raw = std::fs::read(&state_path).unwrap();
+        let mut parsed: serde_json::Value = serde_json::from_slice(&disk_raw).unwrap();
+        parsed["leases"].as_array_mut().unwrap().push(serde_json::json!({
+            "lease_id": "lease-forged",
+            "org_id": "aegis-os",
+            "agent_id": "agy-agent",
+            "action_pattern": "host_exec",
+            "resource_pattern": format!("host_exec:/usr/bin/python3:scripts/bench.py#sha256:{}", hash_v1),
+            "expires_at_ms": Utc::now().timestamp_millis() + 3_600_000,
+            "granted_by": "rogue-child",
+            "kind": "ttl"
+        }));
+        std::fs::write(&state_path, serde_json::to_vec_pretty(&parsed).unwrap()).unwrap();
+        assert!(
+            matches!(kernel.evaluate(&ctx_v1).await.unwrap(), PolicyDecision::Ask { .. }),
+            "disk-forged host_exec lease must be rejected by in-memory gate"
+        );
+
+        // 4. Approving `host_exec` with TTL=3600s STILL pins `#sha256:<hash>`!
+        let ttl_lease = kernel.approve_escalation(&esc_id, 3600, "human").await.unwrap();
+        assert!(
+            ttl_lease.resource_pattern.ends_with(&format!("#sha256:{}", hash_v1)),
+            "TTL host_exec lease must stay SHA-256 pinned: {}",
+            ttl_lease.resource_pattern
+        );
+        // Same frozen bundle hash can re-run repeatedly within TTL...
+        assert!(matches!(
+            kernel.evaluate(&ctx_v1).await.unwrap(),
+            PolicyDecision::Allow { .. }
+        ));
+        assert!(matches!(
+            kernel.evaluate(&ctx_v1).await.unwrap(),
+            PolicyDecision::Allow { .. }
+        ));
+        // ...and a 1-hex-char drift in evidence_hash immediately forces re-escalation!
+        let ctx_v2 = PolicyContext {
+            metadata: serde_json::json!({
+                "enforced_session_broker": true,
+                "evidence_hash": hash_v2
+            }),
+            ..ctx_v1.clone()
+        };
+        assert!(
+            matches!(kernel.evaluate(&ctx_v2).await.unwrap(), PolicyDecision::Ask { .. }),
+            "1-bit hash drift must invalidate TTL host_exec lease"
+        );
+        let _ = std::fs::remove_dir_all(&tmp_dir);
     }
 }
 

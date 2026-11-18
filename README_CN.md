@@ -102,7 +102,7 @@ aegis-os uninstall           # 或彻底清理: aegis-os uninstall --workspace-c
 ## 核心能力
 
 - **事务型 CoW VFS 与 `OrgVault` 加密卷** — 0.42ms 元数据派生；1,000 文件工作区 6.28ms / 15.6ms；四级 LCS 自动归并与领域预检门；按组织隔离的 `AES-256` 加密持久化（`KEK -> DEK` 信封加密）、`fsync` 崩溃一致性与孤儿影子接管恢复。
-- **内核沙箱、受控回环与依赖治理** — Linux `bwrap` 与 macOS Seatbelt enforced launcher；默认 `$HOME` 读收紧配合 SHA-256 锚定的 `fs_import_file`/`fs_export_file`；会话级 `127.0.0.1` 回环端口白名单与 Linux 命名空间预览转发桥（`$AOS_DEV_PORT`）；`pkg_install`（`npm`/`pnpm`/`yarn`/`bun`/`pip`/`uv`/`cargo`/`go`）自动 CoW 解链与生命周期脚本门控；模型 API L7 反向代理 + 统一 `aos-egress` DLP 引擎。
+- **内核沙箱、受控回环与依赖治理** — Linux `bwrap` 与 macOS Seatbelt enforced launcher；默认 `$HOME` 读收紧配合 SHA-256 锚定的 `fs_import_file`/`fs_export_file`；会话级 `127.0.0.1` 回环端口白名单与 Linux 命名空间预览转发桥（`$AOS_DEV_PORT`）；`pkg_install`（`npm`/`pnpm`/`yarn`/`bun`/`pip`/`uv`/`cargo`/`go`）自动 CoW 解链与生命周期脚本门控；`host_exec`（仅限 enforced `SessionBroker` 的宿主平级受审执行，支持只读包冻结与 SHA-256 钉选、`DaemonAuth::Required` `#key=` 防自批、运行期控制面 `423` 互锁、令牌轮换、`env_clear()` 清洗、进程组回收与 DLP 脱敏产物回流）；模型 API L7 反向代理 + 统一 `aos-egress` DLP 引擎。
 - **宿主代理 Git / GitHub 全闭环** — `workspace_git_inspect`、事务型 `workspace_git`（支持 `auto_commit_shadow`、投毒/强推守卫）以及 `github_ci_inspect`、`github_ci_rerun`、`github_pr_inspect`、`github_pr_create`、`github_comment_create`、`github_pr_merge`、`github_issue_inspect`（同仓库只读免弹窗、跨仓库/写操作严格审批及结构化 Web 高危审批卡）。
 - **A2A IPC 与 CAS** — 同伴发现、层级任务、任务绑定文件锁、`artifact://sha256` 内容寻址接力。
 - **Cedar 策略、租约与审计** — 效果级审批、TTL / 单次租约、`evidence_hash` 锁定、哈希链审计账本，以及 `Aegis-OS-Verified` Commit/PR 审计凭证。

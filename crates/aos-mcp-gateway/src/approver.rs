@@ -732,6 +732,7 @@ pub const APPROVE_PAGE_HTML: &str = r##"<!doctype html>
       fs_export_file: 'Approve Host File Export',
       pkg_install: 'Approve Sandbox Package Install',
       pkg_install_scripts: 'HIGH RISK: Approve Package Install With Lifecycle Scripts',
+      host_exec: '[HIGH RISK] Host Sibling Execution (host_exec — Unsandboxed, SHA-256 Frozen)',
       github_pr_create: 'Approve GitHub Pull Request Creation',
       github_pr_merge: 'DESTRUCTIVE: Approve GitHub Pull Request Merge',
       github_comment_create: 'Approve GitHub Issue / PR Comment',
@@ -750,6 +751,7 @@ pub const APPROVE_PAGE_HTML: &str = r##"<!doctype html>
       'workspace_commit_sensitive',
       'workspace_git_sensitive',
       'pkg_install_scripts',
+      'host_exec',
       'github_pr_merge'
     ].includes(esc.action) || !!ev.allow_scripts || !!ev.force_push || !!ev.force_tag;
 
@@ -762,6 +764,9 @@ pub const APPROVE_PAGE_HTML: &str = r##"<!doctype html>
       const warn = document.createElement('div');
       warn.className = 'risk-banner';
       const reasons = [];
+      if (esc.action === 'host_exec') {
+        reasons.push('Runs unsandboxed on the host as a sibling process (input bundle frozen & SHA-256 pinned; 15m/1h leases stay hash-locked)');
+      }
       if (esc.action === 'pkg_install_scripts' || ev.allow_scripts) {
         reasons.push('Lifecycle build/postinstall scripts execute arbitrary code');
       }
@@ -771,9 +776,9 @@ pub const APPROVE_PAGE_HTML: &str = r##"<!doctype html>
       if (ev.force_push) reasons.push('Includes destructive git force push');
       if (ev.force_tag) reasons.push('Includes force tag overwrite');
       if (esc.action === 'github_pr_merge') reasons.push('Destructive PR merge on remote repository');
-      warn.textContent = 'HIGH RISK · ONE-SHOT APPROVAL ONLY: ' +
+      warn.textContent = (esc.action === 'host_exec' ? 'HIGH RISK · HASH-LOCKED HOST EXEC: ' : 'HIGH RISK · ONE-SHOT APPROVAL ONLY: ') +
         (reasons.length ? reasons.join('; ') : 'Elevated security boundary review required') +
-        '. Time-window leases (15m / 1h) are disabled.';
+        (esc.action === 'host_exec' ? '.' : '. Time-window leases (15m / 1h) are disabled.');
       card.appendChild(warn);
     }
 
@@ -832,6 +837,21 @@ pub const APPROVE_PAGE_HTML: &str = r##"<!doctype html>
     if (ev.host_root) {
       fields.push(['Host Repo', ev.host_root]);
     }
+    if (ev.program) {
+      fields.push(['Host Program', ev.program]);
+    }
+    if (ev.script) {
+      fields.push(['Frozen Script', ev.script]);
+    }
+    if (Array.isArray(ev.args) && ev.args.length > 0) {
+      fields.push(['Arguments', ev.args.join(' ')]);
+    }
+    if (Array.isArray(ev.output_files) && ev.output_files.length > 0) {
+      fields.push(['Harvest Outputs', ev.output_files.join(', ')]);
+    }
+    if (Array.isArray(ev.pass_env_keys) && ev.pass_env_keys.length > 0) {
+      fields.push(['Pass Env Keys', ev.pass_env_keys.join(', ')]);
+    }
     for (const [k, v] of fields) {
       const dt = document.createElement('dt'); dt.textContent = k;
       const dd = document.createElement('dd'); dd.textContent = v;
@@ -857,7 +877,7 @@ pub const APPROVE_PAGE_HTML: &str = r##"<!doctype html>
     btnOnce.onclick = () => decide(esc.escalation_id, 'approve', 0);
     row.appendChild(btnOnce);
 
-    if (!isHighRisk) {
+    if (!isHighRisk || esc.action === 'host_exec') {
       const btn15m = document.createElement('button');
       btn15m.className = 'secondary';
       btn15m.textContent = 'Approve 15m';

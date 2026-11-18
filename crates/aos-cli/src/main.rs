@@ -3358,10 +3358,21 @@ async fn main() -> anyhow::Result<()> {
                                 .ok_or_else(|| anyhow::anyhow!("No pending escalations found"))?
                         }
                     };
-                    let lease = kernel
-                        .policy
-                        .approve_escalation(&resolved_id, ttl_secs, "cli_human_operator")
-                        .await?;
+                    let lease = if let Some(broker_lease) =
+                        session_broker::try_approve_via_live_session_broker(
+                            &cli.runtime_dir,
+                            &resolved_id,
+                            ttl_secs,
+                        )
+                        .await?
+                    {
+                        broker_lease
+                    } else {
+                        kernel
+                            .policy
+                            .approve_escalation(&resolved_id, ttl_secs, "cli_human_operator")
+                            .await?
+                    };
                     let _ = kernel
                         .recorder
                         .record(aos_core::AuditEvent {

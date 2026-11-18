@@ -45,7 +45,7 @@ struct BrokerState {
     session_dir: PathBuf,
     identity: AgentIdentity,
     agent_token: String,
-    human_token: String,
+    human_token: Arc<std::sync::RwLock<String>>,
     kernel: Arc<AegisRuntimeKernel>,
     effects_path: PathBuf,
     hello: RwLock<Option<Value>>,
@@ -60,6 +60,7 @@ pub struct SessionBroker {
     pub agent_token: String,
     #[cfg_attr(not(target_os = "macos"), allow(dead_code))]
     pub tcp_addr: Option<std::net::SocketAddr>,
+    endpoint_file: PathBuf,
     temp_control_dir: Option<PathBuf>,
     task: Option<JoinHandle<()>>,
     tcp_task: Option<JoinHandle<()>>,
@@ -85,10 +86,89 @@ impl Drop for SessionBroker {
             task.abort();
         }
         let _ = std::fs::remove_file(&self.socket_path);
+        let _ = std::fs::remove_file(&self.endpoint_file);
         if let Some(ref dir) = self.temp_control_dir {
             let _ = std::fs::remove_dir_all(dir);
         }
     }
+}
+
+fn clean_host_path_for_broker() -> String {
+    let raw = std::env::var("PATH").unwrap_or_default();
+    let filtered: Vec<&str> = raw
+        .split(':')
+        .filter(|seg| {
+            !seg.is_empty()
+                && !seg.contains(".aegis-bin")
+                && !seg.contains("/.aegis/bin")
+                && !seg.ends_with(".aegis/bin")
+                && !seg.contains("/.aegis/")
+        })
+        .collect();
+    if filtered.is_empty() {
+        "/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin".to_string()
+    } else {
+        filtered.join(":")
+    }
+}
+
+/// Discovers an active `SessionBroker` inside `runtime_dir/sessions/ses_*` owning `escalation_id`
+/// and approves it over the broker's authenticated human endpoint so in-memory `host_exec` leases
+/// are registered directly inside the live kernel.
+pub async fn try_approve_via_live_session_broker(
+    runtime_dir: &Path,
+    escalation_id: &str,
+    ttl_secs: i64,
+) -> Result<Option<LeaseGrant>> {
+    let sessions_dir = runtime_dir.join("sessions");
+    let Ok(rd) = std::fs::read_dir(&sessions_dir) else {
+        return Ok(None);
+    };
+    for entry in rd.flatten() {
+        let sdir = entry.path();
+        let ep_path = sdir.join("broker.endpoint");
+        let tok_path = sdir.join("human.token");
+        let Ok(endpoint) = std::fs::read_to_string(&ep_path) else {
+            continue;
+        };
+        let Ok(human_tok) = std::fs::read_to_string(&tok_path) else {
+            continue;
+        };
+        let endpoint = endpoint.trim();
+        let human_tok = human_tok.trim();
+        if endpoint.is_empty() || human_tok.is_empty() {
+            continue;
+        }
+        let Ok(esc_resp) =
+            control_request_at(endpoint, human_tok, "GET", "/v1/escalations", None).await
+        else {
+            continue;
+        };
+        let has_pending = esc_resp
+            .get("escalations")
+            .and_then(|v| v.as_array())
+            .is_some_and(|arr| {
+                arr.iter().any(|e| {
+                    e.get("escalation_id").and_then(|v| v.as_str()) == Some(escalation_id)
+                        && e.get("status").and_then(|v| v.as_str()) == Some("pending")
+                })
+            });
+        if !has_pending {
+            continue;
+        }
+        let decide_resp = control_request_at(
+            endpoint,
+            human_tok,
+            "POST",
+            &format!("/v1/escalations/{escalation_id}/decide"),
+            Some(&json!({ "approve": true, "ttl_secs": ttl_secs })),
+        )
+        .await?;
+        let lease: LeaseGrant = serde_json::from_value(decide_resp["lease"].clone())
+            .context("malformed lease response from session broker")?;
+        return Ok(Some(lease));
+    }
+    Ok(None)
 }
 
 impl SessionBroker {
@@ -206,13 +286,42 @@ impl SessionBroker {
 
         let startup_bin_mtime =
             crate::cloud::current_installed_aegis_max_mtime(hot_reload_home_override.as_deref());
+        let human_token_lock = Arc::new(std::sync::RwLock::new(human_token));
+        let human_token_rot = human_token_lock.clone();
+        let human_token_path = session_dir.join("human.token");
+        let host_home = std::env::var_os("HOME")
+            .map(PathBuf::from)
+            .filter(|h| !h.starts_with(runtime_dir))
+            .unwrap_or_else(|| PathBuf::from("/tmp"));
+        kernel
+            .set_host_exec_config(aos_mcp_gateway::HostExecBrokerConfig {
+                session_dir: session_dir.to_path_buf(),
+                host_home,
+                clean_host_path: clean_host_path_for_broker(),
+                host_workspace_root: PathBuf::from(&session.workspace),
+                on_run_finished: Some(Arc::new(move || {
+                    let fresh = aos_sandbox::bridge::new_secret_token().unwrap_or_else(|_| {
+                        format!(
+                            "{}{}",
+                            aos_sandbox::bridge::new_token(),
+                            aos_sandbox::bridge::new_token()
+                        )
+                    });
+                    if let Ok(mut w) = human_token_rot.write() {
+                        *w = fresh.clone();
+                    }
+                    let _ = write_token(&human_token_path, &fresh);
+                })),
+            })
+            .await;
+
         let state = Arc::new(BrokerState {
             runtime_dir: runtime_dir.to_path_buf(),
             session,
             session_dir: session_dir.to_path_buf(),
             identity,
             agent_token: agent_token.clone(),
-            human_token: human_token.clone(),
+            human_token: human_token_lock,
             kernel,
             effects_path: session_dir.join("effects.jsonl"),
             hello: RwLock::new(None),
@@ -260,11 +369,18 @@ impl SessionBroker {
             (Some(task), None, None)
         };
 
+        let endpoint_file = session_dir.join("broker.endpoint");
+        let endpoint_str = tcp_addr
+            .map(|addr| format!("tcp://{addr}"))
+            .unwrap_or_else(|| socket_path.display().to_string());
+        write_token(&endpoint_file, &endpoint_str)?;
+
         Ok(Self {
             control_dir,
             socket_path,
             agent_token,
             tcp_addr,
+            endpoint_file,
             temp_control_dir,
             task,
             tcp_task,
@@ -464,10 +580,26 @@ where
     if agent_route && !token_eq(&presented, &state.agent_token) {
         return write_json(&mut stream, "401 Unauthorized", json!({"error": "invalid agent token"})).await;
     }
-    let human_auth_ok = token_eq(&presented, &state.human_token)
+    let current_human_token = state
+        .human_token
+        .read()
+        .map(|g| g.clone())
+        .unwrap_or_default();
+    let human_auth_ok = token_eq(&presented, &current_human_token)
         || (aos_core::ablated("dual_token") && token_eq(&presented, &state.agent_token));
     if human_route && !human_auth_ok {
         return write_json(&mut stream, "401 Unauthorized", json!({"error": "invalid human token"})).await;
+    }
+    if human_route
+        && matches!(method, "POST" | "DELETE")
+        && state.kernel.active_host_exec_runs() > 0
+    {
+        return write_json(
+            &mut stream,
+            "423 Locked",
+            json!({"error": "Session control plane is locked while host_exec is running"}),
+        )
+        .await;
     }
 
     match (method, path_only) {
@@ -605,6 +737,14 @@ where
                 .and_then(|v| v.as_str())
                 .unwrap_or("workspace_commit")
                 .to_string();
+            if action == "*" || action == "host_exec" || action.starts_with("host_exec") {
+                return write_json(
+                    &mut stream,
+                    "403 Forbidden",
+                    json!({"error": "Direct lease grant for 'host_exec' or '*' is forbidden; approve a SHA-256 pinned escalation"}),
+                )
+                .await;
+            }
             let resource = payload
                 .get("resource")
                 .and_then(|v| v.as_str())
@@ -1495,5 +1635,170 @@ esac
                 .contains("hot_reload"),
             "{call_resp}"
         );
+    }
+
+    #[tokio::test]
+    async fn test_session_broker_host_exec_approval_interlock_and_human_token_rotation() {
+        let tmp = tempfile::tempdir().unwrap();
+        let runtime_dir = tmp.path().join("runtime");
+        let session_dir = runtime_dir.join("sessions/ses_host_exec_test");
+        let workspace = tmp.path().join("workspace");
+        let shadow = tmp.path().join("shadow");
+        let agent_home = tmp.path().join("agent_home");
+        std::fs::create_dir_all(workspace.join("scripts")).unwrap();
+        std::fs::create_dir_all(&shadow).unwrap();
+        std::fs::create_dir_all(&agent_home).unwrap();
+        std::fs::create_dir_all(&session_dir).unwrap();
+        std::fs::write(
+            workspace.join("scripts/probe.py"),
+            r#"import json, platform, subprocess, time
+from pathlib import Path
+time.sleep(0.35)
+Path("reports").mkdir(exist_ok=True)
+nested_sbx = None
+if platform.system() == "Darwin":
+    # Verify host_exec sibling runs without outer Seatbelt nesting when invoked from unsandboxed broker.
+    import os
+    if not os.environ.get("AOS_SANDBOX_PROFILE"):
+        p = subprocess.run(["/usr/bin/sandbox-exec", "-p", "(version 1)(allow default)", "/usr/bin/true"])
+        nested_sbx = p.returncode
+Path("reports/broker_out.json").write_text(json.dumps({"ok": True, "nested_sbx": nested_sbx}))
+print("BROKER_PROBE_DONE")
+"#,
+        )
+        .unwrap();
+
+        let broker = SessionBroker::start(
+            &runtime_dir,
+            &session_dir,
+            tmp.path().join("c_host_exec"),
+            BrokerSession {
+                session_id: "ses_host_exec_test".to_string(),
+                mode: "implement".to_string(),
+                enforcement: "enforced".to_string(),
+                workspace: workspace.display().to_string(),
+                shadow: shadow.display().to_string(),
+                agent_home: agent_home.display().to_string(),
+            },
+            AgentIdentity::new("org", "agent", "test"),
+            None,
+            false,
+        )
+        .await
+        .unwrap();
+
+        assert!(session_dir.join("broker.endpoint").is_file());
+        let pre_human_token = std::fs::read_to_string(session_dir.join("human.token")).unwrap();
+        let ep = broker.socket_path.to_str().unwrap().to_string();
+
+        // Direct /v1/leases for `host_exec` or `*` must be rejected with 403 Forbidden.
+        let direct_err = control_request_at(
+            &ep,
+            &pre_human_token,
+            "POST",
+            "/v1/leases",
+            Some(&json!({ "action": "host_exec", "resource": "*", "ttl_secs": 3600 })),
+        )
+        .await
+        .unwrap_err()
+        .to_string();
+        assert!(direct_err.contains("403"), "{direct_err}");
+
+        // 1. Trigger `host_exec` via `/v1/mcp` -> returns approval_required (without `#key=` in JSON).
+        let ask_rpc = broker_request(
+            &broker.socket_path,
+            &broker.agent_token,
+            "POST",
+            "/v1/mcp",
+            &json!({
+                "jsonrpc": "2.0",
+                "id": 100,
+                "method": "tools/call",
+                "params": {
+                    "name": "host_exec",
+                    "arguments": {
+                        "program": "python3",
+                        "script": "scripts/probe.py",
+                        "output_files": ["reports/broker_out.json"]
+                    }
+                }
+            }),
+        )
+        .await;
+        let ask_txt = ask_rpc["result"]["content"][0]["text"].as_str().unwrap();
+        assert!(!ask_txt.contains("#key="), "MCP response must never leak UI token: {ask_txt}");
+        let ask_inner: Value = serde_json::from_str(ask_txt).unwrap();
+        assert_eq!(ask_inner["status"], "approval_required", "{ask_inner}");
+        let esc_id = ask_inner["escalation_id"].as_str().unwrap().to_string();
+
+        // 2. Approve via CLI helper `try_approve_via_live_session_broker`.
+        let lease = try_approve_via_live_session_broker(&runtime_dir, &esc_id, 0)
+            .await
+            .unwrap()
+            .expect("broker must approve pending escalation");
+        assert!(lease.resource_pattern.contains("#sha256:"), "{lease:?}");
+
+        // 3. Run `host_exec` concurrently while probing POST /v1/leases -> MUST return 423 Locked!
+        let ep_clone = ep.clone();
+        let tok_clone = pre_human_token.clone();
+        let interlock_task = tokio::spawn(async move {
+            tokio::time::sleep(std::time::Duration::from_millis(120)).await;
+            control_request_at(
+                &ep_clone,
+                &tok_clone,
+                "POST",
+                "/v1/leases",
+                Some(&json!({ "action": "workspace_commit", "resource": "*", "ttl_secs": 60 })),
+            )
+            .await
+        });
+
+        let exec_rpc = broker_request(
+            &broker.socket_path,
+            &broker.agent_token,
+            "POST",
+            "/v1/mcp",
+            &json!({
+                "jsonrpc": "2.0",
+                "id": 101,
+                "method": "tools/call",
+                "params": {
+                    "name": "host_exec",
+                    "arguments": {
+                        "program": "python3",
+                        "script": "scripts/probe.py",
+                        "output_files": ["reports/broker_out.json"]
+                    }
+                }
+            }),
+        )
+        .await;
+        let exec_txt = exec_rpc["result"]["content"][0]["text"].as_str().unwrap();
+        let exec_inner: Value = serde_json::from_str(exec_txt).unwrap();
+        assert_eq!(exec_inner["status"], "completed", "{exec_inner}");
+        assert_eq!(exec_inner["exit_code"], 0, "{exec_inner}");
+        assert!(
+            exec_inner["stdout"].as_str().unwrap().contains("BROKER_PROBE_DONE"),
+            "{exec_inner}"
+        );
+
+        let lock_err = interlock_task.await.unwrap().unwrap_err().to_string();
+        assert!(lock_err.contains("423 Locked"), "expected 423 Locked during host_exec, got: {lock_err}");
+
+        // 4. Verify `human.token` rotated immediately upon `host_exec` completion!
+        let post_human_token = std::fs::read_to_string(session_dir.join("human.token")).unwrap();
+        assert_ne!(
+            pre_human_token, post_human_token,
+            "human.token must rotate after host_exec completes"
+        );
+        let stale_err = control_request_at(&ep, &pre_human_token, "GET", "/v1/audit", None)
+            .await
+            .unwrap_err()
+            .to_string();
+        assert!(stale_err.contains("401 Unauthorized"), "stale token must be rejected: {stale_err}");
+        let fresh_audit = control_request_at(&ep, &post_human_token, "GET", "/v1/audit", None)
+            .await
+            .unwrap();
+        assert!(fresh_audit.get("events").is_some(), "{fresh_audit}");
     }
 }

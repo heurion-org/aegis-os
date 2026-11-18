@@ -1639,6 +1639,19 @@ pub(crate) fn sync_credentials(agent_home: &Path, host_home: &Path, command: &[S
                 &cred_obj,
                 true,
             );
+            if let Some(ses_dir) = agent_home.parent() {
+                if let Some(sessions_dir) = ses_dir.parent() {
+                    if sessions_dir.file_name().and_then(|n| n.to_str()) == Some("sessions") {
+                        if let Some(runtime_dir) = sessions_dir.parent() {
+                            sync_runtime_claude_oauth_from_agent_home(
+                                runtime_dir,
+                                agent_home,
+                                command,
+                            );
+                        }
+                    }
+                }
+            }
         }
         if let Some((_, agent_obj)) = read_sandbox_json_object_with_limit_no_symlink(
             agent_home,
@@ -1927,6 +1940,106 @@ fn sorted_agy_session_dirs(runtime_dir: &Path) -> Vec<PathBuf> {
 
 fn agy_runtime_credentials_dir(runtime_dir: &Path) -> PathBuf {
     runtime_dir.join("credentials").join("agy")
+}
+
+fn claude_runtime_credentials_dir(runtime_dir: &Path) -> PathBuf {
+    runtime_dir.join("credentials").join("claude")
+}
+
+/// Seal active Claude OAuth credentials into `<runtime_dir>/credentials/claude/credentials.json`
+/// (`0700` dir, `0600` symlink-free file) so host Keychain sweeps or missing host `.credentials.json`
+/// cannot strand subsequent sandboxed Claude sessions.
+pub(crate) fn sync_runtime_claude_oauth_from_agent_home(
+    runtime_dir: &Path,
+    agent_home: &Path,
+    command: &[String],
+) {
+    if !is_claude_command(command) {
+        return;
+    }
+    if std::env::var_os("AOS_NO_CREDENTIAL_SYNC")
+        .and_then(|v| v.into_string().ok())
+        .is_some_and(|s| matches!(s.trim(), "1" | "true" | "TRUE" | "yes"))
+    {
+        return;
+    }
+    let creds_parent = runtime_dir.join("credentials");
+    if !ensure_0700_dir_no_symlink(&creds_parent) {
+        return;
+    }
+    let cache_dir = claude_runtime_credentials_dir(runtime_dir);
+    if !ensure_0700_dir_no_symlink(&cache_dir) {
+        return;
+    }
+    if let Some((_, cred_obj)) =
+        read_sandbox_json_object_no_symlink(agent_home, ".claude/.credentials.json", false)
+    {
+        let _ = write_host_json_0600_no_symlink(&cache_dir, "credentials.json", &cred_obj);
+    }
+}
+
+/// Ensure `agent_home` has `.claude/.credentials.json` even when host Claude sweeps credentials
+/// into macOS Keychain.
+pub(crate) fn restore_or_seed_claude_oauth_cache(
+    runtime_dir: &Path,
+    agent_home: &Path,
+    command: &[String],
+    harvested_secrets: &std::collections::HashMap<String, String>,
+) {
+    if !is_claude_command(command) || harvested_secrets.contains_key("CLAUDE_CODE_OAUTH_TOKEN") {
+        return;
+    }
+    let rel = ".claude/.credentials.json";
+    if read_sandbox_json_object_no_symlink(agent_home, rel, false).is_some() {
+        sync_runtime_claude_oauth_from_agent_home(runtime_dir, agent_home, command);
+        return;
+    }
+    let cache_dir = claude_runtime_credentials_dir(runtime_dir);
+    if std::fs::symlink_metadata(&cache_dir)
+        .is_ok_and(|m| !m.file_type().is_symlink() && m.file_type().is_dir())
+    {
+        if let Some((_, cred_obj)) =
+            read_sandbox_json_object_no_symlink(&cache_dir, "credentials.json", false)
+        {
+            let _ = write_host_json_0600_no_symlink(agent_home, rel, &cred_obj);
+            return;
+        }
+    }
+    let sessions_dir = runtime_dir.join("sessions");
+    if let Ok(entries) = std::fs::read_dir(&sessions_dir) {
+        let mut hits: Vec<(i64, PathBuf)> = Vec::new();
+        for entry in entries.flatten() {
+            let dir = entry.path();
+            if !std::fs::symlink_metadata(&dir)
+                .is_ok_and(|m| !m.file_type().is_symlink() && m.file_type().is_dir())
+            {
+                continue;
+            }
+            let ts = std::fs::read_to_string(dir.join("session.json"))
+                .ok()
+                .and_then(|raw| serde_json::from_str::<Value>(&raw).ok())
+                .and_then(|val| {
+                    val.get("updated_at_ms")
+                        .or_else(|| val.get("created_at_ms"))
+                        .and_then(|v| v.as_i64())
+                })
+                .unwrap_or(0);
+            hits.push((ts, dir));
+        }
+        hits.sort_by(|a, b| b.0.cmp(&a.0));
+        for (_, ses_dir) in hits {
+            let Some(ses_home) = resolve_symlink_free_dir(&ses_dir, Path::new("agent_home")) else {
+                continue;
+            };
+            if let Some((_, cred_obj)) =
+                read_sandbox_json_object_no_symlink(&ses_home, rel, false)
+            {
+                let _ = write_host_json_0600_no_symlink(agent_home, rel, &cred_obj);
+                sync_runtime_claude_oauth_from_agent_home(runtime_dir, agent_home, command);
+                return;
+            }
+        }
+    }
 }
 
 fn ensure_0700_dir_no_symlink(dir: &Path) -> bool {
@@ -5985,6 +6098,7 @@ async fn run_inner(
     let _ = std::fs::set_permissions(&agent_home, std::fs::Permissions::from_mode(0o700));
     seed_agent_home(host_home, &agent_home)?;
     restore_native_oauth_store_for_agent(host_home, &agent_home, &orig_command, &harvested_secrets);
+    restore_or_seed_claude_oauth_cache(runtime_dir, &agent_home, &orig_command, &harvested_secrets);
     restore_or_seed_agy_oauth_cache(runtime_dir, host_home, &agent_home, &orig_command);
     for rel in [".run", ".cache", ".local/share", ".local/state", ".cargo/registry", ".cargo/git", ".rustup/toolchains"] {
         std::fs::create_dir_all(agent_home.join(rel))?;
@@ -6453,6 +6567,7 @@ async fn run_macos_inner(
     let _ = std::fs::set_permissions(&agent_home, std::fs::Permissions::from_mode(0o700));
     seed_agent_home(host_home, &agent_home)?;
     restore_native_oauth_store_for_agent(host_home, &agent_home, command, &harvested_secrets);
+    restore_or_seed_claude_oauth_cache(runtime_dir, &agent_home, command, &harvested_secrets);
     restore_or_seed_agy_oauth_cache(runtime_dir, host_home, &agent_home, command);
     stage_agy_conversation_for_resume(runtime_dir, host_home, &agent_home, command);
     for rel in [".run", ".cache", ".local/share", ".local/state", "tmp"] {
@@ -9416,6 +9531,40 @@ mod tests {
         restore_or_seed_agy_oauth_cache(&runtime, &host_home, &fresh_home_2, &cmd);
         let restored = std::fs::read_to_string(fresh_home_2.join(AGY_CACHE_TOKEN_PRIMARY)).unwrap();
         assert!(restored.contains("ya29.sealed"), "got: {restored}");
+    }
+
+    #[test]
+    fn claude_runtime_oauth_cache_seals_and_restores_across_host_removal() {
+        let tmp = tempfile::tempdir().unwrap();
+        let runtime = tmp.path().join("runtime");
+        let host_home = tmp.path().join("host_home");
+        std::fs::create_dir_all(host_home.join(".claude")).unwrap();
+        std::fs::write(
+            host_home.join(".claude/.credentials.json"),
+            r#"{"claudeAiOauth":{"accessToken":"sk-ant-oat01-sealed-test","refreshToken":"rt-1"}}"#,
+        )
+        .unwrap();
+
+        let cmd = vec!["claude".to_string()];
+        let empty_secrets = std::collections::HashMap::new();
+        let ses_home_1 = runtime.join("sessions/ses_c1/agent_home");
+        std::fs::create_dir_all(&ses_home_1).unwrap();
+        restore_native_oauth_store_for_agent(&host_home, &ses_home_1, &cmd, &empty_secrets);
+        restore_or_seed_claude_oauth_cache(&runtime, &ses_home_1, &cmd, &empty_secrets);
+        assert!(ses_home_1.join(".claude/.credentials.json").is_file());
+        assert!(claude_runtime_credentials_dir(&runtime)
+            .join("credentials.json")
+            .is_file());
+
+        // Host `.claude/.credentials.json` removed (e.g. swept into Keychain) -> fresh session recovers it.
+        std::fs::remove_file(host_home.join(".claude/.credentials.json")).unwrap();
+        let ses_home_2 = runtime.join("sessions/ses_c2/agent_home");
+        std::fs::create_dir_all(&ses_home_2).unwrap();
+        restore_native_oauth_store_for_agent(&host_home, &ses_home_2, &cmd, &empty_secrets);
+        restore_or_seed_claude_oauth_cache(&runtime, &ses_home_2, &cmd, &empty_secrets);
+        let restored =
+            std::fs::read_to_string(ses_home_2.join(".claude/.credentials.json")).unwrap();
+        assert!(restored.contains("sk-ant-oat01-sealed-test"), "{restored}");
     }
 }
 

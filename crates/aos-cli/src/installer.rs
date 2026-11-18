@@ -141,6 +141,7 @@ pub async fn install_global_clients(
         "fs_glob",
         "proc_exec",
         "pkg_install",
+        "host_exec",
         "workspace_status",
         "workspace_snapshot",
         "workspace_diff",
@@ -270,6 +271,7 @@ pub async fn install_global_clients(
         "mcp(aegis-os/workspace_commit)",
         "mcp(aegis-os/proc_exec)",
         "mcp(aegis-os/pkg_install)",
+        "mcp(aegis-os/host_exec)",
         "mcp(aegis-os/coord_claim)",
         "mcp(aegis-os/coord_release)",
         "mcp(aegis-os/org_artifact_publish)",
@@ -365,6 +367,7 @@ You are running inside the **Aegis OS Runtime (`aegis-os`)** with an isolated Co
 |---|---|---|
 | Build / test / lint / git status / scripts | `proc_exec` (`mcp_aegis-os_proc_exec`; `loopback_ports` / `$AOS_DEV_PORT` / `$AOS_LOOPBACK_PORTS` for `127.0.0.1` servers) | `run_command` (denied for in-repo work) |
 | Install npm / Python / Rust / Go packages | `pkg_install` (registry-restricted proxy; `allow_scripts` gated) | `npm install` / `pip install` without registry egress approval |
+| Run unsandboxed host sibling commands (e.g. nested sandbox/container benchmarks, simulators) | `host_exec` (enforced SessionBroker only; SHA-256 frozen bundle, human approval, scrubbed env, control-plane lock) | Nested `sandbox-exec`/`bwrap` or inline `python3 -c` inside `proc_exec` |
 | Read / write / edit / delete repo files | `fs_read`, `fs_write`, `fs_edit`, `fs_delete`, `fs_glob` | `write_file` / `edit_file` (denied for repo files) |
 | Claim / release files when collaborating | `coord_claim`, `coord_release` | Uncoordinated overlapping edits |
 | Multi-agent messaging & task handoff | `ipc_list_peers`, `ipc_send`, `ipc_request`, `ipc_reply`, `ipc_recv`, `ipc_ack`, `ipc_wait`, `ipc_task_get`, `ipc_task_list`, `ipc_task_update` | Manual user relay |
@@ -455,6 +458,7 @@ You are running inside the **Aegis OS Runtime (`aegis-os`)** with an isolated Co
         "workspace_commit",
         "proc_exec",
         "pkg_install",
+        "host_exec",
         "coord_claim",
         "coord_release",
         "org_artifact_publish",
@@ -2813,6 +2817,7 @@ You are operating inside **Aegis OS Runtime** (`{role}`) within Organization **`
 |---|---|---|
 | Build / test / lint / git status / scripts | `proc_exec` (`mcp_aegis-os_proc_exec`; `loopback_ports` / `$AOS_DEV_PORT` / `$AOS_LOOPBACK_PORTS` for `127.0.0.1` servers) | `run_command` (denied for in-repo work) |
 | Install npm / Python / Rust / Go packages | `pkg_install` (registry-restricted proxy; `allow_scripts` gated) | `npm install` / `pip install` without registry egress approval |
+| Run unsandboxed host sibling commands (e.g. nested sandbox/container benchmarks, simulators) | `host_exec` (enforced SessionBroker only; SHA-256 frozen bundle, human approval, scrubbed env, control-plane lock) | Nested `sandbox-exec`/`bwrap` or inline `python3 -c` inside `proc_exec` |
 | Read / write / edit / delete repo files | `fs_read`, `fs_write`, `fs_edit`, `fs_delete`, `fs_glob` | `write_file` / `edit_file` (denied for repo files) |
 | Claim / release files when collaborating | `coord_claim`, `coord_release` | Uncoordinated overlapping edits |
 | Multi-agent messaging & task handoff | `ipc_list_peers`, `ipc_send`, `ipc_request`, `ipc_reply`, `ipc_recv`, `ipc_ack`, `ipc_wait`, `ipc_task_get`, `ipc_task_list`, `ipc_task_update` | Manual user relay |

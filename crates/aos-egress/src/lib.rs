@@ -100,6 +100,177 @@ fn dlp_token_span_bytes(s: &str, allow_extra_base64_chars: bool) -> usize {
     end
 }
 
+fn has_bound_secret_placeholder(text: &str) -> Option<(usize, usize)> {
+    const PREFIX: &str = "$AOS_SECRET_";
+    let mut from = 0usize;
+    while let Some(rel) = text[from..].find(PREFIX) {
+        let start = from + rel;
+        let tail = &text[start + PREFIX.len()..];
+        let mut ext = 0usize;
+        let mut ident_chars = 0usize;
+        for (i, ch) in tail.char_indices() {
+            if ch.is_ascii_alphanumeric() || ch == '_' {
+                ext = i + ch.len_utf8();
+                ident_chars += 1;
+            } else {
+                break;
+            }
+        }
+        if ident_chars >= 2 && !tail[ext..].starts_with('*') {
+            return Some((start, start + PREFIX.len() + ext));
+        }
+        from = start + PREFIX.len();
+    }
+    None
+}
+
+fn is_plausible_bearer_secret(tok: &str, after_tok: &str) -> bool {
+    if tok.chars().count() < 8 {
+        return false;
+    }
+    if after_tok.starts_with('<') || after_tok.starts_with('{') || after_tok.starts_with('*') {
+        return false;
+    }
+    if tok.contains("...") || tok.ends_with("..") {
+        return false;
+    }
+    let upper = tok.to_ascii_uppercase();
+    const PLACEHOLDER_PREFIXES: &[&str] = &[
+        "REDACTED",
+        "YOUR_",
+        "YOUR-",
+        "EXAMPLE",
+        "REPLACE",
+        "PLACEHOLDER",
+        "AEGIS_AT_",
+        "SAMPLE_",
+        "DUMMY_",
+        "FAKE_",
+        "TEST_TOKEN",
+    ];
+    if PLACEHOLDER_PREFIXES.iter().any(|p| upper.starts_with(p)) {
+        return false;
+    }
+    if matches!(
+        upper.as_str(),
+        "AUTHENTICATION"
+            | "AUTHORIZATION"
+            | "CREDENTIALS"
+            | "OPERATOR"
+            | "PASSWORD"
+            | "TOKEN_HERE"
+            | "ACCESS_TOKEN"
+            | "SECRET_TOKEN"
+            | "BEARER_TOKEN"
+    ) {
+        return false;
+    }
+    let has_digit = tok.bytes().any(|b| b.is_ascii_digit());
+    let has_structured_prefix = [
+        "eyJ", "sk-", "ghp_", "gho_", "ghu_", "ghs_", "ghr_", "github_", "xox", "glpat", "ya29.",
+        "ak_live_", "aop_",
+    ]
+    .iter()
+    .any(|p| tok.starts_with(p));
+    let long_mixed_case = tok.len() >= 24
+        && tok.bytes().any(|b| b.is_ascii_uppercase())
+        && tok.bytes().any(|b| b.is_ascii_lowercase());
+    has_digit || has_structured_prefix || long_mixed_case
+}
+
+fn find_auth_header_token_span(text: &str) -> Option<(usize, usize, String)> {
+    let bytes = text.as_bytes();
+    let mut best: Option<(usize, usize, String)> = None;
+    let mut consider = |start: usize, end: usize, repl: String| {
+        if best.as_ref().is_none_or(|(b_start, ..)| start < *b_start) {
+            best = Some((start, end, repl));
+        }
+    };
+
+    // Case A: Explicit `Authorization` header / JSON field context (`Authorization: Bearer <tok>`,
+    // `"authorization": "Bearer <tok>"`, `Authorization: token <tok>`).
+    const AUTH_KEY: &[u8] = b"authorization";
+    if bytes.len() > AUTH_KEY.len() + 8 {
+        let mut idx = 0usize;
+        while idx + AUTH_KEY.len() < bytes.len() {
+            let boundary_ok = idx == 0 || !bytes[idx - 1].is_ascii_alphanumeric();
+            if boundary_ok && bytes[idx..idx + AUTH_KEY.len()].eq_ignore_ascii_case(AUTH_KEY) {
+                let auth_end = idx + AUTH_KEY.len();
+                let mut sep_len = 0usize;
+                let mut has_kv_sep = false;
+                while sep_len <= 8 && auth_end + sep_len < bytes.len() {
+                    let pos = auth_end + sep_len;
+                    if has_kv_sep {
+                        let rest_bytes = &bytes[pos..];
+                        let scheme_len = if rest_bytes.len() >= 7
+                            && rest_bytes[..7].eq_ignore_ascii_case(b"bearer ")
+                        {
+                            Some(7usize)
+                        } else if rest_bytes.len() >= 6
+                            && rest_bytes[..6].eq_ignore_ascii_case(b"token ")
+                        {
+                            Some(6usize)
+                        } else {
+                            None
+                        };
+                        if let Some(slen) = scheme_len {
+                            let tail = &text[pos + slen..];
+                            let span = dlp_token_span_bytes(tail, true);
+                            let tok = &tail[..span];
+                            if is_plausible_bearer_secret(tok, &tail[span..]) {
+                                consider(
+                                    idx,
+                                    pos + slen + span,
+                                    format!("{}[REDACTED_BY_AEGIS_DLP]", &text[idx..pos + slen]),
+                                );
+                            }
+                            break;
+                        }
+                    }
+                    let b = bytes[pos];
+                    if !matches!(b, b':' | b'=' | b' ' | b'\t' | b'"' | b'\'' | b'\\') {
+                        break;
+                    }
+                    if matches!(b, b':' | b'=') {
+                        has_kv_sep = true;
+                    }
+                    sep_len += 1;
+                }
+                idx = auth_end;
+            } else {
+                idx += 1;
+            }
+        }
+    }
+
+    // Case B: Standalone JWT Bearer token (`Bearer eyJ...`).
+    for prefix in ["Bearer ", "bearer "] {
+        let mut from = 0usize;
+        while let Some(rel) = text[from..].find(prefix) {
+            let start = from + rel;
+            let tail = &text[start + prefix.len()..];
+            if tail.starts_with("eyJ") {
+                let span = dlp_token_span_bytes(tail, true);
+                let tok = &tail[..span];
+                if tok.contains('.')
+                    && tok.len() >= 20
+                    && is_plausible_bearer_secret(tok, &tail[span..])
+                {
+                    consider(
+                        start,
+                        start + prefix.len() + span,
+                        format!("{prefix}[REDACTED_BY_AEGIS_DLP]"),
+                    );
+                    break;
+                }
+            }
+            from = start + prefix.len();
+        }
+    }
+
+    best
+}
+
 fn find_next_dlp_span(text: &str) -> Option<(usize, usize, String, &'static str)> {
     // `(match_start, match_end, replacement, rule_label)`
     let mut best: Option<(usize, usize, String, &'static str)> = None;
@@ -112,20 +283,11 @@ fn find_next_dlp_span(text: &str) -> Option<(usize, usize, String, &'static str)
         }
     };
 
-    // 1. Virtual `$AOS_SECRET_*` placeholders.
-    if let Some(idx) = text.find("$AOS_SECRET_") {
-        let tail = &text[idx + "$AOS_SECRET_".len()..];
-        let mut ext = 0usize;
-        for (i, ch) in tail.char_indices() {
-            if ch.is_ascii_alphanumeric() || ch == '_' {
-                ext = i + ch.len_utf8();
-            } else {
-                break;
-            }
-        }
+    // 1. Virtual `$AOS_SECRET_*` placeholders (ignoring doc wildcards like `$AOS_SECRET_*`).
+    if let Some((start, end)) = has_bound_secret_placeholder(text) {
         consider(
-            idx,
-            idx + "$AOS_SECRET_".len() + ext,
+            start,
+            end,
             "[REDACTED_BY_AEGIS_DLP:AOS_SECRET]".to_string(),
             "$AOS_SECRET_* (outbound DLP)",
         );
@@ -211,24 +373,9 @@ fn find_next_dlp_span(text: &str) -> Option<(usize, usize, String, &'static str)
         }
     }
 
-    // 5. HTTP `Bearer <token>` / `Authorization: token <token>`.
-    for marker in ["Bearer ", "Authorization: token ", "authorization: token "] {
-        let mut from = 0usize;
-        while let Some(rel) = text[from..].find(marker) {
-            let start = from + rel;
-            let tail = &text[start + marker.len()..];
-            let span = dlp_token_span_bytes(tail, true);
-            if tail[..span].chars().count() >= 8 {
-                consider(
-                    start,
-                    start + marker.len() + span,
-                    format!("{marker}[REDACTED_BY_AEGIS_DLP]"),
-                    "DLP:AUTH_HEADER_TOKEN",
-                );
-                break;
-            }
-            from = start + marker.len();
-        }
+    // 5. HTTP `Authorization: Bearer <token>` / `Authorization: token <token>` / standalone JWT `Bearer eyJ...`.
+    if let Some((start, end, repl)) = find_auth_header_token_span(text) {
+        consider(start, end, repl, "DLP:AUTH_HEADER_TOKEN");
     }
 
     // 6. HTTP(S) URL embedded userinfo secrets (`https://user:secret@host`).
@@ -489,7 +636,7 @@ impl AegisEgressGateway {
         if text.is_empty() {
             return None;
         }
-        if text.contains("$AOS_SECRET_") {
+        if has_bound_secret_placeholder(text).is_some() {
             return Some("$AOS_SECRET_* (outbound DLP)".to_string());
         }
         let org_prefix = format!("{}::", org_id);
@@ -1256,7 +1403,8 @@ impl AegisEgressGateway {
                                 let body = json!({
                                     "egress": "blocked_exfiltration",
                                     "placeholder": placeholder,
-                                    "unauthorized_domain": unauthorized_domain
+                                    "unauthorized_domain": unauthorized_domain,
+                                    "message": "Blocked by local Aegis OS outbound DLP proxy (not an Anthropic/provider login error — do NOT run /login)"
                                 })
                                 .to_string();
                                 let resp = format!(
@@ -1387,7 +1535,8 @@ impl AegisEgressGateway {
                                 let body = json!({
                                     "egress": "blocked_exfiltration",
                                     "placeholder": placeholder,
-                                    "unauthorized_domain": unauthorized_domain
+                                    "unauthorized_domain": unauthorized_domain,
+                                    "message": "Blocked by local Aegis OS outbound DLP proxy (not an Anthropic/provider login error — do NOT run /login)"
                                 })
                                 .to_string();
                                 let resp = format!(
@@ -1580,7 +1729,8 @@ impl AegisEgressGateway {
                             json!({
                                 "egress": "blocked_exfiltration",
                                 "placeholder": placeholder,
-                                "unauthorized_domain": unauthorized_domain
+                                "unauthorized_domain": unauthorized_domain,
+                                "message": "Blocked by local Aegis OS outbound DLP proxy (not an Anthropic/provider login error — do NOT run /login)"
                             })
                             .to_string(),
                         ),
@@ -2357,5 +2507,52 @@ mod tests {
                 "{blocked_domain} should require escalation: {blocked:?}"
             );
         }
+    }
+
+    #[test]
+    fn test_dlp_auth_header_no_false_positive_on_prose_docs_or_mcp_schemas() {
+        for safe in [
+            "Bearer authentication and Bearer credentials in prose",
+            "Authorization: Bearer aegis_at_<app_id>.*",
+            "Authorization: Bearer ak_live_...",
+            "Authorization: Bearer YOUR_API_KEY_HERE",
+            "\"authorization\": \"Bearer EXAMPLE_SECRET_TOKEN\"",
+            "Inject `$AOS_SECRET_*` tokens at boundary",
+            "Use placeholder $AOS_SECRET_A* in docs",
+        ] {
+            let hits = detect_dlp_patterns(safe);
+            assert!(
+                hits.is_empty(),
+                "expected no DLP hit for benign doc/prose string {safe:?}, got {hits:?}"
+            );
+            assert_eq!(
+                AegisEgressGateway::inspect_payload_dlp(safe, &[], "acme"),
+                None,
+                "inspect_payload_dlp false-triggered on {safe:?}"
+            );
+        }
+
+        for real_auth in [
+            "Authorization: Bearer s3cr3tTok3nValu3",
+            "\"authorization\": \"Bearer s3cr3tTok3nValu3\"",
+            "curl -H 'Authorization: token mySecretTok1234'",
+            "Bearer eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJzdWIiOiIxMjM0NTY3ODkwIn0",
+            "Mixed YOUR_TOKEN then Authorization: Bearer s3cr3tTok3nValu3",
+        ] {
+            let hits = detect_dlp_patterns(real_auth);
+            assert!(
+                hits.contains(&"DLP:AUTH_HEADER_TOKEN"),
+                "expected DLP:AUTH_HEADER_TOKEN for {real_auth:?}, got {hits:?}"
+            );
+        }
+
+        let bound_hits = detect_dlp_patterns("Docs $AOS_SECRET_* plus real $AOS_SECRET_ANTHROPIC_API_KEY");
+        assert!(
+            bound_hits.contains(&"$AOS_SECRET_* (outbound DLP)"),
+            "{bound_hits:?}"
+        );
+        assert!(
+            AegisEgressGateway::inspect_payload_dlp("$AOS_SECRET_GH", &[], "acme").is_some()
+        );
     }
 }

@@ -2929,6 +2929,7 @@ pub async fn serve_unified_stdio(
                                     "workspace_commit_sensitive"
                                         | "workspace_git_sensitive"
                                         | "pkg_install_scripts"
+                                        | "host_exec"
                                 )
                             );
                             if is_sensitive {

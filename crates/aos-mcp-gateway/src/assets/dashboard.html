@@ -1255,6 +1255,7 @@
           'workspace_commit_sensitive',
           'workspace_git_sensitive',
           'pkg_install_scripts',
+          'host_exec',
           'github_pr_merge'
         ].includes(esc.action) || !!ev.allow_scripts || !!ev.force_push || !!ev.force_tag;
 
@@ -1275,6 +1276,7 @@
           fs_export_file: '请求受控导出产物到宿主机 (fs_export_file)',
           pkg_install: '请求在隔离 Shadow 中安装依赖包 (pkg_install)',
           pkg_install_scripts: '高危：请求启用生命周期脚本安装依赖包 (pkg_install_scripts)',
+          host_exec: '高危：请求在宿主机平级无沙箱运行冻结脚本包 (host_exec)',
           github_pr_create: '请求创建 GitHub Pull Request (github_pr_create)',
           github_pr_merge: '高危破坏性操作：请求合并 GitHub PR (github_pr_merge)',
           github_comment_create: '请求发表 GitHub Issue / PR 评论 (github_comment_create)',
@@ -1289,6 +1291,7 @@
           fs_export_file: 'Approve Host File Export (fs_export_file)',
           pkg_install: 'Approve Sandbox Package Install (pkg_install)',
           pkg_install_scripts: 'HIGH RISK: Package Install With Lifecycle Scripts',
+          host_exec: '[HIGH RISK] Host Sibling Execution (host_exec — Unsandboxed, SHA-256 Frozen)',
           github_pr_create: 'Approve GitHub PR Creation (github_pr_create)',
           github_pr_merge: 'DESTRUCTIVE: Approve GitHub PR Merge (github_pr_merge)',
           github_comment_create: 'Approve GitHub Issue / PR Comment',
@@ -1310,9 +1313,15 @@
         if (isHighRisk) {
           const warnBanner = document.createElement('div');
           warnBanner.className = 'esc-risk-banner';
-          warnBanner.textContent = currentLang === 'zh'
-            ? '高危操作 · 仅限单次锁定审批（SHA-256 Pinned）：涉及生命周期脚本、敏感路径、强制推送或 PR 合并，已禁用 15m/1h 租约快捷放行。'
-            : 'HIGH RISK · ONE-SHOT APPROVAL ONLY: Lifecycle scripts, sensitive paths, force-push, or PR merge. 15m/1h window leases are disabled.';
+          if (esc.action === 'host_exec') {
+            warnBanner.textContent = currentLang === 'zh'
+              ? '高危操作 · 哈希锁定宿主执行 (SHA-256 Pinned)：将在宿主机无沙箱平级运行，15m/1h 租约同样严格绑定冻结包 SHA-256，改动 1 字节即重审。'
+              : 'HIGH RISK · HASH-LOCKED HOST EXEC: Runs unsandboxed on host as sibling process. 15m/1h leases stay pinned to identical bundle & args.';
+          } else {
+            warnBanner.textContent = currentLang === 'zh'
+              ? '高危操作 · 仅限单次锁定审批（SHA-256 Pinned）：涉及生命周期脚本、敏感路径、强制推送或 PR 合并，已禁用 15m/1h 租约快捷放行。'
+              : 'HIGH RISK · ONE-SHOT APPROVAL ONLY: Lifecycle scripts, sensitive paths, force-push, or PR merge. 15m/1h window leases are disabled.';
+          }
           box.appendChild(warnBanner);
         }
 
@@ -1362,6 +1371,11 @@
         if (ev.commit_message) rows.push(['Commit Msg', ev.commit_message]);
         if (ev.tag) rows.push(['Tag', ev.tag + (ev.force_tag ? ' (FORCE)' : '')]);
         if (ev.push !== undefined) rows.push(['Push', String(!!ev.push) + (ev.force_push ? ' (FORCE)' : '')]);
+        if (ev.program) rows.push([currentLang === 'zh' ? '宿主程序' : 'Host Program', ev.program]);
+        if (ev.script) rows.push([currentLang === 'zh' ? '冻结脚本' : 'Frozen Script', ev.script]);
+        if (Array.isArray(ev.args) && ev.args.length) rows.push([currentLang === 'zh' ? '参数' : 'Arguments', ev.args.join(' ')]);
+        if (Array.isArray(ev.output_files) && ev.output_files.length) rows.push([currentLang === 'zh' ? '回收产物' : 'Harvest Outputs', ev.output_files.join(', ')]);
+        if (Array.isArray(ev.pass_env_keys) && ev.pass_env_keys.length) rows.push([currentLang === 'zh' ? '透传环境变量' : 'Pass Env Keys', ev.pass_env_keys.join(', ')]);
         if (esc.reason) {
           rows.push(['Reason', esc.reason]);
         }
@@ -1393,7 +1407,7 @@
         bOnce.onclick = () => decideEscalation(esc.escalation_id, 'approve', 0);
         actions.appendChild(bOnce);
 
-        if (!isHighRisk) {
+        if (!isHighRisk || esc.action === 'host_exec') {
           const b15m = document.createElement('button');
           b15m.className = 'btn btn-ghost';
           b15m.textContent = currentLang === 'zh' ? '批准 15 分钟' : 'Approve 15m';
