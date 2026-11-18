@@ -15,7 +15,7 @@ use anyhow::bail;
 use serde::{Deserialize, Serialize};
 use serde_json::json;
 use std::collections::{HashMap, HashSet};
-use std::net::SocketAddr;
+use std::net::{IpAddr, SocketAddr};
 use std::sync::Arc;
 use tokio::io::{
     AsyncBufReadExt, AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt, BufReader,
@@ -68,6 +68,97 @@ const MAX_PROXY_BODY_BYTES: usize = 16 * 1024 * 1024;
 
 trait ProxyStream: AsyncRead + AsyncWrite + Unpin + Send {}
 impl<T: AsyncRead + AsyncWrite + Unpin + Send> ProxyStream for T {}
+
+/// Returns `true` for loopback, private RFC1918, CGNAT, link-local / cloud metadata, ULA,
+/// unspecified, multicast, or IPv4-mapped equivalents that untrusted outbound proxy traffic
+/// must never reach directly.
+pub fn is_forbidden_outbound_ip(ip: IpAddr) -> bool {
+    match ip {
+        IpAddr::V6(v6) => {
+            if let Some(v4) = v6.to_ipv4_mapped() {
+                return is_forbidden_outbound_ip(IpAddr::V4(v4));
+            }
+            let segs = v6.segments();
+            v6.is_loopback()
+                || v6.is_unspecified()
+                || v6.is_multicast()
+                || v6.is_unicast_link_local()
+                || v6.is_unique_local()
+                || (segs[0] & 0xffc0) == 0xfec0
+                || (segs[0] == 0x2001 && segs[1] == 0x0db8)
+        }
+        IpAddr::V4(v4) => {
+            let o = v4.octets();
+            v4.is_loopback()
+                || v4.is_private()
+                || v4.is_link_local()
+                || v4.is_broadcast()
+                || v4.is_unspecified()
+                || v4.is_multicast()
+                || o[0] == 0
+                || (o[0] == 100 && (o[1] & 0b1100_0000) == 64)
+                || (o[0] == 192 && o[1] == 0 && o[2] == 0)
+                || (o[0] == 198 && (o[1] == 18 || o[1] == 19))
+                || o[0] >= 240
+        }
+    }
+}
+
+fn replace_query_key_param(path_and_query: &str, placeholder: &str, replacement: &str) -> String {
+    let Some((path, query)) = path_and_query.split_once('?') else {
+        return path_and_query.to_string();
+    };
+    let mut updated = Vec::new();
+    for pair in query.split('&') {
+        if let Some((k, v)) = pair.split_once('=') {
+            if k == "key" && v == placeholder {
+                if replacement.is_empty() {
+                    updated.push("key=".to_string());
+                } else {
+                    updated.push(format!("key={replacement}"));
+                }
+                continue;
+            }
+        }
+        updated.push(pair.to_string());
+    }
+    format!("{path}?{}", updated.join("&"))
+}
+
+async fn read_bounded_http_line(
+    reader: &mut BufReader<&mut TcpStream>,
+    max_bytes: usize,
+) -> std::io::Result<Option<String>> {
+    let mut raw = Vec::new();
+    let res = tokio::time::timeout(
+        std::time::Duration::from_secs(30),
+        reader.take((max_bytes + 1) as u64).read_until(b'\n', &mut raw),
+    )
+    .await;
+    let n = match res {
+        Ok(Ok(n)) => n,
+        Ok(Err(e)) => return Err(e),
+        Err(_) => {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::TimedOut,
+                "HTTP header read timeout",
+            ));
+        }
+    };
+    if n == 0 {
+        return Ok(None);
+    }
+    if raw.len() > max_bytes {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            "HTTP header line exceeded 64 KiB limit",
+        ));
+    }
+    let s = String::from_utf8(raw).map_err(|_| {
+        std::io::Error::new(std::io::ErrorKind::InvalidData, "non-UTF8 HTTP header line")
+    })?;
+    Ok(Some(s))
+}
 
 const DLP_TOKEN_PREFIXES: &[(&str, &str, usize)] = &[
     ("github_pat_", "DLP:TOKEN_github_pat", 8),
@@ -690,6 +781,13 @@ impl AegisEgressGateway {
             {
                 continue;
             }
+            if secret_entry
+                .real_secret_value
+                .chars()
+                .any(|c| matches!(c, '\r' | '\n' | '\0'))
+            {
+                bail!("Refusing secret injection containing CR/LF/NUL bytes");
+            }
             // Only Gemini APIs (`generativelanguage.googleapis.com`) authenticate via `?key=$AOS_SECRET_*`
             // in the query string. On any other domain or query parameter name, a secret placeholder
             // in the URL query/path is treated as outbound exfiltration and left in `dlp_path`.
@@ -744,21 +842,20 @@ impl AegisEgressGateway {
                     }
                 }
             }
-            out_path = out_path.replace(
+            out_path = replace_query_key_param(
+                &out_path,
                 &secret_entry.placeholder,
                 &secret_entry.real_secret_value,
             );
-            // Keep the DLP input free of the authorized placeholder, but retain any other query.
-            dlp_path = dlp_path.replace(&secret_entry.placeholder, "");
+            // Keep the DLP input free of the authorized `key=` query param, preserving all path segments & other params.
+            dlp_path = replace_query_key_param(&dlp_path, &secret_entry.placeholder, "");
             secrets_injected.push(secret_entry.placeholder.clone());
         }
 
-        // 1b. Outbound L7 DLP inspection on URL query string and HTTP request body (prevents exfiltrating
-        // secrets or private keys inside the body/query of an allowlisted endpoint such as POST /repos/acme/app/issues).
+        // 1b. Outbound L7 DLP inspection on FULL URL path+query and HTTP request body.
         if !aos_core::ablated("secret_binding") && !aos_core::ablated("secret_vault") {
-            let query_part = dlp_path.split_once('?').map(|(_, q)| q).unwrap_or("");
             if let Some(dlp_hit) =
-                Self::inspect_payload_dlp(query_part, &entries, &identity.org_id)
+                Self::inspect_payload_dlp(&dlp_path, &entries, &identity.org_id)
                     .or_else(|| body.and_then(|b| Self::inspect_payload_dlp(b, &entries, &identity.org_id)))
             {
                 return Ok(EgressVerdict::BlockedSecretExfiltration {
@@ -771,12 +868,25 @@ impl AegisEgressGateway {
             }
         }
 
-        for header_val in out_headers.values_mut() {
+        for (header_key, header_val) in out_headers.iter_mut() {
+            if header_key.chars().any(|c| matches!(c, '\r' | '\n' | '\0'))
+                || header_val.chars().any(|c| matches!(c, '\r' | '\n' | '\0'))
+            {
+                bail!("Refusing outbound HTTP header containing CR/LF/NUL bytes");
+            }
+            let mut header_dlp_shadow = header_val.clone();
             for &(vault_key, secret_entry) in &entries {
-                if !vault_key.starts_with(&format!("{}::", identity.org_id)) {
+                if !vault_key.starts_with(&org_prefix) {
                     continue;
                 }
                 if header_val.contains(&secret_entry.placeholder) {
+                    if secret_entry
+                        .real_secret_value
+                        .chars()
+                        .any(|c| matches!(c, '\r' | '\n' | '\0'))
+                    {
+                        bail!("Refusing secret injection containing CR/LF/NUL bytes");
+                    }
                     if !aos_core::ablated("secret_binding") && !aos_core::ablated("secret_vault") {
                         if !secret_entry
                             .allowed_domains
@@ -819,9 +929,23 @@ impl AegisEgressGateway {
                             }
                         }
                     }
+                    header_dlp_shadow = header_dlp_shadow.replace(&secret_entry.placeholder, "");
                     *header_val = header_val
                         .replace(&secret_entry.placeholder, &secret_entry.real_secret_value);
                     secrets_injected.push(secret_entry.placeholder.clone());
+                }
+            }
+            if !aos_core::ablated("secret_binding") && !aos_core::ablated("secret_vault") {
+                if let Some(dlp_hit) =
+                    Self::inspect_payload_dlp(&header_dlp_shadow, &entries, &identity.org_id)
+                {
+                    return Ok(EgressVerdict::BlockedSecretExfiltration {
+                        placeholder: dlp_hit,
+                        unauthorized_domain: format!(
+                            "{} (outbound DLP header violation on {} header '{}')",
+                            req.target_domain, normalized_path, header_key
+                        ),
+                    });
                 }
             }
         }
@@ -943,10 +1067,37 @@ impl AegisEgressGateway {
         None
     }
 
-    async fn resolve_upstream_addrs(upstream_addr: &str) -> anyhow::Result<Vec<SocketAddr>> {
+    fn split_host_and_port(authority: &str, default_port: u16) -> (String, u16) {
+        let trimmed = authority.trim();
+        if let Some(after_open) = trimmed.strip_prefix('[') {
+            if let Some((h, after_close)) = after_open.split_once(']') {
+                let port = after_close
+                    .strip_prefix(':')
+                    .and_then(|p| p.parse::<u16>().ok())
+                    .unwrap_or(default_port);
+                return (h.to_string(), port);
+            }
+        }
+        if let Some((h, ps)) = trimmed.rsplit_once(':') {
+            if !h.contains(':') {
+                if let Ok(port) = ps.parse::<u16>() {
+                    return (h.to_string(), port);
+                }
+            }
+        }
+        (trimmed.trim_matches(['[', ']']).to_string(), default_port)
+    }
+
+    async fn resolve_upstream_addrs(
+        upstream_addr: &str,
+        allow_override_local: bool,
+    ) -> anyhow::Result<Vec<SocketAddr>> {
         let mut addrs: Vec<SocketAddr> = tokio::net::lookup_host(upstream_addr).await?.collect();
+        if !allow_override_local {
+            addrs.retain(|a| !is_forbidden_outbound_ip(a.ip()));
+        }
         if addrs.is_empty() {
-            bail!("no socket addresses resolved for '{upstream_addr}'");
+            bail!("no permitted public socket addresses resolved for '{upstream_addr}'");
         }
         // Prefer IPv4 before IPv6 so dual-stack hosts with broken IPv6 PMTU or middlebox resets
         // on large TLS records fall through to IPv4 first while retaining IPv6 as fallback.
@@ -954,10 +1105,23 @@ impl AegisEgressGateway {
         Ok(addrs)
     }
 
-    async fn connect_upstream_tcp(upstream_addr: &str) -> std::io::Result<TcpStream> {
+    async fn connect_upstream_tcp(
+        upstream_addr: &str,
+        allow_override_local: bool,
+    ) -> std::io::Result<TcpStream> {
         let addrs: Vec<SocketAddr> = match tokio::net::lookup_host(upstream_addr).await {
             Ok(iter) => {
-                let mut v: Vec<SocketAddr> = iter.collect();
+                let mut v: Vec<SocketAddr> = iter
+                    .filter(|a| allow_override_local || !is_forbidden_outbound_ip(a.ip()))
+                    .collect();
+                if v.is_empty() {
+                    return Err(std::io::Error::new(
+                        std::io::ErrorKind::PermissionDenied,
+                        format!(
+                            "all resolved addresses for {upstream_addr} are forbidden loopback/private/link-local IPs"
+                        ),
+                    ));
+                }
                 v.sort_by_key(|a| a.is_ipv6());
                 v
             }
@@ -986,6 +1150,7 @@ impl AegisEgressGateway {
         &self,
         client: &mut TcpStream,
         upstream_addr: &str,
+        allow_override_local: bool,
         use_tls: bool,
         server_name: &str,
         domain: &str,
@@ -1018,8 +1183,8 @@ impl AegisEgressGateway {
         // buffering the response would destroy first-token latency.
         request.push_str("Connection: close\r\n\r\n");
 
-        let addrs = Self::resolve_upstream_addrs(upstream_addr).await?;
-        let max_attempts = addrs.len().min(2).max(1);
+        let addrs = Self::resolve_upstream_addrs(upstream_addr, allow_override_local).await?;
+        let max_attempts = addrs.len().clamp(1, 2);
         let mut last_err: Option<anyhow::Error> = None;
 
         for attempt in 0..max_attempts {
@@ -1157,37 +1322,53 @@ impl AegisEgressGateway {
                 tokio::spawn(async move {
                     let mut reader = BufReader::new(&mut stream);
 
-                    let mut request_line = String::new();
-                    let Ok(n) = reader.read_line(&mut request_line).await else {
+                    let Ok(Some(request_line)) = read_bounded_http_line(&mut reader, 64 * 1024).await
+                    else {
                         return;
                     };
-                    if n == 0 {
-                        return;
-                    }
                     let parts: Vec<&str> = request_line.split_whitespace().collect();
                     let method = parts.first().copied().unwrap_or("GET").to_string();
                     let raw_target = parts.get(1).copied().unwrap_or("/").to_string();
 
                     let mut headers: HashMap<String, String> = HashMap::new();
-                    let mut content_length: usize = 0;
+                    let mut seen_content_length: Option<usize> = None;
+                    let mut has_transfer_encoding = false;
+                    let mut malformed_framing = false;
                     let mut body_too_large = false;
                     loop {
-                        let mut line = String::new();
-                        let Ok(read_n) = reader.read_line(&mut line).await else {
-                            break;
+                        let line = match read_bounded_http_line(&mut reader, 64 * 1024).await {
+                            Ok(Some(l)) => l,
+                            Ok(None) => break,
+                            Err(_) => {
+                                malformed_framing = true;
+                                break;
+                            }
                         };
-                        if read_n == 0 || line.trim().is_empty() {
+                        if line.trim().is_empty() {
                             break;
                         }
                         if let Some((k, v)) = line.split_once(':') {
                             let key = k.trim().to_string();
                             let val = v.trim().to_string();
+                            if key.eq_ignore_ascii_case("transfer-encoding") {
+                                has_transfer_encoding = true;
+                            }
                             if key.eq_ignore_ascii_case("content-length") {
-                                let declared = val.parse::<usize>().unwrap_or(0);
-                                if declared > MAX_PROXY_BODY_BYTES {
-                                    body_too_large = true;
-                                } else {
-                                    content_length = declared;
+                                match val.parse::<usize>() {
+                                    Ok(declared) => {
+                                        if let Some(prev) = seen_content_length {
+                                            if prev != declared {
+                                                malformed_framing = true;
+                                            }
+                                        }
+                                        seen_content_length = Some(declared);
+                                        if declared > MAX_PROXY_BODY_BYTES {
+                                            body_too_large = true;
+                                        }
+                                    }
+                                    Err(_) => {
+                                        malformed_framing = true;
+                                    }
                                 }
                             }
                             if let Some(existing_key) = headers
@@ -1218,6 +1399,20 @@ impl AegisEgressGateway {
                         }
                     }
 
+                    if malformed_framing || (has_transfer_encoding && seen_content_length.is_some()) {
+                        let body = json!({
+                            "egress": "malformed_http_framing",
+                            "reason": "Ambiguous or invalid Content-Length / Transfer-Encoding framing"
+                        })
+                        .to_string();
+                        let resp = format!(
+                            "HTTP/1.1 400 Bad Request\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                            body.len()
+                        );
+                        let _ = reader.get_mut().write_all(resp.as_bytes()).await;
+                        return;
+                    }
+                    let content_length = seen_content_length.unwrap_or(0);
                     if body_too_large {
                         let body = json!({
                             "egress": "request_too_large",
@@ -1347,17 +1542,20 @@ impl AegisEgressGateway {
                                 injected_path,
                                 ..
                             }) => {
-                                let (up_addr, use_tls) = gw_conn
+                                let override_entry = gw_conn
                                     .upstream_overrides
                                     .read()
                                     .await
                                     .get(domain)
-                                    .cloned()
-                                    .unwrap_or_else(|| (format!("{domain}:443"), true));
+                                    .cloned();
+                                let allow_override_local = override_entry.is_some();
+                                let (up_addr, use_tls) =
+                                    override_entry.unwrap_or_else(|| (format!("{domain}:443"), true));
                                 if let Err(err) = gw_conn
                                     .forward_reverse_proxy(
                                         &mut stream,
                                         &up_addr,
+                                        allow_override_local,
                                         use_tls,
                                         domain,
                                         domain,
@@ -1428,24 +1626,18 @@ impl AegisEgressGateway {
                     // HTTPS CONNECT Tunneling support: validate target domain against org allowlist
                     // and establish a bidirectional TCP tunnel when allowed.
                     if method.eq_ignore_ascii_case("CONNECT") {
-                        let connect_domain = raw_target
-                            .split(':')
-                            .next()
-                            .filter(|s| !s.is_empty())
-                            .map(str::to_string)
-                            .unwrap_or_else(|| {
-                                headers
-                                    .get("Host")
-                                    .or_else(|| headers.get("host"))
-                                    .cloned()
-                                    .unwrap_or_else(|| "localhost".to_string())
-                                    .split(':')
-                                    .next()
-                                    .unwrap_or("localhost")
-                                    .to_string()
-                            });
+                        let (parsed_host, parsed_port) = if !raw_target.trim().is_empty() && raw_target != "/" {
+                            Self::split_host_and_port(&raw_target, 443)
+                        } else {
+                            let host_hdr = headers
+                                .get("Host")
+                                .or_else(|| headers.get("host"))
+                                .map(|s| s.as_str())
+                                .unwrap_or("localhost");
+                            Self::split_host_and_port(host_hdr, 443)
+                        };
                         let connect_spec = OutboundRequestSpec {
-                            target_domain: connect_domain,
+                            target_domain: parsed_host.clone(),
                             method: "CONNECT".to_string(),
                             path: "/".to_string(),
                             headers: headers.clone(),
@@ -1455,10 +1647,10 @@ impl AegisEgressGateway {
                             .await
                         {
                             Ok(EgressVerdict::AllowedAndSanitized { .. }) => {
-                                let default_dial = if raw_target.contains(':') {
-                                    raw_target.clone()
+                                let default_dial = if parsed_host.contains(':') {
+                                    format!("[{}]:{}", parsed_host, parsed_port)
                                 } else {
-                                    format!("{raw_target}:443")
+                                    format!("{}:{}", parsed_host, parsed_port)
                                 };
                                 #[cfg(test)]
                                 let test_up = headers
@@ -1468,20 +1660,46 @@ impl AegisEgressGateway {
                                     .filter(|s| {
                                         s.starts_with("127.0.0.1:") || s.starts_with("localhost:")
                                     });
-                                #[cfg(not(test))]
-                                let test_up: Option<String> = None;
-                                let dial_addr = if let Some((ov_addr, _)) = gw_conn
+                                let override_entry = gw_conn
                                     .upstream_overrides
                                     .read()
                                     .await
                                     .get(&connect_spec.target_domain)
-                                    .cloned()
-                                {
+                                    .cloned();
+                                #[cfg(test)]
+                                let allow_override_local = override_entry.is_some() || test_up.is_some();
+                                #[cfg(not(test))]
+                                let allow_override_local = override_entry.is_some();
+
+                                if parsed_port != 443 && !allow_override_local {
+                                    let body = json!({
+                                        "egress": "connect_port_forbidden",
+                                        "target": parsed_host,
+                                        "port": parsed_port,
+                                        "reason": "CONNECT tunneling is restricted to port 443"
+                                    })
+                                    .to_string();
+                                    let resp = format!(
+                                        "HTTP/1.1 403 Forbidden\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                                        body.len()
+                                    );
+                                    let _ = stream.write_all(resp.as_bytes()).await;
+                                    return;
+                                }
+
+                                let dial_addr = if let Some((ov_addr, _)) = override_entry {
                                     ov_addr
                                 } else {
-                                    test_up.unwrap_or(default_dial)
+                                    #[cfg(test)]
+                                    {
+                                        test_up.unwrap_or(default_dial)
+                                    }
+                                    #[cfg(not(test))]
+                                    {
+                                        default_dial
+                                    }
                                 };
-                                match Self::connect_upstream_tcp(&dial_addr).await {
+                                match Self::connect_upstream_tcp(&dial_addr, allow_override_local).await {
                                     Ok(mut upstream) => {
                                         if stream
                                             .write_all(
@@ -1557,27 +1775,21 @@ impl AegisEgressGateway {
                         return;
                     }
 
-                    let host_hdr_domain = headers
+                    let host_hdr_raw = headers
                         .get("Host")
                         .or_else(|| headers.get("host"))
-                        .cloned()
-                        .unwrap_or_else(|| "localhost".to_string())
-                        .split(':')
-                        .next()
-                        .unwrap_or("localhost")
-                        .to_string();
+                        .map(|s| s.as_str())
+                        .unwrap_or("localhost");
+                    let (host_hdr_domain, _) = Self::split_host_and_port(host_hdr_raw, 80);
                     let uri_domain = raw_target
                         .trim()
                         .strip_prefix("http://")
                         .or_else(|| raw_target.trim().strip_prefix("https://"))
                         .and_then(|rest| rest.split('/').next())
-                        .and_then(|auth| auth.split(':').next())
-                        .filter(|d| !d.is_empty())
-                        .map(str::to_string);
+                        .map(|auth| Self::split_host_and_port(auth, 80).0)
+                        .filter(|d| !d.is_empty());
                     if let Some(ref ud) = uri_domain {
-                        if !ud.eq_ignore_ascii_case(&host_hdr_domain)
-                            && host_hdr_domain != "localhost"
-                        {
+                        if !ud.eq_ignore_ascii_case(&host_hdr_domain) {
                             let body = json!({
                                 "egress": "domain_fronting_mismatch",
                                 "uri_domain": ud,
@@ -1593,13 +1805,26 @@ impl AegisEgressGateway {
                         }
                     }
                     let target_domain = uri_domain.unwrap_or(host_hdr_domain);
-                    let should_forward_upstream = headers.contains_key("X-Aegis-Upstream")
-                        || headers.contains_key("x-aegis-upstream")
-                        || headers
-                            .get("X-Aegis-Forward")
-                            .or_else(|| headers.get("x-aegis-forward"))
-                            .is_some_and(|v| v == "1" || v.eq_ignore_ascii_case("true"));
-                    let upstream_addr = Self::resolve_upstream_addr(&raw_target, &headers);
+                    let upstream_override = gw_conn
+                        .upstream_overrides
+                        .read()
+                        .await
+                        .get(&target_domain)
+                        .cloned();
+                    let has_test_upstream_hdr = cfg!(test)
+                        && (headers.contains_key("X-Aegis-Upstream")
+                            || headers.contains_key("x-aegis-upstream"));
+                    let allow_override_local = upstream_override.is_some() || has_test_upstream_hdr;
+                    let should_forward_upstream = upstream_override.is_some()
+                        || (cfg!(test)
+                            && (has_test_upstream_hdr
+                                || headers
+                                    .get("X-Aegis-Forward")
+                                    .or_else(|| headers.get("x-aegis-forward"))
+                                    .is_some_and(|v| v == "1" || v.eq_ignore_ascii_case("true"))));
+                    let upstream_addr = upstream_override
+                        .map(|(addr, _)| addr)
+                        .unwrap_or_else(|| Self::resolve_upstream_addr(&raw_target, &headers));
                     let spec = OutboundRequestSpec {
                         target_domain,
                         method,
@@ -1622,7 +1847,7 @@ impl AegisEgressGateway {
                             secrets_injected,
                         }) => {
                             if should_forward_upstream {
-                                match tokio::net::TcpStream::connect(&upstream_addr).await {
+                                match Self::connect_upstream_tcp(&upstream_addr, allow_override_local).await {
                                     Ok(mut upstream) => {
                                         let origin_path = Self::extract_origin_path_and_query(
                                             &injected_path,
@@ -1634,6 +1859,8 @@ impl AegisEgressGateway {
                                             if k.to_ascii_lowercase().starts_with("x-aegis-")
                                                 || k.eq_ignore_ascii_case("connection")
                                                 || k.eq_ignore_ascii_case("proxy-connection")
+                                                || k.eq_ignore_ascii_case("transfer-encoding")
+                                                || k.eq_ignore_ascii_case("content-length")
                                             {
                                                 continue;
                                             }
@@ -1647,6 +1874,11 @@ impl AegisEgressGateway {
                                                 "Host: {}\r\n",
                                                 spec.target_domain
                                             ));
+                                        }
+                                        if !req_body.is_empty() {
+                                            out_req.push_str(&format!("Content-Length: {}\r\n", req_body.len()));
+                                        } else if !matches!(spec.method.as_str(), "GET" | "HEAD") {
+                                            out_req.push_str("Content-Length: 0\r\n");
                                         }
                                         out_req.push_str("Connection: close\r\n\r\n");
                                         let mut write_ok =
@@ -1881,6 +2113,7 @@ mod tests {
             .forward_reverse_proxy(
                 &mut client,
                 "api.anthropic.com:443",
+                false,
                 true,
                 "api.anthropic.com",
                 "api.anthropic.com",
@@ -1989,6 +2222,7 @@ mod tests {
             .forward_reverse_proxy(
                 &mut client,
                 &upstream_addr,
+                true,
                 false,
                 "api.anthropic.com",
                 "api.anthropic.com",
@@ -2052,6 +2286,7 @@ mod tests {
             .forward_reverse_proxy(
                 &mut client,
                 &upstream_addr,
+                true,
                 false,
                 "api.openai.com",
                 "api.openai.com",
@@ -2554,5 +2789,128 @@ mod tests {
         assert!(
             AegisEgressGateway::inspect_payload_dlp("$AOS_SECRET_GH", &[], "acme").is_some()
         );
+    }
+
+    #[tokio::test]
+    async fn domain_fronting_to_localhost_is_rejected_before_secret_injection() {
+        let gw = Arc::new(AegisEgressGateway::new());
+        gw.allow_domains("acme", vec!["api.openai.com".to_string()])
+            .await;
+        gw.register_secret(SecretVaultEntry {
+            org_id: "acme".to_string(),
+            placeholder: "$AOS_SECRET_OPENAI".to_string(),
+            real_secret_value: "sk-real-secret-value-123456".to_string(),
+            allowed_domains: vec!["api.openai.com".to_string()],
+        })
+        .await;
+
+        let agent = AgentIdentity::new("acme", "coder-1", "Engineer");
+        let proxy_addr = gw
+            .start_local_proxy_with_bound_identity("127.0.0.1:0", Some(agent))
+            .await
+            .unwrap();
+
+        let mut client = tokio::net::TcpStream::connect(proxy_addr).await.unwrap();
+        let req = "GET http://api.openai.com/v1/models HTTP/1.1\r\n\
+Host: localhost:9999\r\n\
+Authorization: Bearer $AOS_SECRET_OPENAI\r\n\
+Connection: close\r\n\r\n";
+        client.write_all(req.as_bytes()).await.unwrap();
+        let mut resp = Vec::new();
+        client.read_to_end(&mut resp).await.unwrap();
+        let resp_str = String::from_utf8_lossy(&resp);
+        assert!(resp_str.contains("403 Forbidden"), "resp: {resp_str}");
+        assert!(
+            resp_str.contains("domain_fronting_mismatch"),
+            "resp: {resp_str}"
+        );
+        assert!(
+            !resp_str.contains("sk-real-secret-value-123456"),
+            "secret leaked in response: {resp_str}"
+        );
+    }
+
+    #[tokio::test]
+    async fn ssrf_private_ip_non443_connect_and_url_path_header_dlp_are_blocked() {
+        use std::net::Ipv4Addr;
+        assert!(is_forbidden_outbound_ip(IpAddr::V4(Ipv4Addr::new(127, 0, 0, 1))));
+        assert!(is_forbidden_outbound_ip(IpAddr::V4(Ipv4Addr::new(100, 64, 0, 1))));
+        assert!(is_forbidden_outbound_ip(IpAddr::V4(Ipv4Addr::new(169, 254, 169, 254))));
+        assert!(is_forbidden_outbound_ip("::ffff:127.0.0.1".parse().unwrap()));
+        assert!(is_forbidden_outbound_ip("fd00:ec2::254".parse().unwrap()));
+        assert!(!is_forbidden_outbound_ip("8.8.8.8".parse().unwrap()));
+
+        let gw = Arc::new(AegisEgressGateway::new());
+        gw.allow_domains("acme", vec!["127.0.0.1".to_string(), "api.github.com".to_string()])
+            .await;
+        let agent = AgentIdentity::new("acme", "coder-1", "Engineer");
+
+        // 1. Path & Header DLP block secrets embedded in URL path or custom header
+        let mut path_headers = HashMap::new();
+        path_headers.insert("X-Exfil".to_string(), "ok".to_string());
+        let path_verdict = gw
+            .inspect_and_inject_with_body(
+                &agent,
+                &OutboundRequestSpec {
+                    target_domain: "api.github.com".to_string(),
+                    method: "GET".to_string(),
+                    path: "/repos/acme/app/ghp_1234567890abcdefghijklmn".to_string(),
+                    headers: path_headers,
+                },
+                None,
+            )
+            .await
+            .unwrap();
+        assert!(matches!(path_verdict, EgressVerdict::BlockedSecretExfiltration { .. }));
+
+        let mut bad_hdr = HashMap::new();
+        bad_hdr.insert("X-Covert".to_string(), "AKIAIOSFODNN7EXAMPLE".to_string());
+        let hdr_verdict = gw
+            .inspect_and_inject_with_body(
+                &agent,
+                &OutboundRequestSpec {
+                    target_domain: "api.github.com".to_string(),
+                    method: "GET".to_string(),
+                    path: "/user".to_string(),
+                    headers: bad_hdr,
+                },
+                None,
+            )
+            .await
+            .unwrap();
+        assert!(matches!(hdr_verdict, EgressVerdict::BlockedSecretExfiltration { .. }));
+
+        // 2. Proxy blocks non-443 CONNECT, private IP CONNECT, and TE+CL smuggling
+        let proxy_addr = gw
+            .start_local_proxy_with_bound_identity("127.0.0.1:0", Some(agent))
+            .await
+            .unwrap();
+
+        let mut non443 = tokio::net::TcpStream::connect(proxy_addr).await.unwrap();
+        non443
+            .write_all(b"CONNECT api.github.com:22 HTTP/1.1\r\nHost: api.github.com:22\r\n\r\n")
+            .await
+            .unwrap();
+        let mut r1 = Vec::new();
+        non443.read_to_end(&mut r1).await.unwrap();
+        assert!(String::from_utf8_lossy(&r1).contains("403 Forbidden"));
+
+        let mut ssrf = tokio::net::TcpStream::connect(proxy_addr).await.unwrap();
+        ssrf.write_all(b"CONNECT 127.0.0.1:443 HTTP/1.1\r\nHost: 127.0.0.1:443\r\n\r\n")
+            .await
+            .unwrap();
+        let mut r2 = Vec::new();
+        ssrf.read_to_end(&mut r2).await.unwrap();
+        let r2_s = String::from_utf8_lossy(&r2);
+        assert!(r2_s.contains("502 Bad Gateway") || r2_s.contains("403 Forbidden"), "{r2_s}");
+
+        let mut smuggle = tokio::net::TcpStream::connect(proxy_addr).await.unwrap();
+        smuggle
+            .write_all(b"POST http://api.github.com/user HTTP/1.1\r\nHost: api.github.com\r\nContent-Length: 4\r\nTransfer-Encoding: chunked\r\n\r\n0\r\n\r\n")
+            .await
+            .unwrap();
+        let mut r3 = Vec::new();
+        smuggle.read_to_end(&mut r3).await.unwrap();
+        assert!(String::from_utf8_lossy(&r3).contains("400 Bad Request"));
     }
 }

@@ -24,10 +24,42 @@ pub enum CedarEffect {
     Forbid,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum CedarOperand {
+    PrincipalOrgId,
+    PrincipalAgentId,
+    PrincipalRole,
+    ResourceOrgId,
+    ResourceOwnerAgentId,
+    ResourceId,
+    ResourcePath,
+    Literal(String),
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum CedarExpr {
+    And(Box<CedarExpr>, Box<CedarExpr>),
+    Or(Box<CedarExpr>, Box<CedarExpr>),
+    Not(Box<CedarExpr>),
+    Eq(CedarOperand, CedarOperand),
+    Ne(CedarOperand, CedarOperand),
+    Like(CedarOperand, String),
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum CedarCondition {
+    When(CedarExpr),
+    Unless(CedarExpr),
+}
+
 #[derive(Debug, Clone)]
 pub struct CedarRule {
     pub id: String,
     pub effect: CedarEffect,
+    /// Required principal entity type (`principal is Agent`, etc.).
+    pub principal_type: Option<String>,
+    /// Matched principal agent IDs (`principal == Agent::"<id>"`). Empty means any principal.
+    pub principal_agents: Vec<String>,
     /// Action names matched by this rule (`Action::"<name>"`). Empty means any action (`action`).
     pub actions: Vec<String>,
     /// Optional resource entity type (`resource is WorkspaceResource`, etc.).
@@ -38,156 +70,709 @@ pub struct CedarRule {
     pub require_same_org: bool,
     /// `when { ... principal.org_id != resource.org_id ... }`
     pub require_diff_org: bool,
+    /// Guard clauses (`when { ... }` / `unless { ... }`) evaluated against `PolicyContext`.
+    pub conditions: Vec<CedarCondition>,
 }
 
 #[derive(Debug, Clone, Default)]
 pub struct CedarPolicySet {
     pub rules: Vec<CedarRule>,
+    pub parse_error: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum CedarToken {
+    Ident(String),
+    Str(String),
+    LParen,
+    RParen,
+    LBrace,
+    RBrace,
+    LBracket,
+    RBracket,
+    Comma,
+    Semicolon,
+    Dot,
+    Bang,
+    ColonColon,
+    EqEq,
+    NotEq,
+    AndAnd,
+    OrOr,
+}
+
+fn tokenize_cedar(src: &str) -> anyhow::Result<Vec<CedarToken>> {
+    let mut tokens = Vec::new();
+    let chars: Vec<char> = src.chars().collect();
+    let mut i = 0usize;
+    while i < chars.len() {
+        let ch = chars[i];
+        if ch.is_whitespace() {
+            i += 1;
+            continue;
+        }
+        // Line comment (`// ...`) only outside string literals
+        if ch == '/' && chars.get(i + 1) == Some(&'/') {
+            i += 2;
+            while i < chars.len() && chars[i] != '\n' {
+                i += 1;
+            }
+            continue;
+        }
+        // Block comment (`/* ... */`) only outside string literals
+        if ch == '/' && chars.get(i + 1) == Some(&'*') {
+            i += 2;
+            let mut closed = false;
+            while i + 1 < chars.len() {
+                if chars[i] == '*' && chars[i + 1] == '/' {
+                    i += 2;
+                    closed = true;
+                    break;
+                }
+                i += 1;
+            }
+            if !closed {
+                anyhow::bail!("Unterminated block comment in Cedar policy");
+            }
+            continue;
+        }
+        if ch == '"' {
+            i += 1;
+            let mut out = String::new();
+            let mut closed = false;
+            while i < chars.len() {
+                let c = chars[i];
+                if c == '"' {
+                    i += 1;
+                    closed = true;
+                    break;
+                }
+                if c == '\\' {
+                    i += 1;
+                    let esc = chars
+                        .get(i)
+                        .copied()
+                        .context("Unterminated escape in Cedar string literal")?;
+                    match esc {
+                        '"' => out.push('"'),
+                        '\\' => out.push('\\'),
+                        'n' => out.push('\n'),
+                        'r' => out.push('\r'),
+                        't' => out.push('\t'),
+                        other => out.push(other),
+                    }
+                    i += 1;
+                } else {
+                    out.push(c);
+                    i += 1;
+                }
+            }
+            if !closed {
+                anyhow::bail!("Unterminated string literal in Cedar policy");
+            }
+            tokens.push(CedarToken::Str(out));
+            continue;
+        }
+        if let Some(&next) = chars.get(i + 1) {
+            let two = match (ch, next) {
+                (':', ':') => Some(CedarToken::ColonColon),
+                ('=', '=') => Some(CedarToken::EqEq),
+                ('!', '=') => Some(CedarToken::NotEq),
+                ('&', '&') => Some(CedarToken::AndAnd),
+                ('|', '|') => Some(CedarToken::OrOr),
+                _ => None,
+            };
+            if let Some(tok) = two {
+                tokens.push(tok);
+                i += 2;
+                continue;
+            }
+        }
+        match ch {
+            '(' => tokens.push(CedarToken::LParen),
+            ')' => tokens.push(CedarToken::RParen),
+            '{' => tokens.push(CedarToken::LBrace),
+            '}' => tokens.push(CedarToken::RBrace),
+            '[' => tokens.push(CedarToken::LBracket),
+            ']' => tokens.push(CedarToken::RBracket),
+            ',' => tokens.push(CedarToken::Comma),
+            ';' => tokens.push(CedarToken::Semicolon),
+            '.' => tokens.push(CedarToken::Dot),
+            '!' => tokens.push(CedarToken::Bang),
+            _ if ch.is_ascii_alphabetic() || ch == '_' => {
+                let start = i;
+                while i < chars.len() && (chars[i].is_ascii_alphanumeric() || chars[i] == '_') {
+                    i += 1;
+                }
+                let ident: String = chars[start..i].iter().collect();
+                tokens.push(CedarToken::Ident(ident));
+                continue;
+            }
+            other => anyhow::bail!("Unexpected character '{}' in Cedar policy", other),
+        }
+        i += 1;
+    }
+    Ok(tokens)
+}
+
+struct CedarParser<'a> {
+    tokens: &'a [CedarToken],
+    pos: usize,
+}
+
+impl<'a> CedarParser<'a> {
+    fn peek(&self) -> Option<&CedarToken> {
+        self.tokens.get(self.pos)
+    }
+
+    fn next(&mut self) -> anyhow::Result<&CedarToken> {
+        let tok = self
+            .tokens
+            .get(self.pos)
+            .context("Unexpected end of Cedar policy")?;
+        self.pos += 1;
+        Ok(tok)
+    }
+
+    fn expect(&mut self, expected: &CedarToken) -> anyhow::Result<()> {
+        let tok = self.next()?;
+        if tok != expected {
+            anyhow::bail!("Expected {:?} in Cedar policy, found {:?}", expected, tok);
+        }
+        Ok(())
+    }
+
+    fn expect_ident_value(&mut self) -> anyhow::Result<String> {
+        match self.next()? {
+            CedarToken::Ident(s) => Ok(s.clone()),
+            other => anyhow::bail!("Expected identifier in Cedar policy, found {:?}", other),
+        }
+    }
+
+    fn expect_str_value(&mut self) -> anyhow::Result<String> {
+        match self.next()? {
+            CedarToken::Str(s) => Ok(s.clone()),
+            other => anyhow::bail!("Expected string literal in Cedar policy, found {:?}", other),
+        }
+    }
+
+    fn consume_ident(&mut self, name: &str) -> bool {
+        if matches!(self.peek(), Some(CedarToken::Ident(s)) if s == name) {
+            self.pos += 1;
+            true
+        } else {
+            false
+        }
+    }
+
+    fn parse_principal_clause(&mut self) -> anyhow::Result<(Option<String>, Vec<String>)> {
+        if !self.consume_ident("principal") {
+            anyhow::bail!("Expected 'principal' clause in Cedar statement head");
+        }
+        if matches!(self.peek(), Some(CedarToken::Comma)) {
+            return Ok((None, Vec::new()));
+        }
+        if self.consume_ident("is") {
+            let ty = self.expect_ident_value()?;
+            if ty != "Agent" {
+                anyhow::bail!("Unsupported principal entity type '{}'", ty);
+            }
+            return Ok((Some(ty), Vec::new()));
+        }
+        if matches!(self.peek(), Some(CedarToken::EqEq)) {
+            self.pos += 1;
+            if let Some(CedarToken::Str(_)) = self.peek() {
+                return Ok((None, vec![self.expect_str_value()?]));
+            }
+            let ty = self.expect_ident_value()?;
+            self.expect(&CedarToken::ColonColon)?;
+            let id = self.expect_str_value()?;
+            return Ok((Some(ty), vec![id]));
+        }
+        if self.consume_ident("in") {
+            if matches!(self.peek(), Some(CedarToken::LBracket)) {
+                self.pos += 1;
+                let mut ids = Vec::new();
+                while !matches!(self.peek(), Some(CedarToken::RBracket)) {
+                    let ty = self.expect_ident_value()?;
+                    if ty != "Agent" {
+                        anyhow::bail!("Unsupported principal entity type '{}' in set", ty);
+                    }
+                    self.expect(&CedarToken::ColonColon)?;
+                    ids.push(self.expect_str_value()?);
+                    if matches!(self.peek(), Some(CedarToken::Comma)) {
+                        self.pos += 1;
+                    } else {
+                        break;
+                    }
+                }
+                self.expect(&CedarToken::RBracket)?;
+                if ids.is_empty() {
+                    anyhow::bail!("Empty principal set in Cedar rule");
+                }
+                return Ok((Some("Agent".to_string()), ids));
+            }
+            let ty = self.expect_ident_value()?;
+            self.expect(&CedarToken::ColonColon)?;
+            let id = self.expect_str_value()?;
+            return Ok((Some(ty), vec![id]));
+        }
+        anyhow::bail!("Unsupported 'principal' clause syntax: {:?}", self.peek());
+    }
+
+    fn parse_action_item(&mut self) -> anyhow::Result<String> {
+        let ns = self.expect_ident_value()?;
+        if ns != "Action" {
+            anyhow::bail!("Expected Action::\"...\", found '{}::...'", ns);
+        }
+        self.expect(&CedarToken::ColonColon)?;
+        self.expect_str_value()
+    }
+
+    fn parse_action_clause(&mut self) -> anyhow::Result<Vec<String>> {
+        if !self.consume_ident("action") {
+            anyhow::bail!("Expected 'action' clause in Cedar statement head");
+        }
+        if matches!(self.peek(), Some(CedarToken::Comma)) {
+            return Ok(Vec::new());
+        }
+        if matches!(self.peek(), Some(CedarToken::EqEq)) {
+            self.pos += 1;
+            return Ok(vec![self.parse_action_item()?]);
+        }
+        if self.consume_ident("in") {
+            if matches!(self.peek(), Some(CedarToken::LBracket)) {
+                self.pos += 1;
+                let mut actions = Vec::new();
+                while !matches!(self.peek(), Some(CedarToken::RBracket)) {
+                    actions.push(self.parse_action_item()?);
+                    if matches!(self.peek(), Some(CedarToken::Comma)) {
+                        self.pos += 1;
+                    } else {
+                        break;
+                    }
+                }
+                self.expect(&CedarToken::RBracket)?;
+                if actions.is_empty() {
+                    anyhow::bail!("Empty action set in Cedar rule");
+                }
+                return Ok(actions);
+            }
+            return Ok(vec![self.parse_action_item()?]);
+        }
+        anyhow::bail!("Unsupported 'action' clause syntax: {:?}", self.peek());
+    }
+
+    fn parse_resource_clause(&mut self) -> anyhow::Result<(Option<String>, Option<String>)> {
+        if !self.consume_ident("resource") {
+            anyhow::bail!("Expected 'resource' clause in Cedar statement head");
+        }
+        if matches!(self.peek(), Some(CedarToken::RParen)) {
+            return Ok((None, None));
+        }
+        if self.consume_ident("is") {
+            let rt = self.expect_ident_value()?;
+            return Ok((Some(rt), None));
+        }
+        if matches!(self.peek(), Some(CedarToken::EqEq)) {
+            self.pos += 1;
+            if matches!(self.peek(), Some(CedarToken::Str(_))) {
+                return Ok((None, Some(self.expect_str_value()?)));
+            }
+            let rt = self.expect_ident_value()?;
+            self.expect(&CedarToken::ColonColon)?;
+            let id = self.expect_str_value()?;
+            return Ok((Some(rt), Some(id)));
+        }
+        if self.consume_ident("like") {
+            let pat = self.expect_str_value()?;
+            return Ok((None, Some(pat)));
+        }
+        anyhow::bail!("Unsupported 'resource' clause syntax: {:?}", self.peek());
+    }
+
+    fn parse_operand(&mut self) -> anyhow::Result<CedarOperand> {
+        match self.next()?.clone() {
+            CedarToken::Str(s) => Ok(CedarOperand::Literal(s)),
+            CedarToken::Ident(root) => {
+                self.expect(&CedarToken::Dot)?;
+                let field = self.expect_ident_value()?;
+                match (root.as_str(), field.as_str()) {
+                    ("principal", "org_id") => Ok(CedarOperand::PrincipalOrgId),
+                    ("principal", "agent_id") => Ok(CedarOperand::PrincipalAgentId),
+                    ("principal", "role") => Ok(CedarOperand::PrincipalRole),
+                    ("resource", "org_id") => Ok(CedarOperand::ResourceOrgId),
+                    ("resource", "owner_agent_id") => Ok(CedarOperand::ResourceOwnerAgentId),
+                    ("resource", "id") => Ok(CedarOperand::ResourceId),
+                    ("resource", "path") => Ok(CedarOperand::ResourcePath),
+                    _ => anyhow::bail!("Unsupported Cedar attribute '{}.{}'", root, field),
+                }
+            }
+            other => anyhow::bail!("Expected Cedar operand, found {:?}", other),
+        }
+    }
+
+    fn parse_expr(&mut self) -> anyhow::Result<CedarExpr> {
+        self.parse_or()
+    }
+
+    fn parse_or(&mut self) -> anyhow::Result<CedarExpr> {
+        let mut lhs = self.parse_and()?;
+        while matches!(self.peek(), Some(CedarToken::OrOr)) {
+            self.pos += 1;
+            let rhs = self.parse_and()?;
+            lhs = CedarExpr::Or(Box::new(lhs), Box::new(rhs));
+        }
+        Ok(lhs)
+    }
+
+    fn parse_and(&mut self) -> anyhow::Result<CedarExpr> {
+        let mut lhs = self.parse_unary()?;
+        while matches!(self.peek(), Some(CedarToken::AndAnd)) {
+            self.pos += 1;
+            let rhs = self.parse_unary()?;
+            lhs = CedarExpr::And(Box::new(lhs), Box::new(rhs));
+        }
+        Ok(lhs)
+    }
+
+    fn parse_unary(&mut self) -> anyhow::Result<CedarExpr> {
+        if matches!(self.peek(), Some(CedarToken::Bang)) {
+            self.pos += 1;
+            return Ok(CedarExpr::Not(Box::new(self.parse_unary()?)));
+        }
+        if matches!(self.peek(), Some(CedarToken::LParen)) {
+            self.pos += 1;
+            let inner = self.parse_expr()?;
+            self.expect(&CedarToken::RParen)?;
+            return Ok(inner);
+        }
+        let lhs = self.parse_operand()?;
+        if matches!(self.peek(), Some(CedarToken::EqEq)) {
+            self.pos += 1;
+            let rhs = self.parse_operand()?;
+            return Ok(CedarExpr::Eq(lhs, rhs));
+        }
+        if matches!(self.peek(), Some(CedarToken::NotEq)) {
+            self.pos += 1;
+            let rhs = self.parse_operand()?;
+            return Ok(CedarExpr::Ne(lhs, rhs));
+        }
+        if self.consume_ident("like") {
+            let pat = self.expect_str_value()?;
+            return Ok(CedarExpr::Like(lhs, pat));
+        }
+        anyhow::bail!(
+            "Expected comparison operator ('==', '!=', 'like') in Cedar condition, found {:?}",
+            self.peek()
+        );
+    }
+
+    fn parse_statement(&mut self, idx: usize, is_default: bool) -> anyhow::Result<CedarRule> {
+        let effect = if self.consume_ident("permit") {
+            CedarEffect::Permit
+        } else if self.consume_ident("forbid") {
+            CedarEffect::Forbid
+        } else {
+            anyhow::bail!(
+                "Expected 'permit' or 'forbid' in Cedar statement, found {:?}",
+                self.peek()
+            );
+        };
+
+        self.expect(&CedarToken::LParen)?;
+        let (principal_type, principal_agents) = self.parse_principal_clause()?;
+        self.expect(&CedarToken::Comma)?;
+        let actions = self.parse_action_clause()?;
+        self.expect(&CedarToken::Comma)?;
+        let (resource_type, resource_pattern) = self.parse_resource_clause()?;
+        self.expect(&CedarToken::RParen)?;
+
+        let mut conditions = Vec::new();
+        while let Some(CedarToken::Ident(kw)) = self.peek() {
+            if kw == "when" || kw == "unless" {
+                let is_when = kw == "when";
+                self.pos += 1;
+                self.expect(&CedarToken::LBrace)?;
+                let expr = self.parse_expr()?;
+                self.expect(&CedarToken::RBrace)?;
+                if is_when {
+                    conditions.push(CedarCondition::When(expr));
+                } else {
+                    conditions.push(CedarCondition::Unless(expr));
+                }
+            } else {
+                anyhow::bail!("Unexpected trailing keyword '{}' in Cedar rule", kw);
+            }
+        }
+        self.expect(&CedarToken::Semicolon)?;
+
+        let mut require_same_org = false;
+        let mut require_diff_org = false;
+        for cond in &conditions {
+            if let CedarCondition::When(expr) = cond {
+                if expr_contains_org_cmp(expr, true) {
+                    require_same_org = true;
+                }
+                if expr_contains_org_cmp(expr, false) {
+                    require_diff_org = true;
+                }
+            }
+        }
+
+        let id = match (is_default, effect, resource_type.as_deref()) {
+            (true, CedarEffect::Permit, Some("WorkspaceResource")) => {
+                "cedar:default:cow_workspace_auto_allow".to_string()
+            }
+            (true, CedarEffect::Permit, Some("SandboxResource")) => {
+                "cedar:default:sandbox_exec_auto_allow".to_string()
+            }
+            (true, CedarEffect::Permit, Some("OrgResource")) => {
+                "cedar:default:intra_org_sharing_auto_allow".to_string()
+            }
+            (true, CedarEffect::Permit, Some("IpcResource")) => {
+                "aegis:default:intra_org_ipc_auto_allow".to_string()
+            }
+            (true, CedarEffect::Forbid, None) if require_diff_org => {
+                "cedar:default:cross_org_forbid".to_string()
+            }
+            (_, CedarEffect::Forbid, _) => format!("cedar:forbid:rule_{}", idx + 1),
+            (_, CedarEffect::Permit, _) => format!("cedar:permit:rule_{}", idx + 1),
+        };
+
+        Ok(CedarRule {
+            id,
+            effect,
+            principal_type,
+            principal_agents,
+            actions,
+            resource_type,
+            resource_pattern,
+            require_same_org,
+            require_diff_org,
+            conditions,
+        })
+    }
+}
+
+fn expr_contains_org_cmp(expr: &CedarExpr, same: bool) -> bool {
+    match expr {
+        CedarExpr::And(a, b) | CedarExpr::Or(a, b) => {
+            expr_contains_org_cmp(a, same) || expr_contains_org_cmp(b, same)
+        }
+        CedarExpr::Not(_) => false,
+        CedarExpr::Eq(lhs, rhs) if same => matches!(
+            (lhs, rhs),
+            (CedarOperand::ResourceOrgId, CedarOperand::PrincipalOrgId)
+                | (CedarOperand::PrincipalOrgId, CedarOperand::ResourceOrgId)
+        ),
+        CedarExpr::Ne(lhs, rhs) if !same => matches!(
+            (lhs, rhs),
+            (CedarOperand::ResourceOrgId, CedarOperand::PrincipalOrgId)
+                | (CedarOperand::PrincipalOrgId, CedarOperand::ResourceOrgId)
+        ),
+        _ => false,
+    }
+}
+
+fn resolve_cedar_operand<'a>(op: &'a CedarOperand, ctx: &'a PolicyContext) -> &'a str {
+    match op {
+        CedarOperand::PrincipalOrgId => ctx.principal.org_id.as_str(),
+        CedarOperand::PrincipalAgentId => ctx.principal.agent_id.as_str(),
+        CedarOperand::PrincipalRole => ctx.principal.role.as_str(),
+        CedarOperand::ResourceOrgId => ctx.target_org_id.as_str(),
+        CedarOperand::ResourceOwnerAgentId => ctx
+            .metadata
+            .get("owner_agent_id")
+            .and_then(|v| v.as_str())
+            .unwrap_or(ctx.principal.agent_id.as_str()),
+        CedarOperand::ResourceId | CedarOperand::ResourcePath => ctx.target_resource.as_str(),
+        CedarOperand::Literal(s) => s.as_str(),
+    }
+}
+
+fn eval_cedar_expr(expr: &CedarExpr, ctx: &PolicyContext) -> bool {
+    match expr {
+        CedarExpr::And(a, b) => eval_cedar_expr(a, ctx) && eval_cedar_expr(b, ctx),
+        CedarExpr::Or(a, b) => eval_cedar_expr(a, ctx) || eval_cedar_expr(b, ctx),
+        CedarExpr::Not(inner) => !eval_cedar_expr(inner, ctx),
+        CedarExpr::Eq(lhs, rhs) => resolve_cedar_operand(lhs, ctx) == resolve_cedar_operand(rhs, ctx),
+        CedarExpr::Ne(lhs, rhs) => resolve_cedar_operand(lhs, ctx) != resolve_cedar_operand(rhs, ctx),
+        CedarExpr::Like(lhs, pat) => {
+            AegisPolicyKernel::matches_pattern(pat, resolve_cedar_operand(lhs, ctx))
+        }
+    }
+}
+
+fn infer_builtin_resource_type(action: &str) -> Option<&'static str> {
+    if action.starts_with("fs_")
+        || action.starts_with("workspace_")
+        || matches!(
+            action,
+            "github_ci_inspect" | "github_pr_inspect" | "github_issue_inspect"
+        )
+    {
+        Some("WorkspaceResource")
+    } else if matches!(action, "proc_exec" | "proc_manage") {
+        Some("SandboxResource")
+    } else if action.starts_with("org_") {
+        Some("OrgResource")
+    } else if action.starts_with("ipc_")
+        || action == "egress_http_request"
+        || action.starts_with("coord_")
+        || action.starts_with("app_")
+    {
+        Some("IpcResource")
+    } else {
+        None
+    }
 }
 
 impl CedarPolicySet {
-    pub fn parse(src: &str) -> Self {
+    pub fn try_parse(src: &str) -> anyhow::Result<Self> {
+        Self::try_parse_with_mode(src, false)
+    }
+
+    pub fn try_parse_default(src: &str) -> anyhow::Result<Self> {
+        Self::try_parse_with_mode(src, true)
+    }
+
+    fn try_parse_with_mode(src: &str, is_default: bool) -> anyhow::Result<Self> {
+        let tokens = tokenize_cedar(src)?;
+        let mut parser = CedarParser {
+            tokens: &tokens,
+            pos: 0,
+        };
         let mut rules = Vec::new();
-        let cleaned: String = src
-            .lines()
-            .map(|line| match line.find("//") {
-                Some(idx) => &line[..idx],
-                None => line,
-            })
-            .collect::<Vec<_>>()
-            .join("\n");
-
-        for (idx, raw_stmt) in cleaned.split(';').enumerate() {
-            let stmt = raw_stmt.trim();
-            if stmt.is_empty() {
-                continue;
-            }
-            let (effect, rest) = if let Some(r) = stmt.strip_prefix("permit") {
-                (CedarEffect::Permit, r.trim())
-            } else if let Some(r) = stmt.strip_prefix("forbid") {
-                (CedarEffect::Forbid, r.trim())
-            } else {
-                continue;
-            };
-
-            let Some(open_paren) = rest.find('(') else {
-                continue;
-            };
-            let Some(close_paren) = rest.rfind(')') else {
-                continue;
-            };
-            if close_paren <= open_paren {
-                continue;
-            }
-            let head = &rest[open_paren + 1..close_paren];
-            let tail = rest[close_paren + 1..].trim();
-
-            let mut actions = Vec::new();
-            let mut search = head;
-            while let Some(pos) = search.find("Action::\"") {
-                let after = &search[pos + "Action::\"".len()..];
-                if let Some(end_q) = after.find('"') {
-                    actions.push(after[..end_q].to_string());
-                    search = &after[end_q + 1..];
-                } else {
-                    break;
-                }
-            }
-
-            let mut resource_type = None;
-            let mut resource_pattern = None;
-            for clause in head.split(',') {
-                let c = clause.trim();
-                if let Some(rt) = c.strip_prefix("resource is ") {
-                    let token = rt
-                        .split_whitespace()
-                        .next()
-                        .unwrap_or("")
-                        .trim_matches(|ch: char| !ch.is_alphanumeric() && ch != '_');
-                    if !token.is_empty() {
-                        resource_type = Some(token.to_string());
-                    }
-                } else if let Some(rp) = c
-                    .strip_prefix("resource == ")
-                    .or_else(|| c.strip_prefix("resource like "))
-                {
-                    let pat = rp.trim().trim_matches('"');
-                    if !pat.is_empty() {
-                        resource_pattern = Some(pat.to_string());
-                    }
-                }
-            }
-
-            let when_body = if let Some(w) = tail.strip_prefix("when") {
-                w.trim().trim_start_matches('{').trim_end_matches('}').trim()
-            } else {
-                ""
-            };
-            let compact_when: String = when_body.chars().filter(|c| !c.is_whitespace()).collect();
-            let require_same_org = compact_when.contains("resource.org_id==principal.org_id")
-                || compact_when.contains("principal.org_id==resource.org_id");
-            let require_diff_org = compact_when.contains("principal.org_id!=resource.org_id")
-                || compact_when.contains("resource.org_id!=principal.org_id");
-            if resource_pattern.is_none() {
-                for marker in ["resource.pathlike\"", "resource.id==\""] {
-                    if let Some(pos) = compact_when.find(marker) {
-                        let after = &compact_when[pos + marker.len()..];
-                        if let Some(end_q) = after.find('"') {
-                            resource_pattern = Some(after[..end_q].to_string());
-                        }
-                    }
-                }
-            }
-
-            let id = match (effect, resource_type.as_deref()) {
-                (CedarEffect::Permit, Some("WorkspaceResource")) => {
-                    "cedar:default:cow_workspace_auto_allow".to_string()
-                }
-                (CedarEffect::Permit, Some("SandboxResource")) => {
-                    "cedar:default:sandbox_exec_auto_allow".to_string()
-                }
-                (CedarEffect::Permit, Some("OrgResource")) => {
-                    "cedar:default:intra_org_sharing_auto_allow".to_string()
-                }
-                (CedarEffect::Permit, Some("IpcResource")) => {
-                    "aegis:default:intra_org_ipc_auto_allow".to_string()
-                }
-                (CedarEffect::Forbid, _) => format!("cedar:forbid:rule_{}", idx + 1),
-                (CedarEffect::Permit, _) => format!("cedar:permit:rule_{}", idx + 1),
-            };
-
-            rules.push(CedarRule {
-                id,
-                effect,
-                actions,
-                resource_type,
-                resource_pattern,
-                require_same_org,
-                require_diff_org,
-            });
+        let mut idx = 0usize;
+        while parser.peek().is_some() {
+            rules.push(parser.parse_statement(idx, is_default)?);
+            idx += 1;
         }
+        Ok(Self {
+            rules,
+            parse_error: None,
+        })
+    }
 
-        Self { rules }
+    /// Parses a Cedar policy source string, failing closed with a catch-all `forbid` rule if syntax
+    /// is invalid so malformed policies never silently fail open.
+    pub fn parse(src: &str) -> Self {
+        match Self::try_parse(src) {
+            Ok(set) => set,
+            Err(err) => Self::fail_closed(format!("Cedar policy parse error: {err}")),
+        }
+    }
+
+    fn fail_closed(reason: String) -> Self {
+        Self {
+            rules: vec![CedarRule {
+                id: "cedar:forbid:parse_error".to_string(),
+                effect: CedarEffect::Forbid,
+                principal_type: None,
+                principal_agents: Vec::new(),
+                actions: Vec::new(),
+                resource_type: None,
+                resource_pattern: None,
+                require_same_org: false,
+                require_diff_org: false,
+                conditions: Vec::new(),
+            }],
+            parse_error: Some(reason),
+        }
+    }
+
+    pub fn try_extend_from_str(&mut self, extra_src: &str) -> anyhow::Result<()> {
+        let parsed = Self::try_parse(extra_src)?;
+        let offset = self.rules.len();
+        for (i, mut rule) in parsed.rules.into_iter().enumerate() {
+            if let Some(prefix) = rule.id.strip_suffix(&format!(":rule_{}", i + 1)) {
+                rule.id = format!("{prefix}:rule_{}", offset + i + 1);
+            }
+            self.rules.push(rule);
+        }
+        Ok(())
     }
 
     pub fn extend_from_str(&mut self, extra_src: &str) {
-        let parsed = Self::parse(extra_src);
-        self.rules.extend(parsed.rules);
+        if let Err(err) = self.try_extend_from_str(extra_src) {
+            self.fail_closed_in_place(format!("Cedar policy parse error: {err}"));
+        }
+    }
+
+    fn fail_closed_in_place(&mut self, reason: String) {
+        self.rules.retain(|r| r.effect == CedarEffect::Forbid);
+        self.rules.insert(
+            0,
+            CedarRule {
+                id: "cedar:forbid:parse_error".to_string(),
+                effect: CedarEffect::Forbid,
+                principal_type: None,
+                principal_agents: Vec::new(),
+                actions: Vec::new(),
+                resource_type: None,
+                resource_pattern: None,
+                require_same_org: false,
+                require_diff_org: false,
+                conditions: Vec::new(),
+            },
+        );
+        self.parse_error = Some(reason);
     }
 
     fn rule_matches(&self, rule: &CedarRule, ctx: &PolicyContext) -> bool {
+        if let Some(ref pt) = rule.principal_type {
+            if pt != "Agent" {
+                return false;
+            }
+        }
+        if !rule.principal_agents.is_empty()
+            && !rule
+                .principal_agents
+                .iter()
+                .any(|a| a == &ctx.principal.agent_id)
+        {
+            return false;
+        }
         if !rule.actions.is_empty() && !rule.actions.iter().any(|a| a == &ctx.action) {
             return false;
         }
-        if rule.require_same_org && ctx.principal.org_id != ctx.target_org_id {
-            return false;
-        }
-        if rule.require_diff_org && ctx.principal.org_id == ctx.target_org_id {
-            return false;
+        if let Some(ref req_rt) = rule.resource_type {
+            let explicit_rt = ctx.metadata.get("resource_type").and_then(|v| v.as_str());
+            let effective_rt = explicit_rt.or_else(|| infer_builtin_resource_type(&ctx.action));
+            match effective_rt {
+                Some(rt) if rt != req_rt.as_str() => return false,
+                None if rule.actions.is_empty()
+                    || matches!(
+                        req_rt.as_str(),
+                        "WorkspaceResource"
+                            | "SandboxResource"
+                            | "OrgResource"
+                            | "IpcResource"
+                    ) =>
+                {
+                    return false;
+                }
+                _ => {}
+            }
         }
         if let Some(ref pat) = rule.resource_pattern {
             if !AegisPolicyKernel::matches_pattern(pat, &ctx.target_resource) {
                 return false;
+            }
+        }
+        for cond in &rule.conditions {
+            match cond {
+                CedarCondition::When(expr) => {
+                    if !eval_cedar_expr(expr, ctx) {
+                        return false;
+                    }
+                }
+                CedarCondition::Unless(expr) => {
+                    if eval_cedar_expr(expr, ctx) {
+                        return false;
+                    }
+                }
             }
         }
         true
@@ -197,13 +782,16 @@ impl CedarPolicySet {
     pub fn find_custom_forbid(&self, ctx: &PolicyContext) -> Option<&CedarRule> {
         self.rules.iter().find(|r| {
             r.effect == CedarEffect::Forbid
-                && !r.require_diff_org
+                && r.id != "cedar:default:cross_org_forbid"
                 && self.rule_matches(r, ctx)
         })
     }
 
     /// Evaluates `permit` rules loaded from `policy/default.cedar` (and any custom Cedar policy file).
     pub fn find_permit(&self, ctx: &PolicyContext) -> Option<&CedarRule> {
+        if self.parse_error.is_some() {
+            return None;
+        }
         self.rules
             .iter()
             .find(|r| r.effect == CedarEffect::Permit && self.rule_matches(r, ctx))
@@ -216,6 +804,8 @@ struct PersistedPolicyState {
     escalations: Vec<PendingEscalation>,
 }
 
+type HostExecLeaseEntry = (String, String, String);
+
 pub struct AegisPolicyKernel {
     state_file: Option<PathBuf>,
     state_mutex: Arc<tokio::sync::Mutex<()>>,
@@ -223,8 +813,7 @@ pub struct AegisPolicyKernel {
     escalations: Arc<RwLock<Vec<PendingEscalation>>>,
     /// Unforgeable in-memory lease registry for `host_exec`. Never persisted or hydrated from
     /// `policy_state.json`, preventing an unsandboxed same-UID child from forging disk leases.
-    in_memory_host_exec_leases:
-        Arc<RwLock<std::collections::HashMap<String, (String, String, String)>>>,
+    in_memory_host_exec_leases: Arc<RwLock<std::collections::HashMap<String, HostExecLeaseEntry>>>,
     forbidden_host_prefixes: Vec<String>,
     cedar_policies: CedarPolicySet,
 }
@@ -253,10 +842,27 @@ impl AegisPolicyKernel {
             }
         }
 
-        let mut cedar_policies = CedarPolicySet::parse(DEFAULT_CEDAR_POLICY);
+        let mut cedar_policies = CedarPolicySet::try_parse_default(DEFAULT_CEDAR_POLICY)
+            .expect("embedded policy/default.cedar must parse cleanly");
         if let Ok(custom_path) = std::env::var("AOS_CEDAR_POLICY_FILE") {
-            if let Ok(custom_src) = std::fs::read_to_string(&custom_path) {
-                cedar_policies.extend_from_str(&custom_src);
+            let trimmed = custom_path.trim();
+            if !trimmed.is_empty() {
+                match std::fs::read_to_string(trimmed) {
+                    Ok(custom_src) => {
+                        if let Err(err) = cedar_policies.try_extend_from_str(&custom_src) {
+                            cedar_policies.fail_closed_in_place(format!(
+                                "Failed to parse AOS_CEDAR_POLICY_FILE '{}': {}",
+                                trimmed, err
+                            ));
+                        }
+                    }
+                    Err(err) => {
+                        cedar_policies.fail_closed_in_place(format!(
+                            "Failed to read AOS_CEDAR_POLICY_FILE '{}': {}",
+                            trimmed, err
+                        ));
+                    }
+                }
             }
         }
 
@@ -270,6 +876,7 @@ impl AegisPolicyKernel {
                 "~/.ssh".to_string(),
                 "~/.aws".to_string(),
                 "~/.gnupg".to_string(),
+                "~/.kube".to_string(),
                 "/etc/shadow".to_string(),
                 "/etc/sudoers".to_string(),
                 "/System".to_string(),
@@ -278,7 +885,14 @@ impl AegisPolicyKernel {
         }
     }
 
-    /// Appends additional declarative Cedar policy statements (`permit` / `forbid`) to this kernel.
+    /// Appends additional declarative Cedar policy statements (`permit` / `forbid`), returning
+    /// an error if parsing fails.
+    pub fn try_add_cedar_policies(&mut self, cedar_src: &str) -> anyhow::Result<()> {
+        self.cedar_policies.try_extend_from_str(cedar_src)
+    }
+
+    /// Appends additional declarative Cedar policy statements (`permit` / `forbid`) to this kernel,
+    /// failing closed if `cedar_src` contains invalid or unsupported syntax.
     pub fn add_cedar_policies(&mut self, cedar_src: &str) {
         self.cedar_policies.extend_from_str(cedar_src);
     }
@@ -322,10 +936,31 @@ impl AegisPolicyKernel {
         if pattern == "*" || pattern == value {
             return true;
         }
-        if let Some(prefix) = pattern.strip_suffix('*') {
-            return value.starts_with(prefix);
+        let pat: Vec<char> = pattern.chars().collect();
+        let val: Vec<char> = value.chars().collect();
+        let (mut pi, mut vi) = (0usize, 0usize);
+        let mut star_pi: Option<usize> = None;
+        let mut match_vi = 0usize;
+        while vi < val.len() {
+            if pi < pat.len() && (pat[pi] == '?' || pat[pi] == val[vi]) {
+                pi += 1;
+                vi += 1;
+            } else if pi < pat.len() && pat[pi] == '*' {
+                star_pi = Some(pi);
+                match_vi = vi;
+                pi += 1;
+            } else if let Some(sp) = star_pi {
+                pi = sp + 1;
+                match_vi += 1;
+                vi = match_vi;
+            } else {
+                return false;
+            }
         }
-        false
+        while pi < pat.len() && pat[pi] == '*' {
+            pi += 1;
+        }
+        pi == pat.len()
     }
 
     /// Matches a lease `resource_pattern` against `target_resource` and, if the pattern includes a
@@ -336,11 +971,14 @@ impl AegisPolicyKernel {
         value: &str,
         metadata: &serde_json::Value,
     ) -> bool {
-        if let Some((base_pat, expected_hash)) = pattern.split_once("#sha256:") {
-            if !Self::matches_pattern(base_pat, value) {
-                return false;
+        if let Some((base_pat, expected_hash)) = pattern.rsplit_once("#sha256:") {
+            if !expected_hash.is_empty() {
+                if !Self::matches_pattern(base_pat, value) {
+                    return false;
+                }
+                return metadata.get("evidence_hash").and_then(|v| v.as_str())
+                    == Some(expected_hash);
             }
-            return metadata.get("evidence_hash").and_then(|v| v.as_str()) == Some(expected_hash);
         }
         if let Some(expected_hash) = pattern.strip_prefix("sha256:") {
             return metadata.get("evidence_hash").and_then(|v| v.as_str()) == Some(expected_hash);
@@ -368,9 +1006,22 @@ impl AegisPolicyKernel {
         if std::env::var("AEGIS_ALLOW_NESTED_TEST_SANDBOX").as_deref() != Ok("1") {
             return s;
         }
+        let temp_dir_str = std::env::temp_dir().to_string_lossy().into_owned();
+        let temp_norm = temp_dir_str.trim_end_matches('/');
+        let has_real_tmp_prefix = s.starts_with("/tmp/")
+            || s.starts_with("/private/tmp/")
+            || s.starts_with("/var/folders/")
+            || s.starts_with("/private/var/folders/")
+            || (!temp_norm.is_empty() && s.starts_with(&format!("{temp_norm}/")));
+        if !has_real_tmp_prefix {
+            return s;
+        }
         let Some(idx) = s.find("/agent_home/.tmp") else {
             return s;
         };
+        if s[..idx].contains("/../") || s[..idx].ends_with("/..") {
+            return s;
+        }
         let rest = &s[idx + "/agent_home/".len()..];
         match rest.find('/') {
             Some(slash) => &rest[slash..],
@@ -506,22 +1157,6 @@ impl AegisPolicyKernel {
         .any(|marker| norm.contains(&marker) || norm.ends_with(marker.trim_end_matches('/')))
     }
 
-    async fn has_active_sensitive_lease(
-        &self,
-        ctx: &PolicyContext,
-        sensitive_action: &str,
-        resource: &str,
-    ) -> bool {
-        let sensitive_ctx = PolicyContext {
-            principal: ctx.principal.clone(),
-            action: sensitive_action.to_string(),
-            target_org_id: ctx.target_org_id.clone(),
-            target_resource: resource.to_string(),
-            metadata: ctx.metadata.clone(),
-        };
-        self.check_active_lease(&sensitive_ctx).await.is_some()
-    }
-
     /// Matches an already-built policy context against active leases using the same semantics as
     /// `evaluate` (org/agent/action/resource/task/evidence pin). A matching OneShot lease is
     /// consumed, which is the desired fail-closed behaviour for a one-shot approval.
@@ -530,6 +1165,93 @@ impl AegisPolicyKernel {
     /// must use `evaluate`; this helper only answers "is there an active lease for this effect?".
     pub async fn match_active_lease(&self, ctx: &PolicyContext) -> Option<LeaseGrant> {
         self.check_active_lease(ctx).await
+    }
+
+    /// Atomically verifies that every target in `targets` has an active sensitive lease for
+    /// `sensitive_action`. Consumes matching `OneShot` leases only when ALL targets are covered;
+    /// otherwise preserves all existing `OneShot` leases untouched and returns the unleased targets.
+    async fn check_all_sensitive_targets_atomic(
+        &self,
+        ctx: &PolicyContext,
+        sensitive_action: &str,
+        targets: &[String],
+    ) -> Vec<String> {
+        let _guard = self.state_mutex.lock().await;
+        let _file_lock = self.acquire_state_lock().await.ok().flatten();
+        self.reload_from_disk().await;
+        let now_ms = Utc::now().timestamp_millis();
+        let ctx_task_id = ctx
+            .metadata
+            .get("task_id")
+            .and_then(|value| value.as_str());
+
+        let mut missing = Vec::new();
+        let mut oneshot_consume_indices: std::collections::BTreeSet<usize> =
+            std::collections::BTreeSet::new();
+
+        {
+            let leases = self.leases.read().await;
+            for target in targets {
+                let mut matched_idx = None;
+                let mut matched_oneshot = false;
+                for (idx, lease) in leases.iter().enumerate() {
+                    let kind = if lease.kind == LeaseKind::Ttl && lease.expires_at_ms == -1 {
+                        LeaseKind::OneShot
+                    } else {
+                        lease.kind
+                    };
+                    let valid = if lease.expires_at_ms == -1 {
+                        kind == LeaseKind::OneShot
+                    } else {
+                        lease.expires_at_ms > now_ms
+                    };
+                    let task_ok = match kind {
+                        LeaseKind::TaskScoped => {
+                            ctx_task_id.is_some() && lease.task_id.as_deref() == ctx_task_id
+                        }
+                        LeaseKind::Ttl | LeaseKind::OneShot => {
+                            lease.task_id.is_none() || lease.task_id.as_deref() == ctx_task_id
+                        }
+                    };
+                    if valid
+                        && task_ok
+                        && lease.org_id == ctx.principal.org_id
+                        && (lease.agent_id == "*" || lease.agent_id == ctx.principal.agent_id)
+                        && Self::matches_pattern(&lease.action_pattern, sensitive_action)
+                        && Self::matches_resource_and_evidence(
+                            &lease.resource_pattern,
+                            target,
+                            &ctx.metadata,
+                        )
+                    {
+                        matched_idx = Some(idx);
+                        matched_oneshot = kind == LeaseKind::OneShot;
+                        break;
+                    }
+                }
+                if let Some(idx) = matched_idx {
+                    if matched_oneshot {
+                        oneshot_consume_indices.insert(idx);
+                    }
+                } else {
+                    missing.push(target.clone());
+                }
+            }
+        }
+
+        if missing.is_empty() && !oneshot_consume_indices.is_empty() {
+            {
+                let mut leases = self.leases.write().await;
+                for idx in oneshot_consume_indices.into_iter().rev() {
+                    if idx < leases.len() {
+                        leases.remove(idx);
+                    }
+                }
+            }
+            let _ = self.flush_to_disk_unlocked().await;
+        }
+
+        missing
     }
 
     async fn check_active_lease(&self, ctx: &PolicyContext) -> Option<LeaseGrant> {
@@ -554,15 +1276,18 @@ impl AegisPolicyKernel {
                 } else {
                     lease.kind
                 };
-                let valid = match kind {
-                    LeaseKind::OneShot => true,
-                    LeaseKind::Ttl | LeaseKind::TaskScoped => lease.expires_at_ms > now_ms,
+                let valid = if lease.expires_at_ms == -1 {
+                    kind == LeaseKind::OneShot
+                } else {
+                    lease.expires_at_ms > now_ms
                 };
                 let task_ok = match kind {
                     LeaseKind::TaskScoped => {
                         ctx_task_id.is_some() && lease.task_id.as_deref() == ctx_task_id
                     }
-                    LeaseKind::Ttl | LeaseKind::OneShot => true,
+                    LeaseKind::Ttl | LeaseKind::OneShot => {
+                        lease.task_id.is_none() || lease.task_id.as_deref() == ctx_task_id
+                    }
                 };
                 if valid
                     && task_ok
@@ -620,15 +1345,18 @@ impl AegisPolicyKernel {
                 } else {
                     lease.kind
                 };
-                let valid = match kind {
-                    LeaseKind::OneShot => true,
-                    LeaseKind::Ttl | LeaseKind::TaskScoped => lease.expires_at_ms > now_ms,
+                let valid = if lease.expires_at_ms == -1 {
+                    kind == LeaseKind::OneShot
+                } else {
+                    lease.expires_at_ms > now_ms
                 };
                 let task_ok = match kind {
                     LeaseKind::TaskScoped => {
                         ctx_task_id.is_some() && lease.task_id.as_deref() == ctx_task_id
                     }
-                    LeaseKind::Ttl | LeaseKind::OneShot => true,
+                    LeaseKind::Ttl | LeaseKind::OneShot => {
+                        lease.task_id.is_none() || lease.task_id.as_deref() == ctx_task_id
+                    }
                 };
                 let mem_verified = in_mem.get(&lease.lease_id).is_some_and(|(o, a, r)| {
                     o == &lease.org_id && a == &lease.agent_id && r == &lease.resource_pattern
@@ -835,9 +1563,10 @@ impl PolicyEngine for AegisPolicyKernel {
             });
         }
 
-        let redline_target = Self::strip_nested_test_tmpdir(&ctx.target_resource);
+        let redline_target = Self::strip_nested_test_tmpdir(&ctx.target_resource).to_lowercase();
         for forbidden in &self.forbidden_host_prefixes {
-            if redline_target.starts_with(forbidden)
+            let forbidden_folded = forbidden.to_lowercase();
+            if redline_target.starts_with(&forbidden_folded)
                 || redline_target.contains("/.ssh/")
                 || redline_target.contains("/.aws/")
                 || redline_target.contains("/.gnupg/")
@@ -853,6 +1582,41 @@ impl PolicyEngine for AegisPolicyKernel {
                         ctx.target_resource
                     ),
                 });
+            }
+        }
+
+        // Sandbox command hard red-lines must run BEFORE session-lease matching so even a wildcard
+        // lease can never authorize privilege escalation (`sudo`/`doas`/`pkexec`/`su`) or credential scraping.
+        if matches!(ctx.action.as_str(), "proc_exec" | "proc_manage") {
+            if let Some(cmd) = ctx.metadata.get("command").and_then(|v| v.as_str()) {
+                let trimmed = cmd.trim();
+                let invokes_privesc = trimmed
+                    .split([';', '|', '&', '\n', '(', '`'])
+                    .map(|seg| seg.trim())
+                    .any(|seg| {
+                        let first = seg.split_whitespace().next().unwrap_or("");
+                        let bin = first.rsplit('/').next().unwrap_or(first);
+                        matches!(
+                            bin.to_ascii_lowercase().as_str(),
+                            "sudo" | "doas" | "pkexec" | "su"
+                        )
+                    });
+                if invokes_privesc {
+                    return Ok(PolicyDecision::Deny {
+                        reason: "Privilege escalation ('sudo') is forbidden inside Aegis OS sandbox"
+                            .to_string(),
+                    });
+                }
+                let cmd_folded = trimmed.to_lowercase();
+                if cmd_folded.contains("/.ssh")
+                    || cmd_folded.contains("/.aws")
+                    || cmd_folded.contains("/.gnupg")
+                    || cmd_folded.contains("/.kube")
+                {
+                    return Ok(PolicyDecision::Deny {
+                        reason: "Command attempts to access protected host credentials".to_string(),
+                    });
+                }
             }
         }
 
@@ -917,20 +1681,13 @@ impl PolicyEngine for AegisPolicyKernel {
         // `skip_verify=true` (when a host verification gate is configured) requires explicit human
         // escalation (`workspace_commit_sensitive`).
         if ctx.action == "workspace_commit" && !aos_core::ablated("commit_guard") {
-            let mut unleased_sensitive: Vec<String> = Vec::new();
+            let mut sensitive_candidates: Vec<String> = Vec::new();
+            let mut seen_sensitive: std::collections::BTreeSet<String> =
+                std::collections::BTreeSet::new();
             if let Some(paths) = ctx.metadata.get("paths").and_then(|v| v.as_array()) {
                 for p in paths.iter().filter_map(|x| x.as_str()) {
-                    if Self::is_commit_poisoning_path(p) {
-                        let sensitive_ctx = PolicyContext {
-                            principal: ctx.principal.clone(),
-                            action: "workspace_commit_sensitive".to_string(),
-                            target_org_id: ctx.target_org_id.clone(),
-                            target_resource: p.to_string(),
-                            metadata: ctx.metadata.clone(),
-                        };
-                        if self.check_active_lease(&sensitive_ctx).await.is_none() {
-                            unleased_sensitive.push(p.to_string());
-                        }
+                    if Self::is_commit_poisoning_path(p) && seen_sensitive.insert(p.to_string()) {
+                        sensitive_candidates.push(p.to_string());
                     }
                 }
             }
@@ -939,17 +1696,9 @@ impl PolicyEngine for AegisPolicyKernel {
                 .get("overwrite_binaries")
                 .and_then(|v| v.as_bool())
                 == Some(true)
+                && seen_sensitive.insert("flag:overwrite_binaries".to_string())
             {
-                let bin_ctx = PolicyContext {
-                    principal: ctx.principal.clone(),
-                    action: "workspace_commit_sensitive".to_string(),
-                    target_org_id: ctx.target_org_id.clone(),
-                    target_resource: "flag:overwrite_binaries".to_string(),
-                    metadata: ctx.metadata.clone(),
-                };
-                if self.check_active_lease(&bin_ctx).await.is_none() {
-                    unleased_sensitive.push("flag:overwrite_binaries".to_string());
-                }
+                sensitive_candidates.push("flag:overwrite_binaries".to_string());
             }
             if ctx.metadata.get("skip_verify").and_then(|v| v.as_bool()) == Some(true)
                 && ctx
@@ -957,26 +1706,40 @@ impl PolicyEngine for AegisPolicyKernel {
                     .get("has_configured_verify_cmd")
                     .and_then(|v| v.as_bool())
                     == Some(true)
+                && seen_sensitive.insert("flag:skip_verify".to_string())
             {
-                let skip_ctx = PolicyContext {
-                    principal: ctx.principal.clone(),
-                    action: "workspace_commit_sensitive".to_string(),
-                    target_org_id: ctx.target_org_id.clone(),
-                    target_resource: "flag:skip_verify".to_string(),
-                    metadata: ctx.metadata.clone(),
-                };
-                if self.check_active_lease(&skip_ctx).await.is_none() {
-                    unleased_sensitive.push("flag:skip_verify".to_string());
-                }
+                sensitive_candidates.push("flag:skip_verify".to_string());
             }
+            let unleased_sensitive = if sensitive_candidates.is_empty() {
+                Vec::new()
+            } else {
+                self.check_all_sensitive_targets_atomic(
+                    ctx,
+                    "workspace_commit_sensitive",
+                    &sensitive_candidates,
+                )
+                .await
+            };
             if !unleased_sensitive.is_empty() {
                 let combined_resource = unleased_sensitive.join(", ");
+                let mut sensitive_meta = ctx.metadata.clone();
+                if let Some(obj) = sensitive_meta.as_object_mut() {
+                    let ev_entry = obj
+                        .entry("evidence".to_string())
+                        .or_insert_with(|| serde_json::json!({}));
+                    if let Some(ev_obj) = ev_entry.as_object_mut() {
+                        ev_obj.insert(
+                            "sensitive_targets".to_string(),
+                            serde_json::json!(unleased_sensitive),
+                        );
+                    }
+                }
                 let batch_ctx = PolicyContext {
                     principal: ctx.principal.clone(),
                     action: "workspace_commit_sensitive".to_string(),
                     target_org_id: ctx.target_org_id.clone(),
                     target_resource: combined_resource.clone(),
-                    metadata: ctx.metadata.clone(),
+                    metadata: sensitive_meta,
                 };
                 let reason = if unleased_sensitive.len() == 1
                     && unleased_sensitive[0] == "flag:overwrite_binaries"
@@ -1009,7 +1772,7 @@ impl PolicyEngine for AegisPolicyKernel {
         // `skip_verify` / `overwrite_binaries` (under `auto_commit_shadow`) require explicit
         // `workspace_git_sensitive` escalation and cannot ride on a general `workspace_git` lease.
         if ctx.action == "workspace_git" && !aos_core::ablated("commit_guard") {
-            let mut unleased_sensitive: Vec<String> = Vec::new();
+            let mut sensitive_candidates: Vec<String> = Vec::new();
             let mut seen_sensitive_paths: std::collections::BTreeSet<String> =
                 std::collections::BTreeSet::new();
             for key in ["paths", "shadow_paths"] {
@@ -1017,11 +1780,8 @@ impl PolicyEngine for AegisPolicyKernel {
                     for p in arr.iter().filter_map(|x| x.as_str()) {
                         if Self::is_commit_poisoning_path(p)
                             && seen_sensitive_paths.insert(p.to_string())
-                            && !self
-                                .has_active_sensitive_lease(ctx, "workspace_git_sensitive", p)
-                                .await
                         {
-                            unleased_sensitive.push(p.to_string());
+                            sensitive_candidates.push(p.to_string());
                         }
                     }
                 }
@@ -1032,11 +1792,9 @@ impl PolicyEngine for AegisPolicyKernel {
                 ("overwrite_binaries", "flag:overwrite_binaries"),
             ] {
                 if ctx.metadata.get(meta_key).and_then(|v| v.as_bool()) == Some(true)
-                    && !self
-                        .has_active_sensitive_lease(ctx, "workspace_git_sensitive", flag_res)
-                        .await
+                    && seen_sensitive_paths.insert(flag_res.to_string())
                 {
-                    unleased_sensitive.push(flag_res.to_string());
+                    sensitive_candidates.push(flag_res.to_string());
                 }
             }
             if ctx.metadata.get("skip_verify").and_then(|v| v.as_bool()) == Some(true)
@@ -1045,12 +1803,20 @@ impl PolicyEngine for AegisPolicyKernel {
                     .get("has_configured_verify_cmd")
                     .and_then(|v| v.as_bool())
                     == Some(true)
-                && !self
-                    .has_active_sensitive_lease(ctx, "workspace_git_sensitive", "flag:skip_verify")
-                    .await
+                && seen_sensitive_paths.insert("flag:skip_verify".to_string())
             {
-                unleased_sensitive.push("flag:skip_verify".to_string());
+                sensitive_candidates.push("flag:skip_verify".to_string());
             }
+            let unleased_sensitive = if sensitive_candidates.is_empty() {
+                Vec::new()
+            } else {
+                self.check_all_sensitive_targets_atomic(
+                    ctx,
+                    "workspace_git_sensitive",
+                    &sensitive_candidates,
+                )
+                .await
+            };
             if !unleased_sensitive.is_empty() {
                 let combined_resource = unleased_sensitive.join(", ");
                 let mut sensitive_meta = ctx.metadata.clone();
@@ -1062,6 +1828,10 @@ impl PolicyEngine for AegisPolicyKernel {
                         ev_obj.insert(
                             "git_target_resource".to_string(),
                             serde_json::json!(ctx.target_resource.clone()),
+                        );
+                        ev_obj.insert(
+                            "sensitive_targets".to_string(),
+                            serde_json::json!(unleased_sensitive),
                         );
                     }
                 }
@@ -1233,33 +2003,6 @@ impl PolicyEngine for AegisPolicyKernel {
         }
 
         // 4. Evaluate Declarative Cedar `permit` Rules (`policy/default.cedar` + custom Cedar policies):
-        if matches!(ctx.action.as_str(), "proc_exec" | "proc_manage") {
-            if let Some(cmd) = ctx.metadata.get("command").and_then(|v| v.as_str()) {
-                let trimmed = cmd.trim();
-                let invokes_privesc = trimmed
-                    .split([';', '|', '&', '\n'])
-                    .map(|seg| seg.trim())
-                    .any(|seg| {
-                        let first = seg.split_whitespace().next().unwrap_or("");
-                        let bin = first.rsplit('/').next().unwrap_or(first);
-                        matches!(bin, "sudo" | "doas" | "pkexec" | "su")
-                    });
-                if invokes_privesc {
-                    return Ok(PolicyDecision::Deny {
-                        reason: "Privilege escalation ('sudo') is forbidden inside Aegis OS sandbox"
-                            .to_string(),
-                    });
-                }
-                if trimmed.contains("/.ssh")
-                    || trimmed.contains("/.aws")
-                    || trimmed.contains("/.gnupg")
-                {
-                    return Ok(PolicyDecision::Deny {
-                        reason: "Command attempts to access protected host credentials".to_string(),
-                    });
-                }
-            }
-        }
         if let Some(permit_rule) = self.cedar_policies.find_permit(ctx) {
             return Ok(PolicyDecision::Allow {
                 matched_rule: permit_rule.id.clone(),
@@ -1756,6 +2499,8 @@ impl PolicyEngine for AegisPolicyKernel {
         org_id: &str,
         agent_id: Option<&str>,
     ) -> anyhow::Result<Vec<LeaseGrant>> {
+        let _guard = self.state_mutex.lock().await;
+        let _file_lock = self.acquire_state_lock().await.ok().flatten();
         self.reload_from_disk().await;
         let now_ms = Utc::now().timestamp_millis();
         let leases = self.leases.read().await;
@@ -1905,22 +2650,28 @@ impl PolicyEngine for AegisPolicyKernel {
                 target.action.as_str(),
                 "workspace_commit_sensitive" | "workspace_git_sensitive"
             ) {
-                let parts: Vec<&str> = target
-                    .target_resource
-                    .split(',')
-                    .map(|s| s.trim())
-                    .filter(|s| !s.is_empty())
-                    .collect();
+                let parts: Vec<String> = target
+                    .evidence
+                    .as_ref()
+                    .and_then(|ev| ev.get("sensitive_targets"))
+                    .and_then(|v| v.as_array())
+                    .map(|arr| {
+                        arr.iter()
+                            .filter_map(|item| item.as_str().map(str::to_string))
+                            .filter(|s| !s.is_empty())
+                            .collect()
+                    })
+                    .unwrap_or_else(|| vec![target.target_resource.clone()]);
                 if parts.len() > 1 {
                     for (idx, part) in parts.into_iter().enumerate() {
                         let part_pattern = if is_oneshot {
                             if let Some(ref ev_hash) = target.evidence_hash {
                                 format!("{}#sha256:{}", part, ev_hash)
                             } else {
-                                part.to_string()
+                                part
                             }
                         } else {
-                            part.to_string()
+                            part
                         };
                         let part_lease = LeaseGrant {
                             lease_id: format!("lease-{}", &Uuid::new_v4().to_string()[..8]),
@@ -1939,7 +2690,7 @@ impl PolicyEngine for AegisPolicyKernel {
                         leases.push(part_lease);
                     }
                 } else {
-                    // One combined target is already represented by `lease`.
+                    // One combined target (even if its filename contains `, `) is already represented by `lease`.
                     leases.push(lease.clone());
                 }
                 let (companion_action, companion_base) = if target.action == "workspace_commit_sensitive" {
@@ -3400,5 +4151,222 @@ mod casefold_guard_tests {
         assert!(K::is_forbidden_import_source("/Users/x/library/keychains/login.keychain-db"));
         assert!(K::is_forbidden_import_source("/Users/x/proj/.ENV"));
         assert!(!K::is_forbidden_import_source("/Users/x/proj/.env.example"));
+    }
+}
+
+#[cfg(test)]
+mod stage2_security_tests {
+    use super::*;
+    use aos_core::AgentIdentity;
+    use serde_json::json;
+
+    #[tokio::test]
+    async fn cedar_parser_handles_urls_globs_principal_owner_unless_and_fails_closed() {
+        // 1. Quotes with `//` and `;`, mid-string globs, `principal == Agent::"..."`,
+        // `resource.owner_agent_id`, `unless { ... }`, and custom cross-org forbid rule.
+        let mut kernel = AegisPolicyKernel::new();
+        kernel
+            .try_add_cedar_policies(
+                r#"
+                permit (
+                    principal == Agent::"uploader-1",
+                    action in [Action::"custom_upload"],
+                    resource like "/workspace/*/artifacts/*.bin"
+                ) when {
+                    resource.org_id == principal.org_id &&
+                    resource.id != "https://blocked.example.com/a;b"
+                } unless {
+                    resource.path like "*.tmp"
+                };
+
+                forbid (
+                    principal is Agent,
+                    action in [Action::"custom_upload"],
+                    resource like "*.pem"
+                );
+                "#,
+            )
+            .expect("valid Cedar policy with URL and mid-globs must parse");
+
+        let uploader = AgentIdentity::new("acme", "uploader-1", "Bot");
+        let other = AgentIdentity::new("acme", "other-agent", "Bot");
+
+        // Matching mid-glob + allowed agent + allowed org -> Allow
+        let ok_ctx = PolicyContext {
+            principal: uploader.clone(),
+            action: "custom_upload".to_string(),
+            target_org_id: "acme".to_string(),
+            target_resource: "/workspace/sub1/artifacts/pkg.bin".to_string(),
+            metadata: json!({}),
+        };
+        assert!(matches!(
+            kernel.evaluate(&ok_ctx).await.unwrap(),
+            PolicyDecision::Allow { .. }
+        ));
+
+        // Different agent does not match `principal == Agent::"uploader-1"`
+        let wrong_agent_ctx = PolicyContext {
+            principal: other.clone(),
+            ..ok_ctx.clone()
+        };
+        assert!(!matches!(
+            kernel.evaluate(&wrong_agent_ctx).await.unwrap(),
+            PolicyDecision::Allow { .. }
+        ));
+
+        // `.pem` matches suffix glob -> Deny by forbid rule
+        let pem_ctx = PolicyContext {
+            principal: uploader.clone(),
+            action: "custom_upload".to_string(),
+            target_org_id: "acme".to_string(),
+            target_resource: "/workspace/key.pem".to_string(),
+            metadata: json!({}),
+        };
+        assert!(matches!(
+            kernel.evaluate(&pem_ctx).await.unwrap(),
+            PolicyDecision::Deny { .. }
+        ));
+
+        // `owner_agent_id` mismatch blocks default WorkspaceResource permit
+        let cross_agent_fs = PolicyContext {
+            principal: other,
+            action: "fs_read".to_string(),
+            target_org_id: "acme".to_string(),
+            target_resource: "/workspace/file.txt".to_string(),
+            metadata: json!({ "owner_agent_id": "uploader-1" }),
+        };
+        assert!(!matches!(
+            kernel.evaluate(&cross_agent_fs).await.unwrap(),
+            PolicyDecision::Allow { .. }
+        ));
+
+        // 2. Malformed Cedar must return Err from `try_add_cedar_policies` AND fail closed via `add_cedar_policies`
+        assert!(CedarPolicySet::try_parse("permit(principal, action, resource) when { unknown.field == \"x\" };").is_err());
+        let mut fail_closed_kernel = AegisPolicyKernel::new();
+        fail_closed_kernel.add_cedar_policies("permit(principal, action, resource) when { bogus.x == \"1\" };");
+        let benign_fs = PolicyContext {
+            principal: uploader,
+            action: "fs_read".to_string(),
+            target_org_id: "acme".to_string(),
+            target_resource: "/workspace/readme.md".to_string(),
+            metadata: json!({}),
+        };
+        assert!(
+            matches!(fail_closed_kernel.evaluate(&benign_fs).await.unwrap(), PolicyDecision::Deny { .. }),
+            "invalid Cedar policy must fail closed rather than permit"
+        );
+    }
+
+    #[tokio::test]
+    async fn sensitive_commit_preserves_oneshot_atomically_and_blocks_comma_injection() {
+        let kernel = AegisPolicyKernel::new();
+        let agent = AgentIdentity::new("acme", "coder-1", "Engineer");
+
+        // Grant OneShot for Cargo.toml only, then request commit touching BOTH Cargo.toml and Makefile.
+        kernel
+            .grant_lease(LeaseGrant {
+                lease_id: "lease-cargo-oneshot".to_string(),
+                org_id: "acme".to_string(),
+                agent_id: "coder-1".to_string(),
+                action_pattern: "workspace_commit_sensitive".to_string(),
+                resource_pattern: "Cargo.toml".to_string(),
+                expires_at_ms: Utc::now().timestamp_millis() + 60_000,
+                granted_by: "human".to_string(),
+                kind: LeaseKind::OneShot,
+                task_id: None,
+            })
+            .await
+            .unwrap();
+        let two_files_ctx = PolicyContext {
+            principal: agent.clone(),
+            action: "workspace_commit".to_string(),
+            target_org_id: "acme".to_string(),
+            target_resource: "/workspace".to_string(),
+            metadata: json!({ "paths": ["Cargo.toml", "Makefile"] }),
+        };
+        assert!(matches!(
+            kernel.evaluate(&two_files_ctx).await.unwrap(),
+            PolicyDecision::Ask { .. }
+        ));
+        // Cargo.toml OneShot lease must still exist because Makefile failed!
+        let single_cargo_ctx = PolicyContext {
+            principal: agent.clone(),
+            action: "workspace_commit_sensitive".to_string(),
+            target_org_id: "acme".to_string(),
+            target_resource: "Cargo.toml".to_string(),
+            metadata: json!({}),
+        };
+        assert!(
+            kernel.match_active_lease(&single_cargo_ctx).await.is_some(),
+            "Cargo.toml OneShot lease must not be burned when Makefile fails"
+        );
+
+        // Comma injection in a single filename must NOT split into `flag:skip_verify`
+        let comma_ctx = PolicyContext {
+            principal: agent.clone(),
+            action: "workspace_commit".to_string(),
+            target_org_id: "acme".to_string(),
+            target_resource: "/workspace".to_string(),
+            metadata: json!({
+                "paths": [".github/workflows/x, flag:skip_verify"],
+                "skip_verify": false,
+            }),
+        };
+        let esc_id = match kernel.evaluate(&comma_ctx).await.unwrap() {
+            PolicyDecision::Ask { escalation_id, .. } => escalation_id,
+            other => panic!("Expected Ask, got {other:?}"),
+        };
+        kernel.approve_escalation(&esc_id, 600, "human").await.unwrap();
+        let leases = kernel.list_leases("acme", Some("coder-1")).await.unwrap();
+        assert!(
+            !leases.iter().any(|l| l.resource_pattern == "flag:skip_verify"),
+            "comma in filename must not mint flag:skip_verify lease: {leases:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn proc_exec_redline_overrides_wildcard_lease_and_casefolds() {
+        let kernel = AegisPolicyKernel::new();
+        let agent = AgentIdentity::new("acme", "coder-1", "Engineer");
+        kernel
+            .grant_lease(LeaseGrant {
+                lease_id: "lease-wild-proc".to_string(),
+                org_id: "acme".to_string(),
+                agent_id: "*".to_string(),
+                action_pattern: "*".to_string(),
+                resource_pattern: "*".to_string(),
+                expires_at_ms: Utc::now().timestamp_millis() + 60_000,
+                granted_by: "human".to_string(),
+                kind: LeaseKind::Ttl,
+                task_id: None,
+            })
+            .await
+            .unwrap();
+
+        for cmd in ["SUDO id", "$(sudo whoami)", "cat ~/.KUBE/config", "ls /Users/x/.SSH/"] {
+            let ctx = PolicyContext {
+                principal: agent.clone(),
+                action: "proc_exec".to_string(),
+                target_org_id: "acme".to_string(),
+                target_resource: "sandbox:cmd".to_string(),
+                metadata: json!({ "command": cmd }),
+            };
+            assert!(
+                matches!(kernel.evaluate(&ctx).await.unwrap(), PolicyDecision::Deny { .. }),
+                "command '{cmd}' must be denied even under wildcard lease"
+            );
+        }
+
+        let sys_ctx = PolicyContext {
+            principal: agent,
+            action: "fs_read".to_string(),
+            target_org_id: "acme".to_string(),
+            target_resource: "/system/Library/CoreServices".to_string(),
+            metadata: json!({}),
+        };
+        assert!(
+            matches!(kernel.evaluate(&sys_ctx).await.unwrap(), PolicyDecision::Deny { .. }),
+            "/system mixed-case prefix must trigger Host Red-Line"
+        );
     }
 }

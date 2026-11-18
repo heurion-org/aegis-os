@@ -560,7 +560,21 @@ impl NativeOsSandboxInstance {
         // Deny both the Mach IPC families (`coreservices`/`lsd`) and direct exec of
         // `launchctl`, `open`, and `osascript` alongside `(deny appleevent-send)`, and
         // block `hdiutil`/`diskutil` so agents cannot detach or tamper with encrypted OrgVault mounts.
-        let launch_rules = r##"
+        // Additionally enforce kernel-level signal, process-info, and pasteboard isolation across
+        // sibling sandboxes and host processes when `kernel_sandbox` is enabled.
+        let ipc_proc_isolation = if !aos_core::ablated("kernel_sandbox") {
+            r##"
+(deny signal (target others))
+(allow signal (target same-sandbox))
+(deny process-info* (target others))
+(allow process-info* (target same-sandbox))
+(allow process-info-pidinfo (target self))
+(deny mach-lookup (global-name "com.apple.pasteboard.1"))"##
+        } else {
+            ""
+        };
+        let launch_rules = format!(
+            r##"
 (deny process-exec
     (literal "/bin/launchctl")
     (literal "/usr/bin/open")
@@ -568,7 +582,8 @@ impl NativeOsSandboxInstance {
     (literal "/usr/bin/hdiutil")
     (literal "/usr/sbin/diskutil")
 )
-(deny mach-lookup (global-name-regex #"^com\.apple\.(coreservices\.|lsd\.)"))"##;
+(deny mach-lookup (global-name-regex #"^com\.apple\.(coreservices\.|lsd\.)")){ipc_proc_isolation}"##
+        );
 
         format!(
             r#"(version 1)
@@ -887,12 +902,22 @@ impl NativeOsSandboxInstance {
             // Detach from the caller's controlling terminal so TIOCSTI cannot inject keystrokes
             // into the user's shell on kernels that still allow it.
             "--new-session".to_string(),
-            // The private `/tmp` must be mounted *before* the writable binds below: bwrap applies
-            // mounts in order, so a later `--tmpfs /tmp` would hide any workspace/home living under
-            // `/tmp` (the default runtime dir is `/tmp/aegis-os-runtime`).
+            // The private `/tmp` and `/run` must be mounted *before* the writable binds below:
+            // bwrap applies mounts in order, so a later `--tmpfs` would hide any workspace/home
+            // living under `/tmp` or `/run`. Masking `/run` hides host Docker/containerd/D-Bus/
+            // ssh-agent sockets while preserving systemd stub DNS if present.
             "--tmpfs".to_string(),
             "/tmp".to_string(),
+            "--tmpfs".to_string(),
+            "/run".to_string(),
         ];
+        if Path::new("/run/systemd/resolve").is_dir() {
+            args.extend([
+                "--ro-bind".to_string(),
+                "/run/systemd/resolve".to_string(),
+                "/run/systemd/resolve".to_string(),
+            ]);
+        }
 
         // Default-Deny Host Home Protection on Linux: mount `--tmpfs` over every candidate host home
         // directory (`$HOME`, `/root`, `/home/*`, `AOS_EXTRA_CREDENTIAL_HOMES`) *before* mounting the
@@ -1195,6 +1220,52 @@ fn build_sandbox_path_with_brew_dirs(
         })
 }
 
+fn is_reserved_sandbox_env_key(k: &str) -> bool {
+    let ku = k.to_ascii_uppercase();
+    matches!(
+        ku.as_str(),
+        "HOME"
+            | "TMPDIR"
+            | "AOS_SANDBOX_ID"
+            | "AOS_ORG_ID"
+            | "AOS_AGENT_ID"
+            | "AOS_AGENT_ROLE"
+            | "AOS_WORKSPACE"
+            | "AOS_ORG_SHARED_RO"
+            | "AOS_ORG_AGENT_PUB"
+            | "AOS_ADMIN_SECRET"
+            | "AOS_REQUEST_LOOPBACK_PORTS"
+            | "AOS_BRIDGE_TOKEN"
+            | "AOS_PREVIEW_TOKEN"
+            | "SSH_AUTH_SOCK"
+            | "SSH_AGENT_PID"
+            | "LD_PRELOAD"
+            | "LD_LIBRARY_PATH"
+            | "DYLD_INSERT_LIBRARIES"
+            | "DYLD_LIBRARY_PATH"
+            | "DYLD_FRAMEWORK_PATH"
+    )
+}
+
+#[cfg(target_os = "macos")]
+unsafe extern "C" {
+    fn sandbox_check(pid: libc::pid_t, operation: *const libc::c_char, flags: libc::c_int) -> libc::c_int;
+}
+
+/// Returns `true` iff the current host process is itself confined inside an outer macOS Seatbelt
+/// profile according to XNU (`sandbox_check(getpid(), NULL, 0) != 0`), preventing spoofed exit codes
+/// or env vars on an unsandboxed host from bypassing Seatbelt confinement.
+fn current_process_is_macos_sandboxed() -> bool {
+    #[cfg(target_os = "macos")]
+    {
+        unsafe { sandbox_check(libc::getpid(), std::ptr::null(), 0) > 0 }
+    }
+    #[cfg(not(target_os = "macos"))]
+    {
+        false
+    }
+}
+
 #[async_trait]
 impl SandboxInstance for NativeOsSandboxInstance {
     fn instance_id(&self) -> &str {
@@ -1280,7 +1351,8 @@ impl SandboxInstance for NativeOsSandboxInstance {
         let active_loopback_ports = self.allocated_loopback_ports();
         let nested_bg_inherited = spec.background
             && std::env::var("AEGIS_ALLOW_NESTED_TEST_SANDBOX").as_deref() == Ok("1")
-            && std::env::var("AOS_SANDBOX_ID").is_ok();
+            && std::env::var("AOS_SANDBOX_ID").is_ok()
+            && current_process_is_macos_sandboxed();
         let (mut cmd, profile_label) = if cfg!(target_os = "macos")
             && !kernel_sandbox_disabled
             && !nested_bg_inherited
@@ -1461,30 +1533,7 @@ impl SandboxInstance for NativeOsSandboxInstance {
         }
 
         for (k, v) in &spec.env {
-            let ku = k.to_ascii_uppercase();
-            if matches!(
-                ku.as_str(),
-                "HOME"
-                    | "TMPDIR"
-                    | "AOS_SANDBOX_ID"
-                    | "AOS_ORG_ID"
-                    | "AOS_AGENT_ID"
-                    | "AOS_AGENT_ROLE"
-                    | "AOS_WORKSPACE"
-                    | "AOS_ORG_SHARED_RO"
-                    | "AOS_ORG_AGENT_PUB"
-                    | "AOS_ADMIN_SECRET"
-                    | "AOS_REQUEST_LOOPBACK_PORTS"
-                    | "AOS_BRIDGE_TOKEN"
-                    | "AOS_PREVIEW_TOKEN"
-                    | "SSH_AUTH_SOCK"
-                    | "SSH_AGENT_PID"
-                    | "LD_PRELOAD"
-                    | "LD_LIBRARY_PATH"
-                    | "DYLD_INSERT_LIBRARIES"
-                    | "DYLD_LIBRARY_PATH"
-                    | "DYLD_FRAMEWORK_PATH"
-            ) {
+            if is_reserved_sandbox_env_key(k) {
                 continue;
             }
             cmd.env(k, v);
@@ -1567,11 +1616,12 @@ impl SandboxInstance for NativeOsSandboxInstance {
 
         // When `cargo test` is executed inside an outer `proc_exec` Seatbelt sandbox on macOS,
         // the XNU kernel rejects nested `sandbox_apply` with exit code 71 (`sandbox-exec: sandbox_apply:
-        // Operation not permitted`) because the process tree is already kernel-confined.
+        // Operation not permitted`) ONLY because the host process tree is already kernel-confined.
         if cfg!(target_os = "macos")
             && output.status.code() == Some(71)
             && stderr_str.contains("sandbox-exec: sandbox_apply: Operation not permitted")
             && std::env::var("AEGIS_ALLOW_NESTED_TEST_SANDBOX").as_deref() == Ok("1")
+            && current_process_is_macos_sandboxed()
         {
             let mut fallback = Command::new(&spec.command);
             fallback
@@ -1613,7 +1663,7 @@ impl SandboxInstance for NativeOsSandboxInstance {
                     .env("AOS_DEV_PORT", first_port.to_string());
             }
             for (k, v) in &spec.env {
-                if k.eq_ignore_ascii_case("AOS_REQUEST_LOOPBACK_PORTS") {
+                if is_reserved_sandbox_env_key(k) {
                     continue;
                 }
                 fallback.env(k, v);
@@ -2480,6 +2530,41 @@ mod tests {
         );
     }
 
+    #[test]
+    fn bwrap_masks_host_run_before_writable_binds() {
+        let tmp = tempfile::tempdir().unwrap();
+        let ws = tmp.path().join("ws");
+        std::fs::create_dir_all(&ws).unwrap();
+        let cfg = SandboxConfig {
+            identity: AgentIdentity::new("acme", "coder-1", "Engineer"),
+            tier: IsolationTier::NativeOsSandbox,
+            limits: ResourceLimits::default(),
+            workspace_dir: ws.clone(),
+            agent_home_dir: tmp.path().join("home"),
+            org_shared_ro_dir: tmp.path().join("ro"),
+            org_agent_pub_dir: tmp.path().join("pub"),
+            egress_proxy_addr: None,
+            host_source_dir: None,
+            tighten_home_read: true,
+            allowed_loopback_ports: Vec::new(),
+            isolate_loopback_only: true,
+        };
+        let args = NativeOsSandboxInstance::new(cfg).generate_linux_bwrap_args();
+        let tmp_run_pos = args
+            .windows(2)
+            .position(|w| w == ["--tmpfs", "/run"])
+            .expect("expected --tmpfs /run in bwrap args");
+        let ws_str = ws.to_string_lossy().to_string();
+        let ws_bind_pos = args
+            .windows(2)
+            .position(|w| w[0] == "--bind" && w[1] == ws_str)
+            .expect("expected writable --bind for workspace in bwrap args");
+        assert!(
+            tmp_run_pos < ws_bind_pos,
+            "--tmpfs /run must appear before writable binds: {args:?}"
+        );
+    }
+
     #[cfg(target_os = "macos")]
     #[tokio::test]
     async fn seatbelt_live_loopback_roundtrip_and_unallocated_block() {
@@ -2706,5 +2791,43 @@ t.join(timeout=2)
             Some(0),
             "host loopback service must not be reachable inside --unshare-net bwrap: {blocked_out:?}"
         );
+    }
+
+    #[test]
+    fn seatbelt_blocks_host_signals_procinfo_pasteboard_and_filters_reserved_env() {
+        let tmp = tempfile::tempdir().unwrap();
+        let cfg = SandboxConfig {
+            identity: AgentIdentity::new("acme", "coder-1", "Engineer"),
+            tier: IsolationTier::NativeOsSandbox,
+            limits: ResourceLimits::default(),
+            workspace_dir: tmp.path().join("ws"),
+            agent_home_dir: tmp.path().join("home"),
+            org_shared_ro_dir: tmp.path().join("ro"),
+            org_agent_pub_dir: tmp.path().join("pub"),
+            egress_proxy_addr: None,
+            host_source_dir: None,
+            tighten_home_read: true,
+            allowed_loopback_ports: Vec::new(),
+            isolate_loopback_only: false,
+        };
+        let profile = NativeOsSandboxInstance::new(cfg).generate_macos_seatbelt_profile();
+        assert!(profile.contains("(deny signal (target others))"), "{profile}");
+        assert!(
+            profile.contains("(deny process-info* (target others))"),
+            "{profile}"
+        );
+        assert!(
+            profile.contains("(deny mach-lookup (global-name \"com.apple.pasteboard.1\"))"),
+            "{profile}"
+        );
+        assert!(super::is_reserved_sandbox_env_key("DYLD_INSERT_LIBRARIES"));
+        assert!(super::is_reserved_sandbox_env_key("AOS_ADMIN_SECRET"));
+        assert!(!super::is_reserved_sandbox_env_key("NORMAL_VAR"));
+        #[cfg(target_os = "macos")]
+        {
+            if !nested_in_aegis_sandbox() {
+                assert!(!super::current_process_is_macos_sandboxed());
+            }
+        }
     }
 }
