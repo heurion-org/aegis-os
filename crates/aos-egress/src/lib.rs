@@ -10,10 +10,22 @@
 //! sees method/path/body, applies DLP and boundary secret injection, then re-encrypts to the real
 //! provider over TLS while streaming the provider response back to the agent.
 
+pub mod breaker;
+pub mod pricing;
+pub mod pseudonym;
+
+pub use breaker::{
+    BudgetPolicy, CircuitTripReason, EgressGuardEvent, PreFlightReservation, SessionBreakerState,
+    SharedBudgetPool, UsageReport, UsageSnapshot,
+};
+pub use pricing::{ModelPricingTable, ModelRate};
+pub use pseudonym::{CustomRedactionRule, PseudonymMode, PseudonymSessionTable};
+
 use aos_core::AgentIdentity;
 use anyhow::bail;
 use serde::{Deserialize, Serialize};
 use serde_json::json;
+use std::borrow::Cow;
 use std::collections::{HashMap, HashSet};
 use std::net::{IpAddr, SocketAddr};
 use std::sync::Arc;
@@ -25,6 +37,19 @@ use tokio::sync::RwLock;
 use tokio_rustls::rustls::pki_types::ServerName;
 use tokio_rustls::rustls::{ClientConfig, RootCertStore};
 use tokio_rustls::TlsConnector;
+
+/// Per-agent / per-org intelligent DLP & budget circuit-breaker gateway settings.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct DlpGatewayConfig {
+    #[serde(default)]
+    pub pseudonym_mode: PseudonymMode,
+    #[serde(default)]
+    pub custom_patterns: Vec<CustomRedactionRule>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub budget: Option<BudgetPolicy>,
+}
+
+pub type EgressEventSink = Arc<dyn Fn(EgressGuardEvent) + Send + Sync>;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SecretVaultEntry {
@@ -158,6 +183,97 @@ async fn read_bounded_http_line(
         std::io::Error::new(std::io::ErrorKind::InvalidData, "non-UTF8 HTTP header line")
     })?;
     Ok(Some(s))
+}
+
+struct ParsedHttpHead {
+    status_line: String,
+    headers: Vec<(String, String)>,
+    is_chunked: bool,
+    content_length: Option<usize>,
+    content_type: String,
+    is_sse: bool,
+    is_compressed: bool,
+}
+
+fn find_http_header_end(buf: &[u8]) -> Option<(usize, usize)> {
+    let crlfcrlf = buf
+        .windows(4)
+        .position(|w| w == b"\r\n\r\n")
+        .map(|p| (p, p + 4));
+    let lflf = buf
+        .windows(2)
+        .position(|w| w == b"\n\n")
+        .map(|p| (p, p + 2));
+    match (crlfcrlf, lflf) {
+        (Some(a), Some(b)) => Some(if a.0 <= b.0 { a } else { b }),
+        (Some(a), None) => Some(a),
+        (None, Some(b)) => Some(b),
+        (None, None) => None,
+    }
+}
+
+fn parse_http_response_head(hdr_bytes: &[u8]) -> ParsedHttpHead {
+    let text = String::from_utf8_lossy(hdr_bytes);
+    let mut lines = text.lines();
+    let status_line = lines
+        .next()
+        .unwrap_or("HTTP/1.1 200 OK")
+        .trim_end_matches('\r')
+        .to_string();
+    let mut headers = Vec::new();
+    let mut is_chunked = false;
+    let mut content_length = None;
+    let mut content_type = String::new();
+    let mut content_encoding = String::new();
+    for line in lines {
+        let trimmed = line.trim_end_matches('\r');
+        if let Some((k, v)) = trimmed.split_once(':') {
+            let key = k.trim().to_string();
+            let val = v.trim().to_string();
+            let low = key.to_ascii_lowercase();
+            let val_low = val.to_ascii_lowercase();
+            if low == "transfer-encoding" && val_low.contains("chunked") {
+                is_chunked = true;
+            } else if low == "content-length" {
+                content_length = val.parse::<usize>().ok();
+            } else if low == "content-type" {
+                content_type = val_low;
+            } else if low == "content-encoding" {
+                content_encoding = val_low;
+            }
+            headers.push((key, val));
+        }
+    }
+    let is_sse = content_type.contains("text/event-stream");
+    let is_compressed = !content_encoding.is_empty() && content_encoding != "identity";
+    ParsedHttpHead {
+        status_line,
+        headers,
+        is_chunked,
+        content_length,
+        content_type,
+        is_sse,
+        is_compressed,
+    }
+}
+
+async fn write_downstream_body_slice(
+    client: &mut TcpStream,
+    is_chunked: bool,
+    data: &[u8],
+) -> std::io::Result<()> {
+    if data.is_empty() {
+        return Ok(());
+    }
+    if is_chunked {
+        let header = format!("{:x}\r\n", data.len());
+        client.write_all(header.as_bytes()).await?;
+        client.write_all(data).await?;
+        client.write_all(b"\r\n").await?;
+    } else {
+        client.write_all(data).await?;
+    }
+    client.flush().await
 }
 
 const DLP_TOKEN_PREFIXES: &[(&str, &str, usize)] = &[
@@ -570,6 +686,11 @@ pub struct AegisEgressGateway {
     vault: Arc<RwLock<HashMap<String, SecretVaultEntry>>>,
     scopes: Arc<RwLock<HashMap<String, SecretScopeRule>>>,
     upstream_overrides: Arc<RwLock<HashMap<String, (String, bool)>>>,
+    dlp_configs: Arc<RwLock<HashMap<String, DlpGatewayConfig>>>,
+    pseudonym_tables: Arc<RwLock<HashMap<String, Arc<PseudonymSessionTable>>>>,
+    breakers: Arc<RwLock<HashMap<String, Arc<SessionBreakerState>>>>,
+    pricing: Arc<RwLock<ModelPricingTable>>,
+    event_sink: Arc<RwLock<Option<EgressEventSink>>>,
     tls_config: Arc<ClientConfig>,
 }
 
@@ -598,8 +719,136 @@ impl AegisEgressGateway {
             vault: Arc::new(RwLock::new(HashMap::new())),
             scopes: Arc::new(RwLock::new(HashMap::new())),
             upstream_overrides: Arc::new(RwLock::new(HashMap::new())),
+            dlp_configs: Arc::new(RwLock::new(HashMap::new())),
+            pseudonym_tables: Arc::new(RwLock::new(HashMap::new())),
+            breakers: Arc::new(RwLock::new(HashMap::new())),
+            pricing: Arc::new(RwLock::new(ModelPricingTable::new())),
+            event_sink: Arc::new(RwLock::new(None)),
             tls_config,
         }
+    }
+
+    /// Configures intelligent DLP pseudonymization and/or budget/loop circuit breaking for a
+    /// bound agent identity (with optional shared `SharedBudgetPool` and per-lane `soft_cap_bps`).
+    pub async fn set_dlp_config_for_agent(
+        &self,
+        identity: &AgentIdentity,
+        cfg: DlpGatewayConfig,
+        shared_pool: Option<Arc<SharedBudgetPool>>,
+        soft_cap_bps: Option<u16>,
+    ) {
+        let fqn = identity.fqn();
+        if cfg.pseudonym_mode == PseudonymMode::Pseudonymize {
+            let mut tables = self.pseudonym_tables.write().await;
+            tables
+                .entry(fqn.clone())
+                .or_insert_with(|| Arc::new(PseudonymSessionTable::new()));
+        }
+        if cfg.budget.is_some()
+            || shared_pool.is_some()
+            || cfg.pseudonym_mode == PseudonymMode::Pseudonymize
+        {
+            let eff_policy = cfg.budget.clone().unwrap_or(BudgetPolicy {
+                max_tokens: None,
+                max_cost_micro_usd: None,
+                max_requests: None,
+                max_identical_loop_streak: 0,
+            });
+            let mut breakers = self.breakers.write().await;
+            if let Some(existing) = breakers.get(&fqn) {
+                existing.update_policy(eff_policy, shared_pool, soft_cap_bps);
+            } else {
+                breakers.insert(
+                    fqn.clone(),
+                    Arc::new(SessionBreakerState::new(
+                        &identity.org_id,
+                        &identity.agent_id,
+                        eff_policy,
+                        shared_pool,
+                        soft_cap_bps,
+                    )),
+                );
+            }
+        }
+        self.dlp_configs.write().await.insert(fqn, cfg);
+    }
+
+    pub async fn set_pricing_overrides(&self, rates: HashMap<String, ModelRate>) {
+        *self.pricing.write().await = ModelPricingTable::with_overrides(rates);
+    }
+
+    pub async fn set_event_sink(&self, sink: EgressEventSink) {
+        *self.event_sink.write().await = Some(sink);
+    }
+
+    pub async fn usage_snapshot(&self, identity: &AgentIdentity) -> UsageSnapshot {
+        let fqn = identity.fqn();
+        let (active, replacements) = {
+            let tables = self.pseudonym_tables.read().await;
+            tables
+                .get(&fqn)
+                .map(|t| t.snapshot_stats())
+                .unwrap_or((0, 0))
+        };
+        let breakers = self.breakers.read().await;
+        if let Some(b) = breakers.get(&fqn) {
+            b.snapshot(active, replacements)
+        } else {
+            UsageSnapshot {
+                pseudonyms_active: active,
+                pseudonym_replacements: replacements,
+                ..UsageSnapshot::default()
+            }
+        }
+    }
+
+    pub async fn extend_agent_budget(
+        &self,
+        identity: &AgentIdentity,
+        add_micro_usd: u64,
+        add_tokens: u64,
+        add_requests: u32,
+    ) -> bool {
+        let fqn = identity.fqn();
+        let breaker = self.breakers.read().await.get(&fqn).cloned();
+        let Some(breaker) = breaker else {
+            return false;
+        };
+        let event = breaker.extend_budget(add_micro_usd, add_tokens, add_requests);
+        self.emit_guard_event(event).await;
+        true
+    }
+
+    async fn emit_guard_event(&self, event: EgressGuardEvent) {
+        let sink = self.event_sink.read().await.clone();
+        if let Some(cb) = sink {
+            cb(event);
+        }
+    }
+
+    async fn resolve_agent_stage1_handles(
+        &self,
+        identity: &AgentIdentity,
+    ) -> (
+        Option<DlpGatewayConfig>,
+        Option<Arc<PseudonymSessionTable>>,
+        Option<Arc<SessionBreakerState>>,
+    ) {
+        let fqn = identity.fqn();
+        let wildcard = format!("org:{}/*", identity.org_id);
+        let cfg = {
+            let cfgs = self.dlp_configs.read().await;
+            cfgs.get(&fqn).or_else(|| cfgs.get(&wildcard)).cloned()
+        };
+        let table = {
+            let tables = self.pseudonym_tables.read().await;
+            tables.get(&fqn).cloned()
+        };
+        let breaker = {
+            let breakers = self.breakers.read().await;
+            breakers.get(&fqn).cloned()
+        };
+        (cfg, table, breaker)
     }
 
     /// Host-controlled upstream override for local integration testing and benchmarking of the
@@ -1278,6 +1527,342 @@ impl AegisEgressGateway {
         Err(last_err.unwrap_or_else(|| anyhow::anyhow!("upstream request to {domain} failed")))
     }
 
+    #[allow(clippy::too_many_arguments)]
+    async fn forward_l7_model_proxy(
+        &self,
+        client: &mut TcpStream,
+        upstream_addr: &str,
+        allow_override_local: bool,
+        use_tls: bool,
+        server_name: &str,
+        domain: &str,
+        method: &str,
+        path: &str,
+        headers: &HashMap<String, String>,
+        body: &[u8],
+        pseudonym_table: Option<&PseudonymSessionTable>,
+    ) -> anyhow::Result<UsageReport> {
+        let mut request = format!("{method} {path} HTTP/1.1\r\n");
+        for (key, value) in headers {
+            let lower = key.to_ascii_lowercase();
+            if lower == "host"
+                || lower == "connection"
+                || lower == "proxy-connection"
+                || lower == "content-length"
+                || lower == "transfer-encoding"
+                || lower == "accept-encoding"
+                || lower.starts_with("x-aegis-")
+            {
+                continue;
+            }
+            request.push_str(&format!("{key}: {value}\r\n"));
+        }
+        request.push_str(&format!("Host: {domain}\r\n"));
+        request.push_str("Accept-Encoding: identity\r\n");
+        if !body.is_empty() {
+            request.push_str(&format!("Content-Length: {}\r\n", body.len()));
+        } else if !matches!(method, "GET" | "HEAD") {
+            request.push_str("Content-Length: 0\r\n");
+        }
+        request.push_str("Connection: close\r\n\r\n");
+
+        let addrs = Self::resolve_upstream_addrs(upstream_addr, allow_override_local).await?;
+        let max_attempts = addrs.len().clamp(1, 2);
+        let mut last_err: Option<anyhow::Error> = None;
+
+        for attempt in 0..max_attempts {
+            let addr = addrs[attempt % addrs.len()];
+            let tcp = match TcpStream::connect(addr).await {
+                Ok(s) => {
+                    let _ = s.set_nodelay(true);
+                    s
+                }
+                Err(err) => {
+                    last_err = Some(err.into());
+                    continue;
+                }
+            };
+            let mut upstream: Box<dyn ProxyStream> = if use_tls {
+                let name = ServerName::try_from(server_name.to_string()).map_err(|err| {
+                    anyhow::anyhow!("invalid TLS server name '{server_name}': {err}")
+                })?;
+                let connector = TlsConnector::from(self.tls_config.clone());
+                match connector.connect(name, tcp).await {
+                    Ok(tls) => Box::new(tls),
+                    Err(err) => {
+                        last_err = Some(err.into());
+                        continue;
+                    }
+                }
+            } else {
+                Box::new(tcp)
+            };
+
+            let write_res: std::io::Result<()> = async {
+                if !body.is_empty() && body.len() <= 256 * 1024 {
+                    let mut combined = Vec::with_capacity(request.len() + body.len());
+                    combined.extend_from_slice(request.as_bytes());
+                    combined.extend_from_slice(body);
+                    upstream.write_all(&combined).await?;
+                } else {
+                    upstream.write_all(request.as_bytes()).await?;
+                    if !body.is_empty() {
+                        upstream.write_all(body).await?;
+                    }
+                }
+                upstream.flush().await
+            }
+            .await;
+
+            // Read upstream HTTP status line and response headers before committing bytes to client.
+            let mut resp_buf: Vec<u8> = Vec::new();
+            let mut tmp = [0u8; 8192];
+            let mut hdr_bounds: Option<(usize, usize)> = None;
+            let mut header_read_err: Option<std::io::Error> = None;
+            loop {
+                match upstream.read(&mut tmp).await {
+                    Ok(0) => break,
+                    Ok(n) => {
+                        resp_buf.extend_from_slice(&tmp[..n]);
+                        if let Some(bounds) = find_http_header_end(&resp_buf) {
+                            hdr_bounds = Some(bounds);
+                            break;
+                        }
+                        if resp_buf.len() > 64 * 1024 {
+                            break;
+                        }
+                    }
+                    Err(err) => {
+                        header_read_err = Some(err);
+                        break;
+                    }
+                }
+            }
+
+            let Some((hdrs_only_end, body_start)) = hdr_bounds else {
+                if !resp_buf.is_empty() {
+                    let _ = client.write_all(&resp_buf).await;
+                    let _ = client.flush().await;
+                    return Ok(UsageReport::default());
+                }
+                if let Some(err) = write_res.err().or(header_read_err) {
+                    last_err = Some(err.into());
+                    continue;
+                }
+                last_err = Some(anyhow::anyhow!(
+                    "upstream {domain} closed connection before sending HTTP headers"
+                ));
+                continue;
+            };
+
+            let head_bytes = &resp_buf[..body_start];
+            let initial_body = &resp_buf[body_start..];
+            let parsed_head = parse_http_response_head(&resp_buf[..hdrs_only_end]);
+            let active_table = pseudonym_table.filter(|t| t.active_count() > 0);
+            let need_sse = active_table.is_some() && parsed_head.is_sse && !parsed_head.is_compressed;
+            let need_json_restore = active_table.is_some()
+                && !parsed_head.is_sse
+                && !parsed_head.is_compressed
+                && (parsed_head.content_type.is_empty() || parsed_head.content_type.contains("json"))
+                && parsed_head
+                    .content_length
+                    .is_none_or(|cl| cl <= MAX_PROXY_BODY_BYTES);
+
+            if need_sse {
+                let table = active_table.expect("checked is_some");
+                let mut sse_head = format!("{}\r\n", parsed_head.status_line);
+                for (k, v) in &parsed_head.headers {
+                    let low = k.to_ascii_lowercase();
+                    if low == "content-length" || low == "connection" {
+                        continue;
+                    }
+                    sse_head.push_str(&format!("{k}: {v}\r\n"));
+                }
+                sse_head.push_str("Connection: close\r\n\r\n");
+                if client.write_all(sse_head.as_bytes()).await.is_err() {
+                    return Ok(UsageReport::default());
+                }
+                let _ = client.flush().await;
+
+                let mut sse_tx = pseudonym::SseResponseTransformer::new(table);
+                let mut acc = breaker::UsageAccumulator::new();
+                let mut chunk_dec = if parsed_head.is_chunked {
+                    Some(breaker::HttpChunkedDecoder::new())
+                } else {
+                    None
+                };
+
+                if !initial_body.is_empty() {
+                    let plain = if let Some(ref mut dec) = chunk_dec {
+                        dec.push(initial_body).unwrap_or_default()
+                    } else {
+                        initial_body.to_vec()
+                    };
+                    if !plain.is_empty() {
+                        let out = sse_tx.push_bytes(&plain);
+                        if !out.is_empty() {
+                            acc.observe_body_bytes(&out);
+                            if write_downstream_body_slice(client, parsed_head.is_chunked, &out)
+                                .await
+                                .is_err()
+                            {
+                                return Ok(acc.into_report());
+                            }
+                        }
+                    }
+                }
+
+                loop {
+                    if chunk_dec.as_ref().is_some_and(|d| d.is_done()) {
+                        break;
+                    }
+                    match upstream.read(&mut tmp).await {
+                        Ok(0) => break,
+                        Ok(n) => {
+                            let plain = if let Some(ref mut dec) = chunk_dec {
+                                dec.push(&tmp[..n]).unwrap_or_default()
+                            } else {
+                                tmp[..n].to_vec()
+                            };
+                            if !plain.is_empty() {
+                                let out = sse_tx.push_bytes(&plain);
+                                if !out.is_empty() {
+                                    acc.observe_body_bytes(&out);
+                                    if write_downstream_body_slice(
+                                        client,
+                                        parsed_head.is_chunked,
+                                        &out,
+                                    )
+                                    .await
+                                    .is_err()
+                                    {
+                                        return Ok(acc.into_report());
+                                    }
+                                }
+                            }
+                        }
+                        Err(_) => break,
+                    }
+                }
+
+                let tail = sse_tx.finish_bytes();
+                if !tail.is_empty() {
+                    acc.observe_body_bytes(&tail);
+                    let _ = write_downstream_body_slice(client, parsed_head.is_chunked, &tail).await;
+                }
+                if parsed_head.is_chunked {
+                    let _ = client.write_all(b"0\r\n\r\n").await;
+                    let _ = client.flush().await;
+                }
+                return Ok(acc.into_report());
+            }
+
+            if need_json_restore {
+                let table = active_table.expect("checked is_some");
+                let mut decoded_body = Vec::new();
+                let mut chunk_dec = if parsed_head.is_chunked {
+                    Some(breaker::HttpChunkedDecoder::new())
+                } else {
+                    None
+                };
+                if let Some(ref mut dec) = chunk_dec {
+                    if !initial_body.is_empty() {
+                        if let Ok(part) = dec.push(initial_body) {
+                            decoded_body.extend_from_slice(&part);
+                        }
+                    }
+                } else {
+                    decoded_body.extend_from_slice(initial_body);
+                }
+
+                loop {
+                    if chunk_dec.as_ref().is_some_and(|d| d.is_done()) {
+                        break;
+                    }
+                    if let Some(cl) = parsed_head.content_length {
+                        if decoded_body.len() >= cl {
+                            break;
+                        }
+                    }
+                    if decoded_body.len() >= MAX_PROXY_BODY_BYTES {
+                        break;
+                    }
+                    match upstream.read(&mut tmp).await {
+                        Ok(0) => break,
+                        Ok(n) => {
+                            if let Some(ref mut dec) = chunk_dec {
+                                if let Ok(part) = dec.push(&tmp[..n]) {
+                                    decoded_body.extend_from_slice(&part);
+                                }
+                            } else {
+                                decoded_body.extend_from_slice(&tmp[..n]);
+                            }
+                        }
+                        Err(_) => break,
+                    }
+                }
+
+                let mut acc = breaker::UsageAccumulator::new();
+                acc.observe_body_bytes(&decoded_body);
+                let final_body = table
+                    .restore_json_response_body(&decoded_body)
+                    .unwrap_or(decoded_body);
+
+                let mut out_head = format!("{}\r\n", parsed_head.status_line);
+                for (k, v) in &parsed_head.headers {
+                    let low = k.to_ascii_lowercase();
+                    if matches!(
+                        low.as_str(),
+                        "content-length" | "transfer-encoding" | "connection"
+                    ) {
+                        continue;
+                    }
+                    out_head.push_str(&format!("{k}: {v}\r\n"));
+                }
+                out_head.push_str(&format!(
+                    "Content-Length: {}\r\nConnection: close\r\n\r\n",
+                    final_body.len()
+                ));
+                let _ = client.write_all(out_head.as_bytes()).await;
+                if !final_body.is_empty() {
+                    let _ = client.write_all(&final_body).await;
+                }
+                let _ = client.flush().await;
+                return Ok(acc.into_report());
+            }
+
+            // Passthrough with zero-latency `StreamingUsageTap` (used for Block+Budget or compressed responses).
+            let mut tap = breaker::StreamingUsageTap::new(parsed_head.is_chunked, parsed_head.is_sse);
+            if client.write_all(head_bytes).await.is_err() {
+                return Ok(tap.finish());
+            }
+            if !initial_body.is_empty() {
+                tap.push_wire_bytes(initial_body);
+                if client.write_all(initial_body).await.is_err() {
+                    return Ok(tap.finish());
+                }
+            }
+            let _ = client.flush().await;
+
+            loop {
+                match upstream.read(&mut tmp).await {
+                    Ok(0) => break,
+                    Ok(n) => {
+                        tap.push_wire_bytes(&tmp[..n]);
+                        if client.write_all(&tmp[..n]).await.is_err() {
+                            break;
+                        }
+                        let _ = client.flush().await;
+                    }
+                    Err(_) => break,
+                }
+            }
+            return Ok(tap.finish());
+        }
+
+        Err(last_err.unwrap_or_else(|| anyhow::anyhow!("upstream request to {domain} failed")))
+    }
+
     /// Starts a lightweight local HTTP Egress Proxy listener (`127.0.0.1:port`) that inspects
     /// outbound requests from Agent sandboxes, enforces domain allowlists, and injects boundary secrets.
     pub async fn start_local_proxy(
@@ -1542,6 +2127,56 @@ impl AegisEgressGateway {
                                 injected_path,
                                 ..
                             }) => {
+                                let (dlp_cfg, pseudo_table, breaker) =
+                                    gw_conn.resolve_agent_stage1_handles(&identity).await;
+                                let pricing_snapshot = gw_conn.pricing.read().await.clone();
+
+                                let pre_flight = if let Some(ref b) = breaker {
+                                    match b.pre_flight_check_and_reserve(&req_body, &pricing_snapshot)
+                                    {
+                                        Ok(res) => Some(res),
+                                        Err(boxed) => {
+                                            let (reason, maybe_ev) = *boxed;
+                                            if let Some(ev) = maybe_ev {
+                                                gw_conn.emit_guard_event(ev).await;
+                                            }
+                                            let resp = breaker::format_tripwire_http_429(&reason);
+                                            let _ = stream.write_all(resp.as_bytes()).await;
+                                            return;
+                                        }
+                                    }
+                                } else {
+                                    None
+                                };
+
+                                let mut effective_body: Cow<'_, [u8]> = Cow::Borrowed(&req_body);
+                                if dlp_cfg
+                                    .as_ref()
+                                    .is_some_and(|c| c.pseudonym_mode == PseudonymMode::Pseudonymize)
+                                {
+                                    if let Some(ref tbl) = pseudo_table {
+                                        let custom_rules = dlp_cfg
+                                            .as_ref()
+                                            .map(|c| c.custom_patterns.as_slice())
+                                            .unwrap_or(&[]);
+                                        if let Some(masked) = tbl.pseudonymize_json_request_body(
+                                            effective_body.as_ref(),
+                                            custom_rules,
+                                        ) {
+                                            effective_body = Cow::Owned(masked);
+                                        }
+                                    }
+                                }
+                                if breaker.is_some() {
+                                    if let Some(with_usage) = breaker::maybe_inject_openai_include_usage(
+                                        domain,
+                                        &injected_path,
+                                        effective_body.as_ref(),
+                                    ) {
+                                        effective_body = Cow::Owned(with_usage);
+                                    }
+                                }
+
                                 let override_entry = gw_conn
                                     .upstream_overrides
                                     .read()
@@ -1551,32 +2186,80 @@ impl AegisEgressGateway {
                                 let allow_override_local = override_entry.is_some();
                                 let (up_addr, use_tls) =
                                     override_entry.unwrap_or_else(|| (format!("{domain}:443"), true));
-                                if let Err(err) = gw_conn
-                                    .forward_reverse_proxy(
-                                        &mut stream,
-                                        &up_addr,
-                                        allow_override_local,
-                                        use_tls,
-                                        domain,
-                                        domain,
-                                        &method,
-                                        &injected_path,
-                                        &injected_headers,
-                                        &req_body,
-                                    )
-                                    .await
-                                {
-                                    let body = json!({
-                                        "egress": "upstream_io_error",
-                                        "target": domain,
-                                        "error": err.to_string()
-                                    })
-                                    .to_string();
-                                    let resp = format!(
-                                        "HTTP/1.1 502 Bad Gateway\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
-                                        body.len()
-                                    );
-                                    let _ = stream.write_all(resp.as_bytes()).await;
+
+                                if pseudo_table.is_none() && breaker.is_none() {
+                                    if let Err(err) = gw_conn
+                                        .forward_reverse_proxy(
+                                            &mut stream,
+                                            &up_addr,
+                                            allow_override_local,
+                                            use_tls,
+                                            domain,
+                                            domain,
+                                            &method,
+                                            &injected_path,
+                                            &injected_headers,
+                                            effective_body.as_ref(),
+                                        )
+                                        .await
+                                    {
+                                        let body = json!({
+                                            "egress": "upstream_io_error",
+                                            "target": domain,
+                                            "error": err.to_string()
+                                        })
+                                        .to_string();
+                                        let resp = format!(
+                                            "HTTP/1.1 502 Bad Gateway\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                                            body.len()
+                                        );
+                                        let _ = stream.write_all(resp.as_bytes()).await;
+                                    }
+                                } else {
+                                    match gw_conn
+                                        .forward_l7_model_proxy(
+                                            &mut stream,
+                                            &up_addr,
+                                            allow_override_local,
+                                            use_tls,
+                                            domain,
+                                            domain,
+                                            &method,
+                                            &injected_path,
+                                            &injected_headers,
+                                            effective_body.as_ref(),
+                                            pseudo_table.as_deref(),
+                                        )
+                                        .await
+                                    {
+                                        Ok(report) => {
+                                            if let (Some(ref b), Some(res)) = (&breaker, pre_flight)
+                                            {
+                                                if let Some(ev) =
+                                                    b.settle_reservation(res, &report, &pricing_snapshot)
+                                                {
+                                                    gw_conn.emit_guard_event(ev).await;
+                                                }
+                                            }
+                                        }
+                                        Err(err) => {
+                                            if let (Some(ref b), Some(res)) = (&breaker, pre_flight)
+                                            {
+                                                b.cancel_reservation(res);
+                                            }
+                                            let body = json!({
+                                                "egress": "upstream_io_error",
+                                                "target": domain,
+                                                "error": err.to_string()
+                                            })
+                                            .to_string();
+                                            let resp = format!(
+                                                "HTTP/1.1 502 Bad Gateway\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                                                body.len()
+                                            );
+                                            let _ = stream.write_all(resp.as_bytes()).await;
+                                        }
+                                    }
                                 }
                             }
                             Ok(EgressVerdict::RequiresEscalation { domain, reason }) => {
@@ -1598,6 +2281,19 @@ impl AegisEgressGateway {
                                 placeholder,
                                 unauthorized_domain,
                             }) => {
+                                let (_, _, breaker) =
+                                    gw_conn.resolve_agent_stage1_handles(&identity).await;
+                                if let Some(b) = breaker {
+                                    b.record_dlp_block();
+                                }
+                                gw_conn
+                                    .emit_guard_event(EgressGuardEvent::DlpBlocked {
+                                        org_id: identity.org_id.clone(),
+                                        agent_id: identity.agent_id.clone(),
+                                        domain: unauthorized_domain.clone(),
+                                        placeholder: placeholder.clone(),
+                                    })
+                                    .await;
                                 let body = json!({
                                     "egress": "blocked_exfiltration",
                                     "placeholder": placeholder,
@@ -2912,5 +3608,420 @@ Connection: close\r\n\r\n";
         let mut r3 = Vec::new();
         smuggle.read_to_end(&mut r3).await.unwrap();
         assert!(String::from_utf8_lossy(&r3).contains("400 Bad Request"));
+    }
+
+    #[tokio::test]
+    async fn secrets_still_hard_blocked_under_pseudonymize_mode() {
+        let upstream_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let upstream_addr = upstream_listener.local_addr().unwrap();
+        let hit_count = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let hit_bg = hit_count.clone();
+        tokio::spawn(async move {
+            while let Ok((_s, _)) = upstream_listener.accept().await {
+                hit_bg.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            }
+        });
+
+        let gw = Arc::new(AegisEgressGateway::new());
+        gw.allow_domains("acme", vec!["api.anthropic.com".to_string()])
+            .await;
+        gw.set_upstream_override("api.anthropic.com", &upstream_addr.to_string(), false)
+            .await;
+        gw.register_secret(SecretVaultEntry {
+            org_id: "acme".to_string(),
+            placeholder: "$AOS_SECRET_GH".to_string(),
+            real_secret_value: "ghp_RealVaultSecretValue123456".to_string(),
+            allowed_domains: vec!["api.github.com".to_string()],
+        })
+        .await;
+
+        let events = Arc::new(std::sync::Mutex::new(Vec::<EgressGuardEvent>::new()));
+        let ev_sink = events.clone();
+        gw.set_event_sink(Arc::new(move |ev| {
+            ev_sink.lock().unwrap().push(ev);
+        }))
+        .await;
+
+        let agent = AgentIdentity::new("acme", "coder-1", "Engineer");
+        gw.set_dlp_config_for_agent(
+            &agent,
+            DlpGatewayConfig {
+                pseudonym_mode: PseudonymMode::Pseudonymize,
+                custom_patterns: Vec::new(),
+                budget: None,
+            },
+            None,
+            None,
+        )
+        .await;
+
+        let (proxy_addr, handle) = gw
+            .clone()
+            .start_local_proxy_abortable("127.0.0.1:0", Some(agent.clone()))
+            .await
+            .unwrap();
+
+        for secret_payload in [
+            r#"{"model":"claude-sonnet-4-5","messages":[{"role":"user","content":"alice@acme.org $AOS_SECRET_GH"}]}"#,
+            r#"{"model":"claude-sonnet-4-5","messages":[{"role":"user","content":"alice@acme.org AKIAIOSFODNN7EXAMPLE"}]}"#,
+            r#"{"model":"claude-sonnet-4-5","messages":[{"role":"user","content":"alice@acme.org sk-ant-api03-abcdef12345678"}]}"#,
+        ] {
+            let mut client = TcpStream::connect(proxy_addr).await.unwrap();
+            let req = format!(
+                "POST /__aegis/base/anthropic/v1/messages HTTP/1.1\r\nHost: 127.0.0.1\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                secret_payload.len(),
+                secret_payload
+            );
+            client.write_all(req.as_bytes()).await.unwrap();
+            let mut resp = Vec::new();
+            client.read_to_end(&mut resp).await.unwrap();
+            let s = String::from_utf8_lossy(&resp);
+            assert!(s.contains("403 Forbidden"), "expected 403 for {secret_payload}: {s}");
+            assert!(s.contains("blocked_exfiltration"), "{s}");
+        }
+
+        handle.abort();
+        assert_eq!(hit_count.load(std::sync::atomic::Ordering::SeqCst), 0);
+        let snap = gw.usage_snapshot(&agent).await;
+        assert_eq!(snap.dlp_blocks, 3);
+        let evs = events.lock().unwrap();
+        assert_eq!(evs.len(), 3);
+        assert!(evs.iter().all(|e| matches!(e, EgressGuardEvent::DlpBlocked { .. })));
+    }
+
+    #[tokio::test]
+    async fn non_streaming_json_restoration_updates_content_length() {
+        let upstream_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let upstream_addr = upstream_listener.local_addr().unwrap();
+        let captured_upstream_req = Arc::new(std::sync::Mutex::new(String::new()));
+        let cap_clone = captured_upstream_req.clone();
+
+        tokio::spawn(async move {
+            if let Ok((mut sock, _)) = upstream_listener.accept().await {
+                let mut buf = Vec::new();
+                let mut tmp = [0u8; 4096];
+                let mut hdr_end = None;
+                let mut expected_len = 0usize;
+                loop {
+                    let n = sock.read(&mut tmp).await.unwrap_or(0);
+                    if n == 0 {
+                        break;
+                    }
+                    buf.extend_from_slice(&tmp[..n]);
+                    if hdr_end.is_none() {
+                        if let Some((he, bs)) = find_http_header_end(&buf) {
+                            let hdr_str = String::from_utf8_lossy(&buf[..he]);
+                            for line in hdr_str.lines() {
+                                if let Some((k, v)) = line.split_once(':') {
+                                    if k.trim().eq_ignore_ascii_case("content-length") {
+                                        expected_len = v.trim().parse().unwrap_or(0);
+                                    }
+                                }
+                            }
+                            hdr_end = Some((he, bs));
+                        }
+                    }
+                    if let Some((_, bs)) = hdr_end {
+                        if buf.len() >= bs + expected_len {
+                            break;
+                        }
+                    }
+                }
+                let (_, bs) = hdr_end.expect("upstream must receive full HTTP request");
+                let raw_req = String::from_utf8_lossy(&buf).to_string();
+                *cap_clone.lock().unwrap() = raw_req;
+                let req_json: serde_json::Value =
+                    serde_json::from_slice(&buf[bs..bs + expected_len]).unwrap();
+                let masked_content = req_json["messages"][0]["content"]
+                    .as_str()
+                    .unwrap()
+                    .to_string();
+
+                let resp_body = json!({
+                    "id": "msg_1",
+                    "model": "claude-sonnet-4-5",
+                    "content": [{ "type": "text", "text": format!("Echo: {masked_content}") }],
+                    "usage": { "input_tokens": 500, "output_tokens": 100 }
+                })
+                .to_string();
+                let resp = format!(
+                    "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                    resp_body.len(),
+                    resp_body
+                );
+                let _ = sock.write_all(resp.as_bytes()).await;
+            }
+        });
+
+        let gw = Arc::new(AegisEgressGateway::new());
+        gw.allow_domains("acme", vec!["api.anthropic.com".to_string()])
+            .await;
+        gw.set_upstream_override("api.anthropic.com", &upstream_addr.to_string(), false)
+            .await;
+
+        let agent = AgentIdentity::new("acme", "coder-json", "Engineer");
+        gw.set_dlp_config_for_agent(
+            &agent,
+            DlpGatewayConfig {
+                pseudonym_mode: PseudonymMode::Pseudonymize,
+                custom_patterns: vec![CustomRedactionRule {
+                    name: "short_tag".to_string(),
+                    literal: "S1".to_string(),
+                    tag: None,
+                }],
+                budget: None,
+            },
+            None,
+            None,
+        )
+        .await;
+
+        let (proxy_addr, handle) = gw
+            .clone()
+            .start_local_proxy_abortable("127.0.0.1:0", Some(agent.clone()))
+            .await
+            .unwrap();
+
+        let orig_text = "Send S1 alert to alice@secret-corp.com on 192.168.42.10";
+        let req_body = json!({
+            "model": "claude-sonnet-4-5",
+            "messages": [{ "role": "user", "content": orig_text }]
+        })
+        .to_string();
+        let mut client = TcpStream::connect(proxy_addr).await.unwrap();
+        let req = format!(
+            "POST /__aegis/base/anthropic/v1/messages HTTP/1.1\r\nHost: 127.0.0.1\r\nAccept-Encoding: gzip, br\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+            req_body.len(),
+            req_body
+        );
+        client.write_all(req.as_bytes()).await.unwrap();
+        let mut raw_resp = Vec::new();
+        client.read_to_end(&mut raw_resp).await.unwrap();
+        handle.abort();
+
+        let seen_upstream = captured_upstream_req.lock().unwrap().clone();
+        assert!(!seen_upstream.contains("alice@secret-corp.com"), "{seen_upstream}");
+        assert!(!seen_upstream.contains("192.168.42.10"), "{seen_upstream}");
+        assert!(
+            seen_upstream.to_ascii_lowercase().contains("accept-encoding: identity"),
+            "must force identity encoding: {seen_upstream}"
+        );
+
+        let (he, bs) = find_http_header_end(&raw_resp).unwrap();
+        let head = parse_http_response_head(&raw_resp[..he]);
+        let body = &raw_resp[bs..];
+        assert_eq!(head.content_length, Some(body.len()));
+
+        let resp_json: serde_json::Value = serde_json::from_slice(body).unwrap();
+        assert_eq!(
+            resp_json["content"][0]["text"],
+            format!("Echo: {orig_text}")
+        );
+
+        let snap = gw.usage_snapshot(&agent).await;
+        assert_eq!(snap.requests, 1);
+        assert_eq!(snap.input_tokens, 500);
+        assert_eq!(snap.output_tokens, 100);
+        assert!(snap.cost_micro_usd > 0);
+        assert_eq!(snap.pseudonyms_active, 3);
+    }
+
+    #[tokio::test]
+    async fn l7_sse_proxy_streams_split_pseudonyms_and_enforces_budget_and_extend() {
+        let upstream_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let upstream_addr = upstream_listener.local_addr().unwrap();
+
+        tokio::spawn(async move {
+            for _ in 0..2 {
+                let Ok((mut sock, _)) = upstream_listener.accept().await else {
+                    break;
+                };
+                let mut buf = Vec::new();
+                let mut tmp = [0u8; 4096];
+                let mut hdr_end = None;
+                let mut expected_len = 0usize;
+                loop {
+                    let n = sock.read(&mut tmp).await.unwrap_or(0);
+                    if n == 0 {
+                        break;
+                    }
+                    buf.extend_from_slice(&tmp[..n]);
+                    if hdr_end.is_none() {
+                        if let Some((he, bs)) = find_http_header_end(&buf) {
+                            let hdr_str = String::from_utf8_lossy(&buf[..he]);
+                            for line in hdr_str.lines() {
+                                if let Some((k, v)) = line.split_once(':') {
+                                    if k.trim().eq_ignore_ascii_case("content-length") {
+                                        expected_len = v.trim().parse().unwrap_or(0);
+                                    }
+                                }
+                            }
+                            hdr_end = Some((he, bs));
+                        }
+                    }
+                    if let Some((_, bs)) = hdr_end {
+                        if buf.len() >= bs + expected_len {
+                            break;
+                        }
+                    }
+                }
+                let (_, bs) = hdr_end.unwrap();
+                let req_json: serde_json::Value =
+                    serde_json::from_slice(&buf[bs..bs + expected_len]).unwrap();
+                let masked_content = req_json["messages"][0]["content"]
+                    .as_str()
+                    .unwrap()
+                    .to_string();
+                let pseudo_email = masked_content
+                    .split_whitespace()
+                    .find(|w| w.contains("@aegis-redact.invalid"))
+                    .unwrap()
+                    .to_string();
+                let split_at = pseudo_email.len() / 2;
+                let part1 = &pseudo_email[..split_at];
+                let part2 = &pseudo_email[split_at..];
+
+                let sse_payload = format!(
+                    "event: message_start\n\
+                     data: {{\"type\":\"message_start\",\"message\":{{\"model\":\"test-sonnet\",\"usage\":{{\"input_tokens\":10000}}}}}}\n\n\
+                     event: content_block_delta\n\
+                     data: {{\"type\":\"content_block_delta\",\"index\":0,\"delta\":{{\"type\":\"text_delta\",\"text\":\"Hi {part1}\"}}}}\n\n\
+                     event: content_block_delta\n\
+                     data: {{\"type\":\"content_block_delta\",\"index\":0,\"delta\":{{\"type\":\"text_delta\",\"text\":\"{part2}!\"}}}}\n\n\
+                     event: content_block_stop\n\
+                     data: {{\"type\":\"content_block_stop\",\"index\":0}}\n\n\
+                     event: message_delta\n\
+                     data: {{\"type\":\"message_delta\",\"usage\":{{\"output_tokens\":4000}}}}\n\n\
+                     event: message_stop\n\
+                     data: {{\"type\":\"message_stop\"}}\n\n"
+                );
+                let mid = sse_payload.len() / 2;
+                let c1 = &sse_payload.as_bytes()[..mid];
+                let c2 = &sse_payload.as_bytes()[mid..];
+                let mut wire = Vec::new();
+                wire.extend_from_slice(
+                    b"HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nTransfer-Encoding: chunked\r\nConnection: close\r\n\r\n",
+                );
+                wire.extend_from_slice(format!("{:x}\r\n", c1.len()).as_bytes());
+                wire.extend_from_slice(c1);
+                wire.extend_from_slice(b"\r\n");
+                wire.extend_from_slice(format!("{:x}\r\n", c2.len()).as_bytes());
+                wire.extend_from_slice(c2);
+                wire.extend_from_slice(b"\r\n0\r\n\r\n");
+                let _ = sock.write_all(&wire).await;
+            }
+        });
+
+        let gw = Arc::new(AegisEgressGateway::new());
+        gw.allow_domains("acme", vec!["api.anthropic.com".to_string()])
+            .await;
+        gw.set_upstream_override("api.anthropic.com", &upstream_addr.to_string(), false)
+            .await;
+        let mut rates = HashMap::new();
+        rates.insert(
+            "test-sonnet".to_string(),
+            ModelRate {
+                input_micro_usd_per_mtok: 1_000_000,
+                output_micro_usd_per_mtok: 5_000_000,
+                cached_input_micro_usd_per_mtok: 0,
+            },
+        );
+        gw.set_pricing_overrides(rates).await;
+
+        let events = Arc::new(std::sync::Mutex::new(Vec::<EgressGuardEvent>::new()));
+        let ev_sink = events.clone();
+        gw.set_event_sink(Arc::new(move |ev| {
+            ev_sink.lock().unwrap().push(ev);
+        }))
+        .await;
+
+        let agent = AgentIdentity::new("acme", "coder-sse", "Engineer");
+        // Budget = $0.025 (25_000 micro_usd); request #1 consumes $0.01 + $0.02 = $0.03 -> trips after #1!
+        gw.set_dlp_config_for_agent(
+            &agent,
+            DlpGatewayConfig {
+                pseudonym_mode: PseudonymMode::Pseudonymize,
+                custom_patterns: Vec::new(),
+                budget: Some(BudgetPolicy {
+                    max_tokens: None,
+                    max_cost_micro_usd: Some(25_000),
+                    max_requests: None,
+                    max_identical_loop_streak: 4,
+                }),
+            },
+            None,
+            None,
+        )
+        .await;
+
+        let (proxy_addr, handle) = gw
+            .clone()
+            .start_local_proxy_abortable("127.0.0.1:0", Some(agent.clone()))
+            .await
+            .unwrap();
+
+        let body_json = json!({
+            "model": "test-sonnet",
+            "stream": true,
+            "messages": [{ "role": "user", "content": "Reply to alice@secret-corp.com now" }]
+        })
+        .to_string();
+        let raw_http_req = format!(
+            "POST /__aegis/base/anthropic/v1/messages HTTP/1.1\r\nHost: 127.0.0.1\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+            body_json.len(),
+            body_json
+        );
+
+        // Request 1: 200 OK chunked SSE with restored original email.
+        let mut c1 = TcpStream::connect(proxy_addr).await.unwrap();
+        c1.write_all(raw_http_req.as_bytes()).await.unwrap();
+        let mut r1 = Vec::new();
+        c1.read_to_end(&mut r1).await.unwrap();
+        let (_he1, bs1) = find_http_header_end(&r1).unwrap();
+        let mut dec1 = breaker::HttpChunkedDecoder::new();
+        let sse1 = String::from_utf8(dec1.push(&r1[bs1..]).unwrap()).unwrap();
+        assert!(dec1.is_done(), "downstream chunked framing must terminate with 0\\r\\n\\r\\n");
+        let mut texts = String::new();
+        for line in sse1.lines() {
+            if let Some(d) = line.strip_prefix("data:") {
+                if let Ok(v) = serde_json::from_str::<serde_json::Value>(d.trim()) {
+                    if let Some(t) = v.pointer("/delta/text").and_then(|x| x.as_str()) {
+                        texts.push_str(t);
+                    }
+                }
+            }
+        }
+        assert_eq!(texts, "Hi alice@secret-corp.com!");
+
+        let snap1 = gw.usage_snapshot(&agent).await;
+        assert_eq!(snap1.cost_micro_usd, 30_000);
+        assert!(matches!(
+            snap1.tripped,
+            Some(CircuitTripReason::SessionBudgetExceeded { .. })
+        ));
+
+        // Request 2: blocked locally with 429 Too Many Requests.
+        let mut c2 = TcpStream::connect(proxy_addr).await.unwrap();
+        c2.write_all(raw_http_req.as_bytes()).await.unwrap();
+        let mut r2 = Vec::new();
+        c2.read_to_end(&mut r2).await.unwrap();
+        let s2 = String::from_utf8_lossy(&r2);
+        assert!(s2.contains("HTTP/1.1 429 Too Many Requests"), "{s2}");
+        assert!(s2.contains("aegis_circuit_tripped"), "{s2}");
+
+        // Extend budget by +50_000 micro-USD => Request 3 succeeds cleanly!
+        assert!(gw.extend_agent_budget(&agent, 50_000, 0, 0).await);
+        let mut c3 = TcpStream::connect(proxy_addr).await.unwrap();
+        c3.write_all(raw_http_req.as_bytes()).await.unwrap();
+        let mut r3 = Vec::new();
+        c3.read_to_end(&mut r3).await.unwrap();
+        let s3 = String::from_utf8_lossy(&r3);
+        assert!(s3.contains("HTTP/1.1 200 OK"), "{s3}");
+        assert!(s3.contains("alice@secret-corp.com"));
+
+        handle.abort();
+        let evs = events.lock().unwrap();
+        assert!(evs.iter().any(|e| matches!(e, EgressGuardEvent::CircuitTripped { .. })));
+        assert!(evs.iter().any(|e| matches!(e, EgressGuardEvent::BudgetExtended { .. })));
     }
 }

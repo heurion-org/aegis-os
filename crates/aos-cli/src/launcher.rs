@@ -19,7 +19,10 @@ use aos_core::{
     PolicyContext, PolicyDecision, PolicyEngine, ResourceLimits, SandboxConfig, SandboxDriver,
     TransactionalWorkspace,
 };
-use aos_egress::{AegisEgressGateway, SecretVaultEntry};
+use aos_egress::{
+    AegisEgressGateway, BudgetPolicy, CustomRedactionRule, DlpGatewayConfig, EgressGuardEvent,
+    ModelRate, PseudonymMode, SecretVaultEntry, UsageSnapshot,
+};
 use aos_mcp_gateway::AegisRuntimeKernel;
 use aos_sandbox::NativeOsSandboxDriver;
 use axum::{
@@ -177,7 +180,216 @@ struct FdMount {
     readonly: bool,
 }
 
+#[derive(Debug, Clone, Default, PartialEq)]
+pub(crate) struct RunEgressOptions {
+    pub dlp_mode: Option<String>,
+    pub dlp_config: Option<PathBuf>,
+    pub budget_usd: Option<f64>,
+    pub max_tokens: Option<u64>,
+    pub max_loop_streak: Option<u32>,
+}
+
+#[derive(Clone)]
+struct ExitTelemetryContext {
+    gateway: Arc<AegisEgressGateway>,
+    identity: AgentIdentity,
+}
+
+#[derive(Debug, Clone, Default, Deserialize)]
+struct DlpFileConfig {
+    #[serde(default)]
+    pseudonym_mode: Option<String>,
+    #[serde(default)]
+    budget_usd: Option<f64>,
+    #[serde(default)]
+    max_tokens: Option<u64>,
+    #[serde(default)]
+    max_requests: Option<u32>,
+    #[serde(default)]
+    max_identical_loop_streak: Option<u32>,
+    #[serde(default)]
+    custom_literals: Vec<DlpFileLiteralEntry>,
+    #[serde(default)]
+    pricing: std::collections::HashMap<String, ModelRate>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+#[serde(untagged)]
+enum DlpFileLiteralEntry {
+    Rule(CustomRedactionRule),
+    Literal(String),
+}
+
+fn usd_to_micro_usd(usd: f64, source: &str) -> anyhow::Result<u64> {
+    if !usd.is_finite() || usd < 0.0 {
+        bail!("invalid {source} USD budget '{usd}'; must be a finite non-negative number");
+    }
+    let scaled = (usd * 1_000_000.0).round();
+    if scaled >= u64::MAX as f64 {
+        Ok(u64::MAX - 1)
+    } else {
+        Ok(scaled as u64)
+    }
+}
+
+fn read_dlp_config_file(path: &Path) -> anyhow::Result<DlpFileConfig> {
+    const MAX_DLP_CONFIG_BYTES: u64 = 256 * 1024;
+    let meta = std::fs::symlink_metadata(path)
+        .with_context(|| format!("inspecting DLP config {}", path.display()))?;
+    if meta.file_type().is_symlink() {
+        bail!("refusing symlinked DLP config at {}", path.display());
+    }
+    if !meta.file_type().is_file() {
+        bail!("DLP config path {} is not a regular file", path.display());
+    }
+    if meta.len() > MAX_DLP_CONFIG_BYTES {
+        bail!(
+            "DLP config {} exceeds 256 KiB limit ({} bytes)",
+            path.display(),
+            meta.len()
+        );
+    }
+    let raw = std::fs::read_to_string(path)
+        .with_context(|| format!("reading DLP config {}", path.display()))?;
+    serde_json::from_str::<DlpFileConfig>(&raw)
+        .with_context(|| format!("parsing DLP config JSON {}", path.display()))
+}
+
+pub(crate) fn resolve_session_dlp_settings_with_env(
+    project: &Path,
+    opts: &RunEgressOptions,
+    env_dlp_mode: Option<&str>,
+    env_budget_usd: Option<&str>,
+    env_max_tokens: Option<&str>,
+) -> anyhow::Result<(DlpGatewayConfig, std::collections::HashMap<String, ModelRate>)> {
+    let file_cfg = if let Some(ref explicit) = opts.dlp_config {
+        read_dlp_config_file(explicit)?
+    } else {
+        let default_path = project.join(".aegis").join("dlp.json");
+        match std::fs::symlink_metadata(&default_path) {
+            Ok(_) => read_dlp_config_file(&default_path)?,
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound => DlpFileConfig::default(),
+            Err(err) => {
+                return Err(err).with_context(|| {
+                    format!("inspecting default DLP config {}", default_path.display())
+                });
+            }
+        }
+    };
+
+    let mode_raw = opts
+        .dlp_mode
+        .as_deref()
+        .or(env_dlp_mode.filter(|s| !s.trim().is_empty()))
+        .or(file_cfg.pseudonym_mode.as_deref())
+        .unwrap_or("block");
+    let pseudonym_mode: PseudonymMode = mode_raw
+        .parse()
+        .map_err(|e: String| anyhow::anyhow!("{e}"))?;
+
+    let env_usd_parsed = match env_budget_usd.map(str::trim).filter(|s| !s.is_empty()) {
+        Some(raw) => Some(
+            raw.parse::<f64>()
+                .with_context(|| format!("parsing AOS_BUDGET_USD='{raw}'"))?,
+        ),
+        None => None,
+    };
+    let env_tokens_parsed = match env_max_tokens.map(str::trim).filter(|s| !s.is_empty()) {
+        Some(raw) => Some(
+            raw.parse::<u64>()
+                .with_context(|| format!("parsing AOS_MAX_TOKENS='{raw}'"))?,
+        ),
+        None => None,
+    };
+
+    let eff_budget_usd = opts.budget_usd.or(env_usd_parsed).or(file_cfg.budget_usd);
+    let max_cost_micro_usd = match eff_budget_usd {
+        Some(usd) => Some(usd_to_micro_usd(usd, "budget_usd")?),
+        None => None,
+    };
+    let max_tokens = opts.max_tokens.or(env_tokens_parsed).or(file_cfg.max_tokens);
+    let max_requests = file_cfg.max_requests;
+    let explicit_streak = opts.max_loop_streak.or(file_cfg.max_identical_loop_streak);
+
+    let budget = if max_cost_micro_usd.is_some()
+        || max_tokens.is_some()
+        || max_requests.is_some()
+        || explicit_streak.is_some()
+    {
+        Some(BudgetPolicy {
+            max_tokens,
+            max_cost_micro_usd,
+            max_requests,
+            max_identical_loop_streak: explicit_streak.unwrap_or(4),
+        })
+    } else {
+        None
+    };
+
+    let custom_patterns: Vec<CustomRedactionRule> = file_cfg
+        .custom_literals
+        .into_iter()
+        .enumerate()
+        .filter_map(|(idx, entry)| match entry {
+            DlpFileLiteralEntry::Rule(r) if !r.literal.trim().is_empty() => Some(r),
+            DlpFileLiteralEntry::Literal(s) if !s.trim().is_empty() => Some(CustomRedactionRule {
+                name: format!("literal_{idx}"),
+                literal: s,
+                tag: None,
+            }),
+            _ => None,
+        })
+        .collect();
+
+    Ok((
+        DlpGatewayConfig {
+            pseudonym_mode,
+            custom_patterns,
+            budget,
+        },
+        file_cfg.pricing,
+    ))
+}
+
+fn resolve_session_dlp_settings(
+    project: &Path,
+    opts: &RunEgressOptions,
+) -> anyhow::Result<(DlpGatewayConfig, std::collections::HashMap<String, ModelRate>)> {
+    let env_mode = std::env::var("AOS_DLP_MODE").ok();
+    let env_usd = std::env::var("AOS_BUDGET_USD").ok();
+    let env_tok = std::env::var("AOS_MAX_TOKENS").ok();
+    resolve_session_dlp_settings_with_env(
+        project,
+        opts,
+        env_mode.as_deref(),
+        env_usd.as_deref(),
+        env_tok.as_deref(),
+    )
+}
+
+async fn persist_egress_usage(
+    telemetry: Option<&ExitTelemetryContext>,
+    session_dir: &Path,
+) -> Option<UsageSnapshot> {
+    let ctx = telemetry?;
+    let snap = ctx.gateway.usage_snapshot(&ctx.identity).await;
+    let usage_path = session_dir.join("egress_usage.json");
+    let has_activity = snap.requests > 0
+        || snap.dlp_blocks > 0
+        || snap.pseudonym_replacements > 0
+        || snap.tripped.is_some()
+        || usage_path.exists();
+    if !has_activity {
+        return None;
+    }
+    if let Ok(bytes) = serde_json::to_vec_pretty(&snap) {
+        let _ = aos_core::session::write_bytes_atomic_synced(&usage_path, &bytes);
+    }
+    Some(snap)
+}
+
 struct EgressGuard {
+    gateway: Arc<AegisEgressGateway>,
     handle: Option<tokio::task::JoinHandle<()>>,
     cred_watch_handle: Option<tokio::task::JoinHandle<()>>,
     sock: Option<PathBuf>,
@@ -1146,7 +1358,8 @@ fn infer_identity(identity: &AgentIdentity, command: &[String]) -> AgentIdentity
     }
 }
 
-pub(crate) async fn run(
+#[allow(clippy::too_many_arguments)]
+pub(crate) async fn run_with_options(
     workspace: &Path,
     identity: &AgentIdentity,
     runtime_dir: &Path,
@@ -1154,6 +1367,7 @@ pub(crate) async fn run(
     profile: &str,
     enforcement: &str,
     command: &[String],
+    egress_opts: &RunEgressOptions,
 ) -> anyhow::Result<i32> {
     let host_home = host_home()?;
     run_inner(
@@ -1165,6 +1379,7 @@ pub(crate) async fn run(
         enforcement,
         command,
         &host_home,
+        egress_opts,
     )
     .await
 }
@@ -2723,11 +2938,17 @@ fn latest_session(runtime_dir: &Path) -> anyhow::Result<Option<(PathBuf, Value)>
 }
 
 pub(crate) fn status(runtime_dir: &Path, as_json: bool) -> anyhow::Result<()> {
-    let Some((dir, value)) = latest_session(runtime_dir)? else {
+    let Some((dir, mut value)) = latest_session(runtime_dir)? else {
         eprintln!("Aegis: no sessions under {}", runtime_dir.display());
         return Ok(());
     };
+    let egress_usage_opt = std::fs::read_to_string(dir.join("egress_usage.json"))
+        .ok()
+        .and_then(|raw| serde_json::from_str::<UsageSnapshot>(&raw).ok());
     if as_json {
+        if let (Some(obj), Some(ref snap)) = (value.as_object_mut(), &egress_usage_opt) {
+            obj.insert("egress_usage".to_string(), json!(snap));
+        }
         println!("{}", serde_json::to_string_pretty(&value)?);
         return Ok(());
     }
@@ -2787,6 +3008,21 @@ pub(crate) fn status(runtime_dir: &Path, as_json: bool) -> anyhow::Result<()> {
     }
     if let Some(code) = value.get("exit_code").and_then(|v| v.as_i64()) {
         println!("Exit:      {code}");
+    }
+    if let Some(ref snap) = egress_usage_opt {
+        let mut line = format!(
+            "Egress:    {} req(s), {} in / {} out tok (${:.4}), {} pseudonym(s), {} dlp block(s)",
+            snap.requests,
+            snap.input_tokens,
+            snap.output_tokens,
+            snap.cost_micro_usd as f64 / 1_000_000.0,
+            snap.pseudonyms_active,
+            snap.dlp_blocks
+        );
+        if let Some(ref tripped) = snap.tripped {
+            line.push_str(&format!(" [TRIPPED: {:?}]", tripped));
+        }
+        println!("{line}");
     }
     println!("Dir:       {}", dir.display());
     Ok(())
@@ -4058,6 +4294,7 @@ async fn register_boundary_secrets(
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn start_egress(
     identity: &AgentIdentity,
     session_dir: &Path,
@@ -4065,8 +4302,49 @@ async fn start_egress(
     host_home: &Path,
     command: &[String],
     harvested_secrets: &std::collections::HashMap<String, String>,
+    dlp_cfg: &DlpGatewayConfig,
+    pricing_overrides: &std::collections::HashMap<String, ModelRate>,
 ) -> anyhow::Result<(EgressGuard, String, String)> {
     let gateway = Arc::new(AegisEgressGateway::new());
+    if !pricing_overrides.is_empty() {
+        gateway.set_pricing_overrides(pricing_overrides.clone()).await;
+    }
+    if dlp_cfg.pseudonym_mode != PseudonymMode::Block || dlp_cfg.budget.is_some() {
+        gateway
+            .set_dlp_config_for_agent(identity, dlp_cfg.clone(), None, None)
+            .await;
+    }
+    let sink_session_dir = session_dir.to_path_buf();
+    gateway
+        .set_event_sink(Arc::new(move |ev| {
+            let effects_path = sink_session_dir.join("effects.jsonl");
+            let is_not_symlink = std::fs::symlink_metadata(&effects_path)
+                .map(|m| !m.file_type().is_symlink())
+                .unwrap_or(true);
+            if is_not_symlink {
+                if let Ok(mut file) = std::fs::OpenOptions::new()
+                    .create(true)
+                    .append(true)
+                    .open(&effects_path)
+                {
+                    let row = json!({
+                        "event": "egress.guard",
+                        "detail": ev,
+                        "timestamp_ms": chrono::Utc::now().timestamp_millis(),
+                    });
+                    let _ = writeln!(file, "{row}");
+                }
+            }
+            if let EgressGuardEvent::CircuitTripped { ref usage, .. } = ev {
+                if let Ok(bytes) = serde_json::to_vec_pretty(usage) {
+                    let _ = aos_core::session::write_bytes_atomic_synced(
+                        &sink_session_dir.join("egress_usage.json"),
+                        &bytes,
+                    );
+                }
+            }
+        }))
+        .await;
     let mut domains: Vec<String> = [
         "api.anthropic.com",
         "api.openai.com",
@@ -4293,6 +4571,7 @@ async fn start_egress(
         None
     };
     let proxy = gateway
+        .clone()
         .start_local_proxy_with_bound_identity("127.0.0.1:0", Some(identity.clone()))
         .await?;
     let proxy = proxy.to_string();
@@ -4307,6 +4586,7 @@ async fn start_egress(
         let _ = std::fs::set_permissions(&egress_dir, std::fs::Permissions::from_mode(0o700));
         Ok((
             EgressGuard {
+                gateway,
                 handle: None,
                 cred_watch_handle,
                 sock: None,
@@ -4337,6 +4617,7 @@ async fn start_egress(
         let handle = aos_sandbox::bridge::spawn_host_bridge(&sock, proxy.clone(), token.clone())?;
         Ok((
             EgressGuard {
+                gateway,
                 handle: Some(handle),
                 cred_watch_handle,
                 sock: Some(sock),
@@ -5226,16 +5507,45 @@ pub(crate) async fn artifacts_fetch(
     Ok(())
 }
 
-async fn print_exit_summary(session_dir: &Path, project: &Path, shadow: &Path) -> usize {
+async fn print_exit_summary(
+    session_dir: &Path,
+    project: &Path,
+    shadow: &Path,
+    telemetry: Option<&ExitTelemetryContext>,
+) -> usize {
+    let egress_snap = persist_egress_usage(telemetry, session_dir).await;
+    let print_egress = |snap: &UsageSnapshot| {
+        eprint!(
+            "  egress:    {} req(s), {} in / {} out tok (${:.4}), {} pseudonym(s), {} dlp block(s)",
+            snap.requests,
+            snap.input_tokens,
+            snap.output_tokens,
+            snap.cost_micro_usd as f64 / 1_000_000.0,
+            snap.pseudonyms_active,
+            snap.dlp_blocks,
+        );
+        if let Some(ref tripped) = snap.tripped {
+            eprintln!(" [TRIPPED: {:?}]", tripped);
+        } else {
+            eprintln!();
+        }
+    };
+
     let changes = match CoWWorkspace::diff_dirs(project, shadow, None).await {
         Ok(changes) => changes,
         Err(err) => {
             eprintln!("\nAgent exited; could not summarize shadow changes: {err}");
+            if let Some(ref snap) = egress_snap {
+                print_egress(snap);
+            }
             return 0;
         }
     };
     if changes.is_empty() {
         eprintln!("\nAgent exited. No shadow changes.");
+        if let Some(ref snap) = egress_snap {
+            print_egress(snap);
+        }
         return 0;
     }
 
@@ -5252,6 +5562,9 @@ async fn print_exit_summary(session_dir: &Path, project: &Path, shadow: &Path) -
     }
     if changes.len() > 20 {
         eprintln!("  ... {} more", changes.len() - 20);
+    }
+    if let Some(ref snap) = egress_snap {
+        print_egress(snap);
     }
     eprintln!("  session: {}", session_dir.display());
     eprintln!("  aegis-os diff      inspect");
@@ -5923,6 +6236,7 @@ async fn run_inner(
     enforcement: &str,
     command: &[String],
     host_home: &Path,
+    egress_opts: &RunEgressOptions,
 ) -> anyhow::Result<i32> {
     let Some((program, _args)) = command.split_first() else {
         bail!("aos run: no agent command given; usage: aegis-os run -- <agent> [args...]");
@@ -6050,6 +6364,8 @@ async fn run_inner(
         );
     }
 
+    let (dlp_cfg, pricing_overrides) = resolve_session_dlp_settings(&project, egress_opts)?;
+
     #[cfg(target_os = "macos")]
     {
         return run_macos_inner(
@@ -6060,6 +6376,8 @@ async fn run_inner(
             &profile,
             &command,
             host_home,
+            &dlp_cfg,
+            &pricing_overrides,
         )
         .await;
     }
@@ -6131,6 +6449,8 @@ async fn run_inner(
             host_home,
             &orig_command,
             &harvested_secrets,
+            &dlp_cfg,
+            &pricing_overrides,
         )
         .await?;
         rewrite_hermes_config_for_l7(&agent_home, &proxy, None);
@@ -6153,6 +6473,13 @@ async fn run_inner(
     } else {
         (None, None, None, true, command)
     };
+    let egress_gateway_opt = egress_guard.as_ref().map(|g| g.gateway.clone());
+    let exit_telemetry = egress_gateway_opt
+        .as_ref()
+        .map(|gateway| ExitTelemetryContext {
+            gateway: gateway.clone(),
+            identity: identity.clone(),
+        });
     let _egress_guard = egress_guard;
 
     let exclude_preview_ports: Vec<u16> = proxy
@@ -6214,7 +6541,7 @@ async fn run_inner(
     // the host side, uses the same policy_state as `aos policy`, and exposes adapter.evaluate /
     // effect / heartbeat plus human-only escalation and lease routes. MCP `proc_exec` receives
     // the same egress proxy so it cannot bypass the launcher's network policy.
-    let broker = crate::session_broker::SessionBroker::start(
+    let broker = crate::session_broker::SessionBroker::start_with_egress(
         runtime_dir,
         &session_dir,
         session_dir.join("control"),
@@ -6229,6 +6556,7 @@ async fn run_inner(
         identity.clone(),
         proxy.clone(),
         false,
+        egress_gateway_opt,
     )
     .await?;
 
@@ -6424,6 +6752,7 @@ async fn run_inner(
             &orig_command,
             &project,
             &shadow,
+            exit_telemetry.as_ref(),
         )
         .await;
     }
@@ -6459,7 +6788,7 @@ async fn run_inner(
             status = &mut wait => {
                 let code = exit_code(status?);
                 sync_credentials(&agent_home, host_home, &orig_command);
-                let pending = print_exit_summary(&session_dir, &project, &shadow).await;
+                let pending = print_exit_summary(&session_dir, &project, &shadow, exit_telemetry.as_ref()).await;
                 let effective = if code == 0 && pending > 0 { 10 } else { code };
                 update_session_state(&session_dir, "exited", Some(effective));
                 return Ok(effective);
@@ -6469,7 +6798,7 @@ async fn run_inner(
                     let status = wait.await?;
                     let code = exit_code(status);
                     sync_credentials(&agent_home, host_home, &orig_command);
-                    let pending = print_exit_summary(&session_dir, &project, &shadow).await;
+                    let pending = print_exit_summary(&session_dir, &project, &shadow, exit_telemetry.as_ref()).await;
                     let effective = if code == 0 && pending > 0 { 10 } else { code };
                     update_session_state(&session_dir, "exited", Some(effective));
                     return Ok(effective);
@@ -6552,6 +6881,8 @@ async fn run_macos_inner(
     profile: &str,
     command: &[String],
     host_home: &Path,
+    dlp_cfg: &DlpGatewayConfig,
+    pricing_overrides: &std::collections::HashMap<String, ModelRate>,
 ) -> anyhow::Result<i32> {
     let harvested_secrets = harvest_host_secrets(host_home, command);
     let session_id = format!("ses_{}", &uuid::Uuid::new_v4().simple().to_string()[..12]);
@@ -6606,18 +6937,24 @@ async fn run_macos_inner(
         let _ = std::fs::write(&session_index, index);
     }
 
-    let (_egress_guard, proxy, _bridge_token) = start_egress(
+    let (egress_guard, proxy, _bridge_token) = start_egress(
         identity,
         &session_dir,
         &agent_home,
         host_home,
         command,
         &harvested_secrets,
+        dlp_cfg,
+        pricing_overrides,
     )
     .await?;
+    let exit_telemetry = ExitTelemetryContext {
+        gateway: egress_guard.gateway.clone(),
+        identity: identity.clone(),
+    };
     rewrite_hermes_config_for_l7(&agent_home, &proxy, hermes_pinned_port);
     rewrite_opencode_config_for_l7(&agent_home, &proxy);
-    let broker = crate::session_broker::SessionBroker::start(
+    let broker = crate::session_broker::SessionBroker::start_with_egress(
         runtime_dir,
         &session_dir,
         agent_home.join("control"),
@@ -6632,6 +6969,7 @@ async fn run_macos_inner(
         identity.clone(),
         Some(proxy.clone()),
         true,
+        Some(egress_guard.gateway.clone()),
     )
     .await?;
 
@@ -6886,6 +7224,18 @@ async fn run_macos_inner(
     eprintln!("  host:    {} (read-only; use AOS_HOST_ROOT)", project.display());
     eprintln!("  git:     {}", if host_git.is_dir() { "host .git read-only + session index" } else { "unavailable" });
     eprintln!("  network: egress allowlist (CONNECT + model API Base URL L7)");
+    if dlp_cfg.pseudonym_mode != PseudonymMode::Block || dlp_cfg.budget.is_some() {
+        eprintln!(
+            "  dlp:     mode={:?}, budget={}",
+            dlp_cfg.pseudonym_mode,
+            dlp_cfg
+                .budget
+                .as_ref()
+                .and_then(|b| b.max_cost_micro_usd)
+                .map(|m| format!("${:.2}", m as f64 / 1_000_000.0))
+                .unwrap_or_else(|| "unlimited".to_string())
+        );
+    }
     eprintln!("  broker:  {}", broker.control_endpoint());
     eprintln!("  warning: macOS v1 uses the shadow as cwd (no path remapping)");
 
@@ -6903,6 +7253,7 @@ async fn run_macos_inner(
             command,
             project,
             &shadow,
+            Some(&exit_telemetry),
         )
         .await
     } else {
@@ -6916,6 +7267,7 @@ async fn run_macos_inner(
             host_home,
             command,
             project,
+            Some(&exit_telemetry),
         )
         .await
     }
@@ -6933,6 +7285,7 @@ async fn run_plain_command(
     host_home: &Path,
     orig_command: &[String],
     project: &Path,
+    telemetry: Option<&ExitTelemetryContext>,
 ) -> anyhow::Result<i32> {
     let mut cmd = Command::new(program);
     cmd.args(args).current_dir(cwd).env_clear().kill_on_drop(true);
@@ -6947,7 +7300,7 @@ async fn run_plain_command(
             status = &mut wait => {
                 let code = exit_code(status?);
                 sync_credentials(agent_home, host_home, orig_command);
-                let pending = print_exit_summary(session_dir, project, cwd).await;
+                let pending = print_exit_summary(session_dir, project, cwd, telemetry).await;
                 let effective = if code == 0 && pending > 0 { 10 } else { code };
                 update_session_state(session_dir, "exited", Some(effective));
                 return Ok(effective);
@@ -6965,7 +7318,7 @@ async fn run_plain_command(
     let status = wait.await?;
     let code = exit_code(status);
     sync_credentials(agent_home, host_home, orig_command);
-    let pending = print_exit_summary(session_dir, project, cwd).await;
+    let pending = print_exit_summary(session_dir, project, cwd, telemetry).await;
     let effective = if code == 0 && pending > 0 { 10 } else { code };
     update_session_state(session_dir, "exited", Some(effective));
     Ok(effective)
@@ -7016,6 +7369,7 @@ async fn run_pty_command(
     orig_command: &[String],
     host_project: &Path,
     shadow: &Path,
+    telemetry: Option<&ExitTelemetryContext>,
 ) -> anyhow::Result<i32> {
     let mut master: libc::c_int = -1;
     let mut slave: libc::c_int = -1;
@@ -7128,7 +7482,7 @@ async fn run_pty_command(
                 drop(raw_guard);
                 let code = exit_code(status);
                 sync_credentials(agent_home, host_home, orig_command);
-                let pending = print_exit_summary(session_dir, host_project, shadow).await;
+                let pending = print_exit_summary(session_dir, host_project, shadow, telemetry).await;
                 let effective = if code == 0 && pending > 0 { 10 } else { code };
                 update_session_state(session_dir, "exited", Some(effective));
                 return Ok(effective);
@@ -7139,7 +7493,7 @@ async fn run_pty_command(
                     drop(raw_guard);
                     let code = exit_code(status);
                     sync_credentials(agent_home, host_home, orig_command);
-                    let pending = print_exit_summary(session_dir, host_project, shadow).await;
+                    let pending = print_exit_summary(session_dir, host_project, shadow, telemetry).await;
                     let effective = if code == 0 && pending > 0 { 10 } else { code };
                     update_session_state(session_dir, "exited", Some(effective));
                     return Ok(effective);
@@ -8978,6 +9332,7 @@ mod tests {
                 "enforced",
                 &argv,
                 &temp_home,
+                &RunEgressOptions::default(),
             )
             .await
             .unwrap_or_else(|e| panic!("{agent} lifecycle invocation failed: {e:#}"));
@@ -9012,6 +9367,7 @@ mod tests {
             "enforced",
             &version_cmd,
             &temp_home,
+            &RunEgressOptions::default(),
         )
         .await
         .expect("agy --version from $HOME should succeed");
@@ -9616,5 +9972,98 @@ mod credential_write_back_tests {
         assert!(!json_shape_within(&json!({"a": {"k": 1}}), &json!({"a": "y"})));
         assert!(json_shape_within(&json!({"s": ["a", "b"]}), &json!({"s": []})));
         assert!(!json_shape_within(&json!({"s": [{"k": 1}]}), &json!({"s": []})));
+    }
+}
+
+#[cfg(test)]
+mod stage1_dlp_config_tests {
+    use super::*;
+
+    #[test]
+    fn dlp_settings_precedence_and_symlink_rejection() {
+        let tmp = tempfile::tempdir().unwrap();
+        let project = tmp.path().join("proj");
+        std::fs::create_dir_all(project.join(".aegis")).unwrap();
+        std::fs::write(
+            project.join(".aegis/dlp.json"),
+            serde_json::to_string_pretty(&json!({
+                "pseudonym_mode": "pseudonymize",
+                "budget_usd": 3.5,
+                "max_tokens": 100000,
+                "max_requests": 42,
+                "max_identical_loop_streak": 6,
+                "custom_literals": [
+                    "ProjectPhoenix",
+                    { "name": "codename", "literal": "Apollo99", "tag": "custom" }
+                ],
+                "pricing": {
+                    "custom-llm": {
+                        "input_micro_usd_per_mtok": 1200000,
+                        "output_micro_usd_per_mtok": 4800000,
+                        "cached_input_micro_usd_per_mtok": 120000
+                    }
+                }
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+
+        // 1. Project `.aegis/dlp.json` values apply when CLI/env are unset.
+        let (cfg, rates) = resolve_session_dlp_settings_with_env(
+            &project,
+            &RunEgressOptions::default(),
+            None,
+            None,
+            None,
+        )
+        .unwrap();
+        assert_eq!(cfg.pseudonym_mode, PseudonymMode::Pseudonymize);
+        let budget = cfg.budget.unwrap();
+        assert_eq!(budget.max_cost_micro_usd, Some(3_500_000));
+        assert_eq!(budget.max_tokens, Some(100_000));
+        assert_eq!(budget.max_requests, Some(42));
+        assert_eq!(budget.max_identical_loop_streak, 6);
+        assert_eq!(cfg.custom_patterns.len(), 2);
+        assert_eq!(rates["custom-llm"].output_micro_usd_per_mtok, 4_800_000);
+
+        // 2. CLI overrides env overrides `.aegis/dlp.json`.
+        let opts = RunEgressOptions {
+            dlp_mode: Some("off".to_string()),
+            dlp_config: None,
+            budget_usd: Some(1.25),
+            max_tokens: None,
+            max_loop_streak: Some(2),
+        };
+        let (overridden, _) = resolve_session_dlp_settings_with_env(
+            &project,
+            &opts,
+            Some("block"),
+            Some("9.0"),
+            Some("50000"),
+        )
+        .unwrap();
+        assert_eq!(overridden.pseudonym_mode, PseudonymMode::Off);
+        let ob = overridden.budget.unwrap();
+        assert_eq!(ob.max_cost_micro_usd, Some(1_250_000));
+        assert_eq!(ob.max_tokens, Some(50_000));
+        assert_eq!(ob.max_identical_loop_streak, 2);
+
+        // 3. Symlinked `.aegis/dlp.json` MUST be rejected fail-closed!
+        #[cfg(unix)]
+        {
+            let target = tmp.path().join("outside.json");
+            std::fs::write(&target, r#"{"pseudonym_mode":"off"}"#).unwrap();
+            std::fs::remove_file(project.join(".aegis/dlp.json")).unwrap();
+            std::os::unix::fs::symlink(&target, project.join(".aegis/dlp.json")).unwrap();
+            let err = resolve_session_dlp_settings_with_env(
+                &project,
+                &RunEgressOptions::default(),
+                None,
+                None,
+                None,
+            )
+            .unwrap_err();
+            assert!(err.to_string().contains("symlink"), "{err}");
+        }
     }
 }

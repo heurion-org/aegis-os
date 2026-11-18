@@ -148,11 +148,17 @@ version = "0.4.11"
 dependencies = [
  "anyhow",
  "aos-core",
+ "chrono",
+ "hex",
+ "hmac",
+ "rand",
  "serde",
  "serde_json",
+ "sha2",
  "tokio",
  "tokio-rustls",
  "webpki-roots 0.26.11",
+ "zeroize",
 ]
 
 [[package]]

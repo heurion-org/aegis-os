@@ -418,6 +418,21 @@ enum Commands {
         /// Explicitly downgrade to advisory mode (recorded in the session metadata)
         #[arg(long, default_value_t = false)]
         no_enforce: bool,
+        /// Session spend cap in USD for L7 model API calls
+        #[arg(long)]
+        budget_usd: Option<f64>,
+        /// Session total token cap for L7 model API calls
+        #[arg(long)]
+        max_tokens: Option<u64>,
+        /// Outbound L7 DLP policy (`block`, `pseudonymize`, `off`)
+        #[arg(long)]
+        dlp_mode: Option<String>,
+        /// Path to `.aegis/dlp.json` policy and custom pseudonym/pricing overrides
+        #[arg(long)]
+        dlp_config: Option<PathBuf>,
+        /// Consecutive identical/failing tool turns before tripping loop breaker (`0` disables)
+        #[arg(long)]
+        max_loop_streak: Option<u32>,
         /// Agent command and arguments, after `--`
         #[arg(trailing_var_arg = true, allow_hyphen_values = true, required = true)]
         cmd: Vec<String>,
@@ -2774,6 +2789,11 @@ async fn main() -> anyhow::Result<()> {
             read_only,
             enforcement,
             no_enforce,
+            budget_usd,
+            max_tokens,
+            dlp_mode,
+            dlp_config,
+            max_loop_streak,
             cmd,
         } => {
             let mode = if read_only {
@@ -2786,7 +2806,14 @@ async fn main() -> anyhow::Result<()> {
             } else {
                 enforcement
             };
-            let code = launcher::run(
+            let egress_opts = launcher::RunEgressOptions {
+                dlp_mode,
+                dlp_config,
+                budget_usd,
+                max_tokens,
+                max_loop_streak,
+            };
+            let code = launcher::run_with_options(
                 &workspace,
                 &identity,
                 &runtime_dir,
@@ -2794,6 +2821,7 @@ async fn main() -> anyhow::Result<()> {
                 &profile,
                 &enforcement,
                 &cmd,
+                &egress_opts,
             )
             .await?;
             std::process::exit(code);

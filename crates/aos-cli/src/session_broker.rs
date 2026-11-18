@@ -52,6 +52,7 @@ pub(crate) struct BrokerState {
     web_console_addr: RwLock<Option<std::net::SocketAddr>>,
     startup_bin_mtime: Option<std::time::SystemTime>,
     hot_reload_home_override: Option<PathBuf>,
+    egress_gateway: Option<Arc<aos_egress::AegisEgressGateway>>,
 }
 
 pub struct SessionBroker {
@@ -172,6 +173,7 @@ pub async fn try_approve_via_live_session_broker(
 }
 
 impl SessionBroker {
+    #[cfg(test)]
     pub async fn start(
         runtime_dir: &Path,
         session_dir: &Path,
@@ -190,6 +192,32 @@ impl SessionBroker {
             egress_proxy,
             expose_tcp,
             None,
+            None,
+        )
+        .await
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub async fn start_with_egress(
+        runtime_dir: &Path,
+        session_dir: &Path,
+        control_dir: PathBuf,
+        session: BrokerSession,
+        identity: AgentIdentity,
+        egress_proxy: Option<String>,
+        expose_tcp: bool,
+        egress_gateway: Option<Arc<aos_egress::AegisEgressGateway>>,
+    ) -> Result<Self> {
+        Self::start_inner(
+            runtime_dir,
+            session_dir,
+            control_dir,
+            session,
+            identity,
+            egress_proxy,
+            expose_tcp,
+            None,
+            egress_gateway,
         )
         .await
     }
@@ -204,6 +232,7 @@ impl SessionBroker {
         egress_proxy: Option<String>,
         expose_tcp: bool,
         hot_reload_home_override: Option<PathBuf>,
+        egress_gateway: Option<Arc<aos_egress::AegisEgressGateway>>,
     ) -> Result<Self> {
         let mut temp_control_dir = None;
         if !expose_tcp && control_dir.join("control.sock").as_os_str().len() >= 96 {
@@ -329,6 +358,7 @@ impl SessionBroker {
             web_console_addr: RwLock::new(None),
             startup_bin_mtime,
             hot_reload_home_override,
+            egress_gateway,
         });
 
         let (task, tcp_task, tcp_addr) = if expose_tcp {
@@ -577,7 +607,9 @@ where
         || path_only.starts_with("/v1/escalations/")
         || path_only == "/v1/leases"
         || path_only.starts_with("/v1/leases/")
-        || path_only == "/v1/audit";
+        || path_only == "/v1/audit"
+        || path_only == "/v1/egress/usage"
+        || path_only == "/v1/egress/extend-budget";
 
     if agent_route && !token_eq(&presented, &state.agent_token) {
         return write_json(&mut stream, "401 Unauthorized", json!({"error": "invalid agent token"})).await;
@@ -779,6 +811,73 @@ where
         ("GET", "/v1/audit") => {
             let events = state.kernel.recorder.query_events(&state.identity.org_id, None, 100).await?;
             write_json(&mut stream, "200 OK", json!({"events": events})).await
+        }
+        ("GET", "/v1/egress/usage") => {
+            let snap = if let Some(ref gw) = state.egress_gateway {
+                gw.usage_snapshot(&state.identity).await
+            } else {
+                aos_egress::UsageSnapshot::default()
+            };
+            write_json(&mut stream, "200 OK", json!({ "usage": snap })).await
+        }
+        ("POST", "/v1/egress/extend-budget") => {
+            let Some(ref gw) = state.egress_gateway else {
+                return write_json(
+                    &mut stream,
+                    "404 Not Found",
+                    json!({ "error": "no egress gateway attached to session broker" }),
+                )
+                .await;
+            };
+            let add_micro_usd = if let Some(u) = payload.get("add_micro_usd").and_then(|v| v.as_u64())
+            {
+                u
+            } else if let Some(usd) = payload.get("add_usd").and_then(|v| v.as_f64()) {
+                if !usd.is_finite() || usd < 0.0 {
+                    return write_json(
+                        &mut stream,
+                        "400 Bad Request",
+                        json!({ "error": "invalid add_usd amount" }),
+                    )
+                    .await;
+                }
+                (usd * 1_000_000.0).round() as u64
+            } else {
+                0
+            };
+            let add_tokens = payload
+                .get("add_tokens")
+                .and_then(|v| v.as_u64())
+                .unwrap_or(0);
+            let add_requests = payload
+                .get("add_requests")
+                .and_then(|v| v.as_u64())
+                .unwrap_or(0)
+                .min(u32::MAX as u64) as u32;
+            if !gw
+                .extend_agent_budget(&state.identity, add_micro_usd, add_tokens, add_requests)
+                .await
+            {
+                return write_json(
+                    &mut stream,
+                    "404 Not Found",
+                    json!({ "error": "no active egress budget breaker for this session" }),
+                )
+                .await;
+            }
+            let snap = gw.usage_snapshot(&state.identity).await;
+            if let Ok(bytes) = serde_json::to_vec_pretty(&snap) {
+                let _ = aos_core::session::write_bytes_atomic_synced(
+                    &state.session_dir.join("egress_usage.json"),
+                    &bytes,
+                );
+            }
+            write_json(
+                &mut stream,
+                "200 OK",
+                json!({ "status": "extended", "usage": snap }),
+            )
+            .await
         }
         _ => write_json(&mut stream, "404 Not Found", json!({"error": "unknown route"})).await,
     }
@@ -1643,6 +1742,7 @@ mod tests {
             None,
             false,
             Some(fake_home.clone()),
+            None,
         )
         .await
         .unwrap();
@@ -2112,5 +2212,96 @@ print("BROKER_PROBE_DONE")
             !injected.is_empty() && injected.contains("Aegis OS Runtime Active"),
             "unexpected SessionStart output: {start_resp}"
         );
+    }
+
+    #[tokio::test]
+    async fn session_broker_egress_usage_and_extend_budget_require_human_token() {
+        let tmp = tempfile::tempdir().unwrap();
+        let runtime = tmp.path().join("runtime");
+        let session_dir = tmp.path().join("session");
+        let workspace = tmp.path().join("workspace");
+        let shadow = workspace.clone();
+        let agent_home = session_dir.join("agent_home");
+        std::fs::create_dir_all(&session_dir).unwrap();
+        std::fs::create_dir_all(&workspace).unwrap();
+        std::fs::create_dir_all(&agent_home).unwrap();
+
+        let identity = AgentIdentity::new("acme", "coder-1", "Engineer");
+        let gw = Arc::new(aos_egress::AegisEgressGateway::new());
+        gw.set_dlp_config_for_agent(
+            &identity,
+            aos_egress::DlpGatewayConfig {
+                pseudonym_mode: aos_egress::PseudonymMode::Pseudonymize,
+                custom_patterns: Vec::new(),
+                budget: Some(aos_egress::BudgetPolicy {
+                    max_tokens: Some(1_000),
+                    max_cost_micro_usd: Some(50_000),
+                    max_requests: Some(2),
+                    max_identical_loop_streak: 4,
+                }),
+            },
+            None,
+            None,
+        )
+        .await;
+
+        let broker = SessionBroker::start_with_egress(
+            &runtime,
+            &session_dir,
+            tmp.path().join("ctrl"),
+            BrokerSession {
+                session_id: "ses_egress_auth".to_string(),
+                mode: "implement".to_string(),
+                enforcement: "enforced".to_string(),
+                workspace: workspace.display().to_string(),
+                shadow: shadow.display().to_string(),
+                agent_home: agent_home.display().to_string(),
+            },
+            identity.clone(),
+            Some("127.0.0.1:18080".to_string()),
+            false,
+            Some(gw.clone()),
+        )
+        .await
+        .unwrap();
+
+        let ep = broker.control_endpoint();
+        let human_token = std::fs::read_to_string(session_dir.join("human.token")).unwrap();
+
+        // Agent token MUST be rejected (401 Unauthorized) on human egress control routes.
+        assert!(
+            control_request_at(&ep, &broker.agent_token, "GET", "/v1/egress/usage", None)
+                .await
+                .is_err()
+        );
+        assert!(
+            control_request_at(
+                &ep,
+                &broker.agent_token,
+                "POST",
+                "/v1/egress/extend-budget",
+                Some(&json!({ "add_usd": 1.0 }))
+            )
+            .await
+            .is_err()
+        );
+
+        // Human token reads usage and extends budget cleanly.
+        let usage = control_request_at(&ep, &human_token, "GET", "/v1/egress/usage", None)
+            .await
+            .unwrap();
+        assert_eq!(usage["usage"]["requests"], 0);
+
+        let extended = control_request_at(
+            &ep,
+            &human_token,
+            "POST",
+            "/v1/egress/extend-budget",
+            Some(&json!({ "add_usd": 0.25, "add_tokens": 5000, "add_requests": 5 })),
+        )
+        .await
+        .unwrap();
+        assert_eq!(extended["status"], "extended");
+        assert!(session_dir.join("egress_usage.json").is_file());
     }
 }
