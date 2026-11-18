@@ -176,6 +176,41 @@ impl CoWWorkspace {
         Ok(next)
     }
 
+    /// Rejects `..`/absolute path components and verifies that every existing component under
+    /// `root` along `rel` is a non-symlink directory or regular file, returning `root.join(rel)`.
+    pub fn ensure_no_symlink_components(root: &Path, rel: &Path) -> anyhow::Result<PathBuf> {
+        let mut cur = root.to_path_buf();
+        for comp in rel.components() {
+            match comp {
+                std::path::Component::CurDir => continue,
+                std::path::Component::Normal(part) => {
+                    cur.push(part);
+                    match std::fs::symlink_metadata(&cur) {
+                        Ok(meta) => {
+                            if meta.file_type().is_symlink() {
+                                anyhow::bail!(
+                                    "Refusing symlink component in workspace path '{}'",
+                                    cur.display()
+                                );
+                            }
+                        }
+                        Err(err) if err.kind() == std::io::ErrorKind::NotFound => {}
+                        Err(err) => return Err(err.into()),
+                    }
+                }
+                std::path::Component::ParentDir
+                | std::path::Component::RootDir
+                | std::path::Component::Prefix(_) => {
+                    anyhow::bail!(
+                        "Disallowed path traversal/root component in '{}'",
+                        rel.display()
+                    );
+                }
+            }
+        }
+        Ok(cur)
+    }
+
     async fn atomic_write_str(dst: &Path, content: &str) -> anyhow::Result<()> {
         aos_core::session::write_bytes_atomic_synced_async(dst, content.as_bytes().to_vec())
             .await?;
@@ -194,8 +229,19 @@ impl CoWWorkspace {
         for action in staged_actions {
             match action {
                 StagedCommitAction::CloneFromShadow { rel, shadow_path } => {
-                    let host_dst = self.host_source_root.join(&rel);
-                    let base_path = self.baseline_root.join(&rel);
+                    let host_dst = Self::ensure_no_symlink_components(
+                        &self.host_source_root,
+                        Path::new(&rel),
+                    )?;
+                    let base_path =
+                        Self::ensure_no_symlink_components(&self.baseline_root, Path::new(&rel))?;
+                    let sp_meta = std::fs::symlink_metadata(&shadow_path)?;
+                    if sp_meta.file_type().is_symlink() || !sp_meta.file_type().is_file() {
+                        anyhow::bail!(
+                            "Refusing non-regular or symlink staged shadow file '{}'",
+                            shadow_path.display()
+                        );
+                    }
                     if let Some(parent) = host_dst.parent() {
                         tokio::fs::create_dir_all(parent).await?;
                     }
@@ -216,8 +262,13 @@ impl CoWWorkspace {
                     shadow_path,
                     merged_content,
                 } => {
-                    let host_dst = self.host_source_root.join(&rel);
-                    let base_path = self.baseline_root.join(&rel);
+                    let host_dst = Self::ensure_no_symlink_components(
+                        &self.host_source_root,
+                        Path::new(&rel),
+                    )?;
+                    let base_path =
+                        Self::ensure_no_symlink_components(&self.baseline_root, Path::new(&rel))?;
+                    let _ = Self::ensure_no_symlink_components(&self.shadow_root, Path::new(&rel))?;
                     Self::atomic_write_str(&host_dst, &merged_content).await?;
                     Self::atomic_write_str(&base_path, &merged_content).await?;
                     // Mirroring into the shadow is best-effort: the host write above already landed,
@@ -226,12 +277,16 @@ impl CoWWorkspace {
                     committed.push(rel);
                 }
                 StagedCommitAction::DeleteFile { rel } => {
-                    let host_dst = self.host_source_root.join(&rel);
-                    let base_path = self.baseline_root.join(&rel);
-                    if host_dst.exists() {
+                    let host_dst = Self::ensure_no_symlink_components(
+                        &self.host_source_root,
+                        Path::new(&rel),
+                    )?;
+                    let base_path =
+                        Self::ensure_no_symlink_components(&self.baseline_root, Path::new(&rel))?;
+                    if tokio::fs::symlink_metadata(&host_dst).await.is_ok() {
                         tokio::fs::remove_file(&host_dst).await?;
                     }
-                    if base_path.exists() {
+                    if tokio::fs::symlink_metadata(&base_path).await.is_ok() {
                         tokio::fs::remove_file(&base_path).await?;
                     }
                     committed.push(rel);
@@ -366,6 +421,10 @@ impl CoWWorkspace {
         let mut report = RefreshReport::default();
 
         for (rel, host_path) in &host {
+            let rel_path = Path::new(rel);
+            let _ = Self::ensure_no_symlink_components(&self.host_source_root, rel_path)?;
+            let shadow_dst = Self::ensure_no_symlink_components(&self.shadow_root, rel_path)?;
+            let base_dst = Self::ensure_no_symlink_components(&self.baseline_root, rel_path)?;
             // Host unchanged since our baseline: nothing to rebase, and no need to read anything.
             if let Some(base_path) = base.get(rel) {
                 if Self::same_fingerprint(host_path, base_path) {
@@ -373,8 +432,6 @@ impl CoWWorkspace {
                 }
             }
             let host_bytes = tokio::fs::read(host_path).await?;
-            let shadow_dst = self.shadow_root.join(rel);
-            let base_dst = self.baseline_root.join(rel);
             let shadow_bytes = match shadow.get(rel) {
                 Some(p) => Some(tokio::fs::read(p).await?),
                 None => None,
@@ -719,111 +776,168 @@ impl CoWWorkspace {
     fn cow_clone_file_inner(
         src: &Path,
         dst: &Path,
-        dst_is_fresh: bool,
+        _dst_is_fresh: bool,
         allow_reflink: &mut bool,
     ) -> anyhow::Result<()> {
         #[cfg(not(target_os = "linux"))]
         let _ = allow_reflink;
 
-        #[cfg(target_os = "macos")]
-        {
-            if !dst_is_fresh && dst.exists() {
-                let _ = std::fs::remove_file(dst);
-            }
-            use std::ffi::CString;
-            use std::os::unix::ffi::OsStrExt;
-            if let (Ok(c_src), Ok(c_dst)) = (
-                CString::new(src.as_os_str().as_bytes()),
-                CString::new(dst.as_os_str().as_bytes()),
-            ) {
-                // `clonefile(src, dst, 0)` performs an instant APFS Copy-on-Write clone
-                let rc = unsafe { libc::clonefile(c_src.as_ptr(), c_dst.as_ptr(), 0) };
-                if rc == 0 {
-                    return Ok(());
-                }
+        let src_meta = std::fs::symlink_metadata(src)?;
+        if src_meta.file_type().is_symlink() || !src_meta.file_type().is_file() {
+            anyhow::bail!(
+                "Refusing non-regular or symlink source '{}' in CoW clone",
+                src.display()
+            );
+        }
+        if let Ok(dst_meta) = std::fs::symlink_metadata(dst) {
+            if dst_meta.file_type().is_symlink() {
+                anyhow::bail!(
+                    "Refusing to overwrite symlink destination '{}' in CoW clone",
+                    dst.display()
+                );
             }
         }
-        #[cfg(target_os = "linux")]
-        {
-            use std::collections::HashSet;
-            use std::os::unix::fs::{MetadataExt, OpenOptionsExt};
-            use std::os::unix::io::AsRawFd;
-            use std::sync::{LazyLock, Mutex};
-            // Linux `FICLONE` ioctl request code (`_IOW(0x94, 9, int)` = 0x40049409)
-            const FICLONE: libc::c_ulong = 0x40049409;
-            static NO_REFLINK: LazyLock<Mutex<HashSet<(u64, u64)>>> =
-                LazyLock::new(|| Mutex::new(HashSet::new()));
+        let dst_parent = dst
+            .parent()
+            .filter(|p| !p.as_os_str().is_empty())
+            .unwrap_or_else(|| Path::new("."));
+        std::fs::create_dir_all(dst_parent)?;
+        let tmp_dst = dst_parent.join(format!(
+            ".aegis.cow.{}.{}",
+            std::process::id(),
+            uuid::Uuid::new_v4().simple()
+        ));
 
-            let mut src_file = std::fs::File::open(src)?;
-            let meta = src_file.metadata()?;
-            let mut dst_file = std::fs::OpenOptions::new()
-                .write(true)
-                .create(true)
-                .truncate(true)
-                .mode(meta.mode())
-                .open(dst)?;
-            if !dst_is_fresh {
-                let _ = dst_file.set_permissions(meta.permissions());
-            }
-
-            if *allow_reflink {
-                let known_unavailable = NO_REFLINK
-                    .lock()
-                    .map(|g| !g.is_empty() && dst_file.metadata().map(|d| g.contains(&(meta.dev(), d.dev()))).unwrap_or(false))
-                    .unwrap_or(false);
-                if known_unavailable {
-                    *allow_reflink = false;
-                } else {
-                    let rc = unsafe {
-                        libc::ioctl(dst_file.as_raw_fd(), FICLONE, src_file.as_raw_fd())
-                    };
+        let res: anyhow::Result<()> = (|| {
+            #[cfg(target_os = "macos")]
+            {
+                use std::ffi::CString;
+                use std::os::unix::ffi::OsStrExt;
+                if let (Ok(c_src), Ok(c_tmp)) = (
+                    CString::new(src.as_os_str().as_bytes()),
+                    CString::new(tmp_dst.as_os_str().as_bytes()),
+                ) {
+                    const CLONE_NOFOLLOW: libc::c_uint = 0x0001;
+                    let rc =
+                        unsafe { libc::clonefile(c_src.as_ptr(), c_tmp.as_ptr(), CLONE_NOFOLLOW) };
                     if rc == 0 {
-                        if let Ok(m) = meta.modified() {
-                            let _ = dst_file.set_modified(m);
-                        }
                         return Ok(());
                     }
-                    let errno = std::io::Error::last_os_error().raw_os_error();
-                    if matches!(
-                        errno,
-                        Some(libc::EOPNOTSUPP) | Some(libc::EXDEV) | Some(libc::ENOTTY)
-                    ) {
+                }
+            }
+
+            #[cfg(unix)]
+            let mut src_file = {
+                use std::os::unix::fs::OpenOptionsExt;
+                std::fs::OpenOptions::new()
+                    .read(true)
+                    .custom_flags(libc::O_NOFOLLOW)
+                    .open(src)?
+            };
+            #[cfg(not(unix))]
+            let mut src_file = std::fs::File::open(src)?;
+
+            let meta = src_file.metadata()?;
+            if !meta.file_type().is_file() {
+                anyhow::bail!("CoW source '{}' is not a regular file", src.display());
+            }
+
+            #[cfg(unix)]
+            let mut dst_file = {
+                use std::os::unix::fs::{MetadataExt, OpenOptionsExt};
+                std::fs::OpenOptions::new()
+                    .write(true)
+                    .create_new(true)
+                    .mode(meta.mode())
+                    .open(&tmp_dst)?
+            };
+            #[cfg(not(unix))]
+            let mut dst_file = std::fs::OpenOptions::new()
+                .write(true)
+                .create_new(true)
+                .open(&tmp_dst)?;
+
+            #[cfg(target_os = "linux")]
+            let cloned = {
+                use std::collections::HashSet;
+                use std::os::unix::fs::MetadataExt;
+                use std::os::unix::io::AsRawFd;
+                use std::sync::{LazyLock, Mutex};
+                // Linux `FICLONE` ioctl request code (`_IOW(0x94, 9, int)` = 0x40049409)
+                const FICLONE: libc::c_ulong = 0x40049409;
+                static NO_REFLINK: LazyLock<Mutex<HashSet<(u64, u64)>>> =
+                    LazyLock::new(|| Mutex::new(HashSet::new()));
+                let mut did_clone = false;
+                if *allow_reflink {
+                    let known_unavailable = NO_REFLINK
+                        .lock()
+                        .map(|g| {
+                            !g.is_empty()
+                                && dst_file
+                                    .metadata()
+                                    .map(|d| g.contains(&(meta.dev(), d.dev())))
+                                    .unwrap_or(false)
+                        })
+                        .unwrap_or(false);
+                    if known_unavailable {
                         *allow_reflink = false;
-                        if let (Ok(dmeta), Ok(mut guard)) = (dst_file.metadata(), NO_REFLINK.lock())
-                        {
-                            if guard.insert((meta.dev(), dmeta.dev()))
-                                && std::env::var_os("AOS_VERBOSE_VFS").is_some()
-                            {
-                                eprintln!(
-                                    "[aos-vfs] WARNING: reflink (FICLONE) unavailable between {} and {} \
-                                     (errno {:?}); falling back to full file copies. Place the runtime \
-                                     directory on btrfs/XFS(reflink) to restore copy-on-write cloning.",
-                                    src.display(),
-                                    dst.display(),
-                                    errno
-                                );
+                    } else {
+                        let rc = unsafe {
+                            libc::ioctl(dst_file.as_raw_fd(), FICLONE, src_file.as_raw_fd())
+                        };
+                        if rc == 0 {
+                            did_clone = true;
+                        } else {
+                            let errno = std::io::Error::last_os_error().raw_os_error();
+                            if matches!(
+                                errno,
+                                Some(libc::EOPNOTSUPP) | Some(libc::EXDEV) | Some(libc::ENOTTY)
+                            ) {
+                                *allow_reflink = false;
+                                if let (Ok(dmeta), Ok(mut guard)) =
+                                    (dst_file.metadata(), NO_REFLINK.lock())
+                                {
+                                    if guard.insert((meta.dev(), dmeta.dev()))
+                                        && std::env::var_os("AOS_VERBOSE_VFS").is_some()
+                                    {
+                                        eprintln!(
+                                            "[aos-vfs] WARNING: reflink (FICLONE) unavailable between {} and {} \
+                                             (errno {:?}); falling back to full file copies. Place the runtime \
+                                             directory on btrfs/XFS(reflink) to restore copy-on-write cloning.",
+                                            src.display(),
+                                            dst.display(),
+                                            errno
+                                        );
+                                    }
+                                }
                             }
                         }
                     }
                 }
-            }
+                did_clone
+            };
+            #[cfg(not(target_os = "linux"))]
+            let cloned = false;
 
-            std::io::copy(&mut src_file, &mut dst_file)?;
+            if !cloned {
+                std::io::copy(&mut src_file, &mut dst_file)?;
+            }
             if let Ok(m) = meta.modified() {
                 let _ = dst_file.set_modified(m);
             }
+            dst_file.sync_all()?;
             Ok(())
+        })();
+
+        if let Err(err) = res {
+            let _ = std::fs::remove_file(&tmp_dst);
+            return Err(err);
         }
-        #[cfg(not(target_os = "linux"))]
-        {
-            std::fs::copy(src, dst)?;
-            if let Ok(m) = std::fs::metadata(src).and_then(|m| m.modified()) {
-                if let Ok(f) = std::fs::OpenOptions::new().write(true).open(dst) {
-                    let _ = f.set_modified(m);
-                }
-            }
-            Ok(())
+        if let Err(err) = std::fs::rename(&tmp_dst, dst) {
+            let _ = std::fs::remove_file(&tmp_dst);
+            return Err(err.into());
         }
+        Ok(())
     }
 
     fn is_ignored_dir_name(name: &str) -> bool {
@@ -1517,8 +1631,12 @@ impl CoWWorkspace {
                     continue;
                 }
             }
+            let rel_path = Path::new(rel);
+            let _ = Self::ensure_no_symlink_components(src_root, rel_path)?;
+            let _ = Self::ensure_no_symlink_components(&self.baseline_root, rel_path)?;
+            let _ = Self::ensure_no_symlink_components(&self.shadow_root, rel_path)?;
+            let host_dst = Self::ensure_no_symlink_components(&self.host_source_root, rel_path)?;
             let shadow_bytes = tokio::fs::read(shadow_path).await?;
-            let host_dst = self.host_source_root.join(rel);
 
             match base_files.get(rel) {
                 None => {
@@ -1614,6 +1732,16 @@ impl CoWWorkspace {
                                 }
                             }
                         }
+                    } else if !aos_core::ablated("merge") {
+                        return self
+                            .fail_commit(
+                                staged_actions,
+                                anyhow::anyhow!(
+                                    "Conflict on '{}': modified in shadow workspace but concurrently deleted on host",
+                                    rel
+                                ),
+                            )
+                            .await;
                     }
 
                     staged_actions.push(StagedCommitAction::CloneFromShadow {
@@ -1624,11 +1752,27 @@ impl CoWWorkspace {
             }
         }
 
-        for rel in base_files.keys() {
+        for (rel, base_path) in &base_files {
             if !shadow_files.contains_key(rel) {
                 if let Some(ref allow_list) = filter_paths {
                     if !allow_list.iter().any(|p| p == rel) {
                         continue;
+                    }
+                }
+                let host_dst = self.host_source_root.join(rel);
+                if host_dst.exists() && !aos_core::ablated("merge") {
+                    let host_bytes = tokio::fs::read(&host_dst).await?;
+                    let base_bytes = tokio::fs::read(base_path).await?;
+                    if Self::sha256_bytes(&host_bytes) != Self::sha256_bytes(&base_bytes) {
+                        return self
+                            .fail_commit(
+                                staged_actions,
+                                anyhow::anyhow!(
+                                    "Conflict on '{}': deleted in shadow workspace but concurrently modified on host",
+                                    rel
+                                ),
+                            )
+                            .await;
                     }
                 }
                 staged_actions.push(StagedCommitAction::DeleteFile { rel: rel.clone() });
@@ -1876,6 +2020,29 @@ impl CoWWorkspace {
 
         Ok(diffs)
     }
+
+    fn resolve_validated_snapshot_dir(&self, snapshot_id: &str) -> anyhow::Result<PathBuf> {
+        if snapshot_id.is_empty()
+            || snapshot_id == "."
+            || snapshot_id == ".."
+            || snapshot_id.contains('/')
+            || snapshot_id.contains('\\')
+            || snapshot_id.contains('\0')
+        {
+            bail!("Invalid snapshot_id '{}'", snapshot_id);
+        }
+        let mut comps = Path::new(snapshot_id).components();
+        if !matches!(comps.next(), Some(std::path::Component::Normal(_))) || comps.next().is_some() {
+            bail!("Invalid snapshot_id '{}'", snapshot_id);
+        }
+        let dir = self.snapshots_root.join(snapshot_id);
+        let meta = std::fs::symlink_metadata(&dir)
+            .with_context(|| format!("Snapshot '{}' not found", snapshot_id))?;
+        if meta.file_type().is_symlink() || !meta.is_dir() {
+            bail!("Snapshot '{}' is not a valid snapshot directory", snapshot_id);
+        }
+        Ok(dir)
+    }
 }
 
 #[async_trait]
@@ -1912,11 +2079,7 @@ impl TransactionalWorkspace for CoWWorkspace {
 
     async fn diff(&self, snapshot_id: Option<&str>) -> anyhow::Result<Vec<FileDiffEntry>> {
         let base_dir = if let Some(id) = snapshot_id {
-            let dir = self.snapshots_root.join(id);
-            if !dir.exists() {
-                bail!("Snapshot '{}' not found", id);
-            }
-            dir
+            CoWWorkspace::resolve_validated_snapshot_dir(self, id)?
         } else {
             self.host_source_root.clone()
         };
@@ -1925,10 +2088,7 @@ impl TransactionalWorkspace for CoWWorkspace {
     }
 
     async fn rollback(&self, snapshot_id: &str) -> anyhow::Result<()> {
-        let snap_dir = self.snapshots_root.join(snapshot_id);
-        if !snap_dir.exists() {
-            bail!("Snapshot '{}' does not exist", snapshot_id);
-        }
+        let snap_dir = CoWWorkspace::resolve_validated_snapshot_dir(self, snapshot_id)?;
         Self::cow_sync_dir(&snap_dir, &self.shadow_root).await?;
         Self::link_host_dependency_dirs(&self.host_source_root, &self.shadow_root);
         Ok(())
@@ -1965,6 +2125,18 @@ impl TransactionalWorkspace for CoWWorkspace {
     ) -> anyhow::Result<Vec<String>> {
         let staged_actions = self.stage_commit(filter_paths, overwrite_binaries).await?;
         // Phase 2: All conflicts cleared; apply staged actions atomically across the commit batch
+        self.apply_staged_actions(staged_actions).await
+    }
+
+    async fn commit_frozen_to_host_with_options(
+        &self,
+        frozen_root: &Path,
+        filter_paths: Option<Vec<String>>,
+        overwrite_binaries: bool,
+    ) -> anyhow::Result<Vec<String>> {
+        let staged_actions = self
+            .stage_commit_frozen(frozen_root, filter_paths, overwrite_binaries)
+            .await?;
         self.apply_staged_actions(staged_actions).await
     }
 }
@@ -2027,8 +2199,9 @@ impl OrgCasAndKvStore {
         Ok(())
     }
 
-    fn org_cas_dir(&self, org_id: &str) -> PathBuf {
-        self.storage_root.join(org_id).join("cas")
+    fn org_cas_dir(&self, org_id: &str) -> anyhow::Result<PathBuf> {
+        let safe_org = crate::vault::sanitize_and_validate_org_id(org_id)?;
+        Ok(self.storage_root.join(safe_org).join("cas"))
     }
 }
 
@@ -2049,11 +2222,12 @@ impl OrgSharedStorage for OrgCasAndKvStore {
         hasher.update(content);
         let sha256 = hex::encode(hasher.finalize());
 
-        let cas_dir = self.org_cas_dir(&identity.org_id);
+        let cas_dir = self.org_cas_dir(&identity.org_id)?;
         tokio::fs::create_dir_all(&cas_dir).await?;
         let blob_path = cas_dir.join(&sha256);
         if !blob_path.exists() {
-            tokio::fs::write(&blob_path, content).await?;
+            aos_core::session::write_bytes_atomic_synced_async(&blob_path, content.to_vec())
+                .await?;
         }
 
         let uri = format!("artifact://{}/sha256:{}", identity.org_id, sha256);
@@ -2085,6 +2259,9 @@ impl OrgSharedStorage for OrgCasAndKvStore {
         identity: &AgentIdentity,
         uri_or_hash: &str,
     ) -> anyhow::Result<(ArtifactMeta, Vec<u8>)> {
+        let cas_dir = self.org_cas_dir(&identity.org_id)?;
+        let _guard = self.state_mutex.lock().await;
+        let _file_lock = aos_core::session::acquire_file_lock(&self.index_file).await?;
         self.reload_from_disk().await;
         let target_hash = if let Some(rest) = uri_or_hash.strip_prefix("artifact://") {
             let parts: Vec<&str> = rest.splitn(2, '/').collect();
@@ -2120,12 +2297,25 @@ impl OrgSharedStorage for OrgCasAndKvStore {
                 })?
         };
 
-        let blob_path = self.org_cas_dir(&identity.org_id).join(&meta.sha256);
+        let blob_path = cas_dir.join(&meta.sha256);
         let bytes = tokio::fs::read(&blob_path).await?;
+        let mut hasher = Sha256::new();
+        hasher.update(&bytes);
+        let actual_sha256 = hex::encode(hasher.finalize());
+        if actual_sha256 != meta.sha256 {
+            bail!(
+                "CAS artifact integrity mismatch for '{}': expected {}, got {}",
+                meta.sha256,
+                meta.sha256,
+                actual_sha256
+            );
+        }
         Ok((meta, bytes))
     }
 
     async fn list_artifacts(&self, org_id: &str) -> anyhow::Result<Vec<ArtifactMeta>> {
+        let _guard = self.state_mutex.lock().await;
+        let _file_lock = aos_core::session::acquire_file_lock(&self.index_file).await?;
         self.reload_from_disk().await;
         let org_artifacts = self.artifacts.read().await;
         Ok(org_artifacts.get(org_id).cloned().unwrap_or_default())
@@ -2197,6 +2387,8 @@ impl OrgSharedStorage for OrgCasAndKvStore {
         namespace: &str,
         key: &str,
     ) -> anyhow::Result<Option<OrgKvEntry>> {
+        let _guard = self.state_mutex.lock().await;
+        let _file_lock = aos_core::session::acquire_file_lock(&self.index_file).await?;
         self.reload_from_disk().await;
         let composite_key = format!("{}::{}::{}", org_id, namespace, key);
         let store = self.kv_store.read().await;
@@ -2699,6 +2891,94 @@ mod tests {
         assert_eq!(diffs.len(), 1, "unexpected diffs: {diffs:?}");
         assert_eq!(diffs[0].relative_path, "package.json");
     }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn test_snapshot_id_rejects_path_traversal_and_symlinks() {
+        let tmp = tempfile::tempdir().unwrap();
+        let host = tmp.path().join("host");
+        let outside = tmp.path().join("outside_secret");
+        std::fs::create_dir_all(&host).unwrap();
+        std::fs::create_dir_all(&outside).unwrap();
+        std::fs::write(host.join("main.rs"), "fn main() {}\n").unwrap();
+        std::fs::write(outside.join("secret.txt"), "TOP_SECRET\n").unwrap();
+
+        let ws = CoWWorkspace::init(&host, tmp.path().join("cow")).await.unwrap();
+        let snap = ws.create_snapshot("good").await.unwrap();
+        let snap_root = tmp.path().join("cow/snapshots");
+        std::os::unix::fs::symlink(&outside, snap_root.join("evil-link")).unwrap();
+
+        for bad_id in [
+            "",
+            ".",
+            "..",
+            "../outside_secret",
+            outside.to_str().unwrap(),
+            "sub/snap",
+            "evil-link",
+        ] {
+            assert!(
+                ws.diff(Some(bad_id)).await.is_err(),
+                "diff must reject invalid snapshot_id {bad_id:?}"
+            );
+            assert!(
+                ws.rollback(bad_id).await.is_err(),
+                "rollback must reject invalid snapshot_id {bad_id:?}"
+            );
+        }
+
+        // Valid snapshot still works cleanly.
+        assert!(ws.diff(Some(&snap.snapshot_id)).await.is_ok());
+        assert!(ws.rollback(&snap.snapshot_id).await.is_ok());
+    }
+
+    #[tokio::test]
+    async fn test_stage_commit_blocks_delete_vs_modify_and_modify_vs_delete_conflicts() {
+        let tmp = tempfile::tempdir().unwrap();
+        let host = tmp.path().join("host");
+        std::fs::create_dir_all(&host).unwrap();
+        std::fs::write(host.join("delete_vs_modify.txt"), "v1\n").unwrap();
+        std::fs::write(host.join("modify_vs_delete.txt"), "v1\n").unwrap();
+
+        let ws = CoWWorkspace::init(&host, tmp.path().join("cow")).await.unwrap();
+
+        // Case A: Shadow deletes file, Host concurrently modifies it -> must fail (no silent data loss).
+        std::fs::remove_file(ws.shadow_root().join("delete_vs_modify.txt")).unwrap();
+        std::fs::write(host.join("delete_vs_modify.txt"), "peer_v2\n").unwrap();
+        let err_a = ws
+            .stage_commit(Some(vec!["delete_vs_modify.txt".to_string()]), false)
+            .await
+            .err()
+            .expect("expected delete-vs-modify conflict")
+            .to_string();
+        assert!(
+            err_a.contains("deleted in shadow workspace but concurrently modified on host"),
+            "{err_a}"
+        );
+        assert_eq!(
+            std::fs::read_to_string(host.join("delete_vs_modify.txt")).unwrap(),
+            "peer_v2\n"
+        );
+
+        // Case B: Shadow modifies file, Host concurrently deletes it -> frozen stage must fail (no silent resurrection).
+        std::fs::write(ws.shadow_root().join("modify_vs_delete.txt"), "shadow_v2\n").unwrap();
+        std::fs::remove_file(host.join("modify_vs_delete.txt")).unwrap();
+        let err_b = ws
+            .stage_commit_frozen(
+                ws.shadow_root(),
+                Some(vec!["modify_vs_delete.txt".to_string()]),
+                false,
+            )
+            .await
+            .err()
+            .expect("expected modify-vs-delete conflict")
+            .to_string();
+        assert!(
+            err_b.contains("modified in shadow workspace but concurrently deleted on host"),
+            "{err_b}"
+        );
+        assert!(!host.join("modify_vs_delete.txt").exists());
+    }
 }
 
 #[cfg(test)]
@@ -2740,5 +3020,72 @@ mod frozen_stage_tests {
         assert_eq!(std::fs::read_to_string(host.join("edit.txt")).unwrap(), "v2\n");
         assert!(host.join("keep.txt").exists(), "post-freeze deletion must not reach the host");
         assert!(!host.join("new.txt").exists(), "post-freeze addition must not reach the host");
+    }
+
+    #[tokio::test]
+    async fn cow_rejects_symlink_components_and_cas_verifies_sha256_under_lock() {
+        let tmp = tempfile::tempdir().unwrap();
+        let host = tmp.path().join("host");
+        let outside = tmp.path().join("outside");
+        std::fs::create_dir_all(&host).unwrap();
+        std::fs::create_dir_all(&outside).unwrap();
+        std::fs::write(outside.join("secret.txt"), "top_secret").unwrap();
+        std::fs::write(host.join("a.txt"), "v1\n").unwrap();
+
+        let ws = CoWWorkspace::init(&host, tmp.path().join("rt")).await.unwrap();
+        // Inject a symlink intermediate directory into baseline_root or host_source_root and verify rejection
+        #[cfg(unix)]
+        {
+            std::os::unix::fs::symlink(&outside, host.join("sub_link")).unwrap();
+            assert!(
+                CoWWorkspace::ensure_no_symlink_components(&host, Path::new("sub_link/secret.txt"))
+                    .is_err(),
+                "symlink intermediate directory must be rejected"
+            );
+            std::fs::write(ws.shadow_root().join("leak.txt"), "x").unwrap();
+            assert!(
+                ws.apply_staged_actions(vec![StagedCommitAction::CloneFromShadow {
+                    rel: "sub_link/leak.txt".to_string(),
+                    shadow_path: ws.shadow_root().join("leak.txt"),
+                }])
+                .await
+                .is_err(),
+                "apply_staged_actions must refuse symlink intermediate host directory"
+            );
+            let leaf_link = tmp.path().join("leaf_link");
+            std::os::unix::fs::symlink(outside.join("secret.txt"), &leaf_link).unwrap();
+            assert!(
+                CoWWorkspace::cow_clone_file(&leaf_link, &tmp.path().join("out2.txt"))
+                    .await
+                    .is_err(),
+                "cow_clone_file must refuse symlink source"
+            );
+            let _ = ws;
+        }
+
+        // OrgCasAndKvStore: concurrent kv_put/kv_get must not lose writes, and corrupted blob fails SHA-256 verify
+        let cas = OrgCasAndKvStore::new(tmp.path().join("cas_root")).await.unwrap();
+        let agent = AgentIdentity::new("acme", "a1", "Dev");
+        cas.kv_put(&agent, "ns", "k1", serde_json::json!(1), Some(0))
+            .await
+            .unwrap();
+        cas.kv_put(&agent, "ns", "k2", serde_json::json!(2), Some(0))
+            .await
+            .unwrap();
+        assert_eq!(
+            cas.kv_get("acme", "ns", "k1").await.unwrap().unwrap().value,
+            serde_json::json!(1)
+        );
+        let meta = cas
+            .publish_artifact(&agent, "blob.bin", b"good_bytes", "application/octet-stream", serde_json::json!({}))
+            .await
+            .unwrap();
+        let blob_path = tmp.path().join("cas_root/acme/cas").join(&meta.sha256);
+        std::fs::write(&blob_path, b"evil_bytes").unwrap();
+        let fetch_err = cas
+            .fetch_artifact(&agent, &meta.uri)
+            .await
+            .expect_err("corrupted CAS blob must fail SHA-256 verification");
+        assert!(fetch_err.to_string().contains("integrity mismatch"), "{fetch_err}");
     }
 }

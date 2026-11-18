@@ -162,7 +162,7 @@ impl DomainProfile {
         if text.contains("-----BEGIN ") && text.contains("PRIVATE KEY-----") {
             return Some("PEM_PRIVATE_KEY");
         }
-        if let Some(idx) = text.find("AKIA") {
+        for (idx, _) in text.match_indices("AKIA") {
             let tail = &text[idx + 4..];
             if tail
                 .chars()
@@ -173,16 +173,102 @@ impl DomainProfile {
                 return Some("AWS_ACCESS_KEY_ID");
             }
         }
-        if let Some(idx) = text.find("ghp_") {
+        for (idx, _) in text.match_indices("ghp_") {
             let tail = &text[idx + 4..];
-            if tail.chars().take_while(|c| c.is_ascii_alphanumeric()).count() >= 20 {
+            if tail
+                .chars()
+                .take_while(|c| c.is_ascii_alphanumeric())
+                .count()
+                >= 20
+            {
                 return Some("GITHUB_PAT");
+            }
+        }
+        for (idx, _) in text.match_indices("github_pat_") {
+            let tail = &text[idx + "github_pat_".len()..];
+            if tail
+                .chars()
+                .take_while(|c| c.is_ascii_alphanumeric() || *c == '_')
+                .count()
+                >= 22
+            {
+                return Some("GITHUB_FINE_GRAINED_PAT");
+            }
+        }
+        for (prefix, min_len, label) in [
+            ("sk-", 20usize, "GENERIC_API_SK_KEY"),
+            ("xoxb-", 16usize, "SLACK_BOT_TOKEN"),
+            ("xoxp-", 16usize, "SLACK_USER_TOKEN"),
+        ] {
+            for (idx, _) in text.match_indices(prefix) {
+                let tail = &text[idx + prefix.len()..];
+                if tail
+                    .chars()
+                    .take_while(|c| c.is_ascii_alphanumeric() || *c == '-' || *c == '_')
+                    .count()
+                    >= min_len
+                {
+                    return Some(label);
+                }
+            }
+        }
+        for (idx, _) in text.match_indices("AIza") {
+            let tail = &text[idx + 4..];
+            if tail
+                .chars()
+                .take_while(|c| c.is_ascii_alphanumeric() || *c == '-' || *c == '_')
+                .count()
+                >= 30
+            {
+                return Some("GOOGLE_API_KEY");
             }
         }
         if text.contains("$AOS_SECRET_") {
             return Some("AOS_SECRET_PLACEHOLDER");
         }
         None
+    }
+
+    fn verify_safe_relative_path(
+        shadow_root: &std::path::Path,
+        rel: &str,
+    ) -> Result<std::path::PathBuf, String> {
+        let rel_path = std::path::Path::new(rel);
+        if rel.starts_with('/') {
+            return Err(format!(
+                "DomainProfile: disallowed absolute path '{rel}'"
+            ));
+        }
+        let mut cur = shadow_root.to_path_buf();
+        for comp in rel_path.components() {
+            match comp {
+                std::path::Component::CurDir => continue,
+                std::path::Component::Normal(part) => {
+                    cur.push(part);
+                    match std::fs::symlink_metadata(&cur) {
+                        Ok(meta) => {
+                            if meta.file_type().is_symlink() {
+                                return Err(format!(
+                                    "DomainProfile: symlink component disallowed in '{rel}'"
+                                ));
+                            }
+                        }
+                        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+                        Err(e) => {
+                            return Err(format!(
+                                "DomainProfile: metadata check failed for '{rel}': {e}"
+                            ))
+                        }
+                    }
+                }
+                _ => {
+                    return Err(format!(
+                        "DomainProfile: disallowed path traversal component in '{rel}'"
+                    ))
+                }
+            }
+        }
+        Ok(cur)
     }
 
     fn is_executable_binary_magic(bytes: &[u8]) -> bool {
@@ -220,10 +306,17 @@ impl DomainProfile {
         let mut total_bytes: u64 = 0;
 
         for rel in changed_paths {
-            let clean = rel.trim_start_matches('/');
-            let full = shadow_root.join(clean);
-            if !full.exists() {
-                continue; // Deleted file
+            let full = Self::verify_safe_relative_path(shadow_root, rel)?;
+            match std::fs::symlink_metadata(&full) {
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => continue,
+                Err(e) => {
+                    return Err(format!(
+                        "DomainProfile({:?}): failed inspecting '{rel}': {e}",
+                        self.domain
+                    ))
+                }
+                Ok(meta) if !meta.file_type().is_file() => continue,
+                Ok(_) => {}
             }
             let bytes = std::fs::read(&full)
                 .map_err(|e| format!("DomainProfile({:?}): failed reading '{rel}': {e}", self.domain))?;
@@ -469,5 +562,39 @@ mod tests {
         )
         .unwrap();
         assert!(memory.verify_workspace_changes(root, &["POISON.md".to_string()]).is_err());
+
+        // 5. Benign early AKIA/ghp_ comment must not shadow real secrets later in the file,
+        // and github_pat_/sk-/xoxb-/AIza tokens plus symlinks must be caught.
+        std::fs::write(
+            root.join("multi_hit.rs"),
+            "// Example placeholder AKIA_EXAMPLE\nlet key = \"AKIA1234567890ABCDEF\";\n",
+        )
+        .unwrap();
+        assert!(code
+            .verify_workspace_changes(root, &["multi_hit.rs".to_string()])
+            .is_err());
+
+        for (fname, content) in [
+            ("pat.rs", "let t = \"github_pat_11ABCDEFG0123456789_abcdefghijklmnop\";\n"),
+            ("oai.rs", "let t = \"sk-proj-abcdefghijklmnopqrstuvwxyz012345\";\n"),
+            ("gkey.rs", "let t = \"AIzaSyDummyKey1234567890abcdefghijklmnopqr\";\n"),
+        ] {
+            std::fs::write(root.join(fname), content).unwrap();
+            assert!(
+                code.verify_workspace_changes(root, &[fname.to_string()])
+                    .is_err(),
+                "expected secret signature rejection for {fname}"
+            );
+        }
+
+        #[cfg(unix)]
+        {
+            let target = root.join("clean.rs");
+            let link = root.join("link.rs");
+            std::os::unix::fs::symlink(&target, &link).unwrap();
+            assert!(code
+                .verify_workspace_changes(root, &["link.rs".to_string()])
+                .is_err());
+        }
     }
 }

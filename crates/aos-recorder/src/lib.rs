@@ -69,6 +69,64 @@ impl AegisFlightRecorder {
             .collect()
     }
 
+    fn last_hash_from_disk(path: &Path) -> Option<String> {
+        use std::io::{Read, Seek, SeekFrom};
+        let mut file = std::fs::File::open(path).ok()?;
+        let len = file.metadata().ok()?.len();
+        let start = len.saturating_sub(65_536);
+        file.seek(SeekFrom::Start(start)).ok()?;
+        let mut tail = Vec::new();
+        file.read_to_end(&mut tail).ok()?;
+        for slice in tail.split(|&b| b == b'\n').rev() {
+            let Ok(s) = std::str::from_utf8(slice) else {
+                continue;
+            };
+            let trimmed = s.trim();
+            if trimmed.is_empty() {
+                continue;
+            }
+            if let Ok(ev) = serde_json::from_str::<AuditEvent>(trimmed) {
+                if let Some(h) = ev.event_hash {
+                    return Some(h);
+                }
+            }
+        }
+        // If log exceeded 64 KiB and had a very large single trailing event, fall back to full strict scan.
+        if start > 0 {
+            if let Ok(all) = Self::read_events_strict(path) {
+                return all.into_iter().rev().find_map(|e| e.event_hash);
+            }
+        }
+        None
+    }
+
+    fn read_events_strict(path: &Path) -> Result<Vec<AuditEvent>, (usize, String)> {
+        let raw = std::fs::read(path).map_err(|e| (0usize, format!("failed to read audit log: {e}")))?;
+        let mut out = Vec::new();
+        for (line_idx, slice) in raw.split(|&b| b == b'\n').enumerate() {
+            let trimmed_bytes = match std::str::from_utf8(slice) {
+                Ok(s) => s.trim(),
+                Err(e) => {
+                    return Err((
+                        line_idx,
+                        format!("invalid UTF-8 bytes on line {}: {}", line_idx + 1, e),
+                    ));
+                }
+            };
+            if trimmed_bytes.is_empty() {
+                continue;
+            }
+            let ev = serde_json::from_str::<AuditEvent>(trimmed_bytes).map_err(|e| {
+                (
+                    line_idx,
+                    format!("malformed audit JSON on line {}: {}", line_idx + 1, e),
+                )
+            })?;
+            out.push(ev);
+        }
+        Ok(out)
+    }
+
     fn extract_task_id(event: &AuditEvent) -> Option<String> {
         if let Some(ref tid) = event.task_id {
             if !tid.is_empty() {
@@ -92,9 +150,33 @@ impl AegisFlightRecorder {
 
     /// Verifies the tamper-evident SHA-256 hash chain across all recorded audit events.
     pub async fn verify_chain(&self, org_id: Option<&str>) -> anyhow::Result<serde_json::Value> {
+        let _guard = self.state_mutex.lock().await;
+        let _file_lock = if let Some(ref path) = self.jsonl_log_path {
+            if let Some(parent) = path.parent() {
+                let _ = tokio::fs::create_dir_all(parent).await;
+            }
+            aos_core::session::acquire_file_lock(path).await.ok()
+        } else {
+            None
+        };
+
         let all_events: Vec<AuditEvent> = if let Some(ref path) = self.jsonl_log_path {
             if path.exists() {
-                Self::load_all_events_from_disk(path)
+                match Self::read_events_strict(path) {
+                    Ok(ev) => ev,
+                    Err((bad_idx, reason)) => {
+                        return Ok(serde_json::json!({
+                            "verified": false,
+                            "total_events": bad_idx,
+                            "chained_events": 0,
+                            "org_events": 0,
+                            "head_hash": AuditEvent::GENESIS_HASH,
+                            "tampered_event_id": serde_json::Value::Null,
+                            "tampered_index": bad_idx,
+                            "error": reason,
+                        }));
+                    }
+                }
             } else {
                 self.events.read().await.iter().cloned().collect()
             }
@@ -103,7 +185,6 @@ impl AegisFlightRecorder {
         };
 
         let mut expected_prev = AuditEvent::GENESIS_HASH.to_string();
-        let mut chain_started = false;
         let mut verified = true;
         let mut tampered_event_id: Option<String> = None;
         let mut tampered_index: Option<usize> = None;
@@ -115,20 +196,11 @@ impl AegisFlightRecorder {
                 org_events += 1;
             }
             let (Some(ref prev), Some(ref hash)) = (&ev.prev_hash, &ev.event_hash) else {
-                // Legacy pre-hash-chain event; reset baseline if chain hasn't started.
-                if !chain_started {
-                    continue;
-                } else {
-                    verified = false;
-                    tampered_event_id = Some(ev.event_id.clone());
-                    tampered_index = Some(idx);
-                    break;
-                }
+                verified = false;
+                tampered_event_id = Some(ev.event_id.clone());
+                tampered_index = Some(idx);
+                break;
             };
-            if !chain_started {
-                chain_started = true;
-                expected_prev = prev.clone();
-            }
             chained_events += 1;
             let computed = ev.compute_hash(&expected_prev);
             if prev != &expected_prev || hash != &computed {
@@ -153,6 +225,7 @@ impl AegisFlightRecorder {
 
     /// Returns all audit events in chronological order correlated with `task_id` inside `org_id`.
     pub async fn trace_task(&self, org_id: &str, task_id: &str) -> anyhow::Result<Vec<AuditEvent>> {
+        let _guard = self.state_mutex.lock().await;
         let all_events: Vec<AuditEvent> = if let Some(ref path) = self.jsonl_log_path {
             if path.exists() {
                 Self::load_all_events_from_disk(path)
@@ -190,24 +263,29 @@ impl FlightRecorder for AegisFlightRecorder {
                 tokio::fs::create_dir_all(parent).await?;
             }
             let _file_lock = aos_core::session::acquire_file_lock(path).await?;
-            let disk_events = Self::load_events_from_disk(path);
-            let prev_hash = disk_events
-                .iter()
-                .rev()
-                .find_map(|e| e.event_hash.clone())
+            let prev_hash = Self::last_hash_from_disk(path)
                 .unwrap_or_else(|| AuditEvent::GENESIS_HASH.to_string());
             let event_hash = event.compute_hash(&prev_hash);
             event.prev_hash = Some(prev_hash);
             event.event_hash = Some(event_hash);
 
+            let needs_leading_newline = std::fs::read(path)
+                .ok()
+                .is_some_and(|b| !b.is_empty() && !b.ends_with(b"\n"));
             let mut file = tokio::fs::OpenOptions::new()
                 .create(true)
                 .append(true)
                 .open(path)
                 .await?;
-            let line = format!("{}\n", serde_json::to_string(&event)?);
+            let json_line = serde_json::to_string(&event)?;
+            let line = if needs_leading_newline {
+                format!("\n{json_line}\n")
+            } else {
+                format!("{json_line}\n")
+            };
             file.write_all(line.as_bytes()).await?;
             file.flush().await?;
+            file.sync_data().await?;
         } else {
             let prev_hash = self
                 .events
@@ -337,5 +415,43 @@ mod tests {
         let bad_report = rec.verify_chain(Some("acme")).await.unwrap();
         assert_eq!(bad_report["verified"], false);
         assert_eq!(bad_report["tampered_event_id"], "ev-1");
+    }
+
+    #[tokio::test]
+    async fn prefix_truncation_and_corrupt_json_fail_verification() {
+        let dir = std::env::temp_dir().join(format!("aos-rec-sec-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let log_path = dir.join("audit.jsonl");
+        let rec = AegisFlightRecorder::new(Some(log_path.clone()));
+
+        for idx in 1..=2 {
+            rec.record(AuditEvent {
+                event_id: format!("ev-{idx}"),
+                timestamp_ms: idx * 1000,
+                org_id: "acme".to_string(),
+                agent_id: "agy-lead".to_string(),
+                action: "fs_write".to_string(),
+                resource: "main.rs".to_string(),
+                policy_decision: "allow".to_string(),
+                snapshot_id: None,
+                details: json!({}),
+                task_id: None,
+                prev_hash: None,
+                event_hash: None,
+            })
+            .await
+            .unwrap();
+        }
+        assert_eq!(rec.verify_chain(None).await.unwrap()["verified"], true);
+
+        // 1. Truncating the first event breaks anchoring to GENESIS_HASH and must fail.
+        let full = std::fs::read_to_string(&log_path).unwrap();
+        let second_only = full.lines().nth(1).unwrap().to_string() + "\n";
+        std::fs::write(&log_path, &second_only).unwrap();
+        assert_eq!(rec.verify_chain(None).await.unwrap()["verified"], false);
+
+        // 2. Appending malformed JSON / non-UTF8 bytes must fail strict verification.
+        std::fs::write(&log_path, format!("{full}{{corrupt-line\n")).unwrap();
+        assert_eq!(rec.verify_chain(None).await.unwrap()["verified"], false);
     }
 }

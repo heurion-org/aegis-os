@@ -155,6 +155,7 @@ impl AegisIpcBus {
                         *self.mailboxes.write().await = parsed.mailboxes;
                         *self.msg_index.write().await = parsed.msg_index;
                         *self.tasks.write().await = parsed.tasks;
+                        *self.state_error.lock().unwrap() = None;
                     }
                     Err(error) => {
                         *self.state_error.lock().unwrap() = Some(format!(
@@ -163,7 +164,9 @@ impl AegisIpcBus {
                         ));
                     }
                 },
-                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                    *self.state_error.lock().unwrap() = None;
+                }
                 Err(error) => {
                     *self.state_error.lock().unwrap() = Some(format!(
                         "failed to read IPC state '{}': {error}",
@@ -189,10 +192,42 @@ impl AegisIpcBus {
                 tasks: self.tasks.read().await.clone(),
             };
             let bytes = serde_json::to_vec_pretty(&state)?;
-            // Write to a sibling temp file, then atomically rename. Readers see either the old or
-            // the new complete state, never a truncated JSON file.
-            let tmp = path.with_extension("json.tmp");
-            tokio::fs::write(&tmp, bytes).await?;
+            // Write with 0o600 + sync_all to a sibling temp file, then atomically rename.
+            // Preserve the legacy `.json.tmp` name ONLY when debug kill-9 test delay hook is active.
+            let use_test_delay_tmp =
+                cfg!(debug_assertions) && std::env::var_os("AOS_IPC_WRITE_DELAY_MS").is_some();
+            let tmp = if use_test_delay_tmp {
+                path.with_extension("json.tmp")
+            } else {
+                path.with_extension(format!(
+                    "json.tmp.{}.{}",
+                    std::process::id(),
+                    &Uuid::new_v4().simple().to_string()[..8]
+                ))
+            };
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::OpenOptionsExt;
+                let mut opts = std::fs::OpenOptions::new();
+                opts.write(true).create(true).truncate(true).mode(0o600);
+                let tmp_path = tmp.clone();
+                let write_res: anyhow::Result<()> = tokio::task::spawn_blocking(move || {
+                    use std::io::Write;
+                    let mut f = opts.open(&tmp_path)?;
+                    f.write_all(&bytes)?;
+                    f.sync_all()?;
+                    Ok(())
+                })
+                .await?;
+                if let Err(err) = write_res {
+                    let _ = tokio::fs::remove_file(&tmp).await;
+                    return Err(err);
+                }
+            }
+            #[cfg(not(unix))]
+            {
+                tokio::fs::write(&tmp, &bytes).await?;
+            }
             // Test hook: hold the temp file before rename so an integration test can kill the
             // writer mid-transaction. Debug builds only; release builds ignore it.
             #[cfg(debug_assertions)]
@@ -201,13 +236,212 @@ impl AegisIpcBus {
                     tokio::time::sleep(std::time::Duration::from_millis(ms)).await;
                 }
             }
-            tokio::fs::rename(&tmp, path).await?;
+            if let Err(err) = tokio::fs::rename(&tmp, path).await {
+                let _ = tokio::fs::remove_file(&tmp).await;
+                return Err(err.into());
+            }
         }
         Ok(())
     }
 
     fn mailbox_key(org_id: &str, agent_id: &str) -> String {
         format!("{}::{}", org_id, agent_id)
+    }
+
+    async fn send_unlocked(&self, mut envelope: IpcEnvelope) -> anyhow::Result<IpcEnvelope> {
+        if envelope.msg_id.is_empty() {
+            envelope.msg_id = format!("msg-{}", Uuid::new_v4().simple());
+        } else if self.msg_index.read().await.contains_key(&envelope.msg_id)
+            || self.tasks.read().await.contains_key(&envelope.msg_id)
+        {
+            bail!("Duplicate IPC msg_id '{}' rejected", envelope.msg_id);
+        }
+        envelope.created_at_ms = Utc::now().timestamp_millis();
+        envelope.status = MessageDeliveryStatus::Unread;
+
+        Self::validate_attachments(&envelope.org_id, &envelope.from_agent, &envelope.attachments)?;
+
+        let verified_cross_org_task_reply = match &envelope.kind {
+            IpcKind::TaskResponse { correlation_id, .. } => {
+                let target_agent = envelope
+                    .to_target
+                    .strip_prefix("agent:")
+                    .unwrap_or(&envelope.to_target);
+                let expected_orig_sender = format!("{}/{}", envelope.org_id, target_agent);
+                self.msg_index
+                    .read()
+                    .await
+                    .get(correlation_id)
+                    .is_some_and(|orig| {
+                        let orig_target = orig
+                            .to_target
+                            .strip_prefix("agent:")
+                            .unwrap_or(&orig.to_target);
+                        orig.from_agent == expected_orig_sender
+                            && envelope.from_agent == format!("{}/{}", orig.org_id, orig_target)
+                    })
+            }
+            _ => false,
+        };
+
+        if !aos_core::ablated("tenant_gate") && !verified_cross_org_task_reply {
+            let target_agent = envelope
+                .to_target
+                .strip_prefix("agent:")
+                .unwrap_or(&envelope.to_target);
+            let peers = self.peers.read().await;
+            if let Some((sender_org, sender_agent)) = envelope.from_agent.split_once('/') {
+                if sender_org != envelope.org_id {
+                    let sender_verified = peers
+                        .get(sender_org)
+                        .and_then(|m| m.get(sender_agent))
+                        .is_some_and(|p| p.pid.is_some());
+                    let target_verified = peers
+                        .get(&envelope.org_id)
+                        .and_then(|m| m.get(target_agent))
+                        .is_some_and(|p| p.pid.is_some());
+                    if !(sender_verified && target_verified) {
+                        bail!(
+                            "Cross-organization IPC delivery denied by broker tenant guard: '{}' -> '{}/{}'",
+                            envelope.from_agent,
+                            envelope.org_id,
+                            target_agent
+                        );
+                    }
+                }
+            } else {
+                let in_target_org = peers
+                    .get(&envelope.org_id)
+                    .is_some_and(|m| m.contains_key(&envelope.from_agent));
+                let in_other_org = peers.iter().any(|(org, m)| {
+                    org != &envelope.org_id && m.contains_key(&envelope.from_agent)
+                });
+                if !in_target_org && in_other_org {
+                    bail!(
+                        "Cross-organization sender spoofing denied by broker tenant guard: '{}' does not belong to '{}'",
+                        envelope.from_agent,
+                        envelope.org_id
+                    );
+                }
+            }
+        }
+
+        match &envelope.kind {
+            IpcKind::TopicBroadcast { topic } => {
+                let subscribers: Vec<String> = {
+                    let peers = self.peers.read().await;
+                    peers
+                        .get(&envelope.org_id)
+                        .map(|org_peers| {
+                            org_peers
+                                .values()
+                                .filter(|p| {
+                                    p.agent_id != envelope.from_agent
+                                        && p.subscribed_topics
+                                            .iter()
+                                            .any(|t| t == "*" || t == topic)
+                                })
+                                .map(|p| p.agent_id.clone())
+                                .collect()
+                        })
+                        .unwrap_or_default()
+                };
+
+                self.msg_index
+                    .write()
+                    .await
+                    .insert(envelope.msg_id.clone(), envelope.clone());
+
+                for sub_agent in subscribers {
+                    let mut fanout_copy = envelope.clone();
+                    fanout_copy.msg_id = format!("{}-{}", envelope.msg_id, sub_agent);
+                    self.deliver_to_agent(&envelope.org_id, &sub_agent, fanout_copy)
+                        .await;
+                }
+            }
+            IpcKind::DirectMessage | IpcKind::TaskRequest { .. } | IpcKind::TaskResponse { .. } => {
+                let target_agent = envelope
+                    .to_target
+                    .strip_prefix("agent:")
+                    .unwrap_or(&envelope.to_target)
+                    .to_string();
+
+                if matches!(envelope.kind, IpcKind::TaskRequest { .. }) {
+                    let context_id = envelope
+                        .payload
+                        .get("context_id")
+                        .and_then(|v| v.as_str())
+                        .map(|s| s.to_string())
+                        .unwrap_or_else(|| format!("ctx-{}", envelope.msg_id));
+                    let from_canonical = if envelope.from_agent.contains('/') {
+                        envelope.from_agent.clone()
+                    } else {
+                        format!("{}/{}", envelope.org_id, envelope.from_agent)
+                    };
+                    let to_canonical = format!("{}/{}", envelope.org_id, target_agent);
+                    let parent_task_id = envelope
+                        .payload
+                        .get("parent_task_id")
+                        .and_then(|v| v.as_str())
+                        .filter(|s| !s.is_empty())
+                        .map(str::to_string);
+                    let depends_on = envelope
+                        .payload
+                        .get("depends_on")
+                        .and_then(|v| v.as_array())
+                        .map(|arr| {
+                            arr.iter()
+                                .filter_map(|x| x.as_str())
+                                .filter(|s| !s.is_empty())
+                                .map(str::to_string)
+                                .collect::<Vec<_>>()
+                        })
+                        .unwrap_or_default();
+                    let workspace_id = envelope
+                        .payload
+                        .get("workspace_id")
+                        .and_then(|v| v.as_str())
+                        .filter(|s| !s.is_empty())
+                        .map(str::to_string);
+                    let a2a_task = A2ATask {
+                        id: envelope.msg_id.clone(),
+                        context_id,
+                        org_id: envelope.org_id.clone(),
+                        from_agent: from_canonical.clone(),
+                        to_agent: to_canonical,
+                        subject: envelope.subject.clone(),
+                        state: A2ATaskState::Submitted,
+                        parts: envelope.a2a_parts(),
+                        artifacts: Vec::new(),
+                        history: vec![A2ATaskStatusUpdate {
+                            state: A2ATaskState::Submitted,
+                            actor: from_canonical,
+                            message: Some(envelope.subject.clone()),
+                            timestamp_ms: envelope.created_at_ms,
+                        }],
+                        created_at_ms: envelope.created_at_ms,
+                        updated_at_ms: envelope.created_at_ms,
+                        failure_kind: None,
+                        stale: false,
+                        revision: 0,
+                        parent_task_id,
+                        depends_on,
+                        workspace_id,
+                        claimed_paths: Vec::new(),
+                        lease_ids: Vec::new(),
+                    };
+                    self.tasks
+                        .write()
+                        .await
+                        .insert(envelope.msg_id.clone(), a2a_task);
+                }
+
+                self.deliver_to_agent(&envelope.org_id, &target_agent, envelope.clone())
+                    .await;
+            }
+        }
+
+        Ok(envelope)
     }
 
     fn validate_attachments(
@@ -838,18 +1072,22 @@ impl IpcBus for AegisIpcBus {
             .await
             .values()
             .filter(|t| {
-                let org_ok = org_id.is_none_or(|o| {
-                    t.org_id == o
-                        || t.from_agent.starts_with(&format!("{}/", o))
-                        || t.to_agent.starts_with(&format!("{}/", o))
-                });
-                let agent_ok = agent_id.is_none_or(|a| {
-                    t.from_agent == a
-                        || t.to_agent == a
-                        || t.from_agent.ends_with(&format!("/{}", a))
-                        || t.to_agent.ends_with(&format!("/{}", a))
-                });
-                org_ok && agent_ok
+                let (from_org, from_name) = t
+                    .from_agent
+                    .split_once('/')
+                    .unwrap_or((t.org_id.as_str(), t.from_agent.as_str()));
+                let (to_org, to_name) = t
+                    .to_agent
+                    .split_once('/')
+                    .unwrap_or((t.org_id.as_str(), t.to_agent.as_str()));
+                match (org_id, agent_id) {
+                    (Some(o), Some(a)) => {
+                        (from_org == o && from_name == a) || (to_org == o && to_name == a)
+                    }
+                    (Some(o), None) => t.org_id == o || from_org == o || to_org == o,
+                    (None, Some(a)) => from_name == a || to_name == a,
+                    (None, None) => true,
+                }
             })
             .cloned()
             .collect();
@@ -874,179 +1112,13 @@ impl IpcBus for AegisIpcBus {
         AegisIpcBus::record_task_lease(self, task_id, lease_id).await
     }
 
-    async fn send(&self, mut envelope: IpcEnvelope) -> anyhow::Result<IpcEnvelope> {
+    async fn send(&self, envelope: IpcEnvelope) -> anyhow::Result<IpcEnvelope> {
         let _state = self.state_guard().await;
         let _lock = self.state_lock().await?;
         self.reload_from_disk().await;
-        if envelope.msg_id.is_empty() {
-            envelope.msg_id = format!("msg-{}", &Uuid::new_v4().to_string()[..8]);
-        }
-        envelope.created_at_ms = Utc::now().timestamp_millis();
-        envelope.status = MessageDeliveryStatus::Unread;
-
-        Self::validate_attachments(&envelope.org_id, &envelope.from_agent, &envelope.attachments)?;
-
-        if !aos_core::ablated("tenant_gate")
-            && !matches!(envelope.kind, IpcKind::TaskResponse { .. })
-        {
-            let target_agent = envelope
-                .to_target
-                .strip_prefix("agent:")
-                .unwrap_or(&envelope.to_target);
-            let peers = self.peers.read().await;
-            if let Some((sender_org, sender_agent)) = envelope.from_agent.split_once('/') {
-                if sender_org != envelope.org_id {
-                    let sender_verified = peers
-                        .get(sender_org)
-                        .and_then(|m| m.get(sender_agent))
-                        .is_some_and(|p| p.pid.is_some());
-                    let target_verified = peers
-                        .get(&envelope.org_id)
-                        .and_then(|m| m.get(target_agent))
-                        .is_some_and(|p| p.pid.is_some());
-                    if !(sender_verified && target_verified) {
-                        bail!(
-                            "Cross-organization IPC delivery denied by broker tenant guard: '{}' -> '{}/{}'",
-                            envelope.from_agent,
-                            envelope.org_id,
-                            target_agent
-                        );
-                    }
-                }
-            } else {
-                let in_target_org = peers
-                    .get(&envelope.org_id)
-                    .is_some_and(|m| m.contains_key(&envelope.from_agent));
-                let in_other_org = peers.iter().any(|(org, m)| {
-                    org != &envelope.org_id && m.contains_key(&envelope.from_agent)
-                });
-                if !in_target_org && in_other_org {
-                    bail!(
-                        "Cross-organization sender spoofing denied by broker tenant guard: '{}' does not belong to '{}'",
-                        envelope.from_agent,
-                        envelope.org_id
-                    );
-                }
-            }
-        }
-
-        match &envelope.kind {
-            IpcKind::TopicBroadcast { topic } => {
-                let subscribers: Vec<String> = {
-                    let peers = self.peers.read().await;
-                    peers
-                        .get(&envelope.org_id)
-                        .map(|org_peers| {
-                            org_peers
-                                .values()
-                                .filter(|p| {
-                                    p.agent_id != envelope.from_agent
-                                        && p.subscribed_topics
-                                            .iter()
-                                            .any(|t| t == "*" || t == topic)
-                                })
-                                .map(|p| p.agent_id.clone())
-                                .collect()
-                        })
-                        .unwrap_or_default()
-                };
-
-                self.msg_index
-                    .write()
-                    .await
-                    .insert(envelope.msg_id.clone(), envelope.clone());
-
-                for sub_agent in subscribers {
-                    let mut fanout_copy = envelope.clone();
-                    fanout_copy.msg_id = format!("{}-{}", envelope.msg_id, sub_agent);
-                    self.deliver_to_agent(&envelope.org_id, &sub_agent, fanout_copy)
-                        .await;
-                }
-            }
-            IpcKind::DirectMessage | IpcKind::TaskRequest { .. } | IpcKind::TaskResponse { .. } => {
-                let target_agent = envelope
-                    .to_target
-                    .strip_prefix("agent:")
-                    .unwrap_or(&envelope.to_target)
-                    .to_string();
-
-                if matches!(envelope.kind, IpcKind::TaskRequest { .. }) {
-                    let context_id = envelope
-                        .payload
-                        .get("context_id")
-                        .and_then(|v| v.as_str())
-                        .map(|s| s.to_string())
-                        .unwrap_or_else(|| format!("ctx-{}", envelope.msg_id));
-                    let from_canonical = if envelope.from_agent.contains('/') {
-                        envelope.from_agent.clone()
-                    } else {
-                        format!("{}/{}", envelope.org_id, envelope.from_agent)
-                    };
-                    let to_canonical = format!("{}/{}", envelope.org_id, target_agent);
-                    let parent_task_id = envelope
-                        .payload
-                        .get("parent_task_id")
-                        .and_then(|v| v.as_str())
-                        .filter(|s| !s.is_empty())
-                        .map(str::to_string);
-                    let depends_on = envelope
-                        .payload
-                        .get("depends_on")
-                        .and_then(|v| v.as_array())
-                        .map(|arr| {
-                            arr.iter()
-                                .filter_map(|x| x.as_str())
-                                .filter(|s| !s.is_empty())
-                                .map(str::to_string)
-                                .collect::<Vec<_>>()
-                        })
-                        .unwrap_or_default();
-                    let workspace_id = envelope
-                        .payload
-                        .get("workspace_id")
-                        .and_then(|v| v.as_str())
-                        .filter(|s| !s.is_empty())
-                        .map(str::to_string);
-                    let a2a_task = A2ATask {
-                        id: envelope.msg_id.clone(),
-                        context_id,
-                        org_id: envelope.org_id.clone(),
-                        from_agent: from_canonical.clone(),
-                        to_agent: to_canonical,
-                        subject: envelope.subject.clone(),
-                        state: A2ATaskState::Submitted,
-                        parts: envelope.a2a_parts(),
-                        artifacts: Vec::new(),
-                        history: vec![A2ATaskStatusUpdate {
-                            state: A2ATaskState::Submitted,
-                            actor: from_canonical,
-                            message: Some(envelope.subject.clone()),
-                            timestamp_ms: envelope.created_at_ms,
-                        }],
-                        created_at_ms: envelope.created_at_ms,
-                        updated_at_ms: envelope.created_at_ms,
-                        failure_kind: None,
-                        stale: false,
-                        revision: 0,
-                        parent_task_id,
-                        depends_on,
-                        workspace_id,
-                        claimed_paths: Vec::new(),
-                        lease_ids: Vec::new(),
-                    };
-                    self.tasks
-                        .write()
-                        .await
-                        .insert(envelope.msg_id.clone(), a2a_task);
-                }
-
-                self.deliver_to_agent(&envelope.org_id, &target_agent, envelope.clone())
-                    .await;
-            }
-        }
-
+        let sent = self.send_unlocked(envelope).await?;
         self.flush_to_disk().await?;
-        Ok(envelope)
+        Ok(sent)
     }
 
     async fn recv_inbox(
@@ -1138,37 +1210,45 @@ impl IpcBus for AegisIpcBus {
         let _state = self.state_guard().await;
         let _lock = self.state_lock().await?;
         self.reload_from_disk().await;
-        let original = {
+
+        let original = if !aos_core::ablated("tenant_gate") {
+            let fanout_id = format!("{}-{}", original_msg_id, responder.agent_id);
+            let mb_key = Self::mailbox_key(&responder.org_id, &responder.agent_id);
+            let delivered = self
+                .mailboxes
+                .read()
+                .await
+                .get(&mb_key)
+                .and_then(|inbox| {
+                    inbox
+                        .iter()
+                        .find(|m| m.msg_id == original_msg_id || m.msg_id == fanout_id)
+                        .cloned()
+                });
+            match delivered {
+                Some(mut env) => {
+                    env.msg_id = original_msg_id.to_string();
+                    env
+                }
+                None => {
+                    let exists = self.msg_index.read().await.contains_key(original_msg_id);
+                    if !exists {
+                        anyhow::bail!("Original message '{}' not found", original_msg_id);
+                    }
+                    bail!(
+                        "IPC reply forbidden: message '{}' was not delivered to '{}/{}'; only its recipient can reply",
+                        original_msg_id,
+                        responder.org_id,
+                        responder.agent_id
+                    );
+                }
+            }
+        } else {
             let idx = self.msg_index.read().await;
             idx.get(original_msg_id)
                 .cloned()
                 .with_context(|| format!("Original message '{}' not found", original_msg_id))?
         };
-
-        // Only a recipient may answer: otherwise any agent that learns a msg_id (task lists,
-        // status views) could complete someone else's task with forged results. Topic fan-out
-        // copies are delivered as `<msg_id>-<agent>`.
-        if !aos_core::ablated("tenant_gate") {
-            let fanout_id = format!("{}-{}", original_msg_id, responder.agent_id);
-            let delivered = self
-                .mailboxes
-                .read()
-                .await
-                .get(&Self::mailbox_key(&responder.org_id, &responder.agent_id))
-                .is_some_and(|inbox| {
-                    inbox
-                        .iter()
-                        .any(|m| m.msg_id == original_msg_id || m.msg_id == fanout_id)
-                });
-            if !delivered {
-                bail!(
-                    "IPC reply forbidden: message '{}' was not delivered to '{}/{}'; only its recipient can reply",
-                    original_msg_id,
-                    responder.org_id,
-                    responder.agent_id
-                );
-            }
-        }
 
         let (reply_target_org, reply_target_agent, reply_from_agent) =
             if let Some((orig_from_org, orig_from_agent)) = original.from_agent.split_once('/') {
@@ -1260,14 +1340,8 @@ impl IpcBus for AegisIpcBus {
             }
         }
 
-        self.flush_to_disk().await?;
-        // The reply's task/mailbox mutation is committed. Release the writer lock before
-        // enqueueing the response through `send`, which acquires the same lock.
-        drop(_lock);
-        drop(_state);
-
         let response_env = IpcEnvelope {
-            msg_id: format!("reply-{}", &Uuid::new_v4().to_string()[..8]),
+            msg_id: format!("reply-{}", Uuid::new_v4().simple()),
             org_id: reply_target_org,
             from_agent: reply_from_agent,
             to_target: reply_target_agent,
@@ -1282,7 +1356,11 @@ impl IpcBus for AegisIpcBus {
             created_at_ms: Utc::now().timestamp_millis(),
         };
 
-        self.send(response_env).await
+        // Enqueue the response under the same `_state` + `_lock` transaction and flush once so
+        // task completion and reply delivery succeed or fail atomically.
+        let sent = self.send_unlocked(response_env).await?;
+        self.flush_to_disk().await?;
+        Ok(sent)
     }
 
     async fn subscribe_wakeup(
@@ -2532,5 +2610,111 @@ mod tests {
         let child_after = bus.get_task(&child_req.msg_id).await.unwrap().unwrap();
         assert_eq!(child_after.state, A2ATaskState::Canceled);
         let _ = (mid, leaf);
+    }
+
+    #[tokio::test]
+    async fn cross_tenant_duplicate_msg_id_cannot_hijack_task_reply() {
+        let bus = AegisIpcBus::new();
+        let victim_planner = AgentIdentity::new("org-victim", "planner", "Lead");
+        let victim_worker = AgentIdentity::new("org-victim", "worker", "Worker");
+        let attacker = AgentIdentity::new("org-evil", "attacker", "Attacker");
+
+        bus.register_peer(&victim_planner, vec!["*".to_string()]).await.unwrap();
+        bus.register_peer(&victim_worker, vec!["*".to_string()]).await.unwrap();
+        bus.register_peer(&attacker, vec!["*".to_string()]).await.unwrap();
+
+        let task = bus
+            .send(IpcEnvelope {
+                msg_id: String::new(),
+                org_id: "org-victim".to_string(),
+                from_agent: "planner".to_string(),
+                to_target: "worker".to_string(),
+                kind: IpcKind::TaskRequest {
+                    timeout_secs: Some(60),
+                },
+                subject: "Handle victim secret".to_string(),
+                payload: json!({}),
+                attachments: vec![],
+                status: MessageDeliveryStatus::Unread,
+                created_at_ms: 0,
+            })
+            .await
+            .unwrap();
+
+        // Attacker attempts to overwrite `msg_index[task.msg_id]` using an intra-org send with colliding `msg_id`.
+        let collide_err = bus
+            .send(IpcEnvelope {
+                msg_id: task.msg_id.clone(),
+                org_id: "org-evil".to_string(),
+                from_agent: "attacker".to_string(),
+                to_target: "attacker".to_string(),
+                kind: IpcKind::DirectMessage,
+                subject: "collision".to_string(),
+                payload: json!({}),
+                attachments: vec![],
+                status: MessageDeliveryStatus::Unread,
+                created_at_ms: 0,
+            })
+            .await
+            .unwrap_err()
+            .to_string();
+        assert!(collide_err.contains("Duplicate IPC msg_id"), "{collide_err}");
+
+        // Forged cross-org TaskResponse without a matching original request must be rejected by tenant guard.
+        let forged_resp_err = bus
+            .send(IpcEnvelope {
+                msg_id: String::new(),
+                org_id: "org-victim".to_string(),
+                from_agent: "org-evil/attacker".to_string(),
+                to_target: "planner".to_string(),
+                kind: IpcKind::TaskResponse {
+                    correlation_id: "nonexistent-corr".to_string(),
+                    success: true,
+                },
+                subject: "forged".to_string(),
+                payload: json!({}),
+                attachments: vec![],
+                status: MessageDeliveryStatus::Unread,
+                created_at_ms: 0,
+            })
+            .await
+            .unwrap_err()
+            .to_string();
+        assert!(forged_resp_err.contains("tenant guard"), "{forged_resp_err}");
+
+        // Victim worker's reply strictly delivers back to org-victim/planner, never org-evil/attacker.
+        bus.reply(
+            &victim_worker,
+            &task.msg_id,
+            true,
+            json!({ "secret": "VICTIM_SECRET" }),
+            vec![],
+        )
+        .await
+        .unwrap();
+        assert!(bus
+            .recv_inbox("org-evil", "attacker", true, 10)
+            .await
+            .unwrap()
+            .is_empty());
+        let planner_msgs = bus.recv_inbox("org-victim", "planner", true, 10).await.unwrap();
+        assert_eq!(planner_msgs.len(), 1);
+        assert_eq!(planner_msgs[0].payload["secret"], "VICTIM_SECRET");
+
+        // Paired `(org_id, agent_id)` filter in `list_tasks` must NOT match across sides
+        // (org-victim/planner -> org-evil/attacker must not match `(Some("org-victim"), Some("attacker"))`).
+        let cross_pair = bus
+            .list_tasks(Some("org-victim"), Some("attacker"))
+            .await
+            .unwrap();
+        assert!(
+            cross_pair.is_empty(),
+            "paired org+agent filter must not cross-pair sender org with receiver agent: {cross_pair:?}"
+        );
+        let valid_pair = bus
+            .list_tasks(Some("org-victim"), Some("planner"))
+            .await
+            .unwrap();
+        assert_eq!(valid_pair.len(), 1);
     }
 }

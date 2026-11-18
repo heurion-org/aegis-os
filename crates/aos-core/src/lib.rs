@@ -310,6 +310,18 @@ pub trait TransactionalWorkspace: Send + Sync {
         self.commit_to_host(filter_paths).await
     }
 
+    /// Atomically commit changes computed strictly from an immutable `frozen_root` snapshot,
+    /// closing the post-verification TOCTOU window if the live shadow is concurrently mutated.
+    async fn commit_frozen_to_host_with_options(
+        &self,
+        _frozen_root: &Path,
+        filter_paths: Option<Vec<String>>,
+        overwrite_binaries: bool,
+    ) -> anyhow::Result<Vec<String>> {
+        self.commit_to_host_with_options(filter_paths, overwrite_binaries)
+            .await
+    }
+
     /// Relative paths whose shadow content differs from this Agent's baseline.
     async fn changed_since_baseline(&self) -> anyhow::Result<Vec<String>> {
         Ok(self

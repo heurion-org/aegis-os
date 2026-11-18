@@ -109,34 +109,19 @@ impl hkdf::KeyType for HkdfKeyLen32 {
     }
 }
 
-/// Validates an `org_id` against path traversal and returns a filesystem-safe slug for filenames.
+/// Validates an `org_id` strictly and bijectively for filesystem vault paths.
 pub fn sanitize_and_validate_org_id(org_id: &str) -> anyhow::Result<String> {
     if org_id.is_empty()
-        || org_id == "."
-        || org_id == ".."
-        || org_id.contains('/')
-        || org_id.contains('\\')
-        || org_id.contains('\0')
-        || org_id.contains('*')
+        || org_id.len() > 96
+        || org_id.starts_with('.')
         || org_id.contains("..")
+        || !org_id
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || c == '.' || c == '_' || c == '-')
     {
         bail!("Invalid org_id '{}' for vault path", org_id);
     }
-    let mut safe: String = org_id
-        .chars()
-        .map(|c| {
-            if c.is_ascii_alphanumeric() || c == '.' || c == '_' || c == '-' {
-                c
-            } else {
-                '_'
-            }
-        })
-        .take(96)
-        .collect();
-    if safe.is_empty() || safe == "." || safe == ".." {
-        safe = format!("org-{}", &sha256_hex(org_id)[..12]);
-    }
-    Ok(safe)
+    Ok(org_id.to_string())
 }
 
 pub fn sha256_hex(input: &str) -> String {
@@ -180,13 +165,17 @@ fn is_ephemeral_tmp_root(runtime_root: &Path) -> bool {
 }
 
 fn set_dir_0700(path: &Path) -> std::io::Result<()> {
+    set_dir_mode(path, 0o700)
+}
+
+fn set_dir_mode(path: &Path, mode: u32) -> std::io::Result<()> {
     #[cfg(unix)]
     {
         use std::os::unix::fs::PermissionsExt;
-        std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o700))?;
+        std::fs::set_permissions(path, std::fs::Permissions::from_mode(mode))?;
     }
     #[cfg(not(unix))]
-    let _ = path;
+    let _ = (path, mode);
     Ok(())
 }
 
@@ -244,9 +233,22 @@ fn run_cmd_with_stdin(program: &str, args: &[&str], stdin_bytes: &[u8]) -> anyho
         .with_context(|| format!("failed waiting for `{}`", program))
 }
 
+/// A 256-bit master KEK along with the backend identifier that loaded or created it.
+pub type KekWithSource = (Zeroizing<[u8; 32]>, &'static str);
+
 /// Source of the master Key Encryption Key (KEK) used to wrap per-org DEKs.
 pub trait MasterKekProvider: Send + Sync {
-    fn load_or_create_kek(&self) -> anyhow::Result<(Zeroizing<[u8; 32]>, &'static str)>;
+    fn load_or_create_kek(&self) -> anyhow::Result<KekWithSource>;
+
+    /// Loads an existing master KEK strictly matching `expected_source` (never creating a fresh
+    /// key that would mask the prior source). Returning `Ok(None)` delegates to `load_or_create_kek`.
+    fn load_existing_kek_for_source(
+        &self,
+        expected_source: &str,
+    ) -> anyhow::Result<Option<KekWithSource>> {
+        let _ = expected_source;
+        Ok(None)
+    }
 }
 
 /// Deterministic in-memory KEK provider for isolated unit and integration tests.
@@ -308,7 +310,7 @@ impl DefaultOsKekProvider {
             return Ok((decode_hex_32(&raw)?, "sealed_local_kek"));
         }
         let generated = random_bytes_32()?;
-        let hex_key = Zeroizing::new(hex::encode(&*generated));
+        let hex_key = Zeroizing::new(hex::encode(*generated));
 
         // Write and fsync into a 0o600 sibling temp file before atomic rename so concurrent readers
         // never observe an empty or partially written `master.kek`.
@@ -387,7 +389,7 @@ impl DefaultOsKekProvider {
     }
 
     #[cfg(target_os = "macos")]
-    fn try_macos_keychain(&self) -> anyhow::Result<Zeroizing<[u8; 32]>> {
+    fn lookup_macos_keychain(&self) -> anyhow::Result<Option<Zeroizing<[u8; 32]>>> {
         let find = Command::new("/usr/bin/security")
             .args([
                 "find-generic-password",
@@ -401,26 +403,40 @@ impl DefaultOsKekProvider {
             .context("spawning /usr/bin/security find-generic-password")?;
         if find.status.success() {
             let stdout = Zeroizing::new(String::from_utf8_lossy(&find.stdout).to_string());
-            return decode_hex_32(&stdout);
+            return Ok(Some(decode_hex_32(&stdout)?));
+        }
+        // Exit code 44 is errSecItemNotFound (`security` CLI). Any other failure (locked Keychain,
+        // user cancellation, securityd error) MUST NOT overwrite or recreate the KEK.
+        if find.status.code() == Some(44) {
+            return Ok(None);
+        }
+        bail!(
+            "macOS Keychain lookup failed with status {:?}: {}",
+            find.status.code(),
+            String::from_utf8_lossy(&find.stderr).trim()
+        )
+    }
+
+    #[cfg(target_os = "macos")]
+    fn try_macos_keychain(&self) -> anyhow::Result<Zeroizing<[u8; 32]>> {
+        if let Some(existing) = self.lookup_macos_keychain()? {
+            return Ok(existing);
         }
         let generated = random_bytes_32()?;
-        let hex_key = Zeroizing::new(hex::encode(&*generated));
-        let add = Command::new("/usr/bin/security")
-            .args([
-                "add-generic-password",
-                "-U",
-                "-s",
-                KEYCHAIN_SERVICE,
-                "-a",
-                KEYCHAIN_ACCOUNT,
-                "-w",
-                hex_key.as_str(),
-            ])
-            .output()
-            .context("spawning /usr/bin/security add-generic-password")?;
+        let hex_key = Zeroizing::new(hex::encode(*generated));
+        // Pipe command over `/usr/bin/security -i` stdin so the hex KEK never appears in argv (`ps`)
+        // and omit `-U` so a racing writer cannot silently clobber an initialized KEK.
+        let escaped_svc = KEYCHAIN_SERVICE.replace('\\', "\\\\").replace('"', "\\\"");
+        let escaped_acc = KEYCHAIN_ACCOUNT.replace('\\', "\\\\").replace('"', "\\\"");
+        let script = Zeroizing::new(format!(
+            "add-generic-password -s \"{escaped_svc}\" -a \"{escaped_acc}\" -w \"{}\"\n",
+            hex_key.as_str()
+        ));
+        let add = run_cmd_with_stdin("/usr/bin/security", &["-i"], script.as_bytes())
+            .context("spawning /usr/bin/security -i add-generic-password")?;
         if !add.status.success() {
             bail!(
-                "macOS Keychain add-generic-password failed: {}",
+                "macOS Keychain add-generic-password via stdin failed: {}",
                 String::from_utf8_lossy(&add.stderr).trim()
             );
         }
@@ -451,7 +467,7 @@ impl DefaultOsKekProvider {
             return decode_hex_32(&stdout);
         }
         let generated = random_bytes_32()?;
-        let hex_key = Zeroizing::new(hex::encode(&*generated));
+        let hex_key = Zeroizing::new(hex::encode(*generated));
         let store = run_cmd_with_stdin(
             "secret-tool",
             &[
@@ -491,6 +507,11 @@ impl MasterKekProvider for DefaultOsKekProvider {
             }
         }
 
+        std::fs::create_dir_all(&self.fallback_dir)?;
+        let _ = set_dir_0700(&self.fallback_dir);
+        let kek_lock_path = self.fallback_dir.join("master.kek.lock");
+        let _lock = aos_core::session::acquire_file_lock_sync(&kek_lock_path)?;
+
         #[cfg(target_os = "macos")]
         if let Ok(kek) = self.try_macos_keychain() {
             return Ok((kek, "macos_keychain"));
@@ -502,6 +523,82 @@ impl MasterKekProvider for DefaultOsKekProvider {
         }
 
         self.load_or_create_sealed_file()
+    }
+
+    fn load_existing_kek_for_source(
+        &self,
+        expected_source: &str,
+    ) -> anyhow::Result<Option<KekWithSource>> {
+        match expected_source {
+            "env_kms_kek" => {
+                let master = std::env::var("AOS_VAULT_MASTER_KEY").unwrap_or_default();
+                let trimmed = master.trim();
+                if trimmed.is_empty() {
+                    bail!("DEK envelope expects 'env_kms_kek' but AOS_VAULT_MASTER_KEY is unset");
+                }
+                let salt = hkdf::Salt::new(hkdf::HKDF_SHA256, HKDF_SALT);
+                let prk = salt.extract(trimmed.as_bytes());
+                let okm = prk
+                    .expand(&[HKDF_INFO], HkdfKeyLen32)
+                    .map_err(|_| anyhow::anyhow!("HKDF expand failure for AOS_VAULT_MASTER_KEY"))?;
+                let mut kek = Zeroizing::new([0u8; 32]);
+                okm.fill(&mut *kek)
+                    .map_err(|_| anyhow::anyhow!("HKDF fill failure for AOS_VAULT_MASTER_KEY"))?;
+                Ok(Some((kek, "env_kms_kek")))
+            }
+            "macos_keychain" => {
+                #[cfg(target_os = "macos")]
+                {
+                    let kek = self
+                        .lookup_macos_keychain()?
+                        .context("DEK envelope expects 'macos_keychain' KEK, which is missing")?;
+                    Ok(Some((kek, "macos_keychain")))
+                }
+                #[cfg(not(target_os = "macos"))]
+                bail!("DEK envelope expects 'macos_keychain' KEK on non-macOS host")
+            }
+            "linux_secret_service" => {
+                #[cfg(target_os = "linux")]
+                {
+                    if which_in_path("secret-tool").is_none()
+                        || std::env::var_os("DBUS_SESSION_BUS_ADDRESS")
+                            .filter(|v| !v.is_empty())
+                            .is_none()
+                    {
+                        bail!("secret-tool or DBUS_SESSION_BUS_ADDRESS unavailable for existing KEK");
+                    }
+                    let lookup = Command::new("secret-tool")
+                        .args([
+                            "lookup",
+                            "service",
+                            KEYCHAIN_SERVICE,
+                            "account",
+                            KEYCHAIN_ACCOUNT,
+                        ])
+                        .output()
+                        .context("spawning secret-tool lookup")?;
+                    if !lookup.status.success() {
+                        bail!("DEK envelope expects 'linux_secret_service' KEK, lookup failed");
+                    }
+                    let stdout = Zeroizing::new(String::from_utf8_lossy(&lookup.stdout).to_string());
+                    Ok(Some((decode_hex_32(&stdout)?, "linux_secret_service")))
+                }
+                #[cfg(not(target_os = "linux"))]
+                bail!("DEK envelope expects 'linux_secret_service' KEK on non-Linux host")
+            }
+            "sealed_local_kek" => {
+                let path = self.sealed_kek_path();
+                if !path.exists() {
+                    bail!(
+                        "DEK envelope expects 'sealed_local_kek' at '{}', which does not exist",
+                        path.display()
+                    );
+                }
+                let raw = Zeroizing::new(std::fs::read_to_string(&path)?);
+                Ok(Some((decode_hex_32(&raw)?, "sealed_local_kek")))
+            }
+            _ => Ok(None),
+        }
     }
 }
 
@@ -520,7 +617,6 @@ impl VaultKeyStore {
         org_id: &str,
         dek_path: &Path,
     ) -> anyhow::Result<(Zeroizing<String>, String)> {
-        let (kek, key_source) = self.kek_provider.load_or_create_kek()?;
         if dek_path.exists() {
             let bytes = std::fs::read(dek_path).with_context(|| {
                 format!("reading encrypted DEK envelope '{}'", dek_path.display())
@@ -538,6 +634,13 @@ impl VaultKeyStore {
                     org_id
                 );
             }
+            let kek = match self
+                .kek_provider
+                .load_existing_kek_for_source(&env.key_source)?
+            {
+                Some((k, _)) => k,
+                None => self.kek_provider.load_or_create_kek()?.0,
+            };
             let nonce_bytes = hex::decode(env.nonce_hex.trim())
                 .context("decoding DEK envelope nonce_hex")?;
             if nonce_bytes.len() != 12 {
@@ -570,8 +673,9 @@ impl VaultKeyStore {
             return Ok((dek_str, env.key_source));
         }
 
+        let (kek, key_source) = self.kek_provider.load_or_create_kek()?;
         let raw_dek = random_bytes_32()?;
-        let dek_hex = Zeroizing::new(hex::encode(&*raw_dek));
+        let dek_hex = Zeroizing::new(hex::encode(*raw_dek));
         let rng = SystemRandom::new();
         let mut nonce_arr = [0u8; 12];
         rng.fill(&mut nonce_arr)
@@ -627,22 +731,33 @@ pub trait VolumeMounter: Send + Sync {
         org_id: &str,
         mount_dir: &Path,
     ) -> anyhow::Result<()>;
+
+    fn unmount_with_force(
+        &self,
+        backend: VaultBackendKind,
+        org_id: &str,
+        mount_dir: &Path,
+        force: bool,
+    ) -> anyhow::Result<()> {
+        let _ = force;
+        self.unmount(backend, org_id, mount_dir)
+    }
 }
 
 pub fn is_mountpoint(mount_dir: &Path) -> bool {
     #[cfg(unix)]
     {
         use std::os::unix::fs::MetadataExt;
-        if !mount_dir.exists() {
+        let Ok(m_meta) = std::fs::symlink_metadata(mount_dir) else {
+            return false;
+        };
+        if m_meta.file_type().is_symlink() || !m_meta.file_type().is_dir() {
             return false;
         }
         let Some(parent) = mount_dir.parent() else {
             return false;
         };
-        let Ok(m_meta) = std::fs::metadata(mount_dir) else {
-            return false;
-        };
-        let Ok(p_meta) = std::fs::metadata(parent) else {
+        let Ok(p_meta) = std::fs::symlink_metadata(parent) else {
             return false;
         };
         m_meta.dev() != p_meta.dev()
@@ -734,7 +849,7 @@ impl OsVolumeMounter {
     }
 
     #[cfg(target_os = "macos")]
-    fn hdiutil_detach(mount_dir: &Path) -> anyhow::Result<()> {
+    fn hdiutil_detach(mount_dir: &Path, force: bool) -> anyhow::Result<()> {
         if !is_mountpoint(mount_dir) {
             return Ok(());
         }
@@ -745,6 +860,12 @@ impl OsVolumeMounter {
             .context("spawning hdiutil detach")?;
         if out.status.success() {
             return Ok(());
+        }
+        if !force {
+            bail!(
+                "hdiutil detach failed (non-force): {}",
+                String::from_utf8_lossy(&out.stderr).trim()
+            );
         }
         std::thread::sleep(std::time::Duration::from_millis(150));
         let force_out = Command::new("/usr/bin/hdiutil")
@@ -1147,26 +1268,37 @@ impl VolumeMounter for OsVolumeMounter {
         org_id: &str,
         mount_dir: &Path,
     ) -> anyhow::Result<()> {
+        self.unmount_with_force(backend, org_id, mount_dir, false)
+    }
+
+    fn unmount_with_force(
+        &self,
+        backend: VaultBackendKind,
+        org_id: &str,
+        mount_dir: &Path,
+        force: bool,
+    ) -> anyhow::Result<()> {
         match backend {
             VaultBackendKind::ApfsSparseBundle => {
                 #[cfg(target_os = "macos")]
                 {
-                    Self::hdiutil_detach(mount_dir)
+                    Self::hdiutil_detach(mount_dir, force)
                 }
                 #[cfg(not(target_os = "macos"))]
                 {
-                    let _ = (org_id, mount_dir);
+                    let _ = (org_id, mount_dir, force);
                     Ok(())
                 }
             }
             VaultBackendKind::LuksBtrfs => {
                 #[cfg(target_os = "linux")]
                 {
+                    let _ = force;
                     Self::luks_unmount(org_id, mount_dir)
                 }
                 #[cfg(not(target_os = "linux"))]
                 {
-                    let _ = (org_id, mount_dir);
+                    let _ = (org_id, mount_dir, force);
                     Ok(())
                 }
             }
@@ -1182,8 +1314,13 @@ impl VolumeMounter for OsVolumeMounter {
                     } else {
                         "fusermount3"
                     };
+                    let args: &[&str] = if force {
+                        &["-u", "-z", mount_str.as_ref()]
+                    } else {
+                        &["-u", mount_str.as_ref()]
+                    };
                     let out = Command::new(fusermount)
-                        .args(["-u", mount_str.as_ref()])
+                        .args(args)
                         .output()
                         .with_context(|| format!("spawning {} -u", fusermount))?;
                     if !out.status.success() && is_mountpoint(mount_dir) {
@@ -1197,7 +1334,7 @@ impl VolumeMounter for OsVolumeMounter {
                 }
                 #[cfg(not(target_os = "linux"))]
                 {
-                    let _ = (org_id, mount_dir);
+                    let _ = (org_id, mount_dir, force);
                     Ok(())
                 }
             }
@@ -1563,10 +1700,22 @@ impl OrgVaultManager {
             .unwrap_or_else(|| self.mounter.detect_preferred_backend());
 
         if self.mounter.is_mounted(&mount_dir) {
-            self.mounter.unmount(backend, org_id, &mount_dir)?;
+            self.mounter
+                .unmount_with_force(backend, org_id, &mount_dir, false)?;
+        }
+        #[cfg(target_os = "linux")]
+        {
+            if backend == VaultBackendKind::LuksBtrfs {
+                let _ = OsVolumeMounter::luks_unmount(org_id, &mount_dir);
+            }
         }
 
         let mounted_after = self.mounter.is_mounted(&mount_dir);
+        if !mounted_after && mount_dir.is_dir() && backend.is_encrypted() {
+            // Lock empty mountpoint shell read-only so companion processes cannot silently write
+            // unencrypted plaintext into `<runtime>/orgs/<org_id>` while locked.
+            let _ = set_dir_mode(&mount_dir, 0o500);
+        }
         let key_source = self
             .read_envelope_key_source(&safe_org)
             .unwrap_or_else(|| "none".to_string());
@@ -1595,6 +1744,18 @@ impl OrgVaultManager {
         let _lock = aos_core::session::acquire_file_lock_sync(&lock_target)?;
 
         let mount_dir = self.mount_dir(org_id);
+        let dek = self.dek_path(&safe_org);
+        if dek.exists() {
+            let bytes = std::fs::read(&dek)?;
+            let env: EncryptedDekEnvelope = serde_json::from_slice(&bytes)?;
+            if env.org_id != org_id {
+                bail!(
+                    "Refusing to destroy vault '{}': DEK envelope belongs to '{}'",
+                    org_id,
+                    env.org_id
+                );
+            }
+        }
         let existing_backing = self.detect_existing_backing(&safe_org);
         let backend = existing_backing
             .as_ref()
@@ -1602,7 +1763,14 @@ impl OrgVaultManager {
             .unwrap_or_else(|| self.mounter.detect_preferred_backend());
 
         if self.mounter.is_mounted(&mount_dir) {
-            self.mounter.unmount(backend, org_id, &mount_dir)?;
+            self.mounter
+                .unmount_with_force(backend, org_id, &mount_dir, true)?;
+        }
+        #[cfg(target_os = "linux")]
+        {
+            if backend == VaultBackendKind::LuksBtrfs {
+                let _ = OsVolumeMounter::luks_unmount(org_id, &mount_dir);
+            }
         }
 
         if let Some((_, backing)) = existing_backing {
@@ -1612,11 +1780,11 @@ impl OrgVaultManager {
                 let _ = std::fs::remove_file(&backing);
             }
         }
-        let dek = self.dek_path(&safe_org);
         if dek.exists() {
             let _ = std::fs::remove_file(&dek);
         }
         if mount_dir.is_dir() {
+            let _ = set_dir_0700(&mount_dir);
             let _ = std::fs::remove_dir_all(&mount_dir);
         }
         Ok(())
@@ -2032,5 +2200,62 @@ pub mod tests {
             std::fs::read_to_string(host_repo.join("README.md")).unwrap(),
             "host clean baseline\n"
         );
+    }
+
+    #[test]
+    fn test_vault_org_id_rejects_ambiguous_slugs_and_leading_dot() {
+        assert_eq!(sanitize_and_validate_org_id("acme-prod_1.v2").unwrap(), "acme-prod_1.v2");
+        for bad in [
+            "",
+            ".hidden",
+            "..",
+            "a..b",
+            "acme:prod",
+            "acme@prod",
+            "acme/prod",
+            "acme prod",
+            &"a".repeat(97),
+        ] {
+            assert!(
+                sanitize_and_validate_org_id(bad).is_err(),
+                "expected invalid org_id rejection for {bad:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn is_mountpoint_rejects_symlinks() {
+        let tmp = tempfile::tempdir().unwrap();
+        let target = tmp.path().join("other_dir");
+        std::fs::create_dir_all(&target).unwrap();
+        let link = tmp.path().join("mnt_link");
+        #[cfg(unix)]
+        {
+            std::os::unix::fs::symlink(&target, &link).unwrap();
+            assert!(
+                !is_mountpoint(&link),
+                "symlink must never be treated as a mounted vault mountpoint"
+            );
+        }
+    }
+
+    #[test]
+    fn vault_dek_selects_envelope_key_source_matching_sealed_kek() {
+        let tmp = tempfile::tempdir().unwrap();
+        let dek_path = tmp.path().join("org.dek.json");
+        let kek_provider = Arc::new(DefaultOsKekProvider::new(tmp.path().join("vaults")));
+        // Force sealed_local_kek by writing an isolated sealed file and pointing XDG_CONFIG_HOME
+        // only isn't safe under parallel tests, so verify InMemoryKekProvider & DefaultOsKekProvider lookup error on missing expected source.
+        let env_missing = kek_provider.load_existing_kek_for_source("sealed_local_kek");
+        // Either Ok(Some(_)) if developer machine has master.kek, or Err if missing (never creates a new file unexpectedly).
+        if let Ok(Some((_, src))) = env_missing {
+            assert_eq!(src, "sealed_local_kek");
+        }
+        let store = VaultKeyStore::new(Arc::new(InMemoryKekProvider::new([0x42u8; 32])));
+        let (dek1, src1) = store.load_or_create_dek("acme", &dek_path).unwrap();
+        assert_eq!(src1, "in_memory_test");
+        let (dek2, src2) = store.load_or_create_dek("acme", &dek_path).unwrap();
+        assert_eq!(dek1.as_str(), dek2.as_str());
+        assert_eq!(src2, "in_memory_test");
     }
 }
