@@ -92,8 +92,12 @@ impl SqliteMemoryStore {
     }
 
     fn init_schema(&self) -> anyhow::Result<()> {
+        self.conn.busy_timeout(std::time::Duration::from_secs(5))?;
         self.conn.execute_batch(
             r#"
+            PRAGMA journal_mode = WAL;
+            PRAGMA synchronous = NORMAL;
+            PRAGMA foreign_keys = ON;
             CREATE TABLE IF NOT EXISTS memory_items (
                 key TEXT PRIMARY KEY,
                 value TEXT NOT NULL,
@@ -262,6 +266,33 @@ impl SqliteMemoryStore {
         id: &str,
         reviewed_by: &str,
     ) -> anyhow::Result<Option<MemoryItem>> {
+        struct ImmediateTx<'a> {
+            conn: &'a Connection,
+            committed: bool,
+        }
+        impl<'a> ImmediateTx<'a> {
+            fn begin(conn: &'a Connection) -> anyhow::Result<Self> {
+                conn.execute_batch("BEGIN IMMEDIATE;")?;
+                Ok(Self {
+                    conn,
+                    committed: false,
+                })
+            }
+            fn commit(mut self) -> anyhow::Result<()> {
+                self.conn.execute_batch("COMMIT;")?;
+                self.committed = true;
+                Ok(())
+            }
+        }
+        impl Drop for ImmediateTx<'_> {
+            fn drop(&mut self) {
+                if !self.committed {
+                    let _ = self.conn.execute_batch("ROLLBACK;");
+                }
+            }
+        }
+
+        let tx = ImmediateTx::begin(&self.conn)?;
         let Some(staged) = self.get_staged_write(id)? else {
             return Ok(None);
         };
@@ -269,6 +300,14 @@ impl SqliteMemoryStore {
             return Ok(None);
         }
         let now = Utc::now().to_rfc3339();
+        let updated = self.conn.execute(
+            "UPDATE staged_writes SET status = 'approved', reviewed_at = ?, reviewed_by = ?
+             WHERE id = ? AND status = 'pending'",
+            params![now, reviewed_by, id],
+        )?;
+        if updated != 1 {
+            return Ok(None);
+        }
         self.set(&MemoryItem {
             key: staged.key.clone(),
             value: staged.value,
@@ -276,14 +315,10 @@ impl SqliteMemoryStore {
             sensitivity: staged.sensitivity,
             source: "agent".to_string(),
             created_at: now.clone(),
-            updated_at: now.clone(),
+            updated_at: now,
             description: staged.description,
         })?;
-        self.conn.execute(
-            "UPDATE staged_writes SET status = 'approved', reviewed_at = ?, reviewed_by = ?
-             WHERE id = ? AND status = 'pending'",
-            params![now, reviewed_by, id],
-        )?;
+        tx.commit()?;
         self.get(&staged.key)
     }
 
@@ -292,18 +327,34 @@ impl SqliteMemoryStore {
         id: &str,
         reviewed_by: &str,
     ) -> anyhow::Result<Option<StagedWrite>> {
-        let Some(staged) = self.get_staged_write(id)? else {
-            return Ok(None);
-        };
-        if staged.status != "pending" {
-            return Ok(None);
+        self.conn.execute_batch("BEGIN IMMEDIATE;")?;
+        let res = (|| -> anyhow::Result<Option<StagedWrite>> {
+            let Some(staged) = self.get_staged_write(id)? else {
+                return Ok(None);
+            };
+            if staged.status != "pending" {
+                return Ok(None);
+            }
+            let updated = self.conn.execute(
+                "UPDATE staged_writes SET status = 'denied', reviewed_at = ?, reviewed_by = ?
+                 WHERE id = ? AND status = 'pending'",
+                params![Utc::now().to_rfc3339(), reviewed_by, id],
+            )?;
+            if updated != 1 {
+                return Ok(None);
+            }
+            self.get_staged_write(id)
+        })();
+        match res {
+            Ok(val) => {
+                self.conn.execute_batch("COMMIT;")?;
+                Ok(val)
+            }
+            Err(err) => {
+                let _ = self.conn.execute_batch("ROLLBACK;");
+                Err(err)
+            }
         }
-        self.conn.execute(
-            "UPDATE staged_writes SET status = 'denied', reviewed_at = ?, reviewed_by = ?
-             WHERE id = ? AND status = 'pending'",
-            params![Utc::now().to_rfc3339(), reviewed_by, id],
-        )?;
-        self.get_staged_write(id)
     }
 
     pub fn get_staged_write(&self, id: &str) -> anyhow::Result<Option<StagedWrite>> {
@@ -705,6 +756,9 @@ mod tests {
             .unwrap()
             .unwrap();
         assert_eq!(denied.status, "denied");
+        assert_eq!(store.get("note.projects.denied").unwrap(), None);
+        // Denied staged write cannot subsequently be approved into memory_items.
+        assert_eq!(store.approve_staged_write(&staged.id, "user").unwrap(), None);
         assert_eq!(store.get("note.projects.denied").unwrap(), None);
     }
 

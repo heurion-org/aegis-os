@@ -46,8 +46,12 @@ impl AuthStore {
     }
 
     fn init_schema(&self) -> anyhow::Result<()> {
+        self.conn.busy_timeout(std::time::Duration::from_secs(5))?;
         self.conn.execute_batch(
             r#"
+            PRAGMA journal_mode = WAL;
+            PRAGMA synchronous = NORMAL;
+            PRAGMA foreign_keys = ON;
             CREATE TABLE IF NOT EXISTS sessions (
                 session_id TEXT PRIMARY KEY,
                 agent_id TEXT NOT NULL,
@@ -261,6 +265,61 @@ impl AuthStore {
             }
             None => false,
         })
+    }
+
+    /// Atomically verifies that `session_id` is `'active'`, unexpired, and matches `token_hash`,
+    /// returning the persisted `granted_scopes` from the database so tokens cannot outlive revokes
+    /// or broaden claims beyond DB truth.
+    pub fn verify_active_session(
+        &self,
+        session_id: &str,
+        token_hash: &str,
+    ) -> anyhow::Result<Option<MemoryScopes>> {
+        let row = self
+            .conn
+            .query_row(
+                "SELECT status, expires_at, granted_scopes, token_hash FROM sessions WHERE session_id = ?",
+                params![session_id],
+                |row| {
+                    Ok((
+                        row.get::<_, String>(0)?,
+                        row.get::<_, String>(1)?,
+                        row.get::<_, Option<String>>(2)?,
+                        row.get::<_, Option<String>>(3)?,
+                    ))
+                },
+            )
+            .optional()?;
+        let Some((status, expires_at, granted_raw, stored_hash)) = row else {
+            return Ok(None);
+        };
+        if status != "active" {
+            return Ok(None);
+        }
+        let unexpired = chrono::DateTime::parse_from_rfc3339(&expires_at)
+            .map(|value| value > Utc::now())
+            .unwrap_or(false);
+        if !unexpired {
+            return Ok(None);
+        }
+        let Some(expected_hash) = stored_hash.filter(|h| !h.is_empty()) else {
+            return Ok(None);
+        };
+        if expected_hash.len() != token_hash.len()
+            || expected_hash
+                .as_bytes()
+                .iter()
+                .zip(token_hash.as_bytes().iter())
+                .fold(0u8, |acc, (&a, &b)| acc | (a ^ b))
+                != 0
+        {
+            return Ok(None);
+        }
+        let Some(scopes_json) = granted_raw else {
+            return Ok(None);
+        };
+        let scopes: MemoryScopes = serde_json::from_str(&scopes_json)?;
+        Ok(Some(scopes))
     }
 
     pub fn create_consent(

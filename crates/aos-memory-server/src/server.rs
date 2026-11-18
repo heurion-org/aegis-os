@@ -108,6 +108,13 @@ fn constant_time_eq(a: &str, b: &str) -> bool {
 }
 
 fn check_admin(state: &AppState, headers: &HeaderMap) -> Result<(), (StatusCode, Json<Value>)> {
+    if state.admin_token.is_empty() {
+        return Err(api_error(
+            StatusCode::UNAUTHORIZED,
+            "UNAUTHORIZED",
+            "admin token required",
+        ));
+    }
     let provided = headers
         .get("x-uomp-admin-token")
         .and_then(|value| value.to_str().ok())
@@ -124,8 +131,16 @@ fn check_admin(state: &AppState, headers: &HeaderMap) -> Result<(), (StatusCode,
 }
 
 fn check_bridge(state: &AppState, headers: &HeaderMap) -> Result<(), (StatusCode, Json<Value>)> {
+    if state.bridge_token.is_empty() {
+        return Err(api_error(
+            StatusCode::UNAUTHORIZED,
+            "UNAUTHORIZED",
+            "bridge token required",
+        ));
+    }
     let provided = headers
         .get("x-uomp-bridge-token")
+        .or_else(|| headers.get("x-aegis-bridge-token"))
         .and_then(|value| value.to_str().ok())
         .unwrap_or("");
     if constant_time_eq(provided, &state.bridge_token) {
@@ -154,7 +169,7 @@ fn claims_from_headers(
             "bearer token required",
         )
     })?;
-    let claims = state
+    let mut claims = state
         .issuer
         .verify(token)
         .map_err(|_| api_error(StatusCode::UNAUTHORIZED, "INVALID_TOKEN", "invalid token"))?;
@@ -165,19 +180,38 @@ fn claims_from_headers(
             "token has expired",
         ));
     }
-    let active = state
+    if claims.profile == "local" {
+        if claims.audience.trim_end_matches('/') != state.public_url.trim_end_matches('/') {
+            return Err(api_error(
+                StatusCode::UNAUTHORIZED,
+                "AUDIENCE_MISMATCH",
+                "token audience does not match this server",
+            ));
+        }
+    } else {
+        check_bridge(state, headers)?;
+    }
+    let token_hash = format!("{:x}", sha2::Sha256::digest(token.as_bytes()));
+    let db_scopes = state
         .auth
         .lock()
         .unwrap_or_else(|value| value.into_inner())
-        .is_active(&claims.session_id)
-        .unwrap_or(false);
-    if !active {
-        return Err(api_error(
-            StatusCode::UNAUTHORIZED,
-            "SESSION_NOT_ACTIVE",
-            "session is not active",
-        ));
-    }
+        .verify_active_session(&claims.session_id, &token_hash)
+        .map_err(|error| {
+            api_error(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "STORE_ERROR",
+                &error.to_string(),
+            )
+        })?
+        .ok_or_else(|| {
+            api_error(
+                StatusCode::UNAUTHORIZED,
+                "SESSION_NOT_ACTIVE",
+                "session is not active",
+            )
+        })?;
+    claims.scopes = db_scopes;
     Ok(claims)
 }
 
@@ -528,13 +562,21 @@ async fn list_sessions(State(state): State<Arc<AppState>>, headers: HeaderMap) -
     Ok(Json(json!({ "sessions": sessions })))
 }
 
-async fn validate_token(State(state): State<Arc<AppState>>, Json(body): Json<Value>) -> ApiResult {
+async fn validate_token(
+    State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
+    Json(body): Json<Value>,
+) -> ApiResult {
+    if !state.bridge_token.is_empty() || !state.admin_token.is_empty() {
+        check_bridge(&state, &headers).or_else(|_| check_admin(&state, &headers))?;
+    }
     let token = body
         .get("token")
         .and_then(|value| value.as_str())
         .unwrap_or("");
     let claims = state.issuer.verify(token).ok();
     let now_ms = Utc::now().timestamp_millis();
+    let token_hash = format!("{:x}", sha2::Sha256::digest(token.as_bytes()));
     let valid = claims
         .as_ref()
         .map(|claims| {
@@ -543,14 +585,20 @@ async fn validate_token(State(state): State<Arc<AppState>>, Json(body): Json<Val
                     .auth
                     .lock()
                     .unwrap_or_else(|value| value.into_inner())
-                    .is_active(&claims.session_id)
-                    .unwrap_or(false)
+                    .verify_active_session(&claims.session_id, &token_hash)
+                    .ok()
+                    .flatten()
+                    .is_some()
         })
         .unwrap_or(false);
-    Ok(Json(json!({
-        "valid": valid,
-        "session_id": claims.as_ref().map(|value| value.session_id.clone()),
-    })))
+    if valid {
+        Ok(Json(json!({
+            "valid": true,
+            "session_id": claims.as_ref().map(|value| value.session_id.clone()),
+        })))
+    } else {
+        Ok(Json(json!({ "valid": false })))
+    }
 }
 
 async fn create_consent(
@@ -759,7 +807,8 @@ async fn approve_consent(
             )
         })?;
     let token_hash = format!("{:x}", sha2::Sha256::digest(token.as_bytes()));
-    auth.grant_session(&session.session_id, &granted, &token_hash)
+    let granted_ok = auth
+        .grant_session(&session.session_id, &granted, &token_hash)
         .map_err(|error| {
             api_error(
                 StatusCode::INTERNAL_SERVER_ERROR,
@@ -767,6 +816,13 @@ async fn approve_consent(
                 &error.to_string(),
             )
         })?;
+    if !granted_ok {
+        return Err(api_error(
+            StatusCode::CONFLICT,
+            "SESSION_CONFLICT",
+            "session is no longer in 'created' state",
+        ));
+    }
     auth.approve_consent(&id, &granted, &token)
         .map_err(|error| {
             api_error(

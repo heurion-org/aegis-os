@@ -373,3 +373,96 @@ fn native_server_auth_consent_memory_staged_payload_audit() {
         .iter()
         .any(|event| event["action"] == "revoke" && event["decision"] == "allow"));
 }
+
+#[test]
+fn validate_token_requires_auth_and_audience_profile_and_token_hash_are_enforced() {
+    use aos_memory_server::{IssueClaims, TokenIssuer};
+    let server = start_server();
+
+    // Create + grant a real session
+    let (_, created) = request(
+        &server,
+        "POST",
+        "/v1/sessions",
+        &admin(),
+        Some(json!({
+            "agent_id": "claude",
+            "requested_scopes": scopes(),
+            "duration_minutes": 5
+        })),
+    );
+    let sid = created["session_id"].as_str().unwrap().to_string();
+    let (_, granted) = request(
+        &server,
+        "POST",
+        &format!("/v1/sessions/{sid}/grant"),
+        &admin(),
+        Some(json!({ "granted_scopes": scopes() })),
+    );
+    let valid_token = granted["token"].as_str().unwrap().to_string();
+
+    // Anonymous `/v1/tokens/validate` is rejected when bridge/admin tokens are configured
+    let (status, _) = request(
+        &server,
+        "POST",
+        "/v1/tokens/validate",
+        &[],
+        Some(json!({ "token": valid_token })),
+    );
+    assert_eq!(status, 401);
+
+    // Authenticated `/v1/tokens/validate` omits `session_id` when token is invalid
+    let (status, body) = request(
+        &server,
+        "POST",
+        "/v1/tokens/validate",
+        &bridge(),
+        Some(json!({ "token": "bad.token.value" })),
+    );
+    assert_eq!(status, 200);
+    assert_eq!(body["valid"], false);
+    assert!(body.get("session_id").is_none());
+
+    // Mint a synthetic `remote` token signed by the server's issuer: direct call without bridge header -> 401
+    let issuer = TokenIssuer::load_or_generate(server._dir.path().join("secrets")).unwrap();
+    let remote_tok = issuer
+        .issue(&IssueClaims {
+            session_id: sid.clone(),
+            agent_id: "claude".to_string(),
+            expires_at_ms: chrono::Utc::now().timestamp_millis() + 60_000,
+            scopes: serde_json::from_value(scopes()).unwrap(),
+            profile: "remote".to_string(),
+            audience: server.base.clone(),
+        })
+        .unwrap();
+    let (status, _) = request(&server, "GET", "/v1/memory?tag=notes", &bearer(&remote_tok), None);
+    assert_eq!(status, 401);
+
+    // Local token with wrong audience -> 401
+    let wrong_aud_tok = issuer
+        .issue(&IssueClaims {
+            session_id: sid.clone(),
+            agent_id: "claude".to_string(),
+            expires_at_ms: chrono::Utc::now().timestamp_millis() + 60_000,
+            scopes: serde_json::from_value(scopes()).unwrap(),
+            profile: "local".to_string(),
+            audience: "https://other.invalid".to_string(),
+        })
+        .unwrap();
+    let (status, _) = request(&server, "GET", "/v1/memory?tag=notes", &bearer(&wrong_aud_tok), None);
+    assert_eq!(status, 401);
+
+    // Re-signed local token with right audience & sid, but different bytes than DB token_hash -> 401
+    let swapped_tok = issuer
+        .issue(&IssueClaims {
+            session_id: sid,
+            agent_id: "claude".to_string(),
+            expires_at_ms: chrono::Utc::now().timestamp_millis() + 65_000,
+            scopes: serde_json::from_value(scopes()).unwrap(),
+            profile: "local".to_string(),
+            audience: server.base.clone(),
+        })
+        .unwrap();
+    let (status, _) = request(&server, "GET", "/v1/memory?tag=notes", &bearer(&swapped_tok), None);
+    assert_eq!(status, 401);
+}

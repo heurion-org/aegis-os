@@ -155,7 +155,7 @@ pub fn verify_token(
         audience,
         session_id,
         agent_id,
-        expires_at_ms: exp * 1000,
+        expires_at_ms: exp.saturating_mul(1000),
         scopes,
     })
 }
@@ -485,21 +485,36 @@ async fn serve_inner(
         config.audit_log.clone(),
         config.profile.gateway_id.clone(),
     ));
+    let conn_semaphore = std::sync::Arc::new(tokio::sync::Semaphore::new(256));
     loop {
         let (stream, _) = listener.accept().await?;
+        let Ok(permit) = conn_semaphore.clone().try_acquire_owned() else {
+            drop(stream);
+            continue;
+        };
         let config = config.clone();
         let guard = guard.clone();
         let limiter = limiter.clone();
         let audit = audit.clone();
         let tls = tls.clone();
         tokio::spawn(async move {
+            let _permit = permit;
             let result = match tls {
-                Some(acceptor) => match acceptor.accept(stream).await {
-                    Ok(stream) => {
+                Some(acceptor) => match tokio::time::timeout(
+                    std::time::Duration::from_secs(30),
+                    acceptor.accept(stream),
+                )
+                .await
+                {
+                    Ok(Ok(stream)) => {
                         handle_connection(stream, &config, &guard, &limiter, &audit).await
                     }
-                    Err(error) => {
+                    Ok(Err(error)) => {
                         eprintln!("memory gateway TLS handshake failed: {error}");
+                        return;
+                    }
+                    Err(_) => {
+                        eprintln!("memory gateway TLS handshake timed out");
                         return;
                     }
                 },
@@ -539,6 +554,27 @@ fn is_public_route(method: &str, path: &str) -> bool {
         || (method == "GET" && path.starts_with("/v1/remote/requests/"))
 }
 
+async fn write_gateway_error<S>(stream: &mut S, status: &str, error_msg: &str) -> anyhow::Result<()>
+where
+    S: AsyncWrite + Unpin,
+{
+    let body = serde_json::json!({ "error": error_msg }).to_string();
+    let response = format!(
+        "HTTP/1.1 {status}\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{body}",
+        body.len()
+    );
+    stream.write_all(response.as_bytes()).await?;
+    Ok(())
+}
+
+fn configured_bridge_token() -> Option<String> {
+    std::env::var("AOS_MEMORY_BRIDGE_TOKEN")
+        .or_else(|_| std::env::var("UOMP_BRIDGE_TOKEN"))
+        .ok()
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty())
+}
+
 async fn handle_connection<S>(
     mut stream: S,
     config: &GatewayConfig,
@@ -549,18 +585,31 @@ async fn handle_connection<S>(
 where
     S: AsyncRead + AsyncWrite + Unpin,
 {
+    const IO_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
     let mut buffer = Vec::new();
     let mut chunk = [0u8; 4096];
-    loop {
-        let read = stream.read(&mut chunk).await?;
-        if read == 0 {
-            return Ok(());
+    let header_read = tokio::time::timeout(IO_TIMEOUT, async {
+        loop {
+            let read = stream.read(&mut chunk).await?;
+            if read == 0 {
+                return Ok::<bool, std::io::Error>(false);
+            }
+            buffer.extend_from_slice(&chunk[..read]);
+            if buffer.windows(4).any(|window| window == b"\r\n\r\n") {
+                return Ok(true);
+            }
+            if buffer.len() > 1024 * 1024 {
+                return Ok(false);
+            }
         }
-        buffer.extend_from_slice(&chunk[..read]);
-        if buffer.windows(4).any(|window| window == b"\r\n\r\n") {
-            break;
-        }
-        if buffer.len() > 1024 * 1024 {
+    })
+    .await;
+    match header_read {
+        Ok(Ok(true)) => {}
+        Ok(Ok(false)) => return Ok(()),
+        Ok(Err(e)) => return Err(e.into()),
+        Err(_) => {
+            let _ = write_gateway_error(&mut stream, "408 Request Timeout", "header read timed out").await;
             return Ok(());
         }
     }
@@ -577,40 +626,74 @@ where
     let path = request_parts.next().unwrap_or_default().to_string();
 
     let mut authorization = None;
-    let mut content_length = 0usize;
+    let mut seen_content_length: Option<usize> = None;
+    let mut malformed_framing = false;
     for line in lines {
         if let Some((name, value)) = line.split_once(':') {
             let name = name.trim().to_ascii_lowercase();
             let value = value.trim();
             if name == "authorization" {
                 authorization = Some(value.to_string());
+            } else if name == "transfer-encoding" {
+                malformed_framing = true;
             } else if name == "content-length" {
-                content_length = value.parse().unwrap_or(0);
+                match value.parse::<usize>() {
+                    Ok(parsed) => {
+                        if let Some(prev) = seen_content_length {
+                            if prev != parsed {
+                                malformed_framing = true;
+                            }
+                        } else {
+                            seen_content_length = Some(parsed);
+                        }
+                    }
+                    Err(_) => {
+                        malformed_framing = true;
+                    }
+                }
             }
         }
     }
 
+    if malformed_framing {
+        return write_gateway_error(
+            &mut stream,
+            "400 Bad Request",
+            "malformed or unsupported framing headers",
+        )
+        .await;
+    }
+
+    let content_length = seen_content_length.unwrap_or(0);
     const MAX_BODY_BYTES: usize = 4 * 1024 * 1024;
     if content_length > MAX_BODY_BYTES {
-        let body = serde_json::json!({ "error": "request body exceeds maximum allowed size" })
-            .to_string();
-        let response = format!(
-            "HTTP/1.1 413 Payload Too Large\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{body}",
-            body.len()
-        );
-        stream.write_all(response.as_bytes()).await?;
-        return Ok(());
+        return write_gateway_error(
+            &mut stream,
+            "413 Payload Too Large",
+            "request body exceeds maximum allowed size",
+        )
+        .await;
     }
 
     let body_start = header_end + 4;
     let mut body = buffer[body_start..].to_vec();
-    while body.len() < content_length {
-        let remaining = (content_length - body.len()).min(chunk.len());
-        let read = stream.read(&mut chunk[..remaining]).await?;
-        if read == 0 {
-            break;
+    let body_read = tokio::time::timeout(IO_TIMEOUT, async {
+        while body.len() < content_length {
+            let remaining = (content_length - body.len()).min(chunk.len());
+            let read = stream.read(&mut chunk[..remaining]).await?;
+            if read == 0 {
+                break;
+            }
+            body.extend_from_slice(&chunk[..read]);
         }
-        body.extend_from_slice(&chunk[..read]);
+        Ok::<(), std::io::Error>(())
+    })
+    .await;
+    if body_read.is_err() {
+        return write_gateway_error(&mut stream, "408 Request Timeout", "body read timed out").await;
+    }
+    if body.len() < content_length {
+        return write_gateway_error(&mut stream, "400 Bad Request", "truncated request body").await;
     }
     body.truncate(content_length);
 
@@ -622,6 +705,13 @@ where
     };
 
     if is_public_route(&request.method, &request.path) {
+        if !limiter.allow("__public__") {
+            audit
+                .record("", "", &request.method, &request.path, "rate_limited", 429)
+                .await;
+            return write_gateway_error(&mut stream, "429 Too Many Requests", "rate limit exceeded")
+                .await;
+        }
         audit
             .record("", "", &request.method, &request.path, "allow", 200)
             .await;
@@ -641,13 +731,12 @@ where
                         429,
                     )
                     .await;
-                let body = serde_json::json!({ "error": "rate limit exceeded" }).to_string();
-                let response = format!(
-                    "HTTP/1.1 429 Too Many Requests\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{body}",
-                    body.len()
-                );
-                stream.write_all(response.as_bytes()).await?;
-                return Ok(());
+                return write_gateway_error(
+                    &mut stream,
+                    "429 Too Many Requests",
+                    "rate limit exceeded",
+                )
+                .await;
             }
             if config.check_session {
                 let token = request
@@ -666,13 +755,12 @@ where
                             401,
                         )
                         .await;
-                    let body = serde_json::json!({ "error": "session is not active" }).to_string();
-                    let response = format!(
-                        "HTTP/1.1 401 Unauthorized\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{body}",
-                        body.len()
-                    );
-                    stream.write_all(response.as_bytes()).await?;
-                    return Ok(());
+                    return write_gateway_error(
+                        &mut stream,
+                        "401 Unauthorized",
+                        "session is not active",
+                    )
+                    .await;
                 }
             }
             audit
@@ -695,38 +783,39 @@ where
                 GatewayError::Access(_) | GatewayError::InvalidSignature => "403 Forbidden",
                 _ => "401 Unauthorized",
             };
-            let body = serde_json::json!({ "error": error.to_string() }).to_string();
-            let response = format!(
-                "HTTP/1.1 {status}\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{body}",
-                body.len()
-            );
-            stream.write_all(response.as_bytes()).await?;
-            Ok(())
+            write_gateway_error(&mut stream, status, &error.to_string()).await
         }
     }
 }
 
 async fn session_is_active(guard: &GuardTarget, token: &str) -> anyhow::Result<bool> {
+    const IO_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(15);
     let body = serde_json::json!({ "token": token }).to_string();
-    let mut upstream = TcpStream::connect((guard.host.as_str(), guard.port)).await?;
-    let request = format!(
-        "POST /v1/tokens/validate HTTP/1.1\r\nHost: {}:{}\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{body}",
-        guard.host,
-        guard.port,
-        body.len()
-    );
-    upstream.write_all(request.as_bytes()).await?;
-    let mut response = Vec::new();
-    upstream.read_to_end(&mut response).await?;
-    let response = String::from_utf8_lossy(&response);
-    let Some((_, body)) = response.split_once("\r\n\r\n") else {
-        return Ok(false);
-    };
-    let value: Value = serde_json::from_str(body).unwrap_or(Value::Null);
-    Ok(value
-        .get("valid")
-        .and_then(|v| v.as_bool())
-        .unwrap_or(false))
+    let bridge_hdr = configured_bridge_token()
+        .map(|t| format!("x-uomp-bridge-token: {t}\r\n"))
+        .unwrap_or_default();
+    tokio::time::timeout(IO_TIMEOUT, async {
+        let mut upstream = TcpStream::connect((guard.host.as_str(), guard.port)).await?;
+        let request = format!(
+            "POST /v1/tokens/validate HTTP/1.1\r\nHost: {}:{}\r\n{bridge_hdr}content-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{body}",
+            guard.host,
+            guard.port,
+            body.len()
+        );
+        upstream.write_all(request.as_bytes()).await?;
+        let mut response = Vec::new();
+        upstream.take(1024 * 1024).read_to_end(&mut response).await?;
+        let response = String::from_utf8_lossy(&response);
+        let Some((_, body)) = response.split_once("\r\n\r\n") else {
+            return Ok(false);
+        };
+        let value: Value = serde_json::from_str(body).unwrap_or(Value::Null);
+        Ok(value
+            .get("valid")
+            .and_then(|v| v.as_bool())
+            .unwrap_or(false))
+    })
+    .await?
 }
 
 async fn forward<S>(
@@ -737,27 +826,46 @@ async fn forward<S>(
 where
     S: AsyncRead + AsyncWrite + Unpin,
 {
-    let mut upstream = TcpStream::connect((guard.host.as_str(), guard.port)).await?;
+    const IO_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
+    const MAX_UPSTREAM_RESPONSE_BYTES: usize = 16 * 1024 * 1024;
     let body = request.body;
     let content_type_header = if body.is_empty() {
         ""
     } else {
         "Content-Type: application/json\r\n"
     };
+    let bridge_hdr = configured_bridge_token()
+        .map(|t| format!("X-Uomp-Bridge-Token: {t}\r\n"))
+        .unwrap_or_default();
     let request_head = format!(
-        "{} {} HTTP/1.1\r\nHost: {}:{}\r\nAuthorization: {}\r\n{}Content-Length: {}\r\nConnection: close\r\n\r\n",
+        "{} {} HTTP/1.1\r\nHost: {}:{}\r\nAuthorization: {}\r\n{bridge_hdr}{content_type_header}Content-Length: {}\r\nConnection: close\r\n\r\n",
         request.method,
         request.path,
         guard.host,
         guard.port,
         request.authorization.unwrap_or_default(),
-        content_type_header,
         body.len()
     );
-    upstream.write_all(request_head.as_bytes()).await?;
-    upstream.write_all(&body).await?;
-    let mut response = Vec::new();
-    upstream.read_to_end(&mut response).await?;
+    let response = tokio::time::timeout(IO_TIMEOUT, async {
+        let mut upstream = TcpStream::connect((guard.host.as_str(), guard.port)).await?;
+        upstream.write_all(request_head.as_bytes()).await?;
+        upstream.write_all(&body).await?;
+        let mut resp = Vec::new();
+        upstream
+            .take((MAX_UPSTREAM_RESPONSE_BYTES + 1) as u64)
+            .read_to_end(&mut resp)
+            .await?;
+        Ok::<Vec<u8>, anyhow::Error>(resp)
+    })
+    .await??;
+    if response.len() > MAX_UPSTREAM_RESPONSE_BYTES {
+        return write_gateway_error(
+            &mut client,
+            "502 Bad Gateway",
+            "upstream response exceeds maximum size",
+        )
+        .await;
+    }
     client.write_all(&response).await?;
     Ok(())
 }

@@ -140,7 +140,7 @@ pub fn lease_plan(
     let expires_at_ms = if ttl_secs <= 0 {
         -1
     } else {
-        now_ms + ttl_secs * 1000
+        now_ms.saturating_add(ttl_secs.saturating_mul(1000))
     };
 
     let mut leases = Vec::new();
@@ -396,7 +396,8 @@ pub fn validate_remote_identity(
     if session_revoked {
         return Err(RemoteAccessError::SessionRevoked);
     }
-    if claims.expires_at_ms - now_ms > profile.max_token_ttl_secs * 1000 {
+    let max_ttl_ms = profile.max_token_ttl_secs.saturating_mul(1000);
+    if claims.expires_at_ms.saturating_sub(now_ms) > max_ttl_ms {
         return Err(RemoteAccessError::TokenTtlTooLong);
     }
     if !profile.allowed_endpoints.is_empty()
