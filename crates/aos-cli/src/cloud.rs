@@ -350,35 +350,83 @@ pub async fn cloud_http_json(
             .map(|b| serde_json::to_vec(b).unwrap_or_default())
             .unwrap_or_default();
 
-        let mut stream = tokio::net::TcpStream::connect(&addr)
-            .await
-            .with_context(|| format!("Failed to connect to Aegis Cloud endpoint {}", full_url))?;
+        let mut stream = tokio::time::timeout(
+            std::time::Duration::from_secs(10),
+            tokio::net::TcpStream::connect(&addr),
+        )
+        .await
+        .with_context(|| format!("Connection timeout to Aegis Cloud endpoint {}", full_url))?
+        .with_context(|| format!("Failed to connect to Aegis Cloud endpoint {}", full_url))?;
 
+        let clean_method: String = method
+            .chars()
+            .filter(|c| c.is_ascii_alphabetic())
+            .collect();
+        let clean_path: String = target_path
+            .chars()
+            .filter(|c| !matches!(c, '\r' | '\n' | '\0'))
+            .collect();
+        let clean_host: String = host_port
+            .chars()
+            .filter(|c| !matches!(c, '\r' | '\n' | '\0'))
+            .collect();
         let mut req_str = format!(
             "{} {} HTTP/1.1\r\nHost: {}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n",
-            method,
-            target_path,
-            host_port,
+            clean_method,
+            clean_path,
+            clean_host,
             body_bytes.len()
         );
         if let Some(k) = api_key {
-            if !k.trim().is_empty() {
-                req_str.push_str(&format!("Authorization: Bearer {}\r\n", k.trim()));
+            let clean_k: String = k
+                .trim()
+                .chars()
+                .filter(|c| !matches!(c, '\r' | '\n' | '\0'))
+                .collect();
+            if !clean_k.is_empty() {
+                req_str.push_str(&format!("Authorization: Bearer {}\r\n", clean_k));
             }
         }
         for (hk, hv) in extra_headers {
-            req_str.push_str(&format!("{}: {}\r\n", hk, hv));
+            let ck: String = hk
+                .chars()
+                .filter(|c| !matches!(c, '\r' | '\n' | '\0' | ':'))
+                .collect();
+            let cv: String = hv
+                .chars()
+                .filter(|c| !matches!(c, '\r' | '\n' | '\0'))
+                .collect();
+            req_str.push_str(&format!("{}: {}\r\n", ck, cv));
         }
         req_str.push_str("\r\n");
 
-        stream.write_all(req_str.as_bytes()).await?;
-        if !body_bytes.is_empty() {
-            stream.write_all(&body_bytes).await?;
-        }
-        stream.flush().await?;
+        tokio::time::timeout(std::time::Duration::from_secs(30), async {
+            stream.write_all(req_str.as_bytes()).await?;
+            if !body_bytes.is_empty() {
+                stream.write_all(&body_bytes).await?;
+            }
+            stream.flush().await
+        })
+        .await
+        .with_context(|| format!("Write timeout to Aegis Cloud endpoint {}", full_url))??;
 
+        const MAX_CLOUD_HTTP_BYTES: u64 = 64 * 1024 * 1024;
         let mut resp_buf = Vec::new();
-        stream.read_to_end(&mut resp_buf).await?;
+        tokio::time::timeout(
+            std::time::Duration::from_secs(30),
+            (&mut stream)
+                .take(MAX_CLOUD_HTTP_BYTES + 1)
+                .read_to_end(&mut resp_buf),
+        )
+        .await
+        .with_context(|| format!("Read timeout from Aegis Cloud endpoint {}", full_url))??;
+        if (resp_buf.len() as u64) > MAX_CLOUD_HTTP_BYTES {
+            bail!(
+                "Response from {} exceeded {} bytes limit",
+                full_url,
+                MAX_CLOUD_HTTP_BYTES
+            );
+        }
         let raw_resp = String::from_utf8_lossy(&resp_buf);
         let (_, resp_body) = raw_resp.split_once("\r\n\r\n").unwrap_or(("", &raw_resp));
         let parsed: Value = serde_json::from_str(resp_body.trim()).with_context(|| {
@@ -391,46 +439,87 @@ pub async fn cloud_http_json(
         return Ok(parsed);
     }
 
-    // Fallback to `curl` for `https://` TLS endpoints (pipe JSON body via stdin `--data-binary @-`
-    // so large workspace sync bundles never hit OS `ARG_MAX` / `Argument list too long (os error 7)`).
-    let mut cmd = std::process::Command::new("curl");
-    cmd.args(["-sS", "-X", method, &full_url, "-H", "Content-Type: application/json"]);
-    if let Some(k) = api_key {
-        if !k.trim().is_empty() {
-            cmd.args(["-H", &format!("Authorization: Bearer {}", k.trim())]);
-        }
+    // Fallback to `curl` for `https://` TLS endpoints inside `spawn_blocking`
+    if full_url.starts_with('-')
+        || method.starts_with('-')
+        || full_url.chars().any(|c| c.is_control() || c.is_whitespace())
+    {
+        bail!("Invalid cloud HTTP URL or method '{}'", full_url);
     }
-    for (hk, hv) in extra_headers {
-        cmd.args(["-H", &format!("{}: {}", hk, hv)]);
-    }
-    let body_bytes = if let Some(b) = body {
-        cmd.args(["--data-binary", "@-"]);
-        Some(serde_json::to_vec(b)?)
-    } else {
-        None
-    };
-    cmd.stdin(if body_bytes.is_some() {
-        std::process::Stdio::piped()
-    } else {
-        std::process::Stdio::null()
+    let method_owned = method.to_string();
+    let url_owned = full_url.clone();
+    let auth_header = api_key.and_then(|k| {
+        let clean_k: String = k
+            .trim()
+            .chars()
+            .filter(|c| !matches!(c, '\r' | '\n' | '\0'))
+            .collect();
+        (!clean_k.is_empty()).then(|| format!("Authorization: Bearer {}", clean_k))
     });
-    cmd.stdout(std::process::Stdio::piped());
-    cmd.stderr(std::process::Stdio::piped());
+    let sanitized_headers: Vec<String> = extra_headers
+        .iter()
+        .map(|(hk, hv)| {
+            let ck: String = hk
+                .chars()
+                .filter(|c| !matches!(c, '\r' | '\n' | '\0' | ':'))
+                .collect();
+            let cv: String = hv
+                .chars()
+                .filter(|c| !matches!(c, '\r' | '\n' | '\0'))
+                .collect();
+            format!("{}: {}", ck, cv)
+        })
+        .collect();
+    let body_bytes = body.map(serde_json::to_vec).transpose()?;
 
-    let mut child = cmd
-        .spawn()
-        .context("Failed to execute `curl` for HTTPS cloud endpoint")?;
-    if let Some(bytes) = body_bytes {
-        if let Some(mut stdin) = child.stdin.take() {
-            use std::io::Write;
-            stdin
-                .write_all(&bytes)
-                .context("Failed to write request body to `curl` stdin")?;
+    let out = tokio::task::spawn_blocking(move || -> anyhow::Result<std::process::Output> {
+        use std::io::Write;
+        let mut cmd = std::process::Command::new("curl");
+        cmd.args([
+            "-sS",
+            "--proto",
+            "=http,https",
+            "--connect-timeout",
+            "10",
+            "--max-time",
+            "60",
+            "-X",
+            &method_owned,
+            "-H",
+            "Content-Type: application/json",
+        ]);
+        if let Some(ref ah) = auth_header {
+            cmd.args(["-H", ah]);
         }
-    }
-    let out = child
-        .wait_with_output()
-        .context("Failed waiting for `curl` HTTPS cloud response")?;
+        for h in &sanitized_headers {
+            cmd.args(["-H", h]);
+        }
+        if body_bytes.is_some() {
+            cmd.args(["--data-binary", "@-"]);
+            cmd.stdin(std::process::Stdio::piped());
+        } else {
+            cmd.stdin(std::process::Stdio::null());
+        }
+        cmd.stdout(std::process::Stdio::piped());
+        cmd.stderr(std::process::Stdio::piped());
+        cmd.args(["--", &url_owned]);
+
+        let mut child = cmd
+            .spawn()
+            .context("Failed to execute `curl` for HTTPS cloud endpoint")?;
+        if let Some(bytes) = body_bytes {
+            if let Some(mut stdin) = child.stdin.take() {
+                stdin
+                    .write_all(&bytes)
+                    .context("Failed to write request body to `curl` stdin")?;
+            }
+        }
+        child
+            .wait_with_output()
+            .context("Failed waiting for `curl` HTTPS cloud response")
+    })
+    .await
+    .context("Cloud HTTPS curl task failed")??;
     if !out.status.success() {
         bail!(
             "Cloud HTTPS request failed: {}",
@@ -739,11 +828,39 @@ pub fn open_url_in_browser(url: &str) -> bool {
         .is_ok()
 }
 
-/// Records a short-lived (5-minute) pre-approval ticket when the IDE's `PreToolUse` hook intercepts
-/// `workspace_commit` and returns `{"decision": "ask"}` to the user in the IDE chat window.
-/// If the user clicks **Allow** in the IDE, `serve_unified_stdio` consumes this ticket and
-/// completes `workspace_commit` immediately without opening a browser or needing a second CLI session.
-pub fn record_hook_commit_ticket(runtime_dir: &Path, org_id: &str) {
+fn canonicalize_json_value(val: &Value) -> Value {
+    match val {
+        Value::Object(map) => {
+            let mut sorted = std::collections::BTreeMap::new();
+            for (k, v) in map {
+                sorted.insert(k.clone(), canonicalize_json_value(v));
+            }
+            let out: serde_json::Map<String, Value> = sorted.into_iter().collect();
+            Value::Object(out)
+        }
+        Value::Array(arr) => Value::Array(arr.iter().map(canonicalize_json_value).collect()),
+        other => other.clone(),
+    }
+}
+
+fn hook_ticket_key(org_id: &str, agent_id: &str, tool_name: &str, args: &Value) -> String {
+    use sha2::Digest as _;
+    let canonical = canonicalize_json_value(args);
+    let bytes = serde_json::to_vec(&canonical).unwrap_or_default();
+    let digest = hex::encode(sha2::Sha256::digest(&bytes));
+    format!("{org_id}:{agent_id}:{tool_name}:{digest}")
+}
+
+/// Records a short-lived (60-second) 4-tuple pre-approval ticket bound to
+/// `(org_id, agent_id, tool_name, sha256(canonical_args))` when the IDE's `PreToolUse` hook
+/// returns `{"decision": "ask"}` in the IDE chat window.
+pub fn record_hook_commit_ticket(
+    runtime_dir: &Path,
+    org_id: &str,
+    agent_id: &str,
+    tool_name: &str,
+    args: &Value,
+) {
     let path = runtime_dir.join("hook_commit_tickets.json");
     let _lock = aos_core::session::acquire_file_lock_sync(&path).ok();
     let mut map: std::collections::HashMap<String, i64> = std::fs::read(&path)
@@ -752,12 +869,20 @@ pub fn record_hook_commit_ticket(runtime_dir: &Path, org_id: &str) {
         .unwrap_or_default();
     let now_ms = Utc::now().timestamp_millis();
     map.retain(|_, exp| *exp > now_ms);
-    map.insert(org_id.to_string(), now_ms + 300_000);
+    let key = hook_ticket_key(org_id, agent_id, tool_name, args);
+    map.insert(key, now_ms + 60_000);
     let _ = aos_core::session::write_json_pretty_unlocked_sync(&path, &map);
 }
 
-/// Consumes a valid `PreToolUse` hook approval ticket for `org_id`, if present and unexpired.
-pub fn consume_hook_commit_ticket(runtime_dir: &Path, org_id: &str) -> bool {
+/// Consumes a valid `PreToolUse` hook approval ticket only when all four tuple fields
+/// `(org_id, agent_id, tool_name, args_sha256)` match and the 60s TTL has not expired.
+pub fn consume_hook_commit_ticket(
+    runtime_dir: &Path,
+    org_id: &str,
+    agent_id: &str,
+    tool_name: &str,
+    args: &Value,
+) -> bool {
     let path = runtime_dir.join("hook_commit_tickets.json");
     let _lock = aos_core::session::acquire_file_lock_sync(&path).ok();
     let mut map: std::collections::HashMap<String, i64> = match std::fs::read(&path)
@@ -769,7 +894,8 @@ pub fn consume_hook_commit_ticket(runtime_dir: &Path, org_id: &str) -> bool {
     };
     let now_ms = Utc::now().timestamp_millis();
     map.retain(|_, exp| *exp > now_ms);
-    let matched = map.remove(org_id).is_some() || map.remove("*").is_some();
+    let key = hook_ticket_key(org_id, agent_id, tool_name, args);
+    let matched = map.remove(&key).is_some();
     let _ = aos_core::session::write_json_pretty_unlocked_sync(&path, &map);
     matched
 }
@@ -1474,11 +1600,16 @@ pub async fn handle_cloud_command(
                         .map(|e| format!("&customer_email={}", e.trim()))
                         .unwrap_or_default()
                 );
+                let existing_org_key = store
+                    .auth
+                    .as_ref()
+                    .filter(|a| a.org_id == identity.org_id)
+                    .map(|a| a.api_key.as_str());
                 let mut resp = cloud_http_json(
                     "POST",
                     &ep,
                     "/v1/billing/checkout",
-                    None,
+                    existing_org_key,
                     &[],
                     Some(&json!({
                         "org_id": identity.org_id,
@@ -2910,7 +3041,13 @@ pub async fn serve_unified_stdio(
                             | "github_pr_merge"
                             | "pkg_install"
                     )
-                        && consume_hook_commit_ticket(&runtime_dir, &identity.org_id)
+                        && consume_hook_commit_ticket(
+                            &runtime_dir,
+                            &identity.org_id,
+                            &identity.agent_id,
+                            tool_name,
+                            &tool_args,
+                        )
                     {
                         let mut cur_esc = Some(esc_id);
                         for _ in 0..8 {
@@ -2935,11 +3072,7 @@ pub async fn serve_unified_stdio(
                             if is_sensitive {
                                 break;
                             }
-                            let ttl_secs = if pending_action.as_deref() == Some("github_pr_merge") {
-                                0
-                            } else {
-                                900
-                            };
+                            let ttl_secs = 0;
                             if kernel
                                 .policy
                                 .approve_escalation(&eid, ttl_secs, "ide-pretooluse-hook")
@@ -3288,11 +3421,68 @@ mod tests {
         // 1. By default, new directories silently run in Local CoW mode without prompting
         assert!(!should_prompt_mode_onboarding(&local_rt, &local_repo));
 
-        // 2. Hook commit ticket lifecycle (In-IDE PreToolUse 1-click commit approval)
-        assert!(!consume_hook_commit_ticket(&local_rt, "approve_project"));
-        record_hook_commit_ticket(&local_rt, "approve_project");
-        assert!(consume_hook_commit_ticket(&local_rt, "approve_project"));
-        assert!(!consume_hook_commit_ticket(&local_rt, "approve_project"));
+        // 2. Hook commit ticket lifecycle (In-IDE PreToolUse 4-tuple bound approval)
+        let args_a = json!({ "paths": ["app.rs"], "b": 1 });
+        let args_a_reordered = json!({ "b": 1, "paths": ["app.rs"] });
+        let args_b = json!({ "paths": ["secret.rs"], "b": 1 });
+        assert!(!consume_hook_commit_ticket(
+            &local_rt,
+            "approve_project",
+            "agy-agent",
+            "workspace_commit",
+            &args_a
+        ));
+        record_hook_commit_ticket(
+            &local_rt,
+            "approve_project",
+            "agy-agent",
+            "workspace_commit",
+            &args_a,
+        );
+        // Mismatched org, agent, tool, or arguments must not consume the ticket
+        assert!(!consume_hook_commit_ticket(
+            &local_rt,
+            "*",
+            "agy-agent",
+            "workspace_commit",
+            &args_a
+        ));
+        assert!(!consume_hook_commit_ticket(
+            &local_rt,
+            "approve_project",
+            "other-agent",
+            "workspace_commit",
+            &args_a
+        ));
+        assert!(!consume_hook_commit_ticket(
+            &local_rt,
+            "approve_project",
+            "agy-agent",
+            "fs_export_file",
+            &args_a
+        ));
+        assert!(!consume_hook_commit_ticket(
+            &local_rt,
+            "approve_project",
+            "agy-agent",
+            "workspace_commit",
+            &args_b
+        ));
+        // Exact 4-tuple match (even with reordered JSON keys) consumes once
+        assert!(consume_hook_commit_ticket(
+            &local_rt,
+            "approve_project",
+            "agy-agent",
+            "workspace_commit",
+            &args_a_reordered
+        ));
+        assert!(!consume_hook_commit_ticket(
+            &local_rt,
+            "approve_project",
+            "agy-agent",
+            "workspace_commit",
+            &args_a
+        ));
 
         // 3. Top-level `aegis-os approve` (`handle_unified_approve`) auto-selects latest pending escalation
         let kernel = AegisRuntimeKernel::new(&local_rt).await.unwrap();

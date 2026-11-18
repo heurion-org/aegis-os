@@ -2979,25 +2979,33 @@ async fn main() -> anyhow::Result<()> {
                 AppAction::List { tier, category } => {
                     let res = kernel
                         .app_store
-                        .search_catalog(None, category.as_deref(), tier.as_deref())
+                        .search_catalog_for_org(
+                            &identity.org_id,
+                            None,
+                            category.as_deref(),
+                            tier.as_deref(),
+                        )
                         .await;
                     println!("{}", serde_json::to_string_pretty(&res)?);
                 }
                 AppAction::Search { query } => {
                     let res = kernel
                         .app_store
-                        .search_catalog(query.as_deref(), None, None)
+                        .search_catalog_for_org(&identity.org_id, query.as_deref(), None, None)
                         .await;
                     println!("{}", serde_json::to_string_pretty(&res)?);
                 }
                 AppAction::Info { app_id } => {
-                    let res = kernel.app_store.get_app_info(&app_id).await?;
+                    let res = kernel
+                        .app_store
+                        .get_app_info(&identity.org_id, &app_id)
+                        .await?;
                     println!("{}", serde_json::to_string_pretty(&res)?);
                 }
                 AppAction::Install { app_id_or_url, url } => {
                     let res = kernel
                         .app_store
-                        .install_app(&app_id_or_url, url.as_deref(), Some(&workspace))
+                        .install_app(&identity.org_id, &app_id_or_url, url.as_deref(), Some(&workspace))
                         .await?;
                     println!("{}", serde_json::to_string_pretty(&res)?);
                 }
@@ -3020,6 +3028,7 @@ async fn main() -> anyhow::Result<()> {
                         kernel
                             .app_store
                             .login_app_device_code(
+                                &identity.org_id,
                                 &app_id,
                                 url.as_deref(),
                                 scope_vec,
@@ -3031,6 +3040,7 @@ async fn main() -> anyhow::Result<()> {
                         kernel
                             .app_store
                             .login_app(
+                                &identity.org_id,
                                 &app_id,
                                 url.as_deref(),
                                 token.as_deref(),
@@ -3043,7 +3053,10 @@ async fn main() -> anyhow::Result<()> {
                     println!("{}", serde_json::to_string_pretty(&res)?);
                 }
                 AppAction::Logout { app_id } => {
-                    let res = kernel.app_store.logout_app(&app_id).await?;
+                    let res = kernel
+                        .app_store
+                        .logout_app(&identity.org_id, &app_id)
+                        .await?;
                     println!("{}", serde_json::to_string_pretty(&res)?);
                 }
                 AppAction::Mount { app_id, url } => {
@@ -3061,11 +3074,12 @@ async fn main() -> anyhow::Result<()> {
                 } => {
                     let install_res = kernel
                         .app_store
-                        .install_app(&app_id, url.as_deref(), Some(&workspace))
+                        .install_app(&identity.org_id, &app_id, url.as_deref(), Some(&workspace))
                         .await?;
                     let login_res = kernel
                         .app_store
                         .login_app_device_code(
+                            &identity.org_id,
                             &app_id,
                             url.as_deref(),
                             Vec::new(),

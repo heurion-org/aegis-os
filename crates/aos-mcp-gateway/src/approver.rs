@@ -583,8 +583,8 @@ pub const APPROVE_PAGE_HTML: &str = r##"<!doctype html>
     const el = document.getElementById(id);
     if (el) el.href = apiBase + '/dashboard';
   });
-  let authKey = hashParams.get('key') || sessionStorage.getItem('aegis_approve_key') || '';
-  if (hashParams.get('key')) {
+  let authKey = hashParams.get('ticket') || hashParams.get('key') || sessionStorage.getItem('aegis_approve_key') || '';
+  if (hashParams.get('ticket') || hashParams.get('key')) {
     sessionStorage.setItem('aegis_approve_key', authKey);
     history.replaceState(null, '', location.pathname + location.search);
   }

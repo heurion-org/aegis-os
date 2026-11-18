@@ -140,7 +140,7 @@ fn infer_mime_type(path: &Path) -> &'static str {
     }
 }
 
-fn strip_root_matching_macos_private<'a>(path: &'a Path, root: &Path) -> Option<PathBuf> {
+fn strip_root_matching_macos_private(path: &Path, root: &Path) -> Option<PathBuf> {
     if let Ok(rel) = path.strip_prefix(root) {
         return Some(rel.to_path_buf());
     }
@@ -396,10 +396,14 @@ fn is_forbidden_export_dest(raw: &str, canonical: &str) -> bool {
         "/Library/LaunchDaemons/",
     ];
     for candidate in [raw, canonical] {
-        let candidate = strip_nested_test_tmpdir(candidate);
-        if RING0_MARKERS.iter().any(|m| candidate.contains(m))
-            || SYSTEM_PREFIXES.iter().any(|p| candidate.starts_with(p))
-            || AegisPolicyKernel::is_commit_poisoning_path(candidate)
+        let candidate_folded = strip_nested_test_tmpdir(candidate).to_ascii_lowercase();
+        if RING0_MARKERS
+            .iter()
+            .any(|m| candidate_folded.contains(&m.to_ascii_lowercase()))
+            || SYSTEM_PREFIXES
+                .iter()
+                .any(|p| candidate_folded.starts_with(&p.to_ascii_lowercase()))
+            || AegisPolicyKernel::is_commit_poisoning_path(&candidate_folded)
         {
             return true;
         }
@@ -525,6 +529,29 @@ async fn export_file_atomic_from_cas_or_bytes(
         if let Err(err) = stage_res {
             let _ = std::fs::remove_file(&tmp);
             return Err(err);
+        }
+        // Re-verify immediately before atomic rename that no ancestor or destination was swapped for a symlink.
+        let mut cur = PathBuf::from("/");
+        for comp in parent.components() {
+            match comp {
+                std::path::Component::RootDir => continue,
+                std::path::Component::Normal(part) => {
+                    cur.push(part);
+                    if let Ok(m) = std::fs::symlink_metadata(&cur) {
+                        if m.file_type().is_symlink() {
+                            let _ = std::fs::remove_file(&tmp);
+                            bail!("Refusing export through symlink ancestor '{}'", cur.display());
+                        }
+                    }
+                }
+                _ => {}
+            }
+        }
+        if let Ok(m) = std::fs::symlink_metadata(&dst) {
+            if m.file_type().is_symlink() || m.file_type().is_dir() {
+                let _ = std::fs::remove_file(&tmp);
+                bail!("Refusing to export onto symlink or directory '{}'", dst.display());
+            }
         }
         if let Err(err) = std::fs::rename(&tmp, &dst) {
             let _ = std::fs::remove_file(&tmp);
@@ -708,7 +735,7 @@ fn validate_repo_relative_paths(raw_paths: Vec<String>, context_name: &str) -> a
     Ok(paths)
 }
 
-fn resolve_system_git_binary() -> anyhow::Result<PathBuf> {
+pub(crate) fn resolve_system_git_binary() -> anyhow::Result<PathBuf> {
     ["/usr/bin/git", "/opt/homebrew/bin/git", "/usr/local/bin/git", "/bin/git"]
         .into_iter()
         .map(PathBuf::from)
@@ -716,7 +743,7 @@ fn resolve_system_git_binary() -> anyhow::Result<PathBuf> {
         .context("System `git` binary not found in /usr/bin, /opt/homebrew/bin, /usr/local/bin, or /bin")
 }
 
-fn run_sanitized_host_git(
+pub(crate) fn run_sanitized_host_git(
     git_bin: &Path,
     repo_root: &Path,
     extra_cfg: &[(&str, &str)],
@@ -1279,18 +1306,12 @@ fn is_valid_github_repo_slug(slug: &str) -> bool {
 
 fn extract_github_slug_from_remote_url(raw_url: &str) -> Option<String> {
     let trimmed = raw_url.trim().trim_end_matches('/');
-    let path_part = if let Some(rest) = trimmed
+    let path_part = trimmed
         .strip_prefix("https://github.com/")
         .or_else(|| trimmed.strip_prefix("http://github.com/"))
         .or_else(|| trimmed.strip_prefix("ssh://git@github.com/"))
         .or_else(|| trimmed.strip_prefix("git://github.com/"))
-    {
-        rest
-    } else if let Some(rest) = trimmed.strip_prefix("git@github.com:") {
-        rest
-    } else {
-        return None;
-    };
+        .or_else(|| trimmed.strip_prefix("git@github.com:"))?;
     let cleaned = path_part.strip_suffix(".git").unwrap_or(path_part).trim_end_matches('/');
     is_valid_github_repo_slug(cleaned).then(|| cleaned.to_string())
 }
@@ -2158,8 +2179,7 @@ struct HostExecRunGuard {
 
 impl Drop for HostExecRunGuard {
     fn drop(&mut self) {
-        let new_op = format!("aop_{}{}", Uuid::new_v4().simple(), Uuid::new_v4().simple());
-        self.paas.set_secrets(&new_op, &self.paas.webhook_secret());
+        self.paas.rotate_ephemeral_admin_secret_if_dynamic();
         if let Some(ref cb) = self.on_run_finished {
             cb();
         }
@@ -2609,7 +2629,35 @@ fn is_interpreter_program(resolved: &Path) -> bool {
         || name.starts_with("python2")
         || matches!(
             name.as_str(),
-            "node" | "nodejs" | "deno" | "bun" | "sh" | "bash" | "zsh" | "dash" | "ksh" | "ruby" | "perl" | "php"
+            "node"
+                | "nodejs"
+                | "deno"
+                | "bun"
+                | "sh"
+                | "bash"
+                | "zsh"
+                | "dash"
+                | "ksh"
+                | "fish"
+                | "tcsh"
+                | "csh"
+                | "pwsh"
+                | "ruby"
+                | "perl"
+                | "php"
+                | "lua"
+                | "luajit"
+                | "awk"
+                | "gawk"
+                | "nawk"
+                | "osascript"
+                | "swift"
+                | "tclsh"
+                | "expect"
+                | "rscript"
+                | "julia"
+                | "lldb"
+                | "gdb"
         )
 }
 
@@ -2620,9 +2668,10 @@ fn has_disallowed_interpreter_flags(raw_args: &[String]) -> Option<String> {
         }
         if matches!(
             arg.as_str(),
-            "-c" | "-e" | "--eval" | "--print" | "-m" | "-"
+            "-c" | "-e" | "--eval" | "--print" | "--command" | "-Command" | "-m" | "-"
         ) || arg.starts_with("--eval=")
             || arg.starts_with("--print=")
+            || arg.starts_with("--command=")
         {
             return Some(arg.clone());
         }
@@ -2896,6 +2945,7 @@ fn write_frozen_file_0444(
     bytes: &[u8],
     expected_sha256: &str,
 ) -> anyhow::Result<()> {
+    use std::io::Write;
     let rel_path = shadow_relative(rel)?;
     let dst = frozen_dir.join(&rel_path);
     if let Some(parent) = dst.parent() {
@@ -2917,11 +2967,20 @@ fn write_frozen_file_0444(
         }
         return Ok(());
     }
-    std::fs::write(&dst, bytes)?;
+    let mut opts = std::fs::OpenOptions::new();
+    opts.write(true).create_new(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        opts.mode(0o400);
+    }
+    let mut f = opts.open(&dst)?;
+    f.write_all(bytes)?;
+    f.sync_all()?;
     #[cfg(unix)]
     {
         use std::os::unix::fs::PermissionsExt;
-        let _ = std::fs::set_permissions(&dst, std::fs::Permissions::from_mode(0o444));
+        std::fs::set_permissions(&dst, std::fs::Permissions::from_mode(0o400))?;
     }
     Ok(())
 }
@@ -3169,6 +3228,8 @@ fn route_path(target: &str) -> &str {
 
 /// Routes anonymous callers may use: static pages, discovery, installers, and the billing flow,
 /// which authenticates with its own credentials (webhook HMAC, claim token, first-key signup).
+/// Note: `POST /v1/approvals/decide` reaches its handler so anonymous callers get `403 Forbidden`
+/// with a structured error rather than `401 Unauthorized`.
 fn is_public_route(method: &str, target: &str) -> bool {
     let path = route_path(target);
     let get_public = path == "/"
@@ -3181,10 +3242,6 @@ fn is_public_route(method: &str, target: &str) -> bool {
             "/.well-known/",
             "/releases/",
             "/v1/billing/status",
-            "/v1/status",
-            "/api/status",
-            "/v1/approver",
-            "/v1/approvals/diff",
         ]
         .iter()
         .any(|p| path.starts_with(p));
@@ -3195,9 +3252,7 @@ fn is_public_route(method: &str, target: &str) -> bool {
         "/v1/billing/claim",
         "/v1/telemetry/ping",
         "/approver/enroll",
-        "/v1/approver/email",
         "/v1/approvals/decide",
-        "/v1/leases/revoke",
     ]
     .iter()
     .any(|p| path.starts_with(p));
@@ -3714,7 +3769,10 @@ impl AegisRuntimeKernel {
         let mut terminal_ids = vec![root_task_id.to_string()];
         if let Ok(subtasks) = self.ipc.list_subtasks(root_task_id).await {
             for sub in subtasks {
-                if sub.state.is_terminal() && !terminal_ids.contains(&sub.id) {
+                if sub.visible_to_org(&identity.org_id)
+                    && sub.state.is_terminal()
+                    && !terminal_ids.contains(&sub.id)
+                {
                     terminal_ids.push(sub.id);
                 }
             }
@@ -4134,7 +4192,7 @@ impl AegisRuntimeKernel {
         evicted
     }
 
-    async fn authorize_and_audit(
+    pub(crate) async fn authorize_and_audit(
         &self,
         identity: &AgentIdentity,
         action: &str,
@@ -4997,7 +5055,19 @@ impl AegisRuntimeKernel {
             let (_clean, full) = shadow_path_for_write(env.workspace.shadow_root(), &clean_dst_rel)?;
             full
         } else {
-            env.sandbox.config().agent_home_dir.join("imports").join(&rel_dst)
+            let imports_root = env.sandbox.config().agent_home_dir.join("imports");
+            if let Ok(meta) = std::fs::symlink_metadata(&imports_root) {
+                if meta.file_type().is_symlink() || !meta.is_dir() {
+                    bail!(
+                        "Agent imports directory '{}' must not be a symlink",
+                        imports_root.display()
+                    );
+                }
+            } else {
+                std::fs::create_dir_all(&imports_root)?;
+            }
+            let (_clean, full) = shadow_path_for_write(&imports_root, &clean_dst_rel)?;
+            full
         };
 
         if let Ok(dst_meta) = std::fs::symlink_metadata(&dst_full_path) {
@@ -6042,7 +6112,9 @@ impl AegisRuntimeKernel {
             .stderr(Stdio::piped());
 
         let started = std::time::Instant::now();
-        let mut child = tokio::process::Command::from(std_cmd)
+        let mut cmd = tokio::process::Command::from(std_cmd);
+        cmd.kill_on_drop(true);
+        let mut child = cmd
             .spawn()
             .with_context(|| {
                 format!(
@@ -6190,10 +6262,7 @@ impl AegisRuntimeKernel {
             .unwrap_or("/workspace")
             .to_string();
 
-        let mut audit_metadata = args.clone();
-        let mut pre_commit_diffs: Option<Vec<aos_core::FileDiffEntry>> = None;
-        let mut pre_commit_evidence_hash: Option<String> = None;
-        let mut pre_export_plan: Option<(
+        type PreExportPlan = (
             PathBuf,
             Vec<u8>,
             &'static str,
@@ -6201,7 +6270,11 @@ impl AegisRuntimeKernel {
             String,
             String,
             Option<PathBuf>,
-        )> = None;
+        );
+        let mut audit_metadata = args.clone();
+        let mut pre_commit_diffs: Option<Vec<aos_core::FileDiffEntry>> = None;
+        let mut pre_commit_evidence_hash: Option<String> = None;
+        let mut pre_export_plan: Option<PreExportPlan> = None;
         let mut pre_switch_plan: Option<(PathBuf, String, Option<PathBuf>)> = None;
         let mut pre_git_plan: Option<HostGitPlan> = None;
         let mut pre_import_plan: Option<ImportFilePlan> = None;
@@ -6709,6 +6782,7 @@ impl AegisRuntimeKernel {
             }
         }
 
+        let mut policy_matched_rule: Option<String> = None;
         if !matches!(
             tool_name,
             "policy_grant_lease" | "policy_approve_escalation" | "policy_list_escalations"
@@ -6723,7 +6797,9 @@ impl AegisRuntimeKernel {
                 )
                 .await?
             {
-                PolicyDecision::Allow { .. } => {}
+                PolicyDecision::Allow { matched_rule } => {
+                    policy_matched_rule = Some(matched_rule);
+                }
                 PolicyDecision::Ask {
                     escalation_id,
                     reason,
@@ -6754,12 +6830,14 @@ impl AegisRuntimeKernel {
                     let mut ask_payload = json!({
                         "status": "approval_required",
                         "escalation_id": escalation_id,
+                        "approval_ticket": self.paas.issue_escalation_ticket(&identity.org_id, &escalation_id, 1_800_000).await,
                         "reason": reason,
                         "suggested_lease_scope": suggested_lease_scope,
                         "evidence_hash": pre_commit_evidence_hash,
                         "hint": format!(
-                            "Approve in the auto-opened Web Approval Console (/approve or /dashboard) where you can inspect the Unified Diff and click Approve Once (SHA-256 pinned) or Approve 1h, or in Cloud Mode provide your 6-digit Authenticator TOTP code in chat and pass `totp` on retry (escalation: {0}). Agents cannot self-approve without human action.",
-                            escalation_id
+                            "Approve in the auto-opened Web Approval Console (/approve?id={0}&org={1} or /dashboard) where you can inspect the Unified Diff and click Approve Once (SHA-256 pinned) or Approve 1h, or in Cloud Mode provide your 6-digit Authenticator TOTP code in chat and pass `totp` on retry (escalation: {0}). Agents cannot self-approve without human action.",
+                            escalation_id,
+                            identity.org_id
                         )
                     });
                     if let Some((_, _, _, _, ref uri, _, _)) = pre_export_plan {
@@ -7266,10 +7344,110 @@ impl AegisRuntimeKernel {
                         epoch_reverified = true;
                     }
                 }
-                let committed = env
+                let base_dir = env
                     .workspace
-                    .commit_to_host_with_options(filter_paths, overwrite_binaries)
-                    .await?;
+                    .shadow_root()
+                    .parent()
+                    .map(|p| p.join("baseline_snapshot"))
+                    .filter(|p| p.exists())
+                    .unwrap_or_else(|| env.workspace.host_source_root().to_path_buf());
+                let frozen_dir = env
+                    .workspace
+                    .shadow_root()
+                    .parent()
+                    .unwrap_or_else(|| env.workspace.shadow_root())
+                    .join(format!("commit_frozen_{}", &Uuid::new_v4().to_string()[..8]));
+                let commit_res: anyhow::Result<Vec<String>> = async {
+                    CoWWorkspace::cow_sync_dir(env.workspace.shadow_root(), &frozen_dir).await?;
+                    let frozen_diffs = CoWWorkspace::diff_dirs(
+                        &base_dir,
+                        &frozen_dir,
+                        filter_paths.as_deref(),
+                    )
+                    .await
+                    .unwrap_or_default();
+                    let frozen_paths: Vec<String> = frozen_diffs
+                        .iter()
+                        .map(|d| d.relative_path.clone())
+                        .collect();
+                    if let Some(msg) = self.claim_conflict_for_paths(identity, &frozen_paths).await? {
+                        bail!("{}", msg);
+                    }
+                    let pre_paths: std::collections::HashSet<&str> = pre_commit_diffs
+                        .as_ref()
+                        .map(|v| v.iter().map(|d| d.relative_path.as_str()).collect())
+                        .unwrap_or_default();
+                    let mut rebased_paths: std::collections::HashSet<&str> =
+                        std::collections::HashSet::new();
+                    for p in refresh
+                        .fast_forwarded
+                        .iter()
+                        .chain(refresh.merged.iter())
+                        .chain(refresh.added_from_host.iter())
+                        .chain(refresh.removed_from_host.iter())
+                    {
+                        rebased_paths.insert(p.trim_start_matches('/'));
+                    }
+                    if let Some(bad) = frozen_diffs.iter().find(|d| {
+                        let rel = d.relative_path.trim_start_matches('/');
+                        AegisPolicyKernel::is_commit_poisoning_path(rel)
+                            && !pre_paths.contains(d.relative_path.as_str())
+                    }) {
+                        bail!(
+                            "Refusing commit: sensitive path '{}' was added to shadow workspace after authorization (TOCTOU guard)",
+                            bad.relative_path
+                        );
+                    }
+                    let sha_pinned = policy_matched_rule
+                        .as_deref()
+                        .is_some_and(|r| r.contains("#sha256:"));
+                    if sha_pinned || (verify_cmd.is_none() && rebased_paths.is_empty() && !epoch_reverified) {
+                        if let Some(ref expected_hash) = pre_commit_evidence_hash {
+                            let (_, recomputed_hash) = aos_core::compute_diff_evidence(
+                                &frozen_diffs,
+                                overwrite_binaries,
+                                skip_verify,
+                            );
+                            if &recomputed_hash != expected_hash {
+                                bail!(
+                                    "workspace_commit aborted: shadow workspace evidence drifted after approval (expected {}, got {})",
+                                    expected_hash,
+                                    recomputed_hash
+                                );
+                            }
+                        }
+                    } else if verify_cmd.is_none() {
+                        if let Some(ref pre_diffs) = pre_commit_diffs {
+                            let pre_map: std::collections::HashMap<&str, Option<&str>> = pre_diffs
+                                .iter()
+                                .map(|d| (d.relative_path.trim_start_matches('/'), d.new_sha256.as_deref()))
+                                .collect();
+                            for d in &frozen_diffs {
+                                let rel = d.relative_path.trim_start_matches('/');
+                                if rebased_paths.contains(rel) {
+                                    continue;
+                                }
+                                match pre_map.get(rel) {
+                                    Some(expected_sha) if *expected_sha == d.new_sha256.as_deref() => {}
+                                    _ => bail!(
+                                        "workspace_commit aborted: unapproved post-authorization modification on '{}'",
+                                        rel
+                                    ),
+                                }
+                            }
+                        }
+                    }
+                    env.workspace
+                        .commit_frozen_to_host_with_options(
+                            &frozen_dir,
+                            filter_paths,
+                            overwrite_binaries,
+                        )
+                        .await
+                }
+                .await;
+                let _ = tokio::fs::remove_dir_all(&frozen_dir).await;
+                let committed = commit_res?;
                 drop(_host_commit_lock);
 
                 let released_claims = if release_claims && !committed.is_empty() {
@@ -7824,7 +8002,14 @@ impl AegisRuntimeKernel {
                     .filter(|t| t.visible_to_org(&identity.org_id))
                     .with_context(|| format!("A2A task '{}' not found", task_id))?;
                 let mut out = serde_json::to_value(&task)?;
-                let subtasks = self.ipc.list_subtasks(task_id).await.unwrap_or_default();
+                let subtasks: Vec<_> = self
+                    .ipc
+                    .list_subtasks(task_id)
+                    .await
+                    .unwrap_or_default()
+                    .into_iter()
+                    .filter(|t| t.visible_to_org(&identity.org_id))
+                    .collect();
                 if let Some(obj) = out.as_object_mut() {
                     obj.insert("subtasks_count".to_string(), json!(subtasks.len()));
                     obj.insert("subtasks".to_string(), json!(subtasks));
@@ -8476,7 +8661,10 @@ impl AegisRuntimeKernel {
                 let query = args.get("query").and_then(|v| v.as_str());
                 let category = args.get("category").and_then(|v| v.as_str());
                 let trust_tier = args.get("trust_tier").and_then(|v| v.as_str());
-                Ok(self.app_store.search_catalog(query, category, trust_tier).await)
+                Ok(self
+                    .app_store
+                    .search_catalog_for_org(&identity.org_id, query, category, trust_tier)
+                    .await)
             }
 
             "app_mount_session" => {
@@ -8485,6 +8673,44 @@ impl AegisRuntimeKernel {
                     .and_then(|v| v.as_str())
                     .context("Missing 'app_id' (e.g. 'heurion')")?;
                 let endpoint = args.get("endpoint").and_then(|v| v.as_str());
+                if let Some(custom_ep) = self
+                    .app_store
+                    .requires_custom_endpoint_approval(&identity.org_id, app_id, endpoint)
+                    .await
+                {
+                    match self
+                        .authorize_and_audit(
+                            identity,
+                            "app_custom_endpoint",
+                            &identity.org_id,
+                            &custom_ep,
+                            json!({ "app_id": app_id, "endpoint": custom_ep, "via": "app_mount_session" }),
+                        )
+                        .await?
+                    {
+                        PolicyDecision::Allow { .. } => {}
+                        PolicyDecision::Ask {
+                            escalation_id,
+                            reason,
+                            suggested_lease_scope,
+                        } => {
+                            let ticket = self
+                                .paas
+                                .issue_escalation_ticket(&identity.org_id, &escalation_id, 1_800_000)
+                                .await;
+                            return Ok(json!({
+                                "status": "approval_required",
+                                "escalation_id": escalation_id,
+                                "approval_ticket": ticket,
+                                "reason": reason,
+                                "suggested_lease_scope": suggested_lease_scope
+                            }));
+                        }
+                        PolicyDecision::Deny { reason } => {
+                            bail!("Policy Denied custom AAP endpoint '{}': {}", custom_ep, reason);
+                        }
+                    }
+                }
                 self.app_store.mount_session(identity, app_id, endpoint).await
             }
 
@@ -8505,6 +8731,44 @@ impl AegisRuntimeKernel {
                     .unwrap_or_else(|| json!({}));
                 let endpoint = args.get("endpoint").and_then(|v| v.as_str());
                 let lease_token = args.get("lease_token").and_then(|v| v.as_str());
+                if let Some(custom_ep) = self
+                    .app_store
+                    .requires_custom_endpoint_approval(&identity.org_id, app_id, endpoint)
+                    .await
+                {
+                    match self
+                        .authorize_and_audit(
+                            identity,
+                            "app_custom_endpoint",
+                            &identity.org_id,
+                            &custom_ep,
+                            json!({ "app_id": app_id, "tool_name": remote_tool, "endpoint": custom_ep, "via": "app_call_tool" }),
+                        )
+                        .await?
+                    {
+                        PolicyDecision::Allow { .. } => {}
+                        PolicyDecision::Ask {
+                            escalation_id,
+                            reason,
+                            suggested_lease_scope,
+                        } => {
+                            let ticket = self
+                                .paas
+                                .issue_escalation_ticket(&identity.org_id, &escalation_id, 1_800_000)
+                                .await;
+                            return Ok(json!({
+                                "status": "approval_required",
+                                "escalation_id": escalation_id,
+                                "approval_ticket": ticket,
+                                "reason": reason,
+                                "suggested_lease_scope": suggested_lease_scope
+                            }));
+                        }
+                        PolicyDecision::Deny { reason } => {
+                            bail!("Policy Denied custom AAP endpoint '{}': {}", custom_ep, reason);
+                        }
+                    }
+                }
                 self.app_store
                     .call_app_tool(
                         self,
@@ -10306,7 +10570,7 @@ impl AegisRuntimeKernel {
         if auth_mode == DaemonAuth::Required && self.paas.admin_secret().is_empty() {
             // Held only in memory and printed by the CLI; never written where a sandbox could read it.
             let generated = format!("aop_{}{}", Uuid::new_v4().simple(), Uuid::new_v4().simple());
-            self.paas.set_secrets(&generated, &self.paas.webhook_secret());
+            self.paas.set_ephemeral_admin_secret(&generated);
         }
         let listener = tokio::net::TcpListener::bind(bind_addr).await?;
         let local_addr = listener.local_addr()?;
@@ -10442,6 +10706,7 @@ impl AegisRuntimeKernel {
                         .flatten()
                         .any(|cred| paas::PaasControlPlane::secrets_match(cred, &operator_secret));
                     let mut key_org: Option<String> = None;
+                    let mut scoped_ticket: Option<paas::ScopedEscalationTicket> = None;
                     let mut auth_failed = false;
                     if is_operator {
                         if let Some(ref ws_id) = bound_ws_id {
@@ -10450,7 +10715,14 @@ impl AegisRuntimeKernel {
                             }
                         }
                     } else if let Some(ref token_hdr) = raw_auth {
-                        if let Some(key_rec) = k.paas.authenticate_token(token_hdr).await {
+                        if let Some(ticket_raw) = bearer.as_deref().filter(|t| t.starts_with("ast_")) {
+                            if let Some(ticket) = k.paas.verify_escalation_ticket(ticket_raw).await {
+                                org_id = ticket.org_id.clone();
+                                scoped_ticket = Some(ticket);
+                            } else {
+                                auth_failed = true;
+                            }
+                        } else if let Some(key_rec) = k.paas.authenticate_token(token_hdr).await {
                             key_org = Some(key_rec.org_id.clone());
                             org_id = key_rec.org_id;
                             if !headers.contains_key("x-aegis-agent") {
@@ -10461,6 +10733,8 @@ impl AegisRuntimeKernel {
                             }
                             if let Some(ref ws_id) = key_rec.workspace_id {
                                 bound_ws_id = Some(ws_id.clone());
+                            }
+                            if let Some(ref ws_id) = bound_ws_id {
                                 if let Some(ws_rec) = k.paas.get_workspace(&org_id, ws_id).await {
                                     bound_ws_path = ws_rec.host_repo_path;
                                 }
@@ -10478,8 +10752,50 @@ impl AegisRuntimeKernel {
                             bound_ws_path = ws_rec.host_repo_path;
                         }
                     }
+                    let req_path = route_path(full_target);
                     let forbidden: Option<String> = if auth_mode == DaemonAuth::Disabled || auth_failed {
                         None
+                    } else if let Some(ref ticket) = scoped_ticket {
+                        let allowed_route = (method == "GET"
+                            && (req_path.starts_with("/v1/status")
+                                || req_path.starts_with("/api/status")
+                                || req_path.starts_with("/v1/approvals/diff")
+                                || req_path == "/v1/approver"))
+                            || (method == "POST"
+                                && (req_path == "/v1/approver/email"
+                                    || req_path == "/v1/approvals/decide"));
+                        if !allowed_route {
+                            Some("Scoped escalation ticket is restricted to inspecting and deciding its bound escalation".to_string())
+                        } else if let Some(req_o) = requested_orgs(full_target, &body_str)
+                            .into_iter()
+                            .find(|req| req != &ticket.org_id)
+                        {
+                            Some(format!("Scoped escalation ticket for org '{}' cannot access org '{}'", ticket.org_id, req_o))
+                        } else if req_path.starts_with("/v1/approvals/diff") {
+                            let mut q_esc = String::new();
+                            if let Some((_, qs)) = full_target.split_once('?') {
+                                for pair in qs.split('&') {
+                                    if let Some((qk, qv)) = pair.split_once('=') {
+                                        if matches!(qk, "escalation_id" | "id") && !qv.is_empty() {
+                                            q_esc = qv.to_string();
+                                        }
+                                    }
+                                }
+                            }
+                            (!q_esc.is_empty() && q_esc != ticket.escalation_id).then(|| {
+                                "Scoped escalation ticket cannot inspect another escalation".to_string()
+                            })
+                        } else if req_path == "/v1/approvals/decide" {
+                            let b_esc = serde_json::from_str::<Value>(body_str.trim())
+                                .ok()
+                                .and_then(|v| v.get("escalation_id").and_then(|s| s.as_str()).map(str::to_string))
+                                .unwrap_or_default();
+                            (b_esc != ticket.escalation_id).then(|| {
+                                "Scoped escalation ticket cannot decide another escalation".to_string()
+                            })
+                        } else {
+                            None
+                        }
                     } else if is_operator_only_route(method, full_target) && !is_operator {
                         Some("This endpoint is reserved for the operator (Authorization: Bearer <operator token> or X-Aegis-Admin-Secret); tenant/agent API keys cannot use it.".to_string())
                     } else {
@@ -10489,6 +10805,25 @@ impl AegisRuntimeKernel {
                                 .find(|req| req != own)
                                 .map(|req| format!("API key for org '{}' cannot access org '{}'", own, req))
                         })
+                    };
+                    let host_exec_locked: Option<&'static str> = if auth_failed
+                        || forbidden.is_some()
+                        || k.active_host_exec_runs() == 0
+                    {
+                        None
+                    } else if (method == "POST" && req_path.starts_with("/v1/tenants/plan"))
+                        || (method == "POST" && req_path.starts_with("/v1/tenants/keys"))
+                        || (method == "DELETE" && req_path.starts_with("/v1/approver"))
+                        || (method == "DELETE" && req_path == "/v1/orgs")
+                        || (method == "POST" && req_path.starts_with("/v1/vault/secrets"))
+                        || (method == "POST" && req_path.starts_with("/v1/leases/revoke"))
+                        || (is_operator
+                            && method == "POST"
+                            && (req_path.starts_with("/mcp") || req_path.starts_with("/v1/mcp")))
+                    {
+                        Some("Control-plane mutations are locked while an unsandboxed host_exec process is active")
+                    } else {
+                        None
                     };
 
                     if method == "GET" && full_target.starts_with("/releases/") {
@@ -10522,6 +10857,8 @@ impl AegisRuntimeKernel {
                         )
                     } else if let Some(reason) = forbidden {
                         ("HTTP/1.1 403 Forbidden", json!({ "error": reason }).to_string())
+                    } else if let Some(lock_msg) = host_exec_locked {
+                        ("HTTP/1.1 423 Locked", json!({ "error": lock_msg }).to_string())
                     } else if method == "GET"
                         && (full_target == "/"
                             || full_target.starts_with("/dashboard")
@@ -10589,76 +10926,99 @@ impl AegisRuntimeKernel {
                         } else {
                             org_id.clone()
                         };
-                        // Only the operator (or insecure local mode, or read-only Web Console status)
-                        // may widen the view. A tenant key is always pinned to its own org, even when
-                        // its org id is `default-org` and the request omits `org_id`.
-                        let effective_org = if is_operator
-                            || auth_mode == DaemonAuth::Disabled
-                            || raw_auth.is_none()
-                        {
-                            requested_scope
+                        if let Some(ref ticket) = scoped_ticket {
+                            let matched_esc: Vec<_> = k
+                                .policy
+                                .list_escalations(&ticket.org_id)
+                                .await
+                                .unwrap_or_default()
+                                .into_iter()
+                                .filter(|e| e.escalation_id == ticket.escalation_id)
+                                .collect();
+                            (
+                                "HTTP/1.1 200 OK",
+                                json!({
+                                    "org_id": ticket.org_id,
+                                    "peers": [],
+                                    "global_peers": [],
+                                    "a2a_tasks": [],
+                                    "pending_escalations": matched_esc,
+                                    "active_leases": [],
+                                    "workspaces": [],
+                                    "api_keys": [],
+                                    "tenants": [],
+                                    "secrets": [],
+                                    "telemetry": Value::Null
+                                })
+                                .to_string(),
+                            )
                         } else {
-                            org_id.clone()
-                        };
-                        let peers = if effective_org == "*" {
-                            k.ipc.list_all_peers().await.unwrap_or_default()
-                        } else {
-                            k.ipc.list_peers(&effective_org).await.unwrap_or_default()
-                        };
-                        let global_peers = if effective_org == "*" {
-                            k.ipc.list_all_peers().await.unwrap_or_default()
-                        } else {
-                            Vec::new()
-                        };
-                        // A2A tasks follow the same org scope as every other section: only the
-                        // operator (or insecure local mode) may see the whole workstation.
-                        let tasks = if effective_org == "*" {
-                            k.ipc.list_tasks(None, None).await.unwrap_or_default()
-                        } else {
-                            k.ipc.list_tasks(Some(&effective_org), None).await.unwrap_or_default()
-                        };
-                        let escalations = k.policy.list_escalations(&effective_org).await.unwrap_or_default();
-                        let leases = k.policy.list_leases(&effective_org, None).await.unwrap_or_default();
-                        let workspaces = k.paas.list_workspaces(Some(&effective_org)).await;
-                        let api_keys = if is_operator
-                            || auth_mode == DaemonAuth::Disabled
-                            || key_org.is_some()
-                        {
-                            k.paas.list_api_keys(Some(&effective_org)).await
-                        } else {
-                            Vec::new()
-                        };
-                        let tenants = k.paas.list_tenants(Some(&effective_org)).await;
-                        let secrets = if effective_org == "*" {
-                            let mut all_sec = k.egress.list_redacted_secrets("aegis-os").await;
-                            all_sec.extend(k.egress.list_redacted_secrets("acme").await);
-                            all_sec.extend(k.egress.list_redacted_secrets("default-org").await);
-                            all_sec
-                        } else {
-                            k.egress.list_redacted_secrets(&effective_org).await
-                        };
-                        let telemetry = if effective_org == "*" {
-                            Some(k.paas.get_telemetry_stats().await)
-                        } else {
-                            None
-                        };
-                        (
-                            "HTTP/1.1 200 OK",
-                            json!({
-                                "org_id": effective_org,
-                                "peers": peers,
-                                "global_peers": global_peers,
-                                "a2a_tasks": tasks,
-                                "pending_escalations": escalations,
-                                "active_leases": leases,
-                                "workspaces": workspaces,
-                                "api_keys": api_keys,
-                                "tenants": tenants,
-                                "secrets": secrets,
-                                "telemetry": telemetry
-                            })
-                            .to_string(),
-                        )
+                            // Only the operator (or insecure local mode) may widen the view.
+                            let effective_org = if is_operator || auth_mode == DaemonAuth::Disabled {
+                                requested_scope
+                            } else {
+                                org_id.clone()
+                            };
+                            let peers = if effective_org == "*" {
+                                k.ipc.list_all_peers().await.unwrap_or_default()
+                            } else {
+                                k.ipc.list_peers(&effective_org).await.unwrap_or_default()
+                            };
+                            let global_peers = if effective_org == "*" {
+                                k.ipc.list_all_peers().await.unwrap_or_default()
+                            } else {
+                                Vec::new()
+                            };
+                            // A2A tasks follow the same org scope as every other section: only the
+                            // operator (or insecure local mode) may see the whole workstation.
+                            let tasks = if effective_org == "*" {
+                                k.ipc.list_tasks(None, None).await.unwrap_or_default()
+                            } else {
+                                k.ipc.list_tasks(Some(&effective_org), None).await.unwrap_or_default()
+                            };
+                            let escalations = k.policy.list_escalations(&effective_org).await.unwrap_or_default();
+                            let leases = k.policy.list_leases(&effective_org, None).await.unwrap_or_default();
+                            let workspaces = k.paas.list_workspaces(Some(&effective_org)).await;
+                            let api_keys = if is_operator
+                                || auth_mode == DaemonAuth::Disabled
+                                || key_org.is_some()
+                            {
+                                k.paas.list_api_keys(Some(&effective_org)).await
+                            } else {
+                                Vec::new()
+                            };
+                            let tenants = k.paas.list_tenants(Some(&effective_org)).await;
+                            let secrets = if effective_org == "*" {
+                                let mut all_sec = k.egress.list_redacted_secrets("aegis-os").await;
+                                all_sec.extend(k.egress.list_redacted_secrets("acme").await);
+                                all_sec.extend(k.egress.list_redacted_secrets("default-org").await);
+                                all_sec
+                            } else {
+                                k.egress.list_redacted_secrets(&effective_org).await
+                            };
+                            let telemetry = if effective_org == "*" {
+                                Some(k.paas.get_telemetry_stats().await)
+                            } else {
+                                None
+                            };
+                            (
+                                "HTTP/1.1 200 OK",
+                                json!({
+                                    "org_id": effective_org,
+                                    "peers": peers,
+                                    "global_peers": global_peers,
+                                    "a2a_tasks": tasks,
+                                    "pending_escalations": escalations,
+                                    "active_leases": leases,
+                                    "workspaces": workspaces,
+                                    "api_keys": api_keys,
+                                    "tenants": tenants,
+                                    "secrets": secrets,
+                                    "telemetry": telemetry
+                                })
+                                .to_string(),
+                            )
+                        }
                     } else if method == "POST" && full_target.starts_with("/v1/telemetry/ping") {
                         let Ok(payload) =
                             serde_json::from_str::<paas::TelemetryPingPayload>(body_str.trim())
@@ -10802,10 +11162,24 @@ impl AegisRuntimeKernel {
                             }
                         }
                         let tier = paas::PlanTier::from_str_lossy(&c_plan);
-                        match k.paas.create_checkout(&c_org, tier, c_email.as_deref()).await {
+                        match k
+                            .paas
+                            .create_checkout(
+                                &c_org,
+                                tier,
+                                c_email.as_deref(),
+                                key_org.as_deref(),
+                                is_operator || auth_mode == DaemonAuth::Disabled,
+                            )
+                            .await
+                        {
                             Ok(info) => ("HTTP/1.1 200 OK", info.to_string()),
+                            Err(e) if e.to_string().contains("CHECKOUT_ORG_EXISTS") => (
+                                "HTTP/1.1 403 Forbidden",
+                                json!({ "error": e.to_string(), "code": "CHECKOUT_ORG_EXISTS" }).to_string(),
+                            ),
                             Err(e) => (
-                                "HTTP/1.1 500 Internal Server Error",
+                                "HTTP/1.1 400 Bad Request",
                                 json!({ "error": e.to_string() }).to_string(),
                             ),
                         }
@@ -11117,7 +11491,16 @@ impl AegisRuntimeKernel {
                             .export_workspace_pr(&k, &id, p_ws, p_branch, p_title, overwrite_bin)
                             .await
                         {
-                            Ok(val) => ("HTTP/1.1 200 OK", val.to_string()),
+                            Ok(val) => {
+                                let status = if val.get("status").and_then(|s| s.as_str())
+                                    == Some("approval_required")
+                                {
+                                    "HTTP/1.1 202 Accepted"
+                                } else {
+                                    "HTTP/1.1 200 OK"
+                                };
+                                (status, val.to_string())
+                            }
                             Err(e) => (
                                 "HTTP/1.1 500 Internal Server Error",
                                 json!({ "error": e.to_string() }).to_string(),
@@ -11188,31 +11571,47 @@ impl AegisRuntimeKernel {
                         }
                     } else if route_path(full_target).starts_with("/v1/approver") {
                         let payload: Value = serde_json::from_str(body_str.trim()).unwrap_or_else(|_| json!({}));
-                        let mut target_org = key_org
-                            .clone()
-                            .or_else(|| requested_org(full_target, &body_str))
-                            .unwrap_or_else(|| org_id.clone());
-                        if key_org.is_none() && target_org == "default-org" {
-                            if let Ok(env_org) = std::env::var("AOS_ORG") {
-                                if !env_org.trim().is_empty() {
-                                    target_org = env_org.trim().to_string();
-                                }
-                            } else if let Ok(escs) = k.policy.list_escalations("*").await {
-                                if let Some(first) = escs.first() {
-                                    target_org = first.org_id.clone();
+                        let target_org = if let Some(ref ticket) = scoped_ticket {
+                            Some(ticket.org_id.clone())
+                        } else if let Some(ref own) = key_org {
+                            Some(own.clone())
+                        } else if is_operator || auth_mode == DaemonAuth::Disabled {
+                            requested_org(full_target, &body_str)
+                                .or_else(|| (org_id != "default-org").then(|| org_id.clone()))
+                        } else {
+                            None
+                        };
+                        match (method, route_path(full_target), target_org) {
+                            (_, _, None) => (
+                                "HTTP/1.1 403 Forbidden",
+                                json!({ "error": "Explicit org_id and valid credentials are required for approver operations" }).to_string(),
+                            ),
+                            ("GET", "/v1/approver", Some(target_org)) => {
+                                ("HTTP/1.1 200 OK", k.paas.approver_status(&target_org).await.to_string())
+                            }
+                            ("POST", "/v1/approver/email", Some(target_org)) => {
+                                let org_exists = !k.paas.list_api_keys(Some(&target_org)).await.is_empty()
+                                    || !k.paas.list_tenants(Some(&target_org)).await.is_empty()
+                                    || !k
+                                        .policy
+                                        .list_escalations(&target_org)
+                                        .await
+                                        .unwrap_or_default()
+                                        .is_empty();
+                                if auth_mode == DaemonAuth::Required && !is_operator && !org_exists {
+                                    (
+                                        "HTTP/1.1 403 Forbidden",
+                                        json!({ "error": format!("Unknown org '{}'; cannot send approver enrollment email", target_org) }).to_string(),
+                                    )
+                                } else {
+                                    let email = payload.get("email").and_then(|v| v.as_str()).unwrap_or("");
+                                    match k.paas.request_approver_email_enrollment(&target_org, email).await {
+                                        Ok(v) => ("HTTP/1.1 200 OK", v.to_string()),
+                                        Err(e) => ("HTTP/1.1 400 Bad Request", json!({ "error": e.to_string() }).to_string()),
+                                    }
                                 }
                             }
-                        }
-                        match (method, route_path(full_target)) {
-                            ("GET", "/v1/approver") => ("HTTP/1.1 200 OK", k.paas.approver_status(&target_org).await.to_string()),
-                            ("POST", "/v1/approver/email") => {
-                                let email = payload.get("email").and_then(|v| v.as_str()).unwrap_or("");
-                                match k.paas.request_approver_email_enrollment(&target_org, email).await {
-                                    Ok(v) => ("HTTP/1.1 200 OK", v.to_string()),
-                                    Err(e) => ("HTTP/1.1 400 Bad Request", json!({ "error": e.to_string() }).to_string()),
-                                }
-                            }
-                            ("DELETE", "/v1/approver") => match k.paas.remove_approver(&target_org).await {
+                            ("DELETE", "/v1/approver", Some(target_org)) => match k.paas.remove_approver(&target_org).await {
                                 Ok(removed) => ("HTTP/1.1 200 OK", json!({ "org_id": target_org, "removed": removed }).to_string()),
                                 Err(e) => ("HTTP/1.1 500 Internal Server Error", json!({ "error": e.to_string() }).to_string()),
                             },
@@ -11242,7 +11641,7 @@ impl AegisRuntimeKernel {
                                 }
                             }
                         }
-                        let scope_org = if is_operator || auth_mode == DaemonAuth::Disabled || raw_auth.is_none() {
+                        let scope_org = if is_operator || auth_mode == DaemonAuth::Disabled {
                             "*"
                         } else {
                             org_id.as_str()
@@ -11253,7 +11652,12 @@ impl AegisRuntimeKernel {
                             .await
                             .unwrap_or_default()
                             .into_iter()
-                            .find(|e| e.escalation_id == esc_id);
+                            .find(|e| {
+                                e.escalation_id == esc_id
+                                    && scoped_ticket
+                                        .as_ref()
+                                        .is_none_or(|t| t.escalation_id == e.escalation_id && t.org_id == e.org_id)
+                            });
                         if let Some(esc) = found_esc {
                             let diff_file = k
                                 .runtime_data_root
@@ -11328,7 +11732,7 @@ impl AegisRuntimeKernel {
                             .get("lease_id")
                             .and_then(|v| v.as_str())
                             .unwrap_or("");
-                        let scope_org = if is_operator || auth_mode == DaemonAuth::Disabled || raw_auth.is_none() {
+                        let scope_org = if is_operator || auth_mode == DaemonAuth::Disabled {
                             "*"
                         } else {
                             org_id.as_str()
@@ -11424,9 +11828,10 @@ impl AegisRuntimeKernel {
                         };
                         // Tenant approvals: the escalation must belong to the key's org and the
                         // request must carry that org's approver code. Leases stay bounded.
-                        let tenant_check: Result<(), String> = if lock_err.is_some() {
-                            Ok(())
-                        } else if is_operator || auth_mode == DaemonAuth::Disabled {
+                        let tenant_check: Result<(), String> = if lock_err.is_some()
+                            || is_operator
+                            || auth_mode == DaemonAuth::Disabled
+                        {
                             Ok(())
                         } else if let Some(own) = key_org.clone() {
                             let in_org = k
@@ -11454,50 +11859,40 @@ impl AegisRuntimeKernel {
                                     Err(e) => Err(e.to_string()),
                                 }
                             }
-                        } else {
-                            let found_esc = k
-                                .policy
-                                .list_escalations("*")
-                                .await
-                                .unwrap_or_default()
-                                .into_iter()
-                                .find(|e| e.escalation_id == esc_id);
-                            if let Some(esc) = found_esc {
-                                let enrolled = k
-                                    .paas
-                                    .approver_status(&esc.org_id)
+                        } else if let Some(ref ticket) = scoped_ticket {
+                            if esc_id != ticket.escalation_id {
+                                Err("Scoped escalation ticket cannot decide another escalation".to_string())
+                            } else {
+                                let in_org = k
+                                    .policy
+                                    .list_escalations(&ticket.org_id)
                                     .await
-                                    .get("enrolled")
-                                    .and_then(|v| v.as_bool())
+                                    .map(|list| list.iter().any(|e| e.escalation_id == esc_id))
                                     .unwrap_or(false);
                                 let code = payload.get("totp").and_then(|v| v.as_str()).unwrap_or("");
-                                if enrolled {
-                                    if code.is_empty() {
-                                        Err("Approving requires your 6-digit authenticator code (`totp`)".to_string())
-                                    } else {
-                                        match k.paas.verify_approver_code(&esc.org_id, code).await {
-                                            Ok(()) => {
-                                                if ttl_secs > 0 {
-                                                    ttl_secs = ttl_secs.clamp(60, MAX_TOOL_LEASE_TTL_SECS);
-                                                } else {
-                                                    ttl_secs = 0;
-                                                }
-                                                actor = format!("tenant-approver:{}", esc.org_id);
-                                                Ok(())
-                                            }
-                                            Err(e) => Err(e.to_string()),
-                                        }
-                                    }
+                                if !in_org {
+                                    Err(format!("Escalation '{}' not found in org '{}'", esc_id, ticket.org_id))
+                                } else if code.is_empty() {
+                                    Err("Approving requires your 6-digit authenticator code (`totp`)".to_string())
                                 } else {
-                                    // No anonymous approvals, not even from loopback: any local
-                                    // process (or a DNS-rebinding page) can reach a loopback port.
-                                    // The local `/approve` console authenticates with the operator
-                                    // credential delivered in its URL fragment instead.
-                                    Err("Approvals require an operator token or a tenant key with an approver code".to_string())
+                                    match k.paas.verify_approver_code(&ticket.org_id, code).await {
+                                        Ok(()) => {
+                                            if ttl_secs > 0 {
+                                                ttl_secs = ttl_secs.clamp(60, MAX_TOOL_LEASE_TTL_SECS);
+                                            } else {
+                                                ttl_secs = 0;
+                                            }
+                                            actor = format!("ticket-approver:{}", ticket.org_id);
+                                            Ok(())
+                                        }
+                                        Err(e) => Err(e.to_string()),
+                                    }
                                 }
-                            } else {
-                                Err(format!("Escalation '{}' not found", esc_id))
                             }
+                        } else {
+                            // No anonymous approvals, not even with TOTP or from loopback: callers must
+                            // present an operator token, scoped escalation ticket (plus TOTP), or tenant key (plus TOTP).
+                            Err("Approvals require an operator token, scoped escalation ticket, or tenant key with an approver code".to_string())
                         };
                         let actor = actor.as_str();
                         if let Some(msg) = lock_err {
@@ -15294,6 +15689,31 @@ mod tests {
             std::fs::read_to_string(env.workspace.shadow_root().join("ref/notes.md")).unwrap(),
             "tampered bytes!"
         );
+
+        // 4. Symlinked subdirectory inside `<agent_home>/imports/` must never allow escaping imports_root.
+        #[cfg(unix)]
+        {
+            let outside_escape = tmp.path().join("outside_escape");
+            std::fs::create_dir_all(&outside_escape).unwrap();
+            let imports_dir = env.sandbox.config().agent_home_dir.join("imports");
+            std::fs::create_dir_all(&imports_dir).unwrap();
+            std::os::unix::fs::symlink(&outside_escape, imports_dir.join("escape")).unwrap();
+            let err = kernel
+                .call_tool(
+                    &agent,
+                    "fs_import_file",
+                    json!({
+                        "src_host_path": &spec_file,
+                        "import_to": "imports",
+                        "dst_path": "escape/pwned.txt"
+                    }),
+                )
+                .await
+                .unwrap_err()
+                .to_string();
+            assert!(err.contains("symlink"), "{err}");
+            assert!(!outside_escape.join("pwned.txt").exists());
+        }
     }
 
     #[tokio::test]
@@ -16085,5 +16505,229 @@ time.sleep(60)
         .await;
         assert!(head_ok.contains("200 OK"), "{head_ok}: {body_ok}");
         assert_eq!(body_ok["status"], "approved", "{body_ok}");
+    }
+
+    #[tokio::test]
+    async fn test_http_control_plane_auth_and_scoped_ticket_isolation() {
+        let temp = tempfile::tempdir().unwrap();
+        let repo = temp.path().join("repo");
+        tokio::fs::create_dir_all(&repo).await.unwrap();
+        let outbox = temp.path().join("outbox");
+        let kernel = Arc::new(AegisRuntimeKernel::new(&temp.path().join("rt")).await.unwrap());
+        kernel.paas.set_mailer(
+            approver::Mailer::Directory(outbox.clone()),
+            "https://cloud.example",
+        );
+        let addr = kernel
+            .clone()
+            .start_http_daemon_with_auth("127.0.0.1:0", repo.clone(), DaemonAuth::Required)
+            .await
+            .unwrap();
+        let op = kernel.operator_token();
+
+        // Anonymous callers are rejected on protected status, diff, revoke, and approver endpoints
+        for (m, path) in [
+            ("GET", "/v1/status"),
+            ("GET", "/api/status"),
+            ("GET", "/v1/approvals/diff?escalation_id=esc-1"),
+            ("GET", "/v1/approver?org_id=org-a"),
+            ("POST", "/v1/approver/email"),
+            ("POST", "/v1/leases/revoke"),
+        ] {
+            let (head, _) = raw_http(addr, m, path, None, Some(json!({}))).await;
+            assert!(
+                head.contains("401 Unauthorized"),
+                "expected 401 on anonymous {m} {path}, got: {head}"
+            );
+        }
+
+        // Provision org-a key & TOTP approver, plus org-b key & escalation
+        let (_k_a, _) = kernel
+            .paas
+            .issue_api_key("org-a", "coder-a", "Engineer", None, "test-a")
+            .await
+            .unwrap();
+        let (_k_b, _) = kernel
+            .paas
+            .issue_api_key("org-b", "coder-b", "Engineer", None, "test-b")
+            .await
+            .unwrap();
+        // Existing org must reject unauthenticated billing checkout
+        let (chk_head, chk_body) = raw_http(
+            addr,
+            "POST",
+            "/v1/billing/checkout",
+            None,
+            Some(json!({ "org_id": "org-a", "plan_tier": "pro" })),
+        )
+        .await;
+        assert!(chk_head.contains("403 Forbidden"), "{chk_head}: {chk_body}");
+
+        kernel
+            .paas
+            .request_approver_email_enrollment("org-a", "lead@orga.dev")
+            .await
+            .unwrap();
+        let mail = std::fs::read_dir(&outbox).unwrap().next().unwrap().unwrap().path();
+        let enroll_tok = std::fs::read_to_string(mail)
+            .unwrap()
+            .split("token=")
+            .nth(1)
+            .unwrap()
+            .split_whitespace()
+            .next()
+            .unwrap()
+            .to_string();
+        let enrolled = kernel
+            .paas
+            .confirm_approver_email_enrollment(&enroll_tok)
+            .await
+            .unwrap();
+        let secret_hex = enrolled["secret"].as_str().unwrap().to_string();
+
+        kernel
+            .ensure_agent_environment(
+                AgentIdentity::new("org-a", "coder-a", "Engineer"),
+                &repo,
+                IsolationTier::NativeOsSandbox,
+                vec!["*".to_string()],
+            )
+            .await
+            .unwrap();
+        kernel
+            .call_tool(
+                &AgentIdentity::new("org-a", "coder-a", "Engineer"),
+                "fs_write",
+                json!({ "path": "note.txt", "content": "hello\n" }),
+            )
+            .await
+            .unwrap();
+        let ask_a = kernel
+            .call_tool(
+                &AgentIdentity::new("org-a", "coder-a", "Engineer"),
+                "workspace_commit",
+                json!({}),
+            )
+            .await
+            .unwrap();
+        let esc_a = ask_a["escalation_id"].as_str().unwrap().to_string();
+        let ticket_a = ask_a["approval_ticket"].as_str().unwrap().to_string();
+        assert!(ticket_a.starts_with("ast_"), "{ask_a}");
+
+        let (_, sim_b) = raw_http(
+            addr,
+            "POST",
+            "/v1/approvals/simulate",
+            Some(&op),
+            Some(json!({ "org_id": "org-b", "agent_id": "coder-b" })),
+        )
+        .await;
+        let esc_b = sim_b["escalation_id"].as_str().unwrap().to_string();
+
+        // Scoped ticket sees ONLY esc_a in /v1/status, never esc_b or keys/workspaces
+        let (st_head, st_body) = raw_http(addr, "GET", "/v1/status", Some(&ticket_a), None).await;
+        assert!(st_head.contains("200 OK"), "{st_head}: {st_body}");
+        assert_eq!(st_body["pending_escalations"].as_array().unwrap().len(), 1);
+        assert_eq!(st_body["pending_escalations"][0]["escalation_id"], esc_a);
+        assert_eq!(st_body["api_keys"].as_array().unwrap().len(), 0);
+
+        // Scoped ticket cannot access esc_b, other orgs, workspaces, or lease revocation
+        let (diff_b_head, _) = raw_http(
+            addr,
+            "GET",
+            &format!("/v1/approvals/diff?escalation_id={esc_b}"),
+            Some(&ticket_a),
+            None,
+        )
+        .await;
+        assert!(diff_b_head.contains("403 Forbidden"), "{diff_b_head}");
+        let (rev_head, _) = raw_http(
+            addr,
+            "POST",
+            "/v1/leases/revoke",
+            Some(&ticket_a),
+            Some(json!({ "lease_id": "lease-1" })),
+        )
+        .await;
+        assert!(rev_head.contains("403 Forbidden"), "{rev_head}");
+
+        // Scoped ticket can approve esc_a ONLY with valid 6-digit TOTP
+        let (bad_dec, _) = raw_http(
+            addr,
+            "POST",
+            "/v1/approvals/decide",
+            Some(&ticket_a),
+            Some(json!({ "escalation_id": esc_a, "decision": "approve", "totp": "000000" })),
+        )
+        .await;
+        assert!(bad_dec.contains("403 Forbidden"), "{bad_dec}");
+        let code = code_for(&secret_hex, 0);
+        let (ok_dec, ok_body) = raw_http(
+            addr,
+            "POST",
+            "/v1/approvals/decide",
+            Some(&ticket_a),
+            Some(json!({ "escalation_id": esc_a, "decision": "approve", "totp": code })),
+        )
+        .await;
+        assert!(ok_dec.contains("200 OK"), "{ok_dec}: {ok_body}");
+        assert_eq!(ok_body["status"], "approved");
+    }
+
+    #[tokio::test]
+    async fn test_export_case_folding_and_post_verify_commit_poisoning_toctou() {
+        assert!(is_forbidden_export_dest("/tmp/user/.SSH/id_rsa", "/tmp/user/.SSH/id_rsa"));
+        assert!(is_forbidden_export_dest(
+            "/Library/launchagents/evil.plist",
+            "/Library/launchagents/evil.plist"
+        ));
+
+        let temp = tempfile::tempdir().unwrap();
+        let host_repo = temp.path().join("host_repo");
+        tokio::fs::create_dir_all(&host_repo).await.unwrap();
+        tokio::fs::write(host_repo.join("main.rs"), "fn main() {}\n")
+            .await
+            .unwrap();
+        let kernel = AegisRuntimeKernel::new(&temp.path().join("rt")).await.unwrap();
+        let agent = AgentIdentity::new("toctou-org", "coder", "Engineer");
+        kernel
+            .ensure_agent_environment(
+                agent.clone(),
+                &host_repo,
+                IsolationTier::NativeOsSandbox,
+                vec!["*".to_string()],
+            )
+            .await
+            .unwrap();
+        kernel
+            .call_tool(
+                &agent,
+                "policy_grant_lease",
+                json!({ "action": "workspace_commit", "resource": "*", "ttl_secs": 3600 }),
+            )
+            .await
+            .unwrap();
+        kernel
+            .call_tool(
+                &agent,
+                "fs_write",
+                json!({ "path": "main.rs", "content": "fn main() { println!(\"ok\"); }\n" }),
+            )
+            .await
+            .unwrap();
+
+        // A verify_cmd that attempts to drop a sensitive CI workflow file after pre-commit policy check
+        // must be blocked by the post-verify frozen TOCTOU guard before touching host_repo.
+        let err = kernel
+            .call_tool(
+                &agent,
+                "workspace_commit",
+                json!({ "verify_cmd": "mkdir -p .github/workflows && echo 'name: evil' > .github/workflows/evil.yml" }),
+            )
+            .await
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("TOCTOU guard") || err.contains("sensitive path"), "{err}");
+        assert!(!host_repo.join(".github/workflows/evil.yml").exists());
     }
 }

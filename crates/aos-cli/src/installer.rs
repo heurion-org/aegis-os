@@ -1268,11 +1268,15 @@ fn clean_workspace_agents(workspace: &Path, dry_run: bool) -> anyhow::Result<Vec
 }
 
 fn is_tty_stdin() -> bool {
-    #[cfg(unix)]
+    #[cfg(test)]
+    {
+        false
+    }
+    #[cfg(all(unix, not(test)))]
     {
         unsafe { libc::isatty(libc::STDIN_FILENO) == 1 }
     }
-    #[cfg(not(unix))]
+    #[cfg(all(not(unix), not(test)))]
     {
         false
     }
@@ -2756,7 +2760,19 @@ pub(crate) async fn setup_agy_workspace(
     tokio::fs::create_dir_all(&rules_dir).await?;
 
     let rt_str = runtime_dir.to_string_lossy();
-    let strict_flag = if strict_cow { "--strict-cow" } else { "" };
+    let strict_flag = if strict_cow { " --strict-cow" } else { "" };
+    let sh_single_esc = |s: &str| -> String { s.replace('\'', "'\\''") };
+    let hook_cmd = |event_name: &str, fallback_json_fmt: &str| -> String {
+        format!(
+            "sh -c 'if command -v aegis-os >/dev/null 2>&1; then exec aegis-os --org \"{}\" --agent auto --role \"{}\" --workspace \"..\" --runtime-dir \"{}\" agy-hook --event {}{}; else printf \"{}\\n\"; fi'",
+            sh_single_esc(org),
+            sh_single_esc(role),
+            sh_single_esc(&rt_str),
+            event_name,
+            strict_flag,
+            fallback_json_fmt
+        )
+    };
 
     let hooks_json = json!({
         "aegis-os-runtime-guard": {
@@ -2764,17 +2780,13 @@ pub(crate) async fn setup_agy_workspace(
             "SessionStart": [
                 {
                     "type": "command",
-                    "command": format!(
-                        "\"aegis-os\" --org \"{org}\" --agent auto --role \"{role}\" --workspace \"..\" --runtime-dir \"{rt_str}\" agy-hook --event SessionStart {strict_flag}"
-                    )
+                    "command": hook_cmd("SessionStart", "{}")
                 }
             ],
             "PreInvocation": [
                 {
                     "type": "command",
-                    "command": format!(
-                        "\"aegis-os\" --org \"{org}\" --agent auto --role \"{role}\" --workspace \"..\" --runtime-dir \"{rt_str}\" agy-hook --event PreInvocation {strict_flag}"
-                    )
+                    "command": hook_cmd("PreInvocation", "{}")
                 }
             ],
             "PreToolUse": [
@@ -2783,9 +2795,7 @@ pub(crate) async fn setup_agy_workspace(
                     "hooks": [
                         {
                             "type": "command",
-                            "command": format!(
-                                "\"aegis-os\" --org \"{org}\" --agent auto --role \"{role}\" --workspace \"..\" --runtime-dir \"{rt_str}\" agy-hook --event PreToolUse {strict_flag}"
-                            )
+                            "command": hook_cmd("PreToolUse", "{\\042decision\\042:\\042allow\\042}")
                         }
                     ]
                 }
@@ -2793,9 +2803,7 @@ pub(crate) async fn setup_agy_workspace(
             "Stop": [
                 {
                     "type": "command",
-                    "command": format!(
-                        "\"aegis-os\" --org \"{org}\" --agent auto --role \"{role}\" --workspace \"..\" --runtime-dir \"{rt_str}\" agy-hook --event Stop {strict_flag}"
-                    )
+                    "command": hook_cmd("Stop", "{}")
                 }
             ]
         }
@@ -3528,6 +3536,42 @@ mod install_tests {
             home.join(".aegis/bin/claude").is_file(),
             "enforced shim must still be installed in-process when legacy binary lacks --enforce"
         );
+    }
+
+    #[tokio::test]
+    async fn setup_agy_workspace_hooks_degrade_gracefully_when_binary_missing() {
+        let tmp = tempfile::tempdir().unwrap();
+        let ws = tmp.path().join("repo");
+        let rt = tmp.path().join("runtime");
+        std::fs::create_dir_all(&ws).unwrap();
+        setup_agy_workspace(&ws, "demo", "auto", "Lead", &rt, false)
+            .await
+            .unwrap();
+
+        let hooks_val: serde_json::Value = serde_json::from_str(
+            &std::fs::read_to_string(ws.join(".agents/hooks.json")).unwrap(),
+        )
+        .unwrap();
+        let guard = &hooks_val["aegis-os-runtime-guard"];
+        let pre_tool_cmd = guard["PreToolUse"][0]["hooks"][0]["command"].as_str().unwrap();
+        let session_start_cmd = guard["SessionStart"][0]["command"].as_str().unwrap();
+
+        // Execute the exact `sh -c ...` commands with `/usr/bin:/bin` only (no `aegis-os` on PATH).
+        for (cmd, expected_key) in [(pre_tool_cmd, Some("allow")), (session_start_cmd, None)] {
+            let out = std::process::Command::new("/bin/sh")
+                .args(["-c", cmd])
+                .env("PATH", "/usr/bin:/bin")
+                .output()
+                .unwrap();
+            assert!(out.status.success(), "cmd failed: {cmd} stderr={}", String::from_utf8_lossy(&out.stderr));
+            let parsed: serde_json::Value = serde_json::from_slice(&out.stdout)
+                .unwrap_or_else(|e| panic!("invalid JSON from `{cmd}` -> `{}`: {e}", String::from_utf8_lossy(&out.stdout)));
+            if let Some(decision) = expected_key {
+                assert_eq!(parsed["decision"], decision, "{parsed}");
+            } else {
+                assert_eq!(parsed, json!({}));
+            }
+        }
     }
 
     use std::path::{Path, PathBuf};

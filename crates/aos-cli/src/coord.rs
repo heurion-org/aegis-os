@@ -280,7 +280,9 @@ pub async fn handle_pre_invocation(
     if !system_sections.is_empty() {
         return json!({
             "injectSteps": [{
-                "systemMessage": system_sections.join("\n\n")
+                "systemMessage": {
+                    "systemMessage": system_sections.join("\n\n")
+                }
             }]
         });
     }
@@ -293,11 +295,13 @@ pub async fn handle_pre_invocation(
             .collect();
         return json!({
             "injectSteps": [{
-                "ephemeralMessage": format!(
-                    "[Aegis-OS IPC Reminder] {} TaskRequest(s) still awaiting reply: {}. Call `mcp_aegis-os_ipc_reply` or `mcp_aegis-os_ipc_ack`.",
-                    pending_ack.len(),
-                    ids.join(", ")
-                )
+                "systemMessage": {
+                    "systemMessage": format!(
+                        "[Aegis-OS IPC Reminder] {} TaskRequest(s) still awaiting reply: {}. Call `mcp_aegis-os_ipc_reply` or `mcp_aegis-os_ipc_ack`.",
+                        pending_ack.len(),
+                        ids.join(", ")
+                    )
+                }
             }]
         });
     }
@@ -341,7 +345,8 @@ pub async fn handle_stop_gate(
     max_continues: u32,
 ) -> Value {
     let stop_reason = payload
-        .get("stop_reason")
+        .get("terminationReason")
+        .or_else(|| payload.get("stop_reason"))
         .or_else(|| payload.get("reason"))
         .or_else(|| payload.get("stopReason"))
         .and_then(|v| v.as_str())
@@ -349,9 +354,18 @@ pub async fn handle_stop_gate(
     if stop_reason.eq_ignore_ascii_case("USER_CANCELED")
         || stop_reason.eq_ignore_ascii_case("user_cancelled")
         || stop_reason.eq_ignore_ascii_case("aborted")
+        || stop_reason.eq_ignore_ascii_case("ERROR")
+        || stop_reason.eq_ignore_ascii_case("MAX_INVOCATIONS")
+        || stop_reason.eq_ignore_ascii_case("MAX_FORCED_INVOCATIONS")
+        || stop_reason.eq_ignore_ascii_case("MAX_TOKEN_BUDGET_EXCEEDED")
+        || stop_reason.eq_ignore_ascii_case("TERMINAL_CUSTOM_HOOK")
     {
         return json!({});
     }
+    let continuation_active = payload
+        .get("continuationActive")
+        .and_then(|v| v.as_bool())
+        .unwrap_or(false);
 
     let unread = kernel
         .ipc
@@ -376,7 +390,13 @@ pub async fn handle_stop_gate(
         .ok()
         .and_then(|s| s.trim().parse().ok())
         .unwrap_or(0);
-    if used >= max_continues {
+    // Respect `max_continues`, capping to at most 1 continuation when `continuationActive` is true.
+    let effective_max = if continuation_active {
+        max_continues.min(1)
+    } else {
+        max_continues
+    };
+    if used >= effective_max {
         return json!({});
     }
     let _ = std::fs::write(&path, (used + 1).to_string());
@@ -477,7 +497,9 @@ mod tests {
 
         // 1. First PreInvocation surfaces the newly arrived message via systemMessage
         let out1 = handle_pre_invocation(&rt, &kernel, &receiver).await;
-        let sys_msg = out1["injectSteps"][0]["systemMessage"].as_str().unwrap();
+        let sys_msg = out1["injectSteps"][0]["systemMessage"]["systemMessage"]
+            .as_str()
+            .unwrap();
         assert!(sys_msg.contains(&sent.msg_id));
         assert!(sys_msg.contains("Review Section 6"));
 
@@ -485,7 +507,7 @@ mod tests {
         let out2 = handle_pre_invocation(&rt, &kernel, &receiver).await;
         assert!(out2.get("injectSteps").is_none());
 
-        // 3. Stop hook blocks turn completion up to max_continues (2), never on USER_CANCELED
+        // 3. Stop hook blocks turn completion up to max_continues (2), never on USER_CANCELED or ERROR
         let cancel_out = handle_stop_gate(
             &rt,
             &kernel,
@@ -495,6 +517,24 @@ mod tests {
         )
         .await;
         assert_eq!(cancel_out, json!({}));
+        let agy_cancel_out = handle_stop_gate(
+            &rt,
+            &kernel,
+            &receiver,
+            &json!({ "terminationReason": "USER_CANCELED", "continuationActive": false }),
+            2,
+        )
+        .await;
+        assert_eq!(agy_cancel_out, json!({}));
+        let agy_err_out = handle_stop_gate(
+            &rt,
+            &kernel,
+            &receiver,
+            &json!({ "terminationReason": "ERROR" }),
+            2,
+        )
+        .await;
+        assert_eq!(agy_err_out, json!({}));
 
         let s1 = handle_stop_gate(&rt, &kernel, &receiver, &json!({}), 2).await;
         assert_eq!(s1["decision"], "continue");
@@ -540,7 +580,9 @@ mod tests {
 
         // Initial PreInvocation for peer_b records initial live peer state
         let init_out = handle_pre_invocation(&rt, &kernel, &peer_b).await;
-        let init_msg = init_out["injectSteps"][0]["systemMessage"].as_str().unwrap();
+        let init_msg = init_out["injectSteps"][0]["systemMessage"]["systemMessage"]
+            .as_str()
+            .unwrap();
         assert!(init_msg.contains("[Aegis-OS Live Collaboration Radar]"));
         assert!(init_msg.contains("org1/agy-aaaaaa"));
 
@@ -557,7 +599,9 @@ mod tests {
 
         // Next PreInvocation for peer_b automatically rebases shared.rs AND surfaces the new file claim!
         let next_out = handle_pre_invocation(&rt, &kernel, &peer_b).await;
-        let next_msg = next_out["injectSteps"][0]["systemMessage"].as_str().unwrap();
+        let next_msg = next_out["injectSteps"][0]["systemMessage"]["systemMessage"]
+            .as_str()
+            .unwrap();
         assert!(next_msg.contains("[Aegis-OS Auto-Rebase]"));
         assert!(next_msg.contains("shared.rs (ff)"));
         assert!(next_msg.contains("[Aegis-OS Live Collaboration Radar]"));

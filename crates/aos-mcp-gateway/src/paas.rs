@@ -10,14 +10,15 @@
 
 use crate::AegisRuntimeKernel;
 use anyhow::{bail, Context};
-use aos_core::{AgentIdentity, IsolationTier};
+use aos_core::{AgentIdentity, IsolationTier, PolicyDecision};
+use aos_policy::AegisPolicyKernel;
 use aos_vfs::CoWWorkspace;
+use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine as _};
 use chrono::Utc;
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
 use std::path::{Path, PathBuf};
-use std::process::Command;
 use tokio::sync::RwLock;
 use uuid::Uuid;
 
@@ -267,6 +268,10 @@ pub struct TelemetryDeviceRecord {
     pub modes_used: std::collections::BTreeSet<String>,
 }
 
+fn default_ticket_signing_secret() -> String {
+    format!("{}{}", Uuid::new_v4().simple(), Uuid::new_v4().simple())
+}
+
 #[derive(Debug, Default, Clone, Serialize, Deserialize)]
 struct PersistedPaasState {
     #[serde(default)]
@@ -285,6 +290,15 @@ struct PersistedPaasState {
     approver_enrollments: Vec<ApproverEnrollmentRecord>,
     #[serde(default)]
     telemetry_devices: std::collections::BTreeMap<String, TelemetryDeviceRecord>,
+    #[serde(default = "default_ticket_signing_secret")]
+    ticket_signing_secret: String,
+}
+
+#[derive(Debug, Clone)]
+pub struct ScopedEscalationTicket {
+    pub org_id: String,
+    pub escalation_id: String,
+    pub expires_at_ms: i64,
 }
 
 /// The human who approves an org's Cloud escalations, holding the TOTP secret on their phone.
@@ -319,8 +333,10 @@ pub struct PaasControlPlane {
     state_file: PathBuf,
     workspaces_root: PathBuf,
     state: RwLock<PersistedPaasState>,
-    /// Server-side secrets: `(admin, billing_webhook)`. Never derived from request data.
-    secrets: std::sync::RwLock<(String, String)>,
+    /// Serializes `reload -> mutate -> flush` across async tasks and processes (combined with `flock`).
+    io_gate: tokio::sync::Mutex<()>,
+    /// Server-side secrets: `(admin, billing_webhook, is_static_admin)`. Never derived from request data.
+    secrets: std::sync::RwLock<(String, String, bool)>,
     mailer: std::sync::RwLock<crate::approver::Mailer>,
     /// Public base URL used in mailed links (`AOS_PUBLIC_URL`).
     public_url: std::sync::RwLock<String>,
@@ -330,18 +346,25 @@ impl PaasControlPlane {
     pub fn new(runtime_data_root: &Path) -> Self {
         let state_file = runtime_data_root.join("paas_state.json");
         let workspaces_root = runtime_data_root.join("paas_workspaces");
-        let initial = std::fs::read(&state_file)
+        let mut initial = std::fs::read(&state_file)
             .ok()
             .and_then(|b| serde_json::from_slice::<PersistedPaasState>(&b).ok())
             .unwrap_or_default();
+        if initial.ticket_signing_secret.is_empty() {
+            initial.ticket_signing_secret = default_ticket_signing_secret();
+        }
         let env_secret = |k: &str| std::env::var(k).unwrap_or_default().trim().to_string();
+        let env_admin = env_secret("AOS_ADMIN_SECRET");
+        let has_static_admin = !env_admin.is_empty();
         Self {
             state_file,
             workspaces_root,
             state: RwLock::new(initial),
+            io_gate: tokio::sync::Mutex::new(()),
             secrets: std::sync::RwLock::new((
-                env_secret("AOS_ADMIN_SECRET"),
+                env_admin,
                 env_secret("AOS_BILLING_WEBHOOK_SECRET"),
+                has_static_admin,
             )),
             mailer: std::sync::RwLock::new(crate::approver::Mailer::from_env()),
             public_url: std::sync::RwLock::new(match env_secret("AOS_PUBLIC_URL") {
@@ -357,9 +380,31 @@ impl PaasControlPlane {
         *self.public_url.write().unwrap() = public_url.trim_end_matches('/').to_string();
     }
 
-    /// Overrides the secrets loaded from `AOS_ADMIN_SECRET` / `AOS_BILLING_WEBHOOK_SECRET`.
+    /// Overrides the static operator/billing secrets loaded from `AOS_ADMIN_SECRET` / `AOS_BILLING_WEBHOOK_SECRET`.
     pub fn set_secrets(&self, admin: &str, billing_webhook: &str) {
-        *self.secrets.write().unwrap() = (admin.trim().to_string(), billing_webhook.trim().to_string());
+        let trimmed_admin = admin.trim().to_string();
+        let is_static = !trimmed_admin.is_empty();
+        *self.secrets.write().unwrap() = (
+            trimmed_admin,
+            billing_webhook.trim().to_string(),
+            is_static,
+        );
+    }
+
+    /// Sets an auto-generated ephemeral local operator/UI token (does not mark `is_static_admin`).
+    pub fn set_ephemeral_admin_secret(&self, admin: &str) {
+        let mut guard = self.secrets.write().unwrap();
+        guard.0 = admin.trim().to_string();
+        guard.2 = false;
+    }
+
+    /// Rotates the ephemeral local UI operator token after an unsandboxed `host_exec` finishes,
+    /// preserving any statically configured `AOS_ADMIN_SECRET` on cloud/operator daemons.
+    pub fn rotate_ephemeral_admin_secret_if_dynamic(&self) {
+        let mut guard = self.secrets.write().unwrap();
+        if !guard.2 {
+            guard.0 = format!("aop_{}{}", Uuid::new_v4().simple(), Uuid::new_v4().simple());
+        }
     }
 
     /// Empty when no admin secret is configured.
@@ -487,17 +532,152 @@ impl PaasControlPlane {
         false
     }
 
-    async fn reload(&self) {
+    async fn reload_unlocked(&self) {
         if let Ok(bytes) = tokio::fs::read(&self.state_file).await {
-            if let Ok(parsed) = serde_json::from_slice::<PersistedPaasState>(&bytes) {
+            if let Ok(mut parsed) = serde_json::from_slice::<PersistedPaasState>(&bytes) {
+                if parsed.ticket_signing_secret.is_empty() {
+                    let current = self.state.read().await.ticket_signing_secret.clone();
+                    parsed.ticket_signing_secret = if current.is_empty() {
+                        default_ticket_signing_secret()
+                    } else {
+                        current
+                    };
+                }
                 *self.state.write().await = parsed;
             }
         }
     }
 
-    async fn flush(&self) -> anyhow::Result<()> {
+    async fn reload(&self) {
+        let _io = self.io_gate.lock().await;
+        self.reload_unlocked().await;
+    }
+
+    async fn flush_unlocked(&self) -> anyhow::Result<()> {
         let snapshot = self.state.read().await.clone();
-        aos_core::session::write_json_pretty_atomic(&self.state_file, &snapshot).await
+        aos_core::session::write_json_pretty_unlocked(&self.state_file, &snapshot).await
+    }
+
+    /// Serializes `reload -> mutate -> flush` under both an in-process async mutex and a file lock,
+    /// guaranteeing no lost updates across concurrent TOTP verifications, key issuance, and usage writes.
+    async fn with_state_mut<R, F>(&self, f: F) -> anyhow::Result<R>
+    where
+        F: FnOnce(&mut PersistedPaasState) -> anyhow::Result<R>,
+    {
+        let _io = self.io_gate.lock().await;
+        if let Some(parent) = self.state_file.parent() {
+            tokio::fs::create_dir_all(parent).await?;
+        }
+        let _flock = aos_core::session::acquire_file_lock(&self.state_file).await?;
+        self.reload_unlocked().await;
+        let out = {
+            let mut guard = self.state.write().await;
+            f(&mut guard)
+        }?;
+        self.flush_unlocked().await?;
+        Ok(out)
+    }
+
+    /// Like [`Self::with_state_mut`], but always flushes mutated state (e.g., failed TOTP attempts or
+    /// lockout timestamps) even when the inner business operation returns an `Err`.
+    async fn with_state_mut_always_flush<R, F>(&self, f: F) -> anyhow::Result<R>
+    where
+        F: FnOnce(&mut PersistedPaasState) -> anyhow::Result<R>,
+    {
+        let _io = self.io_gate.lock().await;
+        if let Some(parent) = self.state_file.parent() {
+            tokio::fs::create_dir_all(parent).await?;
+        }
+        let _flock = aos_core::session::acquire_file_lock(&self.state_file).await?;
+        self.reload_unlocked().await;
+        let res = {
+            let mut guard = self.state.write().await;
+            f(&mut guard)
+        };
+        self.flush_unlocked().await?;
+        res
+    }
+
+    async fn ensure_ticket_signing_secret(&self) -> String {
+        {
+            let guard = self.state.read().await;
+            if !guard.ticket_signing_secret.is_empty() && self.state_file.exists() {
+                return guard.ticket_signing_secret.clone();
+            }
+        }
+        self.with_state_mut(|state| {
+            if state.ticket_signing_secret.is_empty() {
+                state.ticket_signing_secret = default_ticket_signing_secret();
+            }
+            Ok(state.ticket_signing_secret.clone())
+        })
+        .await
+        .unwrap_or_else(|_| default_ticket_signing_secret())
+    }
+
+    /// Mints a short-lived HMAC-SHA256 approval ticket (`ast_...`) strictly scoped to a single
+    /// `(org_id, escalation_id)` pair so a human can open `/approve?...#ticket=ast_...` in a
+    /// browser or mobile device without exposing cluster-wide state to unauthenticated callers.
+    pub async fn issue_escalation_ticket(
+        &self,
+        org_id: &str,
+        escalation_id: &str,
+        ttl_ms: i64,
+    ) -> String {
+        let key = self.ensure_ticket_signing_secret().await;
+        let exp_ms = Utc::now().timestamp_millis() + ttl_ms.clamp(60_000, 86_400_000);
+        let org_b64 = URL_SAFE_NO_PAD.encode(org_id.as_bytes());
+        let esc_b64 = URL_SAFE_NO_PAD.encode(escalation_id.as_bytes());
+        let payload = format!("v1.{exp_ms}.{org_b64}.{esc_b64}");
+        let mac = Self::hmac_sha256_hex(key.as_bytes(), payload.as_bytes());
+        format!("ast_{payload}.{mac}")
+    }
+
+    /// Verifies a scoped `ast_...` escalation ticket against expiration and the node HMAC secret.
+    pub async fn verify_escalation_ticket(&self, raw: &str) -> Option<ScopedEscalationTicket> {
+        let rest = raw.trim().strip_prefix("ast_")?;
+        let (payload, mac) = rest.rsplit_once('.')?;
+        let mut parts = payload.split('.');
+        let version = parts.next()?;
+        let exp_str = parts.next()?;
+        let org_b64 = parts.next()?;
+        let esc_b64 = parts.next()?;
+        if version != "v1" || parts.next().is_some() {
+            return None;
+        }
+        let expires_at_ms = exp_str.parse::<i64>().ok()?;
+        if expires_at_ms <= Utc::now().timestamp_millis() {
+            return None;
+        }
+        let key = {
+            let guard = self.state.read().await;
+            if guard.ticket_signing_secret.is_empty() {
+                drop(guard);
+                self.reload().await;
+                self.state.read().await.ticket_signing_secret.clone()
+            } else {
+                guard.ticket_signing_secret.clone()
+            }
+        };
+        if key.is_empty() {
+            return None;
+        }
+        let expected_mac = Self::hmac_sha256_hex(key.as_bytes(), payload.as_bytes());
+        if !Self::secrets_match(mac, &expected_mac) {
+            return None;
+        }
+        let org_bytes = URL_SAFE_NO_PAD.decode(org_b64).ok()?;
+        let esc_bytes = URL_SAFE_NO_PAD.decode(esc_b64).ok()?;
+        let org_id = String::from_utf8(org_bytes).ok()?;
+        let escalation_id = String::from_utf8(esc_bytes).ok()?;
+        if org_id.is_empty() || escalation_id.is_empty() {
+            return None;
+        }
+        Some(ScopedEscalationTicket {
+            org_id,
+            escalation_id,
+            expires_at_ms,
+        })
     }
 
     /// Estimate directory size in bytes for CoW savings accounting.
@@ -520,12 +700,11 @@ impl PaasControlPlane {
         org_id: &str,
         plan_tier: PlanTier,
     ) -> anyhow::Result<TenantUsageRecord> {
-        self.reload().await;
         let now = Utc::now().timestamp_millis();
         let today = Utc::now().format("%Y-%m-%d").to_string();
-        let rec = {
-            let mut state = self.state.write().await;
-            if let Some(existing) = state.tenants.iter_mut().find(|t| t.org_id == org_id) {
+        let org_owned = org_id.to_string();
+        self.with_state_mut(|state| {
+            let rec = if let Some(existing) = state.tenants.iter_mut().find(|t| t.org_id == org_owned) {
                 existing.plan_tier = plan_tier;
                 existing.max_concurrent_agents = plan_tier.max_concurrent_agents();
                 if existing.active_agents.len() > existing.max_concurrent_agents {
@@ -537,7 +716,7 @@ impl PaasControlPlane {
                 existing.clone()
             } else {
                 let created = TenantUsageRecord {
-                    org_id: org_id.to_string(),
+                    org_id: org_owned.clone(),
                     plan_tier,
                     max_concurrent_agents: plan_tier.max_concurrent_agents(),
                     total_syscalls: 0,
@@ -552,10 +731,10 @@ impl PaasControlPlane {
                 };
                 state.tenants.push(created.clone());
                 created
-            }
-        };
-        self.flush().await?;
-        Ok(rec)
+            };
+            Ok(rec)
+        })
+        .await
     }
 
     /// Record MCP syscall, sandbox execution duration, and CoW storage savings for tenant billing/metering.
@@ -567,12 +746,12 @@ impl PaasControlPlane {
         exec_ms_delta: u64,
         cow_saved_delta: u64,
     ) -> anyhow::Result<()> {
-        self.reload().await;
         let now = Utc::now().timestamp_millis();
         let today = Utc::now().format("%Y-%m-%d").to_string();
-        {
-            let mut state = self.state.write().await;
-            if let Some(t) = state.tenants.iter_mut().find(|t| t.org_id == org_id) {
+        let org_owned = org_id.to_string();
+        let ws_owned = workspace_id.map(str::to_string);
+        self.with_state_mut(|state| {
+            if let Some(t) = state.tenants.iter_mut().find(|t| t.org_id == org_owned) {
                 if t.quota_day_utc != today {
                     t.quota_day_utc = today.clone();
                     t.daily_syscalls = 0;
@@ -586,7 +765,7 @@ impl PaasControlPlane {
                 t.updated_at_ms = now;
             } else {
                 state.tenants.push(TenantUsageRecord {
-                    org_id: org_id.to_string(),
+                    org_id: org_owned.clone(),
                     plan_tier: PlanTier::Community,
                     max_concurrent_agents: PlanTier::Community.max_concurrent_agents(),
                     total_syscalls: syscalls_delta,
@@ -600,19 +779,20 @@ impl PaasControlPlane {
                     updated_at_ms: now,
                 });
             }
-            if let Some(ws_id) = workspace_id {
+            if let Some(ref ws_id) = ws_owned {
                 if let Some(ws) = state
                     .workspaces
                     .iter_mut()
-                    .find(|w| w.org_id == org_id && w.workspace_id == ws_id)
+                    .find(|w| w.org_id == org_owned && w.workspace_id == *ws_id)
                 {
                     ws.last_active_ms = now;
                     ws.status = WorkspaceLifecycleState::Active;
                     ws.hibernated_at_ms = None;
                 }
             }
-        }
-        self.flush().await
+            Ok(())
+        })
+        .await
     }
 
     /// Enforce commercial paywall quotas on `/v1/mcp` tool invocations:
@@ -625,10 +805,11 @@ impl PaasControlPlane {
         agent_id: &str,
         tool_name: &str,
     ) -> Result<PlanTier, Value> {
-        self.reload().await;
         let now = Utc::now().timestamp_millis();
         let today = Utc::now().format("%Y-%m-%d").to_string();
-        let clean_agent = agent_id.trim();
+        let clean_agent = agent_id.trim().to_string();
+        let org_owned = org_id.to_string();
+        let tool_owned = tool_name.to_string();
 
         let (
             tier,
@@ -639,125 +820,136 @@ impl PaasControlPlane {
             max_exec_ms,
             active_agents_snapshot,
             violation,
-        ) = {
-            let mut state = self.state.write().await;
-            if !state.tenants.iter().any(|t| t.org_id == org_id) {
-                state.tenants.push(TenantUsageRecord {
-                    org_id: org_id.to_string(),
-                    plan_tier: PlanTier::Community,
-                    max_concurrent_agents: PlanTier::Community.max_concurrent_agents(),
-                    total_syscalls: 0,
-                    sandbox_exec_ms: 0,
-                    cow_saved_bytes: 0,
-                    wake_count: 0,
-                    quota_day_utc: today.clone(),
-                    daily_syscalls: 0,
-                    daily_exec_ms: 0,
-                    active_agents: Vec::new(),
-                    updated_at_ms: now,
-                });
-            }
-            let t = state
-                .tenants
-                .iter_mut()
-                .find(|t| t.org_id == org_id)
-                .unwrap();
-            if t.quota_day_utc != today {
-                t.quota_day_utc = today;
-                t.daily_syscalls = 0;
-                t.daily_exec_ms = 0;
-            }
-            let tier = t.plan_tier;
-            let max_ag = t.max_concurrent_agents.max(tier.max_concurrent_agents());
-            let max_sys = tier.max_daily_syscalls();
-            let max_ex = tier.max_daily_exec_ms();
+        ) = self
+            .with_state_mut(|state| {
+                if !state.tenants.iter().any(|t| t.org_id == org_owned) {
+                    state.tenants.push(TenantUsageRecord {
+                        org_id: org_owned.clone(),
+                        plan_tier: PlanTier::Community,
+                        max_concurrent_agents: PlanTier::Community.max_concurrent_agents(),
+                        total_syscalls: 0,
+                        sandbox_exec_ms: 0,
+                        cow_saved_bytes: 0,
+                        wake_count: 0,
+                        quota_day_utc: today.clone(),
+                        daily_syscalls: 0,
+                        daily_exec_ms: 0,
+                        active_agents: Vec::new(),
+                        updated_at_ms: now,
+                    });
+                }
+                let t = state
+                    .tenants
+                    .iter_mut()
+                    .find(|t| t.org_id == org_owned)
+                    .unwrap();
+                if t.quota_day_utc != today {
+                    t.quota_day_utc = today;
+                    t.daily_syscalls = 0;
+                    t.daily_exec_ms = 0;
+                }
+                let tier = t.plan_tier;
+                let max_ag = t.max_concurrent_agents.max(tier.max_concurrent_agents());
+                let max_sys = tier.max_daily_syscalls();
+                let max_ex = tier.max_daily_exec_ms();
 
-            // Replace placeholder `"cloud-coder-1"` if the user's real Agent client connects first
-            if !clean_agent.is_empty()
-                && clean_agent != "cloud-coder-1"
-                && t.active_agents.len() == 1
-                && t.active_agents[0] == "cloud-coder-1"
-            {
-                t.active_agents[0] = clean_agent.to_string();
-            }
+                if !clean_agent.is_empty()
+                    && clean_agent != "cloud-coder-1"
+                    && t.active_agents.len() == 1
+                    && t.active_agents[0] == "cloud-coder-1"
+                {
+                    t.active_agents[0] = clean_agent.clone();
+                }
 
-            let mut viol: Option<(&'static str, String, String)> = None;
-            if !clean_agent.is_empty() && !t.active_agents.iter().any(|a| a == clean_agent) {
-                if t.active_agents.len() >= max_ag {
-                    let existing_list = t.active_agents.join(", ");
+                let mut viol: Option<(&'static str, String, String)> = None;
+                if !clean_agent.is_empty() && !t.active_agents.iter().any(|a| a == &clean_agent) {
+                    if t.active_agents.len() >= max_ag {
+                        let existing_list = t.active_agents.join(", ");
+                        viol = Some((
+                            "PAYWALL_CONCURRENT_AGENTS_LIMIT",
+                            format!(
+                                "Tenant '{}' ({} plan) allows at most {} active Agent runtime (currently active: [{}]), cannot attach parallel Agent '{}'. Upgrade to Aegis Cloud Pro ($29/mo) for 8 parallel Agent runtimes.",
+                                org_owned,
+                                tier.as_str(),
+                                max_ag,
+                                existing_list,
+                                clean_agent
+                            ),
+                            format!(
+                                "当前租户 '{}'（{} 免费档）最多允许 {} 个并发 Agent 运行时（当前已挂载：[{}]），无法同时接入新 Agent '{}'。升级 Aegis Cloud Pro ($29/月) 即可解锁 8 个 Agent 并行运行时与 16 个线上工作区。",
+                                org_owned,
+                                tier.as_str(),
+                                max_ag,
+                                existing_list,
+                                clean_agent
+                            ),
+                        ));
+                    } else {
+                        t.active_agents.push(clean_agent.clone());
+                        t.updated_at_ms = now;
+                    }
+                }
+
+                if viol.is_none() && t.daily_syscalls >= max_sys {
                     viol = Some((
-                        "PAYWALL_CONCURRENT_AGENTS_LIMIT",
+                        "PAYWALL_DAILY_SYSCALL_LIMIT",
                         format!(
-                            "Tenant '{}' ({} plan) allows at most {} active Agent runtime (currently active: [{}]), cannot attach parallel Agent '{}'. Upgrade to Aegis Cloud Pro ($29/mo) for 8 parallel Agent runtimes.",
-                            org_id,
+                            "Daily MCP syscall quota reached for tenant '{}' on {} plan ({}/{} syscalls used today). Upgrade to Aegis Cloud Pro ($29/mo) for 20,000 daily syscalls.",
+                            org_owned,
                             tier.as_str(),
-                            max_ag,
-                            existing_list,
-                            clean_agent
+                            t.daily_syscalls,
+                            max_sys
                         ),
                         format!(
-                            "当前租户 '{}'（{} 免费档）最多允许 {} 个并发 Agent 运行时（当前已挂载：[{}]），无法同时接入新 Agent '{}'。升级 Aegis Cloud Pro ($29/月) 即可解锁 8 个 Agent 并行运行时与 16 个线上工作区。",
-                            org_id,
-                            tier.as_str(),
-                            max_ag,
-                            existing_list,
-                            clean_agent
+                            "当前租户 '{}' 今日免费系统调用额度已用尽（已用 {}/{} 次）。升级 Aegis Cloud Pro ($29/月) 即可解锁每日 20,000 次系统调用与 64GB 独享 OS 运行时。",
+                            org_owned, t.daily_syscalls, max_sys
                         ),
                     ));
-                } else {
-                    t.active_agents.push(clean_agent.to_string());
-                    t.updated_at_ms = now;
                 }
-            }
 
-            if viol.is_none() && t.daily_syscalls >= max_sys {
-                viol = Some((
-                    "PAYWALL_DAILY_SYSCALL_LIMIT",
-                    format!(
-                        "Daily MCP syscall quota reached for tenant '{}' on {} plan ({}/{} syscalls used today). Upgrade to Aegis Cloud Pro ($29/mo) for 20,000 daily syscalls.",
-                        org_id,
-                        tier.as_str(),
-                        t.daily_syscalls,
-                        max_sys
-                    ),
-                    format!(
-                        "当前租户 '{}' 今日免费系统调用额度已用尽（已用 {}/{} 次）。升级 Aegis Cloud Pro ($29/月) 即可解锁每日 20,000 次系统调用与 64GB 独享 OS 运行时。",
-                        org_id, t.daily_syscalls, max_sys
-                    ),
-                ));
-            }
+                if viol.is_none() && tool_owned == "proc_exec" && t.daily_exec_ms >= max_ex {
+                    viol = Some((
+                        "PAYWALL_DAILY_EXEC_TIME_LIMIT",
+                        format!(
+                            "Daily sandbox CPU execution quota reached for tenant '{}' on {} plan ({} ms / {} ms used today). Upgrade to Aegis Cloud Pro ($29/mo) for 10 hours/day of 64GB sandbox compute.",
+                            org_owned,
+                            tier.as_str(),
+                            t.daily_exec_ms,
+                            max_ex
+                        ),
+                        format!(
+                            "当前租户 '{}' 今日免费沙箱 CPU 执行时长已达上限（已用 {}s / {}s）。升级 Aegis Cloud Pro ($29/月) 即可解锁每日 10 小时 64GB 独享沙箱算力。",
+                            org_owned,
+                            t.daily_exec_ms / 1000,
+                            max_ex / 1000
+                        ),
+                    ));
+                }
 
-            if viol.is_none() && tool_name == "proc_exec" && t.daily_exec_ms >= max_ex {
-                viol = Some((
-                    "PAYWALL_DAILY_EXEC_TIME_LIMIT",
-                    format!(
-                        "Daily sandbox CPU execution quota reached for tenant '{}' on {} plan ({} ms / {} ms used today). Upgrade to Aegis Cloud Pro ($29/mo) for 10 hours/day of 64GB sandbox compute.",
-                        org_id,
-                        tier.as_str(),
-                        t.daily_exec_ms,
-                        max_ex
-                    ),
-                    format!(
-                        "当前租户 '{}' 今日免费沙箱 CPU 执行时长已达上限（已用 {}s / {}s）。升级 Aegis Cloud Pro ($29/月) 即可解锁每日 10 小时 64GB 独享沙箱算力。",
-                        org_id,
-                        t.daily_exec_ms / 1000,
-                        max_ex / 1000
-                    ),
-                ));
-            }
-
-            (
-                tier,
-                max_ag,
-                t.daily_syscalls,
-                max_sys,
-                t.daily_exec_ms,
-                max_ex,
-                t.active_agents.clone(),
-                viol,
-            )
-        };
-        let _ = self.flush().await;
+                Ok((
+                    tier,
+                    max_ag,
+                    t.daily_syscalls,
+                    max_sys,
+                    t.daily_exec_ms,
+                    max_ex,
+                    t.active_agents.clone(),
+                    viol,
+                ))
+            })
+            .await
+            .unwrap_or_else(|_| {
+                (
+                    PlanTier::Community,
+                    1,
+                    0,
+                    PlanTier::Community.max_daily_syscalls(),
+                    0,
+                    PlanTier::Community.max_daily_exec_ms(),
+                    Vec::new(),
+                    None,
+                )
+            });
 
         if let Some((code, reason_en, reason_zh)) = violation {
             let checkout = self.build_checkout_info(org_id, PlanTier::Pro, None, None);
@@ -994,36 +1186,66 @@ impl PaasControlPlane {
 
     /// Starts a checkout: like [`Self::build_checkout_info`], plus a one-time `claim_token` that is
     /// the only credential able to collect the API key minted when this checkout is paid.
+    /// Rejects unauthenticated checkouts targeting an existing org (one with API keys or active subscriptions)
+    /// to prevent checkout hijack / enumeration attacks (`CHECKOUT_ORG_EXISTS`).
     pub async fn create_checkout(
         &self,
         org_id: &str,
         plan_tier: PlanTier,
         customer_email: Option<&str>,
+        caller_org: Option<&str>,
+        is_operator: bool,
     ) -> anyhow::Result<Value> {
-        self.reload().await;
+        let org_clean = org_id.trim();
+        Self::validate_identifier("org_id", org_clean)?;
+        let org_owned = org_clean.to_string();
+        let caller_org_owned = caller_org.map(str::to_string);
         let claim_id = format!("clm-{}", &Uuid::new_v4().simple().to_string()[..12]);
         let claim_token = format!("ct_{}{}", Uuid::new_v4().simple(), Uuid::new_v4().simple());
-        {
-            let mut state = self.state.write().await;
+        let token_sha256 = Self::sha256_hex(&claim_token);
+        let claim_id_clone = claim_id.clone();
+
+        self.with_state_mut(move |state| {
+            let org_exists = state.api_keys.iter().any(|k| k.org_id == org_owned)
+                || state
+                    .subscriptions
+                    .iter()
+                    .any(|s| s.org_id == org_owned && s.status == "active");
+            if org_exists
+                && !is_operator
+                && caller_org_owned.as_deref() != Some(org_owned.as_str())
+            {
+                bail!(
+                    "CHECKOUT_ORG_EXISTS: Org '{}' already exists; authenticate with a Bearer key for that org or an operator token to create a new checkout",
+                    org_owned
+                );
+            }
+
             state.pending_claims.push(PendingClaimRecord {
-                claim_id: claim_id.clone(),
-                token_sha256: Self::sha256_hex(&claim_token),
-                org_id: org_id.to_string(),
+                claim_id: claim_id_clone,
+                token_sha256,
+                org_id: org_owned.clone(),
                 created_at_ms: Utc::now().timestamp_millis(),
             });
-            let for_org = state.pending_claims.iter().filter(|c| c.org_id == org_id).count();
+            let for_org = state
+                .pending_claims
+                .iter()
+                .filter(|c| c.org_id == org_owned)
+                .count();
             let mut excess = for_org.saturating_sub(Self::MAX_PENDING_CLAIMS_PER_ORG);
             state.pending_claims.retain(|c| {
-                if excess > 0 && c.org_id == org_id {
+                if excess > 0 && c.org_id == org_owned {
                     excess -= 1;
                     false
                 } else {
                     true
                 }
             });
-        }
-        self.flush().await?;
-        let mut info = self.build_checkout_info(org_id, plan_tier, customer_email, Some(&claim_id));
+            Ok(())
+        })
+        .await?;
+
+        let mut info = self.build_checkout_info(org_clean, plan_tier, customer_email, Some(&claim_id));
         if let Some(obj) = info.as_object_mut() {
             obj.insert("claim_id".into(), json!(claim_id));
             obj.insert("claim_token".into(), json!(claim_token));
@@ -1071,6 +1293,16 @@ impl PaasControlPlane {
         } else {
             "polar"
         };
+
+        // Never downgrade/hibernate an existing paid org when an unpaid checkout session expires.
+        if event_type.contains("checkout") && event_type.contains("expir") {
+            return Ok(json!({
+                "status": "ignored",
+                "provider": provider,
+                "event_type": event_type,
+                "reason": "unpaid checkout session expiration does not affect existing subscriptions"
+            }));
+        }
 
         let data_node = payload
             .get("data")
@@ -1160,13 +1392,14 @@ impl PaasControlPlane {
             PlanTier::Pro
         };
 
-        let sub_id = data_node
-            .get("id")
-            .and_then(|v| {
-                v.as_str()
-                    .map(|s| s.to_string())
-                    .or_else(|| v.as_i64().map(|n| n.to_string()))
-            })
+        let explicit_sub_id = data_node.get("id").and_then(|v| {
+            v.as_str()
+                .map(|s| s.trim().to_string())
+                .filter(|s| !s.is_empty())
+                .or_else(|| v.as_i64().map(|n| n.to_string()))
+        });
+        let sub_id = explicit_sub_id
+            .clone()
             .unwrap_or_else(|| format!("sub-{}", &Uuid::new_v4().to_string()[..8]));
 
         let is_cancel = event_type.contains("cancel")
@@ -1177,35 +1410,77 @@ impl PaasControlPlane {
         let now = Utc::now().timestamp_millis();
 
         if is_cancel {
-            let mut revoked_keys = Vec::new();
-            let ws_ids_to_hibernate: Vec<String> = {
-                let mut state = self.state.write().await;
-                for sub in state.subscriptions.iter_mut() {
-                    if sub.org_id == org_id || sub.subscription_id == sub_id {
-                        sub.status = "canceled".to_string();
-                        sub.claimable_api_key = None;
-                        sub.updated_at_ms = now;
-                        if let Some(ref kid) = sub.issued_key_id {
-                            revoked_keys.push(kid.clone());
+            let Some(req_sub_id) = explicit_sub_id else {
+                return Ok(json!({
+                    "status": "ignored",
+                    "provider": provider,
+                    "event_type": event_type,
+                    "reason": "cancellation webhook missing explicit subscription id"
+                }));
+            };
+            let req_sub_owned = req_sub_id.clone();
+            let (revoked_keys, target_orgs, ws_to_hibernate) = self
+                .with_state_mut(move |state| {
+                    let mut revoked = Vec::new();
+                    let mut orgs: Vec<String> = Vec::new();
+                    for sub in state.subscriptions.iter_mut() {
+                        // Exact match by provider subscription_id only; never bulk-revoke by unverified metadata.org_id.
+                        if sub.subscription_id == req_sub_owned {
+                            sub.status = "canceled".to_string();
+                            sub.claimable_api_key = None;
+                            sub.updated_at_ms = now;
+                            if let Some(ref kid) = sub.issued_key_id {
+                                revoked.push(kid.clone());
+                            }
+                            if !orgs.contains(&sub.org_id) {
+                                orgs.push(sub.org_id.clone());
+                            }
                         }
                     }
-                }
-                if !revoked_keys.is_empty() {
-                    state.api_keys.retain(|k| !revoked_keys.contains(&k.key_id));
-                }
-                state
-                    .workspaces
-                    .iter()
-                    .filter(|w| w.org_id == org_id && w.status == WorkspaceLifecycleState::Active)
-                    .map(|w| w.workspace_id.clone())
-                    .collect()
-            };
-            self.flush().await?;
+                    if !revoked.is_empty() {
+                        state.api_keys.retain(|k| !revoked.contains(&k.key_id));
+                    }
+                    let ws: Vec<(String, String)> = state
+                        .workspaces
+                        .iter()
+                        .filter(|w| {
+                            orgs.contains(&w.org_id)
+                                && w.status == WorkspaceLifecycleState::Active
+                        })
+                        .map(|w| (w.org_id.clone(), w.workspace_id.clone()))
+                        .collect();
+                    Ok((revoked, orgs, ws))
+                })
+                .await?;
 
-            let tenant = self.set_tenant_plan(&org_id, PlanTier::Community).await?;
+            if target_orgs.is_empty() {
+                return Ok(json!({
+                    "status": "ignored",
+                    "provider": provider,
+                    "event_type": event_type,
+                    "subscription_id": req_sub_id,
+                    "reason": "no matching active subscription_id"
+                }));
+            }
+
+            let mut primary_plan = PlanTier::Community;
+            for matched_org in &target_orgs {
+                // Only downgrade to Community if the org has no remaining active subscription.
+                let still_paid = {
+                    let state = self.state.read().await;
+                    state
+                        .subscriptions
+                        .iter()
+                        .any(|s| s.org_id == *matched_org && s.status == "active")
+                };
+                if !still_paid {
+                    let tenant = self.set_tenant_plan(matched_org, PlanTier::Community).await?;
+                    primary_plan = tenant.plan_tier;
+                }
+            }
             let mut hibernated = Vec::new();
-            for ws_id in ws_ids_to_hibernate {
-                if self.hibernate_workspace(kernel, &org_id, &ws_id).await.is_ok() {
+            for (ws_org, ws_id) in ws_to_hibernate {
+                if self.hibernate_workspace(kernel, &ws_org, &ws_id).await.is_ok() {
                     hibernated.push(ws_id);
                 }
             }
@@ -1214,9 +1489,9 @@ impl PaasControlPlane {
                 "status": "subscription_canceled",
                 "provider": provider,
                 "event_type": event_type,
-                "subscription_id": sub_id,
-                "org_id": org_id,
-                "downgraded_plan": tenant.plan_tier,
+                "subscription_id": req_sub_id,
+                "org_id": target_orgs.first().cloned().unwrap_or(org_id),
+                "downgraded_plan": primary_plan,
                 "revoked_key_ids": revoked_keys,
                 "hibernated_workspaces": hibernated
             }));
@@ -1257,14 +1532,16 @@ impl PaasControlPlane {
             updated_at_ms: now,
         };
 
-        {
-            let mut state = self.state.write().await;
+        let org_owned = org_id.clone();
+        let sub_id_owned = sub_id.clone();
+        self.with_state_mut(move |state| {
             state
                 .subscriptions
-                .retain(|s| !(s.org_id == org_id && s.subscription_id == sub_id));
+                .retain(|s| !(s.org_id == org_owned && s.subscription_id == sub_id_owned));
             state.subscriptions.push(sub_record);
-        }
-        self.flush().await?;
+            Ok(())
+        })
+        .await?;
 
         Ok(json!({
             "status": "subscription_activated",
@@ -1285,49 +1562,58 @@ impl PaasControlPlane {
     /// Collects the `ak_live_*` key minted for a paid checkout. Requires the one-time claim token
     /// returned by [`Self::create_checkout`]; an org id or email alone is not proof of payment.
     pub async fn claim_subscription_key(&self, claim_token: &str) -> anyhow::Result<Value> {
-        self.reload().await;
         let token = claim_token.trim();
         if token.is_empty() {
             bail!("Missing claim_token (returned by `aegis-os cloud subscribe` when the checkout was started)");
         }
         let hash = Self::sha256_hex(token);
-        let mut state = self.state.write().await;
-        let pending = state
-            .pending_claims
-            .iter()
-            .find(|c| Self::secrets_match(&c.token_sha256, &hash))
-            .cloned()
-            .context("Unknown or already used claim token")?;
-        let sub = state
-            .subscriptions
-            .iter_mut()
-            .rev()
-            .find(|s| s.status == "active" && s.claim_id.as_deref() == Some(pending.claim_id.as_str()))
-            .context("Checkout not paid yet: no active subscription for this claim token (retry after the payment webhook arrives)")?;
-        let claimed_key = sub
-            .claimable_api_key
-            .take()
-            .context("Subscription API key has already been claimed (use `aegis-os cloud keys --create` to mint an additional key)")?;
-        let out = json!({
-            "status": "subscription_claimed",
-            "subscription_id": sub.subscription_id,
-            "provider": sub.provider,
-            "org_id": sub.org_id,
-            "customer_email": sub.customer_email,
-            "plan_tier": sub.plan_tier,
-            "api_key": claimed_key
-        });
-        state.pending_claims.retain(|c| c.claim_id != pending.claim_id);
-        let has_approver = state.approvers.iter().any(|a| a.org_id == pending.org_id);
-        drop(state);
-        self.flush().await?;
+        let (mut out, has_approver, pending_org_id) = self
+            .with_state_mut(move |state| {
+                let pending = state
+                    .pending_claims
+                    .iter()
+                    .find(|c| Self::secrets_match(&c.token_sha256, &hash))
+                    .cloned()
+                    .context("Unknown or already used claim token")?;
+                let sub = state
+                    .subscriptions
+                    .iter_mut()
+                    .rev()
+                    .find(|s| {
+                        s.status == "active"
+                            && s.claim_id.as_deref() == Some(pending.claim_id.as_str())
+                    })
+                    .context("Checkout not paid yet: no active subscription for this claim token (retry after the payment webhook arrives)")?;
+                let claimed_key = sub
+                    .claimable_api_key
+                    .take()
+                    .context("Subscription API key has already been claimed (use `aegis-os cloud keys --create` to mint an additional key)")?;
+                let out = json!({
+                    "status": "subscription_claimed",
+                    "subscription_id": sub.subscription_id,
+                    "provider": sub.provider,
+                    "org_id": sub.org_id,
+                    "customer_email": sub.customer_email,
+                    "plan_tier": sub.plan_tier,
+                    "api_key": claimed_key
+                });
+                state
+                    .pending_claims
+                    .retain(|c| c.claim_id != pending.claim_id);
+                let has_approver = state.approvers.iter().any(|a| a.org_id == pending.org_id);
+                Ok((out, has_approver, pending.org_id))
+            })
+            .await?;
+
         // The claim token can sit on disk where an agent may read it, so the claim itself never
         // hands out the approver secret. Instead the enrollment link goes to the billing email,
         // which comes from the payment provider.
-        let mut out = out;
         if !has_approver {
             out["approver_enrollment"] = match out["customer_email"].as_str().map(str::to_string) {
-                Some(email) => match self.request_approver_email_enrollment(&pending.org_id, &email).await {
+                Some(email) => match self
+                    .request_approver_email_enrollment(&pending_org_id, &email)
+                    .await
+                {
                     Ok(_) => json!({ "status": "email_sent", "email": crate::approver::mask_email(&email) }),
                     Err(e) => json!({ "status": "not_sent", "reason": e.to_string() }),
                 },
@@ -1387,6 +1673,7 @@ impl PaasControlPlane {
     /// Mails a one-time enrollment link. The address must match the org's existing approver or
     /// billing email when there is one, so a tenant key alone cannot redirect enrollment.
     pub async fn request_approver_email_enrollment(&self, org_id: &str, email: &str) -> anyhow::Result<Value> {
+        let org_clean = aos_vfs::vault::sanitize_and_validate_org_id(org_id)?;
         let email = email.trim().to_lowercase();
         if !crate::approver::valid_email(&email) {
             bail!("Invalid email address");
@@ -1395,51 +1682,59 @@ impl PaasControlPlane {
         if !mailer.is_enabled() {
             bail!("Email enrollment is not configured on this Aegis Cloud node (ask the operator)");
         }
-        self.reload().await;
         let token = format!("aet_{}{}", Uuid::new_v4().simple(), Uuid::new_v4().simple());
-        {
-            let mut state = self.state.write().await;
+        let token_hash = Self::sha256_hex(&token);
+        let org_owned = org_clean.clone();
+        let email_owned = email.clone();
+        let token_hash_insert = token_hash.clone();
+        self.with_state_mut(move |state| {
             let bound = state
                 .approvers
                 .iter()
-                .find(|a| a.org_id == org_id)
+                .find(|a| a.org_id == org_owned)
                 .and_then(|a| a.email.clone())
                 .or_else(|| {
                     state
                         .subscriptions
                         .iter()
                         .rev()
-                        .find(|s| s.org_id == org_id && s.status == "active")
+                        .find(|s| s.org_id == org_owned && s.status == "active")
                         .and_then(|s| s.customer_email.clone())
                 })
                 .map(|e| e.trim().to_lowercase());
             if let Some(bound) = bound {
-                if bound != email {
+                if bound != email_owned {
                     bail!(
                         "Org '{}' is bound to {}; enrollment links can only go to that address",
-                        org_id,
+                        org_owned,
                         crate::approver::mask_email(&bound)
                     );
                 }
             }
             let now = Utc::now().timestamp_millis();
             state.approver_enrollments.retain(|e| e.expires_at_ms > now);
-            if state.approver_enrollments.iter().filter(|e| e.org_id == org_id).count()
+            if state
+                .approver_enrollments
+                .iter()
+                .filter(|e| e.org_id == org_owned)
+                .count()
                 >= Self::MAX_PENDING_ENROLLMENTS_PER_ORG
             {
-                bail!("Too many pending enrollment links for org '{}'; use the latest email or wait 30 minutes", org_id);
+                bail!("Too many pending enrollment links for org '{}'; use the latest email or wait 30 minutes", org_owned);
             }
             state.approver_enrollments.push(ApproverEnrollmentRecord {
-                token_sha256: Self::sha256_hex(&token),
-                org_id: org_id.to_string(),
-                email: email.clone(),
+                token_sha256: token_hash_insert,
+                org_id: org_owned,
+                email: email_owned,
                 expires_at_ms: now + Self::ENROLLMENT_LINK_TTL_MS,
             });
-        }
-        self.flush().await?;
+            Ok(())
+        })
+        .await?;
+
         let link = format!("{}/approver/enroll?token={}", self.public_url.read().unwrap(), token);
         let body = format!(
-            "Someone asked to make this address the approver for Aegis Cloud org '{org_id}'.\n\n\
+            "Someone asked to make this address the approver for Aegis Cloud org '{org_clean}'.\n\n\
              Open this link within 30 minutes to enroll your authenticator app:\n{link}\n\n\
              If this wasn't you, ignore this email; nothing changes until the link is used."
         );
@@ -1449,21 +1744,24 @@ impl PaasControlPlane {
         .await
         .context("mail task failed")?;
         if let Err(e) = mail_result {
-            let hash = Self::sha256_hex(&token);
-            self.state.write().await.approver_enrollments.retain(|r| r.token_sha256 != hash);
-            self.flush().await?;
+            let _ = self
+                .with_state_mut(move |state| {
+                    state
+                        .approver_enrollments
+                        .retain(|r| r.token_sha256 != token_hash);
+                    Ok(())
+                })
+                .await;
             return Err(e);
         }
-        Ok(json!({ "status": "enrollment_email_sent", "org_id": org_id, "expires_in_secs": Self::ENROLLMENT_LINK_TTL_MS / 1000 }))
+        Ok(json!({ "status": "enrollment_email_sent", "org_id": org_clean, "expires_in_secs": Self::ENROLLMENT_LINK_TTL_MS / 1000 }))
     }
 
     /// Redeems a mailed link: (re)enrolls the org's approver and returns the secret, once.
     pub async fn confirm_approver_email_enrollment(&self, token: &str) -> anyhow::Result<Value> {
-        self.reload().await;
         let hash = Self::sha256_hex(token.trim());
         let now = Utc::now().timestamp_millis();
-        let out = {
-            let mut state = self.state.write().await;
+        self.with_state_mut(move |state| {
             let rec = state
                 .approver_enrollments
                 .iter()
@@ -1472,30 +1770,34 @@ impl PaasControlPlane {
                 .context("This enrollment link is invalid, expired or already used")?;
             // One approver device per org: every outstanding link for it dies with this one.
             state.approver_enrollments.retain(|e| e.org_id != rec.org_id);
-            Self::new_approver(&mut state, &rec.org_id, Some(rec.email.clone()), "email")
-        };
-        self.flush().await?;
-        Ok(out)
+            Ok(Self::new_approver(
+                state,
+                &rec.org_id,
+                Some(rec.email.clone()),
+                "email",
+            ))
+        })
+        .await
     }
 
     /// Checks an approver's TOTP code for `org_id`, with replay protection and a lockout after
     /// repeated failures.
     pub async fn verify_approver_code(&self, org_id: &str, code: &str) -> anyhow::Result<()> {
-        self.reload().await;
         let now = Utc::now();
         let now_ms = now.timestamp_millis();
-        let result = {
-            let mut state = self.state.write().await;
+        let org_owned = org_id.to_string();
+        let code_owned = code.to_string();
+        self.with_state_mut_always_flush(move |state| {
             let approver = state
                 .approvers
                 .iter_mut()
-                .find(|a| a.org_id == org_id)
+                .find(|a| a.org_id == org_owned)
                 .context("No approver enrolled for this org (`aegis-os cloud approver enroll --email <you>`)")?;
             if approver.locked_until_ms > now_ms {
                 bail!("Too many wrong codes; approvals for this org are locked for a few minutes");
             }
             let secret = hex::decode(&approver.secret_hex).context("corrupt approver secret")?;
-            match crate::approver::match_totp(&secret, code, now.timestamp()) {
+            match crate::approver::match_totp(&secret, &code_owned, now.timestamp()) {
                 Some(step) if step > approver.last_used_step => {
                     approver.last_used_step = step;
                     approver.failed_attempts = 0;
@@ -1511,23 +1813,20 @@ impl PaasControlPlane {
                     Err(anyhow::anyhow!("Wrong approval code"))
                 }
             }
-        };
-        self.flush().await?;
-        result
+        })
+        .await
     }
 
     /// Operator reset, e.g. when an approver loses their phone.
     pub async fn remove_approver(&self, org_id: &str) -> anyhow::Result<bool> {
-        self.reload().await;
-        let removed = {
-            let mut state = self.state.write().await;
+        let org_owned = org_id.to_string();
+        self.with_state_mut(move |state| {
             let before = state.approvers.len();
-            state.approvers.retain(|a| a.org_id != org_id);
-            state.approver_enrollments.retain(|e| e.org_id != org_id);
-            before != state.approvers.len()
-        };
-        self.flush().await?;
-        Ok(removed)
+            state.approvers.retain(|a| a.org_id != org_owned);
+            state.approver_enrollments.retain(|e| e.org_id != org_owned);
+            Ok(before != state.approvers.len())
+        })
+        .await
     }
 
     /// Issue a new scoped `ak_live_*` API key for a tenant organization and agent principal.
@@ -1539,7 +1838,6 @@ impl PaasControlPlane {
         workspace_id: Option<String>,
         label: &str,
     ) -> anyhow::Result<(String, TenantApiKeyRecord)> {
-        self.reload().await;
         let raw_secret = format!(
             "ak_live_{}{}",
             Uuid::new_v4().simple(),
@@ -1558,8 +1856,12 @@ impl PaasControlPlane {
             label: label.to_string(),
             created_at_ms: Utc::now().timestamp_millis(),
         };
-        self.state.write().await.api_keys.push(record.clone());
-        self.flush().await?;
+        let rec_insert = record.clone();
+        self.with_state_mut(move |state| {
+            state.api_keys.push(rec_insert);
+            Ok(())
+        })
+        .await?;
         Ok((raw_secret, record))
     }
 
@@ -1660,8 +1962,11 @@ impl PaasControlPlane {
             || trimmed.starts_with('-')
             || trimmed.starts_with('/')
             || trimmed.ends_with('/')
+            || trimmed.ends_with('.')
+            || trimmed.ends_with(".lock")
             || trimmed.contains("..")
             || trimmed.contains("//")
+            || trimmed.contains("@{")
             || !trimmed
                 .chars()
                 .all(|c| c.is_ascii_alphanumeric() || matches!(c, '-' | '_' | '.' | '/'))
@@ -1919,25 +2224,40 @@ impl PaasControlPlane {
             || source_url_or_path.starts_with("https://")
             || source_url_or_path.starts_with("git@")
         {
-            let status = Command::new("git")
-                .env("GIT_TERMINAL_PROMPT", "0")
-                .args([
-                    "clone",
-                    "--depth",
-                    "1",
-                    "--branch",
-                    branch,
-                    "--",
-                    source_url_or_path,
-                    &host_repo.to_string_lossy(),
-                ])
-                .status()
-                .context("Failed to spawn `git clone` for cloud workspace")?;
-            if !status.success() {
+            let parent_dir = host_repo
+                .parent()
+                .map(|p| p.to_path_buf())
+                .context("cloud workspace host_repo missing parent directory")?;
+            let clone_url = source_url_or_path.to_string();
+            let clone_branch = branch.to_string();
+            let clone_dst = host_repo.to_string_lossy().into_owned();
+            let output = tokio::task::spawn_blocking(move || -> anyhow::Result<std::process::Output> {
+                let git_bin = crate::resolve_system_git_binary()?;
+                let args = vec![
+                    "clone".to_string(),
+                    "--depth".to_string(),
+                    "1".to_string(),
+                    "--branch".to_string(),
+                    clone_branch,
+                    "--".to_string(),
+                    clone_url,
+                    clone_dst,
+                ];
+                crate::run_sanitized_host_git(
+                    &git_bin,
+                    &parent_dir,
+                    &[("protocol.file.allow", "never")],
+                    &args,
+                )
+            })
+            .await
+            .context("git clone task failed")??;
+            if !output.status.success() {
                 bail!(
-                    "git clone failed for '{}' (branch '{}')",
+                    "git clone failed for '{}' (branch '{}'): {}",
                     source_url_or_path,
-                    branch
+                    branch,
+                    String::from_utf8_lossy(&output.stderr).trim()
                 );
             }
         } else {
@@ -1950,26 +2270,43 @@ impl PaasControlPlane {
         }
 
         if !host_repo.join(".git").exists() {
-            let _ = Command::new("git")
-                .current_dir(&host_repo)
-                .args(["init", "-b", branch])
-                .output();
-            let _ = Command::new("git")
-                .current_dir(&host_repo)
-                .args(["config", "user.name", "Aegis Cloud PaaS"])
-                .output();
-            let _ = Command::new("git")
-                .current_dir(&host_repo)
-                .args(["config", "user.email", "paas@aegis-os.dev"])
-                .output();
-            let _ = Command::new("git")
-                .current_dir(&host_repo)
-                .args(["add", "-A"])
-                .output();
-            let _ = Command::new("git")
-                .current_dir(&host_repo)
-                .args(["commit", "-m", "chore: initial cloud workspace baseline", "--allow-empty"])
-                .output();
+            let repo_init = host_repo.clone();
+            let branch_owned = branch.to_string();
+            tokio::task::spawn_blocking(move || {
+                if let Ok(git_bin) = crate::resolve_system_git_binary() {
+                    let _ = crate::run_sanitized_host_git(
+                        &git_bin,
+                        &repo_init,
+                        &[],
+                        &["init".into(), "-b".into(), branch_owned],
+                    );
+                    let _ = crate::run_sanitized_host_git(
+                        &git_bin,
+                        &repo_init,
+                        &[],
+                        &["config".into(), "user.name".into(), "Aegis Cloud PaaS".into()],
+                    );
+                    let _ = crate::run_sanitized_host_git(
+                        &git_bin,
+                        &repo_init,
+                        &[],
+                        &["config".into(), "user.email".into(), "paas@aegis-os.dev".into()],
+                    );
+                    let _ = crate::run_sanitized_host_git(&git_bin, &repo_init, &[], &["add".into(), "-A".into()]);
+                    let _ = crate::run_sanitized_host_git(
+                        &git_bin,
+                        &repo_init,
+                        &[],
+                        &[
+                            "commit".into(),
+                            "-m".into(),
+                            "chore: initial cloud workspace baseline".into(),
+                            "--allow-empty".into(),
+                        ],
+                    );
+                }
+            })
+            .await?;
         }
 
         for agent_id in &agent_list {
@@ -2002,14 +2339,17 @@ impl PaasControlPlane {
             cow_saved_bytes: cow_saved,
         };
 
-        {
-            let mut state = self.state.write().await;
+        let org_owned = org_id.to_string();
+        let ws_id_owned = ws_id.clone();
+        let rec_insert = record.clone();
+        self.with_state_mut(move |state| {
             state
                 .workspaces
-                .retain(|w| !(w.org_id == org_id && w.workspace_id == ws_id));
-            state.workspaces.push(record.clone());
-        }
-        self.flush().await?;
+                .retain(|w| !(w.org_id == org_owned && w.workspace_id == ws_id_owned));
+            state.workspaces.push(rec_insert);
+            Ok(())
+        })
+        .await?;
         let _ = self
             .record_usage(org_id, Some(&ws_id), 1, 0, cow_saved)
             .await;
@@ -2024,46 +2364,43 @@ impl PaasControlPlane {
         org_id: &str,
         workspace_id: &str,
     ) -> anyhow::Result<CloudWorkspaceRecord> {
-        self.reload().await;
         let now = Utc::now().timestamp_millis();
-        let record = {
-            let mut state = self.state.write().await;
-            let ws = state
-                .workspaces
-                .iter_mut()
-                .find(|w| (org_id == "*" || w.org_id == org_id) && w.workspace_id == workspace_id)
-                .with_context(|| {
-                    format!(
-                        "Cloud workspace '{}/{}' not found",
-                        org_id, workspace_id
-                    )
-                })?;
-            ws.status = WorkspaceLifecycleState::Hibernated;
-            ws.hibernated_at_ms = Some(now);
-            let cloned = ws.clone();
-            if let Some(t) = state.tenants.iter_mut().find(|t| t.org_id == cloned.org_id) {
-                t.active_agents.clear();
-                t.updated_at_ms = now;
-            }
-            cloned
-        };
+        let org_owned = org_id.to_string();
+        let ws_owned = workspace_id.to_string();
+        let (record, has_other_active) = self
+            .with_state_mut(move |state| {
+                let ws = state
+                    .workspaces
+                    .iter_mut()
+                    .find(|w| {
+                        (org_owned == "*" || w.org_id == org_owned) && w.workspace_id == ws_owned
+                    })
+                    .with_context(|| {
+                        format!("Cloud workspace '{}/{}' not found", org_owned, ws_owned)
+                    })?;
+                ws.status = WorkspaceLifecycleState::Hibernated;
+                ws.hibernated_at_ms = Some(now);
+                let cloned = ws.clone();
+                if let Some(t) = state.tenants.iter_mut().find(|t| t.org_id == cloned.org_id) {
+                    t.active_agents.clear();
+                    t.updated_at_ms = now;
+                }
+                let has_other = state.workspaces.iter().any(|w| {
+                    w.org_id == cloned.org_id
+                        && w.workspace_id != cloned.workspace_id
+                        && w.status == WorkspaceLifecycleState::Active
+                });
+                Ok((cloned, has_other))
+            })
+            .await?;
         kernel
             .evict_agent_environments(&record.org_id, &record.agents)
             .await;
-        let has_other_active = {
-            let state = self.state.read().await;
-            state.workspaces.iter().any(|w| {
-                w.org_id == record.org_id
-                    && w.workspace_id != record.workspace_id
-                    && w.status == WorkspaceLifecycleState::Active
-            })
-        };
         if !has_other_active {
             let vault = kernel.vault.clone();
             let lock_org_id = record.org_id.clone();
             let _ = tokio::task::spawn_blocking(move || vault.lock_org(&lock_org_id)).await;
         }
-        self.flush().await?;
         Ok(record)
     }
 
@@ -2121,21 +2458,22 @@ impl PaasControlPlane {
         org_id: &str,
         workspace_id: &str,
     ) -> anyhow::Result<Value> {
-        self.reload().await;
-        let removed = {
-            let mut state = self.state.write().await;
-            let idx = state
-                .workspaces
-                .iter()
-                .position(|w| (org_id == "*" || w.org_id == org_id) && w.workspace_id == workspace_id)
-                .with_context(|| {
-                    format!(
-                        "Cloud workspace '{}/{}' not found",
-                        org_id, workspace_id
-                    )
-                })?;
-            state.workspaces.remove(idx)
-        };
+        let org_owned = org_id.to_string();
+        let ws_owned = workspace_id.to_string();
+        let removed = self
+            .with_state_mut(move |state| {
+                let idx = state
+                    .workspaces
+                    .iter()
+                    .position(|w| {
+                        (org_owned == "*" || w.org_id == org_owned) && w.workspace_id == ws_owned
+                    })
+                    .with_context(|| {
+                        format!("Cloud workspace '{}/{}' not found", org_owned, ws_owned)
+                    })?;
+                Ok(state.workspaces.remove(idx))
+            })
+            .await?;
         kernel
             .evict_agent_environments(&removed.org_id, &removed.agents)
             .await;
@@ -2143,7 +2481,6 @@ impl PaasControlPlane {
         if let Some(ws_dir) = removed.host_repo_path.parent() {
             let _ = tokio::fs::remove_dir_all(ws_dir).await;
         }
-        self.flush().await?;
         Ok(json!({
             "status": "deleted",
             "org_id": removed.org_id,
@@ -2159,39 +2496,52 @@ impl PaasControlPlane {
         org_id: &str,
         force: bool,
     ) -> anyhow::Result<Value> {
-        if org_id.is_empty() || org_id == "*" || org_id.contains('/') || org_id.contains("..") {
+        if org_id.is_empty()
+            || org_id == "*"
+            || org_id.contains('/')
+            || org_id.contains("..")
+            || aos_vfs::vault::sanitize_and_validate_org_id(org_id).is_err()
+        {
             bail!("Invalid org_id '{}'", org_id);
         }
-        self.reload().await;
-        let (workspaces, counts) = {
-            let mut state = self.state.write().await;
-            if !force
-                && state
-                    .subscriptions
+        let org_owned = org_id.to_string();
+        let (workspaces, counts) = self
+            .with_state_mut(move |state| {
+                if !force
+                    && state
+                        .subscriptions
+                        .iter()
+                        .any(|s| s.org_id == org_owned && s.status == "active")
+                {
+                    bail!(
+                        "Org '{}' has an active subscription; cancel it first or pass force",
+                        org_owned
+                    );
+                }
+                let mut counts = serde_json::Map::new();
+                macro_rules! purge {
+                    ($field:ident) => {{
+                        let before = state.$field.len();
+                        state.$field.retain(|r| r.org_id != org_owned);
+                        counts.insert(stringify!($field).to_string(), json!(before - state.$field.len()));
+                    }};
+                }
+                let workspaces: Vec<CloudWorkspaceRecord> = state
+                    .workspaces
                     .iter()
-                    .any(|s| s.org_id == org_id && s.status == "active")
-            {
-                bail!("Org '{}' has an active subscription; cancel it first or pass force", org_id);
-            }
-            let mut counts = serde_json::Map::new();
-            macro_rules! purge {
-                ($field:ident) => {{
-                    let before = state.$field.len();
-                    state.$field.retain(|r| r.org_id != org_id);
-                    counts.insert(stringify!($field).to_string(), json!(before - state.$field.len()));
-                }};
-            }
-            let workspaces: Vec<CloudWorkspaceRecord> =
-                state.workspaces.iter().filter(|w| w.org_id == org_id).cloned().collect();
-            purge!(api_keys);
-            purge!(workspaces);
-            purge!(tenants);
-            purge!(subscriptions);
-            purge!(pending_claims);
-            purge!(approvers);
-            purge!(approver_enrollments);
-            (workspaces, counts)
-        };
+                    .filter(|w| w.org_id == org_owned)
+                    .cloned()
+                    .collect();
+                purge!(api_keys);
+                purge!(workspaces);
+                purge!(tenants);
+                purge!(subscriptions);
+                purge!(pending_claims);
+                purge!(approvers);
+                purge!(approver_enrollments);
+                Ok((workspaces, counts))
+            })
+            .await?;
         let found = counts.values().any(|n| n.as_u64() != Some(0));
         for ws in &workspaces {
             kernel.evict_agent_environments(&ws.org_id, &ws.agents).await;
@@ -2200,7 +2550,6 @@ impl PaasControlPlane {
         let vault = kernel.vault.clone();
         let destroy_org_id = org_id.to_string();
         let _ = tokio::task::spawn_blocking(move || vault.destroy_org(&destroy_org_id)).await;
-        self.flush().await?;
         Ok(json!({ "status": if found { "deleted" } else { "not_found" }, "org_id": org_id, "removed": counts }))
     }
 
@@ -2211,34 +2560,35 @@ impl PaasControlPlane {
         org_id: &str,
         workspace_id: &str,
     ) -> anyhow::Result<(CloudWorkspaceRecord, u64)> {
-        self.reload().await;
         let started = std::time::Instant::now();
         let now = Utc::now().timestamp_millis();
-        let (record, was_hibernated) = {
-            let mut state = self.state.write().await;
-            let ws = state
-                .workspaces
-                .iter_mut()
-                .find(|w| (org_id == "*" || w.org_id == org_id) && w.workspace_id == workspace_id)
-                .with_context(|| {
-                    format!(
-                        "Cloud workspace '{}/{}' not found",
-                        org_id, workspace_id
-                    )
-                })?;
-            let was_hib = ws.status == WorkspaceLifecycleState::Hibernated;
-            ws.status = WorkspaceLifecycleState::Active;
-            ws.last_active_ms = now;
-            ws.hibernated_at_ms = None;
-            let cloned = ws.clone();
-            if was_hib {
-                if let Some(t) = state.tenants.iter_mut().find(|t| t.org_id == cloned.org_id) {
-                    t.wake_count = t.wake_count.saturating_add(1);
-                    t.updated_at_ms = now;
+        let org_owned = org_id.to_string();
+        let ws_owned = workspace_id.to_string();
+        let record = self
+            .with_state_mut(move |state| {
+                let ws = state
+                    .workspaces
+                    .iter_mut()
+                    .find(|w| {
+                        (org_owned == "*" || w.org_id == org_owned) && w.workspace_id == ws_owned
+                    })
+                    .with_context(|| {
+                        format!("Cloud workspace '{}/{}' not found", org_owned, ws_owned)
+                    })?;
+                let was_hib = ws.status == WorkspaceLifecycleState::Hibernated;
+                ws.status = WorkspaceLifecycleState::Active;
+                ws.last_active_ms = now;
+                ws.hibernated_at_ms = None;
+                let cloned = ws.clone();
+                if was_hib {
+                    if let Some(t) = state.tenants.iter_mut().find(|t| t.org_id == cloned.org_id) {
+                        t.wake_count = t.wake_count.saturating_add(1);
+                        t.updated_at_ms = now;
+                    }
                 }
-            }
-            (cloned, was_hib)
-        };
+                Ok(cloned)
+            })
+            .await?;
 
         kernel.ensure_org_vault(&record.org_id).await?;
         for agent_id in &record.agents {
@@ -2251,9 +2601,6 @@ impl PaasControlPlane {
                     vec!["*".to_string()],
                 )
                 .await?;
-        }
-        if was_hibernated {
-            self.flush().await?;
         }
         let wake_ms = started.elapsed().as_millis() as u64;
         Ok((record, wake_ms))
@@ -2464,19 +2811,12 @@ impl PaasControlPlane {
         commit_title: &str,
         overwrite_binaries: bool,
     ) -> anyhow::Result<Value> {
-        let env = kernel.get_agent_environment(identity).await?;
-        let _ = env.workspace.refresh_from_host().await?;
-        let committed_files = env
-            .workspace
-            .commit_to_host_with_options(None, overwrite_binaries)
-            .await?;
-
-        let host_root = env.workspace.host_source_root().to_path_buf();
         let target_branch = if branch_name.trim().is_empty() {
             format!("aegis/{}/{}", identity.org_id, identity.agent_id)
         } else {
             branch_name.trim().to_string()
         };
+        Self::validate_branch_name(&target_branch)?;
         let title = if commit_title.trim().is_empty() {
             format!(
                 "feat({}): automated multi-agent CoW merge commit",
@@ -2486,32 +2826,134 @@ impl PaasControlPlane {
             commit_title.trim().to_string()
         };
 
-        if !host_root.join(".git").exists() {
-            let _ = Command::new("git")
-                .current_dir(&host_root)
-                .args(["init", "-b", "main"])
-                .output();
+        let env = kernel.get_agent_environment(identity).await?;
+        let _ = env.workspace.refresh_from_host().await?;
+        let touched = env.workspace.changed_since_baseline().await?;
+        if let Some(msg) = kernel.claim_conflict_for_paths(identity, &touched).await? {
+            bail!("{}", msg);
         }
-        let _ = Command::new("git")
-            .current_dir(&host_root)
-            .args(["config", "user.name", &identity.agent_id])
-            .output();
-        let _ = Command::new("git")
-            .current_dir(&host_root)
-            .args([
-                "config",
-                "user.email",
-                &format!("{}@{}.aegis-os.dev", identity.agent_id, identity.org_id),
-            ])
-            .output();
-        let _ = Command::new("git")
-            .current_dir(&host_root)
-            .args(["checkout", "-B", &target_branch])
-            .output();
-        let _ = Command::new("git")
-            .current_dir(&host_root)
-            .args(["add", "-A"])
-            .output();
+        let base_dir = env
+            .workspace
+            .shadow_root()
+            .parent()
+            .map(|p| p.join("baseline_snapshot"))
+            .filter(|p| p.exists())
+            .unwrap_or_else(|| env.workspace.host_source_root().to_path_buf());
+        let diffs = CoWWorkspace::diff_dirs(&base_dir, env.workspace.shadow_root(), None)
+            .await
+            .unwrap_or_default();
+        let (_payload, evidence_hash) =
+            aos_core::compute_diff_evidence(&diffs, overwrite_binaries, false);
+        let audit_metadata = json!({
+            "paths": touched.clone(),
+            "host_root": env.workspace.host_source_root().display().to_string(),
+            "overwrite_binaries": overwrite_binaries,
+            "skip_verify": false,
+            "evidence_hash": evidence_hash,
+            "branch_name": target_branch,
+            "evidence": {
+                "changed_files_count": diffs.len(),
+                "paths": touched.clone(),
+                "evidence_hash": evidence_hash,
+                "overwrite_binaries": overwrite_binaries,
+                "skip_verify": false,
+            }
+        });
+
+        let matched_rule = match kernel
+            .authorize_and_audit(
+                identity,
+                "workspace_commit",
+                &identity.org_id,
+                "/workspace",
+                audit_metadata,
+            )
+            .await?
+        {
+            PolicyDecision::Allow { matched_rule } => matched_rule,
+            PolicyDecision::Ask {
+                escalation_id,
+                reason,
+                suggested_lease_scope,
+            } => {
+                if let Some(diff_dir) = self.state_file.parent().map(|p| p.join("escalation_diffs")) {
+                    let _ = tokio::fs::create_dir_all(&diff_dir).await;
+                    let _ = aos_core::session::write_json_pretty_atomic(
+                        &diff_dir.join(format!("{}.json", escalation_id)),
+                        &diffs,
+                    )
+                    .await;
+                }
+                let approval_ticket = self
+                    .issue_escalation_ticket(&identity.org_id, &escalation_id, 1_800_000)
+                    .await;
+                return Ok(json!({
+                    "status": "approval_required",
+                    "escalation_id": escalation_id,
+                    "approval_ticket": approval_ticket,
+                    "reason": reason,
+                    "suggested_lease_scope": suggested_lease_scope,
+                    "evidence_hash": evidence_hash
+                }));
+            }
+            PolicyDecision::Deny { reason } => {
+                bail!("Policy Denied syscall 'workspace_export_pr': {}", reason);
+            }
+        };
+
+        let _host_commit_lock = env.workspace.acquire_host_commit_lock().await?;
+        let frozen_dir = env
+            .workspace
+            .shadow_root()
+            .parent()
+            .unwrap_or_else(|| env.workspace.shadow_root())
+            .join(format!("pr_frozen_{}", &Uuid::new_v4().to_string()[..8]));
+        let commit_res: anyhow::Result<Vec<String>> = async {
+            CoWWorkspace::cow_sync_dir(env.workspace.shadow_root(), &frozen_dir).await?;
+            let frozen_diffs =
+                CoWWorkspace::diff_dirs(&base_dir, &frozen_dir, None)
+                    .await
+                    .unwrap_or_default();
+            let frozen_paths: Vec<String> = frozen_diffs
+                .iter()
+                .map(|d| d.relative_path.clone())
+                .collect();
+            if let Some(msg) = kernel
+                .claim_conflict_for_paths(identity, &frozen_paths)
+                .await?
+            {
+                bail!("{}", msg);
+            }
+            if let Some(bad) = frozen_paths.iter().find(|p| {
+                AegisPolicyKernel::is_commit_poisoning_path(p)
+                    && !touched.iter().any(|old| old == *p)
+            }) {
+                bail!(
+                    "Refusing PR export: shadow path '{}' was introduced after authorization",
+                    bad
+                );
+            }
+            if matched_rule.contains("#sha256:") {
+                let (_, recomputed) =
+                    aos_core::compute_diff_evidence(&frozen_diffs, overwrite_binaries, false);
+                if recomputed != evidence_hash {
+                    bail!(
+                        "PR export aborted: shadow workspace changed after SHA-256 pinned approval ({} != {})",
+                        recomputed,
+                        evidence_hash
+                    );
+                }
+            }
+            env.workspace
+                .commit_frozen_to_host_with_options(&frozen_dir, None, overwrite_binaries)
+                .await
+        }
+        .await;
+        let _ = tokio::fs::remove_dir_all(&frozen_dir).await;
+        drop(_host_commit_lock);
+        let committed_files = commit_res?;
+
+        let host_root = env.workspace.host_source_root().to_path_buf();
         let git_trailer = format!(
             "Aegis-OS-Verified: principal={}/{} workspace={} files={} merge=4tier-cow",
             identity.org_id,
@@ -2527,26 +2969,81 @@ impl PaasControlPlane {
             identity.agent_id,
             committed_files.len()
         );
-        let _ = Command::new("git")
-            .current_dir(&host_root)
-            .args(["commit", "-m", &title, "-m", &git_trailer, "--allow-empty"])
-            .output();
 
-        let commit_sha = Command::new("git")
-            .current_dir(&host_root)
-            .args(["rev-parse", "HEAD"])
-            .output()
+        let host_root_git = host_root.clone();
+        let agent_owned = identity.agent_id.clone();
+        let org_owned = identity.org_id.clone();
+        let branch_owned = target_branch.clone();
+        let title_owned = title.clone();
+        let trailer_owned = git_trailer.clone();
+        let (commit_sha, unified_patch) = tokio::task::spawn_blocking(move || -> anyhow::Result<(String, String)> {
+            let git_bin = crate::resolve_system_git_binary()?;
+            if !host_root_git.join(".git").exists() {
+                let _ = crate::run_sanitized_host_git(
+                    &git_bin,
+                    &host_root_git,
+                    &[],
+                    &["init".into(), "-b".into(), "main".into()],
+                );
+            }
+            let _ = crate::run_sanitized_host_git(
+                &git_bin,
+                &host_root_git,
+                &[],
+                &["config".into(), "user.name".into(), agent_owned.clone()],
+            );
+            let _ = crate::run_sanitized_host_git(
+                &git_bin,
+                &host_root_git,
+                &[],
+                &[
+                    "config".into(),
+                    "user.email".into(),
+                    format!("{}@{}.aegis-os.dev", agent_owned, org_owned),
+                ],
+            );
+            let _ = crate::run_sanitized_host_git(
+                &git_bin,
+                &host_root_git,
+                &[],
+                &["checkout".into(), "-B".into(), branch_owned],
+            );
+            let _ = crate::run_sanitized_host_git(&git_bin, &host_root_git, &[], &["add".into(), "-A".into()]);
+            let _ = crate::run_sanitized_host_git(
+                &git_bin,
+                &host_root_git,
+                &[],
+                &[
+                    "commit".into(),
+                    "-m".into(),
+                    title_owned,
+                    "-m".into(),
+                    trailer_owned,
+                    "--allow-empty".into(),
+                ],
+            );
+            let commit_sha = crate::run_sanitized_host_git(
+                &git_bin,
+                &host_root_git,
+                &[],
+                &["rev-parse".into(), "HEAD".into()],
+            )
             .ok()
             .map(|o| String::from_utf8_lossy(&o.stdout).trim().to_string())
             .unwrap_or_default();
-
-        let unified_patch = Command::new("git")
-            .current_dir(&host_root)
-            .args(["format-patch", "-1", "--stdout"])
-            .output()
+            let unified_patch = crate::run_sanitized_host_git(
+                &git_bin,
+                &host_root_git,
+                &[],
+                &["format-patch".into(), "-1".into(), "--stdout".into()],
+            )
             .ok()
             .map(|o| String::from_utf8_lossy(&o.stdout).to_string())
             .unwrap_or_default();
+            Ok((commit_sha, unified_patch))
+        })
+        .await
+        .context("git PR export task failed")??;
 
         let _ = self
             .record_usage(&identity.org_id, workspace_id, 1, 0, 0)
@@ -2611,26 +3108,26 @@ impl PaasControlPlane {
         let client = Self::sanitize_telemetry_token(&payload.client, "unknown", 32);
         let mode = Self::sanitize_telemetry_token(&payload.mode, "local_cow", 24);
 
-        self.reload().await;
         let now_dt = Utc::now();
         let now_ms = now_dt.timestamp_millis();
         let today = now_dt.format("%Y-%m-%d").to_string();
+        let device_id_owned = device_id.clone();
+        let today_owned = today.clone();
 
-        {
-            let mut state = self.state.write().await;
-            if !state.telemetry_devices.contains_key(&device_id)
+        self.with_state_mut(move |state| {
+            if !state.telemetry_devices.contains_key(&device_id_owned)
                 && state.telemetry_devices.len() >= Self::MAX_TELEMETRY_DEVICES
             {
                 bail!("Telemetry device capacity reached");
             }
             let rec = state
                 .telemetry_devices
-                .entry(device_id.clone())
+                .entry(device_id_owned.clone())
                 .or_insert_with(|| TelemetryDeviceRecord {
-                    device_id: device_id.clone(),
+                    device_id: device_id_owned,
                     first_seen_ms: now_ms,
                     last_seen_ms: now_ms,
-                    first_seen_day: today.clone(),
+                    first_seen_day: today_owned.clone(),
                     install_count: 0,
                     active_days: std::collections::BTreeSet::new(),
                     last_version: version.clone(),
@@ -2646,7 +3143,7 @@ impl PaasControlPlane {
             if event == "install" {
                 rec.install_count = rec.install_count.saturating_add(1);
             }
-            rec.active_days.insert(today.clone());
+            rec.active_days.insert(today_owned);
             while rec.active_days.len() > 90 {
                 if let Some(oldest) = rec.active_days.iter().next().cloned() {
                     rec.active_days.remove(&oldest);
@@ -2656,8 +3153,9 @@ impl PaasControlPlane {
                 rec.clients_used.insert(client);
             }
             rec.modes_used.insert(mode);
-        }
-        self.flush().await?;
+            Ok(())
+        })
+        .await?;
         Ok(json!({
             "status": "recorded",
             "device_id": device_id,
@@ -2897,5 +3395,129 @@ mod tests {
         assert_eq!(stats["by_client"]["claude-code"], 1);
         assert_eq!(stats["by_os_arch"]["macos-aarch64"], 1);
         assert_eq!(stats["by_os_arch"]["linux-x86_64"], 1);
+    }
+
+    #[tokio::test]
+    async fn scoped_escalation_ticket_verifies_and_rejects_tampering() {
+        let tmp = tempfile::tempdir().unwrap();
+        let paas = PaasControlPlane::new(tmp.path());
+        let ticket = paas
+            .issue_escalation_ticket("org-a", "esc-123", 60_000)
+            .await;
+        let verified = paas.verify_escalation_ticket(&ticket).await.unwrap();
+        assert_eq!(verified.org_id, "org-a");
+        assert_eq!(verified.escalation_id, "esc-123");
+
+        let mut chars: Vec<char> = ticket.chars().collect();
+        let last = chars.len() - 1;
+        chars[last] = if chars[last] == '0' { '1' } else { '0' };
+        let tampered: String = chars.into_iter().collect();
+        assert!(paas.verify_escalation_ticket(&tampered).await.is_none());
+    }
+
+    #[tokio::test]
+    async fn concurrent_totp_verification_prevents_replay_race() {
+        let tmp = tempfile::tempdir().unwrap();
+        let paas = std::sync::Arc::new(PaasControlPlane::new(tmp.path()));
+        let outbox = tmp.path().join("outbox");
+        paas.set_mailer(
+            crate::approver::Mailer::Directory(outbox.clone()),
+            "https://cloud.example",
+        );
+        paas.request_approver_email_enrollment("acme", "a@acme.dev")
+            .await
+            .unwrap();
+        let mail = std::fs::read_dir(&outbox).unwrap().next().unwrap().unwrap().path();
+        let token = std::fs::read_to_string(mail)
+            .unwrap()
+            .split("token=")
+            .nth(1)
+            .unwrap()
+            .split_whitespace()
+            .next()
+            .unwrap()
+            .to_string();
+        let enrolled = paas.confirm_approver_email_enrollment(&token).await.unwrap();
+        let secret_b32 = enrolled["secret"].as_str().unwrap();
+        let mut bits = 0u32;
+        let mut buf = 0u32;
+        let mut secret = Vec::new();
+        for c in secret_b32.bytes() {
+            let v = b"ABCDEFGHIJKLMNOPQRSTUVWXYZ234567"
+                .iter()
+                .position(|x| *x == c)
+                .unwrap() as u32;
+            buf = (buf << 5) | v;
+            bits += 5;
+            if bits >= 8 {
+                secret.push((buf >> (bits - 8)) as u8);
+                bits -= 8;
+            }
+        }
+        let step = crate::approver::totp_step(Utc::now().timestamp()) as u64;
+        let code = format!("{:06}", crate::approver::hotp(&secret, step));
+
+        let p1 = paas.clone();
+        let p2 = paas.clone();
+        let c1 = code.clone();
+        let c2 = code.clone();
+        let (r1, r2) = tokio::join!(
+            p1.verify_approver_code("acme", &c1),
+            p2.verify_approver_code("acme", &c2)
+        );
+        let ok_count = [r1.is_ok(), r2.is_ok()].into_iter().filter(|&b| b).count();
+        assert_eq!(ok_count, 1, "exactly one concurrent TOTP verify must win");
+    }
+
+    #[tokio::test]
+    async fn billing_webhook_ignores_checkout_expired_and_requires_matching_sub_id() {
+        let tmp = tempfile::tempdir().unwrap();
+        let kernel = AegisRuntimeKernel::new(&tmp.path().join("rt")).await.unwrap();
+        let sub_resp = kernel
+            .paas
+            .handle_billing_webhook(
+                &kernel,
+                &json!({
+                    "type": "subscription.created",
+                    "data": {
+                        "id": "sub_real_42",
+                        "metadata": { "org_id": "paid-org", "plan_tier": "pro" }
+                    }
+                }),
+            )
+            .await
+            .unwrap();
+        assert_eq!(sub_resp["status"], "subscription_activated");
+        assert_eq!(kernel.paas.get_tenant_plan("paid-org").await, PlanTier::Pro);
+
+        // Unpaid checkout expiration must NOT downgrade an active org
+        let exp_resp = kernel
+            .paas
+            .handle_billing_webhook(
+                &kernel,
+                &json!({
+                    "type": "checkout.session.expired",
+                    "data": { "id": "cs_unpaid", "metadata": { "org_id": "paid-org" } }
+                }),
+            )
+            .await
+            .unwrap();
+        assert_eq!(exp_resp["status"], "ignored");
+        assert_eq!(kernel.paas.get_tenant_plan("paid-org").await, PlanTier::Pro);
+
+        // Cancel with wrong subscription_id must NOT cancel `paid-org`
+        let wrong_cancel = kernel
+            .paas
+            .handle_billing_webhook(
+                &kernel,
+                &json!({
+                    "type": "subscription.canceled",
+                    "data": { "id": "sub_attacker_fake", "metadata": { "org_id": "paid-org" } }
+                }),
+            )
+            .await
+            .unwrap();
+        assert_eq!(wrong_cancel["status"], "ignored");
+        assert_eq!(kernel.paas.get_tenant_plan("paid-org").await, PlanTier::Pro);
     }
 }

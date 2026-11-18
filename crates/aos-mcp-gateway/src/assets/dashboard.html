@@ -1519,13 +1519,18 @@
 
           const infoDiv = document.createElement('div');
           infoDiv.style.minWidth = '0';
-          infoDiv.innerHTML =
-            '<strong style="font-family:var(--font-mono); font-size:0.8rem;">' + (l.action_pattern || l.action || 'workspace_commit') + '</strong>' +
-            '<div style="font-size:0.74rem; color:var(--ink-muted); word-break:break-all;">' +
-              'Agent: ' + (l.agent_id || '*') +
-              ' · Scope: <code>' + shortScope + '</code>' +
-              ' · ' + ttlLabel +
-            '</div>';
+          const titleStrong = document.createElement('strong');
+          titleStrong.style.cssText = 'font-family:var(--font-mono); font-size:0.8rem;';
+          titleStrong.textContent = l.action_pattern || l.action || 'workspace_commit';
+          infoDiv.appendChild(titleStrong);
+          const metaDiv = document.createElement('div');
+          metaDiv.style.cssText = 'font-size:0.74rem; color:var(--ink-muted); word-break:break-all;';
+          metaDiv.appendChild(document.createTextNode('Agent: ' + (l.agent_id || '*') + ' · Scope: '));
+          const scopeCode = document.createElement('code');
+          scopeCode.textContent = shortScope;
+          metaDiv.appendChild(scopeCode);
+          metaDiv.appendChild(document.createTextNode(' · ' + ttlLabel));
+          infoDiv.appendChild(metaDiv);
           row.appendChild(infoDiv);
 
           const rightDiv = document.createElement('div');
@@ -1564,10 +1569,20 @@
         for (const ws of workspaces) {
           const row = document.createElement('div');
           row.className = 'item-row';
-          row.innerHTML =
-            '<div><strong style="font-family:var(--font-mono); font-size:0.8rem;">' + (ws.workspace_id || ws.agent_id || 'workspace') + '</strong>' +
-            '<div style="font-size:0.75rem; color:var(--ink-muted);">State: ' + (ws.state || 'Active') + '</div></div>' +
-            '<span class="badge badge-ok">CoW Shadow</span>';
+          const leftDiv = document.createElement('div');
+          const wsStrong = document.createElement('strong');
+          wsStrong.style.cssText = 'font-family:var(--font-mono); font-size:0.8rem;';
+          wsStrong.textContent = ws.workspace_id || ws.agent_id || 'workspace';
+          leftDiv.appendChild(wsStrong);
+          const stateDiv = document.createElement('div');
+          stateDiv.style.cssText = 'font-size:0.75rem; color:var(--ink-muted);';
+          stateDiv.textContent = 'State: ' + (ws.state || 'Active');
+          leftDiv.appendChild(stateDiv);
+          row.appendChild(leftDiv);
+          const cowBadge = document.createElement('span');
+          cowBadge.className = 'badge badge-ok';
+          cowBadge.textContent = 'CoW Shadow';
+          row.appendChild(cowBadge);
           wsRoot.appendChild(row);
         }
       }

@@ -20,7 +20,11 @@ pub enum RoutingMode {
 
 impl RoutingMode {
     pub fn from_env() -> Self {
-        match std::env::var("AOS_ROUTING").unwrap_or_default().to_ascii_lowercase().as_str() {
+        Self::from_str_opt(std::env::var("AOS_ROUTING").ok().as_deref())
+    }
+
+    pub fn from_str_opt(val: Option<&str>) -> Self {
+        match val.unwrap_or_default().trim().to_ascii_lowercase().as_str() {
             "advise" | "warn" => RoutingMode::Advise,
             "off" | "0" | "false" | "disabled" => RoutingMode::Off,
             _ => RoutingMode::Enforce,
@@ -222,6 +226,12 @@ const CREDENTIAL_MARKERS: &[&str] = &[
     "/.secrets",
     "/etc/shadow",
     "/etc/sudoers",
+    "/oauth_creds.json",
+    "/.credentials.json",
+    "/.codex/auth.json",
+    "/.hermes/auth.json",
+    "/opencode/auth.json",
+    "/plugins_secrets.json",
 ];
 
 const PROTECTED_CLIENT_CONFIG_MARKERS: &[&str] = &[
@@ -825,9 +835,15 @@ fn is_protected_runtime_state_path(raw: &str, canonical: &str) -> bool {
         if RUNTIME_STATE_MARKERS.iter().any(|m| s_checked.contains(m)) {
             return true;
         }
+        let in_agent_home_safe_subpath = s_checked.contains("/cow_workspace/upper_workspace/")
+            || s_checked.contains("/.gemini/antigravity-cli/brain/")
+            || s_checked.contains("/.gemini/antigravity-cli/mcp/")
+            || s_checked.contains("/.gemini/antigravity-cli/builtin/")
+            || s_checked.contains("/.gemini/config/plugins/")
+            || s_checked.contains("/agent_home/imports/")
+            || s_checked.contains("/agent_home/tmp/");
         if s_checked.contains("/.aegis/")
-            && !s_checked.contains("/cow_workspace/upper_workspace/")
-            && !s_checked.contains("/.gemini/antigravity-cli/brain/")
+            && !in_agent_home_safe_subpath
             && !(s_checked.contains("/orgs/") && s_checked.contains("/cas/"))
         {
             return true;
@@ -915,6 +931,7 @@ pub fn classify_native_write(path: &Path, repo_root: &Path) -> Route {
     if t.contains("/cow_workspace/")
         || t.contains("/upper_workspace/")
         || t.contains("/.gemini/antigravity-cli/brain/")
+        || t.contains("/agent_home/tmp/")
         || (!in_repo
             && (t.starts_with("/tmp/") || t.starts_with("/private/tmp/"))
             && !t.contains("/orgs/")
@@ -1343,5 +1360,51 @@ mod tests {
         assert!(classify_enforced_git_redirect("git push origin \"$(sudo rm -rf /)\"", host).is_none());
         assert!(classify_enforced_git_redirect("git commit -m \"`aegis-os approve esc-1`\"", host).is_none());
         assert!(classify_enforced_git_redirect("cat ~/.ssh/id_rsa && git push", host).is_none());
+    }
+
+    #[test]
+    fn agent_home_lazy_mcp_schemas_and_brain_are_readable_while_tokens_stay_ring0_denied() {
+        for safe in [
+            "/Users/alice/.aegis/sessions/ses_9e215161fb95/agent_home/.gemini/antigravity-cli/mcp/aegis-os/fs_read.json",
+            "/Users/alice/.aegis/sessions/ses_9e215161fb95/agent_home/.gemini/antigravity-cli/brain/6435/resource_0.txt",
+            "/Users/alice/.aegis/sessions/ses_9e215161fb95/agent_home/.gemini/config/plugins/dak/skills/SKILL.md",
+            "/Users/alice/.aegis/sessions/ses_9e215161fb95/agent_home/imports/report.pdf",
+            "/Users/alice/.aegis/sessions/ses_9e215161fb95/agent_home/tmp/scratch.txt",
+        ] {
+            assert!(
+                matches!(classify_native_read(Path::new(safe), "aegis-os"), Route::Pass),
+                "expected Route::Pass for {safe}"
+            );
+        }
+
+        for denied in [
+            "/Users/alice/.aegis/sessions/ses_9e215161fb95/human.token",
+            "/Users/alice/.aegis/sessions/ses_9e215161fb95/agent.token",
+            "/Users/alice/.aegis/sessions/ses_9e215161fb95/session.json",
+            "/Users/alice/.aegis/sessions/ses_9e215161fb95/agent_home/.gemini/oauth_creds.json",
+            "/Users/alice/.aegis/sessions/ses_9e215161fb95/agent_home/.claude/.credentials.json",
+            "/Users/alice/.aegis/orgs/aegis-os/policy_state.json",
+        ] {
+            assert!(
+                matches!(classify_native_read(Path::new(denied), "aegis-os"), Route::Deny { .. }),
+                "expected Route::Deny for {denied}"
+            );
+        }
+
+        // Scratch writes in agent_home/tmp/ pass, while oauth_creds.json / plugins_secrets.json remain denied.
+        assert!(matches!(
+            classify_native_write(
+                Path::new("/Users/alice/.aegis/sessions/ses_9e215161fb95/agent_home/tmp/out.txt"),
+                Path::new("/repo")
+            ),
+            Route::Pass
+        ));
+        assert!(matches!(
+            classify_native_write(
+                Path::new("/Users/alice/.aegis/sessions/ses_9e215161fb95/agent_home/.gemini/oauth_creds.json"),
+                Path::new("/repo")
+            ),
+            Route::Deny { .. }
+        ));
     }
 }

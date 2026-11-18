@@ -1934,7 +1934,7 @@ fn sorted_agy_session_dirs(runtime_dir: &Path) -> Vec<PathBuf> {
             .unwrap_or(0);
         hits.push((ts, dir));
     }
-    hits.sort_by(|a, b| b.0.cmp(&a.0));
+    hits.sort_by_key(|b| std::cmp::Reverse(b.0));
     hits.into_iter().map(|(_, dir)| dir).collect()
 }
 
@@ -2026,7 +2026,7 @@ pub(crate) fn restore_or_seed_claude_oauth_cache(
                 .unwrap_or(0);
             hits.push((ts, dir));
         }
-        hits.sort_by(|a, b| b.0.cmp(&a.0));
+        hits.sort_by_key(|b| std::cmp::Reverse(b.0));
         for (_, ses_dir) in hits {
             let Some(ses_home) = resolve_symlink_free_dir(&ses_dir, Path::new("agent_home")) else {
                 continue;
@@ -5510,9 +5510,7 @@ fn classify_host_lifecycle_subcommand(command: &[String]) -> Option<HostLifecycl
                 break;
             }
         }
-        let Some(sub) = command.get(idx).map(String::as_str) else {
-            return None;
-        };
+        let sub = command.get(idx).map(String::as_str)?;
         if matches!(sub, "upgrade" | "update" | "uninstall")
             && !command[1..].iter().any(|a| {
                 flag_matches(
@@ -6041,16 +6039,15 @@ async fn run_inner(
         .unwrap_or("workspace")
         .to_string();
 
-    if is_opencode_command(&command) {
-        if command
+    if is_opencode_command(&command)
+        && command
             .iter()
             .any(|arg| arg == "--server" || arg.starts_with("--server=") || arg == "attach")
-        {
-            bail!(
-                "aos run: OpenCode --server / attach can connect to the host's shared background service \
-                 and bypass the sandbox"
-            );
-        }
+    {
+        bail!(
+            "aos run: OpenCode --server / attach can connect to the host's shared background service \
+             and bypass the sandbox"
+        );
     }
 
     #[cfg(target_os = "macos")]
@@ -6709,7 +6706,7 @@ async fn run_macos_inner(
         ));
     }
     if !aos_core::ablated("config_overmount") {
-        let allow_hermes_cfg_write = is_hermes_config_subcommand(&command);
+        let allow_hermes_cfg_write = is_hermes_config_subcommand(command);
         for rel in PROTECTED_AGENT_CONFIGS {
             if *rel == ".hermes/config.yaml" && allow_hermes_cfg_write {
                 continue;

@@ -51,8 +51,14 @@ pub struct CatalogAppTemplate {
     pub skills: Vec<AppSkillDescriptor>,
 }
 
+fn default_app_org() -> String {
+    "default-org".to_string()
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct InstalledAppRecord {
+    #[serde(default = "default_app_org")]
+    pub org_id: String,
     pub app_id: String,
     pub name: String,
     pub version: String,
@@ -67,6 +73,8 @@ pub struct InstalledAppRecord {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct AppCredentialRecord {
+    #[serde(default = "default_app_org")]
+    pub tenant_org_id: String,
     pub app_id: String,
     pub endpoint: String,
     pub access_token: String,
@@ -127,6 +135,7 @@ impl Default for PersistedAppStoreState {
 pub struct AppStoreRegistry {
     state_file: PathBuf,
     state: RwLock<PersistedAppStoreState>,
+    io_gate: tokio::sync::Mutex<()>,
 }
 
 impl AppStoreRegistry {
@@ -139,10 +148,11 @@ impl AppStoreRegistry {
         Self {
             state_file,
             state: RwLock::new(initial),
+            io_gate: tokio::sync::Mutex::new(()),
         }
     }
 
-    async fn reload(&self) {
+    async fn reload_unlocked(&self) {
         if let Ok(bytes) = tokio::fs::read(&self.state_file).await {
             if let Ok(parsed) = serde_json::from_slice::<PersistedAppStoreState>(&bytes) {
                 *self.state.write().await = parsed;
@@ -150,10 +160,205 @@ impl AppStoreRegistry {
         }
     }
 
-    async fn flush(&self) -> anyhow::Result<()> {
+    async fn reload(&self) {
+        let _io = self.io_gate.lock().await;
+        self.reload_unlocked().await;
+    }
+
+    async fn flush_unlocked(&self) -> anyhow::Result<()> {
         let snapshot = self.state.read().await.clone();
-        aos_core::session::write_json_pretty_atomic(&self.state_file, &snapshot).await?;
-        Ok(())
+        aos_core::session::write_json_pretty_unlocked(&self.state_file, &snapshot).await
+    }
+
+    async fn with_state_mut<R, F>(&self, f: F) -> anyhow::Result<R>
+    where
+        F: FnOnce(&mut PersistedAppStoreState) -> anyhow::Result<R>,
+    {
+        let _io = self.io_gate.lock().await;
+        if let Some(parent) = self.state_file.parent() {
+            tokio::fs::create_dir_all(parent).await?;
+        }
+        let _flock = aos_core::session::acquire_file_lock(&self.state_file).await?;
+        self.reload_unlocked().await;
+        let out = {
+            let mut guard = self.state.write().await;
+            f(&mut guard)
+        }?;
+        self.flush_unlocked().await?;
+        Ok(out)
+    }
+
+    pub fn is_forbidden_app_ip(ip: std::net::IpAddr) -> bool {
+        match ip {
+            std::net::IpAddr::V6(v6) => {
+                if let Some(v4) = v6.to_ipv4_mapped() {
+                    return Self::is_forbidden_app_ip(std::net::IpAddr::V4(v4));
+                }
+                let segs = v6.segments();
+                v6.is_loopback()
+                    || v6.is_unspecified()
+                    || v6.is_multicast()
+                    || v6.is_unicast_link_local()
+                    || v6.is_unique_local()
+                    || (segs[0] & 0xffc0) == 0xfec0
+                    || (segs[0] == 0x2001 && segs[1] == 0x0db8)
+            }
+            std::net::IpAddr::V4(v4) => {
+                let o = v4.octets();
+                v4.is_loopback()
+                    || v4.is_private()
+                    || v4.is_link_local()
+                    || v4.is_broadcast()
+                    || v4.is_unspecified()
+                    || v4.is_multicast()
+                    || o[0] == 0
+                    || (o[0] == 100 && (o[1] & 0b1100_0000) == 64)
+                    || (o[0] == 192 && o[1] == 0 && o[2] == 0)
+                    || (o[0] == 198 && (o[1] == 18 || o[1] == 19))
+                    || o[0] >= 240
+            }
+        }
+    }
+
+    pub async fn validate_and_resolve_app_endpoint_with_mode(
+        raw_url: &str,
+        allow_local_dev: bool,
+    ) -> anyhow::Result<(String, String, u16, std::net::IpAddr, bool)> {
+        let base = raw_url.trim().trim_end_matches('/');
+        if base.is_empty()
+            || base.starts_with('-')
+            || base.chars().any(|c| c.is_control() || c.is_whitespace())
+            || base.contains('#')
+        {
+            bail!("Invalid AAP-1.0 endpoint '{}'", raw_url);
+        }
+        let (is_https, rest) = if let Some(r) = base.strip_prefix("https://") {
+            (true, r)
+        } else if let Some(r) = base.strip_prefix("http://") {
+            (false, r)
+        } else {
+            bail!(
+                "Unsupported AAP-1.0 endpoint scheme '{}': only https:// is allowed",
+                raw_url
+            );
+        };
+        let (authority, base_path) = match rest.split_once('/') {
+            Some((a, p)) => (a, format!("/{}", p.trim_end_matches('/'))),
+            None => (rest, String::new()),
+        };
+        if authority.is_empty() || authority.contains('@') {
+            bail!("Invalid or credentialed AAP-1.0 endpoint authority '{}'", raw_url);
+        }
+        let (host, port): (String, u16) = if let Some(after_open) = authority.strip_prefix('[') {
+            let (h, after_close) = after_open
+                .split_once(']')
+                .context("Malformed IPv6 host literal in AAP-1.0 endpoint")?;
+            let p = if after_close.is_empty() {
+                if is_https { 443 } else { 80 }
+            } else if let Some(ps) = after_close.strip_prefix(':') {
+                ps.parse::<u16>().context("Invalid port in AAP-1.0 endpoint")?
+            } else {
+                bail!("Malformed IPv6 authority in AAP-1.0 endpoint");
+            };
+            (h.to_string(), p)
+        } else if let Some((h, ps)) = authority.rsplit_once(':') {
+            (
+                h.to_string(),
+                ps.parse::<u16>().context("Invalid port in AAP-1.0 endpoint")?,
+            )
+        } else {
+            (authority.to_string(), if is_https { 443 } else { 80 })
+        };
+        if host.is_empty() || host.starts_with('-') || port == 0 {
+            bail!("Invalid host or port in AAP-1.0 endpoint '{}'", raw_url);
+        }
+        let lower_host = host.to_ascii_lowercase();
+        let is_local_loopback_name = matches!(lower_host.as_str(), "127.0.0.1" | "::1" | "localhost");
+        if !is_https {
+            if !(allow_local_dev && is_local_loopback_name) {
+                bail!(
+                    "Plaintext http:// AAP-1.0 endpoints are forbidden outside explicit local dev mode: '{}'",
+                    raw_url
+                );
+            }
+            let ip: std::net::IpAddr = if lower_host == "::1" {
+                std::net::IpAddr::V6(std::net::Ipv6Addr::LOCALHOST)
+            } else {
+                std::net::IpAddr::V4(std::net::Ipv4Addr::LOCALHOST)
+            };
+            return Ok((base_path, host, port, ip, false));
+        }
+
+        if let Ok(ip) = host.parse::<std::net::IpAddr>() {
+            if Self::is_forbidden_app_ip(ip) {
+                bail!(
+                    "Refusing HTTPS AAP-1.0 connection to forbidden internal/private IP '{}'",
+                    ip
+                );
+            }
+            return Ok((base_path, host, port, ip, true));
+        }
+
+        let resolved: Vec<std::net::SocketAddr> =
+            tokio::net::lookup_host((host.as_str(), port))
+                .await
+                .with_context(|| format!("DNS lookup failed for AAP-1.0 host '{}'", host))?
+                .collect();
+        let mut chosen_ip = None;
+        for addr in resolved {
+            let ip = addr.ip();
+            if Self::is_forbidden_app_ip(ip) {
+                bail!(
+                    "Refusing HTTPS AAP-1.0 connection: host '{}' resolved to forbidden IP '{}'",
+                    host,
+                    ip
+                );
+            }
+            if chosen_ip.is_none() {
+                chosen_ip = Some(ip);
+            }
+        }
+        let ip = chosen_ip.with_context(|| format!("No DNS records resolved for '{}'", host))?;
+        Ok((base_path, host, port, ip, true))
+    }
+
+    pub async fn validate_and_resolve_app_endpoint(
+        raw_url: &str,
+    ) -> anyhow::Result<(String, String, u16, std::net::IpAddr, bool)> {
+        let allow_local_dev = cfg!(test)
+            || std::env::var("AOS_ALLOW_INSECURE_LOCAL_APP_ENDPOINT").as_deref() == Ok("1");
+        Self::validate_and_resolve_app_endpoint_with_mode(raw_url, allow_local_dev).await
+    }
+
+    /// Returns `Some(endpoint)` when a caller attempts to override the endpoint to an address
+    /// that differs from both the built-in catalog template and the org's installed app record,
+    /// requiring explicit policy approval (`app_custom_endpoint`).
+    pub async fn requires_custom_endpoint_approval(
+        &self,
+        org_id: &str,
+        app_id: &str,
+        endpoint_override: Option<&str>,
+    ) -> Option<String> {
+        let raw = endpoint_override?.trim().trim_end_matches('/');
+        if raw.is_empty() {
+            return None;
+        }
+        let matches_builtin = Self::builtin_catalog()
+            .into_iter()
+            .any(|b| b.app_id == app_id && b.default_endpoint.trim_end_matches('/') == raw);
+        if matches_builtin {
+            return None;
+        }
+        self.reload().await;
+        let guard = self.state.read().await;
+        let matches_installed = guard.installed_apps.iter().any(|a| {
+            a.org_id == org_id && a.app_id == app_id && a.endpoint.trim_end_matches('/') == raw
+        });
+        if matches_installed {
+            None
+        } else {
+            Some(raw.to_string())
+        }
     }
 
     /// Returns the built-in 3-Tier `AAP-1.0` Application Catalog.
@@ -293,6 +498,17 @@ impl AppStoreRegistry {
         category: Option<&str>,
         trust_tier: Option<&str>,
     ) -> Value {
+        self.search_catalog_for_org("default-org", query, category, trust_tier)
+            .await
+    }
+
+    pub async fn search_catalog_for_org(
+        &self,
+        tenant_org_id: &str,
+        query: Option<&str>,
+        category: Option<&str>,
+        trust_tier: Option<&str>,
+    ) -> Value {
         self.reload().await;
         let state = self.state.read().await;
         let q = query.unwrap_or("").trim().to_lowercase();
@@ -331,8 +547,11 @@ impl AppStoreRegistry {
             let installed_rec = state
                 .installed_apps
                 .iter()
-                .find(|a| a.app_id == tpl.app_id);
-            let cred_rec = state.credentials.iter().find(|c| c.app_id == tpl.app_id);
+                .find(|a| a.org_id == tenant_org_id && a.app_id == tpl.app_id);
+            let cred_rec = state
+                .credentials
+                .iter()
+                .find(|c| c.tenant_org_id == tenant_org_id && c.app_id == tpl.app_id);
 
             entries.push(json!({
                 "app_id": tpl.app_id,
@@ -354,9 +573,9 @@ impl AppStoreRegistry {
             }));
         }
 
-        // Also include any custom installed 3rd-party apps not in `builtins`
+        // Also include any custom installed 3rd-party apps for this org not in `builtins`
         for inst in &state.installed_apps {
-            if builtins.iter().any(|b| b.app_id == inst.app_id) {
+            if inst.org_id != tenant_org_id || builtins.iter().any(|b| b.app_id == inst.app_id) {
                 continue;
             }
             if !q.is_empty() {
@@ -368,7 +587,10 @@ impl AppStoreRegistry {
             if !tier_filter.is_empty() && inst.trust_tier.to_lowercase() != tier_filter {
                 continue;
             }
-            let cred_rec = state.credentials.iter().find(|c| c.app_id == inst.app_id);
+            let cred_rec = state
+                .credentials
+                .iter()
+                .find(|c| c.tenant_org_id == tenant_org_id && c.app_id == inst.app_id);
             entries.push(json!({
                 "app_id": inst.app_id,
                 "name": inst.name,
@@ -389,22 +611,29 @@ impl AppStoreRegistry {
         json!({
             "aap_version": "1.0",
             "node_id": state.node_id,
+            "org_id": tenant_org_id,
             "apps_count": entries.len(),
             "apps": entries
         })
     }
 
-    /// Returns detailed `AAP-1.0` information for a specific `app_id`.
-    pub async fn get_app_info(&self, app_id: &str) -> anyhow::Result<Value> {
+    /// Returns detailed `AAP-1.0` information for a specific `app_id` scoped to `tenant_org_id`.
+    pub async fn get_app_info(&self, tenant_org_id: &str, app_id: &str) -> anyhow::Result<Value> {
         self.reload().await;
         let state = self.state.read().await;
         let clean_id = app_id.trim();
 
-        let installed = state.installed_apps.iter().find(|a| a.app_id == clean_id);
+        let installed = state
+            .installed_apps
+            .iter()
+            .find(|a| a.org_id == tenant_org_id && a.app_id == clean_id);
         let builtin = Self::builtin_catalog()
             .into_iter()
             .find(|b| b.app_id == clean_id);
-        let cred = state.credentials.iter().find(|c| c.app_id == clean_id);
+        let cred = state
+            .credentials
+            .iter()
+            .find(|c| c.tenant_org_id == tenant_org_id && c.app_id == clean_id);
 
         if installed.is_none() && builtin.is_none() {
             bail!(
@@ -416,7 +645,7 @@ impl AppStoreRegistry {
         let endpoint = installed
             .map(|i| i.endpoint.clone())
             .or_else(|| builtin.as_ref().map(|b| b.default_endpoint.clone()))
-            .unwrap_or_else(|| "http://127.0.0.1:8787".to_string());
+            .unwrap_or_else(|| "https://heurion.org".to_string());
 
         let live_manifest = Self::fetch_manifest_from_endpoint(&endpoint).await.ok();
         let manifest = live_manifest
@@ -427,6 +656,7 @@ impl AppStoreRegistry {
 
         Ok(json!({
             "aap_version": "1.0",
+            "org_id": tenant_org_id,
             "app_id": clean_id,
             "endpoint": endpoint,
             "online": live_manifest.is_some(),
@@ -448,14 +678,16 @@ impl AppStoreRegistry {
         }))
     }
 
-    /// Installs an `AAP-1.0` application by `app_id` or endpoint URL, caches its manifest,
+    /// Installs an `AAP-1.0` application for `tenant_org_id` by `app_id` or endpoint URL, caches its manifest,
     /// and optionally downloads declared `skills` into `<workspace_dir>/.agents/skills/<skill_id>/SKILL.md`.
     pub async fn install_app(
         &self,
+        tenant_org_id: &str,
         app_id_or_url: &str,
         endpoint_override: Option<&str>,
         workspace_dir: Option<&Path>,
     ) -> anyhow::Result<Value> {
+        let org_clean = aos_vfs::vault::sanitize_and_validate_org_id(tenant_org_id)?;
         self.reload().await;
         let builtins = Self::builtin_catalog();
 
@@ -476,9 +708,10 @@ impl AppStoreRegistry {
                         .find(|b| b.app_id == clean_id)
                         .map(|b| b.default_endpoint.clone())
                 })
-                .unwrap_or_else(|| "http://127.0.0.1:8787".to_string());
+                .unwrap_or_else(|| "https://heurion.org".to_string());
             (Some(clean_id), ep)
         };
+        let _ = Self::validate_and_resolve_app_endpoint(&endpoint).await?;
 
         let live_manifest = Self::fetch_manifest_from_endpoint(&endpoint).await.ok();
         let manifest = match live_manifest {
@@ -593,6 +826,7 @@ impl AppStoreRegistry {
         }
 
         let record = InstalledAppRecord {
+            org_id: org_clean.clone(),
             app_id: app_id.clone(),
             name: name.clone(),
             version: version.clone(),
@@ -604,15 +838,21 @@ impl AppStoreRegistry {
             installed_at_ms: Utc::now().timestamp_millis(),
         };
 
-        {
-            let mut guard = self.state.write().await;
-            guard.installed_apps.retain(|a| a.app_id != app_id);
-            guard.installed_apps.push(record.clone());
-        }
-        self.flush().await?;
+        let org_owned = org_clean.clone();
+        let app_owned = app_id.clone();
+        let rec_insert = record.clone();
+        self.with_state_mut(move |guard| {
+            guard
+                .installed_apps
+                .retain(|a| !(a.org_id == org_owned && a.app_id == app_owned));
+            guard.installed_apps.push(rec_insert);
+            Ok(())
+        })
+        .await?;
 
         Ok(json!({
             "status": "app_installed",
+            "org_id": org_clean,
             "app_id": app_id,
             "name": name,
             "version": version,
@@ -623,20 +863,32 @@ impl AppStoreRegistry {
         }))
     }
 
-    async fn ensure_installed_if_needed(&self, app_id: &str, endpoint_override: Option<&str>) {
+    async fn ensure_installed_if_needed(
+        &self,
+        tenant_org_id: &str,
+        app_id: &str,
+        endpoint_override: Option<&str>,
+    ) {
         let already = {
             let guard = self.state.read().await;
-            guard.installed_apps.iter().any(|a| a.app_id == app_id)
+            guard
+                .installed_apps
+                .iter()
+                .any(|a| a.org_id == tenant_org_id && a.app_id == app_id)
         };
         if !already {
-            let _ = self.install_app(app_id, endpoint_override, None).await;
+            let _ = self
+                .install_app(tenant_org_id, app_id, endpoint_override, None)
+                .await;
         }
     }
 
     /// Authenticates and binds an `AAP-1.0` application user credential (`aegis_at_<app_id>.*`)
-    /// via direct token, web session token exchange, or username/password exchange.
+    /// for `tenant_org_id` via direct token, web session token exchange, or username/password exchange.
+    #[allow(clippy::too_many_arguments)]
     pub async fn login_app(
         &self,
+        tenant_org_id: &str,
         app_id: &str,
         endpoint_override: Option<&str>,
         token: Option<&str>,
@@ -644,10 +896,15 @@ impl AppStoreRegistry {
         password: Option<&str>,
         scopes: Vec<String>,
     ) -> anyhow::Result<Value> {
+        let org_clean = aos_vfs::vault::sanitize_and_validate_org_id(tenant_org_id)?;
         self.reload().await;
         let clean_id = app_id.trim();
-        self.ensure_installed_if_needed(clean_id, endpoint_override).await;
-        let endpoint = self.resolve_app_endpoint(clean_id, endpoint_override).await;
+        self.ensure_installed_if_needed(&org_clean, clean_id, endpoint_override)
+            .await;
+        let endpoint = self
+            .resolve_app_endpoint(&org_clean, clean_id, endpoint_override)
+            .await;
+        let _ = Self::validate_and_resolve_app_endpoint(&endpoint).await?;
         let (node_id, node_public_key) = {
             let guard = self.state.read().await;
             (guard.node_id.clone(), guard.node_public_key.clone())
@@ -659,6 +916,7 @@ impl AppStoreRegistry {
             if trimmed.starts_with("aegis_at_") {
                 let prefix = trimmed.chars().take(24).collect::<String>();
                 let rec = AppCredentialRecord {
+                    tenant_org_id: org_clean.clone(),
                     app_id: clean_id.to_string(),
                     endpoint: endpoint.clone(),
                     access_token: trimmed.to_string(),
@@ -685,6 +943,7 @@ impl AppStoreRegistry {
                 self.save_credential(rec.clone()).await?;
                 return Ok(json!({
                     "status": "app_logged_in",
+                    "org_id": org_clean,
                     "mode": "direct_aegis_token",
                     "app_id": clean_id,
                     "endpoint": endpoint,
@@ -738,12 +997,19 @@ impl AppStoreRegistry {
             .and_then(|v| v.as_str())
             .context("Response from `/api/aegis/auth/token` missing `access_token`")?
             .to_string();
-        let rec = Self::credential_from_token_response(clean_id, &endpoint, &access_token, &resp);
+        let rec = Self::credential_from_token_response(
+            &org_clean,
+            clean_id,
+            &endpoint,
+            &access_token,
+            &resp,
+        );
         self.save_credential(rec.clone()).await?;
 
         Ok(json!({
             "status": "app_logged_in",
             "mode": "token_exchange",
+            "tenant_org_id": org_clean,
             "app_id": clean_id,
             "endpoint": endpoint,
             "token_prefix": rec.token_prefix,
@@ -757,20 +1023,26 @@ impl AppStoreRegistry {
         }))
     }
 
-    /// Initiates RFC 8628 Device Code Flow (`POST /api/aegis/auth/device`) and optionally polls
-    /// `POST /api/aegis/auth/token` until approved.
+    /// Initiates RFC 8628 Device Code Flow (`POST /api/aegis/auth/device`) for `tenant_org_id`
+    /// and optionally polls `POST /api/aegis/auth/token` until approved.
     pub async fn login_app_device_code(
         &self,
+        tenant_org_id: &str,
         app_id: &str,
         endpoint_override: Option<&str>,
         scopes: Vec<String>,
         wait_secs: u64,
         auto_approve_session_token: Option<&str>,
     ) -> anyhow::Result<Value> {
+        let org_clean = aos_vfs::vault::sanitize_and_validate_org_id(tenant_org_id)?;
         self.reload().await;
         let clean_id = app_id.trim();
-        self.ensure_installed_if_needed(clean_id, endpoint_override).await;
-        let endpoint = self.resolve_app_endpoint(clean_id, endpoint_override).await;
+        self.ensure_installed_if_needed(&org_clean, clean_id, endpoint_override)
+            .await;
+        let endpoint = self
+            .resolve_app_endpoint(&org_clean, clean_id, endpoint_override)
+            .await;
+        let _ = Self::validate_and_resolve_app_endpoint(&endpoint).await?;
         let (node_id, node_public_key) = {
             let guard = self.state.read().await;
             (guard.node_id.clone(), guard.node_public_key.clone())
@@ -839,6 +1111,7 @@ impl AppStoreRegistry {
         if wait_secs == 0 {
             return Ok(json!({
                 "status": "authorization_pending",
+                "tenant_org_id": org_clean,
                 "app_id": clean_id,
                 "endpoint": endpoint,
                 "device_code": device_code,
@@ -867,6 +1140,7 @@ impl AppStoreRegistry {
                 if let Some(access_token) = poll_resp.get("access_token").and_then(|v| v.as_str())
                 {
                     let rec = Self::credential_from_token_response(
+                        &org_clean,
                         clean_id,
                         &endpoint,
                         access_token,
@@ -876,6 +1150,7 @@ impl AppStoreRegistry {
                     return Ok(json!({
                         "status": "app_logged_in",
                         "mode": "device_code",
+                        "tenant_org_id": org_clean,
                         "app_id": clean_id,
                         "endpoint": endpoint,
                         "user_code": user_code,
@@ -901,6 +1176,7 @@ impl AppStoreRegistry {
             if std::time::Instant::now() >= deadline {
                 return Ok(json!({
                     "status": "authorization_pending",
+                    "tenant_org_id": org_clean,
                     "app_id": clean_id,
                     "endpoint": endpoint,
                     "device_code": device_code,
@@ -913,21 +1189,25 @@ impl AppStoreRegistry {
         }
     }
 
-    /// Revokes and removes the stored `aegis_at_<app_id>.*` credential for `app_id`.
-    pub async fn logout_app(&self, app_id: &str) -> anyhow::Result<Value> {
-        self.reload().await;
-        let clean_id = app_id.trim();
-        let removed = {
-            let mut guard = self.state.write().await;
-            let existing = guard
-                .credentials
-                .iter()
-                .find(|c| c.app_id == clean_id)
-                .cloned();
-            guard.credentials.retain(|c| c.app_id != clean_id);
-            existing
-        };
-        self.flush().await?;
+    /// Revokes and removes the stored `aegis_at_<app_id>.*` credential for `(tenant_org_id, app_id)`.
+    pub async fn logout_app(&self, tenant_org_id: &str, app_id: &str) -> anyhow::Result<Value> {
+        let org_clean = aos_vfs::vault::sanitize_and_validate_org_id(tenant_org_id)?;
+        let clean_id = app_id.trim().to_string();
+        let org_owned = org_clean.clone();
+        let app_owned = clean_id.clone();
+        let removed = self
+            .with_state_mut(move |guard| {
+                let existing = guard
+                    .credentials
+                    .iter()
+                    .find(|c| c.tenant_org_id == org_owned && c.app_id == app_owned)
+                    .cloned();
+                guard
+                    .credentials
+                    .retain(|c| !(c.tenant_org_id == org_owned && c.app_id == app_owned));
+                Ok(existing)
+            })
+            .await?;
 
         let mut server_revoked = false;
         if let Some(ref cred) = removed {
@@ -947,6 +1227,7 @@ impl AppStoreRegistry {
 
         Ok(json!({
             "status": "app_logged_out",
+            "org_id": org_clean,
             "app_id": clean_id,
             "had_local_credential": removed.is_some(),
             "server_token_revoked": server_revoked
@@ -955,45 +1236,52 @@ impl AppStoreRegistry {
 
     /// Mounts an `AAP-1.0` application into the calling Agent's active session (`app_mount_session`),
     /// returning its `zero_prompt` vs `lease_gated` tool catalog, live tool schemas (if online),
-    /// and bound user authentication state.
+    /// and bound user authentication state strictly scoped to `identity.org_id`.
     pub async fn mount_session(
         &self,
         identity: &AgentIdentity,
         app_id: &str,
         endpoint_override: Option<&str>,
     ) -> anyhow::Result<Value> {
+        let org_clean = aos_vfs::vault::sanitize_and_validate_org_id(&identity.org_id)?;
         self.reload().await;
         let clean_id = app_id.trim();
-        self.ensure_installed_if_needed(clean_id, endpoint_override).await;
-        let endpoint = self.resolve_app_endpoint(clean_id, endpoint_override).await;
+        self.ensure_installed_if_needed(&org_clean, clean_id, endpoint_override)
+            .await;
+        let endpoint = self
+            .resolve_app_endpoint(&org_clean, clean_id, endpoint_override)
+            .await;
+        let _ = Self::validate_and_resolve_app_endpoint(&endpoint).await?;
 
-        let info = self.get_app_info(clean_id).await?;
+        let info = self.get_app_info(&org_clean, clean_id).await?;
         let cred = {
             let guard = self.state.read().await;
             guard
                 .credentials
                 .iter()
-                .find(|c| c.app_id == clean_id)
+                .find(|c| c.tenant_org_id == org_clean && c.app_id == clean_id)
                 .cloned()
         };
 
-        // Record active session mount
-        {
-            let mut guard = self.state.write().await;
+        // Record active session mount under io_gate + file lock
+        let app_owned = clean_id.to_string();
+        let org_owned = org_clean.clone();
+        let agent_owned = identity.agent_id.clone();
+        let ep_owned = endpoint.clone();
+        self.with_state_mut(move |guard| {
             guard.mounted_sessions.retain(|m| {
-                !(m.app_id == clean_id
-                    && m.org_id == identity.org_id
-                    && m.agent_id == identity.agent_id)
+                !(m.app_id == app_owned && m.org_id == org_owned && m.agent_id == agent_owned)
             });
             guard.mounted_sessions.push(MountedAppSession {
-                app_id: clean_id.to_string(),
-                org_id: identity.org_id.clone(),
-                agent_id: identity.agent_id.clone(),
-                endpoint: endpoint.clone(),
+                app_id: app_owned,
+                org_id: org_owned,
+                agent_id: agent_owned,
+                endpoint: ep_owned,
                 mounted_at_ms: Utc::now().timestamp_millis(),
             });
-        }
-        self.flush().await?;
+            Ok(())
+        })
+        .await?;
 
         // Best-effort query of `tools/list` from `POST <endpoint>/api/aegis/mcp`
         // Only send stored bearer token when endpoint matches the credential's bound endpoint.
@@ -1065,22 +1353,26 @@ impl AppStoreRegistry {
         endpoint_override: Option<&str>,
         lease_token_override: Option<&str>,
     ) -> anyhow::Result<Value> {
+        let org_clean = aos_vfs::vault::sanitize_and_validate_org_id(&identity.org_id)?;
         self.reload().await;
         let clean_app = app_id.trim();
         let clean_tool = tool_name.trim();
-        let endpoint = self.resolve_app_endpoint(clean_app, endpoint_override).await;
+        let endpoint = self
+            .resolve_app_endpoint(&org_clean, clean_app, endpoint_override)
+            .await;
+        let _ = Self::validate_and_resolve_app_endpoint(&endpoint).await?;
 
         let (cred, is_lease_gated) = {
             let guard = self.state.read().await;
             let c = guard
                 .credentials
                 .iter()
-                .find(|c| c.app_id == clean_app)
+                .find(|c| c.tenant_org_id == org_clean && c.app_id == clean_app)
                 .cloned();
             let gated_in_installed = guard
                 .installed_apps
                 .iter()
-                .find(|a| a.app_id == clean_app)
+                .find(|a| a.org_id == org_clean && a.app_id == clean_app)
                 .map(|a| {
                     let in_cap = a
                         .manifest
@@ -1293,36 +1585,52 @@ impl AppStoreRegistry {
         }))
     }
 
-    async fn resolve_app_endpoint(&self, app_id: &str, endpoint_override: Option<&str>) -> String {
+    async fn resolve_app_endpoint(
+        &self,
+        tenant_org_id: &str,
+        app_id: &str,
+        endpoint_override: Option<&str>,
+    ) -> String {
         if let Some(ep) = endpoint_override {
             if !ep.trim().is_empty() {
                 return ep.trim().trim_end_matches('/').to_string();
             }
         }
         let guard = self.state.read().await;
-        if let Some(inst) = guard.installed_apps.iter().find(|a| a.app_id == app_id) {
+        if let Some(inst) = guard
+            .installed_apps
+            .iter()
+            .find(|a| a.org_id == tenant_org_id && a.app_id == app_id)
+        {
             return inst.endpoint.clone();
         }
-        if let Some(cred) = guard.credentials.iter().find(|c| c.app_id == app_id) {
+        if let Some(cred) = guard
+            .credentials
+            .iter()
+            .find(|c| c.tenant_org_id == tenant_org_id && c.app_id == app_id)
+        {
             return cred.endpoint.clone();
         }
         Self::builtin_catalog()
             .into_iter()
             .find(|b| b.app_id == app_id)
             .map(|b| b.default_endpoint)
-            .unwrap_or_else(|| "http://127.0.0.1:8787".to_string())
+            .unwrap_or_else(|| "https://heurion.org".to_string())
     }
 
     async fn save_credential(&self, rec: AppCredentialRecord) -> anyhow::Result<()> {
-        {
-            let mut guard = self.state.write().await;
-            guard.credentials.retain(|c| c.app_id != rec.app_id);
+        self.with_state_mut(move |guard| {
+            guard
+                .credentials
+                .retain(|c| !(c.tenant_org_id == rec.tenant_org_id && c.app_id == rec.app_id));
             guard.credentials.push(rec);
-        }
-        self.flush().await
+            Ok(())
+        })
+        .await
     }
 
     fn credential_from_token_response(
+        tenant_org_id: &str,
         app_id: &str,
         endpoint: &str,
         access_token: &str,
@@ -1335,6 +1643,7 @@ impl AppStoreRegistry {
             .unwrap_or_default();
         let user_obj = resp.get("user").or_else(|| resp.get("bound_user"));
         AppCredentialRecord {
+            tenant_org_id: tenant_org_id.to_string(),
             app_id: app_id.to_string(),
             endpoint: endpoint.to_string(),
             access_token: access_token.to_string(),
@@ -1418,46 +1727,54 @@ impl AppStoreRegistry {
         extra_headers: &[(&str, &str)],
         body: Option<&Value>,
     ) -> anyhow::Result<(u16, String)> {
+        if !path.starts_with('/')
+            || path.starts_with('-')
+            || path.chars().any(|c| c.is_control() || c.is_whitespace())
+        {
+            bail!("Invalid AAP-1.0 request path '{}'", path);
+        }
+        let clean_method = method.trim();
+        if clean_method.is_empty()
+            || clean_method.starts_with('-')
+            || !clean_method.chars().all(|c| c.is_ascii_alphabetic())
+        {
+            bail!("Invalid HTTP method '{}'", method);
+        }
+
+        let (base_path, host, port, validated_ip, is_https) =
+            Self::validate_and_resolve_app_endpoint(endpoint).await?;
         let base = endpoint.trim().trim_end_matches('/');
         let full_url = format!("{}{}", base, path);
 
-        if let Some(rest) = base.strip_prefix("http://") {
-            let (host_port, base_path) = match rest.split_once('/') {
-                Some((hp, bp)) => (hp, format!("/{}", bp.trim_end_matches('/'))),
-                None => (rest, String::new()),
-            };
-            let addr = if host_port.contains(':') {
-                host_port.to_string()
-            } else {
-                format!("{}:80", host_port)
-            };
+        if !is_https {
             let target_path = format!("{}{}", base_path, path);
             let body_bytes = body
                 .map(|b| serde_json::to_vec(b).unwrap_or_default())
                 .unwrap_or_default();
+            let sock_addr = std::net::SocketAddr::new(validated_ip, port);
 
-            let stream = tokio::time::timeout(
+            let mut stream = tokio::time::timeout(
                 std::time::Duration::from_secs(5),
-                tokio::net::TcpStream::connect(&addr),
+                tokio::net::TcpStream::connect(sock_addr),
             )
             .await
             .with_context(|| format!("Connection timeout to {}", full_url))?
             .with_context(|| format!("Failed to connect to {}", full_url))?;
-            let mut stream = stream;
 
-            let clean_path: String = target_path
-                .chars()
-                .filter(|c| !matches!(c, '\r' | '\n' | '\0'))
-                .collect();
-            let clean_host: String = host_port
-                .chars()
-                .filter(|c| !matches!(c, '\r' | '\n' | '\0'))
-                .collect();
+            let host_header = if (port == 80 && !host.contains(':')) || host.contains(':') {
+                if host.contains(':') {
+                    format!("[{}]:{}", host, port)
+                } else {
+                    host.clone()
+                }
+            } else {
+                format!("{}:{}", host, port)
+            };
             let mut req_str = format!(
                 "{} {} HTTP/1.1\r\nHost: {}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n",
-                method,
-                clean_path,
-                clean_host,
+                clean_method,
+                target_path,
+                host_header,
                 body_bytes.len()
             );
             if let Some(tok) = bearer_token {
@@ -1483,14 +1800,30 @@ impl AppStoreRegistry {
             }
             req_str.push_str("\r\n");
 
-            stream.write_all(req_str.as_bytes()).await?;
-            if !body_bytes.is_empty() {
-                stream.write_all(&body_bytes).await?;
-            }
-            stream.flush().await?;
+            tokio::time::timeout(std::time::Duration::from_secs(30), async {
+                stream.write_all(req_str.as_bytes()).await?;
+                if !body_bytes.is_empty() {
+                    stream.write_all(&body_bytes).await?;
+                }
+                stream.flush().await
+            })
+            .await
+            .with_context(|| format!("Write timeout to {}", full_url))??;
 
+            const MAX_APP_HTTP_BYTES: u64 = 16 * 1024 * 1024;
             let mut resp_buf = Vec::new();
-            stream.read_to_end(&mut resp_buf).await?;
+            let read_res = tokio::time::timeout(
+                std::time::Duration::from_secs(30),
+                (&mut stream)
+                    .take(MAX_APP_HTTP_BYTES + 1)
+                    .read_to_end(&mut resp_buf),
+            )
+            .await
+            .with_context(|| format!("Read timeout from {}", full_url))?;
+            read_res?;
+            if (resp_buf.len() as u64) > MAX_APP_HTTP_BYTES {
+                bail!("AAP-1.0 response from {} exceeded 16 MiB limit", full_url);
+            }
             let raw_resp = String::from_utf8_lossy(&resp_buf).to_string();
             let (head, resp_body) = raw_resp.split_once("\r\n\r\n").unwrap_or(("", &raw_resp));
             let status_code = head
@@ -1502,31 +1835,86 @@ impl AppStoreRegistry {
             return Ok((status_code, resp_body.to_string()));
         }
 
-        // Fallback to `curl` for `https://` endpoints
-        let mut cmd = std::process::Command::new("curl");
-        cmd.args([
-            "-sS",
-            "-i",
-            "-X",
-            method,
-            &full_url,
-            "-H",
-            "Content-Type: application/json",
-        ]);
-        if let Some(tok) = bearer_token {
-            if !tok.trim().is_empty() {
-                cmd.args(["-H", &format!("Authorization: Bearer {}", tok.trim())]);
+        // Fallback to `curl` inside `spawn_blocking` for verified `https://` endpoints
+        let method_owned = clean_method.to_string();
+        let url_owned = full_url.clone();
+        let resolve_pin = format!("{}:{}:{}", host, port, validated_ip);
+        let auth_header: Option<String> = bearer_token.and_then(|tok| {
+            let clean_tok: String = tok
+                .trim()
+                .chars()
+                .filter(|c| !matches!(c, '\r' | '\n' | '\0'))
+                .collect();
+            (!clean_tok.is_empty()).then(|| format!("Authorization: Bearer {}", clean_tok))
+        });
+        let sanitized_headers: Vec<String> = extra_headers
+            .iter()
+            .map(|(hk, hv)| {
+                let ck: String = hk
+                    .chars()
+                    .filter(|c| !matches!(c, '\r' | '\n' | '\0' | ':'))
+                    .collect();
+                let cv: String = hv
+                    .chars()
+                    .filter(|c| !matches!(c, '\r' | '\n' | '\0'))
+                    .collect();
+                format!("{}: {}", ck, cv)
+            })
+            .collect();
+        let body_json: Option<Vec<u8>> = body.map(serde_json::to_vec).transpose()?;
+
+        let out = tokio::task::spawn_blocking(move || -> anyhow::Result<std::process::Output> {
+            use std::io::Write;
+            let mut cmd = std::process::Command::new("curl");
+            cmd.args([
+                "-sS",
+                "-i",
+                "--proto",
+                "=https",
+                "--max-redirs",
+                "0",
+                "--connect-timeout",
+                "5",
+                "--max-time",
+                "30",
+                "--resolve",
+                &resolve_pin,
+                "-X",
+                &method_owned,
+                "-H",
+                "Content-Type: application/json",
+            ]);
+            if let Some(ref ah) = auth_header {
+                cmd.args(["-H", ah]);
             }
-        }
-        for (hk, hv) in extra_headers {
-            cmd.args(["-H", &format!("{}: {}", hk, hv)]);
-        }
-        if let Some(b) = body {
-            cmd.args(["-d", &serde_json::to_string(b)?]);
-        }
-        let out = cmd
-            .output()
-            .context("Failed to execute `curl` for HTTPS AAP-1.0 endpoint")?;
+            for h in &sanitized_headers {
+                cmd.args(["-H", h]);
+            }
+            if body_json.is_some() {
+                cmd.args(["--data-binary", "@-"]);
+                cmd.stdin(std::process::Stdio::piped());
+            } else {
+                cmd.stdin(std::process::Stdio::null());
+            }
+            cmd.stdout(std::process::Stdio::piped());
+            cmd.stderr(std::process::Stdio::piped());
+            cmd.args(["--", &url_owned]);
+            let mut child = cmd
+                .spawn()
+                .context("Failed to execute `curl` for HTTPS AAP-1.0 endpoint")?;
+            if let Some(bytes) = body_json {
+                if let Some(mut stdin) = child.stdin.take() {
+                    stdin
+                        .write_all(&bytes)
+                        .context("Failed to write HTTPS request body to `curl` stdin")?;
+                }
+            }
+            child
+                .wait_with_output()
+                .context("Failed waiting for `curl` HTTPS AAP-1.0 endpoint")
+        })
+        .await
+        .context("HTTPS curl task failed")??;
         if !out.status.success() {
             bail!(
                 "HTTPS request to {} failed: {}",
@@ -1760,7 +2148,7 @@ mod tests {
         // 2. Install `heurion` from mock endpoint (also downloads SKILL.md into `.agents/skills/heurion-clinical-research/SKILL.md`)
         let install_res = kernel
             .app_store
-            .install_app("heurion", Some(&mock_ep), Some(&ws_dir))
+            .install_app(&identity.org_id, "heurion", Some(&mock_ep), Some(&ws_dir))
             .await
             .unwrap();
         assert_eq!(install_res["status"], "app_installed");
@@ -1772,7 +2160,7 @@ mod tests {
         // 3. Authenticate via RFC 8628 Device Code Flow (`login_app_device_code`)
         let login_res = kernel
             .app_store
-            .login_app_device_code("heurion", Some(&mock_ep), vec![], 5, None)
+            .login_app_device_code(&identity.org_id, "heurion", Some(&mock_ep), vec![], 5, None)
             .await
             .unwrap();
         assert_eq!(login_res["status"], "app_logged_in");
@@ -1848,5 +2236,67 @@ mod tests {
         assert_eq!(gated_ok["status"], "ok");
         assert_eq!(gated_ok["lease_token_injected"], true);
         assert_eq!(gated_ok["result"]["lease_verified"], true);
+    }
+
+    #[tokio::test]
+    async fn test_app_store_org_isolation_and_ssrf_guards() {
+        let temp = tempfile::tempdir().unwrap();
+        let reg = AppStoreRegistry::new(temp.path());
+
+        // 1. Production SSRF validation rejects file://, flag injection, http://, loopback, and metadata IPs
+        for bad in [
+            "file:///etc/passwd",
+            "-K/etc/passwd",
+            "http://127.0.0.1:8787",
+            "https://127.0.0.1:8443",
+            "https://169.254.169.254/latest/meta-data",
+            "https://10.0.0.1/api",
+            "https://[::ffff:127.0.0.1]/api",
+            "https://user:pass@example.com/api",
+        ] {
+            assert!(
+                AppStoreRegistry::validate_and_resolve_app_endpoint_with_mode(bad, false)
+                    .await
+                    .is_err(),
+                "expected endpoint '{}' to be rejected in prod mode",
+                bad
+            );
+        }
+
+        // 2. Credential saved for org-a must never leak to org-b
+        reg.save_credential(AppCredentialRecord {
+            tenant_org_id: "org-a".to_string(),
+            app_id: "heurion".to_string(),
+            endpoint: "https://heurion.org".to_string(),
+            access_token: "aegis_at_heurion.secret_org_a".to_string(),
+            token_prefix: "aegis_at_heurion.secret".to_string(),
+            token_id: Some("tok-a".to_string()),
+            user_id: Some("u-a".to_string()),
+            username: Some("alice".to_string()),
+            org_id: Some("remote-org-a".to_string()),
+            trust_tier: Some("first_party".to_string()),
+            scopes: vec!["projects:read".to_string()],
+            expires_at: None,
+            updated_at_ms: 1,
+        })
+        .await
+        .unwrap();
+
+        let info_a = reg.get_app_info("org-a", "heurion").await.unwrap();
+        let info_b = reg.get_app_info("org-b", "heurion").await.unwrap();
+        assert_eq!(info_a["authenticated"], true);
+        assert_eq!(info_b["authenticated"], false);
+        assert!(info_b["credential"].is_null());
+
+        let catalog_b = reg.search_catalog_for_org("org-b", Some("heurion"), None, None).await;
+        assert_eq!(catalog_b["apps"][0]["authenticated"], false);
+
+        // Logging out org-b must not affect org-a's credential
+        let out_b = reg.logout_app("org-b", "heurion").await.unwrap();
+        assert_eq!(out_b["had_local_credential"], false);
+        assert_eq!(
+            reg.get_app_info("org-a", "heurion").await.unwrap()["authenticated"],
+            true
+        );
     }
 }

@@ -39,14 +39,14 @@ pub struct BrokerSession {
     pub agent_home: String,
 }
 
-struct BrokerState {
-    runtime_dir: PathBuf,
-    session: BrokerSession,
-    session_dir: PathBuf,
-    identity: AgentIdentity,
+pub(crate) struct BrokerState {
+    pub(crate) runtime_dir: PathBuf,
+    pub(crate) session: BrokerSession,
+    pub(crate) session_dir: PathBuf,
+    pub(crate) identity: AgentIdentity,
     agent_token: String,
     human_token: Arc<std::sync::RwLock<String>>,
-    kernel: Arc<AegisRuntimeKernel>,
+    pub(crate) kernel: Arc<AegisRuntimeKernel>,
     effects_path: PathBuf,
     hello: RwLock<Option<Value>>,
     web_console_addr: RwLock<Option<std::net::SocketAddr>>,
@@ -194,6 +194,7 @@ impl SessionBroker {
         .await
     }
 
+    #[allow(clippy::too_many_arguments)]
     async fn start_inner(
         runtime_dir: &Path,
         session_dir: &Path,
@@ -568,6 +569,7 @@ where
             | ("POST", "/v1/adapter/evaluate")
             | ("POST", "/v1/adapter/effect")
             | ("POST", "/v1/effects")
+            | ("POST", "/v1/hook")
             | ("POST", "/v1/mcp")
             | ("POST", "/v1/adapter/heartbeat")
     );
@@ -621,6 +623,10 @@ where
         }
         ("POST", "/v1/adapter/evaluate") => {
             evaluate_adapter(&mut stream, &state, &payload).await
+        }
+        ("POST", "/v1/hook") => {
+            let output = crate::hooks::evaluate_broker_hook(&state, &payload).await?;
+            write_json(&mut stream, "200 OK", json!({ "output": output })).await
         }
         ("POST", "/v1/adapter/effect") | ("POST", "/v1/effects") => {
             let record = json!({
@@ -778,30 +784,16 @@ where
     }
 }
 
-async fn evaluate_adapter<S>(
-    stream: &mut S,
+pub(crate) async fn evaluate_adapter_inline(
     state: &BrokerState,
-    payload: &Value,
-) -> Result<()>
-where
-    S: AsyncRead + AsyncWrite + Unpin + Send,
-{
-    let tool = payload
-        .get("tool")
-        .and_then(|v| v.as_str())
-        .unwrap_or("")
-        .to_string();
-    let input = payload.get("input").cloned().unwrap_or(Value::Null);
-    let Some(effect) = effect_for_tool(&tool, &input, state) else {
-        return write_json(
-            stream,
-            "200 OK",
-            json!({
-                "effect": "deny",
-                "reason": format!("unsupported adapter tool '{tool}'")
-            }),
-        )
-        .await;
+    tool: &str,
+    input: &Value,
+) -> Result<Value> {
+    let Some(effect) = effect_for_tool(tool, input, state) else {
+        return Ok(json!({
+            "effect": "deny",
+            "reason": format!("unsupported adapter tool '{tool}'")
+        }));
     };
 
     let mut ctx = effect.to_policy_context(state.identity.clone(), &state.identity.org_id);
@@ -876,6 +868,24 @@ where
         })
         .await;
 
+    Ok(response)
+}
+
+async fn evaluate_adapter<S>(
+    stream: &mut S,
+    state: &BrokerState,
+    payload: &Value,
+) -> Result<()>
+where
+    S: AsyncRead + AsyncWrite + Unpin + Send,
+{
+    let tool = payload
+        .get("tool")
+        .and_then(|v| v.as_str())
+        .unwrap_or("")
+        .to_string();
+    let input = payload.get("input").cloned().unwrap_or(Value::Null);
+    let response = evaluate_adapter_inline(state, &tool, &input).await?;
     write_json(stream, "200 OK", response).await
 }
 
@@ -1063,9 +1073,11 @@ fn effect_for_tool(tool: &str, input: &Value, state: &BrokerState) -> Option<Eff
         .or_else(|| input.get("file_path"))
         .or_else(|| input.get("filePath"))
         .or_else(|| input.get("Path"))
+        .or_else(|| input.get("AbsolutePath"))
+        .or_else(|| input.get("TargetFile"))
         .and_then(|v| v.as_str())
         .unwrap_or("");
-    let scope_path = if path.is_empty() || path.starts_with('/') {
+    let scope_path = if path.is_empty() || path.starts_with('/') || path.starts_with("~/") {
         path.to_string()
     } else {
         format!(
@@ -1076,14 +1088,16 @@ fn effect_for_tool(tool: &str, input: &Value, state: &BrokerState) -> Option<Eff
     };
     let scope = scope_for_path(&scope_path, state);
     let kind = match tool_l.as_str() {
-        "read" | "read_file" | "fs_read" | "view" | "glob" | "grep" | "ls" | "list" => {
-            EffectKind::FsRead
-        }
+        "read" | "read_file" | "fs_read" | "view" | "view_file" | "glob" | "grep" | "ls"
+        | "list" => EffectKind::FsRead,
         "write"
         | "write_file"
         | "fs_write"
+        | "create_file"
         | "edit"
         | "edit_file"
+        | "replace_file_content"
+        | "multi_replace_file_content"
         | "multiedit"
         | "notebookedit"
         | "notebook_edit"
@@ -1094,7 +1108,7 @@ fn effect_for_tool(tool: &str, input: &Value, state: &BrokerState) -> Option<Eff
                 EffectKind::FsWrite
             }
         }
-        "delete" | "fs_delete" => EffectKind::FsDelete,
+        "delete" | "delete_file" | "fs_delete" => EffectKind::FsDelete,
         "bash" | "shell" | "run_command" | "proc_exec" => EffectKind::ProcExec,
         "webfetch" | "web_fetch" | "websearch" | "web_search" | "fetch" | "http" => {
             EffectKind::NetRequest
@@ -1137,38 +1151,96 @@ fn effect_for_tool(tool: &str, input: &Value, state: &BrokerState) -> Option<Eff
     ))
 }
 
+fn is_credential_or_ring0_path(raw: &str, norm_s: &str) -> bool {
+    const MARKERS: &[&str] = &[
+        "~/.ssh",
+        "~/.aws",
+        "~/.gnupg",
+        "~/.kube",
+        "/.ssh/",
+        "/.aws/",
+        "/.gnupg/",
+        "/.kube/",
+        ".ssh/",
+        ".aws/",
+        ".gnupg/",
+        ".kube/",
+        "/.config/gh/",
+        "/Library/Keychains",
+        "/oauth_creds.json",
+        "/.credentials.json",
+        "/.codex/auth.json",
+        "/.hermes/auth.json",
+        "/opencode/auth.json",
+        "/plugins_secrets.json",
+        "/human.token",
+        "/agent.token",
+        "/policy_state.json",
+        ".dek.enc.json",
+        "/master.kek",
+        "/.master.kek",
+    ];
+    for candidate in [raw, norm_s] {
+        if MARKERS.iter().any(|m| candidate.contains(m))
+            || candidate.ends_with("/.env")
+            || candidate.ends_with("/.ssh")
+            || candidate.ends_with("/.aws")
+            || candidate.ends_with("/.gnupg")
+            || candidate.ends_with("/.kube")
+        {
+            return true;
+        }
+    }
+    false
+}
+
 fn scope_for_path(path: &str, state: &BrokerState) -> ResourceScope {
     if path.is_empty() {
         return ResourceScope::Shadow;
     }
-    if path.starts_with(&state.session.shadow)
-        || path.starts_with(&state.session.workspace)
-        || path.starts_with(&state.session.agent_home)
-        || path.starts_with("/tmp/")
-        || path.starts_with("/run/aegis/")
+    let norm = crate::routing::canonicalize_lossy(Path::new(path));
+    let norm_s = norm.to_string_lossy();
+
+    // Check credentials and Ring-0 runtime state BEFORE shadow/workspace prefixes so
+    // lexical traversal like `/workspace/../../.ssh/id_rsa` or `agent_home/.gemini/oauth_creds.json`
+    // can never be classified as Shadow or ProjectRo.
+    if is_credential_or_ring0_path(path, &norm_s) {
+        return ResourceScope::Credential;
+    }
+
+    let shadow_norm = crate::routing::canonicalize_lossy(Path::new(&state.session.shadow));
+    let session_upper_norm =
+        crate::routing::canonicalize_lossy(&state.session_dir.join("cow_workspace/upper_workspace"));
+    let agent_home_norm = crate::routing::canonicalize_lossy(Path::new(&state.session.agent_home));
+    let workspace_norm = crate::routing::canonicalize_lossy(Path::new(&state.session.workspace));
+
+    let in_tmp_scratch = (norm_s.starts_with("/tmp/") || norm_s.starts_with("/private/tmp/"))
+        && !norm_s.contains("/aegis-os-runtime/")
+        && !norm_s.contains("/orgs/");
+
+    if norm.starts_with(&shadow_norm)
+        || norm.starts_with(&session_upper_norm)
+        || norm.starts_with(&agent_home_norm)
+        || in_tmp_scratch
+        || norm_s.starts_with("/run/aegis/")
+        || (cfg!(target_os = "linux") && norm.starts_with(&workspace_norm))
     {
         return ResourceScope::Shadow;
     }
-    if path.starts_with("/aegis/host") {
+    if path.starts_with("/aegis/host") || norm.starts_with(&workspace_norm) {
         return ResourceScope::ProjectRo;
     }
-    if path.starts_with("~/.ssh")
-        || path.starts_with("~/.aws")
-        || path.starts_with("~/.gnupg")
-        || path.starts_with("~/.kube")
-        || path.contains(".ssh/")
-        || path.contains(".aws/")
-        || path.contains(".gnupg/")
-        || path.contains(".kube/")
-        || path.ends_with("/.env")
-        || path.contains("/.config/gh/")
-    {
-        return ResourceScope::Credential;
-    }
-    if path.starts_with("/etc/")
-        || path.starts_with("/usr/")
-        || path.starts_with("/var/")
-        || path.starts_with("/root/")
+    if norm_s.starts_with("/etc/")
+        || norm_s.starts_with("/private/etc/")
+        || norm_s.starts_with("/usr/")
+        || norm_s.starts_with("/var/")
+        || norm_s.starts_with("/private/var/")
+        || norm_s.starts_with("/opt/")
+        || norm_s.starts_with("/bin/")
+        || norm_s.starts_with("/sbin/")
+        || (norm_s.starts_with("/System/") && !norm_s.starts_with("/System/Volumes/"))
+        || norm_s.starts_with("/Library/")
+        || norm_s.starts_with("/root/")
     {
         return ResourceScope::System;
     }
@@ -1809,5 +1881,236 @@ print("BROKER_PROBE_DONE")
             .await
             .unwrap();
         assert!(fresh_audit.get("events").is_some(), "{fresh_audit}");
+    }
+
+    #[tokio::test]
+    async fn test_enforced_session_broker_hook_allows_lazy_mcp_and_agent_home_reads_under_unreadable_runtime() {
+        let tmp = tempfile::tempdir().unwrap();
+        let runtime = tmp.path().join("runtime");
+        let session_dir = runtime.join("sessions/ses_9e215161fb95");
+        let workspace = tmp.path().join("workspace");
+        let shadow = session_dir.join("cow_workspace/upper_workspace");
+        let agent_home = session_dir.join("agent_home");
+        std::fs::create_dir_all(&workspace).unwrap();
+        std::fs::write(workspace.join("Cargo.toml"), "[package]\nname = \"demo\"\n").unwrap();
+        std::fs::write(workspace.join("README.md"), "# Demo\n").unwrap();
+        std::fs::create_dir_all(&shadow).unwrap();
+        std::fs::create_dir_all(agent_home.join(".gemini/antigravity-cli/mcp/aegis-os")).unwrap();
+        std::fs::create_dir_all(agent_home.join(".gemini/antigravity-cli/brain/conv")).unwrap();
+        std::fs::write(
+            agent_home.join(".gemini/antigravity-cli/mcp/aegis-os/fs_read.json"),
+            "{}",
+        )
+        .unwrap();
+        std::fs::write(
+            agent_home.join(".gemini/antigravity-cli/brain/conv/resource_0.txt"),
+            "status json",
+        )
+        .unwrap();
+        std::fs::write(agent_home.join(".gemini/oauth_creds.json"), "{}").unwrap();
+
+        let broker = SessionBroker::start(
+            &runtime,
+            &session_dir,
+            tmp.path().join("c_hook"),
+            BrokerSession {
+                session_id: "ses_9e215161fb95".to_string(),
+                mode: "implement".to_string(),
+                enforcement: "enforced".to_string(),
+                workspace: workspace.display().to_string(),
+                shadow: shadow.display().to_string(),
+                agent_home: agent_home.display().to_string(),
+            },
+            AgentIdentity::new("aegis-os", "agy-agent", "Lead"),
+            None,
+            false,
+        )
+        .await
+        .unwrap();
+
+        // 1. Lazy MCP `call_mcp_tool` for `aegis-os` is allowed with permissionOverrides.
+        for tool in ["workspace_status", "proc_exec"] {
+            let resp = broker_request(
+                &broker.socket_path,
+                &broker.agent_token,
+                "POST",
+                "/v1/hook",
+                &json!({
+                    "event": "PreToolUse",
+                    "client": "agy",
+                    "is_claude": false,
+                    "payload": {
+                        "conversationId": "conv-1",
+                        "toolCall": {
+                            "name": "call_mcp_tool",
+                            "args": {
+                                "ServerName": "aegis-os",
+                                "ToolName": tool,
+                                "Arguments": {}
+                            }
+                        }
+                    }
+                }),
+            )
+            .await;
+            let out = &resp["output"];
+            assert_eq!(out["decision"], "allow", "tool={tool}: {resp}");
+            let overrides = out["permissionOverrides"].as_array().unwrap();
+            assert!(
+                overrides
+                    .iter()
+                    .any(|v| v.as_str() == Some(&format!("mcp(aegis-os/{tool})"))),
+                "missing permissionOverride for {tool}: {resp}"
+            );
+        }
+
+        // 2. Native read_file on Lazy MCP schema JSON, brain resource dump, and shadow file.
+        for path in [
+            agent_home.join(".gemini/antigravity-cli/mcp/aegis-os/fs_read.json"),
+            agent_home.join(".gemini/antigravity-cli/brain/conv/resource_0.txt"),
+            shadow.join("README.md"),
+        ] {
+            let resp = broker_request(
+                &broker.socket_path,
+                &broker.agent_token,
+                "POST",
+                "/v1/hook",
+                &json!({
+                    "event": "PreToolUse",
+                    "client": "agy",
+                    "is_claude": false,
+                    "payload": {
+                        "conversationId": "conv-1",
+                        "toolCall": {
+                            "name": "read_file",
+                            "args": { "Path": path }
+                        }
+                    }
+                }),
+            )
+            .await;
+            assert_eq!(resp["output"]["decision"], "allow", "path={path:?}: {resp}");
+        }
+
+        // 3. view_file using `AbsolutePath` into read-only host project workspace.
+        let view_resp = broker_request(
+            &broker.socket_path,
+            &broker.agent_token,
+            "POST",
+            "/v1/hook",
+            &json!({
+                "event": "PreToolUse",
+                "client": "agy",
+                "is_claude": false,
+                "payload": {
+                    "conversationId": "conv-1",
+                    "toolCall": {
+                        "name": "view_file",
+                        "args": { "AbsolutePath": workspace.join("Cargo.toml") }
+                    }
+                }
+            }),
+        )
+        .await;
+        assert_eq!(view_resp["output"]["decision"], "allow", "{view_resp}");
+
+        // 4. Path traversal `.ssh`, `human.token`, and `oauth_creds.json` are denied.
+        let traversal_ssh = format!("{}/../../.ssh/id_rsa", workspace.display());
+        for denied_path in [
+            PathBuf::from(traversal_ssh),
+            session_dir.join("human.token"),
+            agent_home.join(".gemini/oauth_creds.json"),
+        ] {
+            let resp = broker_request(
+                &broker.socket_path,
+                &broker.agent_token,
+                "POST",
+                "/v1/hook",
+                &json!({
+                    "event": "PreToolUse",
+                    "client": "agy",
+                    "is_claude": false,
+                    "payload": {
+                        "conversationId": "conv-1",
+                        "toolCall": {
+                            "name": "read_file",
+                            "args": { "Path": denied_path }
+                        }
+                    }
+                }),
+            )
+            .await;
+            assert_eq!(
+                resp["output"]["decision"], "deny",
+                "denied_path={denied_path:?}: {resp}"
+            );
+        }
+
+        // 5. write_file into shadow is allowed; direct host workspace write_file is denied.
+        let write_shadow = broker_request(
+            &broker.socket_path,
+            &broker.agent_token,
+            "POST",
+            "/v1/hook",
+            &json!({
+                "event": "PreToolUse",
+                "client": "agy",
+                "is_claude": false,
+                "payload": {
+                    "conversationId": "conv-1",
+                    "toolCall": {
+                        "name": "write_file",
+                        "args": { "Path": shadow.join("src/new.rs") }
+                    }
+                }
+            }),
+        )
+        .await;
+        assert_eq!(write_shadow["output"]["decision"], "allow", "{write_shadow}");
+
+        let write_host = broker_request(
+            &broker.socket_path,
+            &broker.agent_token,
+            "POST",
+            "/v1/hook",
+            &json!({
+                "event": "PreToolUse",
+                "client": "agy",
+                "is_claude": false,
+                "payload": {
+                    "conversationId": "conv-1",
+                    "toolCall": {
+                        "name": "write_file",
+                        "args": { "Path": workspace.join("src/new.rs") }
+                    }
+                }
+            }),
+        )
+        .await;
+        assert_eq!(write_host["output"]["decision"], "deny", "{write_host}");
+
+        // 6. SessionStart emits Antigravity's nested `systemMessage.systemMessage` schema.
+        let start_resp = broker_request(
+            &broker.socket_path,
+            &broker.agent_token,
+            "POST",
+            "/v1/hook",
+            &json!({
+                "event": "SessionStart",
+                "client": "agy",
+                "is_claude": false,
+                "payload": {
+                    "conversationId": "conv-session-start-nested"
+                }
+            }),
+        )
+        .await;
+        let injected = start_resp["output"]["injectSteps"][0]["systemMessage"]["systemMessage"]
+            .as_str()
+            .unwrap_or("");
+        assert!(
+            !injected.is_empty() && injected.contains("Aegis OS Runtime Active"),
+            "unexpected SessionStart output: {start_resp}"
+        );
     }
 }
