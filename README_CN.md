@@ -123,13 +123,10 @@ aegis-os uninstall           # 或彻底清理: aegis-os uninstall --workspace-c
 
 ## 文档
 
-- **Enforced Runtime 设计** — advisory / enforced / isolated 威胁模型、Effect 模型、阶段计划：[`docs/AEGIS_ENFORCED_RUNTIME_DESIGN.md`](docs/AEGIS_ENFORCED_RUNTIME_DESIGN.md)
-- **详细架构** — 信任边界、核心 crate、工作区与合并模型、MCP/A2A 接口、领域 profile、云端 PaaS、基准与实施状态：[`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md)
+- **完整技术架构、威胁模型、实现对照与用户手册** — [`docs/DOC.md`](docs/DOC.md)
 - **基准报告** — [`BENCHMARK_REPORT.md`](BENCHMARK_REPORT.md) · [`paper2/ENFORCED_RUNTIME_BENCH_REPORT.json`](paper2/ENFORCED_RUNTIME_BENCH_REPORT.json) · [`scripts/p2_live/README.md`](scripts/p2_live/README.md)
 - **论文一（事务型多租户 Agent OS · arXiv:2611.08516）** — [https://arxiv.org/abs/2611.08516](https://arxiv.org/abs/2611.08516)（[PDF](https://arxiv.org/pdf/2611.08516) · 本地副本：[`paper/aegis_os_arxiv_preprint.pdf`](paper/aegis_os_arxiv_preprint.pdf)）
 - **论文二（Enforced 内核运行时与插件安全边界 · DOI: 10.5281/zenodo.24170505）** — [https://doi.org/10.5281/zenodo.24170505](https://doi.org/10.5281/zenodo.24170505)（[Zenodo 页面](https://zenodo.org/records/24170505) · 本地副本：[`paper2/aegis_enforced_runtime_arxiv_preprint.pdf`](paper2/aegis_enforced_runtime_arxiv_preprint.pdf) · [LaTeX](paper2/main.tex)）
-- **AAP-1.0 应用协议** — [`docs/AEGIS_APPLICATION_PROTOCOL.md`](docs/AEGIS_APPLICATION_PROTOCOL.md)
-- **记忆同意 / UOMP** — [`docs/UOMP_MEMORY_CONSENT_MAPPING.md`](docs/UOMP_MEMORY_CONSENT_MAPPING.md)
 - **技术专论** — [为什么 Agent 插件不是安全边界](https://heurion.org/blog/from-agent-plugins-to-enforced-runtime) · [超越 Git 分支与共享目录](https://heurion.org/blog/aegis-os-transactional-agent-kernel) · [人机权限与能力对等](https://heurion.org/blog/human-agent-capability-parity-ai-native-software) · [双表面 CRDT](https://heurion.org/blog/dual-surface-crdt-clinical-ai)
 - **技术博客总目录** — https://heurion.org/blog
 
@@ -163,6 +160,6 @@ aegis-os uninstall           # 或彻底清理: aegis-os uninstall --workspace-c
 
 ## 遥测与许可证
 
-仅在安装与每日首次会话发送匿名心跳；不包含源码、路径、Prompt 或凭据。设置 `DO_NOT_TRACK=1` / `AOS_TELEMETRY_DISABLED=1`，或 `touch ~/.gemini/aegis-telemetry-opt-out` 即可关闭。详见 [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md)。
+仅在安装与每日首次会话发送匿名心跳；不包含源码、路径、Prompt 或凭据。设置 `DO_NOT_TRACK=1` / `AOS_TELEMETRY_DISABLED=1`，或 `touch ~/.gemini/aegis-telemetry-opt-out` 即可关闭。详见 [`docs/DOC.md`](docs/DOC.md)。
 
 Apache License 2.0，见 [`LICENSE`](LICENSE)。

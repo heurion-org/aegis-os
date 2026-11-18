@@ -2,7 +2,7 @@
 //!
 //! The policy engine evaluates effects (read / write / exec / network / secret / commit),
 //! not tool names. `EffectKind::action` is the stable snake_case string used by Cedar
-//! policies and audit records; keep it in sync with `docs/AEGIS_ENFORCED_RUNTIME_DESIGN.md`.
+//! policies and audit records; keep it in sync with `docs/DOC.md`.
 
 use serde::{Deserialize, Serialize};
 

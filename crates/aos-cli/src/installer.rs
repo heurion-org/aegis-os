@@ -9,7 +9,7 @@ const OPENCODE_AEGIS_PLUGIN: &str = include_str!("../../../plugins/opencode-aegi
 const SUPPORTED_SHIM_AGENTS: &[&str] = &["claude", "codex", "agy", "opencode", "hermes"];
 const CURRENT_VERSION: &str = env!("CARGO_PKG_VERSION");
 
-// Release signing key (must match `scripts/install.sh` / `docs/RELEASING.md`).
+// Release signing key (must match `scripts/install.sh` / `docs/DOC.md`).
 const RELEASE_SIGNER: &str = "aegis-os-release@heurion.org ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIObpFSqmFZ8/ObqSlGmN/zhTbFeDHDxlKx6ha6Y9Zi37";
 const RELEASE_PRINCIPAL: &str = "aegis-os-release@heurion.org";
 const RELEASE_NAMESPACE: &str = "aegis-os-release";

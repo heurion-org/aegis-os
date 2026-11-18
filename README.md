@@ -124,13 +124,10 @@ aegis-os uninstall           # or: aegis-os uninstall --workspace-clean --purge 
 
 ## Documentation
 
-- **Enforced runtime design** — advisory/enforced/isolated threat model, effect model, phase plan: [`docs/AEGIS_ENFORCED_RUNTIME_DESIGN.md`](docs/AEGIS_ENFORCED_RUNTIME_DESIGN.md)
-- **Detailed architecture** — trust boundary, core crates, workspace/merge model, MCP/A2A surface, domain profiles, cloud PaaS, benchmarks, status: [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md)
+- **Complete Technical Reference & User Manual (Architecture, Threat Model, Countermeasures & CLI Guide)** — [`docs/DOC.md`](docs/DOC.md)
 - **Benchmark reports** — [`BENCHMARK_REPORT.md`](BENCHMARK_REPORT.md) · [`paper2/ENFORCED_RUNTIME_BENCH_REPORT.json`](paper2/ENFORCED_RUNTIME_BENCH_REPORT.json) · [`scripts/p2_live/README.md`](scripts/p2_live/README.md)
 - **Paper 1 (Transactional Agent OS · arXiv:2611.08516)** — [https://arxiv.org/abs/2611.08516](https://arxiv.org/abs/2611.08516) ([PDF](https://arxiv.org/pdf/2611.08516) · local copy: [`paper/aegis_os_arxiv_preprint.pdf`](paper/aegis_os_arxiv_preprint.pdf))
 - **Paper 2 (Enforced Runtime & Plugin Security Boundary · DOI: 10.5281/zenodo.24170505)** — [https://doi.org/10.5281/zenodo.24170505](https://doi.org/10.5281/zenodo.24170505) ([Zenodo Record](https://zenodo.org/records/24170505) · local PDF: [`paper2/aegis_enforced_runtime_arxiv_preprint.pdf`](paper2/aegis_enforced_runtime_arxiv_preprint.pdf) · [LaTeX](paper2/main.tex))
-- **AAP-1.0 application protocol** — [`docs/AEGIS_APPLICATION_PROTOCOL.md`](docs/AEGIS_APPLICATION_PROTOCOL.md)
-- **Memory consent / UOMP** — [`docs/UOMP_MEMORY_CONSENT_MAPPING.md`](docs/UOMP_MEMORY_CONSENT_MAPPING.md)
 - **Technical monographs** — [Why Agent Plugins Are Not a Security Boundary](https://heurion.org/en/blog/from-agent-plugins-to-enforced-runtime) · [Beyond Git Branches & Shared Folders](https://heurion.org/en/blog/aegis-os-transactional-agent-kernel) · [Human-Agent Capability Parity](https://heurion.org/en/blog/human-agent-capability-parity-ai-native-software) · [Dual-Surface CRDT](https://heurion.org/en/blog/dual-surface-crdt-clinical-ai)
 - **Blog index** — https://heurion.org/en/blog (中文: https://heurion.org/blog)
 
@@ -164,6 +161,6 @@ If you use Aegis OS in your research or engineering workflows, please cite our p
 
 ## Telemetry & license
 
-Anonymous install/session ping only; no source, paths, prompts, or credentials. Opt out with `DO_NOT_TRACK=1`, `AOS_TELEMETRY_DISABLED=1`, or `touch ~/.gemini/aegis-telemetry-opt-out`. Details: [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md).
+Anonymous install/session ping only; no source, paths, prompts, or credentials. Opt out with `DO_NOT_TRACK=1`, `AOS_TELEMETRY_DISABLED=1`, or `touch ~/.gemini/aegis-telemetry-opt-out`. Details: [`docs/DOC.md`](docs/DOC.md).
 
 Apache License 2.0. See [`LICENSE`](LICENSE).
