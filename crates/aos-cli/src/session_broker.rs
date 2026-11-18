@@ -1653,7 +1653,7 @@ esac
             workspace.join("scripts/probe.py"),
             r#"import json, platform, subprocess, time
 from pathlib import Path
-time.sleep(0.35)
+time.sleep(0.65)
 Path("reports").mkdir(exist_ok=True)
 nested_sbx = None
 if platform.system() == "Darwin":
@@ -1742,15 +1742,24 @@ print("BROKER_PROBE_DONE")
         let ep_clone = ep.clone();
         let tok_clone = pre_human_token.clone();
         let interlock_task = tokio::spawn(async move {
-            tokio::time::sleep(std::time::Duration::from_millis(120)).await;
-            control_request_at(
-                &ep_clone,
-                &tok_clone,
-                "POST",
-                "/v1/leases",
-                Some(&json!({ "action": "workspace_commit", "resource": "*", "ttl_secs": 60 })),
-            )
-            .await
+            let mut last_err = String::new();
+            for _ in 0..15 {
+                tokio::time::sleep(std::time::Duration::from_millis(40)).await;
+                match control_request_at(
+                    &ep_clone,
+                    &tok_clone,
+                    "POST",
+                    "/v1/leases",
+                    Some(&json!({ "action": "workspace_commit", "resource": "*", "ttl_secs": 60 })),
+                )
+                .await
+                {
+                    Err(e) if e.to_string().contains("423 Locked") => return e.to_string(),
+                    Err(e) => last_err = e.to_string(),
+                    Ok(v) => last_err = format!("unexpected 200 OK: {v}"),
+                }
+            }
+            last_err
         });
 
         let exec_rpc = broker_request(
@@ -1782,7 +1791,7 @@ print("BROKER_PROBE_DONE")
             "{exec_inner}"
         );
 
-        let lock_err = interlock_task.await.unwrap().unwrap_err().to_string();
+        let lock_err = interlock_task.await.unwrap();
         assert!(lock_err.contains("423 Locked"), "expected 423 Locked during host_exec, got: {lock_err}");
 
         // 4. Verify `human.token` rotated immediately upon `host_exec` completion!

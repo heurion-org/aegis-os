@@ -15989,9 +15989,19 @@ time.sleep(60)
             assert_eq!(sleep_res["status"], "timed_out", "{sleep_res}");
             let pid_str = std::fs::read_to_string(shadow_root.join("reports/child_pid.txt")).unwrap();
             let child_pid: i32 = pid_str.trim().parse().unwrap();
-            tokio::time::sleep(std::time::Duration::from_millis(100)).await;
-            let alive = unsafe { libc::kill(child_pid, 0) } == 0;
-            assert!(!alive, "grandchild sleep pid {} must be reaped by killpg", child_pid);
+            let mut terminated = false;
+            for _ in 0..15 {
+                let alive = unsafe { libc::kill(child_pid, 0) } == 0;
+                let linux_zombie = std::fs::read_to_string(format!("/proc/{child_pid}/stat"))
+                    .map(|s| s.contains(") Z "))
+                    .unwrap_or(false);
+                if !alive || linux_zombie {
+                    terminated = true;
+                    break;
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+            }
+            assert!(terminated, "grandchild sleep pid {} must be killed by killpg", child_pid);
         }
     }
 

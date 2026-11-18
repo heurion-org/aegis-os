@@ -1010,11 +1010,13 @@ impl PolicyEngine for AegisPolicyKernel {
         // `workspace_git_sensitive` escalation and cannot ride on a general `workspace_git` lease.
         if ctx.action == "workspace_git" && !aos_core::ablated("commit_guard") {
             let mut unleased_sensitive: Vec<String> = Vec::new();
+            let mut seen_sensitive_paths: std::collections::BTreeSet<String> =
+                std::collections::BTreeSet::new();
             for key in ["paths", "shadow_paths"] {
                 if let Some(arr) = ctx.metadata.get(key).and_then(|v| v.as_array()) {
                     for p in arr.iter().filter_map(|x| x.as_str()) {
                         if Self::is_commit_poisoning_path(p)
-                            && !unleased_sensitive.iter().any(|s| s == p)
+                            && seen_sensitive_paths.insert(p.to_string())
                             && !self
                                 .has_active_sensitive_lease(ctx, "workspace_git_sensitive", p)
                                 .await
@@ -3323,6 +3325,45 @@ mod tests {
             "1-bit hash drift must invalidate TTL host_exec lease"
         );
         let _ = std::fs::remove_dir_all(&tmp_dir);
+    }
+
+    #[tokio::test]
+    async fn workspace_git_auto_commit_shadow_oneshot_sensitive_does_not_double_consume() {
+        let kernel = AegisPolicyKernel::new();
+        let agent = AgentIdentity::new("aegis-os", "agy-agent", "Lead");
+        let ctx = PolicyContext {
+            principal: agent,
+            action: "workspace_git".to_string(),
+            target_org_id: "aegis-os".to_string(),
+            target_resource: "git:/repo#push:origin:branch=main,tag=v0.4.10,force_tag=false"
+                .to_string(),
+            metadata: serde_json::json!({
+                "host_root": "/repo",
+                "paths": ["Cargo.toml", "src/lib.rs"],
+                "shadow_paths": ["Cargo.toml", "src/lib.rs"],
+                "auto_commit_shadow": true,
+                "commit_message": "chore(release): release v0.4.10",
+                "tag": "v0.4.10",
+                "push": true,
+                "evidence_hash": "deadbeef12345678",
+            }),
+        };
+
+        let esc_id = match kernel.evaluate(&ctx).await.unwrap() {
+            PolicyDecision::Ask { escalation_id, reason, .. } => {
+                assert!(reason.contains("Cargo.toml"), "{reason}");
+                escalation_id
+            }
+            other => panic!("Expected Ask for Cargo.toml, got {other:?}"),
+        };
+
+        // Single OneShot approval (`ttl_secs = 0`) must cover `Cargo.toml` across both `paths`
+        // and `shadow_paths` without consuming the OneShot lease twice.
+        kernel.approve_escalation(&esc_id, 0, "human").await.unwrap();
+        assert!(
+            matches!(kernel.evaluate(&ctx).await.unwrap(), PolicyDecision::Allow { .. }),
+            "OneShot sensitive workspace_git lease must not be double-consumed across paths and shadow_paths"
+        );
     }
 }
 
