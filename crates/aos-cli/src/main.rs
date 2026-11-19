@@ -15,6 +15,7 @@ mod adapter_manifest;
 mod bench;
 mod cloud;
 mod coord;
+mod explore;
 mod hooks;
 mod installer;
 mod launcher;
@@ -711,6 +712,13 @@ enum Commands {
     Cloud {
         #[command(subcommand)]
         action: cloud::CloudAction,
+    },
+
+    /// Explore K isolated CoW strategy/hypothesis paths in parallel (`run`, `status`, `diff`, `apply`, `resume`, `discard`)
+    #[command(visible_alias = "paths")]
+    Explore {
+        #[command(subcommand)]
+        action: explore::ExploreAction,
     },
 
     /// Discover, install, authenticate (`aegis_at_<app_id>.*`), and invoke AAP-1.0 Ecosystem Applications (e.g. `heurion` Heurion 2.0)
@@ -2812,6 +2820,7 @@ async fn main() -> anyhow::Result<()> {
                 budget_usd,
                 max_tokens,
                 max_loop_streak,
+                seed_from_cow_base: None,
             };
             let code = launcher::run_with_options(
                 &workspace,
@@ -2999,6 +3008,11 @@ async fn main() -> anyhow::Result<()> {
 
         Commands::Cloud { action } => {
             cloud::handle_cloud_command(action, &identity, &workspace, &cli.runtime_dir).await?;
+        }
+
+        Commands::Explore { action } => {
+            explore::handle_explore_command(action, &identity, &workspace, &cli.runtime_dir)
+                .await?;
         }
 
         Commands::App { action } => {

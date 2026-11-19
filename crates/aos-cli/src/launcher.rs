@@ -187,6 +187,34 @@ pub(crate) struct RunEgressOptions {
     pub budget_usd: Option<f64>,
     pub max_tokens: Option<u64>,
     pub max_loop_streak: Option<u32>,
+    pub seed_from_cow_base: Option<PathBuf>,
+}
+
+/// Seeds a fresh session's `dst_cow_base` zero-copy from an existing CoW workspace base
+/// (`upper_workspace` + `baseline_snapshot`) without mutating the source snapshot.
+pub(crate) async fn seed_cow_base_from_existing(
+    src_cow_base: &Path,
+    dst_cow_base: &Path,
+) -> anyhow::Result<()> {
+    let src_real = std::fs::read_link(src_cow_base).unwrap_or_else(|_| src_cow_base.to_path_buf());
+    let src_upper = CoWWorkspace::ensure_no_symlink_components(&src_real, Path::new("upper_workspace"))?;
+    let src_baseline =
+        CoWWorkspace::ensure_no_symlink_components(&src_real, Path::new("baseline_snapshot"))?;
+    if !src_upper.is_dir() || !src_baseline.is_dir() {
+        bail!(
+            "cannot seed CoW workspace from {}: missing upper_workspace or baseline_snapshot",
+            src_real.display()
+        );
+    }
+    CoWWorkspace::cow_sync_dir(&src_upper, &dst_cow_base.join("upper_workspace")).await?;
+    CoWWorkspace::cow_sync_dir(&src_baseline, &dst_cow_base.join("baseline_snapshot")).await?;
+    let init_marker = dst_cow_base.join(".initialized");
+    aos_core::session::write_bytes_atomic_synced_async(
+        &init_marker,
+        chrono::Utc::now().to_rfc3339().into_bytes(),
+    )
+    .await?;
+    Ok(())
 }
 
 #[derive(Clone)]
@@ -351,7 +379,7 @@ pub(crate) fn resolve_session_dlp_settings_with_env(
     ))
 }
 
-fn resolve_session_dlp_settings(
+pub(crate) fn resolve_session_dlp_settings(
     project: &Path,
     opts: &RunEgressOptions,
 ) -> anyhow::Result<(DlpGatewayConfig, std::collections::HashMap<String, ModelRate>)> {
@@ -675,7 +703,7 @@ impl LauncherPlan {
     }
 }
 
-fn host_home() -> anyhow::Result<PathBuf> {
+pub(crate) fn host_home() -> anyhow::Result<PathBuf> {
     std::env::var_os("HOME")
         .map(PathBuf::from)
         .context("HOME is not set; cannot locate agent configuration")
@@ -882,7 +910,7 @@ fn ensure_protected_agent_configs(agent_home: &Path) -> anyhow::Result<()> {
     Ok(())
 }
 
-fn rewrite_hermes_config_for_l7(agent_home: &Path, proxy: &str, pinned_port: Option<u16>) {
+pub(crate) fn rewrite_hermes_config_for_l7(agent_home: &Path, proxy: &str, pinned_port: Option<u16>) {
     let cfg_path = agent_home.join(".hermes/config.yaml");
     let Ok(mut raw) = std::fs::read_to_string(&cfg_path) else {
         return;
@@ -922,7 +950,7 @@ fn rewrite_hermes_config_for_l7(agent_home: &Path, proxy: &str, pinned_port: Opt
     let _ = std::fs::write(&cfg_path, raw);
 }
 
-fn rewrite_opencode_config_for_l7(agent_home: &Path, proxy: &str) {
+pub(crate) fn rewrite_opencode_config_for_l7(agent_home: &Path, proxy: &str) {
     if aos_core::ablated("secret_vault") {
         return;
     }
@@ -937,7 +965,7 @@ fn rewrite_opencode_config_for_l7(agent_home: &Path, proxy: &str) {
     }
 }
 
-fn seed_agent_home(host_home: &Path, agent_home: &Path) -> anyhow::Result<()> {
+pub(crate) fn seed_agent_home(host_home: &Path, agent_home: &Path) -> anyhow::Result<()> {
     std::fs::create_dir_all(agent_home)?;
     for rel in SEEDED_AGENT_DIRS {
         let src = host_home.join(rel);
@@ -1111,7 +1139,7 @@ fn collect_toolchains(host_home: &Path) -> anyhow::Result<Vec<FdMount>> {
     Ok(mounts)
 }
 
-fn install_git_shim(agent_home: &Path) -> anyhow::Result<()> {
+pub(crate) fn install_git_shim(agent_home: &Path) -> anyhow::Result<()> {
     use std::os::unix::fs::PermissionsExt;
     let dir = agent_home.join(".aegis-bin");
     std::fs::create_dir_all(&dir)?;
@@ -1289,7 +1317,7 @@ fn git_view(
     )?))
 }
 
-fn validate_workspace_roots(
+pub(crate) fn validate_workspace_roots(
     project: &Path,
     host_home: &Path,
     runtime_dir: &Path,
@@ -2697,7 +2725,7 @@ pub(crate) fn stage_agy_conversation_for_resume(
     }
 }
 
-fn restore_native_oauth_store_for_agent(
+pub(crate) fn restore_native_oauth_store_for_agent(
     host_home: &Path,
     agent_home: &Path,
     command: &[String],
@@ -2811,7 +2839,7 @@ fn restore_native_oauth_store_for_agent(
     }
 }
 
-fn prepare_session_cow_base(
+pub(crate) fn prepare_session_cow_base(
     runtime_dir: &Path,
     org_id: &str,
     session_id: &str,
@@ -3874,7 +3902,8 @@ fn is_aegis_shim_dir(dir: &Path) -> bool {
     dir.ends_with(".aegis/bin")
 }
 
-fn find_in_path(bin: &str) -> Option<PathBuf> {
+#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+pub(crate) fn find_in_path(bin: &str) -> Option<PathBuf> {
     let path = std::env::var_os("PATH")?;
     for dir in std::env::split_paths(&path) {
         if is_aegis_shim_dir(&dir) {
@@ -4126,7 +4155,7 @@ fn opencode_provider_secret_spec(provider: &str) -> Option<(&'static str, &'stat
     boundary_secret_placeholder(env_key).map(|ph| (env_key, ph))
 }
 
-fn harvest_host_secrets(
+pub(crate) fn harvest_host_secrets(
     host_home: &Path,
     command: &[String],
 ) -> std::collections::HashMap<String, String> {
@@ -4261,7 +4290,7 @@ fn harvest_host_secrets(
     secrets
 }
 
-async fn register_boundary_secrets(
+pub(crate) async fn register_boundary_secrets(
     gateway: &AegisEgressGateway,
     identity: &AgentIdentity,
     harvested: &std::collections::HashMap<String, String>,
@@ -4294,57 +4323,7 @@ async fn register_boundary_secrets(
     }
 }
 
-#[allow(clippy::too_many_arguments)]
-async fn start_egress(
-    identity: &AgentIdentity,
-    session_dir: &Path,
-    agent_home: &Path,
-    host_home: &Path,
-    command: &[String],
-    harvested_secrets: &std::collections::HashMap<String, String>,
-    dlp_cfg: &DlpGatewayConfig,
-    pricing_overrides: &std::collections::HashMap<String, ModelRate>,
-) -> anyhow::Result<(EgressGuard, String, String)> {
-    let gateway = Arc::new(AegisEgressGateway::new());
-    if !pricing_overrides.is_empty() {
-        gateway.set_pricing_overrides(pricing_overrides.clone()).await;
-    }
-    if dlp_cfg.pseudonym_mode != PseudonymMode::Block || dlp_cfg.budget.is_some() {
-        gateway
-            .set_dlp_config_for_agent(identity, dlp_cfg.clone(), None, None)
-            .await;
-    }
-    let sink_session_dir = session_dir.to_path_buf();
-    gateway
-        .set_event_sink(Arc::new(move |ev| {
-            let effects_path = sink_session_dir.join("effects.jsonl");
-            let is_not_symlink = std::fs::symlink_metadata(&effects_path)
-                .map(|m| !m.file_type().is_symlink())
-                .unwrap_or(true);
-            if is_not_symlink {
-                if let Ok(mut file) = std::fs::OpenOptions::new()
-                    .create(true)
-                    .append(true)
-                    .open(&effects_path)
-                {
-                    let row = json!({
-                        "event": "egress.guard",
-                        "detail": ev,
-                        "timestamp_ms": chrono::Utc::now().timestamp_millis(),
-                    });
-                    let _ = writeln!(file, "{row}");
-                }
-            }
-            if let EgressGuardEvent::CircuitTripped { ref usage, .. } = ev {
-                if let Ok(bytes) = serde_json::to_vec_pretty(usage) {
-                    let _ = aos_core::session::write_bytes_atomic_synced(
-                        &sink_session_dir.join("egress_usage.json"),
-                        &bytes,
-                    );
-                }
-            }
-        }))
-        .await;
+pub(crate) fn default_egress_allow_domains() -> Vec<String> {
     let mut domains: Vec<String> = [
         "api.anthropic.com",
         "api.openai.com",
@@ -4409,7 +4388,68 @@ async fn start_egress(
                 .map(str::to_string),
         );
     }
-    gateway.allow_domains(&identity.org_id, domains).await;
+    domains
+}
+
+pub(crate) fn build_egress_event_sink(
+    sink_session_dir: PathBuf,
+) -> aos_egress::EgressEventSink {
+    Arc::new(move |ev| {
+        let effects_path = sink_session_dir.join("effects.jsonl");
+        let is_not_symlink = std::fs::symlink_metadata(&effects_path)
+            .map(|m| !m.file_type().is_symlink())
+            .unwrap_or(true);
+        if is_not_symlink {
+            if let Ok(mut file) = std::fs::OpenOptions::new()
+                .create(true)
+                .append(true)
+                .open(&effects_path)
+            {
+                let row = json!({
+                    "event": "egress.guard",
+                    "detail": ev,
+                    "timestamp_ms": chrono::Utc::now().timestamp_millis(),
+                });
+                let _ = writeln!(file, "{row}");
+            }
+        }
+        if let EgressGuardEvent::CircuitTripped { ref usage, .. } = ev {
+            if let Ok(bytes) = serde_json::to_vec_pretty(usage) {
+                let _ = aos_core::session::write_bytes_atomic_synced(
+                    &sink_session_dir.join("egress_usage.json"),
+                    &bytes,
+                );
+            }
+        }
+    })
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn start_egress(
+    identity: &AgentIdentity,
+    session_dir: &Path,
+    agent_home: &Path,
+    host_home: &Path,
+    command: &[String],
+    harvested_secrets: &std::collections::HashMap<String, String>,
+    dlp_cfg: &DlpGatewayConfig,
+    pricing_overrides: &std::collections::HashMap<String, ModelRate>,
+) -> anyhow::Result<(EgressGuard, String, String)> {
+    let gateway = Arc::new(AegisEgressGateway::new());
+    if !pricing_overrides.is_empty() {
+        gateway.set_pricing_overrides(pricing_overrides.clone()).await;
+    }
+    if dlp_cfg.pseudonym_mode != PseudonymMode::Block || dlp_cfg.budget.is_some() {
+        gateway
+            .set_dlp_config_for_agent(identity, dlp_cfg.clone(), None, None)
+            .await;
+    }
+    gateway
+        .set_event_sink(build_egress_event_sink(session_dir.to_path_buf()))
+        .await;
+    gateway
+        .allow_domains(&identity.org_id, default_egress_allow_domains())
+        .await;
     register_boundary_secrets(&gateway, identity, harvested_secrets).await;
     let watch_enabled = is_claude_command(command)
         || is_codex_command(command)
@@ -4630,7 +4670,7 @@ async fn start_egress(
     }
 }
 
-fn l7_base_url_envs(proxy: &str) -> Vec<(&'static str, String)> {
+pub(crate) fn l7_base_url_envs(proxy: &str) -> Vec<(&'static str, String)> {
     let base = format!("http://{proxy}/__aegis/base");
     vec![
         ("ANTHROPIC_BASE_URL", format!("{base}/anthropic")),
@@ -4753,7 +4793,7 @@ fn canonicalize_allowing_missing(path: &Path) -> PathBuf {
     path.to_path_buf()
 }
 
-fn workspace_profile_name(root: &Path) -> Option<String> {
+pub(crate) fn workspace_profile_name(root: &Path) -> Option<String> {
     let raw = std::fs::read_to_string(root.join(".aegis/workspace.json")).ok()?;
     let value: Value = serde_json::from_str(&raw).ok()?;
     let name = value.get("profile")?.as_str()?;
@@ -4761,7 +4801,7 @@ fn workspace_profile_name(root: &Path) -> Option<String> {
     Some(profile.domain.as_str().to_string())
 }
 
-fn detect_profile(root: &Path) -> &'static str {
+pub(crate) fn detect_profile(root: &Path) -> &'static str {
     if root.join(".git").exists()
         || root.join("Cargo.toml").exists()
         || root.join("package.json").exists()
@@ -5090,11 +5130,11 @@ fn diff_label(kind: &aos_core::DiffChangeType) -> &'static str {
     kind.short_label()
 }
 
-fn approval_evidence(diffs: &[aos_core::FileDiffEntry]) -> anyhow::Result<(Value, String)> {
+pub(crate) fn approval_evidence(diffs: &[aos_core::FileDiffEntry]) -> anyhow::Result<(Value, String)> {
     Ok(aos_core::compute_diff_evidence(diffs, false, false))
 }
 
-fn sanitize_terminal_line(line: &str) -> String {
+pub(crate) fn sanitize_terminal_line(line: &str) -> String {
     let mut out = String::with_capacity(line.len());
     for ch in line.chars() {
         match ch {
@@ -5191,7 +5231,7 @@ fn append_audit(session_dir: &Path, mut event: Value) {
     }
 }
 
-fn resolved_verify_command(host_project: &Path, override_cmd: Option<&str>) -> Option<(String, u64)> {
+pub(crate) fn resolved_verify_command(host_project: &Path, override_cmd: Option<&str>) -> Option<(String, u64)> {
     if let Some(cmd) = override_cmd.map(str::trim).filter(|c| !c.is_empty()) {
         return Some((cmd.to_string(), 60_000));
     }
@@ -6174,7 +6214,7 @@ exit "$rc"
     Ok(wrapper)
 }
 
-fn append_credential_and_tls_envs(
+pub(crate) fn append_credential_and_tls_envs(
     envs: &mut Vec<(String, String)>,
     proxy: Option<&str>,
     harvested_secrets: &std::collections::HashMap<String, String>,
@@ -6378,6 +6418,7 @@ async fn run_inner(
             host_home,
             &dlp_cfg,
             &pricing_overrides,
+            egress_opts.seed_from_cow_base.as_deref(),
         )
         .await;
     }
@@ -6425,6 +6466,9 @@ async fn run_inner(
 
     let (cow_base, vault_status) =
         prepare_session_cow_base(runtime_dir, &identity.org_id, &session_id, &session_dir)?;
+    if let Some(src_base) = egress_opts.seed_from_cow_base.as_deref() {
+        seed_cow_base_from_existing(src_base, &cow_base).await?;
+    }
     let cow = CoWWorkspace::init(&project, &cow_base)
         .await
         .with_context(|| format!("creating CoW workspace for {}", project.display()))?;
@@ -6883,6 +6927,7 @@ async fn run_macos_inner(
     host_home: &Path,
     dlp_cfg: &DlpGatewayConfig,
     pricing_overrides: &std::collections::HashMap<String, ModelRate>,
+    seed_from_cow_base: Option<&Path>,
 ) -> anyhow::Result<i32> {
     let harvested_secrets = harvest_host_secrets(host_home, command);
     let session_id = format!("ses_{}", &uuid::Uuid::new_v4().simple().to_string()[..12]);
@@ -6924,6 +6969,9 @@ async fn run_macos_inner(
 
     let (cow_base, vault_status) =
         prepare_session_cow_base(runtime_dir, &identity.org_id, &session_id, &session_dir)?;
+    if let Some(src_base) = seed_from_cow_base {
+        seed_cow_base_from_existing(src_base, &cow_base).await?;
+    }
     let cow = CoWWorkspace::init(project, &cow_base)
         .await
         .with_context(|| format!("creating CoW workspace for {}", project.display()))?;
@@ -10034,6 +10082,7 @@ mod stage1_dlp_config_tests {
             budget_usd: Some(1.25),
             max_tokens: None,
             max_loop_streak: Some(2),
+            ..Default::default()
         };
         let (overridden, _) = resolve_session_dlp_settings_with_env(
             &project,
