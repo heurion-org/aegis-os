@@ -798,6 +798,31 @@ impl CedarPolicySet {
     }
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct TaintSourceEntry {
+    pub server_id: String,
+    pub tool_name: String,
+    pub summary: String,
+    pub timestamp_ms: i64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct SessionTaintRecord {
+    pub org_id: String,
+    pub agent_id: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub session_id: Option<String>,
+    pub first_tainted_at_ms: i64,
+    pub updated_at_ms: i64,
+    pub expires_at_ms: i64,
+    pub sources: Vec<TaintSourceEntry>,
+}
+
+#[derive(Default, serde::Serialize, serde::Deserialize)]
+struct PersistedTaintState {
+    taints: Vec<SessionTaintRecord>,
+}
+
 #[derive(Default, serde::Serialize, serde::Deserialize)]
 struct PersistedPolicyState {
     leases: Vec<LeaseGrant>,
@@ -808,9 +833,11 @@ type HostExecLeaseEntry = (String, String, String);
 
 pub struct AegisPolicyKernel {
     state_file: Option<PathBuf>,
+    taints_file: Option<PathBuf>,
     state_mutex: Arc<tokio::sync::Mutex<()>>,
     leases: Arc<RwLock<Vec<LeaseGrant>>>,
     escalations: Arc<RwLock<Vec<PendingEscalation>>>,
+    taints: Arc<RwLock<Vec<SessionTaintRecord>>>,
     /// Unforgeable in-memory lease registry for `host_exec`. Never persisted or hydrated from
     /// `policy_state.json`, preventing an unsandboxed same-UID child from forging disk leases.
     in_memory_host_exec_leases: Arc<RwLock<std::collections::HashMap<String, HostExecLeaseEntry>>>,
@@ -830,14 +857,25 @@ impl AegisPolicyKernel {
     }
 
     pub fn with_state_file(state_file: Option<PathBuf>) -> Self {
+        let taints_file = state_file
+            .as_ref()
+            .and_then(|p| p.parent().map(|dir| dir.join("session_taints.json")));
         let mut initial_leases = Vec::new();
         let mut initial_escalations = Vec::new();
+        let mut initial_taints = Vec::new();
 
         if let Some(ref path) = state_file {
             if let Ok(bytes) = std::fs::read(path) {
                 if let Ok(parsed) = serde_json::from_slice::<PersistedPolicyState>(&bytes) {
                     initial_leases = parsed.leases;
                     initial_escalations = parsed.escalations;
+                }
+            }
+        }
+        if let Some(ref path) = taints_file {
+            if let Ok(bytes) = std::fs::read(path) {
+                if let Ok(parsed) = serde_json::from_slice::<PersistedTaintState>(&bytes) {
+                    initial_taints = parsed.taints;
                 }
             }
         }
@@ -868,9 +906,11 @@ impl AegisPolicyKernel {
 
         Self {
             state_file,
+            taints_file,
             state_mutex: Arc::new(tokio::sync::Mutex::new(())),
             leases: Arc::new(RwLock::new(initial_leases)),
             escalations: Arc::new(RwLock::new(initial_escalations)),
+            taints: Arc::new(RwLock::new(initial_taints)),
             in_memory_host_exec_leases: Arc::new(RwLock::new(std::collections::HashMap::new())),
             forbidden_host_prefixes: vec![
                 "~/.ssh".to_string(),
@@ -919,6 +959,13 @@ impl AegisPolicyKernel {
                 }
             }
         }
+        if let Some(ref path) = self.taints_file {
+            if let Ok(bytes) = tokio::fs::read(path).await {
+                if let Ok(parsed) = serde_json::from_slice::<PersistedTaintState>(&bytes) {
+                    *self.taints.write().await = parsed.taints;
+                }
+            }
+        }
     }
 
     async fn flush_to_disk_unlocked(&self) -> anyhow::Result<()> {
@@ -928,6 +975,12 @@ impl AegisPolicyKernel {
                 escalations: self.escalations.read().await.clone(),
             };
             aos_core::session::write_json_pretty_unlocked(path, &state).await?;
+        }
+        if let Some(ref path) = self.taints_file {
+            let taint_state = PersistedTaintState {
+                taints: self.taints.read().await.clone(),
+            };
+            aos_core::session::write_json_pretty_unlocked(path, &taint_state).await?;
         }
         Ok(())
     }
@@ -1175,6 +1228,7 @@ impl AegisPolicyKernel {
         ctx: &PolicyContext,
         sensitive_action: &str,
         targets: &[String],
+        min_created_exclusive_ms: Option<i64>,
     ) -> Vec<String> {
         let _guard = self.state_mutex.lock().await;
         let _file_lock = self.acquire_state_lock().await.ok().flatten();
@@ -1205,6 +1259,8 @@ impl AegisPolicyKernel {
                     } else {
                         lease.expires_at_ms > now_ms
                     };
+                    let taint_epoch_ok = min_created_exclusive_ms
+                        .is_none_or(|min_ms| lease.created_at_ms > min_ms);
                     let task_ok = match kind {
                         LeaseKind::TaskScoped => {
                             ctx_task_id.is_some() && lease.task_id.as_deref() == ctx_task_id
@@ -1214,6 +1270,7 @@ impl AegisPolicyKernel {
                         }
                     };
                     if valid
+                        && taint_epoch_ok
                         && task_ok
                         && lease.org_id == ctx.principal.org_id
                         && (lease.agent_id == "*" || lease.agent_id == ctx.principal.agent_id)
@@ -1255,6 +1312,16 @@ impl AegisPolicyKernel {
     }
 
     async fn check_active_lease(&self, ctx: &PolicyContext) -> Option<LeaseGrant> {
+        self.check_active_lease_with_constraints(ctx, None, false)
+            .await
+    }
+
+    async fn check_active_lease_with_constraints(
+        &self,
+        ctx: &PolicyContext,
+        min_created_exclusive_ms: Option<i64>,
+        disallow_wildcard_resource: bool,
+    ) -> Option<LeaseGrant> {
         if ctx.action == "host_exec" {
             return None;
         }
@@ -1281,6 +1348,10 @@ impl AegisPolicyKernel {
                 } else {
                     lease.expires_at_ms > now_ms
                 };
+                let taint_epoch_ok = min_created_exclusive_ms
+                    .is_none_or(|min_ms| lease.created_at_ms > min_ms);
+                let wildcard_ok =
+                    !disallow_wildcard_resource || lease.resource_pattern.trim() != "*";
                 let task_ok = match kind {
                     LeaseKind::TaskScoped => {
                         ctx_task_id.is_some() && lease.task_id.as_deref() == ctx_task_id
@@ -1290,6 +1361,8 @@ impl AegisPolicyKernel {
                     }
                 };
                 if valid
+                    && taint_epoch_ok
+                    && wildcard_ok
                     && task_ok
                     && lease.org_id == ctx.principal.org_id
                     && (lease.agent_id == "*" || lease.agent_id == ctx.principal.agent_id)
@@ -1418,6 +1491,160 @@ impl AegisPolicyKernel {
             || host.starts_with("169.254.")
             || host.contains("::ffff:127.")
             || host.ends_with(".localhost")
+    }
+
+    pub async fn record_untrusted_taint(
+        &self,
+        org_id: &str,
+        agent_id: &str,
+        session_id: Option<&str>,
+        entry: TaintSourceEntry,
+        ttl_secs: i64,
+    ) -> anyhow::Result<SessionTaintRecord> {
+        let _guard = self.state_mutex.lock().await;
+        let _file_lock = self.acquire_state_lock().await?;
+        self.reload_from_disk().await;
+        let now_ms = Utc::now().timestamp_millis();
+        let max_existing_lease_ms = self
+            .leases
+            .read()
+            .await
+            .iter()
+            .filter(|l| {
+                l.org_id == org_id
+                    && (l.agent_id == "*" || l.agent_id == agent_id)
+                    && (l.expires_at_ms > now_ms || l.expires_at_ms == -1)
+            })
+            .map(|l| l.created_at_ms)
+            .max()
+            .unwrap_or(0);
+        let ttl_ms = ttl_secs.max(60) * 1000;
+        let record = {
+            let mut list = self.taints.write().await;
+            list.retain(|t| t.expires_at_ms > now_ms);
+            if let Some(existing) = list
+                .iter_mut()
+                .find(|t| t.org_id == org_id && t.agent_id == agent_id)
+            {
+                let updated_ms = now_ms
+                    .max(existing.updated_at_ms)
+                    .max(max_existing_lease_ms);
+                existing.updated_at_ms = updated_ms;
+                existing.expires_at_ms = now_ms + ttl_ms;
+                if let Some(sid) = session_id {
+                    if !sid.is_empty() {
+                        existing.session_id = Some(sid.to_string());
+                    }
+                }
+                let same_source = existing.sources.iter().any(|s| {
+                    s.server_id == entry.server_id
+                        && s.tool_name == entry.tool_name
+                        && s.summary == entry.summary
+                });
+                if !same_source {
+                    if existing.sources.len() >= 32 {
+                        existing.sources.remove(0);
+                    }
+                    existing.sources.push(entry);
+                }
+                existing.clone()
+            } else {
+                let updated_ms = now_ms.max(max_existing_lease_ms);
+                let rec = SessionTaintRecord {
+                    org_id: org_id.to_string(),
+                    agent_id: agent_id.to_string(),
+                    session_id: session_id.filter(|s| !s.is_empty()).map(str::to_string),
+                    first_tainted_at_ms: now_ms,
+                    updated_at_ms: updated_ms,
+                    expires_at_ms: now_ms + ttl_ms,
+                    sources: vec![entry],
+                };
+                list.push(rec.clone());
+                rec
+            }
+        };
+        self.flush_to_disk_unlocked().await?;
+        Ok(record)
+    }
+
+    pub async fn get_active_taint(
+        &self,
+        org_id: &str,
+        agent_id: &str,
+    ) -> Option<SessionTaintRecord> {
+        let _guard = self.state_mutex.lock().await;
+        let _file_lock = self.acquire_state_lock().await.ok().flatten();
+        self.reload_from_disk().await;
+        let now_ms = Utc::now().timestamp_millis();
+        self.taints
+            .read()
+            .await
+            .iter()
+            .find(|t| t.org_id == org_id && t.agent_id == agent_id && t.expires_at_ms > now_ms)
+            .cloned()
+    }
+
+    pub async fn list_active_taints(&self, org_id: Option<&str>) -> Vec<SessionTaintRecord> {
+        let _guard = self.state_mutex.lock().await;
+        let _file_lock = self.acquire_state_lock().await.ok().flatten();
+        self.reload_from_disk().await;
+        let now_ms = Utc::now().timestamp_millis();
+        self.taints
+            .read()
+            .await
+            .iter()
+            .filter(|t| {
+                t.expires_at_ms > now_ms && org_id.is_none_or(|o| o == "*" || t.org_id == o)
+            })
+            .cloned()
+            .collect()
+    }
+
+    pub async fn clear_taint(&self, org_id: &str, agent_id: Option<&str>) -> anyhow::Result<usize> {
+        let _guard = self.state_mutex.lock().await;
+        let _file_lock = self.acquire_state_lock().await?;
+        self.reload_from_disk().await;
+        let removed = {
+            let mut list = self.taints.write().await;
+            let before = list.len();
+            list.retain(|t| {
+                let matches = (org_id == "*" || t.org_id == org_id)
+                    && agent_id.is_none_or(|a| t.agent_id == a);
+                !matches
+            });
+            before.saturating_sub(list.len())
+        };
+        if removed > 0 {
+            self.flush_to_disk_unlocked().await?;
+        }
+        Ok(removed)
+    }
+
+    async fn record_tainted_escalation(
+        &self,
+        ctx: &PolicyContext,
+        taint: &SessionTaintRecord,
+        reason: String,
+        suggested_lease_scope: String,
+    ) -> anyhow::Result<PolicyDecision> {
+        let mut tainted_meta = ctx.metadata.clone();
+        if let Some(obj) = tainted_meta.as_object_mut() {
+            let ev_entry = obj
+                .entry("evidence".to_string())
+                .or_insert_with(|| serde_json::json!({}));
+            if let Some(ev_obj) = ev_entry.as_object_mut() {
+                ev_obj.insert("session_taint".to_string(), serde_json::json!(taint));
+            }
+        }
+        let tainted_ctx = PolicyContext {
+            principal: ctx.principal.clone(),
+            action: ctx.action.clone(),
+            target_org_id: ctx.target_org_id.clone(),
+            target_resource: ctx.target_resource.clone(),
+            metadata: tainted_meta,
+        };
+        self.record_escalation(&tainted_ctx, reason, suggested_lease_scope)
+            .await
     }
 
     async fn record_escalation(
@@ -1710,6 +1937,10 @@ impl PolicyEngine for AegisPolicyKernel {
             {
                 sensitive_candidates.push("flag:skip_verify".to_string());
             }
+            let active_taint_for_commit = self
+                .get_active_taint(&ctx.principal.org_id, &ctx.principal.agent_id)
+                .await;
+            let min_created_exclusive = active_taint_for_commit.as_ref().map(|t| t.updated_at_ms);
             let unleased_sensitive = if sensitive_candidates.is_empty() {
                 Vec::new()
             } else {
@@ -1717,6 +1948,7 @@ impl PolicyEngine for AegisPolicyKernel {
                     ctx,
                     "workspace_commit_sensitive",
                     &sensitive_candidates,
+                    min_created_exclusive,
                 )
                 .await
             };
@@ -1755,6 +1987,19 @@ impl PolicyEngine for AegisPolicyKernel {
                         combined_resource
                     )
                 };
+                if let Some(ref taint) = active_taint_for_commit {
+                    return self
+                        .record_tainted_escalation(
+                            &batch_ctx,
+                            taint,
+                            format!("[UNTRUSTED MCP TAINT] {reason}"),
+                            format!(
+                                "action=workspace_commit_sensitive, resource={}",
+                                combined_resource
+                            ),
+                        )
+                        .await;
+                }
                 return self
                     .record_escalation(
                         &batch_ctx,
@@ -1814,6 +2059,7 @@ impl PolicyEngine for AegisPolicyKernel {
                     ctx,
                     "workspace_git_sensitive",
                     &sensitive_candidates,
+                    None,
                 )
                 .await
             };
@@ -1953,6 +2199,59 @@ impl PolicyEngine for AegisPolicyKernel {
                     ),
                 )
                 .await;
+        }
+
+        // 2f. Active Session Taint Guard (`UntrustedExternal` MCP Taint):
+        // Once a session ingests untrusted external MCP data, pre-taint broad TTL leases (or custom
+        // Cedar `permit` rules) cannot authorize `workspace_commit` or `egress_unlisted_domain`,
+        // and wildcard domain leases (`resource_pattern == "*"`) are rejected under taint.
+        if matches!(
+            ctx.action.as_str(),
+            "workspace_commit" | "egress_unlisted_domain"
+        ) {
+            if let Some(taint) = self
+                .get_active_taint(&ctx.principal.org_id, &ctx.principal.agent_id)
+                .await
+            {
+                let disallow_wildcard = ctx.action == "egress_unlisted_domain";
+                if let Some(lease) = self
+                    .check_active_lease_with_constraints(
+                        ctx,
+                        Some(taint.updated_at_ms),
+                        disallow_wildcard,
+                    )
+                    .await
+                {
+                    return Ok(PolicyDecision::Allow {
+                        matched_rule: format!("session_lease:{}", lease.lease_id),
+                    });
+                }
+                let src_summary = taint
+                    .sources
+                    .last()
+                    .map(|s| format!("{}:{}", s.server_id, s.tool_name))
+                    .unwrap_or_else(|| "external_mcp".to_string());
+                let (reason, scope) = if ctx.action == "workspace_commit" {
+                    (
+                        format!(
+                            "[UNTRUSTED MCP TAINT] Session ingested untrusted external data ({}); committing shadow changes to '{}' requires explicit human approval",
+                            src_summary, ctx.target_resource
+                        ),
+                        "action=workspace_commit, resource=*".to_string(),
+                    )
+                } else {
+                    (
+                        format!(
+                            "[UNTRUSTED MCP TAINT] Session ingested untrusted external data ({}); outbound connection to unlisted domain '{}' requires explicit domain-pinned human approval",
+                            src_summary, ctx.target_resource
+                        ),
+                        format!("action=egress_unlisted_domain, resource={}", ctx.target_resource),
+                    )
+                };
+                return self
+                    .record_tainted_escalation(ctx, &taint, reason, scope)
+                    .await;
+            }
         }
 
         // 3. Check if an active Session Lease already covers this action + resource:
@@ -2480,11 +2779,14 @@ impl PolicyEngine for AegisPolicyKernel {
         }
     }
 
-    async fn grant_lease(&self, lease: LeaseGrant) -> anyhow::Result<LeaseGrant> {
+    async fn grant_lease(&self, mut lease: LeaseGrant) -> anyhow::Result<LeaseGrant> {
         if lease.action_pattern == "host_exec" || lease.action_pattern.starts_with("host_exec") {
             anyhow::bail!(
                 "Direct grant_lease for 'host_exec' is forbidden; approve a SHA-256 pinned escalation instead"
             );
+        }
+        if lease.created_at_ms <= 0 {
+            lease.created_at_ms = Utc::now().timestamp_millis();
         }
         let _guard = self.state_mutex.lock().await;
         let _file_lock = self.acquire_state_lock().await?;
@@ -2565,6 +2867,22 @@ impl PolicyEngine for AegisPolicyKernel {
         };
 
         let is_oneshot = ttl_secs <= 0;
+        let active_taint_ms = self
+            .taints
+            .read()
+            .await
+            .iter()
+            .filter(|t| {
+                t.org_id == target.org_id
+                    && t.agent_id == target.agent_id
+                    && t.expires_at_ms > now_ms
+            })
+            .map(|t| t.updated_at_ms)
+            .max();
+        let lease_created_at_ms = match active_taint_ms {
+            Some(t_ms) => now_ms.max(t_ms.saturating_add(1)),
+            None => now_ms,
+        };
         let expires_at_ms = if is_oneshot {
             now_ms + 900_000
         } else {
@@ -2634,6 +2952,7 @@ impl PolicyEngine for AegisPolicyKernel {
             agent_id: target.agent_id.clone(),
             action_pattern: target.action.clone(),
             resource_pattern,
+            created_at_ms: lease_created_at_ms,
             expires_at_ms,
             granted_by: approved_by.to_string(),
             kind,
@@ -2679,6 +2998,7 @@ impl PolicyEngine for AegisPolicyKernel {
                             agent_id: target.agent_id.clone(),
                             action_pattern: target.action.clone(),
                             resource_pattern: part_pattern,
+                            created_at_ms: lease_created_at_ms,
                             expires_at_ms,
                             granted_by: approved_by.to_string(),
                             kind,
@@ -2724,6 +3044,7 @@ impl PolicyEngine for AegisPolicyKernel {
                     agent_id: target.agent_id,
                     action_pattern: companion_action,
                     resource_pattern: companion_resource,
+                    created_at_ms: lease_created_at_ms,
                     expires_at_ms,
                     granted_by: approved_by.to_string(),
                     kind,
@@ -2737,6 +3058,7 @@ impl PolicyEngine for AegisPolicyKernel {
                     agent_id: target.agent_id,
                     action_pattern: "pkg_install".to_string(),
                     resource_pattern: lease.resource_pattern.clone(),
+                    created_at_ms: lease_created_at_ms,
                     expires_at_ms,
                     granted_by: approved_by.to_string(),
                     kind,
@@ -2923,6 +3245,7 @@ mod tests {
                     agent_id: "coder".to_string(),
                     action_pattern: "workspace_commit".to_string(),
                     resource_pattern: "*".to_string(),
+                    created_at_ms: 0,
                     expires_at_ms: now,
                     granted_by: "user".to_string(),
                     kind,
@@ -3043,6 +3366,7 @@ mod tests {
                 agent_id: "coder-1".to_string(),
                 action_pattern: "workspace_commit".to_string(),
                 resource_pattern: "*".to_string(),
+                created_at_ms: 0,
                 expires_at_ms: Utc::now().timestamp_millis() + 60_000,
                 granted_by: "user".to_string(),
                 kind: LeaseKind::TaskScoped,
@@ -3303,6 +3627,7 @@ mod tests {
                 agent_id: "coder-1".to_string(),
                 action_pattern: "workspace_commit".to_string(),
                 resource_pattern: "*".to_string(),
+                created_at_ms: 0,
                 expires_at_ms: Utc::now().timestamp_millis() + 3_600_000,
                 granted_by: "dev-lead".to_string(),
                 kind: LeaseKind::Ttl,
@@ -3420,6 +3745,7 @@ mod tests {
                 agent_id: "coder-1".to_string(),
                 action_pattern: "fs_export_file".to_string(),
                 resource_pattern: "*".to_string(),
+                created_at_ms: 0,
                 expires_at_ms: Utc::now().timestamp_millis() + 60_000,
                 granted_by: "user".to_string(),
                 kind: LeaseKind::Ttl,
@@ -3738,6 +4064,7 @@ mod tests {
                 agent_id: "agy-agent".to_string(),
                 action_pattern: "workspace_git".to_string(),
                 resource_pattern: general_res.to_string(),
+                created_at_ms: 0,
                 expires_at_ms: Utc::now().timestamp_millis() + 600_000,
                 granted_by: "user".to_string(),
                 kind: LeaseKind::Ttl,
@@ -3827,6 +4154,7 @@ mod tests {
                 agent_id: "agy-agent".to_string(),
                 action_pattern: "pkg_install".to_string(),
                 resource_pattern: "*".to_string(),
+                created_at_ms: 0,
                 expires_at_ms: Utc::now().timestamp_millis() + 600_000,
                 granted_by: "user".to_string(),
                 kind: LeaseKind::Ttl,
@@ -3968,6 +4296,7 @@ mod tests {
                 agent_id: "*".to_string(),
                 action_pattern: "*".to_string(),
                 resource_pattern: "*".to_string(),
+                created_at_ms: 0,
                 expires_at_ms: Utc::now().timestamp_millis() + 3_600_000,
                 granted_by: "test".to_string(),
                 kind: LeaseKind::Ttl,
@@ -3983,6 +4312,7 @@ mod tests {
                     agent_id: "agy-agent".to_string(),
                     action_pattern: "host_exec".to_string(),
                     resource_pattern: "*".to_string(),
+                    created_at_ms: 0,
                     expires_at_ms: Utc::now().timestamp_millis() + 3_600_000,
                     granted_by: "test".to_string(),
                     kind: LeaseKind::Ttl,
@@ -4270,6 +4600,7 @@ mod stage2_security_tests {
                 agent_id: "coder-1".to_string(),
                 action_pattern: "workspace_commit_sensitive".to_string(),
                 resource_pattern: "Cargo.toml".to_string(),
+                created_at_ms: 0,
                 expires_at_ms: Utc::now().timestamp_millis() + 60_000,
                 granted_by: "human".to_string(),
                 kind: LeaseKind::OneShot,
@@ -4335,6 +4666,7 @@ mod stage2_security_tests {
                 agent_id: "*".to_string(),
                 action_pattern: "*".to_string(),
                 resource_pattern: "*".to_string(),
+                created_at_ms: 0,
                 expires_at_ms: Utc::now().timestamp_millis() + 60_000,
                 granted_by: "human".to_string(),
                 kind: LeaseKind::Ttl,
@@ -4368,5 +4700,190 @@ mod stage2_security_tests {
             matches!(kernel.evaluate(&sys_ctx).await.unwrap(), PolicyDecision::Deny { .. }),
             "/system mixed-case prefix must trigger Host Red-Line"
         );
+    }
+
+    #[tokio::test]
+    async fn session_taint_blocks_pre_taint_leases_and_allows_post_taint_approval() {
+        let tmp_dir = std::env::temp_dir().join(format!("aos-policy-taint-{}", Uuid::new_v4()));
+        std::fs::create_dir_all(&tmp_dir).unwrap();
+        let state_path = tmp_dir.join("policy_state.json");
+        let kernel = AegisPolicyKernel::with_state_file(Some(state_path.clone()));
+        let agent = AgentIdentity::new("acme", "coder-1", "Engineer");
+
+        // 1. Pre-taint broad TTL leases for `workspace_commit` and `egress_unlisted_domain`
+        let now = Utc::now().timestamp_millis();
+        kernel
+            .grant_lease(LeaseGrant {
+                lease_id: "lease-pre-commit".to_string(),
+                org_id: "acme".to_string(),
+                agent_id: "coder-1".to_string(),
+                action_pattern: "workspace_commit".to_string(),
+                resource_pattern: "*".to_string(),
+                created_at_ms: now,
+                expires_at_ms: now + 3_600_000,
+                granted_by: "human".to_string(),
+                kind: LeaseKind::Ttl,
+                task_id: None,
+            })
+            .await
+            .unwrap();
+        kernel
+            .grant_lease(LeaseGrant {
+                lease_id: "lease-pre-egress-wild".to_string(),
+                org_id: "acme".to_string(),
+                agent_id: "coder-1".to_string(),
+                action_pattern: "egress_unlisted_domain".to_string(),
+                resource_pattern: "*".to_string(),
+                created_at_ms: now,
+                expires_at_ms: now + 3_600_000,
+                granted_by: "human".to_string(),
+                kind: LeaseKind::Ttl,
+                task_id: None,
+            })
+            .await
+            .unwrap();
+
+        let commit_ctx = PolicyContext {
+            principal: agent.clone(),
+            action: "workspace_commit".to_string(),
+            target_org_id: "acme".to_string(),
+            target_resource: "/workspace".to_string(),
+            metadata: json!({ "paths": ["src/main.rs"] }),
+        };
+        let egress_ctx = PolicyContext {
+            principal: agent.clone(),
+            action: "egress_unlisted_domain".to_string(),
+            target_org_id: "acme".to_string(),
+            target_resource: "webhook.evil.example".to_string(),
+            metadata: json!({}),
+        };
+
+        assert!(matches!(
+            kernel.evaluate(&commit_ctx).await.unwrap(),
+            PolicyDecision::Allow { .. }
+        ));
+        assert!(matches!(
+            kernel.evaluate(&egress_ctx).await.unwrap(),
+            PolicyDecision::Allow { .. }
+        ));
+
+        // 2. Agent reads untrusted external MCP data -> session becomes tainted.
+        kernel
+            .record_untrusted_taint(
+                "acme",
+                "coder-1",
+                Some("ses-taint-1"),
+                TaintSourceEntry {
+                    server_id: "gmail-mcp".to_string(),
+                    tool_name: "read_email".to_string(),
+                    summary: "message msg-42".to_string(),
+                    timestamp_ms: Utc::now().timestamp_millis(),
+                },
+                3600,
+            )
+            .await
+            .unwrap();
+
+        // Both `workspace_commit` and `egress_unlisted_domain` are forced back to `Ask`
+        // with `[UNTRUSTED MCP TAINT]` provenance evidence.
+        let esc_commit = match kernel.evaluate(&commit_ctx).await.unwrap() {
+            PolicyDecision::Ask {
+                escalation_id,
+                reason,
+                ..
+            } => {
+                assert!(reason.contains("[UNTRUSTED MCP TAINT]"), "{reason}");
+                assert!(reason.contains("gmail-mcp:read_email"), "{reason}");
+                escalation_id
+            }
+            other => panic!("expected tainted Ask for workspace_commit, got {other:?}"),
+        };
+        let esc_egress = match kernel.evaluate(&egress_ctx).await.unwrap() {
+            PolicyDecision::Ask {
+                escalation_id,
+                reason,
+                ..
+            } => {
+                assert!(reason.contains("[UNTRUSTED MCP TAINT]"), "{reason}");
+                assert!(reason.contains("webhook.evil.example"), "{reason}");
+                escalation_id
+            }
+            other => panic!("expected tainted Ask for egress_unlisted_domain, got {other:?}"),
+        };
+
+        // 3. Approving escalations mints post-taint leases and attaches session_taint evidence.
+        let esc_list = kernel.list_escalations("acme").await.unwrap();
+        let esc_rec = esc_list
+            .iter()
+            .find(|e| e.escalation_id == esc_commit)
+            .unwrap();
+        assert!(
+            esc_rec
+                .evidence
+                .as_ref()
+                .and_then(|ev| ev.get("session_taint"))
+                .is_some(),
+            "expected session_taint in escalation evidence"
+        );
+
+        let post_commit_lease = kernel
+            .approve_escalation(&esc_commit, 600, "human")
+            .await
+            .unwrap();
+        let post_egress_lease = kernel
+            .approve_escalation(&esc_egress, 600, "human")
+            .await
+            .unwrap();
+        assert_eq!(post_egress_lease.resource_pattern, "webhook.evil.example");
+        assert!(
+            post_commit_lease.created_at_ms
+                > kernel
+                    .get_active_taint("acme", "coder-1")
+                    .await
+                    .unwrap()
+                    .updated_at_ms
+        );
+
+        // Reloading from disk into a fresh kernel instance preserves taint and post-taint leases.
+        let reloaded = AegisPolicyKernel::with_state_file(Some(state_path));
+        assert!(matches!(
+            reloaded.evaluate(&commit_ctx).await.unwrap(),
+            PolicyDecision::Allow { .. }
+        ));
+        assert!(matches!(
+            reloaded.evaluate(&egress_ctx).await.unwrap(),
+            PolicyDecision::Allow { .. }
+        ));
+
+        // 4. Another untrusted read re-arms taint and invalidates the earlier commit lease.
+        reloaded
+            .record_untrusted_taint(
+                "acme",
+                "coder-1",
+                None,
+                TaintSourceEntry {
+                    server_id: "github-mcp".to_string(),
+                    tool_name: "get_issue".to_string(),
+                    summary: "issue #99".to_string(),
+                    timestamp_ms: Utc::now().timestamp_millis(),
+                },
+                3600,
+            )
+            .await
+            .unwrap();
+        assert!(matches!(
+            reloaded.evaluate(&commit_ctx).await.unwrap(),
+            PolicyDecision::Ask { .. }
+        ));
+
+        // 5. Clearing taint removes the active taint record.
+        let cleared = reloaded.clear_taint("acme", Some("coder-1")).await.unwrap();
+        assert_eq!(cleared, 1);
+        assert!(reloaded.get_active_taint("acme", "coder-1").await.is_none());
+        assert!(matches!(
+            reloaded.evaluate(&commit_ctx).await.unwrap(),
+            PolicyDecision::Allow { .. }
+        ));
+        let _ = std::fs::remove_dir_all(&tmp_dir);
     }
 }

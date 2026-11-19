@@ -420,6 +420,98 @@ impl PseudonymSessionTable {
             _ => {}
         }
     }
+
+    /// Pseudonymizes string leaves of an arbitrary JSON payload (e.g. an MCP tool result),
+    /// skipping MCP JSON-RPC structural keys (`jsonrpc`, `id`, `method`, `type`, `mimeType`,
+    /// `uri`, `name`, `role`) and `$AOS_SECRET_*` tokens. Returns the number of modified string leaves.
+    pub fn pseudonymize_json_value(
+        &self,
+        val: &mut Value,
+        custom_rules: &[CustomRedactionRule],
+    ) -> u64 {
+        let mut modified = 0u64;
+        self.walk_json_mcp_pseudonymize(val, custom_rules, false, &mut modified);
+        modified
+    }
+
+    fn walk_json_mcp_pseudonymize(
+        &self,
+        val: &mut Value,
+        custom_rules: &[CustomRedactionRule],
+        skip_subtree: bool,
+        modified: &mut u64,
+    ) {
+        if skip_subtree {
+            return;
+        }
+        match val {
+            Value::String(s) => {
+                if s.contains("$AOS_SECRET_") {
+                    return;
+                }
+                if let Some(updated) = self.pseudonymize_text(s, custom_rules) {
+                    *s = updated;
+                    *modified += 1;
+                }
+            }
+            Value::Array(arr) => {
+                for item in arr {
+                    self.walk_json_mcp_pseudonymize(item, custom_rules, false, modified);
+                }
+            }
+            Value::Object(map) => {
+                for (k, v) in map.iter_mut() {
+                    let skip_key = matches!(
+                        k.as_str(),
+                        "jsonrpc"
+                            | "id"
+                            | "method"
+                            | "type"
+                            | "mimeType"
+                            | "uri"
+                            | "name"
+                            | "role"
+                    );
+                    self.walk_json_mcp_pseudonymize(v, custom_rules, skip_key, modified);
+                }
+            }
+            _ => {}
+        }
+    }
+
+    /// Restores every session pseudonym inside string leaves of a `serde_json::Value`
+    /// without escaping for inner JSON strings. Returns `true` if any leaf changed.
+    pub fn restore_json_value(&self, val: &mut Value) -> bool {
+        if self.active_count() == 0 {
+            return false;
+        }
+        let mut changed = false;
+        self.walk_json_plain_restore(val, &mut changed);
+        changed
+    }
+
+    fn walk_json_plain_restore(&self, val: &mut Value, changed: &mut bool) {
+        match val {
+            Value::String(s) => {
+                let restored = self.restore_all_in_str(s, false);
+                if restored != *s {
+                    *s = restored;
+                    *changed = true;
+                }
+            }
+            Value::Array(arr) => {
+                for item in arr {
+                    self.walk_json_plain_restore(item, changed);
+                }
+            }
+            Value::Object(map) => {
+                for v in map.values_mut() {
+                    self.walk_json_plain_restore(v, changed);
+                }
+            }
+            _ => {}
+        }
+    }
 }
 
 fn escape_inner_json_string(raw: &str) -> String {
@@ -1522,5 +1614,35 @@ mod tests {
             .unwrap();
         let args_json: Value = serde_json::from_str(args_str).unwrap();
         assert_eq!(args_json["note"], orig_lit);
+    }
+
+    #[test]
+    fn mcp_json_value_round_trips_pii_while_preserving_structural_keys() {
+        let table = PseudonymSessionTable::new();
+        let mut mcp_resp = json!({
+            "jsonrpc": "2.0",
+            "id": "customer@corp.example",
+            "result": {
+                "content": [{
+                    "type": "text",
+                    "text": "Contact customer@corp.example or +14155551234 at db.corp.internal (10.24.8.12)"
+                }]
+            }
+        });
+        let changed = table.pseudonymize_json_value(&mut mcp_resp, &[]);
+        assert_eq!(changed, 1);
+        assert_eq!(mcp_resp["id"], "customer@corp.example");
+        let redacted = mcp_resp["result"]["content"][0]["text"].as_str().unwrap();
+        assert!(!redacted.contains("customer@corp.example"));
+        assert!(!redacted.contains("+14155551234"));
+        assert!(!redacted.contains("db.corp.internal"));
+        assert!(!redacted.contains("10.24.8.12"));
+
+        let mut args = json!({
+            "to": redacted.split_whitespace().find(|w| w.contains("@aegis-redact.invalid")).unwrap(),
+            "note": "Follow up"
+        });
+        assert!(table.restore_json_value(&mut args));
+        assert_eq!(args["to"], "customer@corp.example");
     }
 }

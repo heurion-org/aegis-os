@@ -19,6 +19,7 @@ mod explore;
 mod hooks;
 mod installer;
 mod launcher;
+mod mcp_guard;
 mod memory_ui;
 mod routing;
 mod session_broker;
@@ -735,6 +736,12 @@ enum Commands {
     Vm {
         #[command(subcommand)]
         action: vm::VmAction,
+    },
+
+    /// Zero-Trust MCP Firewall & Audit Gateway (`scan`, `adopt`, `unadopt`, `add`, `list`, `policy`, `proxy`, `outbox`, `audit`, `taint`)
+    Mcp {
+        #[command(subcommand)]
+        action: mcp_guard::McpAction,
     },
 
     /// Discover, install, authenticate (`aegis_at_<app_id>.*`), and invoke AAP-1.0 Ecosystem Applications (e.g. `heurion` Heurion 2.0)
@@ -3046,6 +3053,11 @@ async fn main() -> anyhow::Result<()> {
             vm::handle_vm_command(action, &cli.runtime_dir).await?;
         }
 
+        Commands::Mcp { action } => {
+            mcp_guard::handle_mcp_command(action, &identity, &workspace, &cli.runtime_dir)
+                .await?;
+        }
+
         Commands::App { action } => {
             let kernel = AegisRuntimeKernel::new(&cli.runtime_dir).await?;
             match action {
@@ -4130,6 +4142,43 @@ async fn render_mission_control_top(
         println!(
             "  • [{}] {:<12} -> {:<22} ({:<16}) => {} [sha256:{}]",
             ev.event_id, ev.agent_id, ev.action, ev.resource, ev.policy_decision, short_hash
+        );
+    }
+
+    let mcp_servers = kernel.mcp_firewall.list_servers(Some(org_id)).await;
+    let active_taints = kernel
+        .mcp_firewall
+        .policy_kernel()
+        .list_active_taints(Some(org_id))
+        .await;
+    let pending_outbox = kernel
+        .mcp_firewall
+        .list_outbox_tickets(
+            Some(org_id),
+            Some(aos_mcp_gateway::mcp_firewall::OutboxStatus::Pending),
+        )
+        .await;
+    println!(
+        "\n[5] Zero-Trust MCP Firewall (Adopted Servers: {}, Active Taints: {}, Pending Outbox: {}):",
+        mcp_servers.len(),
+        active_taints.len(),
+        pending_outbox.len()
+    );
+    for s in mcp_servers.iter().take(10) {
+        println!(
+            "  • {:<18} | trust={:?} | dlp={:?}",
+            s.server_id, s.policy.trust_level, s.policy.dlp_mode
+        );
+    }
+    for t in pending_outbox.iter().take(10) {
+        println!(
+            "  • [Outbox: {}] {}:{} | Agent: {:<12} | Tainted: {} | sha256:{}",
+            t.ticket_id,
+            t.server_id,
+            t.tool_name,
+            t.agent_id,
+            t.taint_snapshot.is_some(),
+            &t.payload_sha256[..12.min(t.payload_sha256.len())]
         );
     }
     Ok(())

@@ -38,8 +38,10 @@ use uuid::Uuid;
 
 pub mod app_store;
 pub mod approver;
+pub mod mcp_firewall;
 pub mod paas;
 use app_store::AppStoreRegistry;
+use mcp_firewall::McpFirewallRegistry;
 use paas::PaasControlPlane;
 
 /// Splits an agent-supplied path into plain components relative to the shadow root. A leading `/`
@@ -3335,6 +3337,7 @@ pub struct AegisRuntimeKernel {
     pub recorder: Arc<dyn FlightRecorder>,
     pub paas: Arc<PaasControlPlane>,
     pub app_store: Arc<AppStoreRegistry>,
+    pub mcp_firewall: Arc<McpFirewallRegistry>,
     pub vault: Arc<OrgVaultManager>,
     memory_url: Option<String>,
     memory_bridge_token: Option<String>,
@@ -3373,6 +3376,11 @@ impl AegisRuntimeKernel {
         let recorder = Arc::new(AegisFlightRecorder::new(Some(audit_path)));
         let paas = Arc::new(PaasControlPlane::new(&root));
         let app_store = Arc::new(AppStoreRegistry::new(&root));
+        let mcp_firewall = Arc::new(McpFirewallRegistry::new(
+            &root,
+            policy.clone(),
+            recorder.clone(),
+        ));
 
         Ok(Self {
             runtime_data_root: root,
@@ -3383,6 +3391,7 @@ impl AegisRuntimeKernel {
             recorder,
             paas,
             app_store,
+            mcp_firewall,
             vault,
             memory_url: std::env::var("AOS_MEMORY_URL")
                 .ok()
@@ -8546,6 +8555,7 @@ impl AegisRuntimeKernel {
                     .and_then(|v| v.as_str())
                     .map(str::to_string);
 
+                let now_ms = Utc::now().timestamp_millis();
                 let lease = self
                     .policy
                     .grant_lease(LeaseGrant {
@@ -8554,7 +8564,8 @@ impl AegisRuntimeKernel {
                         agent_id: identity.agent_id.clone(),
                         action_pattern: action_pattern.to_string(),
                         resource_pattern: resource_pattern.to_string(),
-                        expires_at_ms: Utc::now().timestamp_millis() + (ttl_secs * 1000),
+                        created_at_ms: now_ms,
+                        expires_at_ms: now_ms + (ttl_secs * 1000),
                         granted_by: "session_owner".to_string(),
                         kind: if task_id.is_some() {
                             LeaseKind::TaskScoped

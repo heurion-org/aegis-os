@@ -1314,6 +1314,7 @@ async fn run_single_path(
         "AOS_EXPLORE_PROMPT_FILE".to_string(),
         prompt_file.display().to_string(),
     );
+    env.insert("AOS_MCP_DRY_RUN".to_string(), "1".to_string());
 
     let mut cred_envs = Vec::new();
     launcher::append_credential_and_tls_envs(

@@ -781,6 +781,21 @@ impl AegisEgressGateway {
         *self.event_sink.write().await = Some(sink);
     }
 
+    pub async fn get_or_create_pseudonym_table(
+        &self,
+        identity: &AgentIdentity,
+    ) -> Arc<PseudonymSessionTable> {
+        let fqn = identity.fqn();
+        if let Some(existing) = self.pseudonym_tables.read().await.get(&fqn).cloned() {
+            return existing;
+        }
+        let mut tables = self.pseudonym_tables.write().await;
+        tables
+            .entry(fqn)
+            .or_insert_with(|| Arc::new(PseudonymSessionTable::new()))
+            .clone()
+    }
+
     pub async fn usage_snapshot(&self, identity: &AgentIdentity) -> UsageSnapshot {
         let fqn = identity.fqn();
         let (active, replacements) = {

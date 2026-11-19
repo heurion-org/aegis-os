@@ -101,6 +101,17 @@ pub struct EncryptedDekEnvelope {
     pub created_at_ms: i64,
 }
 
+/// Authenticated `AES-256-GCM` envelope blob bound to an arbitrary AAD context string.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SealedSecretBlob {
+    pub version: u32,
+    pub aad_context: String,
+    pub key_source: String,
+    pub nonce_hex: String,
+    pub ciphertext_b64: String,
+    pub created_at_ms: i64,
+}
+
 struct HkdfKeyLen32;
 
 impl hkdf::KeyType for HkdfKeyLen32 {
@@ -270,6 +281,136 @@ impl MasterKekProvider for InMemoryKekProvider {
     }
 }
 
+fn load_or_create_sealed_hex_file(
+    path: &Path,
+) -> anyhow::Result<Zeroizing<[u8; 32]>> {
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent)?;
+        let _ = set_dir_0700(parent);
+    }
+    let lock_path = path.with_extension("lock");
+    let _lock = aos_core::session::acquire_file_lock_sync(&lock_path)?;
+    if path.exists() {
+        let raw = Zeroizing::new(std::fs::read_to_string(path)?);
+        return decode_hex_32(&raw);
+    }
+    let generated = random_bytes_32()?;
+    let hex_key = Zeroizing::new(hex::encode(*generated));
+
+    // Write and fsync into a 0o600 sibling temp file before atomic publish so concurrent readers
+    // never observe an empty or partially written key file.
+    let parent = path.parent().unwrap_or_else(|| Path::new("."));
+    let tmp_path = parent.join(format!(
+        ".kek.tmp.{}.{}",
+        std::process::id(),
+        &uuid::Uuid::new_v4().simple().to_string()[..8]
+    ));
+
+    #[cfg(unix)]
+    let mut tmp_file = {
+        use std::os::unix::fs::OpenOptionsExt;
+        std::fs::OpenOptions::new()
+            .create_new(true)
+            .write(true)
+            .mode(0o600)
+            .open(&tmp_path)?
+    };
+    #[cfg(not(unix))]
+    let mut tmp_file = std::fs::OpenOptions::new()
+        .create_new(true)
+        .write(true)
+        .open(&tmp_path)?;
+
+    let write_res: anyhow::Result<()> = (|| {
+        tmp_file.write_all(hex_key.as_bytes())?;
+        tmp_file.sync_all()?;
+        Ok(())
+    })();
+    drop(tmp_file);
+    if let Err(err) = write_res {
+        let _ = std::fs::remove_file(&tmp_path);
+        return Err(err);
+    }
+
+    #[cfg(unix)]
+    {
+        match std::fs::hard_link(&tmp_path, path) {
+            Ok(()) => {
+                let _ = std::fs::remove_file(&tmp_path);
+                Ok(generated)
+            }
+            Err(err) if err.kind() == std::io::ErrorKind::AlreadyExists => {
+                let _ = std::fs::remove_file(&tmp_path);
+                let raw = Zeroizing::new(std::fs::read_to_string(path)?);
+                decode_hex_32(&raw)
+            }
+            Err(err) if err.kind() == std::io::ErrorKind::Unsupported => {
+                if path.exists() {
+                    let _ = std::fs::remove_file(&tmp_path);
+                    let raw = Zeroizing::new(std::fs::read_to_string(path)?);
+                    return decode_hex_32(&raw);
+                }
+                std::fs::rename(&tmp_path, path)?;
+                Ok(generated)
+            }
+            Err(err) => {
+                let _ = std::fs::remove_file(&tmp_path);
+                Err(err.into())
+            }
+        }
+    }
+    #[cfg(not(unix))]
+    {
+        if path.exists() {
+            let _ = std::fs::remove_file(&tmp_path);
+            let raw = Zeroizing::new(std::fs::read_to_string(path)?);
+            return decode_hex_32(&raw);
+        }
+        std::fs::rename(&tmp_path, path)?;
+        Ok(generated)
+    }
+}
+
+/// Isolated `0o600` KEK provider stored inside `<runtime_root>/vaults/.ephemeral.kek` so temp
+/// test runtimes never touch the user's macOS Keychain or `~/.config/aegis-os/master.kek`.
+pub struct EphemeralRuntimeKekProvider {
+    kek_path: PathBuf,
+}
+
+impl EphemeralRuntimeKekProvider {
+    pub fn new(runtime_root: impl AsRef<Path>) -> Self {
+        Self {
+            kek_path: runtime_root.as_ref().join("vaults").join(".ephemeral.kek"),
+        }
+    }
+}
+
+impl MasterKekProvider for EphemeralRuntimeKekProvider {
+    fn load_or_create_kek(&self) -> anyhow::Result<KekWithSource> {
+        Ok((
+            load_or_create_sealed_hex_file(&self.kek_path)?,
+            "ephemeral_runtime_kek",
+        ))
+    }
+
+    fn load_existing_kek_for_source(
+        &self,
+        expected_source: &str,
+    ) -> anyhow::Result<Option<KekWithSource>> {
+        if expected_source != "ephemeral_runtime_kek" {
+            return Ok(None);
+        }
+        if !self.kek_path.exists() {
+            bail!(
+                "sealed blob expects 'ephemeral_runtime_kek' at '{}', which does not exist",
+                self.kek_path.display()
+            );
+        }
+        let raw = Zeroizing::new(std::fs::read_to_string(&self.kek_path)?);
+        Ok(Some((decode_hex_32(&raw)?, "ephemeral_runtime_kek")))
+    }
+}
+
 /// Default OS master KEK hierarchy:
 /// 1. `AOS_VAULT_MASTER_KEY` (Cloud KMS / env KEK via HKDF-SHA256)
 /// 2. macOS Login Keychain (`security`)
@@ -301,91 +442,7 @@ impl DefaultOsKekProvider {
 
     fn load_or_create_sealed_file(&self) -> anyhow::Result<(Zeroizing<[u8; 32]>, &'static str)> {
         let path = self.sealed_kek_path();
-        if let Some(parent) = path.parent() {
-            std::fs::create_dir_all(parent)?;
-            let _ = set_dir_0700(parent);
-        }
-        if path.exists() {
-            let raw = Zeroizing::new(std::fs::read_to_string(&path)?);
-            return Ok((decode_hex_32(&raw)?, "sealed_local_kek"));
-        }
-        let generated = random_bytes_32()?;
-        let hex_key = Zeroizing::new(hex::encode(*generated));
-
-        // Write and fsync into a 0o600 sibling temp file before atomic rename so concurrent readers
-        // never observe an empty or partially written `master.kek`.
-        let parent = path.parent().unwrap_or_else(|| Path::new("."));
-        let tmp_path = parent.join(format!(
-            ".master.kek.tmp.{}.{}",
-            std::process::id(),
-            &uuid::Uuid::new_v4().simple().to_string()[..8]
-        ));
-
-        #[cfg(unix)]
-        let mut tmp_file = {
-            use std::os::unix::fs::OpenOptionsExt;
-            std::fs::OpenOptions::new()
-                .create_new(true)
-                .write(true)
-                .mode(0o600)
-                .open(&tmp_path)?
-        };
-        #[cfg(not(unix))]
-        let mut tmp_file = std::fs::OpenOptions::new()
-            .create_new(true)
-            .write(true)
-            .open(&tmp_path)?;
-
-        let write_res: anyhow::Result<()> = (|| {
-            tmp_file.write_all(hex_key.as_bytes())?;
-            tmp_file.sync_all()?;
-            Ok(())
-        })();
-        drop(tmp_file);
-        if let Err(err) = write_res {
-            let _ = std::fs::remove_file(&tmp_path);
-            return Err(err);
-        }
-
-        #[cfg(unix)]
-        {
-            // `hard_link` + `remove_file` never clobbers an existing `master.kek` if a sibling
-            // process won the initialization race between `path.exists()` and publish.
-            match std::fs::hard_link(&tmp_path, &path) {
-                Ok(()) => {
-                    let _ = std::fs::remove_file(&tmp_path);
-                    Ok((generated, "sealed_local_kek"))
-                }
-                Err(err) if err.kind() == std::io::ErrorKind::AlreadyExists => {
-                    let _ = std::fs::remove_file(&tmp_path);
-                    let raw = Zeroizing::new(std::fs::read_to_string(&path)?);
-                    Ok((decode_hex_32(&raw)?, "sealed_local_kek"))
-                }
-                Err(err) if err.kind() == std::io::ErrorKind::Unsupported => {
-                    if path.exists() {
-                        let _ = std::fs::remove_file(&tmp_path);
-                        let raw = Zeroizing::new(std::fs::read_to_string(&path)?);
-                        return Ok((decode_hex_32(&raw)?, "sealed_local_kek"));
-                    }
-                    std::fs::rename(&tmp_path, &path)?;
-                    Ok((generated, "sealed_local_kek"))
-                }
-                Err(err) => {
-                    let _ = std::fs::remove_file(&tmp_path);
-                    Err(err.into())
-                }
-            }
-        }
-        #[cfg(not(unix))]
-        {
-            if path.exists() {
-                let _ = std::fs::remove_file(&tmp_path);
-                let raw = Zeroizing::new(std::fs::read_to_string(&path)?);
-                return Ok((decode_hex_32(&raw)?, "sealed_local_kek"));
-            }
-            std::fs::rename(&tmp_path, &path)?;
-            Ok((generated, "sealed_local_kek"))
-        }
+        Ok((load_or_create_sealed_hex_file(&path)?, "sealed_local_kek"))
     }
 
     #[cfg(target_os = "macos")]
@@ -612,6 +669,22 @@ impl VaultKeyStore {
         Self { kek_provider }
     }
 
+    /// Selects `EphemeralRuntimeKekProvider` (`<runtime_root>/vaults/.ephemeral.kek`) for
+    /// temp-dir test runtimes without `AOS_VAULT_MASTER_KEY`, and `DefaultOsKekProvider`
+    /// (`AOS_VAULT_MASTER_KEY` -> OS Keychain / Secret Service -> `0o600` `master.kek`) otherwise.
+    pub fn for_runtime_root(runtime_root: &Path) -> Self {
+        let has_env_kek = std::env::var("AOS_VAULT_MASTER_KEY")
+            .map(|v| !v.trim().is_empty())
+            .unwrap_or(false);
+        if !has_env_kek && is_ephemeral_tmp_root(runtime_root) {
+            Self::new(Arc::new(EphemeralRuntimeKekProvider::new(runtime_root)))
+        } else {
+            Self::new(Arc::new(DefaultOsKekProvider::new(
+                runtime_root.join("vaults"),
+            )))
+        }
+    }
+
     pub fn load_or_create_dek(
         &self,
         org_id: &str,
@@ -701,6 +774,91 @@ impl VaultKeyStore {
         };
         aos_core::session::write_json_pretty_atomic_sync(dek_path, &env)?;
         Ok((dek_hex, key_source.to_string()))
+    }
+
+    /// Seals an arbitrary plaintext secret using `AES-256-GCM` bound to `aad_context`
+    /// under the active master KEK (`MasterKekProvider`).
+    pub fn seal_secret(
+        &self,
+        aad_context: &str,
+        plaintext: &[u8],
+    ) -> anyhow::Result<SealedSecretBlob> {
+        let (kek, key_source) = self.kek_provider.load_or_create_kek()?;
+        let rng = SystemRandom::new();
+        let mut nonce_arr = [0u8; 12];
+        rng.fill(&mut nonce_arr)
+            .map_err(|_| anyhow::anyhow!("CSPRNG failure generating secret nonce"))?;
+        let mut in_out = plaintext.to_vec();
+        let unbound = UnboundKey::new(&AES_256_GCM, &*kek)
+            .map_err(|_| anyhow::anyhow!("failed initializing AES-256-GCM key"))?;
+        let key = LessSafeKey::new(unbound);
+        key.seal_in_place_append_tag(
+            Nonce::assume_unique_for_key(nonce_arr),
+            Aad::from(aad_context.as_bytes()),
+            &mut in_out,
+        )
+        .map_err(|_| {
+            anyhow::anyhow!("AEAD sealing failure wrapping secret for '{}'", aad_context)
+        })?;
+        Ok(SealedSecretBlob {
+            version: 1,
+            aad_context: aad_context.to_string(),
+            key_source: key_source.to_string(),
+            nonce_hex: hex::encode(nonce_arr),
+            ciphertext_b64: base64::engine::general_purpose::STANDARD.encode(&in_out),
+            created_at_ms: Utc::now().timestamp_millis(),
+        })
+    }
+
+    /// Verifies `blob.aad_context == aad_context` and opens an `AES-256-GCM` sealed secret blob.
+    pub fn open_secret(
+        &self,
+        aad_context: &str,
+        blob: &SealedSecretBlob,
+    ) -> anyhow::Result<Zeroizing<Vec<u8>>> {
+        if blob.version != 1 {
+            bail!("unsupported sealed secret version {}", blob.version);
+        }
+        if blob.aad_context != aad_context {
+            bail!(
+                "sealed secret AAD context mismatch: blob '{}' vs requested '{}'",
+                blob.aad_context,
+                aad_context
+            );
+        }
+        let kek = match self
+            .kek_provider
+            .load_existing_kek_for_source(&blob.key_source)?
+        {
+            Some((k, _)) => k,
+            None => self.kek_provider.load_or_create_kek()?.0,
+        };
+        let nonce_bytes = hex::decode(blob.nonce_hex.trim())
+            .context("decoding sealed secret nonce_hex")?;
+        if nonce_bytes.len() != 12 {
+            bail!("invalid sealed secret nonce length {}", nonce_bytes.len());
+        }
+        let mut nonce_arr = [0u8; 12];
+        nonce_arr.copy_from_slice(&nonce_bytes);
+        let mut in_out = base64::engine::general_purpose::STANDARD
+            .decode(blob.ciphertext_b64.trim())
+            .context("decoding sealed secret ciphertext_b64")?;
+        let unbound = UnboundKey::new(&AES_256_GCM, &*kek)
+            .map_err(|_| anyhow::anyhow!("failed initializing AES-256-GCM key"))?;
+        let key = LessSafeKey::new(unbound);
+        let plain = key
+            .open_in_place(
+                Nonce::assume_unique_for_key(nonce_arr),
+                Aad::from(aad_context.as_bytes()),
+                &mut in_out,
+            )
+            .map_err(|_| {
+                anyhow::anyhow!(
+                    "AEAD authentication failed opening sealed secret for '{}' (wrong KEK or tampered blob)",
+                    aad_context
+                )
+            })?;
+        Ok(Zeroizing::new(plain.to_vec()))
     }
 }
 
@@ -2257,5 +2415,50 @@ pub mod tests {
         let (dek2, src2) = store.load_or_create_dek("acme", &dek_path).unwrap();
         assert_eq!(dek1.as_str(), dek2.as_str());
         assert_eq!(src2, "in_memory_test");
+    }
+
+    #[test]
+    fn seal_and_open_secret_enforces_aad_and_tamper_detection() {
+        let store = VaultKeyStore::new(Arc::new(InMemoryKekProvider::new([0x7Au8; 32])));
+        let secret = b"ghp_super_secret_token_value_123456";
+        let blob = store
+            .seal_secret("mcp-env:org-a:github:GITHUB_TOKEN", secret)
+            .unwrap();
+        assert_eq!(blob.version, 1);
+        assert_eq!(blob.aad_context, "mcp-env:org-a:github:GITHUB_TOKEN");
+
+        let opened = store
+            .open_secret("mcp-env:org-a:github:GITHUB_TOKEN", &blob)
+            .unwrap();
+        assert_eq!(opened.as_slice(), secret);
+
+        assert!(
+            store
+                .open_secret("mcp-env:org-a:slack:GITHUB_TOKEN", &blob)
+                .is_err(),
+            "mismatched AAD context must fail AEAD opening"
+        );
+
+        let mut tampered_bytes = base64::engine::general_purpose::STANDARD
+            .decode(blob.ciphertext_b64.trim())
+            .unwrap();
+        tampered_bytes[0] ^= 0x01;
+        let mut tampered_blob = blob.clone();
+        tampered_blob.ciphertext_b64 =
+            base64::engine::general_purpose::STANDARD.encode(&tampered_bytes);
+        assert!(
+            store
+                .open_secret("mcp-env:org-a:github:GITHUB_TOKEN", &tampered_blob)
+                .is_err(),
+            "bit-flipped ciphertext must fail AEAD authentication"
+        );
+
+        let wrong_key_store = VaultKeyStore::new(Arc::new(InMemoryKekProvider::new([0x99u8; 32])));
+        assert!(
+            wrong_key_store
+                .open_secret("mcp-env:org-a:github:GITHUB_TOKEN", &blob)
+                .is_err(),
+            "wrong KEK must fail AEAD authentication"
+        );
     }
 }

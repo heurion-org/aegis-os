@@ -637,6 +637,28 @@ pub fn compute_audit_me_report(home_dir: &Path, workspace: &Path, runtime_dir: &
         configured_client_ids.join(", ")
     };
 
+    // 5. Client MCP Server & Plaintext Secret Exposure Surface (metadata only)
+    let scanned_mcp = aos_mcp_gateway::mcp_firewall::scan_client_configs(home_dir, workspace);
+    let unprotected_servers_count = scanned_mcp.iter().filter(|s| !s.already_adopted).count() as u64;
+    let protected_servers_count = scanned_mcp.iter().filter(|s| s.already_adopted).count() as u64;
+    let exposed_plaintext_secret_keys_count: usize = scanned_mcp
+        .iter()
+        .filter(|s| !s.already_adopted)
+        .map(|s| s.plaintext_secret_keys.len())
+        .sum();
+    let mcp_servers_summary: Vec<Value> = scanned_mcp
+        .iter()
+        .map(|s| {
+            json!({
+                "server_id": s.server_id,
+                "client": s.client,
+                "already_adopted": s.already_adopted,
+                "transport_kind": s.transport_kind,
+                "plaintext_secret_keys": s.plaintext_secret_keys,
+            })
+        })
+        .collect();
+
     let badge_color = match grade {
         "S" | "A" => "0A7D52",
         "B" => "2563EB",
@@ -718,6 +740,12 @@ pub fn compute_audit_me_report(home_dir: &Path, workspace: &Path, runtime_dir: &
                     "status": if has_enforced_shims { "closed_by_dual_token_session_broker" } else { "open_in_advisory_mode" }
                 }
             ]
+        },
+        "mcp_security": {
+            "unprotected_servers_count": unprotected_servers_count,
+            "protected_servers_count": protected_servers_count,
+            "exposed_plaintext_secret_keys_count": exposed_plaintext_secret_keys_count,
+            "servers": mcp_servers_summary,
         },
         "share_card_markdown": share_card_markdown,
         "install_cta": "brew tap heurion-org/aegis-os https://github.com/heurion-org/aegis-os.git && brew install aegis-os && aegis-os install --enforce"
@@ -853,7 +881,25 @@ pub async fn render_audit_me_report(
         }
     }
 
-    println!("\n[5] Recommended Next Actions & Shareable Report");
+    println!("\n[5] MCP Server & Plaintext Secret Surface (`aegis-os mcp`)");
+    let unprot = report["mcp_security"]["unprotected_servers_count"]
+        .as_u64()
+        .unwrap_or(0);
+    let prot = report["mcp_security"]["protected_servers_count"]
+        .as_u64()
+        .unwrap_or(0);
+    let exp_keys = report["mcp_security"]["exposed_plaintext_secret_keys_count"]
+        .as_u64()
+        .unwrap_or(0);
+    println!(
+        "  • Protected MCP Servers: {} | Unprotected MCP Servers: {} (exposed secret key(s): {})",
+        prot, unprot, exp_keys
+    );
+    if unprot > 0 {
+        println!("  👉 Adopt & seal plaintext MCP credentials: `aegis-os mcp adopt --all`");
+    }
+
+    println!("\n[6] Recommended Next Actions & Shareable Report");
     if !has_shims {
         println!("  👉 Upgrade to Grade S (Kernel Enforced): `aegis-os install --enforce`");
     }
@@ -924,6 +970,25 @@ mod audit_me_tests {
             protected_report["plugin_bypass_surface"]["open_bypass_vectors_count"].as_u64(),
             Some(0)
         );
+
+        // 3. Unadopted MCP server with plaintext token appears in `mcp_security` without leaking secret value.
+        std::fs::write(
+            ws.join(".mcp.json"),
+            r#"{"mcpServers":{"github":{"command":"npx","args":["-y","gh-mcp"],"env":{"GITHUB_TOKEN":"ghp_never_print_me"}}}}"#,
+        )
+        .unwrap();
+        let mcp_report = compute_audit_me_report(&home, &ws, &rt);
+        assert_eq!(
+            mcp_report["mcp_security"]["unprotected_servers_count"].as_u64(),
+            Some(1)
+        );
+        assert_eq!(
+            mcp_report["mcp_security"]["exposed_plaintext_secret_keys_count"].as_u64(),
+            Some(1)
+        );
+        assert!(!serde_json::to_string(&mcp_report)
+            .unwrap()
+            .contains("ghp_never_print_me"));
     }
 }
 

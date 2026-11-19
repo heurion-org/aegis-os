@@ -53,6 +53,8 @@ pub(crate) struct BrokerState {
     startup_bin_mtime: Option<std::time::SystemTime>,
     hot_reload_home_override: Option<PathBuf>,
     egress_gateway: Option<Arc<aos_egress::AegisEgressGateway>>,
+    mcp_proxy_pool: Arc<aos_mcp_gateway::mcp_firewall::McpProxySessionPool>,
+    fallback_pseudonym_table: Arc<aos_egress::PseudonymSessionTable>,
 }
 
 pub struct SessionBroker {
@@ -345,6 +347,11 @@ impl SessionBroker {
             })
             .await;
 
+        let mcp_proxy_pool = Arc::new(aos_mcp_gateway::mcp_firewall::McpProxySessionPool::new(
+            kernel.mcp_firewall.clone(),
+        ));
+        let fallback_pseudonym_table = Arc::new(aos_egress::PseudonymSessionTable::new());
+
         let state = Arc::new(BrokerState {
             runtime_dir: runtime_dir.to_path_buf(),
             session,
@@ -359,6 +366,8 @@ impl SessionBroker {
             startup_bin_mtime,
             hot_reload_home_override,
             egress_gateway,
+            mcp_proxy_pool,
+            fallback_pseudonym_table,
         });
 
         let (task, tcp_task, tcp_addr) = if expose_tcp {
@@ -591,25 +600,28 @@ where
         .unwrap_or_default();
 
     let path_only = target.split('?').next().unwrap_or(target);
-    let agent_route = matches!(
-        (method, path_only),
-        ("GET", "/v1/session")
-            | ("POST", "/v1/adapter/hello")
-            | ("GET", "/v1/adapter/capabilities")
-            | ("POST", "/v1/adapter/evaluate")
-            | ("POST", "/v1/adapter/effect")
-            | ("POST", "/v1/effects")
-            | ("POST", "/v1/hook")
-            | ("POST", "/v1/mcp")
-            | ("POST", "/v1/adapter/heartbeat")
-    );
+    let agent_route = (method == "POST" && path_only.starts_with("/v1/mcp-proxy/"))
+        || matches!(
+            (method, path_only),
+            ("GET", "/v1/session")
+                | ("POST", "/v1/adapter/hello")
+                | ("GET", "/v1/adapter/capabilities")
+                | ("POST", "/v1/adapter/evaluate")
+                | ("POST", "/v1/adapter/effect")
+                | ("POST", "/v1/effects")
+                | ("POST", "/v1/hook")
+                | ("POST", "/v1/mcp")
+                | ("POST", "/v1/adapter/heartbeat")
+        );
     let human_route = path_only == "/v1/escalations"
         || path_only.starts_with("/v1/escalations/")
         || path_only == "/v1/leases"
         || path_only.starts_with("/v1/leases/")
         || path_only == "/v1/audit"
         || path_only == "/v1/egress/usage"
-        || path_only == "/v1/egress/extend-budget";
+        || path_only == "/v1/egress/extend-budget"
+        || path_only == "/v1/mcp-outbox"
+        || path_only.starts_with("/v1/mcp-outbox/");
 
     if agent_route && !token_eq(&presented, &state.agent_token) {
         return write_json(&mut stream, "401 Unauthorized", json!({"error": "invalid agent token"})).await;
@@ -789,13 +801,15 @@ where
                 .unwrap_or("*")
                 .to_string();
             let ttl_secs = payload.get("ttl_secs").and_then(|v| v.as_i64()).unwrap_or(3600);
+            let now_ms = chrono::Utc::now().timestamp_millis();
             let lease = LeaseGrant {
                 lease_id: format!("lease-{}", &uuid::Uuid::new_v4().simple().to_string()[..8]),
                 org_id: state.identity.org_id.clone(),
                 agent_id: state.identity.agent_id.clone(),
                 action_pattern: action,
                 resource_pattern: resource,
-                expires_at_ms: chrono::Utc::now().timestamp_millis() + ttl_secs.max(1) * 1000,
+                created_at_ms: now_ms,
+                expires_at_ms: now_ms + ttl_secs.max(1) * 1000,
                 granted_by: "session-human-token".to_string(),
                 kind: LeaseKind::Ttl,
                 task_id: None,
@@ -811,6 +825,102 @@ where
         ("GET", "/v1/audit") => {
             let events = state.kernel.recorder.query_events(&state.identity.org_id, None, 100).await?;
             write_json(&mut stream, "200 OK", json!({"events": events})).await
+        }
+        ("POST", path) if path.starts_with("/v1/mcp-proxy/") => {
+            let server_id = path.trim_start_matches("/v1/mcp-proxy/").trim_matches('/');
+            if server_id.is_empty() || server_id.contains('/') {
+                return write_json(
+                    &mut stream,
+                    "400 Bad Request",
+                    json!({ "error": "invalid MCP server_id in /v1/mcp-proxy/<server_id>" }),
+                )
+                .await;
+            }
+            let ptable = if let Some(ref gw) = state.egress_gateway {
+                gw.get_or_create_pseudonym_table(&state.identity).await
+            } else {
+                state.fallback_pseudonym_table.clone()
+            };
+            let dry_run_only = headers
+                .get("x-aegis-mcp-dry-run")
+                .map(|v| v == "1")
+                .unwrap_or(false)
+                || std::env::var("AOS_MCP_DRY_RUN").as_deref() == Ok("1");
+            match state
+                .mcp_proxy_pool
+                .handle_jsonrpc(
+                    &state.identity,
+                    &state.session.session_id,
+                    server_id,
+                    &payload,
+                    &ptable,
+                    dry_run_only,
+                )
+                .await
+            {
+                Ok(Some(resp)) => write_json(&mut stream, "200 OK", resp).await,
+                Ok(None) => write_json(&mut stream, "200 OK", Value::Null).await,
+                Err(err) => {
+                    let req_id = payload.get("id").cloned().unwrap_or(Value::Null);
+                    write_json(
+                        &mut stream,
+                        "200 OK",
+                        json!({
+                            "jsonrpc": "2.0",
+                            "id": req_id,
+                            "result": {
+                                "isError": true,
+                                "content": [{ "type": "text", "text": format!("MCP firewall proxy error: {err}") }]
+                            }
+                        }),
+                    )
+                    .await
+                }
+            }
+        }
+        ("GET", "/v1/mcp-outbox") => {
+            let tickets = state
+                .kernel
+                .mcp_firewall
+                .list_outbox_tickets(Some(&state.identity.org_id), None)
+                .await;
+            write_json(&mut stream, "200 OK", json!({ "tickets": tickets })).await
+        }
+        ("POST", path) if path.starts_with("/v1/mcp-outbox/") && path.ends_with("/decide") => {
+            let ticket_id = path
+                .trim_start_matches("/v1/mcp-outbox/")
+                .trim_end_matches("/decide")
+                .trim_matches('/');
+            let approve = payload.get("approve").and_then(|v| v.as_bool()).unwrap_or(false);
+            if approve {
+                match state
+                    .kernel
+                    .mcp_firewall
+                    .approve_outbox_ticket(ticket_id, "session-human-token")
+                    .await
+                {
+                    Ok(ticket) => {
+                        write_json(&mut stream, "200 OK", json!({ "status": "approved", "ticket": ticket })).await
+                    }
+                    Err(e) => {
+                        write_json(&mut stream, "404 Not Found", json!({ "error": e.to_string() })).await
+                    }
+                }
+            } else {
+                match state
+                    .kernel
+                    .mcp_firewall
+                    .deny_outbox_ticket(ticket_id, "session-human-token")
+                    .await
+                {
+                    Ok(ticket) => {
+                        write_json(&mut stream, "200 OK", json!({ "status": "denied", "ticket": ticket })).await
+                    }
+                    Err(e) => {
+                        write_json(&mut stream, "404 Not Found", json!({ "error": e.to_string() })).await
+                    }
+                }
+            }
         }
         ("GET", "/v1/egress/usage") => {
             let snap = if let Some(ref gw) = state.egress_gateway {

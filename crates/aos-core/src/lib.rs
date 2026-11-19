@@ -1027,6 +1027,8 @@ pub struct LeaseGrant {
     pub action_pattern: String,
     /// Resource prefix or `*`
     pub resource_pattern: String,
+    #[serde(default)]
+    pub created_at_ms: i64,
     pub expires_at_ms: i64,
     pub granted_by: String,
     #[serde(default)]

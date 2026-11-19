@@ -1034,6 +1034,7 @@ async fn run_exp2_live_redteam_attacks() -> anyhow::Result<Vec<Exp2RedTeamResult
         let poison_policy = AegisPolicyKernel::new();
         let victim_repo = temp.path().join("poison_victim_repo");
         let attacker = AgentIdentity::new("org-alpha", "agy-agent", "Agent");
+        let now_ms = chrono::Utc::now().timestamp_millis();
         poison_policy
             .grant_lease(LeaseGrant {
                 lease_id: "lease-bench-e".to_string(),
@@ -1041,7 +1042,8 @@ async fn run_exp2_live_redteam_attacks() -> anyhow::Result<Vec<Exp2RedTeamResult
                 agent_id: "agy-agent".to_string(),
                 action_pattern: "workspace_commit".to_string(),
                 resource_pattern: "*".to_string(),
-                expires_at_ms: chrono::Utc::now().timestamp_millis() + 3_600_000,
+                created_at_ms: now_ms,
+                expires_at_ms: now_ms + 3_600_000,
                 granted_by: "bench".to_string(),
                 kind: LeaseKind::Ttl,
                 task_id: None,

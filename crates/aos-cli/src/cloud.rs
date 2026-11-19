@@ -1853,21 +1853,85 @@ pub async fn handle_unified_approve(
         .await;
     }
 
-    // Local Community Mode approval path
+    // Local Community Mode approval path (policy escalations + MCP firewall outbox tickets)
     let kernel = std::sync::Arc::new(AegisRuntimeKernel::new(runtime_dir).await?);
     let mut escalations = kernel.policy.list_escalations(&identity.org_id).await?;
     if escalations.is_empty() {
         escalations = kernel.policy.list_escalations("*").await?;
     }
+    let mut pending_outbox = kernel
+        .mcp_firewall
+        .list_outbox_tickets(
+            Some(&identity.org_id),
+            Some(aos_mcp_gateway::mcp_firewall::OutboxStatus::Pending),
+        )
+        .await;
+    if pending_outbox.is_empty() {
+        pending_outbox = kernel
+            .mcp_firewall
+            .list_outbox_tickets(
+                Some("*"),
+                Some(aos_mcp_gateway::mcp_firewall::OutboxStatus::Pending),
+            )
+            .await;
+    }
 
-    let resolved_esc_id = match escalation_id.filter(|s| !s.trim().is_empty()) {
+    let explicit_id = escalation_id.as_deref().map(str::trim).filter(|s| !s.is_empty());
+    let selected_outbox_id: Option<String> = if let Some(id) = explicit_id {
+        id.starts_with("outbox-").then(|| id.to_string())
+    } else {
+        let latest_pending_esc = escalations
+            .iter()
+            .rfind(|e| e.status == aos_core::EscalationStatus::Pending);
+        let latest_pending_outbox = pending_outbox.last();
+        match (latest_pending_esc, latest_pending_outbox) {
+            (None, Some(ticket)) => Some(ticket.ticket_id.clone()),
+            (Some(esc), Some(ticket)) if ticket.created_at_ms >= esc.created_at_ms => {
+                Some(ticket.ticket_id.clone())
+            }
+            _ => None,
+        }
+    };
+
+    if let Some(ticket_id) = selected_outbox_id {
+        if deny {
+            let ticket = kernel
+                .mcp_firewall
+                .deny_outbox_ticket(&ticket_id, "cli-operator")
+                .await?;
+            println!(
+                "{}",
+                serde_json::to_string_pretty(&json!({
+                    "status": "mcp_outbox_denied",
+                    "mode": "local",
+                    "ticket": ticket
+                }))?
+            );
+        } else {
+            let ticket = kernel
+                .mcp_firewall
+                .approve_outbox_ticket(&ticket_id, "cli-operator")
+                .await?;
+            println!(
+                "{}",
+                serde_json::to_string_pretty(&json!({
+                    "status": "mcp_outbox_dispatched",
+                    "mode": "local",
+                    "ticket": ticket
+                }))?
+            );
+        }
+        return Ok(());
+    }
+
+    let resolved_esc_id = match explicit_id.map(str::to_string) {
         Some(id) => id,
         None => escalations
             .iter()
             .rfind(|e| e.status == aos_core::EscalationStatus::Pending)
             .or_else(|| escalations.last())
             .map(|e| e.escalation_id.clone())
-            .context("No pending escalations found (`aegis-os policy list`)")?,
+            .context("No pending escalations or MCP outbox tickets found (`aegis-os policy list`, `aegis-os mcp outbox list`)")?,
     };
 
     if web {

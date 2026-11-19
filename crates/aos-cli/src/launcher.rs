@@ -5062,6 +5062,7 @@ pub(crate) async fn approval_decide(runtime_dir: &Path, id: &str, approve: bool)
                     agent_id: agent_id.clone(),
                     action_pattern: "workspace_commit".to_string(),
                     resource_pattern,
+                    created_at_ms: now_ms,
                     expires_at_ms: now_ms + 900_000,
                     granted_by: "cli-human".to_string(),
                     kind: LeaseKind::OneShot,
