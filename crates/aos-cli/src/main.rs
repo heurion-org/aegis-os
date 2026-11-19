@@ -23,6 +23,7 @@ mod memory_ui;
 mod routing;
 mod session_broker;
 mod telemetry;
+mod vm;
 
 use aos_core::{A2ATaskState, AgentIdentity, IpcBus, IsolationTier};
 use aos_mcp_gateway::AegisRuntimeKernel;
@@ -434,6 +435,15 @@ enum Commands {
         /// Consecutive identical/failing tool turns before tripping loop breaker (`0` disables)
         #[arg(long)]
         max_loop_streak: Option<u32>,
+        /// Run inside a dedicated hardware-virtualized zero-NIC MicroVM (`vfkit` / `cloud-hypervisor`, fail-closed)
+        #[arg(long, default_value_t = false)]
+        isolated: bool,
+        /// vCPU count allocated to MicroVM when `--isolated` is enabled
+        #[arg(long, default_value_t = 2)]
+        vcpus: u32,
+        /// Memory size in MiB allocated to MicroVM when `--isolated` is enabled
+        #[arg(long, default_value_t = 2048)]
+        mem_mb: u64,
         /// Agent command and arguments, after `--`
         #[arg(trailing_var_arg = true, allow_hyphen_values = true, required = true)]
         cmd: Vec<String>,
@@ -719,6 +729,12 @@ enum Commands {
     Explore {
         #[command(subcommand)]
         action: explore::ExploreAction,
+    },
+
+    /// Inspect host MicroVM readiness and manage verified kernel/initramfs images (`status`, `pull`, `verify`)
+    Vm {
+        #[command(subcommand)]
+        action: vm::VmAction,
     },
 
     /// Discover, install, authenticate (`aegis_at_<app_id>.*`), and invoke AAP-1.0 Ecosystem Applications (e.g. `heurion` Heurion 2.0)
@@ -2802,14 +2818,22 @@ async fn main() -> anyhow::Result<()> {
             dlp_mode,
             dlp_config,
             max_loop_streak,
+            isolated,
+            vcpus,
+            mem_mb,
             cmd,
         } => {
+            if isolated && no_enforce {
+                anyhow::bail!("aos run: --isolated and --no-enforce are mutually exclusive");
+            }
             let mode = if read_only {
                 "observe".to_string()
             } else {
                 mode
             };
-            let enforcement = if no_enforce {
+            let enforcement = if isolated {
+                "isolated".to_string()
+            } else if no_enforce {
                 "advisory".to_string()
             } else {
                 enforcement
@@ -2821,6 +2845,9 @@ async fn main() -> anyhow::Result<()> {
                 max_tokens,
                 max_loop_streak,
                 seed_from_cow_base: None,
+                isolated: isolated || enforcement.eq_ignore_ascii_case("isolated"),
+                vcpus,
+                mem_mb,
             };
             let code = launcher::run_with_options(
                 &workspace,
@@ -3013,6 +3040,10 @@ async fn main() -> anyhow::Result<()> {
         Commands::Explore { action } => {
             explore::handle_explore_command(action, &identity, &workspace, &cli.runtime_dir)
                 .await?;
+        }
+
+        Commands::Vm { action } => {
+            vm::handle_vm_command(action, &cli.runtime_dir).await?;
         }
 
         Commands::App { action } => {

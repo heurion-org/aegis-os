@@ -11,7 +11,7 @@ use crate::launcher;
 use anyhow::{bail, Context};
 use aos_core::{
     AgentIdentity, DiffChangeType, ExecSpec, FileDiffEntry, IsolationTier, ResourceLimits,
-    SandboxConfig, SandboxDriver, TransactionalWorkspace,
+    SandboxConfig, SandboxDriver, SandboxInstance, TransactionalWorkspace,
 };
 use aos_egress::{
     AegisEgressGateway, BudgetPolicy, CircuitTripReason, DlpGatewayConfig, SharedBudgetPool,
@@ -108,6 +108,14 @@ pub(crate) struct PathPlan {
     pub constraints: Vec<String>,
 }
 
+fn default_explore_vcpus() -> u32 {
+    2
+}
+
+fn default_explore_mem_mb() -> u64 {
+    2048
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub(crate) struct ExplorationSpec {
     pub explore_id: String,
@@ -126,6 +134,12 @@ pub(crate) struct ExplorationSpec {
     pub dlp_config: Option<PathBuf>,
     pub max_loop_streak: u32,
     pub wall_timeout_secs: u64,
+    #[serde(default)]
+    pub isolated: bool,
+    #[serde(default = "default_explore_vcpus")]
+    pub vcpus: u32,
+    #[serde(default = "default_explore_mem_mb")]
+    pub mem_mb: u64,
     pub created_at_ms: i64,
 }
 
@@ -306,6 +320,15 @@ pub(crate) struct RunExploreRequest {
     /// Maximum concurrent path sandboxes to execute at once
     #[arg(long, default_value_t = 4)]
     pub max_parallel: usize,
+    /// Execute each exploration path and clean-room VerifyGate inside a hardware-isolated MicroVM (fail-closed)
+    #[arg(long, default_value_t = false)]
+    pub isolated: bool,
+    /// vCPU count per MicroVM when `--isolated` is enabled
+    #[arg(long, default_value_t = 2)]
+    pub vcpus: u32,
+    /// Memory size in MiB per MicroVM when `--isolated` is enabled
+    #[arg(long, default_value_t = 2048)]
+    pub mem_mb: u64,
     /// Output full JSON ExplorationRecord
     #[arg(long, default_value_t = false)]
     pub json: bool,
@@ -949,6 +972,9 @@ pub(crate) async fn execute_explore_run(
         max_tokens: req.max_tokens,
         max_loop_streak: Some(req.max_loop_streak),
         seed_from_cow_base: None,
+        isolated: req.isolated,
+        vcpus: req.vcpus,
+        mem_mb: req.mem_mb,
     };
     let (mut dlp_cfg, pricing_overrides) =
         launcher::resolve_session_dlp_settings(&project, &egress_opts)?;
@@ -981,6 +1007,9 @@ pub(crate) async fn execute_explore_run(
         dlp_config: req.dlp_config.clone(),
         max_loop_streak: req.max_loop_streak,
         wall_timeout_secs: req.timeout_secs,
+        isolated: req.isolated,
+        vcpus: req.vcpus,
+        mem_mb: req.mem_mb,
         created_at_ms: now_ms,
     };
 
@@ -1119,8 +1148,12 @@ async fn run_single_path(
     let prompt_file = agent_home.join(".aegis-explore-prompt.txt");
     aos_core::session::write_bytes_atomic_synced(&prompt_file, combined_prompt.as_bytes())?;
 
-    let (program, args, logical_command) =
-        build_agent_invocation(&plan.agent, agent_cmd_override, &combined_prompt)?;
+    let (program, args, logical_command) = build_agent_invocation(
+        &plan.agent,
+        agent_cmd_override,
+        &combined_prompt,
+        spec.isolated,
+    )?;
 
     let harvested_secrets = launcher::harvest_host_secrets(host_home, &logical_command);
     launcher::seed_agent_home(host_home, &agent_home)?;
@@ -1228,8 +1261,12 @@ async fn run_single_path(
         "explore_id": spec.explore_id,
         "explore_path_id": plan.path_id,
         "mode": "implement",
-        "enforcement": "enforced",
-        "enforcement_scope": "explore-path-isolated",
+        "enforcement": if spec.isolated { "isolated" } else { "enforced" },
+        "enforcement_scope": if spec.isolated {
+            "explore-path-microvm"
+        } else {
+            "explore-path-isolated"
+        },
         "profile": spec.profile,
         "org_id": base_identity.org_id,
         "agent_id": path_agent_id,
@@ -1289,8 +1326,12 @@ async fn run_single_path(
         env.insert(k, v);
     }
 
-    let sandbox = NativeOsSandboxDriver
-        .create_sandbox(SandboxConfig {
+    let sandbox = create_explore_sandbox(
+        spec.isolated,
+        spec.vcpus,
+        spec.mem_mb,
+        runtime_dir,
+        SandboxConfig {
             identity: path_identity.clone(),
             tier: IsolationTier::NativeOsSandbox,
             limits: ResourceLimits::default(),
@@ -1303,8 +1344,9 @@ async fn run_single_path(
             tighten_home_read: true,
             allowed_loopback_ports: aos_sandbox::allocate_loopback_ports(2, &[]),
             isolate_loopback_only: true,
-        })
-        .await?;
+        },
+    )
+    .await?;
 
     let started = std::time::Instant::now();
     let exec_res = sandbox
@@ -1317,6 +1359,9 @@ async fn run_single_path(
             background: false,
         })
         .await;
+    if spec.isolated {
+        let _ = sandbox.destroy().await;
+    }
     drop(_org_guard);
 
     let duration_ms = started.elapsed().as_millis() as u64;
@@ -1407,6 +1452,9 @@ async fn run_single_path(
             &shadow_dir,
             vcmd,
             120_000,
+            spec.isolated,
+            spec.vcpus,
+            spec.mem_mb,
         )
         .await?;
         (Some(res.passed), res.exit_code, res.output_tail)
@@ -1426,6 +1474,9 @@ async fn run_single_path(
                 &shadow_dir,
                 bcmd,
                 120_000,
+                spec.isolated,
+                spec.vcpus,
+                spec.mem_mb,
             )
             .await?;
             let summary = if res.output_tail.trim().is_empty() {
@@ -1502,6 +1553,28 @@ struct CleanRoomOutcome {
     output_tail: String,
 }
 
+async fn create_explore_sandbox(
+    isolated: bool,
+    vcpus: u32,
+    mem_mb: u64,
+    runtime_dir: &Path,
+    mut config: SandboxConfig,
+) -> anyhow::Result<Box<dyn SandboxInstance>> {
+    if isolated {
+        config.tier = IsolationTier::MicroVm;
+        config.limits = ResourceLimits {
+            cpu_millicores: vcpus.max(1).saturating_mul(1000),
+            memory_mb: mem_mb.max(256),
+            ..ResourceLimits::default()
+        };
+        aos_sandbox::microvm::ConfiguredMicroVmSandboxDriver::new(runtime_dir)
+            .create_sandbox(config)
+            .await
+    } else {
+        NativeOsSandboxDriver.create_sandbox(config).await
+    }
+}
+
 #[allow(clippy::too_many_arguments)]
 async fn run_clean_room_command(
     runtime_dir: &Path,
@@ -1512,6 +1585,9 @@ async fn run_clean_room_command(
     source_shadow: &Path,
     cmd_str: &str,
     timeout_ms: u64,
+    isolated: bool,
+    vcpus: u32,
+    mem_mb: u64,
 ) -> anyhow::Result<CleanRoomOutcome> {
     let clean_ws = cleanroom_root.join("ws");
     let clean_home = cleanroom_root.join("home");
@@ -1525,8 +1601,12 @@ async fn run_clean_room_command(
     env.insert("PYTHONDONTWRITEBYTECODE".to_string(), "1".to_string());
     env.insert("GIT_OPTIONAL_LOCKS".to_string(), "0".to_string());
 
-    let sandbox = NativeOsSandboxDriver
-        .create_sandbox(SandboxConfig {
+    let sandbox = create_explore_sandbox(
+        isolated,
+        vcpus,
+        mem_mb,
+        runtime_dir,
+        SandboxConfig {
             identity: AgentIdentity::new(org_id, format!("verify-{tag}"), "clean-room-verify"),
             tier: IsolationTier::NativeOsSandbox,
             limits: ResourceLimits::default(),
@@ -1539,8 +1619,9 @@ async fn run_clean_room_command(
             tighten_home_read: true,
             allowed_loopback_ports: aos_sandbox::allocate_loopback_ports(2, &[]),
             isolate_loopback_only: true,
-        })
-        .await?;
+        },
+    )
+    .await?;
 
     let exec_res = sandbox
         .exec(ExecSpec {
@@ -1552,6 +1633,9 @@ async fn run_clean_room_command(
             background: false,
         })
         .await;
+    if isolated {
+        let _ = sandbox.destroy().await;
+    }
     drop(_org_guard);
     let _ = std::fs::remove_dir_all(cleanroom_root);
 
@@ -1581,6 +1665,7 @@ fn build_agent_invocation(
     agent: &str,
     custom_cmd: Option<&str>,
     combined_prompt: &str,
+    isolated: bool,
 ) -> anyhow::Result<(String, Vec<String>, Vec<String>)> {
     if let Some(cmd) = custom_cmd.map(str::trim).filter(|s| !s.is_empty()) {
         let logical = vec![agent.to_string()];
@@ -1595,9 +1680,13 @@ fn build_agent_invocation(
     if prog.is_empty() {
         bail!("explore: agent name cannot be empty");
     }
-    let resolved = launcher::find_in_path(prog)
-        .map(|p| p.display().to_string())
-        .unwrap_or_else(|| prog.to_string());
+    let resolved = if isolated {
+        prog.to_string()
+    } else {
+        launcher::find_in_path(prog)
+            .map(|p| p.display().to_string())
+            .unwrap_or_else(|| prog.to_string())
+    };
     let base = Path::new(prog)
         .file_name()
         .and_then(|s| s.to_str())
@@ -2347,6 +2436,9 @@ async fn resume_exploration_path(
         max_tokens: record.spec.max_tokens,
         max_loop_streak: Some(record.spec.max_loop_streak),
         seed_from_cow_base: Some(outcome.cow_base_dir.clone()),
+        isolated: record.spec.isolated,
+        vcpus: record.spec.vcpus,
+        mem_mb: record.spec.mem_mb,
     };
     let code = launcher::run_with_options(
         &record.spec.host_source_root,
@@ -2354,7 +2446,11 @@ async fn resume_exploration_path(
         runtime_dir,
         "implement",
         &record.spec.profile,
-        "enforced",
+        if record.spec.isolated {
+            "isolated"
+        } else {
+            "enforced"
+        },
         &launch_cmd,
         &egress_opts,
     )
@@ -2515,6 +2611,9 @@ pub(crate) async fn apply_exploration(
                         &outcome.shadow_dir,
                         vcmd,
                         120_000,
+                        record.spec.isolated,
+                        record.spec.vcpus,
+                        record.spec.mem_mb,
                     )
                     .await?;
                     if !clean.passed {
@@ -2766,6 +2865,9 @@ pub(crate) async fn apply_exploration(
                 &synth_shadow,
                 vcmd,
                 120_000,
+                record.spec.isolated,
+                record.spec.vcpus,
+                record.spec.mem_mb,
             )
             .await?;
             if !clean.passed {
@@ -2887,11 +2989,7 @@ mod tests {
             "#!/bin/sh\ngrep -q 'STATUS=FIXED' src/lib.txt\n",
         );
 
-        let agent_script = tmp.path().join("agent_worker.sh");
-        write_exec_script(
-            &agent_script,
-            r###"#!/bin/sh
-set -eu
+        let agent_script = r###"set -eu
 test -f "$AOS_EXPLORE_PROMPT_FILE"
 case "$AOS_EXPLORE_PATH_ID" in
   minimal)
@@ -2916,9 +3014,7 @@ case "$AOS_EXPLORE_PATH_ID" in
     echo "unexpected path $AOS_EXPLORE_PATH_ID" >&2
     exit 2
     ;;
-esac
-"###,
-        );
+esac"###;
 
         let identity = AgentIdentity::new("org_exp", "tester", "Lead");
         let rec = execute_explore_run(
@@ -2933,7 +3029,7 @@ esac
                 planner_cmd: None,
                 confirm_plan: false,
                 agent: "claude".to_string(),
-                agent_cmd: Some(agent_script.display().to_string()),
+                agent_cmd: Some(agent_script.to_string()),
                 verify_cmd: Some("sh tests/basic.sh".to_string()),
                 bench_cmd: None,
                 budget_usd: 5.0,
@@ -2943,6 +3039,9 @@ esac
                 max_loop_streak: 4,
                 timeout_secs: 60,
                 max_parallel: 3,
+                isolated: false,
+                vcpus: 2,
+                mem_mb: 2048,
                 json: false,
             },
             &identity,
@@ -3031,11 +3130,7 @@ esac
         std::fs::create_dir_all(&runtime_dir).unwrap();
         std::fs::write(project.join("src/value.txt"), "v0\n").unwrap();
 
-        let agent_script = tmp.path().join("worker.sh");
-        write_exec_script(
-            &agent_script,
-            "#!/bin/sh\necho \"from-$AOS_EXPLORE_PATH_ID\" > src/value.txt\n",
-        );
+        let agent_script = r#"echo "from-$AOS_EXPLORE_PATH_ID" > src/value.txt"#;
 
         let identity = AgentIdentity::new("org_apply", "tester", "Lead");
         let rec = execute_explore_run(
@@ -3049,7 +3144,7 @@ esac
                 planner_cmd: None,
                 confirm_plan: false,
                 agent: "claude".to_string(),
-                agent_cmd: Some(agent_script.display().to_string()),
+                agent_cmd: Some(agent_script.to_string()),
                 verify_cmd: Some("grep -q '^from-path-' src/value.txt".to_string()),
                 bench_cmd: None,
                 budget_usd: 5.0,
@@ -3059,6 +3154,9 @@ esac
                 max_loop_streak: 4,
                 timeout_secs: 60,
                 max_parallel: 2,
+                isolated: false,
+                vcpus: 2,
+                mem_mb: 2048,
                 json: false,
             },
             &identity,
@@ -3125,11 +3223,7 @@ esac
         .unwrap();
         std::fs::write(project.join("src/conflict.txt"), "a\nb\nc\n").unwrap();
 
-        let agent_script = tmp.path().join("pick_worker.sh");
-        write_exec_script(
-            &agent_script,
-            r#"#!/bin/sh
-set -eu
+        let agent_script = r###"set -eu
 case "$AOS_EXPLORE_PATH_ID" in
   impl-only)
     cat > src/calc.txt <<'EOF'
@@ -3158,9 +3252,7 @@ grep -q "line1=FIXED_IMPL" src/calc.txt && grep -q "line4=DOC_UPDATED" src/calc.
 EOF
     chmod +x tests/check_calc.sh
     ;;
-esac
-"#,
-        );
+esac"###;
 
         let identity = AgentIdentity::new("org_pick", "tester", "Lead");
         let rec = execute_explore_run(
@@ -3174,7 +3266,7 @@ esac
                 planner_cmd: None,
                 confirm_plan: false,
                 agent: "claude".to_string(),
-                agent_cmd: Some(agent_script.display().to_string()),
+                agent_cmd: Some(agent_script.to_string()),
                 verify_cmd: Some("test -f tests/check_calc.sh && sh tests/check_calc.sh".to_string()),
                 bench_cmd: None,
                 budget_usd: 5.0,
@@ -3184,6 +3276,9 @@ esac
                 max_loop_streak: 4,
                 timeout_secs: 60,
                 max_parallel: 2,
+                isolated: false,
+                vcpus: 2,
+                mem_mb: 2048,
                 json: false,
             },
             &identity,
@@ -3269,6 +3364,9 @@ esac
                 max_loop_streak: 4,
                 timeout_secs: 60,
                 max_parallel: 3,
+                isolated: false,
+                vcpus: 2,
+                mem_mb: 2048,
                 json: true,
             },
             &identity,
@@ -3289,8 +3387,6 @@ esac
 
         // 2. Run a tiny exploration, then seed a resumed CoW base and mutate it:
         // original path shadow + diff hash MUST remain unchanged!
-        let worker = tmp.path().join("w.sh");
-        write_exec_script(&worker, "#!/bin/sh\necho '// explored' >> src/main.rs\n");
         let ran = execute_explore_run(
             RunExploreRequest {
                 prompt: "Annotate main".to_string(),
@@ -3299,7 +3395,7 @@ esac
                 planner_cmd: None,
                 confirm_plan: false,
                 agent: "claude".to_string(),
-                agent_cmd: Some(worker.display().to_string()),
+                agent_cmd: Some("echo '// explored' >> src/main.rs".to_string()),
                 verify_cmd: None,
                 bench_cmd: None,
                 budget_usd: 5.0,
@@ -3309,6 +3405,9 @@ esac
                 max_loop_streak: 4,
                 timeout_secs: 60,
                 max_parallel: 1,
+                isolated: false,
+                vcpus: 2,
+                mem_mb: 2048,
                 json: false,
             },
             &identity,
@@ -3349,6 +3448,56 @@ esac
             !std::fs::read_to_string(alpha.shadow_dir.join("src/main.rs"))
                 .unwrap()
                 .contains("resumed edit")
+        );
+    }
+
+    #[tokio::test]
+    async fn explore_isolated_mode_fails_closed_without_vm_images() {
+        let tmp = tempfile::tempdir().unwrap();
+        let project = tmp.path().join("project");
+        let runtime_dir = tmp.path().join("runtime");
+        std::fs::create_dir_all(&project).unwrap();
+        std::fs::create_dir_all(&runtime_dir).unwrap();
+        std::fs::write(project.join("keep.txt"), "unchanged\n").unwrap();
+
+        let identity = AgentIdentity::new("org_iso_test", "tester", "Lead");
+        let err = execute_explore_run(
+            RunExploreRequest {
+                prompt: "Attempt isolated run without VM images".to_string(),
+                paths: vec!["iso=Try MicroVM path".to_string()],
+                diverge: None,
+                planner_cmd: None,
+                confirm_plan: false,
+                agent: "claude".to_string(),
+                agent_cmd: Some("echo hacked > keep.txt".to_string()),
+                verify_cmd: None,
+                bench_cmd: None,
+                budget_usd: 5.0,
+                max_tokens: None,
+                dlp_mode: Some("block".to_string()),
+                dlp_config: None,
+                max_loop_streak: 4,
+                timeout_secs: 60,
+                max_parallel: 1,
+                isolated: true,
+                vcpus: 2,
+                mem_mb: 2048,
+                json: false,
+            },
+            &identity,
+            &project,
+            &runtime_dir,
+        )
+        .await
+        .expect_err("isolated explore without VM images must fail closed");
+        let msg = err.to_string();
+        assert!(
+            msg.contains("MicroVM"),
+            "expected explicit MicroVM fail-closed error, got: {msg}"
+        );
+        assert_eq!(
+            std::fs::read_to_string(project.join("keep.txt")).unwrap(),
+            "unchanged\n"
         );
     }
 }

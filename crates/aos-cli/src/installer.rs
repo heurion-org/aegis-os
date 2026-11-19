@@ -1824,6 +1824,34 @@ pub(crate) async fn run_doctor(home_dir: &Path) -> anyhow::Result<()> {
             println!("  - status: BLOCKED (/usr/bin/sandbox-exec is missing)");
         }
     }
+
+    println!("Hardware-Isolated Runtime (--isolated MicroVM):");
+    let vm_runtime = aos_sandbox::microvm::default_runtime_dir_for_vm();
+    let probe = aos_sandbox::microvm::probe_microvm_host(&vm_runtime);
+    println!("  - platform: {} ({})", probe.os, probe.arch);
+    println!("  - hypervisor: {}", probe.hypervisor_detail);
+    match (&probe.vmm_backend, &probe.vmm_path) {
+        (Some(kind), Some(path)) => println!("  - vmm: {} ({})", kind.as_str(), path.display()),
+        _ => println!("  - vmm: MISSING (install vfkit/krunkit on macOS or cloud-hypervisor on Linux)"),
+    }
+    if cfg!(target_os = "linux") {
+        match &probe.virtiofsd_path {
+            Some(p) => println!("  - virtiofsd: {}", p.display()),
+            None => println!("  - virtiofsd: MISSING (required on Linux for virtio-fs mounts)"),
+        }
+    }
+    println!(
+        "  - vm images ({}): {} ({})",
+        probe.images_dir.display(),
+        if probe.images_ready { "READY" } else { "MISSING" },
+        probe.images_detail
+    );
+    if probe.ready {
+        println!("  - status: READY (hardware-isolated Zero-NIC MicroVM)");
+        println!("  - launch: `aegis-os --workspace . run --isolated -- claude`");
+    } else {
+        println!("  - status: NOT READY (fail-closed; run `aegis-os vm pull` after installing VMM)");
+    }
     Ok(())
 }
 
@@ -2147,7 +2175,7 @@ fn download_to_file(agent: &ureq::Agent, url: &str, dest: &Path) -> anyhow::Resu
     Ok(())
 }
 
-fn verify_openssh_signature(bin_path: &Path, sig_path: &Path, work_dir: &Path) -> anyhow::Result<()> {
+pub(crate) fn verify_openssh_signature(bin_path: &Path, sig_path: &Path, work_dir: &Path) -> anyhow::Result<()> {
     let allowed_signers = work_dir.join("allowed_signers");
     std::fs::write(&allowed_signers, format!("{}\n", RELEASE_SIGNER))?;
     let bin_file = std::fs::File::open(bin_path)?;

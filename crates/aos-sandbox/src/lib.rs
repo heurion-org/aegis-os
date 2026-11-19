@@ -21,6 +21,7 @@ use tokio::process::Command;
 use uuid::Uuid;
 
 pub mod bridge;
+pub mod microvm;
 
 /// Host-side half of the Linux egress bridge for one `exec` call (see [`bridge`]). Dropping it
 /// stops the relay and removes the socket, including on timeout / early-return paths.
@@ -1748,91 +1749,14 @@ impl SandboxDriver for NativeOsSandboxDriver {
 }
 
 // ============================================================================
-// Tier 2: Cloud Multi-Tenant MicroVM Driver (libkrun / Firecracker Spec)
+// Tier 2: Real Local Hardware-Virtualized MicroVM Driver (microvm module)
 // ============================================================================
 
-pub struct MicroVmSandboxInstance {
-    instance_id: String,
-    inner: NativeOsSandboxInstance,
-}
-
-impl MicroVmSandboxInstance {
-    pub fn new(config: SandboxConfig) -> Self {
-        Self {
-            instance_id: format!("sbx-microvm-{}", &Uuid::new_v4().to_string()[..8]),
-            inner: NativeOsSandboxInstance::new(config),
-        }
-    }
-}
-
-#[async_trait]
-impl SandboxInstance for MicroVmSandboxInstance {
-    fn instance_id(&self) -> &str {
-        &self.instance_id
-    }
-
-    fn config(&self) -> &SandboxConfig {
-        self.inner.config()
-    }
-
-    fn confinement_profile(&self) -> String {
-        let cfg = self.inner.config();
-        serde_json::json!({
-            "engine": if cfg!(target_os = "macos") { "libkrun-hv" } else { "firecracker-kvm" },
-            "vcpu_count": (cfg.limits.cpu_millicores / 1000).max(1),
-            "mem_size_mib": cfg.limits.memory_mb,
-            "virtio_fs_mounts": [
-                {"tag": "workspace", "host_path": cfg.workspace_dir, "mode": "rw_cow"},
-                {"tag": "agent_home", "host_path": cfg.agent_home_dir, "mode": "rw"},
-                {"tag": "org_shared_ro", "host_path": cfg.org_shared_ro_dir, "mode": "ro"},
-                {"tag": "org_agent_pub", "host_path": cfg.org_agent_pub_dir, "mode": "rw"}
-            ]
-        })
-        .to_string()
-    }
-
-    fn allocated_loopback_ports(&self) -> Vec<u16> {
-        self.inner.allocated_loopback_ports()
-    }
-
-    async fn exec(&self, spec: ExecSpec) -> anyhow::Result<ExecOutput> {
-        if self.inner.paused.load(Ordering::SeqCst) {
-            bail!("MicroVM '{}' is paused", self.instance_id);
-        }
-        let mut out = self.inner.exec(spec).await?;
-        // No hypervisor is launched yet; report the confinement that actually ran.
-        out.sandbox_profile_used = format!("microvm-emulated({})", out.sandbox_profile_used);
-        Ok(out)
-    }
-
-    async fn pause(&self) -> anyhow::Result<()> {
-        self.inner.pause().await
-    }
-
-    async fn resume(&self) -> anyhow::Result<()> {
-        self.inner.resume().await
-    }
-
-    async fn destroy(&self) -> anyhow::Result<()> {
-        self.inner.destroy().await
-    }
-}
-
-pub struct MicroVmSandboxDriver;
-
-#[async_trait]
-impl SandboxDriver for MicroVmSandboxDriver {
-    fn tier(&self) -> IsolationTier {
-        IsolationTier::MicroVm
-    }
-
-    async fn create_sandbox(
-        &self,
-        config: SandboxConfig,
-    ) -> anyhow::Result<Box<dyn SandboxInstance>> {
-        Ok(Box::new(MicroVmSandboxInstance::new(config)))
-    }
-}
+pub use microvm::{
+    detect_trusted_vmm, probe_microvm_host, verify_cached_vm_images,
+    ConfiguredMicroVmSandboxDriver, MicroVmHostProbe, MicroVmSandboxDriver,
+    MicroVmSandboxInstance, VerifiedVmImages, VmImageManifest, VmmBackendKind,
+};
 
 #[cfg(test)]
 mod tests {

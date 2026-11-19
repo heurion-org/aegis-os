@@ -188,6 +188,9 @@ pub(crate) struct RunEgressOptions {
     pub max_tokens: Option<u64>,
     pub max_loop_streak: Option<u32>,
     pub seed_from_cow_base: Option<PathBuf>,
+    pub isolated: bool,
+    pub vcpus: u32,
+    pub mem_mb: u64,
 }
 
 /// Seeds a fresh session's `dst_cow_base` zero-copy from an existing CoW workspace base
@@ -6301,9 +6304,10 @@ async fn run_inner(
         bail!("aos run: unknown profile '{profile}'");
     }
     let enforcement = enforcement.to_ascii_lowercase();
-    if !matches!(enforcement.as_str(), "advisory" | "enforced") {
+    let is_isolated = egress_opts.isolated || enforcement == "isolated";
+    if !matches!(enforcement.as_str(), "advisory" | "enforced" | "isolated") {
         bail!(
-            "aos run: enforcement '{enforcement}' is not implemented; use 'advisory' or 'enforced'"
+            "aos run: enforcement '{enforcement}' is not implemented; use 'advisory', 'enforced', or 'isolated'"
         );
     }
 
@@ -6320,7 +6324,18 @@ async fn run_inner(
     }
 
     let mut command = command.to_vec();
-    refresh_stale_agent_binary_path(&mut command);
+    if is_isolated {
+        if let Some(first) = command.first() {
+            let p = Path::new(first);
+            if p.parent().is_some_and(is_aegis_shim_dir) {
+                if let Some(name) = p.file_name().and_then(|s| s.to_str()) {
+                    command[0] = name.to_string();
+                }
+            }
+        }
+    } else {
+        refresh_stale_agent_binary_path(&mut command);
+    }
 
     let project = std::fs::canonicalize(workspace)
         .with_context(|| format!("canonicalizing workspace {}", workspace.display()))?;
@@ -6405,6 +6420,22 @@ async fn run_inner(
     }
 
     let (dlp_cfg, pricing_overrides) = resolve_session_dlp_settings(&project, egress_opts)?;
+
+    if is_isolated {
+        return run_isolated_inner(
+            &project,
+            &identity,
+            runtime_dir,
+            &mode,
+            &profile,
+            &command,
+            host_home,
+            &dlp_cfg,
+            &pricing_overrides,
+            egress_opts,
+        )
+        .await;
+    }
 
     #[cfg(target_os = "macos")]
     {
@@ -6913,6 +6944,241 @@ fn build_macos_agent_path(
         parts.push(host_path.to_string());
     }
     parts.join(":")
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn run_isolated_inner(
+    project: &Path,
+    identity: &AgentIdentity,
+    runtime_dir: &Path,
+    mode: &str,
+    profile: &str,
+    command: &[String],
+    host_home: &Path,
+    dlp_cfg: &DlpGatewayConfig,
+    pricing_overrides: &std::collections::HashMap<String, ModelRate>,
+    egress_opts: &RunEgressOptions,
+) -> anyhow::Result<i32> {
+    let vcpus = if egress_opts.vcpus == 0 {
+        2
+    } else {
+        egress_opts.vcpus
+    };
+    let mem_mb = if egress_opts.mem_mb == 0 {
+        2048
+    } else {
+        egress_opts.mem_mb
+    };
+
+    let harvested_secrets = harvest_host_secrets(host_home, command);
+    let session_id = format!("ses_{}", &uuid::Uuid::new_v4().simple().to_string()[..12]);
+    let session_dir = runtime_dir.join("sessions").join(&session_id);
+    let agent_home = session_dir.join("agent_home");
+    std::fs::create_dir_all(&agent_home)?;
+    use std::os::unix::fs::PermissionsExt;
+    let _ = std::fs::set_permissions(runtime_dir, std::fs::Permissions::from_mode(0o700));
+    let _ = std::fs::set_permissions(&session_dir, std::fs::Permissions::from_mode(0o700));
+    let _ = std::fs::set_permissions(&agent_home, std::fs::Permissions::from_mode(0o700));
+    seed_agent_home(host_home, &agent_home)?;
+    restore_native_oauth_store_for_agent(host_home, &agent_home, command, &harvested_secrets);
+    restore_or_seed_claude_oauth_cache(runtime_dir, &agent_home, command, &harvested_secrets);
+    restore_or_seed_agy_oauth_cache(runtime_dir, host_home, &agent_home, command);
+    for rel in [".run", ".cache", ".local/share", ".local/state", "tmp"] {
+        std::fs::create_dir_all(agent_home.join(rel))?;
+    }
+
+    let (cow_base, vault_status) =
+        prepare_session_cow_base(runtime_dir, &identity.org_id, &session_id, &session_dir)?;
+    if let Some(src_base) = egress_opts.seed_from_cow_base.as_deref() {
+        seed_cow_base_from_existing(src_base, &cow_base).await?;
+    }
+    let cow = CoWWorkspace::init(project, &cow_base)
+        .await
+        .with_context(|| format!("creating CoW workspace for {}", project.display()))?;
+    let shadow = cow.shadow_root().to_path_buf();
+
+    let (egress_guard, proxy, _bridge_token) = start_egress(
+        identity,
+        &session_dir,
+        &agent_home,
+        host_home,
+        command,
+        &harvested_secrets,
+        dlp_cfg,
+        pricing_overrides,
+    )
+    .await?;
+    let exit_telemetry = ExitTelemetryContext {
+        gateway: egress_guard.gateway.clone(),
+        identity: identity.clone(),
+    };
+    let _egress_guard = egress_guard;
+
+    let broker = crate::session_broker::SessionBroker::start_with_egress(
+        runtime_dir,
+        &session_dir,
+        agent_home.join("control"),
+        crate::session_broker::BrokerSession {
+            session_id: session_id.clone(),
+            mode: mode.to_string(),
+            enforcement: "isolated".to_string(),
+            workspace: project.display().to_string(),
+            shadow: shadow.display().to_string(),
+            agent_home: agent_home.display().to_string(),
+        },
+        identity.clone(),
+        Some(proxy.clone()),
+        false,
+        Some(exit_telemetry.gateway.clone()),
+    )
+    .await?;
+
+    let org_shared = runtime_dir
+        .join("orgs")
+        .join(&identity.org_id)
+        .join("shared_ro");
+    let org_pub = runtime_dir
+        .join("orgs")
+        .join(&identity.org_id)
+        .join("pub")
+        .join(&identity.agent_id);
+    std::fs::create_dir_all(&org_shared)?;
+    std::fs::create_dir_all(&org_pub)?;
+
+    let sandbox = match aos_sandbox::microvm::ConfiguredMicroVmSandboxDriver::new(runtime_dir)
+        .create_sandbox(SandboxConfig {
+            identity: identity.clone(),
+            tier: IsolationTier::MicroVm,
+            limits: ResourceLimits {
+                cpu_millicores: vcpus.max(1).saturating_mul(1000),
+                memory_mb: mem_mb.max(256),
+                ..ResourceLimits::default()
+            },
+            workspace_dir: shadow.clone(),
+            agent_home_dir: agent_home.clone(),
+            org_shared_ro_dir: org_shared,
+            org_agent_pub_dir: org_pub,
+            egress_proxy_addr: Some(proxy.clone()),
+            host_source_dir: Some(project.to_path_buf()),
+            tighten_home_read: true,
+            allowed_loopback_ports: Vec::new(),
+            isolate_loopback_only: true,
+        })
+        .await
+    {
+        Ok(sbx) => sbx,
+        Err(err) => {
+            let _ = std::fs::remove_dir_all(&session_dir);
+            return Err(err);
+        }
+    };
+
+    let mut env = std::collections::HashMap::new();
+    let mut cred_envs = Vec::new();
+    append_credential_and_tls_envs(&mut cred_envs, Some(&proxy), &harvested_secrets, command);
+    for (k, v) in cred_envs {
+        env.insert(k, v);
+    }
+    let proxy_url = format!("http://{proxy}");
+    for key in ["HTTP_PROXY", "HTTPS_PROXY", "http_proxy", "https_proxy"] {
+        env.insert(key.to_string(), proxy_url.clone());
+    }
+    env.insert("NO_PROXY".to_string(), "127.0.0.1,localhost".to_string());
+    env.insert("no_proxy".to_string(), "127.0.0.1,localhost".to_string());
+    env.insert("AOS_SESSION_ID".to_string(), session_id.clone());
+    env.insert("AOS_ENFORCEMENT".to_string(), "isolated".to_string());
+    env.insert("AOS_MODE".to_string(), mode.to_string());
+    env.insert("AOS_PROFILE".to_string(), profile.to_string());
+    env.insert("AOS_ORG_ID".to_string(), identity.org_id.clone());
+    env.insert("AOS_AGENT_ID".to_string(), identity.agent_id.clone());
+    env.insert("AOS_SESSION_TOKEN".to_string(), broker.agent_token.clone());
+    env.insert(
+        "AOS_EGRESS".to_string(),
+        "vsock-egress-allowlist+l7-base-url".to_string(),
+    );
+    env.insert("GIT_OPTIONAL_LOCKS".to_string(), "0".to_string());
+    env.insert("GIT_CONFIG_NOSYSTEM".to_string(), "1".to_string());
+    env.insert("GIT_CONFIG_GLOBAL".to_string(), "/dev/null".to_string());
+
+    let meta = json!({
+        "session_id": session_id,
+        "mode": mode,
+        "enforcement": "isolated",
+        "enforcement_scope": "hardware-microvm (zero-nic + virtio-fs + virtio-vsock)",
+        "sandbox": "microvm",
+        "vcpus": vcpus,
+        "memory_mb": mem_mb,
+        "profile": profile,
+        "org_id": identity.org_id,
+        "agent_id": identity.agent_id,
+        "workspace": project.display().to_string(),
+        "shadow": shadow.display().to_string(),
+        "agent_home": agent_home.display().to_string(),
+        "cow_backend": "reflink-or-copy",
+        "vault_encrypted": vault_status.encrypted,
+        "vault_backend": vault_status.backend.as_str(),
+        "broker": true,
+        "network": "vsock-egress-allowlist+l7-base-url",
+        "status": "running",
+        "created_at_ms": chrono::Utc::now().timestamp_millis(),
+    });
+    aos_core::session::write_bytes_atomic_synced(
+        &session_dir.join("session.json"),
+        &serde_json::to_vec_pretty(&meta)?,
+    )?;
+
+    eprintln!(
+        "Aegis · isolated (MicroVM {} vCPU / {} MiB) · {}/{}",
+        vcpus, mem_mb, identity.org_id, identity.agent_id
+    );
+    eprintln!("  session: {session_id}");
+    eprintln!("  shadow:  {}", shadow.display());
+    eprintln!("  network: zero-NIC virtio-vsock -> Stage 1 egress + L7 DLP gateway");
+
+    let exec_fut = sandbox.exec(ExecSpec {
+        command: command[0].clone(),
+        args: command[1..].to_vec(),
+        cwd: Some(shadow.clone()),
+        env,
+        timeout_ms: Some(86_400_000),
+        background: false,
+    });
+    tokio::pin!(exec_fut);
+
+    tokio::select! {
+        res = &mut exec_fut => {
+            let out = match res {
+                Ok(out) => out,
+                Err(err) => {
+                    let _ = sandbox.destroy().await;
+                    update_session_state(&session_dir, "failed", None);
+                    return Err(err);
+                }
+            };
+            if !out.stdout.is_empty() {
+                let mut stdout = io::stdout();
+                let _ = stdout.write_all(out.stdout.as_bytes());
+                let _ = stdout.flush();
+            }
+            if !out.stderr.is_empty() {
+                let mut stderr = io::stderr();
+                let _ = stderr.write_all(out.stderr.as_bytes());
+                let _ = stderr.flush();
+            }
+            let _ = sandbox.destroy().await;
+            let code = out.exit_code.unwrap_or(1);
+            sync_credentials(&agent_home, host_home, command);
+            let pending = print_exit_summary(&session_dir, project, &shadow, Some(&exit_telemetry)).await;
+            let effective = if code == 0 && pending > 0 { 10 } else { code };
+            update_session_state(&session_dir, "exited", Some(effective));
+            Ok(effective)
+        }
+        _ = tokio::signal::ctrl_c() => {
+            let _ = sandbox.destroy().await;
+            update_session_state(&session_dir, "failed", Some(130));
+            Ok(130)
+        }
+    }
 }
 
 #[cfg(target_os = "macos")]

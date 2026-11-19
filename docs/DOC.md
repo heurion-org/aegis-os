@@ -1,8 +1,8 @@
-# Aegis OS (`aegis-os`) 技术参考与用户手册 · Architecture, Threat Model & User Manual (`v0.6.0`)
+# Aegis OS (`aegis-os`) 技术参考与用户手册 · Architecture, Threat Model & User Manual (`v0.7.0`)
 
-> 本文档为 Aegis OS 仓库的唯一权威主文档（中文 + English 双语整合），涵盖 **架构设计**、**威胁模型**、**实际代码实现与威胁缓解对照（基于 `v0.6.0`）** 以及 **完整用户手册**。
+> 本文档为 Aegis OS 仓库的唯一权威主文档（中文 + English 双语整合），涵盖 **架构设计**、**威胁模型**、**实际代码实现与威胁缓解对照（基于 `v0.7.0`）** 以及 **完整用户手册**。
 >
-> *This is the single authoritative reference for Aegis OS (`v0.6.0`, bilingual Chinese + English), covering **Architecture Design**, **Threat Model**, **Actual Implementation & Threat Countermeasures**, and the **User Manual**.*
+> *This is the single authoritative reference for Aegis OS (`v0.7.0`, bilingual Chinese + English), covering **Architecture Design**, **Threat Model**, **Actual Implementation & Threat Countermeasures**, and the **User Manual**.*
 
 ---
 
@@ -11,7 +11,7 @@
 - [1. 架构设计 | Architecture Design](#1-架构设计--architecture-design)
   - [1.1 核心设计原则 | Core Design Principles](#11-核心设计原则--core-design-principles)
   - [1.2 信任边界与进程拓扑 | Trust Boundary & Process Topology](#12-信任边界与进程拓扑--trust-boundary--process-topology)
-  - [1.3 十三模块 Rust 工作空间矩阵 | 13-Crate Rust Workspace Matrix](#13-十三模块-rust-工作空间矩阵--13-crate-rust-workspace-matrix)
+  - [1.3 十四模块 Rust 工作空间矩阵 | 14-Crate Rust Workspace Matrix](#13-十四模块-rust-工作空间矩阵--14-crate-rust-workspace-matrix)
   - [1.4 事务型 CoW VFS、四级合并与 `OrgVault` 加密卷 | Transactional CoW VFS, 4-Tier Merge & Encrypted `OrgVault`](#14-事务型-cow-vfs四级合并与-orgvault-加密卷--transactional-cow-vfs-4-tier-merge--encrypted-orgvault)
   - [1.5 五级策略引擎与协议面 (`MCP` / `A2A` / `AAP-1.0` / `UOMP`) | 5-Tier Policy Engine & Protocol Surface](#15-五级策略引擎与协议面-mcp--a2a--aap-10--uomp--5-tier-policy-engine--protocol-surface)
 - [2. 威胁模型 | Threat Model](#2-威胁模型--threat-model)
@@ -20,11 +20,11 @@
   - [2.3 攻击向量分类 (`V1`–`V6` 及控制面/数据面威胁) | Attack Vectors](#23-攻击向量分类-v1v6-及控制面数据面威胁--attack-vectors)
   - [2.4 运行模式安全承诺矩阵与明确非目标 | Mode Security Matrix & Non-Goals](#24-运行模式安全承诺矩阵与明确非目标--mode-security-matrix--non-goals)
 - [3. 实际实现情况与针对威胁模型的设计 | Implementation Status & Threat Countermeasures](#3-实际实现情况与针对威胁模型的设计--implementation-status--threat-countermeasures)
-  - [3.1 威胁 → 代码级防御实现对照总表 (`v0.6.0`) | Threat-to-Implementation Mapping](#31-威胁--代码级防御实现对照总表-v060--threat-to-implementation-mapping)
-  - [3.2 当前版本 (`v0.6.0`) 真实完备度、性能基准与已知边界 | Readiness, Benchmarks & Known Limits](#32-当前版本-v060-真实完备度性能基准与已知边界--readiness-benchmarks--known-limits)
+  - [3.1 威胁 → 代码级防御实现对照总表 (`v0.7.0`) | Threat-to-Implementation Mapping](#31-威胁--代码级防御实现对照总表-v070--threat-to-implementation-mapping)
+  - [3.2 当前版本 (`v0.7.0`) 真实完备度、性能基准与已知边界 | Readiness, Benchmarks & Known Limits](#32-当前版本-v070-真实完备度性能基准与已知边界--readiness-benchmarks--known-limits)
 - [4. 用户手册 | User Manual](#4-用户手册--user-manual)
   - [4.1 安装、环境自检、升级与卸载 | Install, Doctor, Upgrade & Uninstall](#41-安装环境自检升级与卸载--install-doctor-upgrade--uninstall)
-  - [4.2 单 Agent 受控开发全流程 (`Enforced Mode`) | Single-Agent Enforced Workflow](#42-单-agent-受控开发全流程-enforced-mode--single-agent-enforced-workflow)
+  - [4.2 单 Agent 受控开发与本地硬件虚拟化 MicroVM (`Enforced` & `Isolated Mode`) | Single-Agent Enforced & Isolated MicroVM Workflow](#42-单-agent-受控开发与本地硬件虚拟化-microvm-enforced--isolated-mode--single-agent-enforced--isolated-microvm-workflow)
   - [4.3 审批控制、自定义 Cedar 策略与受控越界能力 | Approvals, Cedar Policy & Brokered Capabilities](#43-审批控制自定义-cedar-策略与受控越界能力--approvals-cedar-policy--brokered-capabilities)
   - [4.4 多 Agent 协同与多路径并行探索 (`A2A` / `IPC` / `CAS` / `Explore`) | Multi-Agent Collaboration & Parallel Path Explorer](#44-多-agent-协同与多路径并行探索-a2a--ipc--cas--explore--multi-agent-collaboration--parallel-path-explorer)
   - [4.5 `OrgVault` 加密卷、`UOMP` 记忆网关、`AAP-1.0` 应用与 `Aegis Cloud` / 发布运维 | Vault, Memory, Apps, Cloud & Release Ops](#45-orgvault-加密卷uomp-记忆网关aap-10-应用与-aegis-cloud--发布运维--vault-memory-apps-cloud--release-ops)
@@ -37,7 +37,7 @@
 ### 1.1 核心设计原则 | Core Design Principles
 
 1. **事务边界替代逐次弹窗 | Transaction Boundaries over Per-Tool Prompts**：Agent 在隔离的 Copy-on-Write（CoW）影子工作区内自由读写与执行测试（零弹窗）；仅当变更需要提交回宿主机，或跨越身份/网络/凭据边界时，才触发策略评估与人类审批。
-2. **内核沙箱优于进程内 Hook | Kernel Enforcement over In-Process Hooks**：客户端自带的 Hook 与 MCP 规则与 Agent 运行在同一 UID 进程空间内，仅作为 UX 兼容层（Advisory）；真正安全边界必须由父进程拉起 OS 内核沙箱（Linux `bwrap` / macOS Seatbelt / Cloud microVM）+ 双令牌 Broker + 独立出口代理构成（Enforced）。
+2. **内核沙箱优于进程内 Hook | Kernel Enforcement over In-Process Hooks**：客户端自带的 Hook 与 MCP 规则与 Agent 运行在同一 UID 进程空间内，仅作为 UX 兼容层（Advisory）；真正安全边界必须由父进程拉起 OS 内核沙箱（Linux `bwrap` / macOS Seatbelt / 本地 Zero-NIC 硬件虚拟化 MicroVM / Cloud microVM）+ 双令牌 Broker + 独立出口代理构成（Enforced / Isolated）。
 3. **效果优先模型 | Effects over Tool Names**：策略引擎不依赖各家客户端五花八门的工具名，而围绕统一抽象原语 `EffectKind × Scope × Reversibility`（`fs.read`、`fs.write`、`proc.exec`、`net.request`、`secret.use`、`workspace_commit`）做授权决策。
 4. **默认 Fail-Closed | Fail-Closed by Default**：沙箱引擎、代理、Broker 任一前置条件缺失，或自定义 Cedar 策略存在语法/未知字段错误时，系统拒绝放行而非静默降级。
 5. **领域无关内核 + 领域 Profile | Domain-Agnostic Kernel + Domain Profiles**：代码（`code`）、文档（`docs`）、数据（`data`）、二进制（`binary`）、应用状态（`app_state`）、长期记忆（`memory`）与混合仓库（`mixed`）共用同一 CoW/认领/校验/提交事务内核，合并与预检语义由 `DomainProfile` 定义。
@@ -60,7 +60,8 @@ Host User Space (Trusted Control Plane & Supervisor)
 │ │    reversible PII pseudonymization & budget/loop circuit breaker)  │ │
 │ │  - Hash-chained Audit Flight Recorder (outside sandbox)          │ │
 │ └───────┬──────────────────────────────────────────────────────────┘ │
-│         │ Kernel Confinement (bwrap --bind-fd / macOS Seatbelt)      │
+│         │ Kernel / Hypervisor Confinement                            │
+│         │ (bwrap --bind-fd / Seatbelt / vfkit|cloud-hypervisor + vsock) │
 │ ┌───────▼──────────────────────────────────────────────────────────┐ │
 │ │ Untrusted Agent Process Tree                                     │ │
 │ │   claude / opencode / agy / hermes / codex                       │ │
@@ -80,13 +81,14 @@ Host User Space (Trusted Control Plane & Supervisor)
 
 ---
 
-### 1.3 十三模块 Rust 工作空间矩阵 | 13-Crate Rust Workspace Matrix
+### 1.3 十四模块 Rust 工作空间矩阵 | 14-Crate Rust Workspace Matrix
 
 | Crate | 中文职责 | Primary Responsibility (English) |
 |---|---|---|
 | `aos-core` | 核心领域模型（`EffectKind`、`AgentIdentity`、`LeaseGrant`）、任务级文件认领表、`DomainProfile`（6 类合并与 DLP 校验） | Shared core traits/types (`EffectKind`, `WorkspaceDomain`, identity/leases), glob file claims, `DomainProfile` merge & DLP verifiers |
 | `aos-vfs` | 事务型 CoW 影子工作区、`ensure_no_symlink_components` 防穿越、4 级 LCS Diff3 自动合并、冻结提交、`OrgVault` OS 加密卷、组织共享 CAS/KV | Transactional CoW VFS (`clonefile`/`FICLONE`/atomic copy fallback), 4-tier LCS Diff3 merge, frozen commit staging, encrypted `OrgVault`, Org CAS/KV |
-| `aos-sandbox` | OS 原生沙箱驱动：Linux `bwrap --bind-fd --unshare-net`、macOS Seatbelt Profile、隔离环境变量过滤、预览桥接器与 microVM 抽象 | Native kernel sandbox drivers (Linux `bwrap`, macOS Seatbelt), env scrubbing, preview/egress Unix bridges, microVM interface |
+| `aos-sandbox` | OS 原生沙箱与本地 MicroVM 驱动：Linux `bwrap --bind-fd --unshare-net`、macOS Seatbelt Profile、本地硬件虚拟化 Zero-NIC MicroVM（macOS `vfkit`/`krunkit` + Linux `cloud-hypervisor`/`virtiofsd` + `virtio-vsock`）、SHA-256 镜像验签与隔离环境变量过滤 | Native kernel & local MicroVM sandbox drivers (Linux `bwrap`, macOS Seatbelt, Zero-NIC `vfkit`/`krunkit` & `cloud-hypervisor`+`virtiofsd` over `virtio-vsock`), SHA-256 VM image verification, fail-closed enforcement |
+| `aos-guest-init` | Linux MicroVM Guest PID-1 Init 与 `AF_VSOCK` 守护进程：初始化 `lo`、挂载 `virtiofs` 共享（`aegis_ws` 映射至宿主机规范路径、`aegis_home`、`aegis_ro`、`aegis_pub`）、port `10700` Token 鉴权 JSONL RPC 与 port `18080` + `bridge_token` 出口流量转发 | Linux MicroVM PID-1 guest init (`lo` setup, `virtiofs` mounts `aegis_ws`/`aegis_home`/`aegis_ro`/`aegis_pub`), authenticated JSONL RPC on `AF_VSOCK` `10700`, `127.0.0.1:<proxy_port>` -> `18080` egress relay with 32-byte `bridge_token` |
 | `aos-egress` | 本地 L4 `CONNECT` 与 Model API L7 反向代理：SSRF 私网阻断、64 KiB 全表面 DLP 扫描、`$AOS_SECRET_*` 边界注入、会话可逆 PII 假名化（`pseudonym.rs`）及基于原子 `SharedBudgetPool`/工具循环检测（`breaker.rs`、`pricing.rs`）的熔断网关 | L4 `CONNECT` & L7 Base-URL model reverse proxy with private/metadata IP blocking, URL/header/body DLP, `$AOS_SECRET_*` injection, reversible session PII pseudonymization (`pseudonym.rs`), and atomic `SharedBudgetPool`/tool-loop circuit breakers (`breaker.rs`, `pricing.rs`) |
 | `aos-policy` | 引用感知 Fail-Closed Cedar 策略解析器、`R0a`–`R4` 五级策略内核、敏感路径防投毒、原子 `OneShot`/TTL/任务租约与审批队列 | Quote-aware fail-closed Cedar parser & evaluator, `R0a`–`R4` policy kernel, atomic sensitive leases, escalation queue |
 | `aos-ipc` | A2A Peer 发现与心跳活性、分层任务 DAG 状态机、P2P 邮箱、`artifact://` 校验、原子 `0o600` 持久化与 `reply()` 单事务入队 | Peer registry, hierarchical A2A task DAG state machine, mailboxes, correlated RPC/pub-sub, atomic `0o600` state persistence |
@@ -96,7 +98,7 @@ Host User Space (Trusted Control Plane & Supervisor)
 | `aos-memory-server` | 本地 UOMP Memory Guard HTTP 服务：Ed25519 JWT 签发/验证、`verify_active_session`（`token_hash`+库内 scope）、consent 流 | Local UOMP Memory Guard server (`EdDSA` JWT issuer, `verify_active_session` DB binding, consent & payload APIs) |
 | `aos-memory-gateway` | 面向远程 Agent 的 TLS 1.3 / mTLS UOMP 代理网关：限流、并发信号量、I/O 超时、防 HTTP 走私帧校验 | TLS 1.3 / mTLS UOMP remote memory gateway with concurrency semaphore, rate limiting, timeouts, and framing checks |
 | `aos-mcp-gateway` | 53 项 MCP 工具 + 7 个动态资源、双令牌控制面 API、`ScopedEscalationTicket`、Web 审批控制台、Cloud PaaS 与 `AAP-1.0` 应用代理 | MCP JSON-RPC + A2A server (53 tools / 7 resources), dual-token control plane, Web consoles, Cloud PaaS, `AAP-1.0` AppStore |
-| `aos-cli` | `aegis-os` 单一二进制入口：`install`、`run`（Supervisor + Broker）、`explore`（`paths` 多路径并行探索与 `--pick` 三方合成）、`diff`/`verify`/`commit`、`vault`、`cloud`、`upgrade`/`uninstall` | Single `aegis-os` binary: installer, `run` supervisor/broker, `explore` (`paths`) parallel path explorer & `--pick` 3-way synthesis, CoW diff/commit/verify CLI, `vault`, `cloud`, `upgrade`/`uninstall` |
+| `aos-cli` | `aegis-os` 单一二进制入口：`install`、`run`（含 `--isolated` / `--vcpus` / `--mem-mb`）、`vm`（`status`/`pull`/`verify`）、`explore`（`paths` 多路径并行探索、`--isolated` 与 `--pick` 三方合成）、`diff`/`verify`/`commit`、`vault`、`cloud`、`upgrade`/`uninstall` | Single `aegis-os` binary: installer, `run` supervisor/broker (`--isolated`/`--vcpus`/`--mem-mb`), `vm` (`status`/`pull`/`verify`), `explore` (`paths`) parallel path explorer (`--isolated` & `--pick`), CoW diff/commit/verify CLI, `vault`, `cloud`, `upgrade`/`uninstall` |
 
 ---
 
@@ -191,7 +193,7 @@ Host User Space (Trusted Control Plane & Supervisor)
 |---|---|---|---|---|---|---|
 | **Advisory** | `aegis-os install` 后直接运行 Agent | Hook / MCP / Rules | ✅ | ⚠️ 部分 | ❌ | ❌ |
 | **Enforced** | `aegis-os run -- <agent>` 或 `install --enforce` Shim | 父进程内核沙箱 (`bwrap`/Seatbelt) + Broker + 代理 | ✅ | ✅ | ✅ | ⚠️ 主动绕过可检测 |
-| **Isolated** | Aegis Cloud / 远端隔离沙箱（本地 microVM 规划中） | 远端隔离容器/VM + 云端控制策略 | ✅ | ✅ | ✅ | ✅（托管环境） |
+| **Isolated** | `aegis-os run --isolated -- <agent>` / `explore run --isolated` / Aegis Cloud | 本地 Zero-NIC 硬件虚拟化 MicroVM (`vfkit` / `cloud-hypervisor` + `virtio-vsock`) 或远端云沙箱 | ✅ | ✅ | ✅ | ✅（独立内核/托管环境） |
 
 **明确非目标 | Explicit Non-Goals**:
 - 不承诺在**本机用户拥有与 Supervisor 同等 UID 且主动关闭/卸载 Aegis** 的前提下阻止人工物理绕过；
@@ -202,26 +204,26 @@ Host User Space (Trusted Control Plane & Supervisor)
 
 ## 3. 实际实现情况与针对威胁模型的设计 | Implementation Status & Threat Countermeasures
 
-### 3.1 威胁 → 代码级防御实现对照总表 (`v0.6.0`) | Threat-to-Implementation Mapping
+### 3.1 威胁 → 代码级防御实现对照总表 (`v0.7.0`) | Threat-to-Implementation Mapping
 
-| 威胁类别 | 核心代码模块 | 具体安全设计与 `v0.6.0` 加固实现 |
+| 威胁类别 | 核心代码模块 | 具体安全设计与 `v0.7.0` 加固实现 |
 |---|---|---|
-| **V1 宿主机写逃逸与符号链接穿越** | `crates/aos-vfs/src/lib.rs`<br>`crates/aos-mcp-gateway/src/lib.rs`<br>`crates/aos-core/src/lib.rs` | - `CoWWorkspace::ensure_no_symlink_components` 在 `refresh_from_host`、`stage_commit_inner`、`apply_staged_actions` 对基准目录、影子目录与宿主机目标路径逐级校验 `symlink_metadata`，拒止一切 `..` 与符号链接组件。<br>- `cow_clone_file_inner` 使用同目录随机临时文件先行克隆（macOS `clonefile(CLONE_NOFOLLOW)` / `O_RDONLY \| O_NOFOLLOW` 回退）并 `sync_all` 后再原子 `rename`，杜绝先删目标导致断电/失败丢文件。<br>- 新增 `TransactionalWorkspace::commit_frozen_to_host_with_options`，提交前强制把冻结目录内容哈希与已审 `evidence_hash` 再比对防 TOCTOU。 |
+| **V1 宿主机写逃逸与符号链接穿越** | `crates/aos-vfs/src/lib.rs`<br>`crates/aos-mcp-gateway/src/lib.rs`<br>`crates/aos-core/src/lib.rs` | - `CoWWorkspace::ensure_no_symlink_components` 在 `refresh_from_host`、`stage_commit_inner`、`apply_staged_actions` 对基准目录、影子目录与宿主机目标路径逐级校验 `symlink_metadata`，拒止一切 `..` 与符号链接组件。<br>- `cow_clone_file_inner` 使用同目录随机临时文件先行克隆（macOS `clonefile(CLONE_NOFOLLOW)` / `O_RDONLY \| O_NOFOLLOW` 回退）并 `sync_all` 后再原子 `rename`，杜绝先删目标导致断电/失败丢文件。<br>- 新增 `TransactionalWorkspace::commit_frozen_to_host_with_options`，提交前强制把冻结目录内容哈希与已审 `evidence_hash` 再比对防 TOCTOU；`--isolated` MicroVM 下通过 `virtio-fs` 仅挂载 CoW `shadow` 根（`aegis_ws`）及会话级 `aegis_home`（`aegis_ro` 强制只读），物理隔离宿主机根文件系统。 |
 | **V2 `$HOME`/Keychain/环境凭据窃取与秘钥泄露** | `crates/aos-sandbox/src/lib.rs`<br>`crates/aos-vfs/src/vault.rs`<br>`crates/aos-core/src/profile.rs` | - Linux `bwrap` 用 `--tmpfs` 遮蔽 `$HOME`、`/run` 等敏感目录；macOS Seatbelt 在 `tighten_home_read` 下默认拒读宿主机 `$HOME`，显式封锁 `~/.ssh`、`~/.aws`、`~/.gnupg`、`~/.kube`、`*/.env*`、Keychain `SecurityAgent`、`human.token` 与 `master.kek`。<br>- 提取 `is_reserved_sandbox_env_key` 统一净化主执行链与回退链中的 `DYLD_*`、`LD_*`、`SSH_AUTH_SOCK`、`AOS_ADMIN_SECRET`。<br>- `DefaultOsKekProvider` 加 `master.kek.lock` 文件锁，仅在 Keychain 返回 `errSecItemNotFound (44)` 时通过 `/usr/bin/security -i` **标准输入** 写入密钥，移除 `-U` 且命令行零明文；`load_existing_kek_for_source` 按信封 `key_source` 精确解封；`lock_org` 卸载后将空挂载壳收紧为 `0o500`。<br>- `DomainProfile::contains_secret_signature` 用 `match_indices` 全文多点扫描 `AKIA`、`ghp_`，并扩展 `github_pat_`、`sk-`、`xoxb-`/`xoxp-`、`AIza`。 |
 | **V3 配置自篡改与 Git/Build RCE** | `crates/aos-sandbox/src/lib.rs`<br>`crates/aos-policy/src/lib.rs`<br>`crates/aos-cli/src/routing.rs` | - 客户代理关键配置文件（`.claude/settings.json`、`.mcp.json`、`opencode.json`、`.gemini/antigravity-cli/settings.json`、`.hermes/config.yaml`）只读锁定或剥离写入权限；`.agents/hooks.json` 在 `aegis-os` 缺失时安全降级同时配合 `PreToolUse` / Lazy MCP 精确校验。<br>- `.aegis-bin/git` Shim 锁定 `core.fsmonitor=false`、`core.hooksPath=/dev/null`。<br>- `is_commit_poisoning_path`、`is_forbidden_export_dest` 与宿主红线路径检查全部大小写折叠；`proc_exec` / `proc_manage` 提权命令与 `~/.kube` 等凭证访问检查前移到 Session Lease 匹配**之前**，通配租约无法覆盖红线。 |
-| **V4 网络外泄、SSRF、HTTP 走私、PII 外传与预算/死循环耗尽** | `crates/aos-egress/src/{lib,pseudonym,breaker,pricing}.rs`<br>`crates/aos-cli/src/{launcher,session_broker,main}.rs`<br>`crates/aos-mcp-gateway/src/app_store.rs`<br>`crates/aos-memory-gateway/src/lib.rs` | - `is_forbidden_outbound_ip` 与 `AppStoreRegistry::is_forbidden_app_ip` 拦截所有 IPv4/IPv6 回环、RFC1918 私网、CGNAT `100.64/10`、云元数据 `169.254.169.254` / `fd00:ec2::254` 及 IPv4-mapped IPv6；HTTPS `CONNECT` 限定端口 `443`。<br>- Model API L7 反向代理通过 `replace_query_key_param` 在边界注入 `$AOS_SECRET_*`，DLP 全量检查完整 `dlp_path`（Path+Query）、Header 与请求体；拒绝含 CR/LF/NUL、冲突多 `Content-Length` 及 `Transfer-Encoding` + `Content-Length` 走私包，并实行 64 KiB 行上限与 30s 超时。<br>- **可逆 PII 假名化 (`pseudonym.rs`)**：在无条件优先阻断硬凭据（`AKIA*`、`ghp_*`、PEM 私钥、`$AOS_SECRET_*`）的前提下，支持 `--dlp-mode pseudonymize` 通过 `PseudonymSessionTable`（`Zeroizing<[u8; 32]>` 会话盐 + `HMAC-SHA256` 确定性替换 `u_<8hex>@aegis-redact.invalid`、`ip_<8hex>.aegis-redact.invalid`、`h_<8hex>.aegis-redact.invalid`、`tel_<8hex>`、`cid_<8hex>`）在出站替换 PII，并经 `SseResponseTransformer` / `StreamingTextRestorer`（前缀缓冲回溯 + JSON 字符串转义还原工具参数）与 `restore_json_response_body` 在响应流中无缝还原。<br>- **原子预算与工具循环熔断 (`breaker.rs` / `pricing.rs` / `session_broker.rs`)**：无锁 `SharedBudgetPool`（`AtomicU64` CAS 预订 + `soft_cap_bps`）与每会话 `SessionBreakerState` 强制执行 `micro_usd` 美元预算、Token 上限与 4 提供商连续相同/失败工具调用检测，超限直接返回 HTTP `429`；`SessionBroker` 提供 `human.token` 鉴权的 `GET /v1/egress/usage` 与 `POST /v1/egress/extend-budget` 人工扩容接口，用量持久化至 `egress_usage.json` 与 `effects.jsonl`。<br>- `AppStoreRegistry` 通过端到端 DNS 解析 + `curl --proto =https --max-redirs 0 --resolve` 阻断重定向/DNS 重绑定 SSRF 与 `file://` 参数注入。 |
+| **V4 网络外泄、SSRF、HTTP 走私、PII 外传与预算/死循环耗尽** | `crates/aos-egress/src/{lib,pseudonym,breaker,pricing}.rs`<br>`crates/aos-sandbox/src/microvm/`<br>`crates/aos-guest-init/src/lib.rs`<br>`crates/aos-cli/src/{launcher,session_broker,vm,main}.rs`<br>`crates/aos-mcp-gateway/src/app_store.rs`<br>`crates/aos-memory-gateway/src/lib.rs` | - `is_forbidden_outbound_ip` 与 `AppStoreRegistry::is_forbidden_app_ip` 拦截所有 IPv4/IPv6 回环、RFC1918 私网、CGNAT `100.64/10`、云元数据 `169.254.169.254` / `fd00:ec2::254` 及 IPv4-mapped IPv6；HTTPS `CONNECT` 限定端口 `443`。<br>- **Zero-NIC 硬件虚拟化与 `virtio-vsock` 出口隧道 (`--isolated`)**：本地 MicroVM 彻底移除 `virtio-net` 网卡（Guest 内无原始外网路由），由 `aos-guest-init` 仅拉起 `lo` 并在 Guest `127.0.0.1:<proxy_port>` 监听，经 `AF_VSOCK` port `18080` + 32 字节每实例 `bridge_token` 帧透传回宿主机 `AegisEgressGateway`，同时按 `Pong.proxy_port` 动态重写 L7 模型 Base-URL，完整继承 DLP 与预算熔断。<br>- Model API L7 反向代理通过 `replace_query_key_param` 在边界注入 `$AOS_SECRET_*`，DLP 全量检查完整 `dlp_path`（Path+Query）、Header 与请求体；拒绝含 CR/LF/NUL、冲突多 `Content-Length` 及 `Transfer-Encoding` + `Content-Length` 走私包，并实行 64 KiB 行上限与 30s 超时。<br>- **可逆 PII 假名化 (`pseudonym.rs`)**：在无条件优先阻断硬凭据（`AKIA*`、`ghp_*`、PEM 私钥、`$AOS_SECRET_*`）的前提下，支持 `--dlp-mode pseudonymize` 通过 `PseudonymSessionTable`（`Zeroizing<[u8; 32]>` 会话盐 + `HMAC-SHA256` 确定性替换 `u_<8hex>@aegis-redact.invalid`、`ip_<8hex>.aegis-redact.invalid`、`h_<8hex>.aegis-redact.invalid`、`tel_<8hex>`、`cid_<8hex>`）在出站替换 PII，并经 `SseResponseTransformer` / `StreamingTextRestorer`（前缀缓冲回溯 + JSON 字符串转义还原工具参数）与 `restore_json_response_body` 在响应流中无缝还原。<br>- **原子预算与工具循环熔断 (`breaker.rs` / `pricing.rs` / `session_broker.rs`)**：无锁 `SharedBudgetPool`（`AtomicU64` CAS 预订 + `soft_cap_bps`）与每会话 `SessionBreakerState` 强制执行 `micro_usd` 美元预算、Token 上限与 4 提供商连续相同/失败工具调用检测，超限直接返回 HTTP `429`；`SessionBroker` 提供 `human.token` 鉴权的 `GET /v1/egress/usage` 与 `POST /v1/egress/extend-budget` 人工扩容接口，用量持久化至 `egress_usage.json` 与 `effects.jsonl`。<br>- `AppStoreRegistry` 通过端到端 DNS 解析 + `curl --proto =https --max-redirs 0 --resolve` 阻断重定向/DNS 重绑定 SSRF 与 `file://` 参数注入。 |
 | **V5 控制面越权、TOCTOU 与 Cedar/租约漏洞** | `crates/aos-mcp-gateway/src/{paas,lib,approver}.rs`<br>`crates/aos-policy/src/lib.rs`<br>`crates/aos-cli/src/{cloud,hooks}.rs` | - 移除控制面匿名查询/审批/吊销入口，由 `ScopedEscalationTicket` (`ast_*`) 为浏览器 `/approve` 提供严格绑定 `(org_id, escalation_id)` 的单笔临时凭据；审批页与看板全面改用 DOM `textContent` 防 XSS；`host_exec` 执行期间激活 `423 Locked` 写锁并在结束后轮换动态管理密钥。<br>- 重写支持引号解析的词法/递归下降 `CedarPolicySet` (`CedarExpr`)，支持 `principal`、`owner_agent_id`、`when`/`unless` 与中部通配符 `*`/`?`；解析错误 Fail-Closed 返回兜底 `forbid`；`find_custom_forbid` 仅跳过内置 `cedar:default:cross_org_forbid`。<br>- `check_all_sensitive_targets_atomic` 两阶段原子核验多个敏感目标（任一未授权即保留已匹 `OneShot` 不销毁）；采用结构化 `evidence["sensitive_targets"]` 取代逗号切分防文件名注入；`HookApprovalTicket` 绑定 `(org_id, agent_id, tool_name, canonical_args_sha256)` 与 60s TTL；自动批准改为 `ttl_secs = 0` 单次作用域。 |
-| **V6 跨进程探测、状态撕裂与跨租户混淆** | `crates/aos-sandbox/src/lib.rs`<br>`crates/aos-recorder/src/lib.rs`<br>`crates/aos-ipc/src/lib.rs`<br>`crates/aos-memory-*` | - macOS Seatbelt 禁止跨沙箱 `(deny signal (target others))`、`(deny process-info* (target others))` 与剪贴板 `com.apple.pasteboard.1`；通过 XNU `sandbox_check(getpid(), NULL, 0) > 0` 验证宿主机真处于外层沙箱才允许测试回退。<br>- PaaS、AppStore、Policy、Org CAS/KV 全量使用 `io_gate`/`state_mutex` + 文件锁串行化读写，CAS 读取严格复核 SHA-256；AppStore 安装与凭据按 `(org_id, app_id)` 分桶。<br>- `aos-ipc` `reply()` 在单事务锁内将终态转换与 `TaskResponse` 一次性原子写入 `0o600` (`sync_all`)；`list_tasks` 改为 `(org_id, agent_id)` 同侧配对过滤且网关侧对 `list_subtasks` 强制叠加 `visible_to_org`。<br>- SQLite 存储启用 `WAL` + `busy_timeout(5s)`，`approve_staged_write` 在 `BEGIN IMMEDIATE` 中先 `UPDATE ... WHERE status = 'pending'` 成功再落表；`AuthStore::verify_active_session` 单查核验状态/过期/常量时间 `token_hash` 并覆盖 Token `scopes`；强制 `local` `audience` 与非 `local` 桥接鉴权。<br>- `aos-recorder` 通过 `read_events_strict` 强制首条哈希链接 `GENESIS_HASH`，任何损坏/非 UTF-8 行立即使 `verify_chain` 返回 `verified == false`。 |
+| **V6 跨进程探测、状态撕裂与跨租户混淆** | `crates/aos-sandbox/src/{lib,microvm/mod}.rs`<br>`crates/aos-recorder/src/lib.rs`<br>`crates/aos-ipc/src/lib.rs`<br>`crates/aos-memory-*`<br>`crates/aos-cli/src/vm.rs` | - macOS Seatbelt 禁止跨沙箱 `(deny signal (target others))`、`(deny process-info* (target others))` 与剪贴板 `com.apple.pasteboard.1`；通过 XNU `sandbox_check(getpid(), NULL, 0) > 0` 验证宿主机真处于外层沙箱才允许测试回退。<br>- `--isolated` MicroVM 拥有独立 Linux Guest 内核、`PID 1` 与内存空间，启动前强制完成 `verify_cached_vm_images`（OpenSSH `.sig` 验签 + SHA-256 完整性 + 符号链接拒绝）且 `aegis-guest-init` 控制面 RPC (`port 10700`) 采用常量时间 Token 鉴权；缺少 Hypervisor、VMM 或已校验镜像时**严格 Fail-Closed**（清理临时会话目录并报错退出，绝不静默降级至 OS 沙箱）。<br>- PaaS、AppStore、Policy、Org CAS/KV 全量使用 `io_gate`/`state_mutex` + 文件锁串行化读写，CAS 读取严格复核 SHA-256；AppStore 安装与凭据按 `(org_id, app_id)` 分桶。<br>- `aos-ipc` `reply()` 在单事务锁内将终态转换与 `TaskResponse` 一次性原子写入 `0o600` (`sync_all`)；`list_tasks` 改为 `(org_id, agent_id)` 同侧配对过滤且网关侧对 `list_subtasks` 强制叠加 `visible_to_org`。<br>- SQLite 存储启用 `WAL` + `busy_timeout(5s)`，`approve_staged_write` 在 `BEGIN IMMEDIATE` 中先 `UPDATE ... WHERE status = 'pending'` 成功再落表；`AuthStore::verify_active_session` 单查核验状态/过期/常量时间 `token_hash` 并覆盖 Token `scopes`；强制 `local` `audience` 与非 `local` 桥接鉴权。<br>- `aos-recorder` 通过 `read_events_strict` 强制首条哈希链接 `GENESIS_HASH`，任何损坏/非 UTF-8 行立即使 `verify_chain` 返回 `verified == false`。 |
 
 ---
 
-### 3.2 当前版本 (`v0.6.0`) 真实完备度、性能基准与已知边界 | Readiness, Benchmarks & Known Limits
+### 3.2 当前版本 (`v0.7.0`) 真实完备度、性能基准与已知边界 | Readiness, Benchmarks & Known Limits
 
-#### 实测验证基线 (`v0.6.0`) | Verified Quality & Benchmark Baseline
+#### 实测验证基线 (`v0.7.0`) | Verified Quality & Benchmark Baseline
 
 | 评估维度 | 实测指标与来源 |
 |---|---|
-| **`v0.6.0` 源码全仓门禁** | `cargo clippy --workspace --all-targets -- -D warnings`: **0 warnings / 0 errors**；`cargo test --workspace`: **311 passed, 0 failed**（`aos-egress` 中 2 项需外网直连 Anthropic API 用例按原标注 `#[ignore]` 跳过）。 |
+| **`v0.7.0` 源码全仓门禁** | `cargo clippy --workspace --all-targets -- -D warnings`: **0 warnings / 0 errors**；`cargo check --workspace --locked`: exit **0**；`cargo test --workspace`（14 crates）：**320 passed, 0 failed**（`aos-egress` 中 2 项需外网直连 Anthropic API 用例按原标注 `#[ignore]` 跳过）。 |
 | **`V1–V6` 越界利用套件 (Paper 2)** | **0/30 (0.0%)** 逃逸（macOS Seatbelt 与 Linux `bwrap --bind-fd` 均全拦截），对比 Advisory Hooks **93.3%**、厂商自带沙箱 **73.3%–83.3%**、`nerdctl` 容器 **80.0%**。 |
 | **四大真实 Agent 投毒实测** | `claude`、`opencode`、`agy`、`hermes` 跨 60 格子矩阵实测：`aegis_enforced` 宿主机被攻破率 **0% (0/4)**（对比 `vendor_default` **100% (4/4)**），正常多文件编程通过率 **100% (8/8)**。 |
 | **启动、代理与提交门开销** | Enforced 启动延迟 **9.91 ms**（Linux `bwrap`） / **20.38 ms**（macOS Seatbelt）；L7 模型反代首 Token 仅增加 **+0.221 ms**；500 MB 紧凑 Git 仓库 APFS 增量仅 **4.76 MB**（节省 **99.05%**），Btrfs `FICLONE` 净增量 **0.00 MB**。 |
@@ -232,7 +234,7 @@ Host User Space (Trusted Control Plane & Supervisor)
 1. **macOS `cwd` 与 Linux 路径重映射差异**：Linux `bwrap --bind-fd` 将 CoW Shadow 直接覆盖挂载到宿主机原路径；macOS 无 rootless bind-mount，Seatbelt 会话 `cwd` 位于 `upper_workspace`、宿主机目录只读挂载（完整 macOS 用户态 VFS 路径重映射计划于 Phase 4）。
 2. **Ubuntu 24.04+ 非特权 Userns AppArmor 限制**：若系统开启 `kernel.apparmor_restrict_unprivileged_userns=1` 且未安装 `/etc/apparmor.d/bwrap`，`aegis-os run` 将 Fail-Closed 拒绝启动并打印配置指引。
 3. **非模型类普通 HTTPS**：模型提供商 API 走 L7 反向代理（无 TLS MITM，完整扫描请求体/头/URL）；其他白名单 HTTPS 站点走 L4 `CONNECT` 域名白名单过滤。
-4. **本地 `--isolated` microVM & 高级领域 CRDT**：云端 64GB 隔离沙箱（Aegis Cloud）已上线；本地 `--isolated` microVM、Office/Data 块级合并归入后续 Phase 4/5 演进。
+4. **本地 `--isolated` MicroVM、交互式 PTY 与高级领域 CRDT**：本地 `--isolated` Zero-NIC 硬件虚拟化 MicroVM 运行时（macOS `vfkit`/`krunkit`、Linux `cloud-hypervisor`+`virtiofsd`、`aos-guest-init`、`aegis-os vm` 及 `run --isolated` / `explore run --isolated`）已于 `v0.7.0` 落地（使用前需宿主机具备 Hypervisor + VMM 并通过 `aegis-os vm pull` 准备已校验 Linux 内核与 `initramfs`）；MicroVM 内交互式 PTY 穿透与 Office/Data 块级 CRDT 归入后续演进。
 
 ---
 
@@ -285,7 +287,7 @@ aegis-os uninstall --workspace-clean --purge --yes   # 同时清理工作区配�
 
 ---
 
-### 4.2 单 Agent 受控开发全流程 (`Enforced Mode`) | Single-Agent Enforced Workflow
+### 4.2 单 Agent 受控开发与本地硬件虚拟化 MicroVM (`Enforced` & `Isolated Mode`) | Single-Agent Enforced & Isolated MicroVM Workflow
 
 #### 配置模型 API 边界秘密（可选，推荐）| Configuring Boundary Secrets
 在宿主机环境变量设置对应提供商真实密钥时，Enforced 沙箱内部可不暴露原始永久 Key，而是经过 L7 本地反向代理在边界替换注入：
@@ -328,6 +330,22 @@ aegis-os why
 ```
 
 - **智能 DLP 与预算策略配置 (`.aegis/dlp.json`)**：可在项目根目录配置 `pseudonym_mode`（`block` / `pseudonymize` / `off`）、`budget_usd`、`max_tokens`、`max_identical_loop_streak`、`custom_literals`（自定义敏字字面量脱敏）与 `pricing`（模型费率覆盖）。会话 Token/USD/假名化统计与熔断记录持久化于 `~/.aegis/sessions/<sid>/egress_usage.json` 与 `effects.jsonl`，运行中可通过携带 `human.token` 访问 `SessionBroker` 的 `GET /v1/egress/usage` 与 `POST /v1/egress/extend-budget` 实时查看或扩容预算。
+
+#### 本地硬件虚拟化 Zero-NIC MicroVM (`--isolated`) | Local Hardware-Isolated MicroVM
+```bash
+# 1. 检查宿主机 Hypervisor (Apple Hypervisor / Linux KVM)、VMM (vfkit/krunkit 或 cloud-hypervisor+virtiofsd) 与镜像状态
+aegis-os doctor
+aegis-os vm status
+aegis-os vm status --json
+
+# 2. 拉取或从本地目录导入 SHA-256 / OpenSSH 签名的 Guest Linux 内核与 initramfs
+aegis-os vm pull
+aegis-os vm pull --from-dir ./vm-bundle
+aegis-os vm verify
+
+# 3. 以独立 Zero-NIC MicroVM 启动（缺少前置条件或已校验镜像时严格 Fail-Closed，绝不降级）
+aegis-os run --isolated --vcpus 2 --mem-mb 2048 -- claude
+```
 
 ---
 
@@ -402,6 +420,8 @@ aegis-os artifacts fetch <artifact_uri> --out ./verified.bin
 # Stage 2：多路径并行探索（基于冻结 CoW 基线 + SharedBudgetPool + Clean-Room VerifyGate + TradeoffBrief）
 aegis-os explore run --prompt "修复会话缓存竞争问题" --path "minimal=最小改动加锁" --path "refactor=改用事件队列重构" --verify-cmd "cargo test -p aos-memory-store" --budget-usd 5.0
 aegis-os explore run --prompt "排查间歇性测试超时" --diverge 3 --confirm-plan --verify-cmd "cargo test"
+# Stage 3：使用硬件虚拟化 Zero-NIC MicroVM 运行每条探索路径及 Clean-Room VerifyGate
+aegis-os explore run --isolated --vcpus 2 --mem-mb 2048 --prompt "隔离运行不可信构建脚本" --path "fix=修复构建" --verify-cmd "cargo test"
 aegis-os explore status
 aegis-os explore diff --path minimal
 aegis-os explore apply --path minimal                                  # 整路径防 TOCTOU 提交回宿主机
@@ -482,3 +502,4 @@ aegis-os cloud down
 | `host_exec` 期间提示 `423 Locked` | 设计如此：物理互锁保护宿主机免于并发审批篡改；等待 `host_exec` 执行完毕退出即自动解除并轮换动态密钥。 |
 | macOS 出现 Keychain 锁屏/写入拒绝 | Enforced 模式下已禁用弹窗（`exit 44`）；如需云/主机 Keychain KEK，请使用环境变量 `AOS_VAULT_MASTER_KEY` 或先在非沙箱环境解锁登录钥匙串。 |
 | `verify_chain` 报告审计链未通过 | 检查 `~/.aegis/audit.jsonl` 是否存在截断首行、非 UTF-8 字符或损坏 JSON；严禁手工编辑账本。 |
+| `run --isolated` 或 `vm status` 显示 `NOT READY` | `--isolated` 严格 Fail-Closed：macOS 需安装 `vfkit`/`krunkit` 并启用 Apple Hypervisor；Linux 需开启 `/dev/kvm` 读写权限并安装 `cloud-hypervisor` 与 `virtiofsd`；随后执行 `aegis-os vm pull`（或 `--from-dir`）完成镜像校验。 |

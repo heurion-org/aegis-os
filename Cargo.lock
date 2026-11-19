@@ -162,6 +162,20 @@ dependencies = [
 ]
 
 [[package]]
+name = "aos-guest-init"
+version = "0.6.0"
+dependencies = [
+ "anyhow",
+ "base64",
+ "libc",
+ "serde",
+ "serde_json",
+ "tempfile",
+ "tokio",
+ "uuid",
+]
+
+[[package]]
 name = "aos-ipc"
 version = "0.6.0"
 dependencies = [
@@ -312,11 +326,15 @@ version = "0.6.0"
 dependencies = [
  "anyhow",
  "aos-core",
+ "aos-guest-init",
  "async-trait",
+ "base64",
  "chrono",
+ "hex",
  "libc",
  "serde",
  "serde_json",
+ "sha2",
  "tempfile",
  "tokio",
  "uuid",

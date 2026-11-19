@@ -6,6 +6,7 @@ members = [
     "crates/aos-vfs",
     "crates/aos-ipc",
     "crates/aos-sandbox",
+    "crates/aos-guest-init",
     "crates/aos-egress",
     "crates/aos-recorder",
     "crates/aos-memory",
@@ -57,6 +58,7 @@ aos-policy = { path = "crates/aos-policy" }
 aos-vfs = { path = "crates/aos-vfs" }
 aos-ipc = { path = "crates/aos-ipc" }
 aos-sandbox = { path = "crates/aos-sandbox" }
+aos-guest-init = { path = "crates/aos-guest-init" }
 aos-egress = { path = "crates/aos-egress" }
 aos-recorder = { path = "crates/aos-recorder" }
 aos-memory = { path = "crates/aos-memory" }
