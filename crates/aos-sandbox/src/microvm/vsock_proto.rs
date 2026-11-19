@@ -1,6 +1,7 @@
 //! Host <-> MicroVM `virtio-vsock` JSONL RPC transport abstractions.
 
 use anyhow::{bail, Context};
+pub use aos_guest_init::{GuestPtyClientFrame, GuestPtyServerFrame};
 use aos_guest_init::{
     GuestRpcRequest, GuestRpcResponse, GUEST_CONTROL_VSOCK_PORT, GUEST_EGRESS_VSOCK_PORT,
 };
@@ -39,14 +40,11 @@ pub async fn send_guest_rpc(
         .with_context(|| format!("MicroVM guest RPC timed out after {}ms", timeout.as_millis()))?
 }
 
-async fn send_guest_rpc_inner(
-    mode: &VsockTransportMode,
-    req: &GuestRpcRequest,
-) -> anyhow::Result<GuestRpcResponse> {
-    let stream = match mode {
+pub async fn open_guest_control_stream(mode: &VsockTransportMode) -> anyhow::Result<UnixStream> {
+    match mode {
         VsockTransportMode::DirectUnix { exec_sock, .. } => UnixStream::connect(exec_sock)
             .await
-            .with_context(|| format!("connecting to guest control socket {}", exec_sock.display()))?,
+            .with_context(|| format!("connecting to guest control socket {}", exec_sock.display())),
         VsockTransportMode::CloudHvMux { mux_sock } => {
             let mut s = UnixStream::connect(mux_sock)
                 .await
@@ -63,9 +61,16 @@ async fn send_guest_rpc_inner(
                     line.trim()
                 );
             }
-            reader.into_inner()
+            Ok(reader.into_inner())
         }
-    };
+    }
+}
+
+async fn send_guest_rpc_inner(
+    mode: &VsockTransportMode,
+    req: &GuestRpcRequest,
+) -> anyhow::Result<GuestRpcResponse> {
+    let stream = open_guest_control_stream(mode).await?;
 
     let (rd, mut wr) = tokio::io::split(stream);
     let mut payload = serde_json::to_vec(req)?;

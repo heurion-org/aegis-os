@@ -7,14 +7,21 @@ use std::path::PathBuf;
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
     let args: Vec<String> = std::env::args().collect();
-    if args.iter().any(|a| a == "--pid1") {
+    if args.iter().any(|a| a == "--pid1") || std::process::id() == 1 {
         #[cfg(target_os = "linux")]
         {
-            let cmdline = std::fs::read_to_string("/proc/cmdline")
-                .context("reading /proc/cmdline in MicroVM guest")?;
-            let cfg = GuestBootConfig::from_kernel_cmdline(&cmdline)?;
-            aos_guest_init::bootstrap_linux_pid1(&cfg)?;
-            aos_guest_init::serve_guest_vsock(cfg).await?;
+            async fn run_pid1() -> anyhow::Result<()> {
+                aos_guest_init::bootstrap_linux_early()?;
+                let cmdline = std::fs::read_to_string("/proc/cmdline")
+                    .context("reading /proc/cmdline in MicroVM guest")?;
+                let cfg = GuestBootConfig::from_kernel_cmdline(&cmdline)?;
+                aos_guest_init::mount_linux_virtiofs_shares(&cfg)?;
+                aos_guest_init::serve_guest_vsock(cfg).await?;
+                Ok(())
+            }
+            if let Err(err) = run_pid1().await {
+                eprintln!("aegis-guest-init PID 1 fatal: {err:#}");
+            }
             unsafe {
                 libc::sync();
                 libc::reboot(libc::RB_POWER_OFF);

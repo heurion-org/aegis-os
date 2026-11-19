@@ -82,6 +82,20 @@ jobs:
               -C "$(dirname "$bin")" aegis-os -C "$GITHUB_WORKSPACE" README.md Formula/aegis-os.rb
           done
 
+      - name: Build & Package MicroVM Guest Images
+        if: runner.os == 'Linux'
+        run: |
+          case "${{ matrix.label }}" in
+            aarch64-*) vm_arch="aarch64" ;;
+            x86_64-*)  vm_arch="x86_64" ;;
+            *) echo "Unsupported Linux matrix label: ${{ matrix.label }}" >&2; exit 1 ;;
+          esac
+          ./scripts/build_vm_images.sh \
+            --arch "$vm_arch" \
+            --version "${GITHUB_REF_NAME#v}" \
+            --out "target/vm-bundle-${vm_arch}" \
+            --release-prefix "out/aegis-vm-${vm_arch}"
+
       - uses: actions/upload-artifact@v4
         with:
           name: ${{ matrix.artifact }}

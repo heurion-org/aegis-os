@@ -7045,8 +7045,8 @@ async fn run_isolated_inner(
     std::fs::create_dir_all(&org_shared)?;
     std::fs::create_dir_all(&org_pub)?;
 
-    let sandbox = match aos_sandbox::microvm::ConfiguredMicroVmSandboxDriver::new(runtime_dir)
-        .create_sandbox(SandboxConfig {
+    let sandbox = match aos_sandbox::microvm::MicroVmSandboxInstance::launch_real(
+        SandboxConfig {
             identity: identity.clone(),
             tier: IsolationTier::MicroVm,
             limits: ResourceLimits {
@@ -7063,8 +7063,10 @@ async fn run_isolated_inner(
             tighten_home_read: true,
             allowed_loopback_ports: Vec::new(),
             isolate_loopback_only: true,
-        })
-        .await
+        },
+        runtime_dir,
+    )
+    .await
     {
         Ok(sbx) => sbx,
         Err(err) => {
@@ -7078,6 +7080,15 @@ async fn run_isolated_inner(
     append_credential_and_tls_envs(&mut cred_envs, Some(&proxy), &harvested_secrets, command);
     for (k, v) in cred_envs {
         env.insert(k, v);
+    }
+    env.insert(
+        "TERM".to_string(),
+        std::env::var("TERM").unwrap_or_else(|_| "xterm-256color".to_string()),
+    );
+    for key in ["LANG", "LC_ALL"] {
+        if let Ok(val) = std::env::var(key) {
+            env.insert(key.to_string(), val);
+        }
     }
     let proxy_url = format!("http://{proxy}");
     for key in ["HTTP_PROXY", "HTTPS_PROXY", "http_proxy", "https_proxy"] {
@@ -7135,6 +7146,132 @@ async fn run_isolated_inner(
     eprintln!("  shadow:  {}", shadow.display());
     eprintln!("  network: zero-NIC virtio-vsock -> Stage 1 egress + L7 DLP gateway");
 
+    if std::io::stdin().is_terminal() && std::io::stdout().is_terminal() {
+        use aos_core::SandboxInstance;
+        use aos_sandbox::microvm::vsock_proto::{GuestPtyClientFrame, GuestPtyServerFrame};
+        use base64::{engine::general_purpose::STANDARD as B64_STD, Engine as _};
+        use std::io::Read;
+
+        let ws = terminal_size();
+        let raw_guard = RawTerminalGuard::enter(libc::STDIN_FILENO);
+        let started = sandbox
+            .start_pty(
+                command[0].clone(),
+                command[1..].to_vec(),
+                Some(shadow.clone()),
+                env,
+                ws.ws_col,
+                ws.ws_row,
+            )
+            .await;
+        let (_pid, mut pty_reader, mut pty_writer) = match started {
+            Ok(tuple) => tuple,
+            Err(err) => {
+                drop(raw_guard);
+                let _ = sandbox.destroy().await;
+                update_session_state(&session_dir, "failed", None);
+                return Err(err);
+            }
+        };
+
+        let (frame_tx, mut frame_rx) = tokio::sync::mpsc::unbounded_channel::<GuestPtyClientFrame>();
+        let writer_handle = tokio::spawn(async move {
+            while let Some(frame) = frame_rx.recv().await {
+                if pty_writer.send(&frame).await.is_err() {
+                    break;
+                }
+            }
+        });
+
+        let stdin_tx = frame_tx.clone();
+        std::thread::spawn(move || {
+            let mut stdin = std::io::stdin();
+            let mut buf = [0u8; 1024];
+            while let Ok(n) = stdin.read(&mut buf) {
+                if n == 0 {
+                    let _ = stdin_tx.send(GuestPtyClientFrame::Eof);
+                    break;
+                }
+                if stdin_tx
+                    .send(GuestPtyClientFrame::Stdin {
+                        data_b64: B64_STD.encode(&buf[..n]),
+                    })
+                    .is_err()
+                {
+                    break;
+                }
+            }
+        });
+
+        let mut sigwinch = tokio::signal::unix::signal(
+            tokio::signal::unix::SignalKind::window_change(),
+        )?;
+        let mut sigterm =
+            tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())?;
+
+        let mut exited_code: Option<i32> = None;
+        let mut pty_err: Option<anyhow::Error> = None;
+        loop {
+            tokio::select! {
+                ev = pty_reader.next_event() => {
+                    match ev {
+                        Ok(Some(GuestPtyServerFrame::Output { data_b64 })) => {
+                            if let Ok(bytes) = B64_STD.decode(data_b64.as_bytes()) {
+                                let mut stdout = io::stdout();
+                                let _ = stdout.write_all(&bytes);
+                                let _ = stdout.flush();
+                            }
+                        }
+                        Ok(Some(GuestPtyServerFrame::Exited { exit_code })) => {
+                            exited_code = Some(exit_code);
+                            break;
+                        }
+                        Ok(Some(GuestPtyServerFrame::Error { message })) => {
+                            pty_err = Some(anyhow::anyhow!("MicroVM PTY error: {message}"));
+                            break;
+                        }
+                        Ok(None) => {
+                            exited_code = Some(1);
+                            break;
+                        }
+                        Err(err) => {
+                            pty_err = Some(err);
+                            break;
+                        }
+                    }
+                }
+                _ = sigwinch.recv() => {
+                    let ws = terminal_size();
+                    let _ = frame_tx.send(GuestPtyClientFrame::Resize {
+                        cols: ws.ws_col,
+                        rows: ws.ws_row,
+                    });
+                }
+                _ = sigterm.recv() => {
+                    let _ = frame_tx.send(GuestPtyClientFrame::Signal {
+                        signal: libc::SIGTERM,
+                    });
+                }
+            }
+        }
+
+        drop(frame_tx);
+        writer_handle.abort();
+        drop(raw_guard);
+        let _ = sandbox.destroy().await;
+        if let Some(err) = pty_err {
+            update_session_state(&session_dir, "failed", None);
+            return Err(err);
+        }
+        let code = exited_code.unwrap_or(1);
+        sync_credentials(&agent_home, host_home, command);
+        let pending = print_exit_summary(&session_dir, project, &shadow, Some(&exit_telemetry)).await;
+        let effective = if code == 0 && pending > 0 { 10 } else { code };
+        update_session_state(&session_dir, "exited", Some(effective));
+        return Ok(effective);
+    }
+
+    use aos_core::SandboxInstance;
     let exec_fut = sandbox.exec(ExecSpec {
         command: command[0].clone(),
         args: command[1..].to_vec(),

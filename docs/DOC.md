@@ -1,8 +1,8 @@
-# Aegis OS (`aegis-os`) 技术参考与用户手册 · Architecture, Threat Model & User Manual (`v0.7.0`)
+# Aegis OS (`aegis-os`) 技术参考与用户手册 · Architecture, Threat Model & User Manual (`v0.7.1`)
 
-> 本文档为 Aegis OS 仓库的唯一权威主文档（中文 + English 双语整合），涵盖 **架构设计**、**威胁模型**、**实际代码实现与威胁缓解对照（基于 `v0.7.0`）** 以及 **完整用户手册**。
+> 本文档为 Aegis OS 仓库的唯一权威主文档（中文 + English 双语整合），涵盖 **架构设计**、**威胁模型**、**实际代码实现与威胁缓解对照（基于 `v0.7.1`）** 以及 **完整用户手册**。
 >
-> *This is the single authoritative reference for Aegis OS (`v0.7.0`, bilingual Chinese + English), covering **Architecture Design**, **Threat Model**, **Actual Implementation & Threat Countermeasures**, and the **User Manual**.*
+> *This is the single authoritative reference for Aegis OS (`v0.7.1`, bilingual Chinese + English), covering **Architecture Design**, **Threat Model**, **Actual Implementation & Threat Countermeasures**, and the **User Manual**.*
 
 ---
 
@@ -20,8 +20,8 @@
   - [2.3 攻击向量分类 (`V1`–`V6` 及控制面/数据面威胁) | Attack Vectors](#23-攻击向量分类-v1v6-及控制面数据面威胁--attack-vectors)
   - [2.4 运行模式安全承诺矩阵与明确非目标 | Mode Security Matrix & Non-Goals](#24-运行模式安全承诺矩阵与明确非目标--mode-security-matrix--non-goals)
 - [3. 实际实现情况与针对威胁模型的设计 | Implementation Status & Threat Countermeasures](#3-实际实现情况与针对威胁模型的设计--implementation-status--threat-countermeasures)
-  - [3.1 威胁 → 代码级防御实现对照总表 (`v0.7.0`) | Threat-to-Implementation Mapping](#31-威胁--代码级防御实现对照总表-v070--threat-to-implementation-mapping)
-  - [3.2 当前版本 (`v0.7.0`) 真实完备度、性能基准与已知边界 | Readiness, Benchmarks & Known Limits](#32-当前版本-v070-真实完备度性能基准与已知边界--readiness-benchmarks--known-limits)
+  - [3.1 威胁 → 代码级防御实现对照总表 (`v0.7.1`) | Threat-to-Implementation Mapping](#31-威胁--代码级防御实现对照总表-v071--threat-to-implementation-mapping)
+  - [3.2 当前版本 (`v0.7.1`) 真实完备度、性能基准与已知边界 | Readiness, Benchmarks & Known Limits](#32-当前版本-v071-真实完备度性能基准与已知边界--readiness-benchmarks--known-limits)
 - [4. 用户手册 | User Manual](#4-用户手册--user-manual)
   - [4.1 安装、环境自检、升级与卸载 | Install, Doctor, Upgrade & Uninstall](#41-安装环境自检升级与卸载--install-doctor-upgrade--uninstall)
   - [4.2 单 Agent 受控开发与本地硬件虚拟化 MicroVM (`Enforced` & `Isolated Mode`) | Single-Agent Enforced & Isolated MicroVM Workflow](#42-单-agent-受控开发与本地硬件虚拟化-microvm-enforced--isolated-mode--single-agent-enforced--isolated-microvm-workflow)
@@ -204,9 +204,9 @@ Host User Space (Trusted Control Plane & Supervisor)
 
 ## 3. 实际实现情况与针对威胁模型的设计 | Implementation Status & Threat Countermeasures
 
-### 3.1 威胁 → 代码级防御实现对照总表 (`v0.7.0`) | Threat-to-Implementation Mapping
+### 3.1 威胁 → 代码级防御实现对照总表 (`v0.7.1`) | Threat-to-Implementation Mapping
 
-| 威胁类别 | 核心代码模块 | 具体安全设计与 `v0.7.0` 加固实现 |
+| 威胁类别 | 核心代码模块 | 具体安全设计与 `v0.7.1` 加固实现 |
 |---|---|---|
 | **V1 宿主机写逃逸与符号链接穿越** | `crates/aos-vfs/src/lib.rs`<br>`crates/aos-mcp-gateway/src/lib.rs`<br>`crates/aos-core/src/lib.rs` | - `CoWWorkspace::ensure_no_symlink_components` 在 `refresh_from_host`、`stage_commit_inner`、`apply_staged_actions` 对基准目录、影子目录与宿主机目标路径逐级校验 `symlink_metadata`，拒止一切 `..` 与符号链接组件。<br>- `cow_clone_file_inner` 使用同目录随机临时文件先行克隆（macOS `clonefile(CLONE_NOFOLLOW)` / `O_RDONLY \| O_NOFOLLOW` 回退）并 `sync_all` 后再原子 `rename`，杜绝先删目标导致断电/失败丢文件。<br>- 新增 `TransactionalWorkspace::commit_frozen_to_host_with_options`，提交前强制把冻结目录内容哈希与已审 `evidence_hash` 再比对防 TOCTOU；`--isolated` MicroVM 下通过 `virtio-fs` 仅挂载 CoW `shadow` 根（`aegis_ws`）及会话级 `aegis_home`（`aegis_ro` 强制只读），物理隔离宿主机根文件系统。 |
 | **V2 `$HOME`/Keychain/环境凭据窃取与秘钥泄露** | `crates/aos-sandbox/src/lib.rs`<br>`crates/aos-vfs/src/vault.rs`<br>`crates/aos-core/src/profile.rs` | - Linux `bwrap` 用 `--tmpfs` 遮蔽 `$HOME`、`/run` 等敏感目录；macOS Seatbelt 在 `tighten_home_read` 下默认拒读宿主机 `$HOME`，显式封锁 `~/.ssh`、`~/.aws`、`~/.gnupg`、`~/.kube`、`*/.env*`、Keychain `SecurityAgent`、`human.token` 与 `master.kek`。<br>- 提取 `is_reserved_sandbox_env_key` 统一净化主执行链与回退链中的 `DYLD_*`、`LD_*`、`SSH_AUTH_SOCK`、`AOS_ADMIN_SECRET`。<br>- `DefaultOsKekProvider` 加 `master.kek.lock` 文件锁，仅在 Keychain 返回 `errSecItemNotFound (44)` 时通过 `/usr/bin/security -i` **标准输入** 写入密钥，移除 `-U` 且命令行零明文；`load_existing_kek_for_source` 按信封 `key_source` 精确解封；`lock_org` 卸载后将空挂载壳收紧为 `0o500`。<br>- `DomainProfile::contains_secret_signature` 用 `match_indices` 全文多点扫描 `AKIA`、`ghp_`，并扩展 `github_pat_`、`sk-`、`xoxb-`/`xoxp-`、`AIza`。 |
@@ -217,13 +217,13 @@ Host User Space (Trusted Control Plane & Supervisor)
 
 ---
 
-### 3.2 当前版本 (`v0.7.0`) 真实完备度、性能基准与已知边界 | Readiness, Benchmarks & Known Limits
+### 3.2 当前版本 (`v0.7.1`) 真实完备度、性能基准与已知边界 | Readiness, Benchmarks & Known Limits
 
-#### 实测验证基线 (`v0.7.0`) | Verified Quality & Benchmark Baseline
+#### 实测验证基线 (`v0.7.1`) | Verified Quality & Benchmark Baseline
 
 | 评估维度 | 实测指标与来源 |
 |---|---|
-| **`v0.7.0` 源码全仓门禁** | `cargo clippy --workspace --all-targets -- -D warnings`: **0 warnings / 0 errors**；`cargo check --workspace --locked`: exit **0**；`cargo test --workspace`（14 crates）：**320 passed, 0 failed**（`aos-egress` 中 2 项需外网直连 Anthropic API 用例按原标注 `#[ignore]` 跳过）。 |
+| **`v0.7.1` 源码全仓门禁** | `cargo clippy --workspace --all-targets -- -D warnings`: **0 warnings / 0 errors**；`cargo check --workspace --locked`: exit **0**；`cargo test --workspace`（14 crates）：**322 passed, 0 failed**（`aos-egress` 中 2 项需外网直连 Anthropic API 用例按原标注 `#[ignore]` 跳过）。 |
 | **`V1–V6` 越界利用套件 (Paper 2)** | **0/30 (0.0%)** 逃逸（macOS Seatbelt 与 Linux `bwrap --bind-fd` 均全拦截），对比 Advisory Hooks **93.3%**、厂商自带沙箱 **73.3%–83.3%**、`nerdctl` 容器 **80.0%**。 |
 | **四大真实 Agent 投毒实测** | `claude`、`opencode`、`agy`、`hermes` 跨 60 格子矩阵实测：`aegis_enforced` 宿主机被攻破率 **0% (0/4)**（对比 `vendor_default` **100% (4/4)**），正常多文件编程通过率 **100% (8/8)**。 |
 | **启动、代理与提交门开销** | Enforced 启动延迟 **9.91 ms**（Linux `bwrap`） / **20.38 ms**（macOS Seatbelt）；L7 模型反代首 Token 仅增加 **+0.221 ms**；500 MB 紧凑 Git 仓库 APFS 增量仅 **4.76 MB**（节省 **99.05%**），Btrfs `FICLONE` 净增量 **0.00 MB**。 |
@@ -234,7 +234,7 @@ Host User Space (Trusted Control Plane & Supervisor)
 1. **macOS `cwd` 与 Linux 路径重映射差异**：Linux `bwrap --bind-fd` 将 CoW Shadow 直接覆盖挂载到宿主机原路径；macOS 无 rootless bind-mount，Seatbelt 会话 `cwd` 位于 `upper_workspace`、宿主机目录只读挂载（完整 macOS 用户态 VFS 路径重映射计划于 Phase 4）。
 2. **Ubuntu 24.04+ 非特权 Userns AppArmor 限制**：若系统开启 `kernel.apparmor_restrict_unprivileged_userns=1` 且未安装 `/etc/apparmor.d/bwrap`，`aegis-os run` 将 Fail-Closed 拒绝启动并打印配置指引。
 3. **非模型类普通 HTTPS**：模型提供商 API 走 L7 反向代理（无 TLS MITM，完整扫描请求体/头/URL）；其他白名单 HTTPS 站点走 L4 `CONNECT` 域名白名单过滤。
-4. **本地 `--isolated` MicroVM、交互式 PTY 与高级领域 CRDT**：本地 `--isolated` Zero-NIC 硬件虚拟化 MicroVM 运行时（macOS `vfkit`/`krunkit`、Linux `cloud-hypervisor`+`virtiofsd`、`aos-guest-init`、`aegis-os vm` 及 `run --isolated` / `explore run --isolated`）已于 `v0.7.0` 落地（使用前需宿主机具备 Hypervisor + VMM 并通过 `aegis-os vm pull` 准备已校验 Linux 内核与 `initramfs`）；MicroVM 内交互式 PTY 穿透与 Office/Data 块级 CRDT 归入后续演进。
+4. **高级领域 CRDT 与非 MicroVM 下 macOS 路径重映射**：本地 `--isolated` Zero-NIC 硬件虚拟化 MicroVM（`vfkit`/`krunkit` & `cloud-hypervisor`+`virtiofsd`）、`virtio-vsock` 交互式流式 PTY 终端与镜像自动化构建打包（`./scripts/build_vm_images.sh` + CI 发布签名产物 `aegis-vm-*`）已完整就绪；Office/Data 块级 CRDT 与非 MicroVM 模式 macOS 用户态 VFS 路径重映射归入后续演进。
 
 ---
 
@@ -338,12 +338,13 @@ aegis-os doctor
 aegis-os vm status
 aegis-os vm status --json
 
-# 2. 拉取或从本地目录导入 SHA-256 / OpenSSH 签名的 Guest Linux 内核与 initramfs
+# 2. 从 Release 下载或从本地构建包导入 SHA-256 / OpenSSH 签名的 Guest Linux 内核与 initramfs
 aegis-os vm pull
-aegis-os vm pull --from-dir ./vm-bundle
+./scripts/build_vm_images.sh --out ./target/vm-bundle   # 如需离线自建静态 musl initramfs + 内核镜像
+aegis-os vm pull --from-dir ./target/vm-bundle
 aegis-os vm verify
 
-# 3. 以独立 Zero-NIC MicroVM 启动（缺少前置条件或已校验镜像时严格 Fail-Closed，绝不降级）
+# 3. 以独立 Zero-NIC MicroVM 启动（支持 TTY 交互式 PTY / SIGWINCH；缺少前置条件或镜像时严格 Fail-Closed）
 aegis-os run --isolated --vcpus 2 --mem-mb 2048 -- claude
 ```
 

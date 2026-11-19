@@ -111,6 +111,7 @@ dependencies = [
  "aos-sandbox",
  "aos-vfs",
  "axum",
+ "base64",
  "chrono",
  "clap",
  "hex",

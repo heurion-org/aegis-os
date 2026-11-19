@@ -167,6 +167,18 @@ pub enum GuestRpcRequest {
         #[serde(default)]
         background: bool,
     },
+    ExecPty {
+        auth_token: String,
+        command: String,
+        #[serde(default)]
+        args: Vec<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        cwd: Option<String>,
+        #[serde(default)]
+        env: BTreeMap<String, String>,
+        cols: u16,
+        rows: u16,
+    },
     KillPgid {
         auth_token: String,
         pgid: u32,
@@ -193,6 +205,9 @@ pub enum GuestRpcResponse {
         duration_ms: u64,
         timed_out: bool,
     },
+    PtyStarted {
+        pid: u32,
+    },
     Ack {
         ok: bool,
         detail: String,
@@ -200,6 +215,23 @@ pub enum GuestRpcResponse {
     Error {
         message: String,
     },
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(tag = "op", rename_all = "snake_case")]
+pub enum GuestPtyClientFrame {
+    Stdin { data_b64: String },
+    Resize { cols: u16, rows: u16 },
+    Signal { signal: i32 },
+    Eof,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(tag = "type", rename_all = "snake_case")]
+pub enum GuestPtyServerFrame {
+    Output { data_b64: String },
+    Exited { exit_code: i32 },
+    Error { message: String },
 }
 
 fn constant_time_eq(a: &str, b: &str) -> bool {
@@ -290,10 +322,56 @@ struct GuestRuntimeState {
 }
 
 impl GuestRuntimeState {
+    fn build_guest_env(
+        &self,
+        raw_env: BTreeMap<String, String>,
+        default_term: Option<&str>,
+    ) -> BTreeMap<String, String> {
+        let mut out = BTreeMap::new();
+        out.insert(
+            "PATH".to_string(),
+            "/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin".to_string(),
+        );
+        out.insert("HOME".to_string(), self.cfg.home_dest.display().to_string());
+        out.insert("TMPDIR".to_string(), "/tmp".to_string());
+        out.insert(
+            "AOS_WORKSPACE".to_string(),
+            self.cfg.ws_dest.display().to_string(),
+        );
+        out.insert(
+            "AOS_ORG_SHARED_RO".to_string(),
+            self.cfg.ro_dest.display().to_string(),
+        );
+        out.insert(
+            "AOS_ORG_AGENT_PUB".to_string(),
+            self.cfg.pub_dest.display().to_string(),
+        );
+        if let Some(term) = default_term {
+            out.insert("TERM".to_string(), term.to_string());
+        }
+        if self.bound_proxy_port > 0 {
+            let proxy_url = format!("http://127.0.0.1:{}", self.bound_proxy_port);
+            out.insert("HTTP_PROXY".to_string(), proxy_url.clone());
+            out.insert("HTTPS_PROXY".to_string(), proxy_url.clone());
+            out.insert("http_proxy".to_string(), proxy_url.clone());
+            out.insert("https_proxy".to_string(), proxy_url);
+            out.insert("NO_PROXY".to_string(), "127.0.0.1,localhost".to_string());
+            out.insert("no_proxy".to_string(), "127.0.0.1,localhost".to_string());
+        }
+        for (k, v) in raw_env {
+            if is_scrubbed_guest_env_key(&k) {
+                continue;
+            }
+            out.insert(k, v);
+        }
+        out
+    }
+
     async fn handle_request(&self, req: GuestRpcRequest) -> (GuestRpcResponse, bool) {
         let presented = match &req {
             GuestRpcRequest::Ping { auth_token }
             | GuestRpcRequest::Exec { auth_token, .. }
+            | GuestRpcRequest::ExecPty { auth_token, .. }
             | GuestRpcRequest::KillPgid { auth_token, .. }
             | GuestRpcRequest::Shutdown { auth_token } => auth_token.as_str(),
         };
@@ -351,6 +429,12 @@ impl GuestRuntimeState {
                     .await,
                 false,
             ),
+            GuestRpcRequest::ExecPty { .. } => (
+                GuestRpcResponse::Error {
+                    message: "ExecPty must use streaming RPC entrypoint".to_string(),
+                },
+                false,
+            ),
         }
     }
 
@@ -374,33 +458,8 @@ impl GuestRuntimeState {
             .unwrap_or_else(|| self.cfg.ws_dest.clone());
 
         let mut cmd = Command::new(&command);
-        cmd.args(&args)
-            .current_dir(&work_dir)
-            .env_clear()
-            .env(
-                "PATH",
-                "/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin",
-            )
-            .env("HOME", &self.cfg.home_dest)
-            .env("TMPDIR", "/tmp")
-            .env("AOS_WORKSPACE", &self.cfg.ws_dest)
-            .env("AOS_ORG_SHARED_RO", &self.cfg.ro_dest)
-            .env("AOS_ORG_AGENT_PUB", &self.cfg.pub_dest);
-
-        if self.bound_proxy_port > 0 {
-            let proxy_url = format!("http://127.0.0.1:{}", self.bound_proxy_port);
-            cmd.env("HTTP_PROXY", &proxy_url)
-                .env("HTTPS_PROXY", &proxy_url)
-                .env("http_proxy", &proxy_url)
-                .env("https_proxy", &proxy_url)
-                .env("NO_PROXY", "127.0.0.1,localhost")
-                .env("no_proxy", "127.0.0.1,localhost");
-        }
-
-        for (k, v) in env {
-            if is_scrubbed_guest_env_key(&k) {
-                continue;
-            }
+        cmd.args(&args).current_dir(&work_dir).env_clear();
+        for (k, v) in self.build_guest_env(env, None) {
             cmd.env(k, v);
         }
 
@@ -571,6 +630,287 @@ impl GuestRuntimeState {
     }
 }
 
+async fn write_json_line<W, T>(wr: &mut W, msg: &T) -> bool
+where
+    W: tokio::io::AsyncWrite + Unpin,
+    T: Serialize,
+{
+    let Ok(mut raw) = serde_json::to_vec(msg) else {
+        return false;
+    };
+    raw.push(b'\n');
+    if wr.write_all(&raw).await.is_err() {
+        return false;
+    }
+    wr.flush().await.is_ok()
+}
+
+#[cfg(unix)]
+#[allow(clippy::too_many_arguments)]
+async fn handle_exec_pty_session<R, W>(
+    reader: &mut BufReader<R>,
+    wr: &mut W,
+    state: &GuestRuntimeState,
+    auth_token: String,
+    command: String,
+    args: Vec<String>,
+    cwd: Option<String>,
+    env: BTreeMap<String, String>,
+    cols: u16,
+    rows: u16,
+) where
+    R: tokio::io::AsyncRead + Unpin,
+    W: tokio::io::AsyncWrite + Unpin,
+{
+    use std::io::{Read, Write};
+    use std::os::fd::{AsRawFd, FromRawFd};
+    use std::os::unix::process::CommandExt;
+
+    if !constant_time_eq(&auth_token, &state.cfg.auth_token) {
+        let _ = write_json_line(
+            wr,
+            &GuestRpcResponse::Error {
+                message: "unauthorized guest RPC token".to_string(),
+            },
+        )
+        .await;
+        return;
+    }
+    if let Err(err) = tokio::fs::create_dir_all(&state.cfg.home_dest).await {
+        let _ = write_json_line(
+            wr,
+            &GuestRpcResponse::Error {
+                message: format!("preparing guest home {}: {err}", state.cfg.home_dest.display()),
+            },
+        )
+        .await;
+        return;
+    }
+
+    let mut master_fd: libc::c_int = -1;
+    let mut slave_fd: libc::c_int = -1;
+    let mut winsize = libc::winsize {
+        ws_row: rows.max(1),
+        ws_col: cols.max(1),
+        ws_xpixel: 0,
+        ws_ypixel: 0,
+    };
+    if unsafe {
+        libc::openpty(
+            &mut master_fd,
+            &mut slave_fd,
+            std::ptr::null_mut(),
+            std::ptr::null_mut(),
+            &mut winsize,
+        )
+    } != 0
+    {
+        let err = std::io::Error::last_os_error();
+        let _ = write_json_line(
+            wr,
+            &GuestRpcResponse::Error {
+                message: format!("allocating guest PTY failed: {err}"),
+            },
+        )
+        .await;
+        return;
+    }
+
+    let master_file = unsafe { std::fs::File::from_raw_fd(master_fd) };
+    let slave_file = unsafe { std::fs::File::from_raw_fd(slave_fd) };
+    let Ok((master_reader_f, master_writer_f)) =
+        master_file.try_clone().and_then(|r| Ok((r, master_file.try_clone()?)))
+    else {
+        let _ = write_json_line(
+            wr,
+            &GuestRpcResponse::Error {
+                message: "cloning guest PTY master fd failed".to_string(),
+            },
+        )
+        .await;
+        return;
+    };
+    drop(master_file);
+
+    let Ok((stdin_f, stdout_f, stderr_f)) = slave_file
+        .try_clone()
+        .and_then(|i| Ok((i, slave_file.try_clone()?, slave_file.try_clone()?)))
+    else {
+        let _ = write_json_line(
+            wr,
+            &GuestRpcResponse::Error {
+                message: "cloning guest PTY slave fd failed".to_string(),
+            },
+        )
+        .await;
+        return;
+    };
+    drop(slave_file);
+
+    let work_dir = cwd
+        .map(PathBuf::from)
+        .unwrap_or_else(|| state.cfg.ws_dest.clone());
+    let mut cmd = std::process::Command::new(&command);
+    cmd.args(&args)
+        .current_dir(&work_dir)
+        .env_clear()
+        .stdin(Stdio::from(stdin_f))
+        .stdout(Stdio::from(stdout_f))
+        .stderr(Stdio::from(stderr_f));
+    for (k, v) in state.build_guest_env(env, Some("xterm-256color")) {
+        cmd.env(k, v);
+    }
+    unsafe {
+        cmd.pre_exec(|| {
+            if libc::setsid() == -1 {
+                return Err(std::io::Error::last_os_error());
+            }
+            if libc::ioctl(0, libc::TIOCSCTTY as _, 0) == -1 {
+                return Err(std::io::Error::last_os_error());
+            }
+            for sig in [
+                libc::SIGCHLD,
+                libc::SIGHUP,
+                libc::SIGINT,
+                libc::SIGQUIT,
+                libc::SIGTERM,
+                libc::SIGALRM,
+            ] {
+                libc::signal(sig, libc::SIG_DFL);
+            }
+            Ok(())
+        });
+    }
+
+    let mut child = match cmd.spawn() {
+        Ok(c) => c,
+        Err(err) => {
+            let _ = write_json_line(
+                wr,
+                &GuestRpcResponse::Error {
+                    message: format!("spawning PTY command '{command}': {err}"),
+                },
+            )
+            .await;
+            return;
+        }
+    };
+    drop(cmd);
+
+    let pid = child.id();
+    if pid > 0 {
+        state.active_pgids.lock().unwrap().insert(pid);
+    }
+    let _pgid_guard = ActivePgidGuard {
+        pgid: pid,
+        registry: state.active_pgids.clone(),
+    };
+
+    if !write_json_line(wr, &GuestRpcResponse::PtyStarted { pid }).await {
+        signal_pgid(pid, libc::SIGKILL);
+        let _ = tokio::task::spawn_blocking(move || child.wait()).await;
+        return;
+    }
+
+    let (tx, mut rx) = tokio::sync::mpsc::channel::<Vec<u8>>(64);
+    let _out_reader_task = tokio::task::spawn_blocking(move || {
+        let mut r = master_reader_f;
+        let mut buf = [0u8; 8192];
+        loop {
+            match r.read(&mut buf) {
+                Ok(0) | Err(_) => break,
+                Ok(n) => {
+                    if tx.blocking_send(buf[..n].to_vec()).is_err() {
+                        break;
+                    }
+                }
+            }
+        }
+    });
+
+    let mut wait_handle = tokio::task::spawn_blocking(move || child.wait());
+    let mut line = String::new();
+    loop {
+        tokio::select! {
+            chunk = rx.recv() => {
+                match chunk {
+                    Some(bytes) => {
+                        let frame = GuestPtyServerFrame::Output {
+                            data_b64: B64_STD.encode(&bytes),
+                        };
+                        if !write_json_line(wr, &frame).await {
+                            signal_pgid(pid, libc::SIGHUP);
+                            signal_pgid(pid, libc::SIGKILL);
+                            break;
+                        }
+                    }
+                    None => {
+                        let exit_code = match (&mut wait_handle).await {
+                            Ok(Ok(status)) => status.code().unwrap_or(1),
+                            _ => 1,
+                        };
+                        let _ = write_json_line(wr, &GuestPtyServerFrame::Exited { exit_code }).await;
+                        return;
+                    }
+                }
+            }
+            read_res = reader.read_line(&mut line) => {
+                match read_res {
+                    Ok(0) | Err(_) => {
+                        signal_pgid(pid, libc::SIGHUP);
+                        signal_pgid(pid, libc::SIGKILL);
+                        break;
+                    }
+                    Ok(_) => {
+                        let trimmed = line.trim();
+                        if !trimmed.is_empty() {
+                            match serde_json::from_str::<GuestPtyClientFrame>(trimmed) {
+                                Ok(GuestPtyClientFrame::Stdin { data_b64 }) => {
+                                    if let Ok(bytes) = B64_STD.decode(data_b64.as_bytes()) {
+                                        let _ = (&master_writer_f).write_all(&bytes);
+                                        let _ = (&master_writer_f).flush();
+                                    }
+                                }
+                                Ok(GuestPtyClientFrame::Resize { cols, rows }) => {
+                                    let ws = libc::winsize {
+                                        ws_row: rows.max(1),
+                                        ws_col: cols.max(1),
+                                        ws_xpixel: 0,
+                                        ws_ypixel: 0,
+                                    };
+                                    unsafe {
+                                        libc::ioctl(
+                                            master_writer_f.as_raw_fd(),
+                                            libc::TIOCSWINSZ as _,
+                                            &ws,
+                                        );
+                                    }
+                                }
+                                Ok(GuestPtyClientFrame::Signal { signal }) => {
+                                    signal_pgid(pid, signal);
+                                }
+                                Ok(GuestPtyClientFrame::Eof) => {}
+                                Err(err) => {
+                                    let _ = write_json_line(
+                                        wr,
+                                        &GuestPtyServerFrame::Error {
+                                            message: format!("malformed PTY client frame: {err}"),
+                                        },
+                                    )
+                                    .await;
+                                }
+                            }
+                        }
+                        line.clear();
+                    }
+                }
+            }
+        }
+    }
+    drop(master_writer_f);
+    let _ = wait_handle.await;
+}
+
 async fn handle_rpc_stream<S>(stream: S, state: GuestRuntimeState)
 where
     S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin,
@@ -590,36 +930,70 @@ where
             let err_resp = GuestRpcResponse::Error {
                 message: "RPC line exceeded 8 MiB limit".to_string(),
             };
-            if let Ok(raw) = serde_json::to_vec(&err_resp) {
-                let _ = wr.write_all(&raw).await;
-                let _ = wr.write_all(b"\n").await;
-                let _ = wr.flush().await;
-            }
+            let _ = write_json_line(&mut wr, &err_resp).await;
             break;
         }
         let trimmed = line.trim();
         if trimmed.is_empty() {
             continue;
         }
-        let (resp, should_shutdown) = match serde_json::from_str::<GuestRpcRequest>(trimmed) {
-            Ok(req) => state.handle_request(req).await,
-            Err(err) => (
-                GuestRpcResponse::Error {
-                    message: format!("malformed guest RPC JSON: {err}"),
-                },
-                false,
-            ),
-        };
-        if let Ok(mut encoded) = serde_json::to_vec(&resp) {
-            encoded.push(b'\n');
-            if wr.write_all(&encoded).await.is_err() {
+        match serde_json::from_str::<GuestRpcRequest>(trimmed) {
+            Ok(GuestRpcRequest::ExecPty {
+                auth_token,
+                command,
+                args,
+                cwd,
+                env,
+                cols,
+                rows,
+            }) => {
+                #[cfg(unix)]
+                {
+                    handle_exec_pty_session(
+                        &mut reader,
+                        &mut wr,
+                        &state,
+                        auth_token,
+                        command,
+                        args,
+                        cwd,
+                        env,
+                        cols,
+                        rows,
+                    )
+                    .await;
+                }
+                #[cfg(not(unix))]
+                {
+                    let _ = (auth_token, command, args, cwd, env, cols, rows);
+                    let _ = write_json_line(
+                        &mut wr,
+                        &GuestRpcResponse::Error {
+                            message: "ExecPty is only supported on Unix guests".to_string(),
+                        },
+                    )
+                    .await;
+                }
                 break;
             }
-            let _ = wr.flush().await;
-        }
-        if should_shutdown {
-            state.shutdown.notify_waiters();
-            break;
+            Ok(req) => {
+                let (resp, should_shutdown) = state.handle_request(req).await;
+                if !write_json_line(&mut wr, &resp).await {
+                    break;
+                }
+                if should_shutdown {
+                    state.shutdown.notify_waiters();
+                    break;
+                }
+            }
+            Err(err) => {
+                let resp = GuestRpcResponse::Error {
+                    message: format!("malformed guest RPC JSON: {err}"),
+                };
+                if !write_json_line(&mut wr, &resp).await {
+                    break;
+                }
+            }
         }
     }
 }
@@ -698,49 +1072,116 @@ pub async fn serve_guest_unix(
 }
 
 #[cfg(target_os = "linux")]
-pub fn bootstrap_linux_pid1(cfg: &GuestBootConfig) -> anyhow::Result<()> {
+fn mount_ignore_ebusy(
+    source: &str,
+    target: &Path,
+    fstype: &str,
+    flags: libc::c_ulong,
+) -> anyhow::Result<()> {
     use std::ffi::CString;
 
-    fn mount_ignore_ebusy(
-        source: &str,
-        target: &Path,
-        fstype: &str,
-        flags: libc::c_ulong,
-    ) -> anyhow::Result<()> {
-        std::fs::create_dir_all(target)
-            .with_context(|| format!("creating mountpoint {}", target.display()))?;
-        let c_src = CString::new(source)?;
-        let c_tgt = CString::new(target.to_string_lossy().as_bytes())?;
-        let c_fs = CString::new(fstype)?;
-        let rc = unsafe {
-            libc::mount(
-                c_src.as_ptr(),
-                c_tgt.as_ptr(),
-                c_fs.as_ptr(),
-                flags,
-                std::ptr::null(),
-            )
-        };
-        if rc != 0 {
-            let err = std::io::Error::last_os_error();
-            if err.raw_os_error() != Some(libc::EBUSY) {
-                anyhow::bail!(
-                    "mount({source} -> {}, {fstype}) failed: {err}",
-                    target.display()
-                );
+    std::fs::create_dir_all(target)
+        .with_context(|| format!("creating mountpoint {}", target.display()))?;
+    let c_src = CString::new(source)?;
+    let c_tgt = CString::new(target.to_string_lossy().as_bytes())?;
+    let c_fs = CString::new(fstype)?;
+    let rc = unsafe {
+        libc::mount(
+            c_src.as_ptr(),
+            c_tgt.as_ptr(),
+            c_fs.as_ptr(),
+            flags,
+            std::ptr::null(),
+        )
+    };
+    if rc != 0 {
+        let err = std::io::Error::last_os_error();
+        if err.raw_os_error() != Some(libc::EBUSY) {
+            anyhow::bail!(
+                "mount({source} -> {}, {fstype}) failed: {err}",
+                target.display()
+            );
+        }
+    }
+    Ok(())
+}
+
+#[cfg(target_os = "linux")]
+fn load_kernel_modules_early() {
+    use std::os::fd::AsRawFd;
+
+    let mod_dir = Path::new("/lib/aegis-modules");
+    if let Ok(entries) = std::fs::read_dir(mod_dir) {
+        let mut ko_paths: Vec<PathBuf> = entries
+            .flatten()
+            .map(|e| e.path())
+            .filter(|p| p.extension().and_then(|s| s.to_str()) == Some("ko"))
+            .collect();
+        ko_paths.sort();
+        for path in ko_paths {
+            if let Ok(file) = std::fs::File::open(&path) {
+                let rc = unsafe {
+                    libc::syscall(
+                        libc::SYS_finit_module,
+                        file.as_raw_fd() as libc::c_long,
+                        b"\0".as_ptr().cast::<libc::c_char>(),
+                        0 as libc::c_int,
+                    )
+                };
+                if rc != 0 {
+                    let err = std::io::Error::last_os_error();
+                    if !matches!(
+                        err.raw_os_error(),
+                        Some(libc::EEXIST | libc::EBUSY | libc::EINVAL | libc::ENODEV)
+                    ) {
+                        eprintln!(
+                            "aegis-guest-init: finit_module {} warning: {err}",
+                            path.display()
+                        );
+                    }
+                }
             }
         }
-        Ok(())
     }
 
+    if Path::new("/lib/modules").is_dir() && Path::new("/sbin/modprobe").is_file() {
+        for m in [
+            "virtio_pci",
+            "virtio_mmio",
+            "virtio_rng",
+            "fuse",
+            "virtiofs",
+            "vsock",
+            "vmw_vsock_virtio_transport",
+        ] {
+            let _ = std::process::Command::new("/sbin/modprobe")
+                .args(["-q", m])
+                .status();
+        }
+    }
+}
+
+/// Performs early PID-1 Linux init before `/proc/cmdline` or `virtio-fs` mounts:
+/// mounts virtual filesystems (`/proc`, `/sys`, `/dev`, `/dev/pts`, `/dev/shm`, `/tmp`, `/run`),
+/// loads bundled virtio/vsock/virtiofs kernel modules, and brings up `lo`.
+#[cfg(target_os = "linux")]
+pub fn bootstrap_linux_early() -> anyhow::Result<()> {
     mount_ignore_ebusy("proc", Path::new("/proc"), "proc", 0)?;
     mount_ignore_ebusy("sysfs", Path::new("/sys"), "sysfs", 0)?;
     mount_ignore_ebusy("devtmpfs", Path::new("/dev"), "devtmpfs", 0)?;
+    mount_ignore_ebusy("devpts", Path::new("/dev/pts"), "devpts", 0)?;
+    mount_ignore_ebusy("tmpfs", Path::new("/dev/shm"), "tmpfs", 0)?;
     mount_ignore_ebusy("tmpfs", Path::new("/tmp"), "tmpfs", 0)?;
     mount_ignore_ebusy("tmpfs", Path::new("/run"), "tmpfs", 0)?;
 
+    load_kernel_modules_early();
     bring_up_loopback()?;
+    Ok(())
+}
 
+/// Mounts the 4 host `virtio-fs` shares into the guest filesystem tree.
+#[cfg(target_os = "linux")]
+pub fn mount_linux_virtiofs_shares(cfg: &GuestBootConfig) -> anyhow::Result<()> {
     let ro_flags = libc::MS_RDONLY | libc::MS_NODEV | libc::MS_NOSUID;
     mount_ignore_ebusy("aegis_ws", &cfg.ws_dest, "virtiofs", 0)?;
     mount_ignore_ebusy("aegis_home", &cfg.home_dest, "virtiofs", 0)?;
@@ -749,7 +1190,13 @@ pub fn bootstrap_linux_pid1(cfg: &GuestBootConfig) -> anyhow::Result<()> {
     if let Some(ref host_ro) = cfg.host_ro_dest {
         mount_ignore_ebusy("aegis_host_ro", host_ro, "virtiofs", ro_flags)?;
     }
+    Ok(())
+}
 
+#[cfg(target_os = "linux")]
+pub fn bootstrap_linux_pid1(cfg: &GuestBootConfig) -> anyhow::Result<()> {
+    bootstrap_linux_early()?;
+    mount_linux_virtiofs_shares(cfg)?;
     Ok(())
 }
 
@@ -796,9 +1243,9 @@ mod vsock_io {
 
     impl VsockStream {
         pub fn from_nonblocking_fd(fd: OwnedFd) -> io::Result<Self> {
-            Ok(Self {
-                inner: AsyncFd::new(fd)?,
-            })
+            #[allow(deprecated)]
+            let inner = AsyncFd::new(fd)?;
+            Ok(Self { inner })
         }
 
         pub async fn connect_host(port: u32) -> io::Result<Self> {
@@ -966,9 +1413,9 @@ mod vsock_io {
             if l_rc != 0 {
                 return Err(io::Error::last_os_error());
             }
-            Ok(Self {
-                inner: AsyncFd::new(fd)?,
-            })
+            #[allow(deprecated)]
+            let inner = AsyncFd::new(fd)?;
+            Ok(Self { inner })
         }
 
         pub async fn accept(&self) -> io::Result<VsockStream> {
@@ -1249,5 +1696,136 @@ mod tests {
         assert!(matches!(sd, GuestRpcResponse::Ack { ok: true, .. }));
         let _ = tokio::time::timeout(Duration::from_secs(2), guest_handle).await;
         egress_srv.abort();
+    }
+
+    #[tokio::test]
+    async fn unix_guest_pty_interactive_echo_resize_and_exit() {
+        let tmp = tempfile::tempdir().unwrap();
+        let ws = tmp.path().join("ws");
+        let home = tmp.path().join("home");
+        let ro = tmp.path().join("ro");
+        let pub_dir = tmp.path().join("pub");
+        std::fs::create_dir_all(&ws).unwrap();
+        std::fs::create_dir_all(&home).unwrap();
+        std::fs::create_dir_all(&ro).unwrap();
+        std::fs::create_dir_all(&pub_dir).unwrap();
+
+        let exec_sock = tmp.path().join("guest_pty.sock");
+        let cfg = GuestBootConfig {
+            ws_dest: ws.clone(),
+            home_dest: home,
+            ro_dest: ro,
+            pub_dest: pub_dir,
+            host_ro_dest: None,
+            auth_token: "pty-secret".to_string(),
+            bridge_token: None,
+            proxy_port: 0,
+        };
+        let (_proxy_addr, guest_handle) =
+            serve_guest_unix(&exec_sock, None, "127.0.0.1:0", cfg)
+                .await
+                .unwrap();
+
+        let stream = UnixStream::connect(&exec_sock).await.unwrap();
+        let (rd, mut wr) = tokio::io::split(stream);
+        let mut reader = BufReader::new(rd);
+
+        let py_script = concat!(
+            "import sys, fcntl, termios, struct; ",
+            "sys.stdout.write('READY\\n'); sys.stdout.flush(); ",
+            "line = sys.stdin.readline().strip(); ",
+            "s = fcntl.ioctl(sys.stdout.fileno(), termios.TIOCGWINSZ, b'\\x00'*8); ",
+            "r, c, _, _ = struct.unpack('HHHH', s); ",
+            "print(f'ECHO={line}|SZ={r}x{c}', flush=True)"
+        );
+        let start_req = GuestRpcRequest::ExecPty {
+            auth_token: "pty-secret".to_string(),
+            command: "python3".to_string(),
+            args: vec!["-u".to_string(), "-c".to_string(), py_script.to_string()],
+            cwd: Some(ws.display().to_string()),
+            env: BTreeMap::new(),
+            cols: 80,
+            rows: 24,
+        };
+        let mut start_line = serde_json::to_vec(&start_req).unwrap();
+        start_line.push(b'\n');
+        wr.write_all(&start_line).await.unwrap();
+        wr.flush().await.unwrap();
+
+        let mut resp_line = String::new();
+        reader.read_line(&mut resp_line).await.unwrap();
+        let started: GuestRpcResponse = serde_json::from_str(resp_line.trim()).unwrap();
+        assert!(matches!(started, GuestRpcResponse::PtyStarted { pid } if pid > 0));
+
+        // Wait until READY marker appears on PTY output so python3 has started and waits on stdin.
+        let mut collected = String::new();
+        let mut exited_code = None;
+        while !collected.contains("READY") {
+            resp_line.clear();
+            let n = reader.read_line(&mut resp_line).await.unwrap();
+            assert!(n > 0);
+            match serde_json::from_str::<GuestPtyServerFrame>(resp_line.trim()).unwrap() {
+                GuestPtyServerFrame::Output { data_b64 } => {
+                    let bytes = B64_STD.decode(data_b64).unwrap();
+                    collected.push_str(&String::from_utf8_lossy(&bytes));
+                }
+                GuestPtyServerFrame::Exited { exit_code } => {
+                    exited_code = Some(exit_code);
+                    break;
+                }
+                GuestPtyServerFrame::Error { message } => panic!("unexpected PTY error: {message}"),
+            }
+        }
+        assert!(exited_code.is_none(), "child exited before resize: {collected}");
+
+        // Send Resize (132x43) and Stdin line.
+        let resize = GuestPtyClientFrame::Resize {
+            cols: 132,
+            rows: 43,
+        };
+        let mut f1 = serde_json::to_vec(&resize).unwrap();
+        f1.push(b'\n');
+        wr.write_all(&f1).await.unwrap();
+        let stdin_frame = GuestPtyClientFrame::Stdin {
+            data_b64: B64_STD.encode(b"ping-pty\n"),
+        };
+        let mut f2 = serde_json::to_vec(&stdin_frame).unwrap();
+        f2.push(b'\n');
+        wr.write_all(&f2).await.unwrap();
+        wr.flush().await.unwrap();
+
+        loop {
+            resp_line.clear();
+            let n = reader.read_line(&mut resp_line).await.unwrap();
+            if n == 0 {
+                break;
+            }
+            match serde_json::from_str::<GuestPtyServerFrame>(resp_line.trim()).unwrap() {
+                GuestPtyServerFrame::Output { data_b64 } => {
+                    let bytes = B64_STD.decode(data_b64).unwrap();
+                    collected.push_str(&String::from_utf8_lossy(&bytes));
+                }
+                GuestPtyServerFrame::Exited { exit_code } => {
+                    exited_code = Some(exit_code);
+                    break;
+                }
+                GuestPtyServerFrame::Error { message } => panic!("unexpected PTY error: {message}"),
+            }
+        }
+
+        assert_eq!(exited_code, Some(0));
+        assert!(
+            collected.contains("ECHO=ping-pty|SZ=43x132"),
+            "unexpected PTY transcript: {collected:?}"
+        );
+
+        let _ = roundtrip_rpc(
+            &exec_sock,
+            &GuestRpcRequest::Shutdown {
+                auth_token: "pty-secret".to_string(),
+            },
+        )
+        .await;
+        let _ = tokio::time::timeout(Duration::from_secs(2), guest_handle).await;
     }
 }

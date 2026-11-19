@@ -19,7 +19,8 @@ use aos_core::{
     ExecOutput, ExecSpec, IsolationTier, SandboxConfig, SandboxDriver, SandboxInstance,
 };
 use aos_guest_init::{
-    GuestBootConfig, GuestRpcRequest, GuestRpcResponse, DEFAULT_GUEST_PROXY_PORT,
+    GuestBootConfig, GuestPtyClientFrame, GuestPtyServerFrame, GuestRpcRequest, GuestRpcResponse,
+    DEFAULT_GUEST_PROXY_PORT,
 };
 use async_trait::async_trait;
 use base64::{engine::general_purpose::STANDARD as B64_STD, Engine as _};
@@ -32,10 +33,13 @@ use std::process::Stdio;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Mutex;
 use std::time::{Duration, Instant};
+use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::process::{Child, Command};
 use uuid::Uuid;
 use vfkit::{build_vfkit_args, vfkit_set_vm_state, VfkitFlavor, VfkitLaunchSpec, VfkitMountSpec};
-use vsock_proto::{egress_host_socket_path, send_guest_rpc, VsockTransportMode};
+use vsock_proto::{
+    egress_host_socket_path, open_guest_control_stream, send_guest_rpc, VsockTransportMode,
+};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -472,15 +476,53 @@ impl MicroVmSandboxInstance {
             bridge_token: bridge_token.clone(),
             proxy_port: DEFAULT_GUEST_PROXY_PORT,
         };
-        let cmdline = format!("console=hvc0 quiet {}", boot_cfg.to_kernel_cmdline_args());
+        let cmdline = format!(
+            "console=hvc0 console=ttyS0 rdinit=/init quiet {}",
+            boot_cfg.to_kernel_cmdline_args()
+        );
         let cpus = (config.limits.cpu_millicores / 1000).max(1);
         let memory_mb = config.limits.memory_mb.max(512);
         let serial_log = config.agent_home_dir.join("vm-serial.log");
+        let vmm_stderr_log = config.agent_home_dir.join("vmm-stderr.log");
 
-        let (transport, rest_or_api_sock, vmm_child, aux_children) = match backend {
-            VmmBackendKind::Vfkit | VmmBackendKind::Krunkit => {
-                let exec_sock = sock_dir.join("exec.s");
-                let egress_sock = sock_dir.join("egress.s");
+        let transport = match backend {
+            VmmBackendKind::Vfkit | VmmBackendKind::Krunkit => VsockTransportMode::DirectUnix {
+                exec_sock: sock_dir.join("exec.s"),
+                egress_sock: sock_dir.join("egress.s"),
+            },
+            VmmBackendKind::CloudHypervisor => VsockTransportMode::CloudHvMux {
+                mux_sock: sock_dir.join("vsock.s"),
+            },
+            VmmBackendKind::MockUnix => unreachable!("detect_trusted_vmm never returns MockUnix"),
+        };
+
+        // Bind host egress Unix bridge BEFORE starting VMM so guest traffic hits a ready socket.
+        let egress_bridge =
+            if let (Some(proxy), Some(btok)) = (&config.egress_proxy_addr, &bridge_token) {
+                let esock = egress_host_socket_path(&transport);
+                let h =
+                    bridge::spawn_host_bridge(&esock, bridge::proxy_host_port(proxy), btok.clone())?;
+                Some(EgressBridge {
+                    handle: h,
+                    token: btok.clone(),
+                    sock: esock,
+                    temp_dir: None,
+                })
+            } else {
+                None
+            };
+
+        let make_vmm_stderr = || -> Stdio {
+            std::fs::File::create(&vmm_stderr_log)
+                .map(Stdio::from)
+                .unwrap_or_else(|_| Stdio::null())
+        };
+
+        let (rest_or_api_sock, vmm_child, aux_children) = match &transport {
+            VsockTransportMode::DirectUnix {
+                exec_sock,
+                egress_sock,
+            } => {
                 let rest_sock = sock_dir.join("rest.s");
                 let flavor = if backend == VmmBackendKind::Krunkit {
                     VfkitFlavor::Krunkit
@@ -521,22 +563,14 @@ impl MicroVmSandboxInstance {
                 cmd.args(&args)
                     .stdin(Stdio::null())
                     .stdout(Stdio::null())
-                    .stderr(Stdio::null())
+                    .stderr(make_vmm_stderr())
                     .kill_on_drop(true);
                 let child = cmd
                     .spawn()
                     .with_context(|| format!("spawning VMM {}", vmm_path.display()))?;
-                (
-                    VsockTransportMode::DirectUnix {
-                        exec_sock,
-                        egress_sock,
-                    },
-                    Some(rest_sock),
-                    child,
-                    Vec::new(),
-                )
+                (Some(rest_sock), child, Vec::new())
             }
-            VmmBackendKind::CloudHypervisor => {
+            VsockTransportMode::CloudHvMux { mux_sock } => {
                 let virtiofsd = probe.virtiofsd_path.expect("checked above");
                 let mut aux = Vec::new();
                 let mut fs_mounts = Vec::new();
@@ -574,7 +608,6 @@ impl MicroVmSandboxInstance {
                 }
 
                 let api_sock = sock_dir.join("api.s");
-                let vsock_mux_sock = sock_dir.join("vsock.s");
                 let ch_args = build_cloud_hypervisor_args(&CloudHvLaunchSpec {
                     cpus,
                     memory_mb,
@@ -583,7 +616,7 @@ impl MicroVmSandboxInstance {
                     cmdline,
                     api_sock: api_sock.clone(),
                     serial_log: serial_log.clone(),
-                    vsock_mux_sock: vsock_mux_sock.clone(),
+                    vsock_mux_sock: mux_sock.clone(),
                     vsock_cid: 3,
                     fs_mounts,
                 });
@@ -591,34 +624,13 @@ impl MicroVmSandboxInstance {
                 cmd.args(&ch_args)
                     .stdin(Stdio::null())
                     .stdout(Stdio::null())
-                    .stderr(Stdio::null())
+                    .stderr(make_vmm_stderr())
                     .kill_on_drop(true);
                 let child = cmd
                     .spawn()
                     .with_context(|| format!("spawning cloud-hypervisor {}", vmm_path.display()))?;
-                (
-                    VsockTransportMode::CloudHvMux {
-                        mux_sock: vsock_mux_sock,
-                    },
-                    Some(api_sock),
-                    child,
-                    aux,
-                )
+                (Some(api_sock), child, aux)
             }
-            VmmBackendKind::MockUnix => unreachable!("detect_trusted_vmm never returns MockUnix"),
-        };
-
-        let egress_bridge = if let (Some(proxy), Some(btok)) = (&config.egress_proxy_addr, &bridge_token) {
-            let esock = egress_host_socket_path(&transport);
-            let h = bridge::spawn_host_bridge(&esock, bridge::proxy_host_port(proxy), btok.clone())?;
-            Some(EgressBridge {
-                handle: h,
-                token: btok.clone(),
-                sock: esock,
-                temp_dir: None,
-            })
-        } else {
-            None
         };
 
         let mut instance = Self {
@@ -638,6 +650,28 @@ impl MicroVmSandboxInstance {
             paused: AtomicBool::new(false),
         };
 
+        let read_vmm_logs = || -> String {
+            let s_tail: String = std::fs::read_to_string(&serial_log)
+                .unwrap_or_default()
+                .chars()
+                .rev()
+                .take(1200)
+                .collect::<Vec<_>>()
+                .into_iter()
+                .rev()
+                .collect();
+            let e_tail: String = std::fs::read_to_string(&vmm_stderr_log)
+                .unwrap_or_default()
+                .chars()
+                .rev()
+                .take(1200)
+                .collect::<Vec<_>>()
+                .into_iter()
+                .rev()
+                .collect();
+            format!("--- serial ---\n{s_tail}\n--- vmm stderr ---\n{e_tail}")
+        };
+
         // Poll guest Ping until init responds or VMM exits prematurely.
         let deadline = Instant::now() + Duration::from_secs(10);
         let mut ready_pong = None;
@@ -647,11 +681,10 @@ impl MicroVmSandboxInstance {
                 guard.as_mut().and_then(|c| c.try_wait().ok().flatten())
             };
             if let Some(exit) = early_exit {
-                let tail = std::fs::read_to_string(&serial_log).unwrap_or_default();
+                let logs = read_vmm_logs();
                 let _ = instance.destroy().await;
                 bail!(
-                    "MicroVM VMM exited prematurely ({exit}) before guest init answered Ping:\n{}",
-                    tail.chars().rev().take(1200).collect::<String>().chars().rev().collect::<String>()
+                    "MicroVM VMM exited prematurely ({exit}) before guest init answered Ping:\n{logs}"
                 );
             }
             if let Ok(GuestRpcResponse::Pong { proxy_port, .. }) = send_guest_rpc(
@@ -669,10 +702,10 @@ impl MicroVmSandboxInstance {
             tokio::time::sleep(Duration::from_millis(30)).await;
         }
         let Some(bound_port) = ready_pong else {
-            let tail = std::fs::read_to_string(&serial_log).unwrap_or_default();
+            let logs = read_vmm_logs();
             let _ = instance.destroy().await;
             bail!(
-                "MicroVM timed out waiting for `aegis-guest-init` Ping over virtio-vsock (10s).\nSerial tail:\n{tail}"
+                "MicroVM timed out waiting for `aegis-guest-init` Ping over virtio-vsock (10s).\n{logs}"
             );
         };
         instance.guest_proxy_port = bound_port;
@@ -710,6 +743,97 @@ impl MicroVmSandboxInstance {
             out.insert(k.clone(), rewritten);
         }
         out
+    }
+
+    /// Starts an interactive PTY session inside the MicroVM over `virtio-vsock`.
+    pub async fn start_pty(
+        &self,
+        command: String,
+        args: Vec<String>,
+        cwd: Option<PathBuf>,
+        env: std::collections::HashMap<String, String>,
+        cols: u16,
+        rows: u16,
+    ) -> anyhow::Result<(u32, MicroVmPtyReader, MicroVmPtyWriter)> {
+        if self.paused.load(Ordering::SeqCst) {
+            bail!(
+                "MicroVM '{}' is currently paused (Scale-to-Zero); call resume() first",
+                self.instance_id
+            );
+        }
+        let mapped_cwd = self.map_cwd_for_guest(cwd.as_deref());
+        let mapped_env = self.rewrite_env_for_guest(&env);
+        let stream = open_guest_control_stream(&self.transport).await?;
+        let (rd, mut wr) = tokio::io::split(stream);
+        let req = GuestRpcRequest::ExecPty {
+            auth_token: self.guest_auth_token.clone(),
+            command,
+            args,
+            cwd: mapped_cwd,
+            env: mapped_env,
+            cols: cols.max(1),
+            rows: rows.max(1),
+        };
+        let mut payload = serde_json::to_vec(&req)?;
+        payload.push(b'\n');
+        wr.write_all(&payload).await?;
+        wr.flush().await?;
+
+        let mut reader = BufReader::new(rd);
+        let mut line = String::new();
+        let n = tokio::time::timeout(Duration::from_secs(10), reader.read_line(&mut line))
+            .await
+            .context("MicroVM timed out waiting for PTY session startup")??;
+        if n == 0 {
+            bail!("MicroVM control stream closed before PTY session started");
+        }
+        let resp: GuestRpcResponse = serde_json::from_str(line.trim())
+            .with_context(|| format!("parsing guest PTY startup response: '{}'", line.trim()))?;
+        match resp {
+            GuestRpcResponse::PtyStarted { pid } => {
+                Ok((pid, MicroVmPtyReader { rd: reader }, MicroVmPtyWriter { wr }))
+            }
+            GuestRpcResponse::Error { message } => bail!("MicroVM PTY error: {message}"),
+            other => bail!("unexpected MicroVM PTY startup response: {other:?}"),
+        }
+    }
+}
+
+pub struct MicroVmPtyReader {
+    rd: BufReader<tokio::io::ReadHalf<tokio::net::UnixStream>>,
+}
+
+impl MicroVmPtyReader {
+    pub async fn next_event(&mut self) -> anyhow::Result<Option<GuestPtyServerFrame>> {
+        let mut line = String::new();
+        loop {
+            line.clear();
+            let n = self.rd.read_line(&mut line).await?;
+            if n == 0 {
+                return Ok(None);
+            }
+            let trimmed = line.trim();
+            if trimmed.is_empty() {
+                continue;
+            }
+            let frame = serde_json::from_str::<GuestPtyServerFrame>(trimmed)
+                .with_context(|| format!("parsing guest PTY frame: '{trimmed}'"))?;
+            return Ok(Some(frame));
+        }
+    }
+}
+
+pub struct MicroVmPtyWriter {
+    wr: tokio::io::WriteHalf<tokio::net::UnixStream>,
+}
+
+impl MicroVmPtyWriter {
+    pub async fn send(&mut self, frame: &GuestPtyClientFrame) -> anyhow::Result<()> {
+        let mut encoded = serde_json::to_vec(frame)?;
+        encoded.push(b'\n');
+        self.wr.write_all(&encoded).await?;
+        self.wr.flush().await?;
+        Ok(())
     }
 }
 
@@ -991,8 +1115,8 @@ mod tests {
         let joined_v = v_args.join(" ");
         assert!(!joined_v.contains("virtio-net"), "{joined_v}");
         assert!(joined_v.contains("virtio-fs,sharedDir=/tmp/ws,mountTag=aegis_ws"));
-        assert!(joined_v.contains("virtio-vsock,port=10700,socketURL=/tmp/exec.s,listen"));
-        assert!(joined_v.contains("virtio-vsock,port=18080,socketURL=/tmp/egress.s"));
+        assert!(joined_v.contains("virtio-vsock,port=10700,socketURL=/tmp/exec.s,connect"));
+        assert!(joined_v.contains("virtio-vsock,port=18080,socketURL=/tmp/egress.s,listen"));
         assert!(joined_v.contains("--restful-uri unix:///tmp/rest.s"));
 
         let fs_args = build_virtiofsd_args(Path::new("/tmp/fs.s"), Path::new("/tmp/ws"));
@@ -1271,5 +1395,157 @@ mod tests {
         ));
         let _ = mux_srv.await;
         proxy_srv.abort();
+    }
+
+    #[tokio::test]
+    async fn mock_microvm_pty_roundtrip_resize_and_l7_env_rewrite() {
+        let tmp = tempfile::tempdir().unwrap();
+        let ws = tmp.path().join("ws");
+        let home = tmp.path().join("home");
+        let ro = tmp.path().join("ro");
+        let pub_dir = tmp.path().join("pub");
+        std::fs::create_dir_all(&ws).unwrap();
+        std::fs::create_dir_all(&home).unwrap();
+        std::fs::create_dir_all(&ro).unwrap();
+        std::fs::create_dir_all(&pub_dir).unwrap();
+
+        let sock_dir = tmp.path().join("pty_socks");
+        std::fs::create_dir_all(&sock_dir).unwrap();
+        let exec_sock = sock_dir.join("exec.s");
+        let egress_sock = sock_dir.join("egress.s");
+        let auth_token = bridge::new_token();
+        let bridge_token = bridge::new_token();
+
+        let mock_proxy = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let mock_proxy_addr = mock_proxy.local_addr().unwrap();
+        let mock_srv = tokio::spawn(async move {
+            while let Ok((mut s, _)) = mock_proxy.accept().await {
+                tokio::spawn(async move {
+                    let mut buf = [0u8; 256];
+                    let _ = s.read(&mut buf).await;
+                    let _ = s.write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nOK").await;
+                });
+            }
+        });
+
+        let boot_cfg = GuestBootConfig {
+            ws_dest: ws.clone(),
+            home_dest: home.clone(),
+            ro_dest: ro.clone(),
+            pub_dest: pub_dir.clone(),
+            host_ro_dest: None,
+            auth_token: auth_token.clone(),
+            bridge_token: Some(bridge_token.clone()),
+            proxy_port: 0,
+        };
+        let (guest_proxy_addr, guest_handle) = aos_guest_init::serve_guest_unix(
+            &exec_sock,
+            Some(egress_sock.clone()),
+            "127.0.0.1:0",
+            boot_cfg,
+        )
+        .await
+        .unwrap();
+
+        let sbx = MicroVmSandboxInstance::connect_mock_unix(
+            SandboxConfig {
+                identity: AgentIdentity::new("org1", "vm-pty", "Lead"),
+                tier: IsolationTier::MicroVm,
+                limits: ResourceLimits::default(),
+                workspace_dir: ws.clone(),
+                agent_home_dir: home,
+                org_shared_ro_dir: ro,
+                org_agent_pub_dir: pub_dir,
+                egress_proxy_addr: Some(mock_proxy_addr.to_string()),
+                host_source_dir: Some(ws.clone()),
+                tighten_home_read: true,
+                allowed_loopback_ports: Vec::new(),
+                isolate_loopback_only: true,
+            },
+            VsockTransportMode::DirectUnix {
+                exec_sock,
+                egress_sock,
+            },
+            auth_token,
+            Some(bridge_token),
+            Some(guest_handle),
+            None,
+        )
+        .await
+        .unwrap();
+
+        let mut env = HashMap::new();
+        env.insert(
+            "OPENAI_BASE_URL".to_string(),
+            format!("http://{mock_proxy_addr}/__aegis/base/openai"),
+        );
+        let py_cmd = concat!(
+            "import os, sys, fcntl, termios, struct; ",
+            "print('URL=' + os.environ['OPENAI_BASE_URL'], flush=True); ",
+            "ln = sys.stdin.readline().strip(); ",
+            "r, c, _, _ = struct.unpack('HHHH', fcntl.ioctl(sys.stdout.fileno(), termios.TIOCGWINSZ, b'\\x00'*8)); ",
+            "print(f'LINE={ln}|W={r}x{c}', flush=True)"
+        );
+        let (pid, mut reader, mut writer) = sbx
+            .start_pty(
+                "python3".to_string(),
+                vec!["-u".to_string(), "-c".to_string(), py_cmd.to_string()],
+                Some(ws),
+                env,
+                80,
+                24,
+            )
+            .await
+            .unwrap();
+        assert!(pid > 0);
+
+        let mut output = String::new();
+        while !output.contains("URL=") {
+            match reader.next_event().await.unwrap().unwrap() {
+                GuestPtyServerFrame::Output { data_b64 } => {
+                    let bytes = B64_STD.decode(data_b64).unwrap();
+                    output.push_str(&String::from_utf8_lossy(&bytes));
+                }
+                other => panic!("expected URL output before prompt exit, got {other:?}"),
+            }
+        }
+        assert!(
+            output.contains(&format!("http://127.0.0.1:{}/__aegis/base/openai", guest_proxy_addr.port())),
+            "expected guest proxy URL rewrite, got: {output}"
+        );
+
+        writer
+            .send(&GuestPtyClientFrame::Resize {
+                cols: 120,
+                rows: 40,
+            })
+            .await
+            .unwrap();
+        writer
+            .send(&GuestPtyClientFrame::Stdin {
+                data_b64: B64_STD.encode(b"hello-pty\n"),
+            })
+            .await
+            .unwrap();
+
+        let mut exit_code = None;
+        while let Some(ev) = reader.next_event().await.unwrap() {
+            match ev {
+                GuestPtyServerFrame::Output { data_b64 } => {
+                    let bytes = B64_STD.decode(data_b64).unwrap();
+                    output.push_str(&String::from_utf8_lossy(&bytes));
+                }
+                GuestPtyServerFrame::Exited { exit_code: c } => {
+                    exit_code = Some(c);
+                    break;
+                }
+                GuestPtyServerFrame::Error { message } => panic!("PTY frame error: {message}"),
+            }
+        }
+        assert_eq!(exit_code, Some(0));
+        assert!(output.contains("LINE=hello-pty|W=40x120"), "{output}");
+
+        sbx.destroy().await.unwrap();
+        mock_srv.abort();
     }
 }

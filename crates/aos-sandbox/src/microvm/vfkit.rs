@@ -64,15 +64,17 @@ pub fn build_vfkit_args(spec: &VfkitLaunchSpec) -> Vec<String> {
         ));
     }
 
+    // Port 10700: guest `aos-guest-init` listens on AF_VSOCK; host connects via `exec.s` (`connect`).
     args.push("--device".to_string());
     args.push(format!(
-        "virtio-vsock,port={GUEST_CONTROL_VSOCK_PORT},socketURL={},listen",
+        "virtio-vsock,port={GUEST_CONTROL_VSOCK_PORT},socketURL={},connect",
         spec.exec_vsock_sock.display()
     ));
 
+    // Port 18080: host `spawn_host_bridge` listens on `egress.s`; guest connects out (`listen`).
     args.push("--device".to_string());
     args.push(format!(
-        "virtio-vsock,port={GUEST_EGRESS_VSOCK_PORT},socketURL={}",
+        "virtio-vsock,port={GUEST_EGRESS_VSOCK_PORT},socketURL={},listen",
         spec.egress_vsock_sock.display()
     ));
 

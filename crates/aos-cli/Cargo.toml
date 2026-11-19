@@ -33,6 +33,7 @@ tracing.workspace = true
 tracing-subscriber.workspace = true
 tempfile.workspace = true
 libc.workspace = true
+base64.workspace = true
 sha2.workspace = true
 hex.workspace = true
 
