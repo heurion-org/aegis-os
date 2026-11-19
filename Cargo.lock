@@ -96,7 +96,7 @@ checksum = "330a5ed07fa54e4702c9d6c4174f74427fc0ef6e214bbd677ae50a5099946470"
 
 [[package]]
 name = "aos-cli"
-version = "0.5.0"
+version = "0.6.0"
 dependencies = [
  "anyhow",
  "aos-core",
@@ -128,7 +128,7 @@ dependencies = [
 
 [[package]]
 name = "aos-core"
-version = "0.5.0"
+version = "0.6.0"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -144,7 +144,7 @@ dependencies = [
 
 [[package]]
 name = "aos-egress"
-version = "0.5.0"
+version = "0.6.0"
 dependencies = [
  "anyhow",
  "aos-core",
@@ -163,7 +163,7 @@ dependencies = [
 
 [[package]]
 name = "aos-ipc"
-version = "0.5.0"
+version = "0.6.0"
 dependencies = [
  "anyhow",
  "aos-core",
@@ -179,7 +179,7 @@ dependencies = [
 
 [[package]]
 name = "aos-mcp-gateway"
-version = "0.5.0"
+version = "0.6.0"
 dependencies = [
  "anyhow",
  "aos-core",
@@ -210,7 +210,7 @@ dependencies = [
 
 [[package]]
 name = "aos-memory"
-version = "0.5.0"
+version = "0.6.0"
 dependencies = [
  "aos-core",
  "serde",
@@ -220,7 +220,7 @@ dependencies = [
 
 [[package]]
 name = "aos-memory-gateway"
-version = "0.5.0"
+version = "0.6.0"
 dependencies = [
  "anyhow",
  "aos-core",
@@ -239,7 +239,7 @@ dependencies = [
 
 [[package]]
 name = "aos-memory-server"
-version = "0.5.0"
+version = "0.6.0"
 dependencies = [
  "anyhow",
  "aos-core",
@@ -266,7 +266,7 @@ dependencies = [
 
 [[package]]
 name = "aos-memory-store"
-version = "0.5.0"
+version = "0.6.0"
 dependencies = [
  "anyhow",
  "aos-memory",
@@ -280,7 +280,7 @@ dependencies = [
 
 [[package]]
 name = "aos-policy"
-version = "0.5.0"
+version = "0.6.0"
 dependencies = [
  "anyhow",
  "aos-core",
@@ -294,7 +294,7 @@ dependencies = [
 
 [[package]]
 name = "aos-recorder"
-version = "0.5.0"
+version = "0.6.0"
 dependencies = [
  "anyhow",
  "aos-core",
@@ -308,7 +308,7 @@ dependencies = [
 
 [[package]]
 name = "aos-sandbox"
-version = "0.5.0"
+version = "0.6.0"
 dependencies = [
  "anyhow",
  "aos-core",
@@ -324,7 +324,7 @@ dependencies = [
 
 [[package]]
 name = "aos-vfs"
-version = "0.5.0"
+version = "0.6.0"
 dependencies = [
  "anyhow",
  "aos-core",
