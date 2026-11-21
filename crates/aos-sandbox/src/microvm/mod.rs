@@ -712,6 +712,12 @@ impl MicroVmSandboxInstance {
         Ok(instance)
     }
 
+    /// Returns the guest loopback port (`127.0.0.1:<port>`) bound by `aegis-guest-init`
+    /// and bridged over `AF_VSOCK` to the host `AegisEgressGateway`.
+    pub fn guest_proxy_port(&self) -> u16 {
+        self.guest_proxy_port
+    }
+
     fn map_cwd_for_guest(&self, cwd: Option<&Path>) -> Option<String> {
         let c = cwd?;
         if let Ok(rel) = c.strip_prefix(&self.config.workspace_dir) {

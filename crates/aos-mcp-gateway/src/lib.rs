@@ -9996,6 +9996,20 @@ impl AegisRuntimeKernel {
         identity: &AgentIdentity,
         req: Value,
     ) -> anyhow::Result<Value> {
+        self.handle_jsonrpc_message_with_profile(
+            identity,
+            req,
+            GatewayToolProfile::from_str_or_env(None),
+        )
+        .await
+    }
+
+    pub async fn handle_jsonrpc_message_with_profile(
+        &self,
+        identity: &AgentIdentity,
+        req: Value,
+        profile: GatewayToolProfile,
+    ) -> anyhow::Result<Value> {
         let id = req.get("id").cloned().unwrap_or(Value::Null);
         let method = req.get("method").and_then(|v| v.as_str()).unwrap_or("");
 
@@ -10016,7 +10030,6 @@ impl AegisRuntimeKernel {
                 }
             }),
             "tools/list" => {
-                let profile = GatewayToolProfile::from_str_or_env(None);
                 json!({
                     "jsonrpc": "2.0",
                     "id": id,
@@ -10024,7 +10037,6 @@ impl AegisRuntimeKernel {
                 })
             }
             "resources/list" => {
-                let profile = GatewayToolProfile::from_str_or_env(None);
                 let mut resources = vec![
                     json!({ "uri": "aegis://workspace/status", "name": "CoW Workspace Status & Diffs" }),
                     json!({ "uri": "aegis://ipc/inbox", "name": "Agent IPC Mailbox" }),
@@ -10051,6 +10063,35 @@ impl AegisRuntimeKernel {
             "resources/read" => {
                 let params = req.get("params").cloned().unwrap_or_else(|| json!({}));
                 let uri = params.get("uri").and_then(|v| v.as_str()).unwrap_or("");
+                let resource_denied = match uri {
+                    "aegis://apps/catalog" => {
+                        matches!(profile, GatewayToolProfile::Minimal | GatewayToolProfile::Collab)
+                    }
+                    "aegis://ipc/inbox"
+                    | "agentos://ipc/inbox"
+                    | "aegis://org/peers"
+                    | "agentos://org/peers"
+                    | "aegis://global/peers"
+                    | "aegis://a2a/agent-cards"
+                    | "aegis://a2a/tasks"
+                    | "aegis://org/shared/catalog"
+                    | "agentos://org/shared/catalog" => profile == GatewayToolProfile::Minimal,
+                    _ => false,
+                };
+                if resource_denied {
+                    return Ok(json!({
+                        "jsonrpc": "2.0",
+                        "id": id,
+                        "error": {
+                            "code": -32601,
+                            "message": format!(
+                                "Resource '{}' is not enabled under active tool profile '{}'",
+                                uri,
+                                profile.as_str()
+                            )
+                        }
+                    }));
+                }
                 let payload = match uri {
                     "aegis://workspace/status" | "agentos://workspace/status" => {
                         self.call_tool(identity, "workspace_status", json!({})).await?
@@ -10245,6 +10286,23 @@ impl AegisRuntimeKernel {
                     .get("arguments")
                     .cloned()
                     .unwrap_or_else(|| json!({}));
+
+                if matches!(profile, GatewayToolProfile::Minimal | GatewayToolProfile::Collab)
+                    && !profile.allows_tool(name)
+                {
+                    return Ok(json!({
+                        "jsonrpc": "2.0",
+                        "id": id,
+                        "error": {
+                            "code": -32601,
+                            "message": format!(
+                                "Tool '{}' is not enabled under active tool profile '{}'",
+                                name,
+                                profile.as_str()
+                            )
+                        }
+                    }));
+                }
 
                 let result = if HUMAN_ONLY_TOOLS.contains(&name) {
                     Err(anyhow::anyhow!(
@@ -16935,5 +16993,42 @@ time.sleep(60)
             .to_string();
         assert!(err.contains("TOCTOU guard") || err.contains("sensitive path"), "{err}");
         assert!(!host_repo.join(".github/workflows/evil.yml").exists());
+    }
+
+    #[tokio::test]
+    async fn test_gateway_tool_profile_minimal_rejects_unlisted_tools_and_resources() {
+        let temp = tempfile::tempdir().unwrap();
+        let kernel = AegisRuntimeKernel::new(&temp.path().join("rt")).await.unwrap();
+        let agent = AgentIdentity::new("prof-org", "agent-min", "Engineer");
+
+        let denied_tool = kernel
+            .handle_jsonrpc_message_with_profile(
+                &agent,
+                json!({
+                    "jsonrpc": "2.0",
+                    "id": 1,
+                    "method": "tools/call",
+                    "params": { "name": "ipc_send", "arguments": {} }
+                }),
+                GatewayToolProfile::Minimal,
+            )
+            .await
+            .unwrap();
+        assert_eq!(denied_tool["error"]["code"], -32601);
+
+        let denied_res = kernel
+            .handle_jsonrpc_message_with_profile(
+                &agent,
+                json!({
+                    "jsonrpc": "2.0",
+                    "id": 2,
+                    "method": "resources/read",
+                    "params": { "uri": "aegis://apps/catalog" }
+                }),
+                GatewayToolProfile::Minimal,
+            )
+            .await
+            .unwrap();
+        assert_eq!(denied_res["error"]["code"], -32601);
     }
 }

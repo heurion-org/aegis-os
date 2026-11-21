@@ -2052,6 +2052,10 @@ impl PolicyEngine for AegisPolicyKernel {
             {
                 sensitive_candidates.push("flag:skip_verify".to_string());
             }
+            let active_taint_for_git = self
+                .get_active_taint(&ctx.principal.org_id, &ctx.principal.agent_id)
+                .await;
+            let min_created_exclusive = active_taint_for_git.as_ref().map(|t| t.updated_at_ms);
             let unleased_sensitive = if sensitive_candidates.is_empty() {
                 Vec::new()
             } else {
@@ -2059,7 +2063,7 @@ impl PolicyEngine for AegisPolicyKernel {
                     ctx,
                     "workspace_git_sensitive",
                     &sensitive_candidates,
-                    None,
+                    min_created_exclusive,
                 )
                 .await
             };
@@ -2092,16 +2096,18 @@ impl PolicyEngine for AegisPolicyKernel {
                     "[HIGH RISK] Git operation touches sensitive target(s)/flags '{}' (bypasses general session lease)",
                     combined_resource
                 );
-                return self
-                    .record_escalation(
-                        &batch_ctx,
-                        reason,
-                        format!(
-                            "action=workspace_git_sensitive, resource={}",
-                            combined_resource
-                        ),
-                    )
-                    .await;
+                let scope = format!("action=workspace_git_sensitive, resource={}", combined_resource);
+                if let Some(ref taint) = active_taint_for_git {
+                    return self
+                        .record_tainted_escalation(
+                            &batch_ctx,
+                            taint,
+                            format!("[UNTRUSTED MCP TAINT] {reason}"),
+                            scope,
+                        )
+                        .await;
+                }
+                return self.record_escalation(&batch_ctx, reason, scope).await;
             }
         }
 
@@ -2203,11 +2209,20 @@ impl PolicyEngine for AegisPolicyKernel {
 
         // 2f. Active Session Taint Guard (`UntrustedExternal` MCP Taint):
         // Once a session ingests untrusted external MCP data, pre-taint broad TTL leases (or custom
-        // Cedar `permit` rules) cannot authorize `workspace_commit` or `egress_unlisted_domain`,
-        // and wildcard domain leases (`resource_pattern == "*"`) are rejected under taint.
+        // Cedar `permit` rules) cannot authorize host writes, Git/PR mutations, host file exports,
+        // or unlisted egress domains without post-taint explicit human approval.
         if matches!(
             ctx.action.as_str(),
-            "workspace_commit" | "egress_unlisted_domain"
+            "workspace_commit"
+                | "workspace_commit_sensitive"
+                | "workspace_git"
+                | "workspace_git_sensitive"
+                | "fs_export_file"
+                | "egress_unlisted_domain"
+                | "github_pr_create"
+                | "github_pr_merge"
+                | "github_comment_create"
+                | "github_ci_rerun"
         ) {
             if let Some(taint) = self
                 .get_active_taint(&ctx.principal.org_id, &ctx.principal.agent_id)
@@ -2231,22 +2246,28 @@ impl PolicyEngine for AegisPolicyKernel {
                     .last()
                     .map(|s| format!("{}:{}", s.server_id, s.tool_name))
                     .unwrap_or_else(|| "external_mcp".to_string());
-                let (reason, scope) = if ctx.action == "workspace_commit" {
-                    (
+                let (reason, scope) = match ctx.action.as_str() {
+                    "workspace_commit" | "workspace_commit_sensitive" => (
                         format!(
                             "[UNTRUSTED MCP TAINT] Session ingested untrusted external data ({}); committing shadow changes to '{}' requires explicit human approval",
                             src_summary, ctx.target_resource
                         ),
-                        "action=workspace_commit, resource=*".to_string(),
-                    )
-                } else {
-                    (
+                        format!("action={}, resource={}", ctx.action, if ctx.action == "workspace_commit" { "*" } else { &ctx.target_resource }),
+                    ),
+                    "egress_unlisted_domain" => (
                         format!(
                             "[UNTRUSTED MCP TAINT] Session ingested untrusted external data ({}); outbound connection to unlisted domain '{}' requires explicit domain-pinned human approval",
                             src_summary, ctx.target_resource
                         ),
                         format!("action=egress_unlisted_domain, resource={}", ctx.target_resource),
-                    )
+                    ),
+                    other => (
+                        format!(
+                            "[UNTRUSTED MCP TAINT] Session ingested untrusted external data ({}); high-impact boundary action '{}' on '{}' requires post-taint human approval",
+                            src_summary, other, ctx.target_resource
+                        ),
+                        format!("action={}, resource={}", other, ctx.target_resource),
+                    ),
                 };
                 return self
                     .record_tainted_escalation(ctx, &taint, reason, scope)
