@@ -19,7 +19,7 @@ use std::sync::Arc;
 use std::task::{Context as TaskContext, Poll};
 use std::time::Duration;
 use tokio::io::{
-    AsyncBufReadExt, AsyncRead, AsyncWrite, AsyncWriteExt, BufReader, ReadBuf,
+    AsyncBufRead, AsyncBufReadExt, AsyncRead, AsyncWrite, AsyncWriteExt, BufReader, ReadBuf,
 };
 use tokio::net::TcpStream;
 use tokio_rustls::rustls::pki_types::ServerName;
@@ -438,49 +438,118 @@ fn validate_header_kv(k: &str, v: &str) -> anyhow::Result<()> {
     Ok(())
 }
 
+async fn read_bounded_line<R: AsyncBufRead + Unpin>(
+    reader: &mut R,
+    max_bytes: usize,
+    idle_timeout: Duration,
+    label: &str,
+) -> anyhow::Result<Option<String>> {
+    let mut buf = Vec::with_capacity(256);
+    loop {
+        let avail = tokio::time::timeout(idle_timeout, reader.fill_buf())
+            .await
+            .map_err(|_| anyhow::anyhow!("Timed out reading {label}"))??;
+        if avail.is_empty() {
+            if buf.is_empty() {
+                return Ok(None);
+            }
+            return Ok(Some(String::from_utf8_lossy(&buf).into_owned()));
+        }
+        if let Some(pos) = avail.iter().position(|&b| b == b'\n') {
+            if buf.len().saturating_add(pos + 1) > max_bytes {
+                bail!("{label} exceeded {max_bytes} byte limit");
+            }
+            buf.extend_from_slice(&avail[..=pos]);
+            reader.consume(pos + 1);
+            return Ok(Some(String::from_utf8_lossy(&buf).into_owned()));
+        }
+        let n = avail.len();
+        if buf.len().saturating_add(n) > max_bytes {
+            bail!("{label} exceeded {max_bytes} byte limit");
+        }
+        buf.extend_from_slice(avail);
+        reader.consume(n);
+    }
+}
+
 async fn read_http_head(
     reader: &mut BufReader<HttpStream>,
     idle_timeout: Duration,
 ) -> anyhow::Result<(u16, BTreeMap<String, String>)> {
-    let mut header_bytes = 0usize;
-    let mut status_line = String::new();
-    let n = tokio::time::timeout(idle_timeout, reader.read_line(&mut status_line))
-        .await
-        .map_err(|_| anyhow::anyhow!("Timed out reading HTTP response status line"))??;
-    if n == 0 {
-        bail!("Upstream MCP HTTP connection closed before response status line");
-    }
-    header_bytes += n;
-
-    let mut parts = status_line.trim_end_matches(['\r', '\n']).split_whitespace();
-    let _proto = parts.next().context("Malformed HTTP status line")?;
-    let code_str = parts.next().context("Missing HTTP status code")?;
-    let status: u16 = code_str
-        .parse()
-        .with_context(|| format!("Invalid HTTP status code '{}'", code_str))?;
-
-    let mut headers = BTreeMap::new();
     loop {
-        let mut line = String::new();
-        let n = tokio::time::timeout(idle_timeout, reader.read_line(&mut line))
-            .await
-            .map_err(|_| anyhow::anyhow!("Timed out reading HTTP response headers"))??;
-        if n == 0 {
-            break;
+        let mut header_bytes = 0usize;
+        let Some(status_line) = read_bounded_line(
+            reader,
+            MAX_HTTP_HEADER_BYTES,
+            idle_timeout,
+            "HTTP response status line",
+        )
+        .await?
+        else {
+            bail!("Upstream MCP HTTP connection closed before response status line");
+        };
+        header_bytes += status_line.len();
+
+        let mut parts = status_line.trim_end_matches(['\r', '\n']).split_whitespace();
+        let _proto = parts.next().context("Malformed HTTP status line")?;
+        let code_str = parts.next().context("Missing HTTP status code")?;
+        let status: u16 = code_str
+            .parse()
+            .with_context(|| format!("Invalid HTTP status code '{}'", code_str))?;
+
+        let mut headers = BTreeMap::new();
+        let mut conflicting_cl = false;
+        let mut seen_cl: Option<String> = None;
+        loop {
+            let Some(line) = read_bounded_line(
+                reader,
+                MAX_HTTP_HEADER_BYTES,
+                idle_timeout,
+                "HTTP response header",
+            )
+            .await?
+            else {
+                break;
+            };
+            header_bytes += line.len();
+            if header_bytes > MAX_HTTP_HEADER_BYTES {
+                bail!("HTTP response headers exceeded {} bytes", MAX_HTTP_HEADER_BYTES);
+            }
+            let trimmed = line.trim_end_matches(['\r', '\n']);
+            if trimmed.is_empty() {
+                break;
+            }
+            if let Some((k, v)) = trimmed.split_once(':') {
+                let key = k.trim().to_ascii_lowercase();
+                let val = v.trim().to_string();
+                if key == "content-length" {
+                    if let Some(ref prev) = seen_cl {
+                        if prev != &val {
+                            conflicting_cl = true;
+                        }
+                    } else {
+                        seen_cl = Some(val.clone());
+                    }
+                    headers.insert(key, val);
+                } else if key == "transfer-encoding" {
+                    let merged = match headers.get(&key) {
+                        Some(prev) => format!("{prev}, {val}"),
+                        None => val,
+                    };
+                    headers.insert(key, merged);
+                } else {
+                    headers.insert(key, val);
+                }
+            }
         }
-        header_bytes += n;
-        if header_bytes > MAX_HTTP_HEADER_BYTES {
-            bail!("HTTP response headers exceeded {} bytes", MAX_HTTP_HEADER_BYTES);
+        if (100..200).contains(&status) && status != 101 {
+            continue;
         }
-        let trimmed = line.trim_end_matches(['\r', '\n']);
-        if trimmed.is_empty() {
-            break;
+        if conflicting_cl {
+            bail!("Upstream MCP HTTP returned conflicting Content-Length headers");
         }
-        if let Some((k, v)) = trimmed.split_once(':') {
-            headers.insert(k.trim().to_ascii_lowercase(), v.trim().to_string());
-        }
+        return Ok((status, headers));
     }
-    Ok((status, headers))
 }
 
 enum BodyKind {
@@ -494,6 +563,9 @@ impl BodyKind {
         let is_chunked = headers
             .get("transfer-encoding")
             .is_some_and(|v| v.to_ascii_lowercase().contains("chunked"));
+        if is_chunked && headers.contains_key("content-length") {
+            bail!("Upstream MCP HTTP response specified both Transfer-Encoding: chunked and Content-Length");
+        }
         if is_chunked {
             return Ok(Self::Chunked {
                 remaining_in_chunk: None,
@@ -521,7 +593,7 @@ struct BoundedBodyReader<R> {
     line_buf: Vec<u8>,
 }
 
-impl<R: tokio::io::AsyncBufRead + Unpin> BoundedBodyReader<R> {
+impl<R: AsyncBufRead + Unpin> BoundedBodyReader<R> {
     fn new(reader: R, kind: BodyKind) -> Self {
         Self {
             reader,
@@ -543,10 +615,22 @@ impl<R: tokio::io::AsyncBufRead + Unpin> BoundedBodyReader<R> {
                 loop {
                     if let Some(rem) = remaining_in_chunk {
                         if *rem == 0 {
-                            let mut crlf = String::new();
-                            let _ = tokio::time::timeout(idle_timeout, self.reader.read_line(&mut crlf))
-                                .await
-                                .map_err(|_| anyhow::anyhow!("Timed out reading HTTP chunk CRLF"))??;
+                            let Some(crlf) = read_bounded_line(
+                                &mut self.reader,
+                                MAX_HTTP_HEADER_BYTES,
+                                idle_timeout,
+                                "HTTP chunk CRLF",
+                            )
+                            .await?
+                            else {
+                                bail!(std::io::Error::new(
+                                    std::io::ErrorKind::UnexpectedEof,
+                                    "Unexpected EOF waiting for HTTP chunk CRLF",
+                                ));
+                            };
+                            if !crlf.trim_end_matches(['\r', '\n']).is_empty() {
+                                bail!("Malformed HTTP chunk terminator");
+                            }
                             *remaining_in_chunk = None;
                             continue;
                         }
@@ -554,8 +638,10 @@ impl<R: tokio::io::AsyncBufRead + Unpin> BoundedBodyReader<R> {
                             .await
                             .map_err(|_| anyhow::anyhow!("Idle timeout reading HTTP response stream"))??;
                         if avail.is_empty() {
-                            *done = true;
-                            return Ok(None);
+                            bail!(std::io::Error::new(
+                                std::io::ErrorKind::UnexpectedEof,
+                                "Unexpected EOF inside HTTP chunked response body",
+                            ));
                         }
                         let take = (*rem).min(avail.len());
                         if self.total_bytes + take > MAX_MCP_HTTP_RESPONSE_BYTES {
@@ -568,14 +654,19 @@ impl<R: tokio::io::AsyncBufRead + Unpin> BoundedBodyReader<R> {
                         return Ok(Some(slice));
                     }
 
-                    let mut size_line = String::new();
-                    let n = tokio::time::timeout(idle_timeout, self.reader.read_line(&mut size_line))
-                        .await
-                        .map_err(|_| anyhow::anyhow!("Idle timeout reading HTTP chunk size"))??;
-                    if n == 0 {
-                        *done = true;
-                        return Ok(None);
-                    }
+                    let Some(size_line) = read_bounded_line(
+                        &mut self.reader,
+                        MAX_HTTP_HEADER_BYTES,
+                        idle_timeout,
+                        "HTTP chunk size",
+                    )
+                    .await?
+                    else {
+                        bail!(std::io::Error::new(
+                            std::io::ErrorKind::UnexpectedEof,
+                            "Unexpected EOF before terminating 0-length HTTP chunk",
+                        ));
+                    };
                     let hex_part = size_line
                         .trim()
                         .split(';')
@@ -585,13 +676,23 @@ impl<R: tokio::io::AsyncBufRead + Unpin> BoundedBodyReader<R> {
                     let chunk_len = usize::from_str_radix(hex_part, 16)
                         .with_context(|| format!("Invalid HTTP chunk size line '{}'", size_line.trim()))?;
                     if chunk_len == 0 {
-                        // Consume optional trailers through empty line.
+                        let mut trailer_bytes = 0usize;
                         loop {
-                            let mut tr = String::new();
-                            let m = tokio::time::timeout(idle_timeout, self.reader.read_line(&mut tr))
-                                .await
-                                .map_err(|_| anyhow::anyhow!("Timed out reading HTTP chunk trailers"))??;
-                            if m == 0 || tr.trim_end_matches(['\r', '\n']).is_empty() {
+                            let Some(tr) = read_bounded_line(
+                                &mut self.reader,
+                                MAX_HTTP_HEADER_BYTES,
+                                idle_timeout,
+                                "HTTP chunk trailer",
+                            )
+                            .await?
+                            else {
+                                break;
+                            };
+                            trailer_bytes += tr.len();
+                            if trailer_bytes > MAX_HTTP_HEADER_BYTES {
+                                bail!("HTTP chunk trailers exceeded {} bytes", MAX_HTTP_HEADER_BYTES);
+                            }
+                            if tr.trim_end_matches(['\r', '\n']).is_empty() {
                                 break;
                             }
                         }
@@ -609,8 +710,10 @@ impl<R: tokio::io::AsyncBufRead + Unpin> BoundedBodyReader<R> {
                     .await
                     .map_err(|_| anyhow::anyhow!("Idle timeout reading HTTP response body"))??;
                 if avail.is_empty() {
-                    *rem = 0;
-                    return Ok(None);
+                    bail!(std::io::Error::new(
+                        std::io::ErrorKind::UnexpectedEof,
+                        format!("Upstream closed connection with {} Content-Length bytes remaining", *rem),
+                    ));
                 }
                 let take = (*rem).min(avail.len());
                 if self.total_bytes + take > MAX_MCP_HTTP_RESPONSE_BYTES {
@@ -657,6 +760,9 @@ impl<R: tokio::io::AsyncBufRead + Unpin> BoundedBodyReader<R> {
                     .trim_end_matches(['\r', '\n'])
                     .to_string();
                 return Ok(Some(s));
+            }
+            if self.line_buf.len() > MAX_MCP_HTTP_RESPONSE_BYTES {
+                bail!("SSE line exceeded 16 MiB cap");
             }
             match self.read_next_chunk(idle_timeout).await? {
                 Some(chunk) => self.line_buf.extend_from_slice(&chunk),
@@ -775,18 +881,28 @@ pub async fn send_http_jsonrpc_streaming(
     if content_type.contains("text/event-stream") {
         let mut sse_reader = BoundedBodyReader::new(reader, body_kind);
         let mut data_lines: Vec<String> = Vec::new();
+        let mut current_event = String::new();
         let mut notifications: Vec<Value> = Vec::new();
         let mut final_payload: Option<Value> = None;
         let expected_id = request_json.get("id").cloned();
+        let wall_deadline = tokio::time::Instant::now()
+            + idle_timeout
+                .saturating_mul(6)
+                .max(Duration::from_secs(1_800));
 
         let dispatch_event = |lines: &mut Vec<String>,
+                              ev_name: &mut String,
                               notifications: &mut Vec<Value>,
                               final_payload: &mut Option<Value>| {
+            let event_type = std::mem::take(ev_name);
             if lines.is_empty() {
                 return;
             }
             let joined = lines.join("\n");
             lines.clear();
+            if !event_type.is_empty() && event_type != "message" {
+                return;
+            }
             let trimmed = joined.trim();
             if trimmed.is_empty() || trimmed == "[DONE]" {
                 return;
@@ -801,25 +917,39 @@ pub async fn send_http_jsonrpc_streaming(
                     if let Some(ref tx) = on_notification {
                         let _ = tx.send(val);
                     }
-                } else if val.get("id").is_some()
-                    || val.get("result").is_some()
-                    || val.get("error").is_some()
-                {
+                    return;
+                }
+                let is_response =
+                    (val.get("result").is_some() || val.get("error").is_some())
+                        && val.get("method").is_none();
+                if is_response {
                     let id_matches = match (&expected_id, val.get("id")) {
                         (Some(exp), Some(got)) => exp == got,
+                        (Some(_), None) => false,
                         (None, _) => true,
-                        (Some(_), None) => true,
                     };
-                    if id_matches || final_payload.is_none() {
+                    if id_matches {
                         *final_payload = Some(val);
                     }
                 }
             }
         };
 
-        while let Some(line) = sse_reader.next_line(idle_timeout).await? {
+        while let Some(line) = {
+            let now = tokio::time::Instant::now();
+            if now >= wall_deadline {
+                bail!("Upstream MCP SSE stream exceeded maximum total wall-clock timeout");
+            }
+            let step_timeout = idle_timeout.min(wall_deadline.saturating_duration_since(now));
+            sse_reader.next_line(step_timeout).await?
+        } {
             if line.is_empty() {
-                dispatch_event(&mut data_lines, &mut notifications, &mut final_payload);
+                dispatch_event(
+                    &mut data_lines,
+                    &mut current_event,
+                    &mut notifications,
+                    &mut final_payload,
+                );
                 if expect_response && final_payload.is_some() {
                     break;
                 }
@@ -829,11 +959,18 @@ pub async fn send_http_jsonrpc_streaming(
                 // Keep-alive SSE comment resets idle_timeout cleanly.
                 continue;
             }
-            if let Some(data) = line.strip_prefix("data:") {
+            if let Some(ev) = line.strip_prefix("event:") {
+                current_event = ev.trim().to_string();
+            } else if let Some(data) = line.strip_prefix("data:") {
                 data_lines.push(data.trim_start().to_string());
             }
         }
-        dispatch_event(&mut data_lines, &mut notifications, &mut final_payload);
+        dispatch_event(
+            &mut data_lines,
+            &mut current_event,
+            &mut notifications,
+            &mut final_payload,
+        );
 
         if let Some(payload) = final_payload {
             return Ok(HttpRpcOutcome::Response {

@@ -61,6 +61,7 @@ const PROTECTED_AGENT_CONFIGS: &[&str] = &[
     ".gemini/antigravity-cli/mcp_config.json",
     ".cursor/mcp.json",
     ".hermes/config.yaml",
+    ".run/aegis-broker.json",
 ];
 
 const PROTECTED_AGENT_PLUGIN_DIRS: &[&str] = &[
@@ -886,6 +887,77 @@ fn sanitize_seeded_agent_home(agent_home: &Path) -> anyhow::Result<()> {
     Ok(())
 }
 
+fn redact_url_userinfo_value(raw: &str) -> Option<String> {
+    let (scheme, after) = raw.split_once("://")?;
+    let (userinfo, host_and_rest) = after.split_once('@')?;
+    if userinfo.contains('/') || userinfo.contains('?') || userinfo.contains('#') {
+        return None;
+    }
+    if userinfo == "[REDACTED_BY_AEGIS_SANDBOX]" || userinfo.is_empty() {
+        return None;
+    }
+    Some(format!(
+        "{scheme}://[REDACTED_BY_AEGIS_SANDBOX]@{host_and_rest}"
+    ))
+}
+
+fn scrub_unadopted_args_array(arr: &mut [Value], skip_first: bool) -> bool {
+    let mut changed = false;
+    let mut prev_sensitive_flag = false;
+    for (idx, item) in arr.iter_mut().enumerate() {
+        if skip_first && idx == 0 {
+            continue;
+        }
+        let Some(s) = item.as_str() else {
+            prev_sensitive_flag = false;
+            continue;
+        };
+        if s == "[REDACTED_BY_AEGIS_SANDBOX]" {
+            prev_sensitive_flag = false;
+            continue;
+        }
+        if prev_sensitive_flag {
+            *item = Value::String("[REDACTED_BY_AEGIS_SANDBOX]".to_string());
+            changed = true;
+            prev_sensitive_flag = false;
+            continue;
+        }
+        let lower = s.to_ascii_lowercase();
+        if matches!(
+            lower.as_str(),
+            "--token"
+                | "--api-key"
+                | "--apikey"
+                | "--secret"
+                | "--password"
+                | "--auth"
+                | "--bearer"
+                | "-h"
+                | "--header"
+        ) {
+            prev_sensitive_flag = true;
+            continue;
+        }
+        if let Some(redacted_url) = redact_url_userinfo_value(s) {
+            *item = Value::String(redacted_url);
+            changed = true;
+            continue;
+        }
+        if let Some((k, v)) = s.split_once('=') {
+            if aos_mcp_gateway::mcp_firewall::is_sensitive_kv(k, v) {
+                *item = Value::String(format!("{k}=[REDACTED_BY_AEGIS_SANDBOX]"));
+                changed = true;
+                continue;
+            }
+        }
+        if aos_mcp_gateway::mcp_firewall::is_sensitive_kv("ARG", s) {
+            *item = Value::String("[REDACTED_BY_AEGIS_SANDBOX]".to_string());
+            changed = true;
+        }
+    }
+    changed
+}
+
 fn redact_sensitive_kv_map(obj: &mut serde_json::Map<String, Value>) -> bool {
     let mut changed = false;
     for (k, v) in obj.iter_mut() {
@@ -915,6 +987,26 @@ fn scrub_unadopted_mcp_server_table(servers: &mut serde_json::Map<String, Value>
                 if redact_sensitive_kv_map(map) {
                     changed = true;
                 }
+            }
+        }
+        for url_field in ["url", "serverUrl"] {
+            if let Some(slot) = entry_obj.get_mut(url_field) {
+                if let Some(raw_url) = slot.as_str() {
+                    if let Some(clean_url) = redact_url_userinfo_value(raw_url) {
+                        *slot = Value::String(clean_url);
+                        changed = true;
+                    }
+                }
+            }
+        }
+        if let Some(args_arr) = entry_obj.get_mut("args").and_then(|v| v.as_array_mut()) {
+            if scrub_unadopted_args_array(args_arr, false) {
+                changed = true;
+            }
+        }
+        if let Some(cmd_arr) = entry_obj.get_mut("command").and_then(|v| v.as_array_mut()) {
+            if scrub_unadopted_args_array(cmd_arr, true) {
+                changed = true;
             }
         }
     }
@@ -967,6 +1059,40 @@ fn parse_toml_header_path(line: &str) -> Option<Vec<String>> {
     Some(parts)
 }
 
+fn redact_toml_inline_table_kv(rhs: &str) -> Option<String> {
+    let trimmed = rhs.trim();
+    if !(trimmed.starts_with('{') && trimmed.ends_with('}')) {
+        return None;
+    }
+    let inner = &trimmed[1..trimmed.len() - 1];
+    let mut changed = false;
+    let mut parts = Vec::new();
+    for entry in inner.split(',') {
+        let e = entry.trim();
+        if e.is_empty() {
+            continue;
+        }
+        if let Some((k, v)) = e.split_once('=') {
+            let k_trim = k.trim();
+            let k_clean = k_trim.trim_matches('"').trim_matches('\'');
+            let v_unquoted = v.trim().trim_matches('"').trim_matches('\'');
+            if v_unquoted != "[REDACTED_BY_AEGIS_SANDBOX]"
+                && aos_mcp_gateway::mcp_firewall::is_sensitive_kv(k_clean, v_unquoted)
+            {
+                parts.push(format!("{k_trim} = \"[REDACTED_BY_AEGIS_SANDBOX]\""));
+                changed = true;
+                continue;
+            }
+        }
+        parts.push(e.to_string());
+    }
+    if changed {
+        Some(format!("{{ {} }}", parts.join(", ")))
+    } else {
+        None
+    }
+}
+
 fn scrub_unadopted_mcp_secrets_in_agent_home(agent_home: &Path) {
     for rel in [
         ".claude.json",
@@ -984,8 +1110,47 @@ fn scrub_unadopted_mcp_secrets_in_agent_home(agent_home: &Path) {
         let Ok(mut root) = serde_json::from_str::<Value>(&raw) else {
             continue;
         };
+        let mut changed = false;
         if let Some(servers) = root.get_mut("mcpServers").and_then(|v| v.as_object_mut()) {
             if scrub_unadopted_mcp_server_table(servers) {
+                changed = true;
+            }
+        }
+        if rel == ".claude.json" {
+            if let Some(projects) = root.get_mut("projects").and_then(|v| v.as_object_mut()) {
+                for (_proj_path, proj_val) in projects.iter_mut() {
+                    if let Some(proj_servers) = proj_val
+                        .as_object_mut()
+                        .and_then(|o| o.get_mut("mcpServers"))
+                        .and_then(|v| v.as_object_mut())
+                    {
+                        if scrub_unadopted_mcp_server_table(proj_servers) {
+                            changed = true;
+                        }
+                    }
+                }
+            }
+        }
+        if changed {
+            if let Ok(pretty) = serde_json::to_string_pretty(&root) {
+                let _ = std::fs::write(&p, format!("{pretty}\n"));
+            }
+        }
+    }
+
+    for rel in [".claude/settings.json", ".claude/settings.local.json"] {
+        let p = agent_home.join(rel);
+        if !p.is_file() {
+            continue;
+        }
+        let Ok(raw) = std::fs::read_to_string(&p) else {
+            continue;
+        };
+        let Ok(mut root) = serde_json::from_str::<Value>(&raw) else {
+            continue;
+        };
+        if let Some(env_obj) = root.get_mut("env").and_then(|v| v.as_object_mut()) {
+            if redact_sensitive_kv_map(env_obj) {
                 if let Ok(pretty) = serde_json::to_string_pretty(&root) {
                     let _ = std::fs::write(&p, format!("{pretty}\n"));
                 }
@@ -993,26 +1158,35 @@ fn scrub_unadopted_mcp_secrets_in_agent_home(agent_home: &Path) {
         }
     }
 
-    let opencode_cfg = agent_home.join(".config/opencode/opencode.json");
-    if opencode_cfg.is_file() {
-        if let Ok(raw) = std::fs::read_to_string(&opencode_cfg) {
-            if let Ok(mut root) = serde_json::from_str::<Value>(&raw) {
-                let mut changed = false;
-                if let Some(servers) = root
-                    .pointer_mut("/mcp/servers")
-                    .and_then(|v| v.as_object_mut())
+    for rel in [
+        ".config/opencode/opencode.json",
+        ".config/opencode/opencode.jsonc",
+    ] {
+        let opencode_cfg = agent_home.join(rel);
+        if opencode_cfg.is_file() {
+            if let Ok(raw) = std::fs::read_to_string(&opencode_cfg) {
+                if let Ok(mut root) = serde_json::from_str::<Value>(&raw)
+                    .or_else(|_| serde_json::from_str::<Value>(&strip_jsonc_comments(&raw)))
                 {
-                    if scrub_unadopted_mcp_server_table(servers) {
-                        changed = true;
+                    let mut changed = false;
+                    if let Some(servers) = root
+                        .pointer_mut("/mcp/servers")
+                        .and_then(|v| v.as_object_mut())
+                    {
+                        if scrub_unadopted_mcp_server_table(servers) {
+                            changed = true;
+                        }
+                    } else if let Some(mcp_obj) =
+                        root.get_mut("mcp").and_then(|v| v.as_object_mut())
+                    {
+                        if scrub_unadopted_mcp_server_table(mcp_obj) {
+                            changed = true;
+                        }
                     }
-                } else if let Some(mcp_obj) = root.get_mut("mcp").and_then(|v| v.as_object_mut()) {
-                    if scrub_unadopted_mcp_server_table(mcp_obj) {
-                        changed = true;
-                    }
-                }
-                if changed {
-                    if let Ok(pretty) = serde_json::to_string_pretty(&root) {
-                        let _ = std::fs::write(&opencode_cfg, format!("{pretty}\n"));
+                    if changed {
+                        if let Ok(pretty) = serde_json::to_string_pretty(&root) {
+                            let _ = std::fs::write(&opencode_cfg, format!("{pretty}\n"));
+                        }
                     }
                 }
             }
@@ -1050,16 +1224,25 @@ fn scrub_unadopted_mcp_secrets_in_agent_home(agent_home: &Path) {
                 }
             }
 
-            // Pass 2: redact sensitive env/header assignments inside unadopted sections.
+            // Pass 2: redact sensitive env/header assignments, URL userinfo, and inline tables inside unadopted sections.
             let mut changed = false;
             let mut out = Vec::new();
             let mut active_sensitive_server: Option<String> = None;
+            let mut active_base_server: Option<String> = None;
             for line in raw.lines() {
                 if let Some(parts) = parse_toml_header_path(line) {
                     active_sensitive_server = if parts.first().map(String::as_str)
                         == Some("mcp_servers")
                         && parts.len() == 3
                         && matches!(parts[2].as_str(), "env" | "http_headers" | "headers")
+                    {
+                        Some(parts[1].clone())
+                    } else {
+                        None
+                    };
+                    active_base_server = if parts.first().map(String::as_str)
+                        == Some("mcp_servers")
+                        && parts.len() == 2
                     {
                         Some(parts[1].clone())
                     } else {
@@ -1089,6 +1272,31 @@ fn scrub_unadopted_mcp_secrets_in_agent_home(agent_home: &Path) {
                             }
                         }
                     }
+                } else if let Some(ref server_key) = active_base_server {
+                    if !adopted.contains(server_key)
+                        && !trimmed.is_empty()
+                        && !trimmed.starts_with('#')
+                    {
+                        if let Some((k, v)) = trimmed.split_once('=') {
+                            let k_trim = k.trim();
+                            if matches!(k_trim, "url" | "serverUrl") {
+                                let v_unquoted = v.trim().trim_matches('"').trim_matches('\'');
+                                if let Some(clean_url) = redact_url_userinfo_value(v_unquoted) {
+                                    let q = serde_json::to_string(&clean_url)
+                                        .unwrap_or_else(|_| format!("\"{clean_url}\""));
+                                    out.push(format!("{k_trim} = {q}"));
+                                    changed = true;
+                                    continue;
+                                }
+                            } else if matches!(k_trim, "env" | "http_headers" | "headers") {
+                                if let Some(clean_tbl) = redact_toml_inline_table_kv(v) {
+                                    out.push(format!("{k_trim} = {clean_tbl}"));
+                                    changed = true;
+                                    continue;
+                                }
+                            }
+                        }
+                    }
                 }
                 out.push(line.to_string());
             }
@@ -1101,6 +1309,40 @@ fn scrub_unadopted_mcp_secrets_in_agent_home(agent_home: &Path) {
             }
         }
     }
+}
+
+fn write_mode_0600_no_symlink(path: &Path, contents: &[u8]) -> anyhow::Result<()> {
+    if let Some(parent) = path.parent() {
+        if let Ok(pmeta) = std::fs::symlink_metadata(parent) {
+            if pmeta.file_type().is_symlink() {
+                anyhow::bail!("refusing symlinked parent directory '{}'", parent.display());
+            }
+        }
+        std::fs::create_dir_all(parent)?;
+    }
+    if let Ok(meta) = std::fs::symlink_metadata(path) {
+        if meta.file_type().is_symlink() {
+            anyhow::bail!("refusing symlinked target file '{}'", path.display());
+        }
+    }
+    use std::io::Write;
+    let mut opts = std::fs::OpenOptions::new();
+    opts.write(true).create(true).truncate(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        opts.mode(0o600).custom_flags(libc::O_NOFOLLOW);
+    }
+    let mut file = opts
+        .open(path)
+        .with_context(|| format!("opening protected file '{}'", path.display()))?;
+    file.write_all(contents)?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let _ = std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600));
+    }
+    Ok(())
 }
 
 fn ensure_protected_agent_configs(agent_home: &Path) -> anyhow::Result<()> {
@@ -1123,6 +1365,10 @@ fn ensure_protected_agent_configs(agent_home: &Path) -> anyhow::Result<()> {
             }
             std::fs::write(&p, stub)?;
         }
+    }
+    let broker_file = agent_home.join(".run/aegis-broker.json");
+    if !broker_file.exists() {
+        write_mode_0600_no_symlink(&broker_file, b"{}\n")?;
     }
     let hermes_cfg = agent_home.join(".hermes/config.yaml");
     if !hermes_cfg.exists() {
@@ -1314,15 +1560,8 @@ pub(crate) fn stage_confined_mcp_configs(
         tool_profile: tool_profile.map(str::to_string),
     };
     let broker_path = run_dir.join("aegis-broker.json");
-    std::fs::write(
-        &broker_path,
-        format!("{}\n", serde_json::to_string_pretty(&broker_file)?),
-    )?;
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-        let _ = std::fs::set_permissions(&broker_path, std::fs::Permissions::from_mode(0o600));
-    }
+    let broker_bytes = format!("{}\n", serde_json::to_string_pretty(&broker_file)?);
+    write_mode_0600_no_symlink(&broker_path, broker_bytes.as_bytes())?;
 
     let client_targets = [
         ("claude", agent_home.join(".claude.json")),
@@ -7565,20 +7804,6 @@ async fn run_isolated_inner(
     )
     .await?;
 
-    let org_mcp_servers = broker
-        .kernel
-        .mcp_firewall
-        .list_servers(Some(&identity.org_id))
-        .await;
-    stage_confined_mcp_configs(
-        &agent_home,
-        identity,
-        &org_mcp_servers,
-        &broker.agent_token,
-        egress_opts.tool_profile.as_deref(),
-        ConfinedMcpTransport::IsolatedHttp { proxy_addr: &proxy },
-    )?;
-
     let org_shared = runtime_dir
         .join("orgs")
         .join(&identity.org_id)
@@ -7620,6 +7845,23 @@ async fn run_isolated_inner(
             return Err(err);
         }
     };
+
+    let guest_proxy = format!("127.0.0.1:{}", sandbox.guest_proxy_port());
+    let org_mcp_servers = broker
+        .kernel
+        .mcp_firewall
+        .list_servers(Some(&identity.org_id))
+        .await;
+    stage_confined_mcp_configs(
+        &agent_home,
+        identity,
+        &org_mcp_servers,
+        &broker.agent_token,
+        egress_opts.tool_profile.as_deref(),
+        ConfinedMcpTransport::IsolatedHttp { proxy_addr: &guest_proxy },
+    )?;
+    rewrite_hermes_config_for_l7(&agent_home, &guest_proxy, None);
+    rewrite_opencode_config_for_l7(&agent_home, &guest_proxy);
 
     let mut env = std::collections::HashMap::new();
     let mut cred_envs = Vec::new();
@@ -11320,5 +11562,98 @@ Authorization = "Bearer sk-secret999"
         assert!(codex_iso.contains("http://127.0.0.1:18080/__aegis/mcp/_kernel"));
         assert!(codex_iso.contains("http://127.0.0.1:18080/__aegis/mcp/heurion-macro"));
         assert!(codex_iso.contains("tok_ses_iso"));
+    }
+
+    #[test]
+    fn scrub_unadopted_secrets_covers_claude_projects_settings_opencode_jsonc_and_codex_inline() {
+        let tmp = tempfile::tempdir().unwrap();
+        let agent_home = tmp.path().join("agent_home");
+        std::fs::create_dir_all(agent_home.join(".claude")).unwrap();
+        std::fs::create_dir_all(agent_home.join(".config/opencode")).unwrap();
+        std::fs::create_dir_all(agent_home.join(".codex")).unwrap();
+
+        std::fs::write(
+            agent_home.join(".claude.json"),
+            serde_json::to_string_pretty(&json!({
+                "projects": {
+                    "/repo/proj": {
+                        "mcpServers": {
+                            "ext": {
+                                "url": "https://user:superpass@mcp.example.com/sse",
+                                "args": ["--token", "ghp_secret_arg_123"],
+                                "env": { "API_KEY": "sk_project_secret" }
+                            }
+                        }
+                    }
+                }
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+
+        std::fs::write(
+            agent_home.join(".claude/settings.json"),
+            serde_json::to_string_pretty(&json!({
+                "env": {
+                    "ANTHROPIC_API_KEY": "sk-ant-api03-secret",
+                    "HARMLESS_FLAG": "1"
+                }
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+
+        std::fs::write(
+            agent_home.join(".config/opencode/opencode.jsonc"),
+            "{\n  // comment in jsonc\n  \"mcp\": { \"ext2\": { \"environment\": { \"LINEAR_TOKEN\": \"lin_secret_xyz\" } } }\n}\n",
+        )
+        .unwrap();
+
+        std::fs::write(
+            agent_home.join(".codex/config.toml"),
+            r#"# --- AEGIS-OS-RUNTIME-START ---
+[mcp_servers.aegis-os]
+command = "aegis-os"
+# --- AEGIS-OS-RUNTIME-END ---
+
+[mcp_servers.raw_srv]
+url = "https://u:pw@api.example.com/mcp"
+env = { SECRET_KEY = "tok_inline_secret" }
+"#,
+        )
+        .unwrap();
+
+        scrub_unadopted_mcp_secrets_in_agent_home(&agent_home);
+
+        let claude_txt = std::fs::read_to_string(agent_home.join(".claude.json")).unwrap();
+        assert!(!claude_txt.contains("superpass"));
+        assert!(!claude_txt.contains("ghp_secret_arg_123"));
+        assert!(!claude_txt.contains("sk_project_secret"));
+
+        let settings_txt =
+            std::fs::read_to_string(agent_home.join(".claude/settings.json")).unwrap();
+        assert!(!settings_txt.contains("sk-ant-api03-secret"));
+        assert!(settings_txt.contains("HARMLESS_FLAG"));
+
+        let oc_txt =
+            std::fs::read_to_string(agent_home.join(".config/opencode/opencode.jsonc")).unwrap();
+        assert!(!oc_txt.contains("lin_secret_xyz"));
+
+        let codex_txt = std::fs::read_to_string(agent_home.join(".codex/config.toml")).unwrap();
+        assert!(!codex_txt.contains(":pw@"));
+        assert!(!codex_txt.contains("tok_inline_secret"));
+
+        // Ensure Codex `aegis-os` proxy upsert strips managed block cleanly (no duplicate section).
+        aos_mcp_gateway::mcp_firewall::upsert_client_proxy_entry(
+            "codex",
+            &agent_home.join(".codex/config.toml"),
+            "aegis-os",
+            "/usr/local/bin/aegis-os",
+            &["mcp-stdio".to_string()],
+            None,
+        )
+        .unwrap();
+        let codex_after = std::fs::read_to_string(agent_home.join(".codex/config.toml")).unwrap();
+        assert_eq!(codex_after.matches("[mcp_servers.aegis-os]").count(), 1);
     }
 }

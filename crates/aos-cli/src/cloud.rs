@@ -1859,22 +1859,13 @@ pub async fn handle_unified_approve(
     if escalations.is_empty() {
         escalations = kernel.policy.list_escalations("*").await?;
     }
-    let mut pending_outbox = kernel
+    let pending_outbox = kernel
         .mcp_firewall
         .list_outbox_tickets(
             Some(&identity.org_id),
             Some(aos_mcp_gateway::mcp_firewall::OutboxStatus::Pending),
         )
         .await;
-    if pending_outbox.is_empty() {
-        pending_outbox = kernel
-            .mcp_firewall
-            .list_outbox_tickets(
-                Some("*"),
-                Some(aos_mcp_gateway::mcp_firewall::OutboxStatus::Pending),
-            )
-            .await;
-    }
 
     let explicit_id = escalation_id.as_deref().map(str::trim).filter(|s| !s.is_empty());
     let selected_outbox_id: Option<String> = if let Some(id) = explicit_id {
@@ -1897,7 +1888,7 @@ pub async fn handle_unified_approve(
         if deny {
             let ticket = kernel
                 .mcp_firewall
-                .deny_outbox_ticket(&ticket_id, "cli-operator")
+                .deny_outbox_ticket(&identity.org_id, &ticket_id, "cli-operator")
                 .await?;
             println!(
                 "{}",
@@ -1910,7 +1901,7 @@ pub async fn handle_unified_approve(
         } else {
             let ticket = kernel
                 .mcp_firewall
-                .approve_outbox_ticket(&ticket_id, "cli-operator")
+                .approve_outbox_ticket(&identity.org_id, &ticket_id, "cli-operator")
                 .await?;
             println!(
                 "{}",

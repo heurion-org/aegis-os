@@ -27,7 +27,7 @@ use tokio::task::JoinHandle;
 
 pub const CONTROL_DIR_IN_SANDBOX: &str = "/run/aegis/control";
 pub const CONTROL_SOCKET_IN_SANDBOX: &str = "/run/aegis/control/control.sock";
-const MAX_BODY_BYTES: usize = 4 * 1024 * 1024;
+const MAX_BODY_BYTES: usize = 16 * 1024 * 1024;
 
 #[derive(Debug, Clone)]
 pub struct BrokerSession {
@@ -460,20 +460,53 @@ pub(crate) fn resolve_broker_credentials_from(
     }
     if let Some(home_dir) = home {
         let fallback = home_dir.join(".run").join("aegis-broker.json");
-        if fallback.is_file() {
-            let raw = std::fs::read_to_string(&fallback).with_context(|| {
-                format!("reading confined broker credentials '{}'", fallback.display())
-            })?;
-            let parsed: ConfinedBrokerFile = serde_json::from_str(&raw).with_context(|| {
-                format!("parsing confined broker credentials '{}'", fallback.display())
-            })?;
-            if !parsed.control_socket.trim().is_empty() && !parsed.session_token.trim().is_empty()
-            {
-                return Ok((
-                    parsed.control_socket,
-                    parsed.session_token,
-                    prof.or(parsed.tool_profile),
-                ));
+        match std::fs::symlink_metadata(&fallback) {
+            Ok(meta) => {
+                if meta.file_type().is_symlink() {
+                    anyhow::bail!(
+                        "refusing symlinked confined broker credentials '{}'",
+                        fallback.display()
+                    );
+                }
+                if meta.is_file() {
+                    let raw = {
+                        use std::io::Read;
+                        let mut opts = std::fs::OpenOptions::new();
+                        opts.read(true);
+                        #[cfg(unix)]
+                        {
+                            use std::os::unix::fs::OpenOptionsExt;
+                            opts.custom_flags(libc::O_NOFOLLOW);
+                        }
+                        let mut f = opts.open(&fallback).with_context(|| {
+                            format!("opening confined broker credentials '{}'", fallback.display())
+                        })?;
+                        let mut s = String::new();
+                        f.read_to_string(&mut s).with_context(|| {
+                            format!("reading confined broker credentials '{}'", fallback.display())
+                        })?;
+                        s
+                    };
+                    let parsed: ConfinedBrokerFile =
+                        serde_json::from_str(&raw).with_context(|| {
+                            format!("parsing confined broker credentials '{}'", fallback.display())
+                        })?;
+                    if !parsed.control_socket.trim().is_empty()
+                        && !parsed.session_token.trim().is_empty()
+                    {
+                        return Ok((
+                            parsed.control_socket,
+                            parsed.session_token,
+                            prof.or(parsed.tool_profile),
+                        ));
+                    }
+                }
+            }
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+            Err(e) => {
+                return Err(e).with_context(|| {
+                    format!("inspecting confined broker credentials '{}'", fallback.display())
+                });
             }
         }
     }
@@ -507,6 +540,19 @@ pub async fn control_request(method: &str, path: &str, payload: Option<&Value>) 
     control_request_at(&socket, &token, method, path, payload).await
 }
 
+fn map_broker_path_for_http(socket: &str, path: &str) -> (String, String) {
+    let after = socket.strip_prefix("http://").unwrap_or(socket);
+    let authority = after.split('/').next().unwrap_or(after).to_string();
+    let mapped = if path == "/v1/mcp" {
+        "/__aegis/mcp/_kernel".to_string()
+    } else if let Some(rest) = path.strip_prefix("/v1/mcp-proxy/") {
+        format!("/__aegis/mcp/{}", rest.trim_matches('/'))
+    } else {
+        path.to_string()
+    };
+    (authority, mapped)
+}
+
 async fn control_request_at(
     socket: &str,
     token: &str,
@@ -515,6 +561,17 @@ async fn control_request_at(
     payload: Option<&Value>,
 ) -> Result<Value> {
     let body = payload.map(serde_json::to_vec).transpose()?.unwrap_or_default();
+    if socket.starts_with("http://") {
+        let (authority, mapped_path) = map_broker_path_for_http(socket, path);
+        let request = format!(
+            "{method} {mapped_path} HTTP/1.1\r\nHost: {authority}\r\nX-Aegis-Token: {token}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+            body.len()
+        );
+        let stream = TcpStream::connect(&authority)
+            .await
+            .with_context(|| format!("connecting to session broker HTTP {authority}"))?;
+        return exchange(stream, &request, &body).await;
+    }
     let request = format!(
         "{method} {path} HTTP/1.1\r\nHost: aegis-session-broker\r\nX-Aegis-Token: {token}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
         body.len()
@@ -530,6 +587,164 @@ async fn control_request_at(
             .with_context(|| format!("connecting to session broker socket {socket}"))?;
         exchange(stream, &request, &body).await
     }
+}
+
+pub(crate) async fn control_request_mcp_streaming(
+    path: &str,
+    payload: &Value,
+    dry_run: bool,
+    on_notification: tokio::sync::mpsc::UnboundedSender<Value>,
+) -> Result<Value> {
+    let (socket, token, _) = resolve_broker_credentials()?;
+    control_request_mcp_streaming_at(&socket, &token, path, payload, dry_run, on_notification).await
+}
+
+pub(crate) async fn control_request_mcp_streaming_at(
+    socket: &str,
+    token: &str,
+    path: &str,
+    payload: &Value,
+    dry_run: bool,
+    on_notification: tokio::sync::mpsc::UnboundedSender<Value>,
+) -> Result<Value> {
+    let body = serde_json::to_vec(payload)?;
+    let dry_hdr = if dry_run {
+        "X-Aegis-Mcp-Dry-Run: 1\r\n"
+    } else {
+        ""
+    };
+    if socket.starts_with("http://") {
+        let (authority, mapped_path) = map_broker_path_for_http(socket, path);
+        let request = format!(
+            "POST {mapped_path} HTTP/1.1\r\nHost: {authority}\r\nX-Aegis-Token: {token}\r\nAccept: text/event-stream, application/json\r\nContent-Type: application/json\r\n{dry_hdr}Content-Length: {}\r\nConnection: close\r\n\r\n",
+            body.len()
+        );
+        let stream = TcpStream::connect(&authority)
+            .await
+            .with_context(|| format!("connecting to session broker HTTP {authority}"))?;
+        return exchange_mcp_streaming(stream, &request, &body, on_notification).await;
+    }
+    let request = format!(
+        "POST {path} HTTP/1.1\r\nHost: aegis-session-broker\r\nX-Aegis-Token: {token}\r\nAccept: text/event-stream, application/json\r\nContent-Type: application/json\r\n{dry_hdr}Content-Length: {}\r\nConnection: close\r\n\r\n",
+        body.len()
+    );
+    if let Some(addr) = socket.strip_prefix("tcp://") {
+        let stream = TcpStream::connect(addr)
+            .await
+            .with_context(|| format!("connecting to session broker TCP {addr}"))?;
+        exchange_mcp_streaming(stream, &request, &body, on_notification).await
+    } else {
+        let stream = UnixStream::connect(socket)
+            .await
+            .with_context(|| format!("connecting to session broker socket {socket}"))?;
+        exchange_mcp_streaming(stream, &request, &body, on_notification).await
+    }
+}
+
+async fn exchange_mcp_streaming<S>(
+    mut stream: S,
+    request: &str,
+    body: &[u8],
+    on_notification: tokio::sync::mpsc::UnboundedSender<Value>,
+) -> Result<Value>
+where
+    S: AsyncRead + AsyncWrite + Unpin,
+{
+    stream.write_all(request.as_bytes()).await?;
+    if !body.is_empty() {
+        stream.write_all(body).await?;
+    }
+    stream.flush().await?;
+
+    let mut reader = BufReader::new(stream);
+    let mut status_line = String::new();
+    let n = reader.read_line(&mut status_line).await?;
+    if n == 0 {
+        anyhow::bail!("session broker closed connection before status line");
+    }
+    let status = status_line.trim().to_string();
+    let mut content_type = String::new();
+    loop {
+        let mut line = String::new();
+        let hn = reader.read_line(&mut line).await?;
+        if hn == 0 || line.trim().is_empty() {
+            break;
+        }
+        if let Some((k, v)) = line.split_once(':') {
+            if k.trim().eq_ignore_ascii_case("content-type") {
+                content_type = v.trim().to_ascii_lowercase();
+            }
+        }
+    }
+    if status.contains(" 202 ") || status.contains(" 204 ") {
+        return Ok(Value::Null);
+    }
+    if !status.contains(" 200 ") && !status.contains(" 201 ") {
+        let mut err_buf = Vec::new();
+        let _ = reader.take(64 * 1024).read_to_end(&mut err_buf).await;
+        let value: Value = serde_json::from_slice(&err_buf).unwrap_or(Value::Null);
+        anyhow::bail!("session broker returned {}: {}", status, value);
+    }
+
+    if content_type.contains("text/event-stream") {
+        let mut data_lines: Vec<String> = Vec::new();
+        let mut final_resp: Option<Value> = None;
+        loop {
+            let mut raw = Vec::new();
+            let rn = (&mut reader)
+                .take((MAX_BODY_BYTES + 1) as u64)
+                .read_until(b'\n', &mut raw)
+                .await?;
+            if rn > 0 && raw.len() > MAX_BODY_BYTES {
+                anyhow::bail!("session broker SSE line exceeded max body limit");
+            }
+            if rn == 0 {
+                if !data_lines.is_empty() {
+                    let payload = data_lines.join("\n");
+                    if let Ok(val) = serde_json::from_str::<Value>(&payload) {
+                        if val.get("result").is_some() || val.get("error").is_some() {
+                            final_resp = Some(val);
+                        } else {
+                            let _ = on_notification.send(val);
+                        }
+                    }
+                }
+                break;
+            }
+            let line = String::from_utf8_lossy(&raw).trim_end_matches(&['\r', '\n'][..]).to_string();
+            if line.is_empty() {
+                if !data_lines.is_empty() {
+                    let payload = data_lines.join("\n");
+                    data_lines.clear();
+                    if let Ok(val) = serde_json::from_str::<Value>(&payload) {
+                        if val.get("result").is_some() || val.get("error").is_some() {
+                            final_resp = Some(val);
+                        } else {
+                            let _ = on_notification.send(val);
+                        }
+                    }
+                }
+                continue;
+            }
+            if line.starts_with(':') {
+                continue;
+            }
+            if let Some(rest) = line.strip_prefix("data:") {
+                data_lines.push(rest.strip_prefix(' ').unwrap_or(rest).to_string());
+            }
+        }
+        return Ok(final_resp.unwrap_or(Value::Null));
+    }
+
+    let mut resp_bytes = Vec::new();
+    reader
+        .take((MAX_BODY_BYTES + 1) as u64)
+        .read_to_end(&mut resp_bytes)
+        .await?;
+    if resp_bytes.len() > MAX_BODY_BYTES {
+        anyhow::bail!("session broker response exceeded max body limit");
+    }
+    Ok(serde_json::from_slice(&resp_bytes).unwrap_or(Value::Null))
 }
 
 async fn exchange<S>(mut stream: S, request: &str, body: &[u8]) -> Result<Value>
@@ -645,18 +860,29 @@ where
         )
         .await;
     }
+    let mut body_truncated = false;
     while buf.len() < header_end + content_length {
         let Ok(Ok(n)) = tokio::time::timeout_at(deadline, stream.read(&mut chunk)).await else {
+            body_truncated = true;
             break;
         };
         if n == 0 {
+            body_truncated = true;
             break;
         }
         buf.extend_from_slice(&chunk[..n]);
     }
     let body_end = (header_end + content_length).min(buf.len());
     let body = String::from_utf8_lossy(&buf[header_end..body_end]).to_string();
-    let payload: Value = serde_json::from_str(&body).unwrap_or(Value::Null);
+    let parsed_json = if body.trim().is_empty() {
+        Err(serde_json::Error::io(std::io::Error::new(
+            std::io::ErrorKind::UnexpectedEof,
+            "empty body",
+        )))
+    } else {
+        serde_json::from_str::<Value>(&body)
+    };
+    let payload: Value = parsed_json.as_ref().ok().cloned().unwrap_or(Value::Null);
 
     let presented = headers
         .get("x-aegis-token")
@@ -669,7 +895,8 @@ where
         .unwrap_or_default();
 
     let path_only = target.split('?').next().unwrap_or(target);
-    let agent_route = (method == "POST" && path_only.starts_with("/v1/mcp-proxy/"))
+    let is_mcp_path = path_only == "/v1/mcp" || path_only.starts_with("/v1/mcp-proxy/");
+    let agent_route = is_mcp_path
         || matches!(
             (method, path_only),
             ("GET", "/v1/session")
@@ -679,7 +906,6 @@ where
                 | ("POST", "/v1/adapter/effect")
                 | ("POST", "/v1/effects")
                 | ("POST", "/v1/hook")
-                | ("POST", "/v1/mcp")
                 | ("POST", "/v1/adapter/heartbeat")
         );
     let human_route = path_only == "/v1/escalations"
@@ -715,6 +941,29 @@ where
             json!({"error": "Session control plane is locked while host_exec is running"}),
         )
         .await;
+    }
+
+    if is_mcp_path {
+        if method != "POST" {
+            let err_body = serde_json::to_vec(&json!({
+                "error": "Method Not Allowed: use POST for MCP JSON-RPC"
+            }))?;
+            let head = format!(
+                "HTTP/1.1 405 Method Not Allowed\r\nAllow: POST\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                err_body.len()
+            );
+            stream.write_all(head.as_bytes()).await?;
+            stream.write_all(&err_body).await?;
+            return Ok(());
+        }
+        if body_truncated || buf.len() < header_end + content_length || parsed_json.is_err() {
+            return write_json(
+                &mut stream,
+                "400 Bad Request",
+                json!({ "error": "invalid or truncated JSON-RPC request body" }),
+            )
+            .await;
+        }
     }
 
     match (method, path_only) {
@@ -1069,7 +1318,7 @@ where
                 match state
                     .kernel
                     .mcp_firewall
-                    .approve_outbox_ticket(ticket_id, "session-human-token")
+                    .approve_outbox_ticket(&state.identity.org_id, ticket_id, "session-human-token")
                     .await
                 {
                     Ok(ticket) => {
@@ -1083,7 +1332,7 @@ where
                 match state
                     .kernel
                     .mcp_firewall
-                    .deny_outbox_ticket(ticket_id, "session-human-token")
+                    .deny_outbox_ticket(&state.identity.org_id, ticket_id, "session-human-token")
                     .await
                 {
                     Ok(ticket) => {
@@ -1561,6 +1810,12 @@ fn is_credential_or_ring0_path(raw: &str, norm_s: &str) -> bool {
         ".dek.enc.json",
         "/master.kek",
         "/.master.kek",
+        "/aegis-broker.json",
+        "/mcp_auth_realms.json",
+        "/mcp_firewall_state.json",
+        "/mcp_bundles.json",
+        "/session_taints.json",
+        "/.ephemeral.kek",
     ];
     for candidate in [raw, norm_s] {
         if MARKERS.iter().any(|m| candidate.contains(m))
@@ -2614,5 +2869,81 @@ print("BROKER_PROBE_DONE")
         .unwrap();
         assert_eq!(extended["status"], "extended");
         assert!(session_dir.join("egress_usage.json").is_file());
+    }
+
+    #[tokio::test]
+    async fn test_http_control_bridge_mapping_and_405_400_compliance() {
+        let tmp = tempfile::tempdir().unwrap();
+        let runtime = tmp.path().join("rt");
+        let workspace = tmp.path().join("ws");
+        let shadow = tmp.path().join("shadow");
+        let agent_home = tmp.path().join("agent_home");
+        let session_dir = tmp.path().join("session");
+        for d in [&runtime, &workspace, &shadow, &agent_home, &session_dir] {
+            std::fs::create_dir_all(d).unwrap();
+        }
+        let identity = AgentIdentity::new("acme", "a1", "Coder");
+        let broker = SessionBroker::start_with_egress(
+            &runtime,
+            &session_dir,
+            tmp.path().join("ctrl"),
+            BrokerSession {
+                session_id: "ses_http_map".to_string(),
+                mode: "implement".to_string(),
+                enforcement: "isolated".to_string(),
+                workspace: workspace.display().to_string(),
+                shadow: shadow.display().to_string(),
+                agent_home: agent_home.display().to_string(),
+            },
+            identity,
+            Some("127.0.0.1:18080".to_string()),
+            false,
+            None,
+        )
+        .await
+        .unwrap();
+
+        // 1. Verify `http://` mapping translates `/v1/mcp` -> `/__aegis/mcp/_kernel` and `/v1/mcp-proxy/<id>`
+        let (auth, path1) = map_broker_path_for_http(
+            "http://127.0.0.1:18080/__aegis/mcp/_kernel",
+            "/v1/mcp",
+        );
+        assert_eq!(auth, "127.0.0.1:18080");
+        assert_eq!(path1, "/__aegis/mcp/_kernel");
+        let (_, path2) = map_broker_path_for_http(
+            "http://127.0.0.1:18080/__aegis/mcp/_kernel",
+            "/v1/mcp-proxy/heurion-macro",
+        );
+        assert_eq!(path2, "/__aegis/mcp/heurion-macro");
+
+        // 2. Verify `GET /v1/mcp` returns 405 Method Not Allowed with `Allow: POST`
+        let ep = broker.control_endpoint();
+        let sock_path = ep.trim();
+        let mut s1 = UnixStream::connect(sock_path).await.unwrap();
+        let req1 = format!(
+            "GET /v1/mcp HTTP/1.1\r\nHost: test\r\nX-Aegis-Token: {}\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
+            broker.agent_token
+        );
+        s1.write_all(req1.as_bytes()).await.unwrap();
+        let mut raw1 = Vec::new();
+        s1.read_to_end(&mut raw1).await.unwrap();
+        let txt1 = String::from_utf8_lossy(&raw1);
+        assert!(txt1.contains("405 Method Not Allowed"), "{txt1}");
+        assert!(txt1.contains("Allow: POST"), "{txt1}");
+
+        // 3. Verify `POST /v1/mcp` with invalid JSON returns 400 Bad Request
+        let mut s2 = UnixStream::connect(sock_path).await.unwrap();
+        let bad_body = b"{not-json";
+        let req2 = format!(
+            "POST /v1/mcp HTTP/1.1\r\nHost: test\r\nX-Aegis-Token: {}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+            broker.agent_token,
+            bad_body.len()
+        );
+        s2.write_all(req2.as_bytes()).await.unwrap();
+        s2.write_all(bad_body).await.unwrap();
+        let mut raw2 = Vec::new();
+        s2.read_to_end(&mut raw2).await.unwrap();
+        let txt2 = String::from_utf8_lossy(&raw2);
+        assert!(txt2.contains("400 Bad Request"), "{txt2}");
     }
 }

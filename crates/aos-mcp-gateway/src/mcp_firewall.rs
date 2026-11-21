@@ -20,7 +20,7 @@
 
 use crate::mcp_http::{
     send_http_jsonrpc_streaming, validate_mcp_http_url_syntax, HttpRpcOutcome,
-    DEFAULT_IDLE_READ_TIMEOUT_MS,
+    DEFAULT_IDLE_READ_TIMEOUT_MS, MAX_MCP_HTTP_RESPONSE_BYTES,
 };
 use crate::mcp_oauth::{sanitize_realm_id, McpOAuthManager};
 use anyhow::{bail, Context};
@@ -363,30 +363,37 @@ fn strip_hidden_html_blocks(input: &str) -> (String, usize) {
         ("<style", "</style>"),
         ("<!--", "-->"),
     ] {
+        let mut search_offset = 0usize;
         loop {
             let lower = current.to_ascii_lowercase();
-            let Some(start) = lower.find(open_tag) else {
+            if search_offset >= lower.len() {
+                break;
+            }
+            let Some(rel) = lower[search_offset..].find(open_tag) else {
                 break;
             };
+            let start = search_offset + rel;
             // Ensure `<script` matches `<script>` or `<script ...`, not `<scripting>`.
             if open_tag.starts_with('<') && open_tag != "<!--" {
                 let after = lower.as_bytes().get(start + open_tag.len()).copied();
                 if after.is_some_and(|b| !b.is_ascii_whitespace() && b != b'>' && b != b'/') {
-                    break;
+                    search_offset = start + open_tag.len();
+                    continue;
                 }
             }
             let search_from = start + open_tag.len();
             let end = lower[search_from..]
                 .find(close_tag)
-                .map(|rel| search_from + rel + close_tag.len())
+                .map(|r| search_from + r + close_tag.len())
                 .unwrap_or_else(|| {
                     lower[search_from..]
                         .find('>')
-                        .map(|rel| search_from + rel + 1)
+                        .map(|r| search_from + r + 1)
                         .unwrap_or(current.len())
                 });
             current.replace_range(start..end, "");
             signals += 1;
+            search_offset = start.min(current.len());
         }
     }
 
@@ -458,7 +465,18 @@ fn strip_hidden_html_blocks(input: &str) -> (String, usize) {
 fn is_zero_width_or_bidi_char(c: char) -> bool {
     matches!(
         c,
-        '\u{200B}'..='\u{200F}' | '\u{202A}'..='\u{202E}' | '\u{2060}'..='\u{206F}' | '\u{FEFF}'
+        '\u{00AD}'
+            | '\u{034F}'
+            | '\u{061C}'
+            | '\u{180E}'
+            | '\u{200B}'..='\u{200F}'
+            | '\u{202A}'..='\u{202E}'
+            | '\u{2060}'..='\u{206F}'
+            | '\u{FE00}'..='\u{FE0F}'
+            | '\u{FEFF}'
+            | '\u{FFF9}'..='\u{FFFB}'
+            | '\u{E0000}'..='\u{E007F}'
+            | '\u{E0100}'..='\u{E01EF}'
     )
 }
 
@@ -480,6 +498,15 @@ pub fn sanitize_inbound_mcp_text(text: &str) -> (String, usize) {
 }
 
 pub fn sanitize_inbound_mcp_value(val: &mut Value, strip_injection: bool) -> usize {
+    sanitize_inbound_mcp_value_at(val, strip_injection, 0, false)
+}
+
+fn sanitize_inbound_mcp_value_at(
+    val: &mut Value,
+    strip_injection: bool,
+    depth: usize,
+    in_content_item: bool,
+) -> usize {
     let mut signals = 0usize;
     match val {
         Value::String(s) => {
@@ -499,16 +526,25 @@ pub fn sanitize_inbound_mcp_value(val: &mut Value, strip_injection: bool) -> usi
         }
         Value::Array(arr) => {
             for item in arr {
-                signals += sanitize_inbound_mcp_value(item, strip_injection);
+                signals +=
+                    sanitize_inbound_mcp_value_at(item, strip_injection, depth + 1, in_content_item);
             }
         }
         Value::Object(map) => {
             for (k, v) in map.iter_mut() {
-                if matches!(k.as_str(), "jsonrpc" | "id" | "method" | "type" | "mimeType" | "uri" | "name")
-                {
+                let skip = (depth == 0 && matches!(k.as_str(), "jsonrpc" | "id" | "method"))
+                    || (in_content_item && matches!(k.as_str(), "type" | "mimeType"));
+                if skip {
                     continue;
                 }
-                signals += sanitize_inbound_mcp_value(v, strip_injection);
+                let child_is_content_items =
+                    depth <= 1 && matches!(k.as_str(), "content" | "contents") && v.is_array();
+                signals += sanitize_inbound_mcp_value_at(
+                    v,
+                    strip_injection,
+                    depth + 1,
+                    child_is_content_items,
+                );
             }
         }
         _ => {}
@@ -545,42 +581,50 @@ fn split_identifier_tokens(name: &str) -> Vec<String> {
     tokens
 }
 
-fn strip_sql_comments(sql: &str) -> String {
+fn strip_sql_comments_and_literals(sql: &str) -> String {
     let mut out = String::with_capacity(sql.len());
     let chars: Vec<char> = sql.chars().collect();
     let mut i = 0usize;
-    let mut in_single = false;
-    let mut in_double = false;
     while i < chars.len() {
         let ch = chars[i];
-        if !in_double && ch == '\'' {
-            in_single = !in_single;
-            out.push(ch);
-            i += 1;
+        // Line comment `-- ...`
+        if ch == '-' && chars.get(i + 1) == Some(&'-') {
+            while i < chars.len() && chars[i] != '\n' {
+                i += 1;
+            }
+            out.push(' ');
             continue;
         }
-        if !in_single && ch == '"' {
-            in_double = !in_double;
-            out.push(ch);
-            i += 1;
+        // Block comment `/* ... */`
+        if ch == '/' && chars.get(i + 1) == Some(&'*') {
+            i += 2;
+            while i + 1 < chars.len() && !(chars[i] == '*' && chars[i + 1] == '/') {
+                i += 1;
+            }
+            i = (i + 2).min(chars.len());
+            out.push(' ');
             continue;
         }
-        if !in_single && !in_double {
-            if ch == '-' && chars.get(i + 1) == Some(&'-') {
-                while i < chars.len() && chars[i] != '\n' {
-                    i += 1;
+        // Single-quoted string literal `'...'` (handles `''` and `\'` escapes)
+        if ch == '\'' {
+            i += 1;
+            while i < chars.len() {
+                if chars[i] == '\\' && i + 1 < chars.len() {
+                    i += 2;
+                    continue;
                 }
-                continue;
-            }
-            if ch == '/' && chars.get(i + 1) == Some(&'*') {
-                i += 2;
-                while i + 1 < chars.len() && !(chars[i] == '*' && chars[i + 1] == '/') {
+                if chars[i] == '\'' {
+                    if chars.get(i + 1) == Some(&'\'') {
+                        i += 2;
+                        continue;
+                    }
                     i += 1;
+                    break;
                 }
-                i = (i + 2).min(chars.len());
-                out.push(' ');
-                continue;
+                i += 1;
             }
+            out.push(' ');
+            continue;
         }
         out.push(ch);
         i += 1;
@@ -588,76 +632,109 @@ fn strip_sql_comments(sql: &str) -> String {
     out
 }
 
+fn sql_word_tokens(stmt: &str) -> Vec<String> {
+    stmt.split(|c: char| !c.is_ascii_alphanumeric() && c != '_')
+        .filter(|t| !t.is_empty())
+        .map(|t| t.to_ascii_uppercase())
+        .collect()
+}
+
+fn is_sql_statement_starter(word: &str) -> bool {
+    matches!(
+        word,
+        "SELECT"
+            | "WITH"
+            | "EXPLAIN"
+            | "SHOW"
+            | "DESCRIBE"
+            | "DESC"
+            | "PRAGMA"
+            | "VALUES"
+            | "INSERT"
+            | "UPDATE"
+            | "REPLACE"
+            | "CREATE"
+            | "MERGE"
+            | "UPSERT"
+            | "CALL"
+            | "EXEC"
+            | "EXECUTE"
+            | "COPY"
+            | "ATTACH"
+            | "DO"
+            | "PERFORM"
+            | "DROP"
+            | "TRUNCATE"
+            | "ALTER"
+            | "DELETE"
+            | "GRANT"
+            | "REVOKE"
+            | "VACUUM"
+            | "DETACH"
+            | "BEGIN"
+            | "COMMIT"
+            | "ROLLBACK"
+            | "SAVEPOINT"
+    )
+}
+
 fn classify_sql_text(sql: &str) -> Option<McpToolRiskClass> {
-    let cleaned = strip_sql_comments(sql);
-    let mut stmts = Vec::new();
-    let mut cur = String::new();
-    let mut in_single = false;
-    let mut in_double = false;
-    for ch in cleaned.chars() {
-        match ch {
-            '\'' if !in_double => {
-                in_single = !in_single;
-                cur.push(ch);
-            }
-            '"' if !in_single => {
-                in_double = !in_double;
-                cur.push(ch);
-            }
-            ';' if !in_single && !in_double => {
-                if !cur.trim().is_empty() {
-                    stmts.push(cur.trim().to_string());
-                }
-                cur.clear();
-            }
-            other => cur.push(other),
-        }
-    }
-    if !cur.trim().is_empty() {
-        stmts.push(cur.trim().to_string());
-    }
+    let cleaned = strip_sql_comments_and_literals(sql);
+    let stmts: Vec<Vec<String>> = cleaned
+        .split(';')
+        .map(sql_word_tokens)
+        .filter(|toks| !toks.is_empty())
+        .collect();
     if stmts.is_empty() {
         return None;
     }
+    // Non-SQL prose in a single `query` parameter (e.g. search queries) must not trigger SQL rules.
+    let any_sql_starter = stmts
+        .iter()
+        .any(|toks| is_sql_statement_starter(toks[0].as_str()));
+    if !any_sql_starter {
+        return None;
+    }
+
     let mut seen_read = false;
     let mut seen_write = false;
-    for stmt in &stmts {
-        let upper_stmt = stmt.to_ascii_uppercase();
-        let first_word = upper_stmt
-            .split_whitespace()
-            .next()
-            .unwrap_or("")
-            .trim_start_matches('(');
-        if matches!(
-            first_word,
-            "DROP" | "TRUNCATE" | "ALTER" | "DELETE" | "GRANT" | "REVOKE" | "VACUUM" | "DETACH"
-        ) {
-            return Some(McpToolRiskClass::Destructive);
-        }
-        if matches!(
-            first_word,
-            "INSERT" | "UPDATE" | "REPLACE" | "CREATE" | "MERGE" | "UPSERT" | "CALL" | "EXEC"
-                | "COPY" | "ATTACH"
-        ) {
-            seen_write = true;
-            continue;
-        }
-        if matches!(
-            first_word,
-            "SELECT" | "WITH" | "EXPLAIN" | "SHOW" | "DESCRIBE" | "DESC" | "PRAGMA"
-        ) {
-            if upper_stmt.contains(" INTO OUTFILE ") || upper_stmt.contains(" INTO DUMPFILE ") {
-                seen_write = true;
-            } else {
-                seen_read = true;
+    for tokens in &stmts {
+        for word in tokens {
+            if matches!(
+                word.as_str(),
+                "DROP" | "TRUNCATE" | "ALTER" | "DELETE" | "GRANT" | "REVOKE" | "VACUUM" | "DETACH"
+            ) {
+                return Some(McpToolRiskClass::Destructive);
             }
-            continue;
+            if matches!(
+                word.as_str(),
+                "INSERT"
+                    | "UPDATE"
+                    | "REPLACE"
+                    | "CREATE"
+                    | "MERGE"
+                    | "UPSERT"
+                    | "CALL"
+                    | "EXEC"
+                    | "EXECUTE"
+                    | "COPY"
+                    | "ATTACH"
+                    | "DO"
+                    | "PERFORM"
+                    | "INTO"
+            ) {
+                seen_write = true;
+            }
         }
-        // Unrecognized first SQL word: do not treat as SQL if first statement isn't SQL-like.
-        if stmts.len() == 1 {
-            return None;
+        let first_word = tokens[0].as_str();
+        if matches!(
+            first_word,
+            "SELECT" | "WITH" | "EXPLAIN" | "SHOW" | "DESCRIBE" | "DESC" | "PRAGMA" | "VALUES"
+        ) {
+            seen_read = true;
+        } else {
+            seen_write = true;
         }
-        seen_write = true;
     }
     if seen_write {
         Some(McpToolRiskClass::StagedWrite)
@@ -692,10 +769,10 @@ pub fn classify_mcp_tool(
                     if sql_class != McpToolRiskClass::ReadOnly {
                         return sql_class;
                     }
-                    if cached_annotations
-                        .and_then(|a| a.destructive_hint)
-                        != Some(true)
-                    {
+                    let explicit_non_readonly = cached_annotations.is_some_and(|a| {
+                        a.destructive_hint == Some(true) || a.read_only_hint == Some(false)
+                    });
+                    if !explicit_non_readonly {
                         return McpToolRiskClass::ReadOnly;
                     }
                 }
@@ -1296,6 +1373,40 @@ pub fn client_config_candidates(
     out
 }
 
+fn strip_aegis_codex_managed_block(src: &str) -> (String, bool) {
+    let mut out = Vec::new();
+    let mut in_managed_block = false;
+    let mut removed = false;
+    for line in src.lines() {
+        let trimmed = line.trim();
+        if trimmed == "# --- AEGIS-OS-RUNTIME-START ---" {
+            in_managed_block = true;
+            removed = true;
+            continue;
+        }
+        if trimmed == "# --- AEGIS-OS-RUNTIME-END ---" {
+            in_managed_block = false;
+            removed = true;
+            continue;
+        }
+        if !in_managed_block {
+            out.push(line);
+        }
+    }
+    if !removed {
+        return (src.to_string(), false);
+    }
+    let mut joined = out.join("\n");
+    if src.ends_with('\n') && !joined.is_empty() && !joined.ends_with('\n') {
+        joined.push('\n');
+    }
+    (joined, true)
+}
+
+fn claude_project_key(client: &str) -> Option<&str> {
+    client.strip_prefix("claude-project:")
+}
+
 /// Scans all supported client MCP configurations without mutating files or exposing secret values.
 pub fn scan_client_configs(home_dir: &Path, workspace: &Path) -> Vec<DiscoveredClientMcpServer> {
     let mut discovered = Vec::new();
@@ -1308,29 +1419,60 @@ pub fn scan_client_configs(home_dir: &Path, workspace: &Path) -> Vec<DiscoveredC
                 let Ok(root) = serde_json::from_str::<Value>(&raw_text) else {
                     continue;
                 };
-                let Some(servers) = root.get("mcpServers").and_then(|v| v.as_object()) else {
-                    continue;
-                };
-                for (key, entry) in servers {
-                    if key == "aegis-os" {
-                        continue;
+                if let Some(servers) = root.get("mcpServers").and_then(|v| v.as_object()) {
+                    for (key, entry) in servers {
+                        if key == "aegis-os" {
+                            continue;
+                        }
+                        let already_adopted = is_already_aegis_proxy_entry(key, entry);
+                        let Some((transport_kind, plaintext_secret_keys)) =
+                            inspect_entry_secrets_and_transport(entry)
+                        else {
+                            continue;
+                        };
+                        discovered.push(DiscoveredClientMcpServer {
+                            server_id: sanitize_server_id(key),
+                            client: client.to_string(),
+                            config_path: path.clone(),
+                            server_key: key.clone(),
+                            already_adopted,
+                            transport_kind,
+                            plaintext_secret_keys,
+                            raw_entry: entry.clone(),
+                        });
                     }
-                    let already_adopted = is_already_aegis_proxy_entry(key, entry);
-                    let Some((transport_kind, plaintext_secret_keys)) =
-                        inspect_entry_secrets_and_transport(entry)
-                    else {
-                        continue;
-                    };
-                    discovered.push(DiscoveredClientMcpServer {
-                        server_id: sanitize_server_id(key),
-                        client: client.to_string(),
-                        config_path: path.clone(),
-                        server_key: key.clone(),
-                        already_adopted,
-                        transport_kind,
-                        plaintext_secret_keys,
-                        raw_entry: entry.clone(),
-                    });
+                }
+                if client == "claude" {
+                    if let Some(projects) = root.get("projects").and_then(|v| v.as_object()) {
+                        for (proj_path, proj_val) in projects {
+                            let Some(proj_servers) =
+                                proj_val.get("mcpServers").and_then(|v| v.as_object())
+                            else {
+                                continue;
+                            };
+                            for (key, entry) in proj_servers {
+                                if key == "aegis-os" {
+                                    continue;
+                                }
+                                let already_adopted = is_already_aegis_proxy_entry(key, entry);
+                                let Some((transport_kind, plaintext_secret_keys)) =
+                                    inspect_entry_secrets_and_transport(entry)
+                                else {
+                                    continue;
+                                };
+                                discovered.push(DiscoveredClientMcpServer {
+                                    server_id: sanitize_server_id(key),
+                                    client: format!("claude-project:{proj_path}"),
+                                    config_path: path.clone(),
+                                    server_key: key.clone(),
+                                    already_adopted,
+                                    transport_kind,
+                                    plaintext_secret_keys,
+                                    raw_entry: entry.clone(),
+                                });
+                            }
+                        }
+                    }
                 }
             }
             ConfigFormatKind::OpenCodeJson => {
@@ -1529,7 +1671,6 @@ impl McpFirewallRegistry {
             .iter()
             .find(|s| s.org_id == org_id && s.server_id == server_id)
             .cloned()
-            .or_else(|| guard.servers.iter().find(|s| s.server_id == server_id).cloned())
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -1703,8 +1844,12 @@ impl McpFirewallRegistry {
                 .servers
                 .iter()
                 .position(|s| s.org_id == org_id && s.server_id == server_id)
-                .or_else(|| st.servers.iter().position(|s| s.server_id == server_id))
-                .with_context(|| format!("Adopted MCP server '{}' not found", server_id))?;
+                .with_context(|| {
+                    format!(
+                        "Adopted MCP server '{}' not found for org '{}'",
+                        server_id, org_id
+                    )
+                })?;
             let rec = &mut st.servers[idx];
             mutator(rec);
             rec.updated_at_ms = now_ms;
@@ -1737,6 +1882,31 @@ impl McpFirewallRegistry {
         server_filter: Option<&str>,
         trust_level: McpTrustLevel,
         dry_run: bool,
+    ) -> anyhow::Result<Vec<Value>> {
+        self.adopt_from_client_configs_with_options(
+            org_id,
+            home_dir,
+            workspace,
+            aegis_bin,
+            server_filter,
+            trust_level,
+            dry_run,
+            false,
+        )
+        .await
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub async fn adopt_from_client_configs_with_options(
+        &self,
+        org_id: &str,
+        home_dir: &Path,
+        workspace: &Path,
+        aegis_bin: &Path,
+        server_filter: Option<&str>,
+        trust_level: McpTrustLevel,
+        dry_run: bool,
+        allow_local_http_for_project: bool,
     ) -> anyhow::Result<Vec<Value>> {
         let discovered = scan_client_configs(home_dir, workspace);
         let mut results = Vec::new();
@@ -1790,11 +1960,14 @@ impl McpFirewallRegistry {
                 }
             }
 
-            let is_adopted_local_http = parsed_entry
-                .get("url")
-                .or_else(|| parsed_entry.get("serverUrl"))
-                .and_then(|v| v.as_str())
-                .is_some_and(is_loopback_http_url);
+            let is_project_config =
+                matches!(item.client.as_str(), "project-mcp" | "cursor-project");
+            let is_adopted_local_http = (!is_project_config || allow_local_http_for_project)
+                && parsed_entry
+                    .get("url")
+                    .or_else(|| parsed_entry.get("serverUrl"))
+                    .and_then(|v| v.as_str())
+                    .is_some_and(is_loopback_http_url);
             let transport = self.build_sealed_transport_from_entry(
                 org_id,
                 &target_id,
@@ -2111,7 +2284,11 @@ impl McpFirewallRegistry {
             .collect()
     }
 
-    pub async fn get_outbox_ticket(&self, ticket_id: &str) -> Option<McpOutboxTicket> {
+    pub async fn get_outbox_ticket(
+        &self,
+        org_id: &str,
+        ticket_id: &str,
+    ) -> Option<McpOutboxTicket> {
         let _io = self.io_gate.lock().await;
         self.reload_unlocked().await;
         self.state
@@ -2119,7 +2296,7 @@ impl McpFirewallRegistry {
             .await
             .outbox
             .iter()
-            .find(|t| t.ticket_id == ticket_id)
+            .find(|t| t.org_id == org_id && t.ticket_id == ticket_id)
             .cloned()
     }
 
@@ -2136,7 +2313,7 @@ impl McpFirewallRegistry {
         taint_snapshot: Option<SessionTaintRecord>,
         dry_run_only: bool,
     ) -> anyhow::Result<McpOutboxTicket> {
-        let ticket_id = format!("outbox-{}", &Uuid::new_v4().simple().to_string()[..8]);
+        let ticket_id = format!("outbox-{}", Uuid::new_v4().simple());
         let payload_sha256 = compute_outbox_payload_sha256(server_id, tool_name, &exec_arguments);
         let preview_arguments = mask_secrets_for_preview(&exec_arguments);
         let exec_bytes = canonical_json_bytes(&exec_arguments);
@@ -2182,11 +2359,12 @@ impl McpFirewallRegistry {
     /// dispatches the tool call directly from host to upstream MCP, and records audit trail.
     pub async fn approve_outbox_ticket(
         &self,
+        org_id: &str,
         ticket_id: &str,
         reviewed_by: &str,
     ) -> anyhow::Result<McpOutboxTicket> {
         let ticket = self
-            .get_outbox_ticket(ticket_id)
+            .get_outbox_ticket(org_id, ticket_id)
             .await
             .with_context(|| format!("Outbox ticket '{}' not found", ticket_id))?;
         if ticket.status != OutboxStatus::Pending {
@@ -2225,6 +2403,12 @@ impl McpFirewallRegistry {
             })?;
 
         let started = std::time::Instant::now();
+        let outbox_turn_id = format!("aegis:{}:outbox-{}", ticket.agent_id, Uuid::new_v4().simple());
+        let outbox_ctx = HttpRequestContext {
+            agent_id: &ticket.agent_id,
+            session_id: &ticket.session_id,
+            turn_id: Some(&outbox_turn_id),
+        };
         let dispatch_res = dispatch_single_tool_call(
             &self.key_store,
             &self.oauth,
@@ -2232,6 +2416,7 @@ impl McpFirewallRegistry {
             &server,
             &ticket.tool_name,
             &exec_args,
+            Some(&outbox_ctx),
         )
         .await;
         let latency_ms = started.elapsed().as_millis() as u64;
@@ -2245,10 +2430,11 @@ impl McpFirewallRegistry {
                     .and_then(|b| b.as_bool())
                     .unwrap_or(false)
                     || val.get("error").is_some();
+                let masked_val = mask_secrets_for_preview(&val);
                 if is_err {
-                    (OutboxStatus::Failed, Some(val), None)
+                    (OutboxStatus::Failed, Some(masked_val), None)
                 } else {
-                    (OutboxStatus::Dispatched, Some(val), None)
+                    (OutboxStatus::Dispatched, Some(masked_val), None)
                 }
             }
             Err(err) => (OutboxStatus::Failed, None, Some(err.to_string())),
@@ -2259,7 +2445,7 @@ impl McpFirewallRegistry {
                 let rec = st
                     .outbox
                     .iter_mut()
-                    .find(|t| t.ticket_id == ticket_id)
+                    .find(|t| t.org_id == org_id && t.ticket_id == ticket_id)
                     .with_context(|| format!("Outbox ticket '{}' disappeared", ticket_id))?;
                 if rec.status != OutboxStatus::Pending {
                     bail!(
@@ -2315,6 +2501,7 @@ impl McpFirewallRegistry {
 
     pub async fn deny_outbox_ticket(
         &self,
+        org_id: &str,
         ticket_id: &str,
         reviewed_by: &str,
     ) -> anyhow::Result<McpOutboxTicket> {
@@ -2324,7 +2511,7 @@ impl McpFirewallRegistry {
                 let rec = st
                     .outbox
                     .iter_mut()
-                    .find(|t| t.ticket_id == ticket_id)
+                    .find(|t| t.org_id == org_id && t.ticket_id == ticket_id)
                     .with_context(|| format!("Outbox ticket '{}' not found", ticket_id))?;
                 if rec.status != OutboxStatus::Pending {
                     bail!(
@@ -2419,20 +2606,23 @@ impl Drop for UpstreamStdioProcess {
 }
 
 struct UpstreamHttpSession {
-    mcp_session_id: Option<String>,
-    cached_init_request: Option<Value>,
-    tool_annotations: BTreeMap<String, CachedToolAnnotations>,
-    annotations_loaded: bool,
+    init_gate: Mutex<()>,
+    mcp_session_id: RwLock<Option<String>>,
+    cached_init_request: RwLock<Option<Value>>,
+    initialized: std::sync::atomic::AtomicBool,
+    tool_annotations: RwLock<BTreeMap<String, CachedToolAnnotations>>,
+    annotations_loaded: std::sync::atomic::AtomicBool,
 }
 
+#[derive(Clone)]
 enum UpstreamBackend {
-    Stdio(Box<UpstreamStdioProcess>),
-    Http(UpstreamHttpSession),
+    Stdio(Arc<Mutex<UpstreamStdioProcess>>),
+    Http(Arc<UpstreamHttpSession>),
 }
 
 pub struct McpProxySessionPool {
     registry: Arc<McpFirewallRegistry>,
-    sessions: Mutex<BTreeMap<String, Arc<Mutex<UpstreamBackend>>>>,
+    sessions: Mutex<BTreeMap<String, UpstreamBackend>>,
     timeout: std::time::Duration,
 }
 
@@ -2453,31 +2643,39 @@ impl McpProxySessionPool {
     async fn get_or_spawn_backend(
         &self,
         server: &AdoptedMcpServerRecord,
-    ) -> anyhow::Result<Arc<Mutex<UpstreamBackend>>> {
+    ) -> anyhow::Result<UpstreamBackend> {
         let key = format!("{}:{}", server.org_id, server.server_id);
-        let mut guard = self.sessions.lock().await;
-        if let Some(existing) = guard.get(&key) {
-            return Ok(existing.clone());
+        {
+            let guard = self.sessions.lock().await;
+            if let Some(existing) = guard.get(&key) {
+                return Ok(existing.clone());
+            }
         }
-        let backend = match &server.transport {
-            UpstreamTransportSpec::Stdio { .. } => UpstreamBackend::Stdio(Box::new(
+        // Spawn stdio children or initialize HTTP session state outside `self.sessions` mutex.
+        let candidate = match &server.transport {
+            UpstreamTransportSpec::Stdio { .. } => UpstreamBackend::Stdio(Arc::new(Mutex::new(
                 spawn_upstream_stdio(
                     &self.registry.key_store,
                     &self.registry.runtime_data_root,
                     server,
                 )
                 .await?,
-            )),
-            UpstreamTransportSpec::Http { .. } => UpstreamBackend::Http(UpstreamHttpSession {
-                mcp_session_id: None,
-                cached_init_request: None,
-                tool_annotations: BTreeMap::new(),
-                annotations_loaded: false,
-            }),
+            ))),
+            UpstreamTransportSpec::Http { .. } => UpstreamBackend::Http(Arc::new(UpstreamHttpSession {
+                init_gate: Mutex::new(()),
+                mcp_session_id: RwLock::new(None),
+                cached_init_request: RwLock::new(None),
+                initialized: std::sync::atomic::AtomicBool::new(false),
+                tool_annotations: RwLock::new(BTreeMap::new()),
+                annotations_loaded: std::sync::atomic::AtomicBool::new(false),
+            })),
         };
-        let wrapped = Arc::new(Mutex::new(backend));
-        guard.insert(key, wrapped.clone());
-        Ok(wrapped)
+        let mut guard = self.sessions.lock().await;
+        if let Some(existing) = guard.get(&key) {
+            return Ok(existing.clone());
+        }
+        guard.insert(key, candidate.clone());
+        Ok(candidate)
     }
 
     async fn drop_backend(&self, org_id: &str, server_id: &str) {
@@ -2534,6 +2732,7 @@ impl McpProxySessionPool {
             .registry
             .get_server(&identity.org_id, server_id)
             .await
+            .filter(|s| s.org_id == identity.org_id)
         else {
             return Ok(req_id.map(|id| {
                 json!({
@@ -2547,7 +2746,7 @@ impl McpProxySessionPool {
             }));
         };
 
-        let backend_arc = match self.get_or_spawn_backend(&server).await {
+        let backend = match self.get_or_spawn_backend(&server).await {
             Ok(b) => b,
             Err(err) => {
                 return Ok(req_id.map(|id| {
@@ -2563,14 +2762,105 @@ impl McpProxySessionPool {
             }
         };
 
+        let Some(outer) = on_notification else {
+            return self
+                .handle_jsonrpc_inner(
+                    identity,
+                    session_id,
+                    &server,
+                    &backend,
+                    method,
+                    req_id,
+                    request,
+                    pseudonym_table,
+                    dry_run_only,
+                    None,
+                )
+                .await;
+        };
+
+        let (inner_tx, mut inner_rx) = tokio::sync::mpsc::unbounded_channel::<Value>();
+        let strip_injection = server.policy.strip_prompt_injection;
+        let dlp_mode = server.policy.dlp_mode;
+        let is_untrusted = server.policy.trust_level == McpTrustLevel::UntrustedExternal;
+        let forward_fut = async {
+            while let Some(mut note) = inner_rx.recv().await {
+                let _ = sanitize_inbound_mcp_value(&mut note, strip_injection);
+                if dlp_mode == PseudonymMode::Pseudonymize {
+                    let _ = pseudonym_table.pseudonymize_json_value(&mut note, &[]);
+                }
+                if is_untrusted {
+                    let note_method = note
+                        .get("method")
+                        .and_then(|v| v.as_str())
+                        .unwrap_or("notification")
+                        .to_string();
+                    let _ = self
+                        .registry
+                        .policy
+                        .record_untrusted_taint(
+                            &identity.org_id,
+                            &identity.agent_id,
+                            Some(session_id),
+                            TaintSourceEntry {
+                                server_id: server.server_id.clone(),
+                                tool_name: note_method,
+                                summary: "sse-notification".to_string(),
+                                timestamp_ms: Utc::now().timestamp_millis(),
+                            },
+                            DEFAULT_TAINT_TTL_SECS,
+                        )
+                        .await;
+                }
+                let _ = outer.send(note);
+            }
+        };
+        let (outcome, ()) = tokio::join!(
+            self.handle_jsonrpc_inner(
+                identity,
+                session_id,
+                &server,
+                &backend,
+                method,
+                req_id,
+                request,
+                pseudonym_table,
+                dry_run_only,
+                Some(inner_tx),
+            ),
+            forward_fut
+        );
+        outcome
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    async fn handle_jsonrpc_inner(
+        &self,
+        identity: &AgentIdentity,
+        session_id: &str,
+        server: &AdoptedMcpServerRecord,
+        backend: &UpstreamBackend,
+        method: &str,
+        req_id: Option<Value>,
+        request: &Value,
+        pseudonym_table: &PseudonymSessionTable,
+        dry_run_only: bool,
+        on_notification: Option<tokio::sync::mpsc::UnboundedSender<Value>>,
+    ) -> anyhow::Result<Option<Value>> {
+        let rpc_ctx = HttpRequestContext {
+            agent_id: &identity.agent_id,
+            session_id,
+            turn_id: None,
+        };
+
         // Notifications (`id` absent) write and flush without awaiting a response.
         if req_id.is_none() || method.starts_with("notifications/") {
-            let mut backend = backend_arc.lock().await;
-            match &mut *backend {
-                UpstreamBackend::Stdio(proc_state) => {
+            match backend {
+                UpstreamBackend::Stdio(proc_arc) => {
+                    let mut proc_state = proc_arc.lock().await;
                     if method == "notifications/initialized" && proc_state.initialized {
                         if !proc_state.annotations_loaded {
-                            let _ = warm_stdio_tool_annotations(proc_state, self.timeout).await;
+                            let _ = warm_stdio_tool_annotations(&mut proc_state, self.timeout).await;
                         }
                         return Ok(None);
                     }
@@ -2578,22 +2868,32 @@ impl McpProxySessionPool {
                     if method == "notifications/initialized" {
                         proc_state.initialized = true;
                         if !proc_state.annotations_loaded {
-                            let _ = warm_stdio_tool_annotations(proc_state, self.timeout).await;
+                            let _ = warm_stdio_tool_annotations(&mut proc_state, self.timeout).await;
                         }
                     }
                 }
                 UpstreamBackend::Http(http_sess) => {
+                    if method == "notifications/initialized" {
+                        http_sess
+                            .initialized
+                            .store(true, std::sync::atomic::Ordering::Release);
+                    }
                     let _ = dispatch_http_session_request(
                         &self.registry.key_store,
                         &self.registry.oauth,
-                        &server,
+                        server,
                         http_sess,
                         request,
                         false,
                         None,
+                        Some(&rpc_ctx),
                     )
                     .await;
-                    if method == "notifications/initialized" && !http_sess.annotations_loaded {
+                    if method == "notifications/initialized"
+                        && !http_sess
+                            .annotations_loaded
+                            .load(std::sync::atomic::Ordering::Acquire)
+                    {
                         let list_req = json!({
                             "jsonrpc": "2.0",
                             "id": format!("warm-{}", Uuid::new_v4()),
@@ -2602,20 +2902,24 @@ impl McpProxySessionPool {
                         if let Ok(Some(list_resp)) = dispatch_http_session_request(
                             &self.registry.key_store,
                             &self.registry.oauth,
-                            &server,
+                            server,
                             http_sess,
                             &list_req,
                             true,
                             None,
+                            Some(&rpc_ctx),
                         )
                         .await
                         {
                             if let Some(tools) =
                                 list_resp.pointer("/result/tools").and_then(|v| v.as_array())
                             {
-                                http_sess.tool_annotations = extract_annotations_map(tools);
+                                *http_sess.tool_annotations.write().await =
+                                    extract_annotations_map(tools);
                             }
-                            http_sess.annotations_loaded = true;
+                            http_sess
+                                .annotations_loaded
+                                .store(true, std::sync::atomic::Ordering::Release);
                         }
                     }
                 }
@@ -2626,9 +2930,9 @@ impl McpProxySessionPool {
         let id = req_id.unwrap_or(Value::Null);
 
         if method == "initialize" {
-            let mut backend = backend_arc.lock().await;
-            match &mut *backend {
-                UpstreamBackend::Stdio(proc_state) => {
+            match backend {
+                UpstreamBackend::Stdio(proc_arc) => {
+                    let mut proc_state = proc_arc.lock().await;
                     if proc_state.initialized {
                         if let Some(mut cached) = proc_state.cached_init_response.clone() {
                             if let Some(obj) = cached.as_object_mut() {
@@ -2637,7 +2941,7 @@ impl McpProxySessionPool {
                             return Ok(Some(cached));
                         }
                     }
-                    let mut resp = send_stdio_rpc(proc_state, request, self.timeout).await?;
+                    let mut resp = send_stdio_rpc(&mut proc_state, request, self.timeout).await?;
                     proc_state.initialized = true;
                     proc_state.cached_init_response = Some(resp.clone());
                     if let Some(obj) = resp.as_object_mut() {
@@ -2646,29 +2950,33 @@ impl McpProxySessionPool {
                     return Ok(Some(resp));
                 }
                 UpstreamBackend::Http(http_sess) => {
-                    http_sess.cached_init_request = Some(request.clone());
+                    *http_sess.cached_init_request.write().await = Some(request.clone());
                     let resp = dispatch_http_session_request(
                         &self.registry.key_store,
                         &self.registry.oauth,
-                        &server,
+                        server,
                         http_sess,
                         request,
                         true,
                         on_notification,
+                        Some(&rpc_ctx),
                     )
                     .await?
                     .unwrap_or(Value::Null);
+                    http_sess
+                        .initialized
+                        .store(true, std::sync::atomic::Ordering::Release);
                     return Ok(Some(with_id(resp, id)));
                 }
             }
         }
 
         if method == "tools/list" {
-            let mut backend = backend_arc.lock().await;
-            let resp = match &mut *backend {
-                UpstreamBackend::Stdio(proc_state) => {
-                    ensure_stdio_initialized(proc_state, self.timeout).await?;
-                    let resp = send_stdio_rpc(proc_state, request, self.timeout).await?;
+            let resp = match backend {
+                UpstreamBackend::Stdio(proc_arc) => {
+                    let mut proc_state = proc_arc.lock().await;
+                    ensure_stdio_initialized(&mut proc_state, self.timeout).await?;
+                    let resp = send_stdio_rpc(&mut proc_state, request, self.timeout).await?;
                     if let Some(tools) = resp.pointer("/result/tools").and_then(|v| v.as_array()) {
                         proc_state.tool_annotations = extract_annotations_map(tools);
                         proc_state.annotations_loaded = true;
@@ -2676,20 +2984,31 @@ impl McpProxySessionPool {
                     resp
                 }
                 UpstreamBackend::Http(http_sess) => {
+                    ensure_http_initialized(
+                        &self.registry.key_store,
+                        &self.registry.oauth,
+                        server,
+                        http_sess,
+                        Some(&rpc_ctx),
+                    )
+                    .await?;
                     let resp = dispatch_http_session_request(
                         &self.registry.key_store,
                         &self.registry.oauth,
-                        &server,
+                        server,
                         http_sess,
                         request,
                         true,
                         on_notification,
+                        Some(&rpc_ctx),
                     )
                     .await?
                     .unwrap_or(Value::Null);
                     if let Some(tools) = resp.pointer("/result/tools").and_then(|v| v.as_array()) {
-                        http_sess.tool_annotations = extract_annotations_map(tools);
-                        http_sess.annotations_loaded = true;
+                        *http_sess.tool_annotations.write().await = extract_annotations_map(tools);
+                        http_sess
+                            .annotations_loaded
+                            .store(true, std::sync::atomic::Ordering::Release);
                     }
                     resp
                 }
@@ -2702,8 +3021,8 @@ impl McpProxySessionPool {
                 .handle_tools_call(
                     identity,
                     session_id,
-                    &server,
-                    &backend_arc,
+                    server,
+                    backend,
                     id,
                     request,
                     pseudonym_table,
@@ -2719,8 +3038,8 @@ impl McpProxySessionPool {
                 .handle_resources_read(
                     identity,
                     session_id,
-                    &server,
-                    &backend_arc,
+                    server,
+                    backend,
                     id,
                     request,
                     pseudonym_table,
@@ -2731,23 +3050,34 @@ impl McpProxySessionPool {
         }
 
         // Other metadata methods (`resources/list`, `prompts/list`, `prompts/get`, `ping`)
-        let mut backend = backend_arc.lock().await;
-        let resp = match &mut *backend {
-            UpstreamBackend::Stdio(proc_state) => {
-                ensure_stdio_initialized(proc_state, self.timeout).await?;
-                send_stdio_rpc(proc_state, request, self.timeout).await?
+        let resp = match backend {
+            UpstreamBackend::Stdio(proc_arc) => {
+                let mut proc_state = proc_arc.lock().await;
+                ensure_stdio_initialized(&mut proc_state, self.timeout).await?;
+                send_stdio_rpc(&mut proc_state, request, self.timeout).await?
             }
-            UpstreamBackend::Http(http_sess) => dispatch_http_session_request(
-                &self.registry.key_store,
-                &self.registry.oauth,
-                &server,
-                http_sess,
-                request,
-                true,
-                on_notification,
-            )
-            .await?
-            .unwrap_or(Value::Null),
+            UpstreamBackend::Http(http_sess) => {
+                ensure_http_initialized(
+                    &self.registry.key_store,
+                    &self.registry.oauth,
+                    server,
+                    http_sess,
+                    Some(&rpc_ctx),
+                )
+                .await?;
+                dispatch_http_session_request(
+                    &self.registry.key_store,
+                    &self.registry.oauth,
+                    server,
+                    http_sess,
+                    request,
+                    true,
+                    on_notification,
+                    Some(&rpc_ctx),
+                )
+                .await?
+                .unwrap_or(Value::Null)
+            }
         };
         Ok(Some(with_id(resp, id)))
     }
@@ -2758,7 +3088,7 @@ impl McpProxySessionPool {
         identity: &AgentIdentity,
         session_id: &str,
         server: &AdoptedMcpServerRecord,
-        backend_arc: &Arc<Mutex<UpstreamBackend>>,
+        backend: &UpstreamBackend,
         id: Value,
         request: &Value,
         pseudonym_table: &PseudonymSessionTable,
@@ -2776,6 +3106,12 @@ impl McpProxySessionPool {
             .get("arguments")
             .cloned()
             .unwrap_or_else(|| json!({}));
+        let turn_id = format!("aegis:{}:{}", identity.agent_id, Uuid::new_v4().simple());
+        let rpc_ctx = HttpRequestContext {
+            agent_id: &identity.agent_id,
+            session_id,
+            turn_id: Some(&turn_id),
+        };
 
         // 1. Restore session pseudonyms on arguments before risk classification / staging / upstream execution.
         let mut restored_args = agent_args.clone();
@@ -2784,41 +3120,58 @@ impl McpProxySessionPool {
             compute_outbox_payload_sha256(&server.server_id, &tool_name, &restored_args);
 
         // 2. Ensure backend initialized & cached annotations warmed before risk classification.
-        let cached_ann = {
-            let mut backend = backend_arc.lock().await;
-            match &mut *backend {
-                UpstreamBackend::Stdio(proc_state) => {
-                    ensure_stdio_initialized(proc_state, self.timeout).await?;
-                    if !proc_state.annotations_loaded {
-                        let _ = warm_stdio_tool_annotations(proc_state, self.timeout).await;
-                    }
-                    proc_state.tool_annotations.get(&tool_name).cloned()
+        let cached_ann = match backend {
+            UpstreamBackend::Stdio(proc_arc) => {
+                let mut proc_state = proc_arc.lock().await;
+                ensure_stdio_initialized(&mut proc_state, self.timeout).await?;
+                if !proc_state.annotations_loaded {
+                    let _ = warm_stdio_tool_annotations(&mut proc_state, self.timeout).await;
                 }
-                UpstreamBackend::Http(http_sess) => {
-                    if !http_sess.annotations_loaded {
-                        let list_req =
-                            json!({"jsonrpc": "2.0", "id": format!("warm-{}", Uuid::new_v4()), "method": "tools/list"});
-                        if let Ok(Some(list_resp)) = dispatch_http_session_request(
-                            &self.registry.key_store,
-                            &self.registry.oauth,
-                            server,
-                            http_sess,
-                            &list_req,
-                            true,
-                            None,
-                        )
-                        .await
+                proc_state.tool_annotations.get(&tool_name).cloned()
+            }
+            UpstreamBackend::Http(http_sess) => {
+                ensure_http_initialized(
+                    &self.registry.key_store,
+                    &self.registry.oauth,
+                    server,
+                    http_sess,
+                    Some(&rpc_ctx),
+                )
+                .await?;
+                if !http_sess
+                    .annotations_loaded
+                    .load(std::sync::atomic::Ordering::Acquire)
+                {
+                    let list_req = json!({"jsonrpc": "2.0", "id": format!("warm-{}", Uuid::new_v4()), "method": "tools/list"});
+                    if let Ok(Some(list_resp)) = dispatch_http_session_request(
+                        &self.registry.key_store,
+                        &self.registry.oauth,
+                        server,
+                        http_sess,
+                        &list_req,
+                        true,
+                        None,
+                        Some(&rpc_ctx),
+                    )
+                    .await
+                    {
+                        if let Some(tools) =
+                            list_resp.pointer("/result/tools").and_then(|v| v.as_array())
                         {
-                            if let Some(tools) =
-                                list_resp.pointer("/result/tools").and_then(|v| v.as_array())
-                            {
-                                http_sess.tool_annotations = extract_annotations_map(tools);
-                            }
-                            http_sess.annotations_loaded = true;
+                            *http_sess.tool_annotations.write().await =
+                                extract_annotations_map(tools);
                         }
+                        http_sess
+                            .annotations_loaded
+                            .store(true, std::sync::atomic::Ordering::Release);
                     }
-                    http_sess.tool_annotations.get(&tool_name).cloned()
                 }
+                http_sess
+                    .tool_annotations
+                    .read()
+                    .await
+                    .get(&tool_name)
+                    .cloned()
             }
         };
 
@@ -2993,32 +3346,40 @@ impl McpProxySessionPool {
             }
         });
 
-        let upstream_res = {
-            let mut backend = backend_arc.lock().await;
-            match &mut *backend {
-                UpstreamBackend::Stdio(proc_state) => {
-                    send_stdio_rpc(proc_state, &upstream_req, self.timeout).await
-                }
-                UpstreamBackend::Http(http_sess) => dispatch_http_session_request(
-                    &self.registry.key_store,
-                    &self.registry.oauth,
-                    server,
-                    http_sess,
-                    &upstream_req,
-                    true,
-                    on_notification.clone(),
-                )
-                .await
-                .and_then(|opt| {
-                    opt.context("upstream MCP HTTP returned empty body for tools/call")
-                }),
+        let upstream_res = match backend {
+            UpstreamBackend::Stdio(proc_arc) => {
+                let mut proc_state = proc_arc.lock().await;
+                send_stdio_rpc(&mut proc_state, &upstream_req, self.timeout).await
             }
+            UpstreamBackend::Http(http_sess) => dispatch_http_session_request(
+                &self.registry.key_store,
+                &self.registry.oauth,
+                server,
+                http_sess,
+                &upstream_req,
+                true,
+                on_notification.clone(),
+                Some(&rpc_ctx),
+            )
+            .await
+            .and_then(|opt| opt.context("upstream MCP HTTP returned empty body for tools/call")),
         };
 
         let mut resp = match upstream_res {
             Ok(r) => r,
             Err(err) => {
-                self.drop_backend(&server.org_id, &server.server_id).await;
+                match backend {
+                    UpstreamBackend::Stdio(_) => {
+                        self.drop_backend(&server.org_id, &server.server_id).await;
+                    }
+                    UpstreamBackend::Http(http_sess) => {
+                        // Preserve `cached_init_request` across transient upstream HTTP failures.
+                        http_sess
+                            .initialized
+                            .store(false, std::sync::atomic::Ordering::Release);
+                        *http_sess.mcp_session_id.write().await = None;
+                    }
+                }
                 let _ = self
                     .registry
                     .recorder
@@ -3131,7 +3492,7 @@ impl McpProxySessionPool {
         identity: &AgentIdentity,
         session_id: &str,
         server: &AdoptedMcpServerRecord,
-        backend_arc: &Arc<Mutex<UpstreamBackend>>,
+        backend: &UpstreamBackend,
         id: Value,
         request: &Value,
         pseudonym_table: &PseudonymSessionTable,
@@ -3143,14 +3504,27 @@ impl McpProxySessionPool {
             .and_then(|v| v.as_str())
             .unwrap_or("")
             .to_string();
-        let mut resp = {
-            let mut backend = backend_arc.lock().await;
-            match &mut *backend {
-                UpstreamBackend::Stdio(proc_state) => {
-                    ensure_stdio_initialized(proc_state, self.timeout).await?;
-                    send_stdio_rpc(proc_state, request, self.timeout).await?
-                }
-                UpstreamBackend::Http(http_sess) => dispatch_http_session_request(
+        let rpc_ctx = HttpRequestContext {
+            agent_id: &identity.agent_id,
+            session_id,
+            turn_id: None,
+        };
+        let mut resp = match backend {
+            UpstreamBackend::Stdio(proc_arc) => {
+                let mut proc_state = proc_arc.lock().await;
+                ensure_stdio_initialized(&mut proc_state, self.timeout).await?;
+                send_stdio_rpc(&mut proc_state, request, self.timeout).await?
+            }
+            UpstreamBackend::Http(http_sess) => {
+                ensure_http_initialized(
+                    &self.registry.key_store,
+                    &self.registry.oauth,
+                    server,
+                    http_sess,
+                    Some(&rpc_ctx),
+                )
+                .await?;
+                dispatch_http_session_request(
                     &self.registry.key_store,
                     &self.registry.oauth,
                     server,
@@ -3158,9 +3532,10 @@ impl McpProxySessionPool {
                     request,
                     true,
                     on_notification,
+                    Some(&rpc_ctx),
                 )
                 .await?
-                .unwrap_or(Value::Null),
+                .unwrap_or(Value::Null)
             }
         };
 
@@ -3385,13 +3760,34 @@ async fn write_jsonrpc_line(stdin: &mut ChildStdin, payload: &Value) -> anyhow::
     Ok(())
 }
 
+async fn read_bounded_stdio_line(
+    reader: &mut BufReader<ChildStdout>,
+    max_bytes: usize,
+) -> anyhow::Result<Option<String>> {
+    let mut buf = Vec::new();
+    let n = reader
+        .take((max_bytes + 1) as u64)
+        .read_until(b'\n', &mut buf)
+        .await?;
+    if n == 0 {
+        return Ok(None);
+    }
+    if buf.len() > max_bytes {
+        bail!(
+            "upstream MCP stdio frame exceeded max {} bytes without newline",
+            max_bytes
+        );
+    }
+    String::from_utf8(buf)
+        .map(Some)
+        .context("upstream MCP stdio emitted non-UTF-8 JSON-RPC frame")
+}
+
 async fn read_next_jsonrpc_frame(reader: &mut BufReader<ChildStdout>) -> anyhow::Result<Value> {
     loop {
-        let mut line = String::new();
-        let n = reader.read_line(&mut line).await?;
-        if n == 0 {
+        let Some(line) = read_bounded_stdio_line(reader, MAX_MCP_HTTP_RESPONSE_BYTES).await? else {
             bail!("upstream MCP server closed stdout before replying");
-        }
+        };
         let trimmed = line.trim();
         if trimmed.is_empty() {
             continue;
@@ -3404,11 +3800,19 @@ async fn read_next_jsonrpc_frame(reader: &mut BufReader<ChildStdout>) -> anyhow:
                 .trim()
                 .parse()
                 .context("invalid Content-Length header from upstream MCP")?;
-            // Consume remaining header lines until blank line.
-            loop {
-                let mut hdr = String::new();
-                let hn = reader.read_line(&mut hdr).await?;
-                if hn == 0 || hdr.trim().is_empty() {
+            if content_len > MAX_MCP_HTTP_RESPONSE_BYTES {
+                bail!(
+                    "upstream MCP stdio Content-Length {} exceeds max {} bytes",
+                    content_len,
+                    MAX_MCP_HTTP_RESPONSE_BYTES
+                );
+            }
+            // Consume remaining header lines until blank line (bounded header count/line size).
+            for _ in 0..64 {
+                let Some(hdr) = read_bounded_stdio_line(reader, 16 * 1024).await? else {
+                    bail!("upstream MCP closed stdout inside frame headers");
+                };
+                if hdr.trim().is_empty() {
                     break;
                 }
             }
@@ -3512,12 +3916,20 @@ fn default_http_init_request() -> Value {
     })
 }
 
+#[derive(Clone, Copy)]
+struct HttpRequestContext<'a> {
+    agent_id: &'a str,
+    session_id: &'a str,
+    turn_id: Option<&'a str>,
+}
+
 async fn resolve_http_target_and_headers(
     key_store: &VaultKeyStore,
     oauth: &McpOAuthManager,
     server: &AdoptedMcpServerRecord,
     mcp_session_id: Option<&str>,
     force_oauth_refresh: bool,
+    ctx: Option<&HttpRequestContext<'_>>,
 ) -> anyhow::Result<(String, Vec<(String, String)>)> {
     let UpstreamTransportSpec::Http {
         url,
@@ -3573,9 +3985,39 @@ async fn resolve_http_target_and_headers(
     if let Some(sid) = mcp_session_id {
         headers.push(("Mcp-Session-Id".to_string(), sid.to_string()));
     }
+
+    // Forward per-agent/session/turn provenance only to internal/bundle servers (never `X-Aegis-Org-Id`).
+    if server.policy.trust_level == McpTrustLevel::TrustedInternal || server.bundle_id.is_some() {
+        if let Some(c) = ctx {
+            if !c.agent_id.is_empty()
+                && !headers
+                    .iter()
+                    .any(|(k, _)| k.eq_ignore_ascii_case("x-aegis-agent-id"))
+            {
+                headers.push(("X-Aegis-Agent-Id".to_string(), c.agent_id.to_string()));
+            }
+            if !c.session_id.is_empty()
+                && !headers
+                    .iter()
+                    .any(|(k, _)| k.eq_ignore_ascii_case("x-aegis-session-id"))
+            {
+                headers.push(("X-Aegis-Session-Id".to_string(), c.session_id.to_string()));
+            }
+            if let Some(tid) = c.turn_id.filter(|s| !s.is_empty()) {
+                if !headers
+                    .iter()
+                    .any(|(k, _)| k.eq_ignore_ascii_case("x-aegis-turn-id"))
+                {
+                    headers.push(("X-Aegis-Turn-Id".to_string(), tid.to_string()));
+                }
+            }
+        }
+    }
+
     Ok((target_url, headers))
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn send_http_once_with_auth_retry(
     key_store: &VaultKeyStore,
     oauth: &McpOAuthManager,
@@ -3584,6 +4026,7 @@ async fn send_http_once_with_auth_retry(
     request: &Value,
     expect_response: bool,
     on_notification: Option<tokio::sync::mpsc::UnboundedSender<Value>>,
+    ctx: Option<&HttpRequestContext<'_>>,
 ) -> anyhow::Result<HttpRpcOutcome> {
     let idle_timeout = std::time::Duration::from_millis(
         server
@@ -3599,6 +4042,7 @@ async fn send_http_once_with_auth_retry(
             server,
             mcp_session_id.as_deref(),
             force_refresh,
+            ctx,
         )
         .await?;
         let outcome = send_http_jsonrpc_streaming(
@@ -3656,68 +4100,152 @@ async fn send_http_once_with_auth_retry(
     unreachable!("loop always returns in 1 or 2 iterations")
 }
 
+async fn ensure_http_initialized(
+    key_store: &VaultKeyStore,
+    oauth: &McpOAuthManager,
+    server: &AdoptedMcpServerRecord,
+    http_sess: &UpstreamHttpSession,
+    ctx: Option<&HttpRequestContext<'_>>,
+) -> anyhow::Result<()> {
+    if http_sess
+        .initialized
+        .load(std::sync::atomic::Ordering::Acquire)
+    {
+        return Ok(());
+    }
+    let _gate = http_sess.init_gate.lock().await;
+    if http_sess
+        .initialized
+        .load(std::sync::atomic::Ordering::Acquire)
+    {
+        return Ok(());
+    }
+    let init_req = http_sess
+        .cached_init_request
+        .read()
+        .await
+        .clone()
+        .unwrap_or_else(default_http_init_request);
+    let mut sid = http_sess.mcp_session_id.read().await.clone();
+    let init_outcome = send_http_once_with_auth_retry(
+        key_store,
+        oauth,
+        server,
+        &mut sid,
+        &init_req,
+        true,
+        None,
+        ctx,
+    )
+    .await?;
+    if matches!(init_outcome, HttpRpcOutcome::SessionExpired) {
+        sid = None;
+    }
+    let notif = json!({ "jsonrpc": "2.0", "method": "notifications/initialized" });
+    let _ = send_http_once_with_auth_retry(
+        key_store,
+        oauth,
+        server,
+        &mut sid,
+        &notif,
+        false,
+        None,
+        ctx,
+    )
+    .await;
+    *http_sess.mcp_session_id.write().await = sid;
+    http_sess
+        .initialized
+        .store(true, std::sync::atomic::Ordering::Release);
+    Ok(())
+}
+
+#[allow(clippy::too_many_arguments)]
 async fn dispatch_http_session_request(
     key_store: &VaultKeyStore,
     oauth: &McpOAuthManager,
     server: &AdoptedMcpServerRecord,
-    http_sess: &mut UpstreamHttpSession,
+    http_sess: &UpstreamHttpSession,
     request: &Value,
     expect_response: bool,
     on_notification: Option<tokio::sync::mpsc::UnboundedSender<Value>>,
+    ctx: Option<&HttpRequestContext<'_>>,
 ) -> anyhow::Result<Option<Value>> {
+    let sid_snapshot = http_sess.mcp_session_id.read().await.clone();
+    let mut sid = sid_snapshot.clone();
     let first = send_http_once_with_auth_retry(
         key_store,
         oauth,
         server,
-        &mut http_sess.mcp_session_id,
+        &mut sid,
         request,
         expect_response,
         on_notification.clone(),
+        ctx,
     )
     .await?;
 
     let final_outcome = match first {
         HttpRpcOutcome::SessionExpired => {
-            // Re-handshake `initialize` + `notifications/initialized` transparently once.
-            http_sess.mcp_session_id = None;
-            let init_req = http_sess
-                .cached_init_request
-                .clone()
-                .unwrap_or_else(default_http_init_request);
-            let _ = send_http_once_with_auth_retry(
-                key_store,
-                oauth,
-                server,
-                &mut http_sess.mcp_session_id,
-                &init_req,
-                true,
-                None,
-            )
-            .await?;
-            let notif = json!({ "jsonrpc": "2.0", "method": "notifications/initialized" });
-            let _ = send_http_once_with_auth_retry(
-                key_store,
-                oauth,
-                server,
-                &mut http_sess.mcp_session_id,
-                &notif,
-                false,
-                None,
-            )
-            .await;
+            // Coordinate re-handshake `initialize` + `notifications/initialized` via `init_gate`.
+            let _gate = http_sess.init_gate.lock().await;
+            let current_sid = http_sess.mcp_session_id.read().await.clone();
+            if current_sid.is_some() && current_sid != sid_snapshot {
+                sid = current_sid;
+            } else {
+                sid = None;
+                let init_req = http_sess
+                    .cached_init_request
+                    .read()
+                    .await
+                    .clone()
+                    .unwrap_or_else(default_http_init_request);
+                let _ = send_http_once_with_auth_retry(
+                    key_store,
+                    oauth,
+                    server,
+                    &mut sid,
+                    &init_req,
+                    true,
+                    None,
+                    ctx,
+                )
+                .await?;
+                let notif = json!({ "jsonrpc": "2.0", "method": "notifications/initialized" });
+                let _ = send_http_once_with_auth_retry(
+                    key_store,
+                    oauth,
+                    server,
+                    &mut sid,
+                    &notif,
+                    false,
+                    None,
+                    ctx,
+                )
+                .await;
+                *http_sess.mcp_session_id.write().await = sid.clone();
+                http_sess
+                    .initialized
+                    .store(true, std::sync::atomic::Ordering::Release);
+            }
             send_http_once_with_auth_retry(
                 key_store,
                 oauth,
                 server,
-                &mut http_sess.mcp_session_id,
+                &mut sid,
                 request,
                 expect_response,
                 on_notification,
+                ctx,
             )
             .await?
         }
         other => other,
     };
+
+    if sid != sid_snapshot {
+        *http_sess.mcp_session_id.write().await = sid;
+    }
 
     match final_outcome {
         HttpRpcOutcome::Accepted { .. } => Ok(None),
@@ -3738,6 +4266,7 @@ async fn dispatch_single_tool_call(
     server: &AdoptedMcpServerRecord,
     tool_name: &str,
     exec_args: &Value,
+    ctx: Option<&HttpRequestContext<'_>>,
 ) -> anyhow::Result<Value> {
     let call_req = json!({
         "jsonrpc": "2.0",
@@ -3756,9 +4285,10 @@ async fn dispatch_single_tool_call(
             send_stdio_rpc(&mut proc_state, &call_req, timeout).await
         }
         UpstreamTransportSpec::Http { .. } => {
-            let mut http_sess = UpstreamHttpSession {
-                mcp_session_id: None,
-                cached_init_request: Some(json!({
+            let http_sess = UpstreamHttpSession {
+                init_gate: Mutex::new(()),
+                mcp_session_id: RwLock::new(None),
+                cached_init_request: RwLock::new(Some(json!({
                     "jsonrpc": "2.0",
                     "id": "outbox-init",
                     "method": "initialize",
@@ -3767,40 +4297,21 @@ async fn dispatch_single_tool_call(
                         "capabilities": {},
                         "clientInfo": { "name": "aegis-os-outbox", "version": env!("CARGO_PKG_VERSION") }
                     }
-                })),
-                tool_annotations: BTreeMap::new(),
-                annotations_loaded: false,
+                }))),
+                initialized: std::sync::atomic::AtomicBool::new(false),
+                tool_annotations: RwLock::new(BTreeMap::new()),
+                annotations_loaded: std::sync::atomic::AtomicBool::new(false),
             };
-            let init_req = http_sess.cached_init_request.clone().unwrap();
-            let _ = dispatch_http_session_request(
-                key_store,
-                oauth,
-                server,
-                &mut http_sess,
-                &init_req,
-                true,
-                None,
-            )
-            .await;
-            let notif = json!({ "jsonrpc": "2.0", "method": "notifications/initialized" });
-            let _ = dispatch_http_session_request(
-                key_store,
-                oauth,
-                server,
-                &mut http_sess,
-                &notif,
-                false,
-                None,
-            )
-            .await;
+            let _ = ensure_http_initialized(key_store, oauth, server, &http_sess, ctx).await;
             dispatch_http_session_request(
                 key_store,
                 oauth,
                 server,
-                &mut http_sess,
+                &http_sess,
                 &call_req,
                 true,
                 None,
+                ctx,
             )
             .await?
             .context("upstream MCP HTTP returned empty body for outbox tool dispatch")
@@ -3828,7 +4339,7 @@ fn build_json_proxy_entry(
                 "command": cmd,
             })
         }
-        "claude" => json!({
+        c if c == "claude" || claude_project_key(c).is_some() => json!({
             "type": "stdio",
             "command": bin_str,
             "args": proxy_args,
@@ -3874,15 +4385,25 @@ pub fn upsert_client_proxy_entry(
     match client {
         "codex" => {
             let replacement = render_codex_proxy_block(server_key, bin_str, proxy_args, extra_env);
-            let sections = scan_codex_mcp_sections(&text);
+            let working_text = if server_key == "aegis-os" {
+                strip_aegis_codex_managed_block(&text).0
+            } else {
+                text
+            };
+            let sections = scan_codex_mcp_sections(&working_text);
             let updated = if let Some(target) =
                 sections.into_iter().find(|s| s.server_key == server_key)
             {
-                replace_toml_line_range(&text, target.start_line, target.end_line, &replacement)
-            } else if text.trim().is_empty() {
+                replace_toml_line_range(
+                    &working_text,
+                    target.start_line,
+                    target.end_line,
+                    &replacement,
+                )
+            } else if working_text.trim().is_empty() {
                 replacement
             } else {
-                let mut out = text.trim_end().to_string();
+                let mut out = working_text.trim_end().to_string();
                 out.push_str("\n\n");
                 out.push_str(&replacement);
                 out
@@ -3906,6 +4427,40 @@ pub fn upsert_client_proxy_entry(
             } else {
                 bail!("opencode.json root is not an object in {}", config_path.display());
             }
+            std::fs::write(config_path, format!("{}\n", serde_json::to_string_pretty(&root)?))?;
+        }
+        c if claude_project_key(c).is_some() => {
+            let proj = claude_project_key(c).unwrap();
+            let mut root: Value = if text.trim().is_empty() {
+                json!({ "projects": {} })
+            } else {
+                serde_json::from_str(&text)
+                    .with_context(|| format!("parsing JSON config '{}'", config_path.display()))?
+            };
+            let root_obj = root.as_object_mut().with_context(|| {
+                format!("JSON config root is not an object in {}", config_path.display())
+            })?;
+            let projects_val = root_obj.entry("projects").or_insert_with(|| json!({}));
+            if !projects_val.is_object() {
+                *projects_val = json!({});
+            }
+            let projects_obj = projects_val.as_object_mut().expect("projects object");
+            let proj_val = projects_obj
+                .entry(proj.to_string())
+                .or_insert_with(|| json!({}));
+            if !proj_val.is_object() {
+                *proj_val = json!({});
+            }
+            let proj_obj = proj_val.as_object_mut().expect("project entry object");
+            let servers_val = proj_obj.entry("mcpServers").or_insert_with(|| json!({}));
+            if !servers_val.is_object() {
+                *servers_val = json!({});
+            }
+            let servers = servers_val.as_object_mut().expect("mcpServers object");
+            servers.insert(
+                server_key.to_string(),
+                build_json_proxy_entry(client, bin_str, proxy_args, extra_env),
+            );
             std::fs::write(config_path, format!("{}\n", serde_json::to_string_pretty(&root)?))?;
         }
         _ => {
@@ -3952,9 +4507,17 @@ pub fn remove_client_proxy_entry(
     }
     match client {
         "codex" => {
-            let sections = scan_codex_mcp_sections(&text);
+            let (mut updated, mut changed) = if server_key == "aegis-os" {
+                strip_aegis_codex_managed_block(&text)
+            } else {
+                (text, false)
+            };
+            let sections = scan_codex_mcp_sections(&updated);
             if let Some(target) = sections.into_iter().find(|s| s.server_key == server_key) {
-                let updated = replace_toml_line_range(&text, target.start_line, target.end_line, "");
+                updated = replace_toml_line_range(&updated, target.start_line, target.end_line, "");
+                changed = true;
+            }
+            if changed {
                 std::fs::write(config_path, updated)?;
                 return Ok(true);
             }
@@ -3968,6 +4531,20 @@ pub fn remove_client_proxy_entry(
             } else if let Some(mcp_obj) = root.get_mut("mcp").and_then(|v| v.as_object_mut()) {
                 removed = mcp_obj.remove(server_key).is_some();
             }
+            if removed {
+                std::fs::write(config_path, format!("{}\n", serde_json::to_string_pretty(&root)?))?;
+            }
+            Ok(removed)
+        }
+        c if claude_project_key(c).is_some() => {
+            let proj = claude_project_key(c).unwrap();
+            let mut root: Value = serde_json::from_str(&text)?;
+            let removed = root
+                .get_mut("projects")
+                .and_then(|p| p.get_mut(proj))
+                .and_then(|pv| pv.get_mut("mcpServers"))
+                .and_then(|v| v.as_object_mut())
+                .is_some_and(|m| m.remove(server_key).is_some());
             if removed {
                 std::fs::write(config_path, format!("{}\n", serde_json::to_string_pretty(&root)?))?;
             }
@@ -4027,6 +4604,19 @@ fn restore_client_config_from_origin(
                 mcp_obj.insert(origin.server_key.clone(), original_val.clone());
             }
             std::fs::write(path, format!("{}\n", serde_json::to_string_pretty(&root)?))?;
+        }
+        c if claude_project_key(c).is_some() => {
+            let proj = claude_project_key(c).unwrap();
+            let mut root: Value = serde_json::from_str(&text)?;
+            if let Some(servers) = root
+                .get_mut("projects")
+                .and_then(|p| p.get_mut(proj))
+                .and_then(|pv| pv.get_mut("mcpServers"))
+                .and_then(|v| v.as_object_mut())
+            {
+                servers.insert(origin.server_key.clone(), original_val.clone());
+                std::fs::write(path, format!("{}\n", serde_json::to_string_pretty(&root)?))?;
+            }
         }
         _ => {
             let mut root: Value = serde_json::from_str(&text)?;
@@ -4631,7 +5221,7 @@ for line in sys.stdin:
 
         // Approve outbox ticket -> host dispatches real email directly to upstream MCP!
         let dispatched = reg
-            .approve_outbox_ticket(&send_ticket_id, "human-operator")
+            .approve_outbox_ticket("acme", &send_ticket_id, "human-operator")
             .await
             .unwrap();
         assert_eq!(dispatched.status, OutboxStatus::Dispatched);
@@ -4873,11 +5463,13 @@ for line in sys.stdin:
         {
             let srv = reg.get_server("acme", "heurion-biostats").await.unwrap();
             let b = pool.get_or_spawn_backend(&srv).await.unwrap();
-            let mut g = b.lock().await;
-            if let UpstreamBackend::Http(ref mut hs) = *g {
-                hs.mcp_session_id = Some("sid-expired".to_string());
-                hs.annotations_loaded = true;
-                hs.tool_annotations.insert(
+            if let UpstreamBackend::Http(ref hs) = b {
+                *hs.mcp_session_id.write().await = Some("sid-expired".to_string());
+                hs.initialized
+                    .store(true, std::sync::atomic::Ordering::Release);
+                hs.annotations_loaded
+                    .store(true, std::sync::atomic::Ordering::Release);
+                hs.tool_annotations.write().await.insert(
                     "run_biostats".to_string(),
                     CachedToolAnnotations {
                         read_only_hint: Some(true),
@@ -4916,5 +5508,271 @@ for line in sys.stdin:
         let txt = resp["result"]["content"][0]["text"].as_str().unwrap();
         assert!(txt.contains("hr=0.62"));
         assert!(!txt.contains("alice@clinic.org"), "PII must be pseudonymized before returning");
+    }
+
+    #[tokio::test]
+    async fn cross_org_isolation_sql_cte_html_cursor_and_sse_notification_taint_hold() {
+        use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader};
+        use tokio::net::TcpListener;
+
+        // 1. HTML `<scripting>` cursor advance + Unicode Tag stripping + nested `"name"` sanitization
+        let mut val = json!({
+            "jsonrpc": "2.0",
+            "id": 1,
+            "result": {
+                "content": [{ "type": "text", "text": "ok" }],
+                "patient": {
+                    "name": "<scripting>keep</scripting><script>evil()</script>\u{E0001}hi\u{E007F}"
+                }
+            }
+        });
+        let sigs = sanitize_inbound_mcp_value(&mut val, true);
+        assert!(sigs >= 3, "expected script, unicode tag stripping, got {sigs}");
+        let pat_name = val["result"]["patient"]["name"].as_str().unwrap();
+        assert!(pat_name.contains("<scripting>keep</scripting>"));
+        assert!(!pat_name.contains("evil()"));
+        assert!(!pat_name.contains('\u{E0001}'));
+
+        // 2. SQL CTE / EXPLAIN / SELECT INTO / literal safety / readOnlyHint=false non-override
+        assert_eq!(
+            classify_sql_text("WITH cte AS (DELETE FROM users RETURNING *) SELECT * FROM cte"),
+            Some(McpToolRiskClass::Destructive)
+        );
+        assert_eq!(
+            classify_sql_text("EXPLAIN ANALYZE DELETE FROM patients WHERE id = 1"),
+            Some(McpToolRiskClass::Destructive)
+        );
+        assert_eq!(
+            classify_sql_text("SELECT * INTO backup_users FROM users"),
+            Some(McpToolRiskClass::StagedWrite)
+        );
+        assert_eq!(
+            classify_sql_text("SELECT 'DELETE FROM users' AS example_sql"),
+            Some(McpToolRiskClass::ReadOnly)
+        );
+        let non_ro_policy = McpServerPolicy::default();
+        assert_eq!(
+            classify_mcp_tool(
+                &non_ro_policy,
+                "custom_query",
+                Some(&CachedToolAnnotations {
+                    read_only_hint: Some(false),
+                    destructive_hint: None,
+                }),
+                &json!({ "query": "SELECT 1" }),
+            ),
+            McpToolRiskClass::StagedWrite
+        );
+
+        // 3. Cross-org isolation on get_server, update_server_config & Outbox tickets
+        let tmp = tempfile::tempdir().unwrap();
+        let rt = tmp.path().join("rt");
+        let policy = Arc::new(AegisPolicyKernel::with_state_file(Some(
+            rt.join("policy_state.json"),
+        )));
+        let recorder = Arc::new(AegisFlightRecorder::new(Some(
+            rt.join("audit/flight_recorder.jsonl"),
+        )));
+        let reg = Arc::new(McpFirewallRegistry::with_kek_provider(
+            &rt,
+            Arc::new(InMemoryKekProvider::new([0x44u8; 32])),
+            policy,
+            recorder,
+        ));
+        reg.register_http_server_with_options(
+            "org-a",
+            "srv-shared-id",
+            "http://127.0.0.1:9/mcp",
+            BTreeMap::new(),
+            McpServerPolicy::default(),
+            None,
+            None,
+            true,
+        )
+        .await
+        .unwrap();
+        assert!(reg.get_server("org-b", "srv-shared-id").await.is_none());
+        assert!(reg
+            .update_server_config("org-b", "srv-shared-id", |r| r.allow_local_http = false)
+            .await
+            .is_err());
+
+        let id_a = AgentIdentity::new("org-a", "agent-a", "Researcher");
+        let ticket_a = reg
+            .stage_outbox_ticket(
+                &id_a,
+                "ses-1",
+                "srv-shared-id",
+                "send_mail",
+                McpToolRiskClass::StagedWrite,
+                json!({}),
+                json!({}),
+                None,
+                false,
+            )
+            .await
+            .unwrap();
+        assert!(ticket_a.ticket_id.len() >= 39, "expected 128-bit ticket id");
+        assert!(reg.get_outbox_ticket("org-b", &ticket_a.ticket_id).await.is_none());
+        assert!(reg
+            .approve_outbox_ticket("org-b", &ticket_a.ticket_id, "attacker")
+            .await
+            .is_err());
+        assert!(reg
+            .deny_outbox_ticket("org-b", &ticket_a.ticket_id, "attacker")
+            .await
+            .is_err());
+
+        // 4. SSE notification sanitization + pseudonymization + UntrustedExternal taint + Bundle context headers
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let seen_headers = Arc::new(tokio::sync::Mutex::new(Vec::<(String, String)>::new()));
+        let seen_headers_srv = seen_headers.clone();
+        tokio::spawn(async move {
+            loop {
+                let Ok((mut sock, _)) = listener.accept().await else {
+                    break;
+                };
+                let hdr_sink = seen_headers_srv.clone();
+                tokio::spawn(async move {
+                    let mut reader = BufReader::new(&mut sock);
+                    let mut req_line = String::new();
+                    if reader.read_line(&mut req_line).await.unwrap_or(0) == 0 {
+                        return;
+                    }
+                    let mut cl = 0usize;
+                    loop {
+                        let mut h = String::new();
+                        if reader.read_line(&mut h).await.unwrap_or(0) == 0 || h.trim().is_empty() {
+                            break;
+                        }
+                        if let Some((k, v)) = h.split_once(':') {
+                            let kl = k.trim().to_ascii_lowercase();
+                            if kl == "content-length" {
+                                cl = v.trim().parse().unwrap_or(0);
+                            }
+                            hdr_sink.lock().await.push((kl, v.trim().to_string()));
+                        }
+                    }
+                    let mut body = vec![0u8; cl];
+                    if cl > 0 {
+                        let _ = reader.read_exact(&mut body).await;
+                    }
+                    let rpc: Value = serde_json::from_slice(&body).unwrap_or(Value::Null);
+                    let method = rpc.get("method").and_then(|v| v.as_str()).unwrap_or("");
+                    let rid = rpc.get("id").cloned().unwrap_or(Value::Null);
+                    if method == "initialize" {
+                        let b = json!({
+                            "jsonrpc": "2.0",
+                            "id": rid,
+                            "result": { "protocolVersion": "2024-11-05", "capabilities": { "tools": {} } }
+                        })
+                        .to_string();
+                        let resp = format!("HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nMcp-Session-Id: sid-ctx-1\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{b}", b.len());
+                        let _ = sock.write_all(resp.as_bytes()).await;
+                    } else if method == "notifications/initialized" {
+                        let _ = sock.write_all(b"HTTP/1.1 202 Accepted\r\nContent-Length: 0\r\nConnection: close\r\n\r\n").await;
+                    } else if method == "tools/list" {
+                        let b = json!({
+                            "jsonrpc": "2.0",
+                            "id": rid,
+                            "result": { "tools": [{ "name": "lit_search", "annotations": { "readOnlyHint": true } }] }
+                        })
+                        .to_string();
+                        let resp = format!("HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{b}", b.len());
+                        let _ = sock.write_all(resp.as_bytes()).await;
+                    } else if method == "tools/call" {
+                        let ev1 = format!(
+                            "data: {}\n\n",
+                            json!({
+                                "jsonrpc": "2.0",
+                                "method": "notifications/progress",
+                                "params": { "message": "<script>pwn()</script>note alice@clinic.org\u{E0020}" }
+                            })
+                        );
+                        let ev2 = format!(
+                            "data: {}\n\n",
+                            json!({
+                                "jsonrpc": "2.0",
+                                "id": rid,
+                                "result": { "content": [{ "type": "text", "text": "ok" }] }
+                            })
+                        );
+                        let sse_body = format!("{ev1}{ev2}");
+                        let resp = format!(
+                            "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                            sse_body.len(),
+                            sse_body
+                        );
+                        let _ = sock.write_all(resp.as_bytes()).await;
+                    }
+                });
+            }
+        });
+
+        reg.register_http_server_with_options(
+            "org-a",
+            "heurion-literature",
+            &format!("http://{addr}/mcp"),
+            BTreeMap::new(),
+            McpServerPolicy::default(),
+            None,
+            Some("heurion"),
+            true,
+        )
+        .await
+        .unwrap();
+        let pool = McpProxySessionPool::new(reg.clone());
+        let ptable = PseudonymSessionTable::new();
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+        let call_resp = pool
+            .handle_jsonrpc_streaming(
+                &id_a,
+                "ses-ctx-99",
+                "heurion-literature",
+                &json!({
+                    "jsonrpc": "2.0",
+                    "id": 42,
+                    "method": "tools/call",
+                    "params": { "name": "lit_search", "arguments": { "q": "sepsis" } }
+                }),
+                &ptable,
+                false,
+                Some(tx),
+            )
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(call_resp["id"], 42);
+        let note = rx.try_recv().unwrap();
+        let msg = note["params"]["message"].as_str().unwrap();
+        assert!(!msg.contains("pwn()"), "notification script must be stripped");
+        assert!(!msg.contains("alice@clinic.org"), "notification PII must be pseudonymized");
+        assert!(!msg.contains('\u{E0020}'), "Unicode tag char must be stripped");
+        let taint = reg
+            .policy_kernel()
+            .get_active_taint(&id_a.org_id, &id_a.agent_id)
+            .await;
+        assert!(taint.is_some(), "SSE notification from UntrustedExternal bundle must apply taint");
+        let hdrs = seen_headers.lock().await;
+        assert!(
+            hdrs.iter()
+                .any(|(k, v)| k == "x-aegis-agent-id" && v == "agent-a"),
+            "missing X-Aegis-Agent-Id: {hdrs:?}"
+        );
+        assert!(
+            hdrs.iter()
+                .any(|(k, v)| k == "x-aegis-session-id" && v == "ses-ctx-99"),
+            "missing X-Aegis-Session-Id: {hdrs:?}"
+        );
+        assert!(
+            hdrs.iter()
+                .any(|(k, v)| k == "x-aegis-turn-id" && v.starts_with("aegis:agent-a:")),
+            "missing X-Aegis-Turn-Id: {hdrs:?}"
+        );
+        assert!(
+            !hdrs.iter().any(|(k, _)| k == "x-aegis-org-id"),
+            "must NOT forward X-Aegis-Org-Id by default: {hdrs:?}"
+        );
     }
 }

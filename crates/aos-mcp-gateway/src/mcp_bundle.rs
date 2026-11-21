@@ -45,6 +45,8 @@ pub struct BundleAuthRealmSpec {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub device_authorization_endpoint: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub registration_endpoint: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub client_id: Option<String>,
     #[serde(default)]
     pub allowed_hosts: Vec<String>,
@@ -200,19 +202,119 @@ fn resolve_bundle_source_url(source: &str) -> String {
     format!("https://{}", trimmed.trim_start_matches('/'))
 }
 
+const MAX_SKILL_MARKDOWN_BYTES: usize = 512 * 1024;
+const MAX_BUNDLE_SKILLS: usize = 64;
+
+fn ensure_dir_no_symlink(base: &Path, subcomponents: &[&str]) -> anyhow::Result<PathBuf> {
+    let mut cur = base.to_path_buf();
+    for seg in subcomponents {
+        cur.push(seg);
+        match std::fs::symlink_metadata(&cur) {
+            Ok(meta) => {
+                if meta.file_type().is_symlink() || !meta.file_type().is_dir() {
+                    bail!(
+                        "Refusing unsafe non-directory/symlink component at '{}'",
+                        cur.display()
+                    );
+                }
+            }
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                std::fs::create_dir(&cur)?;
+            }
+            Err(e) => return Err(e.into()),
+        }
+    }
+    Ok(cur)
+}
+
+fn write_skill_markdown_safe(ws_dir: &Path, skill_slug: &str, bytes: &[u8]) -> anyhow::Result<PathBuf> {
+    if bytes.len() > MAX_SKILL_MARKDOWN_BYTES {
+        bail!(
+            "Skill '{}' exceeds {} byte size cap",
+            skill_slug,
+            MAX_SKILL_MARKDOWN_BYTES
+        );
+    }
+    let skill_dir = ensure_dir_no_symlink(ws_dir, &[".agents", "skills", skill_slug])?;
+    let skill_file = skill_dir.join("SKILL.md");
+    if let Ok(meta) = std::fs::symlink_metadata(&skill_file) {
+        if meta.file_type().is_symlink() {
+            bail!(
+                "Refusing to overwrite symlinked skill file '{}'",
+                skill_file.display()
+            );
+        }
+    }
+    let mut opts = std::fs::OpenOptions::new();
+    opts.write(true).create(true).truncate(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        opts.mode(0o644).custom_flags(libc::O_NOFOLLOW);
+    }
+    use std::io::Write;
+    let mut f = opts.open(&skill_file)?;
+    f.write_all(bytes)?;
+    f.sync_all()?;
+    Ok(skill_dir)
+}
+
+fn remove_skill_dir_safe(skill_dir: &Path) -> bool {
+    let comps: Vec<_> = skill_dir.components().collect();
+    if comps.len() < 3 {
+        return false;
+    }
+    let n = comps.len();
+    if comps[n - 3].as_os_str() != ".agents" || comps[n - 2].as_os_str() != "skills" {
+        return false;
+    }
+    let Ok(slug_ok) = comps[n - 1]
+        .as_os_str()
+        .to_str()
+        .ok_or(())
+        .and_then(|s| sanitize_bundle_slug(s).map_err(|_| ()))
+    else {
+        return false;
+    };
+    let _ = slug_ok;
+    // Check `.agents`, `.agents/skills`, and `.agents/skills/<id>` are real non-symlink directories.
+    for ancestor in [
+        skill_dir.parent().and_then(|p| p.parent()),
+        skill_dir.parent(),
+        Some(skill_dir),
+    ] {
+        let Some(dir) = ancestor else {
+            return false;
+        };
+        let Ok(meta) = std::fs::symlink_metadata(dir) else {
+            return false;
+        };
+        if meta.file_type().is_symlink() || !meta.file_type().is_dir() {
+            return false;
+        }
+    }
+    std::fs::remove_dir_all(skill_dir).is_ok()
+}
+
 fn resolve_relative_url(base_url: &str, target: &str) -> String {
     let t = target.trim();
     if t.starts_with("http://") || t.starts_with("https://") {
         return t.to_string();
     }
     if let Some((scheme, rest)) = base_url.split_once("://") {
-        let origin = rest.split(['/', '?']).next().unwrap_or("");
-        let slash_path = if t.starts_with('/') {
-            t.to_string()
-        } else {
-            format!("/{t}")
+        let without_q = rest.split(['?', '#']).next().unwrap_or(rest);
+        let (origin, path) = match without_q.find('/') {
+            Some(idx) => (&without_q[..idx], &without_q[idx..]),
+            None => (without_q, "/"),
         };
-        return format!("{scheme}://{origin}{slash_path}");
+        if t.starts_with('/') {
+            return format!("{scheme}://{origin}{t}");
+        }
+        let dir = match path.rfind('/') {
+            Some(idx) => &path[..=idx],
+            None => "/",
+        };
+        return format!("{scheme}://{origin}{dir}{t}");
     }
     t.to_string()
 }
@@ -375,9 +477,23 @@ impl McpBundleManager {
         opts: BundleInstallOptions,
     ) -> anyhow::Result<InstalledMcpBundleRecord> {
         let (manifest, fetched_url) = Self::load_manifest(source, opts.allow_local_http).await?;
+        if manifest.schema != "aegis-mcp-bundle/v1" {
+            bail!(
+                "Unsupported MCP bundle schema '{}' (expected 'aegis-mcp-bundle/v1')",
+                manifest.schema
+            );
+        }
         let bundle_id = sanitize_bundle_slug(&manifest.bundle_id)?;
         if manifest.servers.is_empty() {
             bail!("MCP bundle '{}' contains no servers", bundle_id);
+        }
+        if manifest.skills.len() > MAX_BUNDLE_SKILLS {
+            bail!(
+                "MCP bundle '{}' declares {} skills (limit {})",
+                bundle_id,
+                manifest.skills.len(),
+                MAX_BUNDLE_SKILLS
+            );
         }
 
         // Filter servers by requested profile (if specified)
@@ -439,11 +555,39 @@ impl McpBundleManager {
             });
         }
 
+        let previous_record = self.get_bundle(org_id, &bundle_id).await;
+
         // 1. Register / update Auth Realm in Vault-backed McpOAuthManager
         if let Some(ref realm_spec) = manifest.auth_realm {
             let mut allowed_hosts = realm_spec.allowed_hosts.clone();
             if allowed_hosts.is_empty() {
                 allowed_hosts.extend(derived_hosts.iter().cloned());
+            }
+            for ep in [
+                realm_spec.issuer_url.as_deref(),
+                realm_spec.authorization_endpoint.as_deref(),
+                realm_spec.token_endpoint.as_deref(),
+                realm_spec.device_authorization_endpoint.as_deref(),
+                realm_spec.registration_endpoint.as_deref(),
+            ]
+            .into_iter()
+            .flatten()
+            {
+                validate_mcp_http_url_syntax(ep, opts.allow_local_http)?;
+                let (ep_is_https, ep_host) = parse_url_scheme_and_host(ep)?;
+                if !crate::mcp_oauth::host_matches_allowed_patterns(
+                    &ep_host,
+                    ep_is_https,
+                    opts.allow_local_http,
+                    &allowed_hosts,
+                ) {
+                    anyhow::bail!(
+                        "Bundle auth_realm endpoint '{}' host '{}' is not in allowed_hosts {:?}",
+                        ep,
+                        ep_host,
+                        allowed_hosts
+                    );
+                }
             }
             self.oauth
                 .upsert_realm_config(
@@ -457,7 +601,7 @@ impl McpBundleManager {
                         device_authorization_endpoint: realm_spec
                             .device_authorization_endpoint
                             .clone(),
-                        registration_endpoint: None,
+                        registration_endpoint: realm_spec.registration_endpoint.clone(),
                         client_id: realm_spec.client_id.clone(),
                         scopes: realm_spec.scopes.clone(),
                         allow_local_http: opts.allow_local_http,
@@ -531,9 +675,8 @@ impl McpBundleManager {
                     } else {
                         continue;
                     };
-                    let skill_dir = ws_dir.join(".agents").join("skills").join(&clean_sk_id);
-                    tokio::fs::create_dir_all(&skill_dir).await?;
-                    tokio::fs::write(skill_dir.join("SKILL.md"), md_content.as_bytes()).await?;
+                    let skill_dir =
+                        write_skill_markdown_safe(ws_dir, &clean_sk_id, md_content.as_bytes())?;
                     installed_skill_dirs.push(skill_dir.to_string_lossy().to_string());
                 }
             }
@@ -575,6 +718,34 @@ impl McpBundleManager {
                             server_key: sid.clone(),
                         });
                     }
+                }
+            }
+        }
+
+        // Reconcile orphaned resources from any previous installation of this `bundle_id`
+        // (e.g. re-installing with a narrower `--profile` or updated manifest).
+        if let Some(prev) = previous_record {
+            for old_entry in &prev.synced_client_entries {
+                if !synced_client_entries.iter().any(|cur| {
+                    cur.client == old_entry.client
+                        && cur.config_path == old_entry.config_path
+                        && cur.server_key == old_entry.server_key
+                }) {
+                    let _ = remove_client_proxy_entry(
+                        &old_entry.client,
+                        Path::new(&old_entry.config_path),
+                        &old_entry.server_key,
+                    );
+                }
+            }
+            for old_skill in &prev.installed_skill_dirs {
+                if !installed_skill_dirs.contains(old_skill) {
+                    let _ = remove_skill_dir_safe(Path::new(old_skill));
+                }
+            }
+            for old_sid in &prev.server_ids {
+                if !server_ids.contains(old_sid) {
+                    let _ = self.firewall.remove_server(org_id, old_sid).await;
                 }
             }
         }
@@ -635,11 +806,7 @@ impl McpBundleManager {
 
         let mut removed_skills = 0usize;
         for skill_dir in &existing.installed_skill_dirs {
-            let p = Path::new(skill_dir);
-            if p.is_dir()
-                && skill_dir.contains(".agents/skills")
-                && tokio::fs::remove_dir_all(p).await.is_ok()
-            {
+            if remove_skill_dir_safe(Path::new(skill_dir)) {
                 removed_skills += 1;
             }
         }

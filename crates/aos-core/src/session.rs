@@ -255,10 +255,14 @@ fn write_bytes_atomic_with_mode(
     ));
 
     let write_res = (|| -> std::io::Result<()> {
-        let mut f = std::fs::OpenOptions::new()
-            .create_new(true)
-            .write(true)
-            .open(&tmp)?;
+        let mut opts = std::fs::OpenOptions::new();
+        opts.create_new(true).write(true);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::OpenOptionsExt;
+            opts.mode(mode_override.or(preserved_mode).unwrap_or(0o600));
+        }
+        let mut f = opts.open(&tmp)?;
         f.write_all(bytes)?;
         #[cfg(unix)]
         if let Some(mode) = mode_override.or(preserved_mode) {

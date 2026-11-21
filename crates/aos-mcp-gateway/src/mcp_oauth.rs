@@ -170,9 +170,23 @@ pub fn host_matches_allowed_patterns(
         if pat.is_empty() {
             continue;
         }
-        // Strip optional `:port` on pattern if provided for loopback tests
-        let pat_host = if let Some((h, p)) = pat.rsplit_once(':') {
-            if !h.contains(':') && p.chars().all(|c| c.is_ascii_digit()) {
+        // Strip optional `:port` (including `[::1]:8787`) and IPv6 brackets cleanly.
+        let pat_without_port = if let Some(rest) = pat.strip_prefix('[') {
+            if let Some((inner, after)) = rest.split_once(']') {
+                if after.is_empty()
+                    || after
+                        .strip_prefix(':')
+                        .is_some_and(|p| !p.is_empty() && p.chars().all(|c| c.is_ascii_digit()))
+                {
+                    inner
+                } else {
+                    pat.as_str()
+                }
+            } else {
+                pat.as_str()
+            }
+        } else if let Some((h, p)) = pat.rsplit_once(':') {
+            if !h.contains(':') && !p.is_empty() && p.chars().all(|c| c.is_ascii_digit()) {
                 h
             } else {
                 pat.as_str()
@@ -180,6 +194,7 @@ pub fn host_matches_allowed_patterns(
         } else {
             pat.as_str()
         };
+        let pat_host = pat_without_port.trim_matches(['[', ']']);
         if let Some(suffix) = pat_host.strip_prefix("*.") {
             if suffix.is_empty() || suffix.contains('*') {
                 continue;
@@ -277,6 +292,12 @@ pub struct McpOAuthManager {
     key_store: Arc<VaultKeyStore>,
 }
 
+fn sanitize_terminal_str(s: &str) -> String {
+    s.chars()
+        .filter(|&c| !c.is_control() && c != '\u{001b}' && c != '\u{007f}')
+        .collect()
+}
+
 impl McpOAuthManager {
     pub fn new(runtime_data_root: impl AsRef<Path>, key_store: Arc<VaultKeyStore>) -> Self {
         let state_file = runtime_data_root.as_ref().join("mcp_auth_realms.json");
@@ -365,13 +386,30 @@ impl McpOAuthManager {
         {
             if (200..300).contains(&status) {
                 if let Ok(pr_json) = serde_json::from_slice::<Value>(&body) {
-                    if let Some(first_auth) = pr_json
-                        .get("authorization_servers")
-                        .and_then(|v| v.as_array())
-                        .and_then(|arr| arr.first())
+                    let resource_ok = pr_json
+                        .get("resource")
                         .and_then(|v| v.as_str())
-                    {
-                        issuer_base = first_auth.trim().trim_end_matches('/').to_string();
+                        .is_none_or(|res_url| {
+                            split_origin_and_path(res_url)
+                                .is_ok_and(|(ro, _)| ro == origin)
+                        });
+                    if resource_ok {
+                        if let Some(first_auth) = pr_json
+                            .get("authorization_servers")
+                            .and_then(|v| v.as_array())
+                            .and_then(|arr| arr.first())
+                            .and_then(|v| v.as_str())
+                        {
+                            let cand = first_auth.trim().trim_end_matches('/').to_string();
+                            if crate::mcp_http::validate_mcp_http_url_syntax(
+                                &cand,
+                                allow_local_http,
+                            )
+                            .is_ok()
+                            {
+                                issuer_base = cand;
+                            }
+                        }
                     }
                 }
             }
@@ -379,6 +417,11 @@ impl McpOAuthManager {
 
         // 2. RFC 8414 & OIDC discovery candidates
         let (iss_origin, iss_path) = split_origin_and_path(&issuer_base)?;
+        let expected_iss = if iss_path.is_empty() {
+            iss_origin.clone()
+        } else {
+            format!("{iss_origin}{iss_path}")
+        };
         let mut candidates = Vec::new();
         if iss_path.is_empty() {
             candidates.push(format!("{iss_origin}/.well-known/oauth-authorization-server"));
@@ -404,6 +447,12 @@ impl McpOAuthManager {
             };
             if (200..300).contains(&status) {
                 if let Ok(meta) = serde_json::from_slice::<OAuthServerMetadata>(&body) {
+                    if let Some(ref got_iss) = meta.issuer {
+                        let norm_got = got_iss.trim().trim_end_matches('/').to_ascii_lowercase();
+                        if norm_got != expected_iss.to_ascii_lowercase() {
+                            continue;
+                        }
+                    }
                     if meta.authorization_endpoint.is_some()
                         || meta.token_endpoint.is_some()
                         || meta.device_authorization_endpoint.is_some()
@@ -434,6 +483,40 @@ impl McpOAuthManager {
                 .iter_mut()
                 .find(|r| r.org_id == org_id && r.realm_id == clean_realm)
             {
+                let host_expanded = spec.allowed_hosts.iter().any(|h| {
+                    let clean = h.trim().trim_matches(['[', ']']).to_ascii_lowercase();
+                    !clean.is_empty()
+                        && !existing
+                            .allowed_hosts
+                            .iter()
+                            .any(|eh| eh.trim().trim_matches(['[', ']']).eq_ignore_ascii_case(&clean))
+                });
+                let field_changed = |new: &Option<String>, cur: &Option<String>| -> bool {
+                    matches!(new, Some(nv) if cur.as_deref() != Some(nv.as_str()))
+                };
+                let client_changed = field_changed(&spec.client_id, &existing.client_id);
+                let security_surface_changed = host_expanded
+                    || (spec.allow_local_http && !existing.allow_local_http)
+                    || field_changed(&spec.issuer_url, &existing.issuer_url)
+                    || field_changed(&spec.authorization_endpoint, &existing.authorization_endpoint)
+                    || field_changed(&spec.token_endpoint, &existing.token_endpoint)
+                    || field_changed(
+                        &spec.device_authorization_endpoint,
+                        &existing.device_authorization_endpoint,
+                    )
+                    || field_changed(&spec.registration_endpoint, &existing.registration_endpoint)
+                    || client_changed;
+
+                if client_changed {
+                    existing.sealed_client_secret = None;
+                }
+                if security_surface_changed {
+                    existing.sealed_access_token = None;
+                    existing.sealed_refresh_token = None;
+                    existing.token_prefix = None;
+                    existing.expires_at_ms = None;
+                }
+
                 merge_unique_hosts(&mut existing.allowed_hosts, &spec.allowed_hosts);
                 merge_unique_scopes(&mut existing.scopes, &spec.scopes);
                 if spec.issuer_url.is_some() {
@@ -716,6 +799,7 @@ impl McpOAuthManager {
             if spec.token_endpoint.is_none()
                 || spec.authorization_endpoint.is_none()
                 || spec.device_authorization_endpoint.is_none()
+                || (spec.registration_endpoint.is_none() && spec.client_id.is_none())
             {
                 if let Ok(meta) = Self::discover_oauth_metadata(iss, effective_local).await {
                     if spec.authorization_endpoint.is_none() {
@@ -730,9 +814,7 @@ impl McpOAuthManager {
                     if spec.registration_endpoint.is_none() {
                         spec.registration_endpoint = meta.registration_endpoint;
                     }
-                    if spec.scopes.is_empty()
-                        && existing.as_ref().is_none_or(|r| r.scopes.is_empty())
-                    {
+                    if spec.scopes.is_empty() && existing.is_none() {
                         spec.scopes = meta.scopes_supported;
                     }
                 }
@@ -833,6 +915,7 @@ impl McpOAuthManager {
         realm_id: &str,
         resp: &Value,
         default_scopes: &[String],
+        preserve_existing_refresh: bool,
     ) -> anyhow::Result<McpAuthRealmRecord> {
         let access_token = Zeroizing::new(
             resp.get("access_token")
@@ -877,7 +960,7 @@ impl McpOAuthManager {
                 .find(|r| r.org_id == org_id && r.realm_id == realm_id)
                 .with_context(|| format!("Auth realm '{}' disappeared during login", realm_id))?;
             rec.sealed_access_token = Some(sealed_access);
-            if sealed_refresh.is_some() {
+            if sealed_refresh.is_some() || !preserve_existing_refresh {
                 rec.sealed_refresh_token = sealed_refresh;
             }
             rec.token_prefix = Some(prefix);
@@ -982,7 +1065,14 @@ impl McpOAuthManager {
             loop {
                 let (mut sock, _) = listener.accept().await?;
                 let mut buf = vec![0u8; 8192];
-                let n = sock.read(&mut buf).await?;
+                let Ok(Ok(n)) =
+                    tokio::time::timeout(Duration::from_secs(2), sock.read(&mut buf)).await
+                else {
+                    continue;
+                };
+                if n == 0 {
+                    continue;
+                }
                 let req = String::from_utf8_lossy(&buf[..n]);
                 let first_line = req.lines().next().unwrap_or("");
                 let target = first_line.split_whitespace().nth(1).unwrap_or("/");
@@ -994,6 +1084,13 @@ impl McpOAuthManager {
                 }
                 let q = target.split_once('?').map(|(_, q)| q).unwrap_or("");
                 let params = parse_query_params(q);
+                let got_state = params.get("state").map(String::as_str).unwrap_or("");
+                if got_state != state {
+                    let _ = sock
+                        .write_all(b"HTTP/1.1 400 Bad Request\r\nContent-Length: 13\r\nConnection: close\r\n\r\ninvalid state")
+                        .await;
+                    continue;
+                }
                 if let Some(err) = params.get("error") {
                     let desc = params.get("error_description").map(String::as_str).unwrap_or("");
                     let body = "<html><body><h2>Authorization Denied</h2><p>You can close this tab.</p></body></html>";
@@ -1007,14 +1104,11 @@ impl McpOAuthManager {
                             .as_bytes(),
                         )
                         .await;
-                    bail!("OAuth authorization failed: {} {}", err, desc);
-                }
-                let got_state = params.get("state").map(String::as_str).unwrap_or("");
-                if got_state != state {
-                    let _ = sock
-                        .write_all(b"HTTP/1.1 400 Bad Request\r\nContent-Length: 13\r\nConnection: close\r\n\r\ninvalid state")
-                        .await;
-                    bail!("OAuth loopback callback state mismatch");
+                    bail!(
+                        "OAuth authorization failed: {} {}",
+                        sanitize_terminal_str(err),
+                        sanitize_terminal_str(desc)
+                    );
                 }
                 let code = params
                     .get("code")
@@ -1071,7 +1165,13 @@ impl McpOAuthManager {
         }
 
         let updated = self
-            .persist_token_exchange_response(org_id, &clean_realm, &resp_json, &realm.scopes)
+            .persist_token_exchange_response(
+                org_id,
+                &clean_realm,
+                &resp_json,
+                &realm.scopes,
+                false,
+            )
             .await?;
 
         Ok(json!({
@@ -1164,6 +1264,17 @@ impl McpOAuthManager {
             .and_then(|v| v.as_str())
             .unwrap_or("")
             .to_string();
+        if !verification_uri.is_empty() {
+            crate::mcp_http::validate_mcp_http_url_syntax(&verification_uri, effective_local)
+                .with_context(|| {
+                    format!(
+                        "Device authorization returned disallowed verification_uri '{}'",
+                        sanitize_terminal_str(&verification_uri)
+                    )
+                })?;
+        }
+        let safe_uri = sanitize_terminal_str(&verification_uri);
+        let safe_code = sanitize_terminal_str(&user_code);
         let mut interval_secs = dev_json
             .get("interval")
             .and_then(|v| v.as_u64())
@@ -1171,12 +1282,12 @@ impl McpOAuthManager {
             .clamp(1, 30);
 
         if let Some(cb) = on_device_prompt {
-            cb(&verification_uri, &user_code);
+            cb(&safe_uri, &safe_code);
         } else {
             eprintln!("MCP Realm '{}' Device Code Login:", clean_realm);
-            eprintln!("  Visit: {}", verification_uri);
-            if !user_code.is_empty() {
-                eprintln!("  Code:  {}", user_code);
+            eprintln!("  Visit: {}", safe_uri);
+            if !safe_code.is_empty() {
+                eprintln!("  Code:  {}", safe_code);
             }
         }
 
@@ -1217,6 +1328,7 @@ impl McpOAuthManager {
                         &clean_realm,
                         &resp_json,
                         &realm.scopes,
+                        false,
                     )
                     .await?;
                 return Ok(json!({
@@ -1245,7 +1357,11 @@ impl McpOAuthManager {
                         .get("error_description")
                         .and_then(|v| v.as_str())
                         .unwrap_or("");
-                    bail!("Device code login failed ({}): {}", other, desc);
+                    bail!(
+                        "Device code login failed ({}): {}",
+                        sanitize_terminal_str(other),
+                        sanitize_terminal_str(desc)
+                    );
                 }
             }
         }
@@ -1316,6 +1432,25 @@ impl McpOAuthManager {
         if let (Some(ref refresh_blob), Some(ref token_ep)) =
             (&rec.sealed_refresh_token, &rec.token_endpoint)
         {
+            let (tok_https, tok_host) = parse_url_scheme_and_host(token_ep)?;
+            let tok_matches_issuer = rec
+                .issuer_url
+                .as_deref()
+                .and_then(|u| parse_url_scheme_and_host(u).ok())
+                .is_some_and(|(ih, ihost)| tok_https == ih && tok_host == ihost);
+            let tok_matches_hosts = host_matches_allowed_patterns(
+                &tok_host,
+                tok_https,
+                effective_local,
+                &rec.allowed_hosts,
+            );
+            if !(tok_matches_issuer || tok_matches_hosts) {
+                bail!(
+                    "Security policy blocked sending refresh credentials for realm '{}' to untrusted token_endpoint '{}'",
+                    clean_realm,
+                    redact_url_for_log(token_ep)
+                );
+            }
             let refresh_aad = format!("mcp-realm:{}:{}:refresh_token", org_id, clean_realm);
             let refresh_plain = self.key_store.open_secret(&refresh_aad, refresh_blob)?;
             let refresh_str = Zeroizing::new(
@@ -1356,7 +1491,13 @@ impl McpOAuthManager {
             if (200..300).contains(&status) {
                 let resp_json: Value = serde_json::from_slice(&resp_bytes)?;
                 let _ = self
-                    .persist_token_exchange_response(org_id, &clean_realm, &resp_json, &rec.scopes)
+                    .persist_token_exchange_response(
+                        org_id,
+                        &clean_realm,
+                        &resp_json,
+                        &rec.scopes,
+                        true,
+                    )
                     .await?;
                 let fresh = resp_json
                     .get("access_token")
@@ -1682,5 +1823,69 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(hot_tok.as_str(), "tok_device_secret_ok");
+    }
+
+    #[tokio::test]
+    async fn upsert_realm_config_wipes_existing_tokens_on_security_surface_expansion() {
+        let tmp = tempfile::tempdir().unwrap();
+        let ks = Arc::new(VaultKeyStore::new(Arc::new(InMemoryKekProvider::new(
+            [0x33u8; 32],
+        ))));
+        let mgr = McpOAuthManager::new(tmp.path(), ks);
+
+        mgr.login_static_token(
+            "org-a",
+            "r1",
+            "tok_super_secret",
+            vec!["api.good.example".to_string()],
+            false,
+        )
+        .await
+        .unwrap();
+        let before = mgr.get_realm("org-a", "r1").await.unwrap();
+        assert!(before.sealed_access_token.is_some());
+
+        // Expanding `allowed_hosts` with a new host or enabling `allow_local_http` must wipe sealed tokens.
+        mgr.upsert_realm_config(
+            "org-a",
+            "r1",
+            RealmUpsertSpec {
+                allowed_hosts: vec![
+                    "api.good.example".to_string(),
+                    "attacker.evil.example".to_string(),
+                ],
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
+        let after_host = mgr.get_realm("org-a", "r1").await.unwrap();
+        assert!(after_host.sealed_access_token.is_none());
+        assert!(after_host.token_prefix.is_none());
+
+        mgr.login_static_token(
+            "org-a",
+            "r1",
+            "tok_super_secret_2",
+            vec![
+                "api.good.example".to_string(),
+                "attacker.evil.example".to_string(),
+            ],
+            false,
+        )
+        .await
+        .unwrap();
+        mgr.upsert_realm_config(
+            "org-a",
+            "r1",
+            RealmUpsertSpec {
+                issuer_url: Some("https://other-issuer.example".to_string()),
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
+        let after_issuer = mgr.get_realm("org-a", "r1").await.unwrap();
+        assert!(after_issuer.sealed_access_token.is_none());
     }
 }

@@ -699,6 +699,15 @@ pub(crate) async fn handle_mcp_command(
                 token
             };
 
+            let realm_rec = kernel.mcp_oauth.get_realm(&identity.org_id, &realm_id).await;
+            let auto_device_code = !device_code
+                && issuer.is_none()
+                && realm_rec.as_ref().is_some_and(|r| {
+                    r.device_authorization_endpoint.is_some()
+                        && r.authorization_endpoint.is_none()
+                        && r.issuer_url.is_none()
+                });
+
             let res = if let Some(raw_tok) = static_tok {
                 if effective_hosts.is_empty() {
                     if let Some(ref iss) = effective_issuer {
@@ -717,7 +726,7 @@ pub(crate) async fn handle_mcp_command(
                         effective_local,
                     )
                     .await?
-            } else if device_code {
+            } else if device_code || auto_device_code {
                 kernel
                     .mcp_oauth
                     .login_device_code(
@@ -842,6 +851,16 @@ pub(crate) async fn handle_mcp_command(
                     let mut login_result = None;
                     if login && !dry_run {
                         if let Some(ref realm_id) = rec.auth_realm_id {
+                            let auto_device_code = !device_code
+                                && kernel
+                                    .mcp_oauth
+                                    .get_realm(&identity.org_id, realm_id)
+                                    .await
+                                    .is_some_and(|r| {
+                                        r.device_authorization_endpoint.is_some()
+                                            && r.authorization_endpoint.is_none()
+                                            && r.issuer_url.is_none()
+                                    });
                             let res = if let Some(ref raw_tok) = token {
                                 kernel
                                     .mcp_oauth
@@ -853,7 +872,7 @@ pub(crate) async fn handle_mcp_command(
                                         allow_local_http,
                                     )
                                     .await?
-                            } else if device_code {
+                            } else if device_code || auto_device_code {
                                 kernel
                                     .mcp_oauth
                                     .login_device_code(
@@ -1011,7 +1030,7 @@ pub(crate) async fn handle_mcp_command(
                 McpOutboxAction::Show { ticket_id, json } => {
                     let ticket = kernel
                         .mcp_firewall
-                        .get_outbox_ticket(&ticket_id)
+                        .get_outbox_ticket(&identity.org_id, &ticket_id)
                         .await
                         .with_context(|| format!("Outbox ticket '{}' not found", ticket_id))?;
                     if json {
@@ -1048,7 +1067,7 @@ pub(crate) async fn handle_mcp_command(
                 McpOutboxAction::Approve { ticket_id, json } => {
                     let ticket = kernel
                         .mcp_firewall
-                        .approve_outbox_ticket(&ticket_id, "cli-operator")
+                        .approve_outbox_ticket(&identity.org_id, &ticket_id, "cli-operator")
                         .await?;
                     if json {
                         println!("{}", serde_json::to_string_pretty(&ticket)?);
@@ -1062,7 +1081,7 @@ pub(crate) async fn handle_mcp_command(
                 McpOutboxAction::Deny { ticket_id, json } => {
                     let ticket = kernel
                         .mcp_firewall
-                        .deny_outbox_ticket(&ticket_id, "cli-operator")
+                        .deny_outbox_ticket(&identity.org_id, &ticket_id, "cli-operator")
                         .await?;
                     if json {
                         println!("{}", serde_json::to_string_pretty(&ticket)?);
@@ -1264,6 +1283,7 @@ async fn run_mcp_stdio_proxy(
 
     if has_broker {
         let route = format!("/v1/mcp-proxy/{}", server_id);
+        let dry_run = std::env::var("AOS_MCP_DRY_RUN").as_deref() == Ok("1");
         while let Some(line) = lines.next_line().await? {
             let trimmed = line.trim();
             if trimmed.is_empty() {
@@ -1273,12 +1293,36 @@ async fn run_mcp_stdio_proxy(
                 continue;
             };
             let has_id = request.get("id").is_some();
-            let resp = match crate::session_broker::control_request("POST", &route, Some(&request))
-                .await
-            {
+            let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+            let mut rpc_fut = std::pin::pin!(crate::session_broker::control_request_mcp_streaming(
+                &route,
+                &request,
+                dry_run,
+                tx,
+            ));
+            let rpc_res = loop {
+                tokio::select! {
+                    res = &mut rpc_fut => break res,
+                    maybe_n = rx.recv() => {
+                        if let Some(n) = maybe_n {
+                            stdout
+                                .write_all(format!("{}\n", serde_json::to_string(&n)?).as_bytes())
+                                .await?;
+                            stdout.flush().await?;
+                        }
+                    }
+                }
+            };
+            while let Ok(n) = rx.try_recv() {
+                stdout
+                    .write_all(format!("{}\n", serde_json::to_string(&n)?).as_bytes())
+                    .await?;
+            }
+            let resp = match rpc_res {
                 Ok(v) => v,
                 Err(err) => {
                     if !has_id {
+                        stdout.flush().await?;
                         continue;
                     }
                     json!({
@@ -1289,6 +1333,7 @@ async fn run_mcp_stdio_proxy(
                 }
             };
             if !has_id || resp.is_null() {
+                stdout.flush().await?;
                 continue;
             }
             if resp.get("__aegis_mcp_envelope").and_then(|v| v.as_bool()) == Some(true) {
@@ -1748,7 +1793,7 @@ for line in sys.stdin:
 
         let updated = kernel
             .mcp_firewall
-            .get_outbox_ticket(&ticket.ticket_id)
+            .get_outbox_ticket(&identity.org_id, &ticket.ticket_id)
             .await
             .unwrap();
         assert_eq!(updated.status, OutboxStatus::Dispatched);
