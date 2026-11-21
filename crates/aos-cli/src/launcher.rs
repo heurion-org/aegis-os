@@ -58,6 +58,7 @@ const PROTECTED_AGENT_CONFIGS: &[&str] = &[
     ".codex/config.toml",
     ".gemini/config/hooks.json",
     ".gemini/config/mcp_config.json",
+    ".gemini/antigravity-cli/mcp_config.json",
     ".cursor/mcp.json",
     ".hermes/config.yaml",
 ];
@@ -191,6 +192,7 @@ pub(crate) struct RunEgressOptions {
     pub isolated: bool,
     pub vcpus: u32,
     pub mem_mb: u64,
+    pub tool_profile: Option<String>,
 }
 
 /// Seeds a fresh session's `dst_cow_base` zero-copy from an existing CoW workspace base
@@ -877,7 +879,228 @@ fn sanitize_seeded_agent_home(agent_home: &Path) -> anyhow::Result<()> {
             }
         }
     }
+
+    // 4. Scrub sensitive plaintext credentials from unadopted third-party MCP entries seeded from
+    // host client configs so raw tokens never leak into the sandbox agent home.
+    scrub_unadopted_mcp_secrets_in_agent_home(agent_home);
     Ok(())
+}
+
+fn redact_sensitive_kv_map(obj: &mut serde_json::Map<String, Value>) -> bool {
+    let mut changed = false;
+    for (k, v) in obj.iter_mut() {
+        if let Some(s) = v.as_str() {
+            if s != "[REDACTED_BY_AEGIS_SANDBOX]"
+                && aos_mcp_gateway::mcp_firewall::is_sensitive_kv(k, s)
+            {
+                *v = Value::String("[REDACTED_BY_AEGIS_SANDBOX]".to_string());
+                changed = true;
+            }
+        }
+    }
+    changed
+}
+
+fn scrub_unadopted_mcp_server_table(servers: &mut serde_json::Map<String, Value>) -> bool {
+    let mut changed = false;
+    for (server_key, entry) in servers.iter_mut() {
+        if aos_mcp_gateway::mcp_firewall::is_already_aegis_proxy_entry(server_key, entry) {
+            continue;
+        }
+        let Some(entry_obj) = entry.as_object_mut() else {
+            continue;
+        };
+        for field in ["env", "environment", "headers", "http_headers"] {
+            if let Some(map) = entry_obj.get_mut(field).and_then(|v| v.as_object_mut()) {
+                if redact_sensitive_kv_map(map) {
+                    changed = true;
+                }
+            }
+        }
+    }
+    changed
+}
+
+fn parse_toml_header_path(line: &str) -> Option<Vec<String>> {
+    let trimmed = line.trim();
+    if !trimmed.starts_with('[') || !trimmed.ends_with(']') || trimmed.starts_with("[[") {
+        return None;
+    }
+    let inner = &trimmed[1..trimmed.len() - 1];
+    let mut parts = Vec::new();
+    let mut chars = inner.chars().peekable();
+    while let Some(&c) = chars.peek() {
+        if c.is_whitespace() || c == '.' {
+            chars.next();
+            continue;
+        }
+        if c == '"' || c == '\'' {
+            let quote = c;
+            chars.next();
+            let mut part = String::new();
+            while let Some(ch) = chars.next() {
+                if ch == '\\' && quote == '"' {
+                    if let Some(esc) = chars.next() {
+                        part.push(esc);
+                    }
+                } else if ch == quote {
+                    break;
+                } else {
+                    part.push(ch);
+                }
+            }
+            parts.push(part);
+        } else {
+            let mut part = String::new();
+            while let Some(&ch) = chars.peek() {
+                if ch == '.' || ch.is_whitespace() {
+                    break;
+                }
+                part.push(ch);
+                chars.next();
+            }
+            if !part.is_empty() {
+                parts.push(part);
+            }
+        }
+    }
+    Some(parts)
+}
+
+fn scrub_unadopted_mcp_secrets_in_agent_home(agent_home: &Path) {
+    for rel in [
+        ".claude.json",
+        ".gemini/config/mcp_config.json",
+        ".gemini/antigravity-cli/mcp_config.json",
+        ".cursor/mcp.json",
+    ] {
+        let p = agent_home.join(rel);
+        if !p.is_file() {
+            continue;
+        }
+        let Ok(raw) = std::fs::read_to_string(&p) else {
+            continue;
+        };
+        let Ok(mut root) = serde_json::from_str::<Value>(&raw) else {
+            continue;
+        };
+        if let Some(servers) = root.get_mut("mcpServers").and_then(|v| v.as_object_mut()) {
+            if scrub_unadopted_mcp_server_table(servers) {
+                if let Ok(pretty) = serde_json::to_string_pretty(&root) {
+                    let _ = std::fs::write(&p, format!("{pretty}\n"));
+                }
+            }
+        }
+    }
+
+    let opencode_cfg = agent_home.join(".config/opencode/opencode.json");
+    if opencode_cfg.is_file() {
+        if let Ok(raw) = std::fs::read_to_string(&opencode_cfg) {
+            if let Ok(mut root) = serde_json::from_str::<Value>(&raw) {
+                let mut changed = false;
+                if let Some(servers) = root
+                    .pointer_mut("/mcp/servers")
+                    .and_then(|v| v.as_object_mut())
+                {
+                    if scrub_unadopted_mcp_server_table(servers) {
+                        changed = true;
+                    }
+                } else if let Some(mcp_obj) = root.get_mut("mcp").and_then(|v| v.as_object_mut()) {
+                    if scrub_unadopted_mcp_server_table(mcp_obj) {
+                        changed = true;
+                    }
+                }
+                if changed {
+                    if let Ok(pretty) = serde_json::to_string_pretty(&root) {
+                        let _ = std::fs::write(&opencode_cfg, format!("{pretty}\n"));
+                    }
+                }
+            }
+        }
+    }
+
+    let codex_cfg = agent_home.join(".codex/config.toml");
+    if codex_cfg.is_file() {
+        if let Ok(raw) = std::fs::read_to_string(&codex_cfg) {
+            // Pass 1: find adopted Codex `[mcp_servers.<name>]` blocks so they are preserved intact.
+            let mut adopted = std::collections::HashSet::<String>::new();
+            let mut cur_server: Option<String> = None;
+            let mut in_base_section = false;
+            for line in raw.lines() {
+                if let Some(parts) = parse_toml_header_path(line) {
+                    if parts.first().map(String::as_str) == Some("mcp_servers") && parts.len() >= 2
+                    {
+                        cur_server = Some(parts[1].clone());
+                        in_base_section = parts.len() == 2;
+                    } else {
+                        cur_server = None;
+                        in_base_section = false;
+                    }
+                    continue;
+                }
+                if in_base_section {
+                    if let Some(ref key) = cur_server {
+                        if key == "aegis-os"
+                            || line.contains("mcp-stdio")
+                            || (line.contains("\"mcp\"") && line.contains("\"proxy\""))
+                        {
+                            adopted.insert(key.clone());
+                        }
+                    }
+                }
+            }
+
+            // Pass 2: redact sensitive env/header assignments inside unadopted sections.
+            let mut changed = false;
+            let mut out = Vec::new();
+            let mut active_sensitive_server: Option<String> = None;
+            for line in raw.lines() {
+                if let Some(parts) = parse_toml_header_path(line) {
+                    active_sensitive_server = if parts.first().map(String::as_str)
+                        == Some("mcp_servers")
+                        && parts.len() == 3
+                        && matches!(parts[2].as_str(), "env" | "http_headers" | "headers")
+                    {
+                        Some(parts[1].clone())
+                    } else {
+                        None
+                    };
+                    out.push(line.to_string());
+                    continue;
+                }
+                let trimmed = line.trim();
+                if let Some(ref server_key) = active_sensitive_server {
+                    if !adopted.contains(server_key)
+                        && !trimmed.is_empty()
+                        && !trimmed.starts_with('#')
+                    {
+                        if let Some((k, v)) = trimmed.split_once('=') {
+                            let k_trim = k.trim();
+                            let v_unquoted = v.trim().trim_matches('"').trim_matches('\'');
+                            if v_unquoted != "[REDACTED_BY_AEGIS_SANDBOX]"
+                                && aos_mcp_gateway::mcp_firewall::is_sensitive_kv(
+                                    k_trim,
+                                    v_unquoted,
+                                )
+                            {
+                                out.push(format!("{k_trim} = \"[REDACTED_BY_AEGIS_SANDBOX]\""));
+                                changed = true;
+                                continue;
+                            }
+                        }
+                    }
+                }
+                out.push(line.to_string());
+            }
+            if changed {
+                let mut joined = out.join("\n");
+                if raw.ends_with('\n') {
+                    joined.push('\n');
+                }
+                let _ = std::fs::write(&codex_cfg, joined);
+            }
+        }
+    }
 }
 
 fn ensure_protected_agent_configs(agent_home: &Path) -> anyhow::Result<()> {
@@ -889,6 +1112,7 @@ fn ensure_protected_agent_configs(agent_home: &Path) -> anyhow::Result<()> {
         (".claude/settings.local.json", "{}\n"),
         (".gemini/config/hooks.json", "{}\n"),
         (".gemini/config/mcp_config.json", "{}\n"),
+        (".gemini/antigravity-cli/mcp_config.json", "{}\n"),
         (".cursor/mcp.json", "{}\n"),
         (".codex/config.toml", "# protected by aegis-os\n"),
     ] {
@@ -909,6 +1133,282 @@ fn ensure_protected_agent_configs(agent_home: &Path) -> anyhow::Result<()> {
     }
     for rel_dir in PROTECTED_AGENT_PLUGIN_DIRS {
         std::fs::create_dir_all(agent_home.join(rel_dir))?;
+    }
+    Ok(())
+}
+
+pub(crate) enum ConfinedMcpTransport<'a> {
+    EnforcedStdio {
+        bin_path: &'a str,
+        runtime_dir: &'a Path,
+        control_socket: &'a str,
+    },
+    IsolatedHttp {
+        proxy_addr: &'a str,
+    },
+}
+
+fn format_toml_key_part(s: &str) -> String {
+    if !s.is_empty()
+        && s.chars()
+            .all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_')
+    {
+        s.to_string()
+    } else {
+        serde_json::to_string(s).unwrap_or_else(|_| format!("\"{s}\""))
+    }
+}
+
+fn upsert_isolated_http_json_entry(
+    config_path: &Path,
+    is_opencode: bool,
+    server_key: &str,
+    url: &str,
+    session_token: &str,
+) -> anyhow::Result<()> {
+    if let Some(parent) = config_path.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
+    let text = if config_path.is_file() {
+        std::fs::read_to_string(config_path)
+            .with_context(|| format!("reading confined MCP config '{}'", config_path.display()))?
+    } else {
+        String::new()
+    };
+    if is_opencode {
+        let mut root: Value = if text.trim().is_empty() {
+            json!({ "mcp": { "servers": {} } })
+        } else {
+            serde_json::from_str(&text)
+                .with_context(|| format!("parsing JSON config '{}'", config_path.display()))?
+        };
+        let entry = json!({
+            "type": "remote",
+            "url": url,
+            "enabled": true,
+            "headers": {
+                "X-Aegis-Token": session_token
+            }
+        });
+        if let Some(servers) = root
+            .pointer_mut("/mcp/servers")
+            .and_then(|v| v.as_object_mut())
+        {
+            servers.insert(server_key.to_string(), entry);
+        } else if let Some(mcp_obj) = root.get_mut("mcp").and_then(|v| v.as_object_mut()) {
+            mcp_obj.insert(server_key.to_string(), entry);
+        } else if let Some(root_obj) = root.as_object_mut() {
+            root_obj.insert(
+                "mcp".to_string(),
+                json!({ "servers": { server_key: entry } }),
+            );
+        } else {
+            bail!(
+                "opencode.json root is not an object in {}",
+                config_path.display()
+            );
+        }
+        std::fs::write(
+            config_path,
+            format!("{}\n", serde_json::to_string_pretty(&root)?),
+        )?;
+    } else {
+        let mut root: Value = if text.trim().is_empty() {
+            json!({ "mcpServers": {} })
+        } else {
+            serde_json::from_str(&text)
+                .with_context(|| format!("parsing JSON config '{}'", config_path.display()))?
+        };
+        let root_obj = root.as_object_mut().with_context(|| {
+            format!("JSON config root is not an object in {}", config_path.display())
+        })?;
+        let servers_val = root_obj
+            .entry("mcpServers")
+            .or_insert_with(|| json!({}));
+        if !servers_val.is_object() {
+            *servers_val = json!({});
+        }
+        let servers = servers_val
+            .as_object_mut()
+            .expect("mcpServers normalized to object");
+        servers.insert(
+            server_key.to_string(),
+            json!({
+                "type": "http",
+                "url": url,
+                "headers": {
+                    "X-Aegis-Token": session_token
+                }
+            }),
+        );
+        std::fs::write(
+            config_path,
+            format!("{}\n", serde_json::to_string_pretty(&root)?),
+        )?;
+    }
+    Ok(())
+}
+
+fn upsert_isolated_http_codex_entry(
+    config_path: &Path,
+    server_key: &str,
+    url: &str,
+    session_token: &str,
+) -> anyhow::Result<()> {
+    let _ = aos_mcp_gateway::mcp_firewall::remove_client_proxy_entry(
+        "codex",
+        config_path,
+        server_key,
+    )?;
+    if let Some(parent) = config_path.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
+    let existing = if config_path.is_file() {
+        std::fs::read_to_string(config_path)?
+    } else {
+        String::new()
+    };
+    let key_part = format_toml_key_part(server_key);
+    let url_json = serde_json::to_string(url)?;
+    let tok_json = serde_json::to_string(session_token)?;
+    let block = format!(
+        "[mcp_servers.{key_part}]\nurl = {url_json}\n\n[mcp_servers.{key_part}.http_headers]\nX-Aegis-Token = {tok_json}\n"
+    );
+    let updated = if existing.trim().is_empty() {
+        block
+    } else {
+        format!("{}\n\n{}", existing.trim_end(), block)
+    };
+    std::fs::write(config_path, updated)?;
+    Ok(())
+}
+
+/// Stages confined session MCP client configurations inside `agent_home` (never mutating `shadow`
+/// workspace files) and persists `0o600` `$HOME/.run/aegis-broker.json` fallback credentials so
+/// child MCP processes spawned by `claude` / `agy` work even if env vars are stripped.
+pub(crate) fn stage_confined_mcp_configs(
+    agent_home: &Path,
+    identity: &AgentIdentity,
+    servers: &[aos_mcp_gateway::mcp_firewall::AdoptedMcpServerRecord],
+    session_token: &str,
+    tool_profile: Option<&str>,
+    transport: ConfinedMcpTransport<'_>,
+) -> anyhow::Result<()> {
+    let run_dir = agent_home.join(".run");
+    std::fs::create_dir_all(&run_dir)?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let _ = std::fs::set_permissions(&run_dir, std::fs::Permissions::from_mode(0o700));
+    }
+
+    let control_socket_str = match &transport {
+        ConfinedMcpTransport::EnforcedStdio { control_socket, .. } => (*control_socket).to_string(),
+        ConfinedMcpTransport::IsolatedHttp { proxy_addr } => {
+            format!("http://{proxy_addr}/__aegis/mcp/_kernel")
+        }
+    };
+    let broker_file = crate::session_broker::ConfinedBrokerFile {
+        control_socket: control_socket_str,
+        session_token: session_token.to_string(),
+        tool_profile: tool_profile.map(str::to_string),
+    };
+    let broker_path = run_dir.join("aegis-broker.json");
+    std::fs::write(
+        &broker_path,
+        format!("{}\n", serde_json::to_string_pretty(&broker_file)?),
+    )?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let _ = std::fs::set_permissions(&broker_path, std::fs::Permissions::from_mode(0o600));
+    }
+
+    let client_targets = [
+        ("claude", agent_home.join(".claude.json")),
+        ("agy", agent_home.join(".gemini/config/mcp_config.json")),
+        (
+            "agy-cli",
+            agent_home.join(".gemini/antigravity-cli/mcp_config.json"),
+        ),
+        ("cursor", agent_home.join(".cursor/mcp.json")),
+        ("opencode", agent_home.join(".config/opencode/opencode.json")),
+        ("codex", agent_home.join(".codex/config.toml")),
+    ];
+
+    match transport {
+        ConfinedMcpTransport::EnforcedStdio {
+            bin_path,
+            runtime_dir,
+            control_socket,
+        } => {
+            let mut extra_env = std::collections::BTreeMap::new();
+            extra_env.insert("AOS_CONTROL_SOCKET".to_string(), control_socket.to_string());
+            extra_env.insert("AOS_SESSION_TOKEN".to_string(), session_token.to_string());
+            if let Some(tp) = tool_profile.map(str::trim).filter(|s| !s.is_empty()) {
+                extra_env.insert("AOS_MCP_TOOL_PROFILE".to_string(), tp.to_string());
+            }
+            let rt_str = runtime_dir.display().to_string();
+            for (client, cfg_path) in &client_targets {
+                let _ = aos_mcp_gateway::mcp_firewall::upsert_client_proxy_entry(
+                    client,
+                    cfg_path,
+                    "aegis-os",
+                    bin_path,
+                    &["mcp-stdio".to_string()],
+                    Some(&extra_env),
+                )?;
+                for srv in servers {
+                    let args = vec![
+                        "--org".to_string(),
+                        identity.org_id.clone(),
+                        "--agent".to_string(),
+                        identity.agent_id.clone(),
+                        "--runtime-dir".to_string(),
+                        rt_str.clone(),
+                        "mcp".to_string(),
+                        "proxy".to_string(),
+                        srv.server_id.clone(),
+                    ];
+                    let _ = aos_mcp_gateway::mcp_firewall::upsert_client_proxy_entry(
+                        client,
+                        cfg_path,
+                        &srv.server_id,
+                        bin_path,
+                        &args,
+                        Some(&extra_env),
+                    )?;
+                }
+            }
+        }
+        ConfinedMcpTransport::IsolatedHttp { proxy_addr } => {
+            let mut entries = Vec::with_capacity(1 + servers.len());
+            entries.push((
+                "aegis-os".to_string(),
+                format!("http://{proxy_addr}/__aegis/mcp/_kernel"),
+            ));
+            for srv in servers {
+                entries.push((
+                    srv.server_id.clone(),
+                    format!("http://{proxy_addr}/__aegis/mcp/{}", srv.server_id),
+                ));
+            }
+            for (client, cfg_path) in &client_targets {
+                for (key, url) in &entries {
+                    if *client == "codex" {
+                        upsert_isolated_http_codex_entry(cfg_path, key, url, session_token)?;
+                    } else {
+                        upsert_isolated_http_json_entry(
+                            cfg_path,
+                            *client == "opencode",
+                            key,
+                            url,
+                            session_token,
+                        )?;
+                    }
+                }
+            }
+        }
     }
     Ok(())
 }
@@ -6451,6 +6951,7 @@ async fn run_inner(
             &dlp_cfg,
             &pricing_overrides,
             egress_opts.seed_from_cow_base.as_deref(),
+            egress_opts.tool_profile.as_deref(),
         )
         .await;
     }
@@ -6636,6 +7137,33 @@ async fn run_inner(
     )
     .await?;
 
+    let org_mcp_servers = broker
+        .kernel
+        .mcp_firewall
+        .list_servers(Some(&identity.org_id))
+        .await;
+    let sandbox_bin_path = if proxy.is_some() {
+        let exe_name = exe
+            .file_name()
+            .and_then(|s| s.to_str())
+            .unwrap_or("aegis-os");
+        format!("/run/aegis/bin/{exe_name}")
+    } else {
+        exe.display().to_string()
+    };
+    stage_confined_mcp_configs(
+        &agent_home,
+        &identity,
+        &org_mcp_servers,
+        &broker.agent_token,
+        egress_opts.tool_profile.as_deref(),
+        ConfinedMcpTransport::EnforcedStdio {
+            bin_path: &sandbox_bin_path,
+            runtime_dir,
+            control_socket: crate::session_broker::CONTROL_SOCKET_IN_SANDBOX,
+        },
+    )?;
+
     let mut fds = Vec::new();
     fds.push(fd_mount(&project, format!("{HOST_STAGE}/{host_name}"), true)?);
     fds.push(fd_mount(&shadow, project.clone(), mode == "observe")?);
@@ -6801,6 +7329,9 @@ async fn run_inner(
         "AOS_CONTROL_SOCKET".to_string(),
         crate::session_broker::CONTROL_SOCKET_IN_SANDBOX.to_string(),
     ));
+    if let Some(ref tp) = egress_opts.tool_profile {
+        envs.push(("AOS_MCP_TOOL_PROFILE".to_string(), tp.clone()));
+    }
     append_credential_and_tls_envs(
         &mut envs,
         proxy.as_deref(),
@@ -7034,6 +7565,20 @@ async fn run_isolated_inner(
     )
     .await?;
 
+    let org_mcp_servers = broker
+        .kernel
+        .mcp_firewall
+        .list_servers(Some(&identity.org_id))
+        .await;
+    stage_confined_mcp_configs(
+        &agent_home,
+        identity,
+        &org_mcp_servers,
+        &broker.agent_token,
+        egress_opts.tool_profile.as_deref(),
+        ConfinedMcpTransport::IsolatedHttp { proxy_addr: &proxy },
+    )?;
+
     let org_shared = runtime_dir
         .join("orgs")
         .join(&identity.org_id)
@@ -7104,6 +7649,9 @@ async fn run_isolated_inner(
     env.insert("AOS_ORG_ID".to_string(), identity.org_id.clone());
     env.insert("AOS_AGENT_ID".to_string(), identity.agent_id.clone());
     env.insert("AOS_SESSION_TOKEN".to_string(), broker.agent_token.clone());
+    if let Some(ref tp) = egress_opts.tool_profile {
+        env.insert("AOS_MCP_TOOL_PROFILE".to_string(), tp.clone());
+    }
     env.insert(
         "AOS_EGRESS".to_string(),
         "vsock-egress-allowlist+l7-base-url".to_string(),
@@ -7332,6 +7880,7 @@ async fn run_macos_inner(
     dlp_cfg: &DlpGatewayConfig,
     pricing_overrides: &std::collections::HashMap<String, ModelRate>,
     seed_from_cow_base: Option<&Path>,
+    tool_profile: Option<&str>,
 ) -> anyhow::Result<i32> {
     let harvested_secrets = harvest_host_secrets(host_home, command);
     let session_id = format!("ses_{}", &uuid::Uuid::new_v4().simple().to_string()[..12]);
@@ -7424,6 +7973,30 @@ async fn run_macos_inner(
         Some(egress_guard.gateway.clone()),
     )
     .await?;
+
+    let current_exe = std::env::current_exe().ok();
+    let org_mcp_servers = broker
+        .kernel
+        .mcp_firewall
+        .list_servers(Some(&identity.org_id))
+        .await;
+    let sandbox_bin_path = current_exe
+        .as_deref()
+        .map(|p| p.display().to_string())
+        .unwrap_or_else(|| "aegis-os".to_string());
+    let broker_ep = broker.control_endpoint();
+    stage_confined_mcp_configs(
+        &agent_home,
+        identity,
+        &org_mcp_servers,
+        &broker.agent_token,
+        tool_profile,
+        ConfinedMcpTransport::EnforcedStdio {
+            bin_path: &sandbox_bin_path,
+            runtime_dir,
+            control_socket: &broker_ep,
+        },
+    )?;
 
     let org_shared = runtime_dir
         .join("orgs")
@@ -7540,6 +8113,12 @@ async fn run_macos_inner(
             "(allow network-outbound (remote ip \"localhost:{pinned_port}\"))\n"
         ));
     }
+    if let Some(ref exe_path) = current_exe {
+        seatbelt.push_str(&format!(
+            "\n(allow file-read* process-exec (literal \"{}\"))\n",
+            sbpl_quote(exe_path)
+        ));
+    }
 
     let mut envs: Vec<(String, String)> = Vec::new();
     let push = |envs: &mut Vec<(String, String)>, key: &str, value: String| {
@@ -7565,7 +8144,6 @@ async fn run_macos_inner(
     push(&mut envs, "XDG_CACHE_HOME", agent_home.join(".cache").display().to_string());
     push(&mut envs, "XDG_RUNTIME_DIR", short_xdg_rt.0.display().to_string());
     let host_path = std::env::var("PATH").unwrap_or_default();
-    let current_exe = std::env::current_exe().ok();
     let path = build_macos_agent_path(&agent_home, current_exe.as_deref(), &host_path);
     push(&mut envs, "PATH", path);
     let mut exec_command: Vec<String> = command.to_vec();
@@ -7611,6 +8189,9 @@ async fn run_macos_inner(
     push(&mut envs, "AOS_SESSION_ID", session_id.clone());
     push(&mut envs, "AOS_SESSION_TOKEN", broker.agent_token.clone());
     push(&mut envs, "AOS_CONTROL_SOCKET", broker.control_endpoint());
+    if let Some(tp) = tool_profile {
+        push(&mut envs, "AOS_MCP_TOOL_PROFILE", tp.to_string());
+    }
     push(&mut envs, "AOS_ENFORCEMENT", "enforced".to_string());
     push(&mut envs, "AOS_MODE", mode.to_string());
     push(&mut envs, "AOS_PROFILE", profile.to_string());
@@ -10519,5 +11100,225 @@ mod stage1_dlp_config_tests {
             .unwrap_err();
             assert!(err.to_string().contains("symlink"), "{err}");
         }
+    }
+}
+
+#[cfg(test)]
+mod confined_mcp_staging_tests {
+    use super::*;
+    use aos_mcp_gateway::mcp_firewall::McpServerPolicy;
+
+    #[tokio::test]
+    async fn confined_mcp_staging_protects_agy_cli_scrubs_secrets_and_stages_stdio_and_isolated_http()
+    {
+        assert!(PROTECTED_AGENT_CONFIGS.contains(&".gemini/antigravity-cli/mcp_config.json"));
+
+        let tmp = tempfile::tempdir().unwrap();
+        let rt = tmp.path().join("rt");
+        let agent_home = tmp.path().join("agent_home");
+        std::fs::create_dir_all(agent_home.join(".gemini/antigravity-cli")).unwrap();
+        std::fs::create_dir_all(agent_home.join(".config/opencode")).unwrap();
+        std::fs::create_dir_all(agent_home.join(".codex")).unwrap();
+
+        // 1. Seed unadopted client configs with plaintext credentials and verify scrubber redacts them.
+        std::fs::write(
+            agent_home.join(".claude.json"),
+            serde_json::to_string_pretty(&json!({
+                "mcpServers": {
+                    "raw-gh": {
+                        "command": "npx",
+                        "args": ["-y", "@modelcontextprotocol/server-github"],
+                        "env": {
+                            "GITHUB_PERSONAL_ACCESS_TOKEN": "ghp_secret123456"
+                        }
+                    }
+                }
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+        std::fs::write(
+            agent_home.join(".gemini/antigravity-cli/mcp_config.json"),
+            serde_json::to_string_pretty(&json!({
+                "mcpServers": {
+                    "raw-gh": {
+                        "command": "npx",
+                        "args": ["-y", "@modelcontextprotocol/server-github"],
+                        "env": {
+                            "GITHUB_PERSONAL_ACCESS_TOKEN": "ghp_secret123456"
+                        }
+                    }
+                }
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+        std::fs::write(
+            agent_home.join(".config/opencode/opencode.json"),
+            serde_json::to_string_pretty(&json!({
+                "mcp": {
+                    "raw-gh": {
+                        "type": "local",
+                        "command": ["npx"],
+                        "environment": {
+                            "GITHUB_PERSONAL_ACCESS_TOKEN": "ghp_secret123456"
+                        }
+                    }
+                }
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+        std::fs::write(
+            agent_home.join(".codex/config.toml"),
+            r#"[mcp_servers.raw]
+url = "https://mcp.example.com/mcp"
+
+[mcp_servers.raw.http_headers]
+Authorization = "Bearer sk-secret999"
+"#,
+        )
+        .unwrap();
+
+        sanitize_seeded_agent_home(&agent_home).unwrap();
+        ensure_protected_agent_configs(&agent_home).unwrap();
+
+        for rel in [
+            ".claude.json",
+            ".gemini/antigravity-cli/mcp_config.json",
+            ".config/opencode/opencode.json",
+            ".codex/config.toml",
+        ] {
+            let raw = std::fs::read_to_string(agent_home.join(rel)).unwrap();
+            assert!(!raw.contains("ghp_secret123456"), "secret leaked in {rel}: {raw}");
+            assert!(!raw.contains("sk-secret999"), "secret leaked in {rel}: {raw}");
+            assert!(
+                raw.contains("[REDACTED_BY_AEGIS_SANDBOX]"),
+                "expected redaction marker in {rel}: {raw}"
+            );
+        }
+
+        // 2. Stage EnforcedStdio configs for org server `heurion-macro`.
+        let kernel = AegisRuntimeKernel::new(&rt).await.unwrap();
+        let srv = kernel
+            .mcp_firewall
+            .register_http_server_with_options(
+                "heurion",
+                "heurion-macro",
+                "http://127.0.0.1:19999/mcp",
+                std::collections::BTreeMap::new(),
+                McpServerPolicy::default(),
+                Some("heurion"),
+                Some("heurion-suite"),
+                true,
+            )
+            .await
+            .unwrap();
+        let identity = AgentIdentity::new("heurion", "agy-1", "Engineer");
+
+        stage_confined_mcp_configs(
+            &agent_home,
+            &identity,
+            std::slice::from_ref(&srv),
+            "tok_ses_abc",
+            Some("minimal"),
+            ConfinedMcpTransport::EnforcedStdio {
+                bin_path: "/run/aegis/bin/aegis-os",
+                runtime_dir: &rt,
+                control_socket: "/run/aegis/control/control.sock",
+            },
+        )
+        .unwrap();
+
+        let (sock, tok, prof) =
+            crate::session_broker::resolve_broker_credentials_from(None, None, None, Some(&agent_home))
+                .unwrap();
+        assert_eq!(sock, "/run/aegis/control/control.sock");
+        assert_eq!(tok, "tok_ses_abc");
+        assert_eq!(prof.as_deref(), Some("minimal"));
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mode = std::fs::metadata(agent_home.join(".run/aegis-broker.json"))
+                .unwrap()
+                .permissions()
+                .mode()
+                & 0o777;
+            assert_eq!(mode, 0o600);
+        }
+
+        for rel in [
+            ".claude.json",
+            ".gemini/config/mcp_config.json",
+            ".gemini/antigravity-cli/mcp_config.json",
+            ".cursor/mcp.json",
+            ".config/opencode/opencode.json",
+            ".codex/config.toml",
+        ] {
+            let txt = std::fs::read_to_string(agent_home.join(rel)).unwrap();
+            assert!(txt.contains("aegis-os"), "{rel} missing aegis-os: {txt}");
+            assert!(txt.contains("mcp-stdio"), "{rel} missing mcp-stdio: {txt}");
+            assert!(txt.contains("heurion-macro"), "{rel} missing heurion-macro: {txt}");
+            assert!(txt.contains("AOS_CONTROL_SOCKET"), "{rel} missing AOS_CONTROL_SOCKET: {txt}");
+            assert!(txt.contains("tok_ses_abc"), "{rel} missing tok_ses_abc: {txt}");
+        }
+
+        // 3. Stage IsolatedHttp configs for MicroVM egress AF_VSOCK relay.
+        stage_confined_mcp_configs(
+            &agent_home,
+            &identity,
+            &[srv],
+            "tok_ses_iso",
+            None,
+            ConfinedMcpTransport::IsolatedHttp {
+                proxy_addr: "127.0.0.1:18080",
+            },
+        )
+        .unwrap();
+
+        let claude_iso: Value =
+            serde_json::from_str(&std::fs::read_to_string(agent_home.join(".claude.json")).unwrap())
+                .unwrap();
+        assert_eq!(claude_iso["mcpServers"]["aegis-os"]["type"], "http");
+        assert_eq!(
+            claude_iso["mcpServers"]["aegis-os"]["url"],
+            "http://127.0.0.1:18080/__aegis/mcp/_kernel"
+        );
+        assert_eq!(
+            claude_iso["mcpServers"]["heurion-macro"]["url"],
+            "http://127.0.0.1:18080/__aegis/mcp/heurion-macro"
+        );
+        assert_eq!(
+            claude_iso["mcpServers"]["heurion-macro"]["headers"]["X-Aegis-Token"],
+            "tok_ses_iso"
+        );
+
+        let agy_cli_iso: Value = serde_json::from_str(
+            &std::fs::read_to_string(agent_home.join(".gemini/antigravity-cli/mcp_config.json"))
+                .unwrap(),
+        )
+        .unwrap();
+        assert_eq!(
+            agy_cli_iso["mcpServers"]["heurion-macro"]["url"],
+            "http://127.0.0.1:18080/__aegis/mcp/heurion-macro"
+        );
+
+        let opencode_iso: Value = serde_json::from_str(
+            &std::fs::read_to_string(agent_home.join(".config/opencode/opencode.json")).unwrap(),
+        )
+        .unwrap();
+        assert_eq!(
+            opencode_iso["mcp"]["heurion-macro"]["type"],
+            "remote"
+        );
+        assert_eq!(
+            opencode_iso["mcp"]["heurion-macro"]["url"],
+            "http://127.0.0.1:18080/__aegis/mcp/heurion-macro"
+        );
+
+        let codex_iso = std::fs::read_to_string(agent_home.join(".codex/config.toml")).unwrap();
+        assert!(codex_iso.contains("http://127.0.0.1:18080/__aegis/mcp/_kernel"));
+        assert!(codex_iso.contains("http://127.0.0.1:18080/__aegis/mcp/heurion-macro"));
+        assert!(codex_iso.contains("tok_ses_iso"));
     }
 }

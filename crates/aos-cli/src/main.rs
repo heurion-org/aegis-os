@@ -445,6 +445,9 @@ enum Commands {
         /// Memory size in MiB allocated to MicroVM when `--isolated` is enabled
         #[arg(long, default_value_t = 2048)]
         mem_mb: u64,
+        /// MCP Gateway tool exposure profile (`minimal`, `collab`, `standard`, `legacy-full`)
+        #[arg(long)]
+        tool_profile: Option<String>,
         /// Agent command and arguments, after `--`
         #[arg(trailing_var_arg = true, allow_hyphen_values = true, required = true)]
         cmd: Vec<String>,
@@ -2618,7 +2621,7 @@ async fn main() -> anyhow::Result<()> {
         std::process::exit(0);
     }
     if let Commands::McpStdio = &cli.command {
-        if std::env::var("AOS_CONTROL_SOCKET").is_ok_and(|s| !s.trim().is_empty()) {
+        if session_broker::has_broker_credentials() {
             session_broker::serve_mcp_stdio().await?;
             std::process::exit(0);
         }
@@ -2828,10 +2831,24 @@ async fn main() -> anyhow::Result<()> {
             isolated,
             vcpus,
             mem_mb,
+            tool_profile,
             cmd,
         } => {
             if isolated && no_enforce {
                 anyhow::bail!("aos run: --isolated and --no-enforce are mutually exclusive");
+            }
+            if let Some(ref tp) = tool_profile {
+                let norm = tp.trim().to_ascii_lowercase();
+                if !matches!(
+                    norm.as_str(),
+                    "minimal" | "collab" | "standard" | "legacy-full" | "legacy_full" | "full"
+                ) {
+                    anyhow::bail!(
+                        "aos run: invalid --tool-profile '{}' (expected minimal, collab, standard, or legacy-full)",
+                        tp
+                    );
+                }
+                std::env::set_var("AOS_MCP_TOOL_PROFILE", &norm);
             }
             let mode = if read_only {
                 "observe".to_string()
@@ -2855,6 +2872,7 @@ async fn main() -> anyhow::Result<()> {
                 isolated: isolated || enforcement.eq_ignore_ascii_case("isolated"),
                 vcpus,
                 mem_mb,
+                tool_profile,
             };
             let code = launcher::run_with_options(
                 &workspace,
@@ -3059,6 +3077,9 @@ async fn main() -> anyhow::Result<()> {
         }
 
         Commands::App { action } => {
+            eprintln!(
+                "[DEPRECATED] 'aegis-os app' (AAP-1.0) is deprecated in v0.9.0; migrate to 'aegis-os mcp bundle' and 'aegis-os mcp login'."
+            );
             let kernel = AegisRuntimeKernel::new(&cli.runtime_dir).await?;
             match action {
                 AppAction::List { tier, category } => {

@@ -29,6 +29,9 @@ qrcode.workspace = true
 ureq.workspace = true
 rand.workspace = true
 ed25519-dalek.workspace = true
+tokio-rustls.workspace = true
+webpki-roots = "0.26"
+zeroize.workspace = true
 
 [dev-dependencies]
 tempfile.workspace = true

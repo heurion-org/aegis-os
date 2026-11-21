@@ -63,6 +63,7 @@ pub struct SessionBroker {
     pub agent_token: String,
     #[cfg_attr(not(target_os = "macos"), allow(dead_code))]
     pub tcp_addr: Option<std::net::SocketAddr>,
+    pub kernel: Arc<AegisRuntimeKernel>,
     endpoint_file: PathBuf,
     temp_control_dir: Option<PathBuf>,
     task: Option<JoinHandle<()>>,
@@ -359,7 +360,7 @@ impl SessionBroker {
             identity,
             agent_token: agent_token.clone(),
             human_token: human_token_lock,
-            kernel,
+            kernel: kernel.clone(),
             effects_path: session_dir.join("effects.jsonl"),
             hello: RwLock::new(None),
             web_console_addr: RwLock::new(None),
@@ -370,6 +371,7 @@ impl SessionBroker {
             fallback_pseudonym_table,
         });
 
+        let gw_opt = state.egress_gateway.clone();
         let (task, tcp_task, tcp_addr) = if expose_tcp {
             let listener = TcpListener::bind("127.0.0.1:0").await?;
             let addr = listener.local_addr()?;
@@ -414,12 +416,17 @@ impl SessionBroker {
             .map(|addr| format!("tcp://{addr}"))
             .unwrap_or_else(|| socket_path.display().to_string());
         write_token(&endpoint_file, &endpoint_str)?;
+        if let Some(ref gw) = gw_opt {
+            gw.set_local_mcp_broker_endpoint(Some(endpoint_str.clone()))
+                .await;
+        }
 
         Ok(Self {
             control_dir,
             socket_path,
             agent_token,
             tcp_addr,
+            kernel,
             endpoint_file,
             temp_control_dir,
             task,
@@ -428,13 +435,75 @@ impl SessionBroker {
     }
 }
 
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+pub(crate) struct ConfinedBrokerFile {
+    pub control_socket: String,
+    pub session_token: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tool_profile: Option<String>,
+}
+
+pub(crate) fn resolve_broker_credentials_from(
+    env_sock: Option<&str>,
+    env_tok: Option<&str>,
+    env_prof: Option<&str>,
+    home: Option<&Path>,
+) -> Result<(String, String, Option<String>)> {
+    let sock = env_sock.map(str::trim).filter(|s| !s.is_empty());
+    let tok = env_tok.map(str::trim).filter(|s| !s.is_empty());
+    let prof = env_prof
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .map(str::to_string);
+    if let (Some(socket), Some(token)) = (sock, tok) {
+        return Ok((socket.to_string(), token.to_string(), prof));
+    }
+    if let Some(home_dir) = home {
+        let fallback = home_dir.join(".run").join("aegis-broker.json");
+        if fallback.is_file() {
+            let raw = std::fs::read_to_string(&fallback).with_context(|| {
+                format!("reading confined broker credentials '{}'", fallback.display())
+            })?;
+            let parsed: ConfinedBrokerFile = serde_json::from_str(&raw).with_context(|| {
+                format!("parsing confined broker credentials '{}'", fallback.display())
+            })?;
+            if !parsed.control_socket.trim().is_empty() && !parsed.session_token.trim().is_empty()
+            {
+                return Ok((
+                    parsed.control_socket,
+                    parsed.session_token,
+                    prof.or(parsed.tool_profile),
+                ));
+            }
+        }
+    }
+    anyhow::bail!(
+        "AOS_CONTROL_SOCKET and AOS_SESSION_TOKEN are not set (and $HOME/.run/aegis-broker.json is absent); run inside `aegis-os run`"
+    )
+}
+
+pub(crate) fn resolve_broker_credentials() -> Result<(String, String, Option<String>)> {
+    let env_sock = std::env::var("AOS_CONTROL_SOCKET").ok();
+    let env_tok = std::env::var("AOS_SESSION_TOKEN").ok();
+    let env_prof = std::env::var("AOS_MCP_TOOL_PROFILE").ok();
+    let env_home = std::env::var_os("HOME").map(PathBuf::from);
+    resolve_broker_credentials_from(
+        env_sock.as_deref(),
+        env_tok.as_deref(),
+        env_prof.as_deref(),
+        env_home.as_deref(),
+    )
+}
+
+pub(crate) fn has_broker_credentials() -> bool {
+    resolve_broker_credentials().is_ok()
+}
+
 /// Client helper for `aos adapter ...`: speaks the session broker HTTP-over-Unix protocol using
-/// the token/socket injected by `aos run`.
+/// the token/socket injected by `aos run` (with `$HOME/.run/aegis-broker.json` fallback when an
+/// agent strips child env vars).
 pub async fn control_request(method: &str, path: &str, payload: Option<&Value>) -> Result<Value> {
-    let socket = std::env::var("AOS_CONTROL_SOCKET")
-        .context("AOS_CONTROL_SOCKET is not set; run inside `aos run`")?;
-    let token = std::env::var("AOS_SESSION_TOKEN")
-        .context("AOS_SESSION_TOKEN is not set; run inside `aos run`")?;
+    let (socket, token, _) = resolve_broker_credentials()?;
     control_request_at(&socket, &token, method, path, payload).await
 }
 
@@ -685,6 +754,9 @@ where
             write_json(&mut stream, "200 OK", json!({"status": "recorded"})).await
         }
         ("POST", "/v1/mcp") => {
+            if payload.get("id").is_none() {
+                return write_empty_status(&mut stream, "202 Accepted").await;
+            }
             let (response, delegated_bin) = crate::cloud::handle_jsonrpc_with_hot_reload(
                 &state.kernel,
                 &state.runtime_dir,
@@ -698,7 +770,14 @@ where
             let response =
                 maybe_handle_mcp_escalation(&state, &payload, response, delegated_bin.as_deref())
                     .await;
-            write_json(&mut stream, "200 OK", response).await
+            let accepts_sse = headers
+                .get("accept")
+                .is_some_and(|v| v.to_ascii_lowercase().contains("text/event-stream"));
+            if accepts_sse {
+                write_sse_single(&mut stream, &response).await
+            } else {
+                write_json(&mut stream, "200 OK", response).await
+            }
         }
         ("POST", "/v1/adapter/hello") => {
             let hello = json!({
@@ -846,35 +925,129 @@ where
                 .map(|v| v == "1")
                 .unwrap_or(false)
                 || std::env::var("AOS_MCP_DRY_RUN").as_deref() == Ok("1");
-            match state
-                .mcp_proxy_pool
-                .handle_jsonrpc(
+            let accepts_sse = headers
+                .get("accept")
+                .is_some_and(|v| v.to_ascii_lowercase().contains("text/event-stream"));
+
+            if payload.get("id").is_none() {
+                let _ = state
+                    .mcp_proxy_pool
+                    .handle_jsonrpc_streaming(
+                        &state.identity,
+                        &state.session.session_id,
+                        server_id,
+                        &payload,
+                        &ptable,
+                        dry_run_only,
+                        None,
+                    )
+                    .await;
+                if accepts_sse {
+                    return write_empty_status(&mut stream, "202 Accepted").await;
+                }
+                return write_json(&mut stream, "200 OK", Value::Null).await;
+            }
+
+            let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+            if accepts_sse {
+                let sse_head = "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nCache-Control: no-cache\r\nConnection: close\r\n\r\n";
+                stream.write_all(sse_head.as_bytes()).await?;
+                stream.flush().await?;
+
+                let mut rpc_fut = std::pin::pin!(state.mcp_proxy_pool.handle_jsonrpc_streaming(
                     &state.identity,
                     &state.session.session_id,
                     server_id,
                     &payload,
                     &ptable,
                     dry_run_only,
-                )
-                .await
-            {
-                Ok(Some(resp)) => write_json(&mut stream, "200 OK", resp).await,
-                Ok(None) => write_json(&mut stream, "200 OK", Value::Null).await,
-                Err(err) => {
-                    let req_id = payload.get("id").cloned().unwrap_or(Value::Null);
-                    write_json(
-                        &mut stream,
-                        "200 OK",
-                        json!({
-                            "jsonrpc": "2.0",
-                            "id": req_id,
-                            "result": {
-                                "isError": true,
-                                "content": [{ "type": "text", "text": format!("MCP firewall proxy error: {err}") }]
+                    Some(tx),
+                ));
+                let outcome = loop {
+                    tokio::select! {
+                        res = &mut rpc_fut => break res,
+                        maybe_n = rx.recv() => {
+                            if let Some(n) = maybe_n {
+                                let frame = format!("data: {}\n\n", serde_json::to_string(&n)?);
+                                let _ = stream.write_all(frame.as_bytes()).await;
+                                let _ = stream.flush().await;
                             }
-                        }),
+                        }
+                    }
+                };
+                while let Ok(n) = rx.try_recv() {
+                    let frame = format!("data: {}\n\n", serde_json::to_string(&n)?);
+                    let _ = stream.write_all(frame.as_bytes()).await;
+                }
+                let final_json = match outcome {
+                    Ok(Some(resp)) => resp,
+                    Ok(None) => Value::Null,
+                    Err(err) => json!({
+                        "jsonrpc": "2.0",
+                        "id": payload.get("id").cloned().unwrap_or(Value::Null),
+                        "result": {
+                            "isError": true,
+                            "content": [{ "type": "text", "text": format!("MCP firewall proxy error: {err}") }]
+                        }
+                    }),
+                };
+                if !final_json.is_null() {
+                    let frame = format!("data: {}\n\n", serde_json::to_string(&final_json)?);
+                    stream.write_all(frame.as_bytes()).await?;
+                }
+                stream.flush().await?;
+                Ok(())
+            } else {
+                let res = state
+                    .mcp_proxy_pool
+                    .handle_jsonrpc_streaming(
+                        &state.identity,
+                        &state.session.session_id,
+                        server_id,
+                        &payload,
+                        &ptable,
+                        dry_run_only,
+                        Some(tx),
                     )
-                    .await
+                    .await;
+                let mut notifications = Vec::new();
+                while let Ok(n) = rx.try_recv() {
+                    notifications.push(n);
+                }
+                match res {
+                    Ok(Some(resp)) => {
+                        if notifications.is_empty() {
+                            write_json(&mut stream, "200 OK", resp).await
+                        } else {
+                            write_json(
+                                &mut stream,
+                                "200 OK",
+                                json!({
+                                    "__aegis_mcp_envelope": true,
+                                    "notifications": notifications,
+                                    "response": resp,
+                                }),
+                            )
+                            .await
+                        }
+                    }
+                    Ok(None) => write_json(&mut stream, "200 OK", Value::Null).await,
+                    Err(err) => {
+                        let req_id = payload.get("id").cloned().unwrap_or(Value::Null);
+                        write_json(
+                            &mut stream,
+                            "200 OK",
+                            json!({
+                                "jsonrpc": "2.0",
+                                "id": req_id,
+                                "result": {
+                                    "isError": true,
+                                    "content": [{ "type": "text", "text": format!("MCP firewall proxy error: {err}") }]
+                                }
+                            }),
+                        )
+                        .await
+                    }
                 }
             }
         }
@@ -1546,6 +1719,34 @@ fn token_eq(a: &str, b: &str) -> bool {
         return false;
     }
     a.iter().zip(b).fold(0u8, |acc, (x, y)| acc | (x ^ y)) == 0
+}
+
+async fn write_empty_status<S>(stream: &mut S, status: &str) -> Result<()>
+where
+    S: AsyncRead + AsyncWrite + Unpin + Send,
+{
+    let head = format!("HTTP/1.1 {status}\r\nContent-Length: 0\r\nConnection: close\r\n\r\n");
+    stream.write_all(head.as_bytes()).await?;
+    stream.flush().await?;
+    Ok(())
+}
+
+async fn write_sse_single<S>(stream: &mut S, value: &Value) -> Result<()>
+where
+    S: AsyncRead + AsyncWrite + Unpin + Send,
+{
+    let frame = if value.is_null() {
+        String::new()
+    } else {
+        format!("data: {}\n\n", serde_json::to_string(value)?)
+    };
+    let head = "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nCache-Control: no-cache\r\nConnection: close\r\n\r\n";
+    stream.write_all(head.as_bytes()).await?;
+    if !frame.is_empty() {
+        stream.write_all(frame.as_bytes()).await?;
+    }
+    stream.flush().await?;
+    Ok(())
 }
 
 async fn write_json<S>(stream: &mut S, status: &str, value: Value) -> Result<()>

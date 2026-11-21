@@ -38,10 +38,15 @@ use uuid::Uuid;
 
 pub mod app_store;
 pub mod approver;
+pub mod mcp_bundle;
 pub mod mcp_firewall;
+pub mod mcp_http;
+pub mod mcp_oauth;
 pub mod paas;
 use app_store::AppStoreRegistry;
+use mcp_bundle::McpBundleManager;
 use mcp_firewall::McpFirewallRegistry;
+use mcp_oauth::McpOAuthManager;
 use paas::PaasControlPlane;
 
 /// Splits an agent-supplied path into plain components relative to the shadow root. A leading `/`
@@ -3338,6 +3343,8 @@ pub struct AegisRuntimeKernel {
     pub paas: Arc<PaasControlPlane>,
     pub app_store: Arc<AppStoreRegistry>,
     pub mcp_firewall: Arc<McpFirewallRegistry>,
+    pub mcp_oauth: Arc<McpOAuthManager>,
+    pub mcp_bundles: Arc<McpBundleManager>,
     pub vault: Arc<OrgVaultManager>,
     memory_url: Option<String>,
     memory_bridge_token: Option<String>,
@@ -3346,6 +3353,92 @@ pub struct AegisRuntimeKernel {
     mounted_mcp_servers: Arc<RwLock<Vec<MountedMcpServer>>>,
     active_host_exec_runs: Arc<std::sync::atomic::AtomicUsize>,
     host_exec_config: RwLock<Option<HostExecBrokerConfig>>,
+}
+
+/// Controls how many built-in Aegis runtime MCP tools are advertised via `tools/list`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum GatewayToolProfile {
+    /// Core 10 transactional CoW / execution / egress / escalation inspection tools.
+    Minimal,
+    /// Core 10 + 17 multi-agent coordination / IPC / Org CAS / Git PR collaboration tools (27 tools).
+    Collab,
+    /// Default `v0.9.0` profile: all active runtime tools excluding deprecated `AAP-1.0` `app_*` wrappers (50 tools).
+    #[default]
+    Standard,
+    /// Full legacy surface including deprecated `app_catalog_search`, `app_mount_session`, `app_call_tool` (53 tools).
+    LegacyFull,
+}
+
+impl GatewayToolProfile {
+    pub fn from_str_or_env(explicit: Option<&str>) -> Self {
+        let env_val = std::env::var("AOS_MCP_TOOL_PROFILE").ok();
+        let raw = explicit
+            .or(env_val.as_deref())
+            .unwrap_or("standard")
+            .trim()
+            .to_ascii_lowercase();
+        match raw.as_str() {
+            "minimal" => Self::Minimal,
+            "collab" => Self::Collab,
+            "legacy-full" | "legacy_full" | "full" => Self::LegacyFull,
+            _ => Self::Standard,
+        }
+    }
+
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Minimal => "minimal",
+            Self::Collab => "collab",
+            Self::Standard => "standard",
+            Self::LegacyFull => "legacy-full",
+        }
+    }
+
+    pub fn allows_tool(self, name: &str) -> bool {
+        const MINIMAL_TOOLS: &[&str] = &[
+            "workspace_status",
+            "workspace_diff",
+            "workspace_sync",
+            "workspace_commit",
+            "workspace_rollback",
+            "proc_exec",
+            "egress_http_request",
+            "policy_list_escalations",
+            "fs_export_file",
+            "fs_import_file",
+        ];
+        const COLLAB_EXTRA_TOOLS: &[&str] = &[
+            "coord_claim",
+            "coord_release",
+            "ipc_send",
+            "ipc_recv",
+            "ipc_request",
+            "ipc_reply",
+            "ipc_list_peers",
+            "ipc_task_update",
+            "ipc_task_get",
+            "ipc_task_list",
+            "org_artifact_publish",
+            "org_artifact_fetch",
+            "org_kv_put",
+            "org_kv_get",
+            "workspace_git_inspect",
+            "workspace_git",
+            "github_pr_create",
+        ];
+        const DEPRECATED_APP_TOOLS: &[&str] = &[
+            "app_catalog_search",
+            "app_mount_session",
+            "app_call_tool",
+        ];
+
+        match self {
+            Self::Minimal => MINIMAL_TOOLS.contains(&name),
+            Self::Collab => MINIMAL_TOOLS.contains(&name) || COLLAB_EXTRA_TOOLS.contains(&name),
+            Self::Standard => !DEPRECATED_APP_TOOLS.contains(&name),
+            Self::LegacyFull => true,
+        }
+    }
 }
 
 impl AegisRuntimeKernel {
@@ -3381,6 +3474,12 @@ impl AegisRuntimeKernel {
             policy.clone(),
             recorder.clone(),
         ));
+        let mcp_oauth = mcp_firewall.oauth().clone();
+        let mcp_bundles = Arc::new(McpBundleManager::new(
+            &root,
+            mcp_firewall.clone(),
+            mcp_oauth.clone(),
+        ));
 
         Ok(Self {
             runtime_data_root: root,
@@ -3392,6 +3491,8 @@ impl AegisRuntimeKernel {
             paas,
             app_store,
             mcp_firewall,
+            mcp_oauth,
+            mcp_bundles,
             vault,
             memory_url: std::env::var("AOS_MEMORY_URL")
                 .ok()
@@ -8798,8 +8899,16 @@ impl AegisRuntimeKernel {
     }
 
     pub fn mcp_tools_schema() -> Value {
+        Self::mcp_tools_schema_for_profile(GatewayToolProfile::LegacyFull)
+    }
+
+    pub fn mcp_tools_schema_for_profile(profile: GatewayToolProfile) -> Value {
         let mut schema = Self::mcp_tools_schema_unannotated();
         if let Some(tools) = schema["tools"].as_array_mut() {
+            tools.retain(|tool| {
+                let name = tool["name"].as_str().unwrap_or_default();
+                profile.allows_tool(name)
+            });
             for tool in tools {
                 let name = tool["name"].as_str().unwrap_or_default();
                 if let Some(&(_, read_only, destructive, idempotent, open_world)) =
@@ -9906,27 +10015,39 @@ impl AegisRuntimeKernel {
                     }
                 }
             }),
-            "tools/list" => json!({
-                "jsonrpc": "2.0",
-                "id": id,
-                "result": Self::mcp_tools_schema()
-            }),
-            "resources/list" => json!({
-                "jsonrpc": "2.0",
-                "id": id,
-                "result": {
-                    "resources": [
-                        { "uri": "aegis://workspace/status", "name": "CoW Workspace Status & Diffs" },
-                        { "uri": "aegis://ipc/inbox", "name": "Agent IPC Mailbox" },
-                        { "uri": "aegis://org/peers", "name": "Organization Active Peers" },
-                        { "uri": "aegis://global/peers", "name": "Global Workstation Peers Across All Repositories" },
-                        { "uri": "aegis://a2a/agent-cards", "name": "Google A2A Agent Cards Across Workstation" },
-                        { "uri": "aegis://a2a/tasks", "name": "Google A2A Stateful Tasks" },
-                        { "uri": "aegis://org/shared/catalog", "name": "Organization CAS Artifact Catalog" },
-                        { "uri": "aegis://apps/catalog", "name": "AAP-1.0 Application Ecosystem Catalog & Installed Apps" }
-                    ]
+            "tools/list" => {
+                let profile = GatewayToolProfile::from_str_or_env(None);
+                json!({
+                    "jsonrpc": "2.0",
+                    "id": id,
+                    "result": Self::mcp_tools_schema_for_profile(profile)
+                })
+            }
+            "resources/list" => {
+                let profile = GatewayToolProfile::from_str_or_env(None);
+                let mut resources = vec![
+                    json!({ "uri": "aegis://workspace/status", "name": "CoW Workspace Status & Diffs" }),
+                    json!({ "uri": "aegis://ipc/inbox", "name": "Agent IPC Mailbox" }),
+                    json!({ "uri": "aegis://org/peers", "name": "Organization Active Peers" }),
+                    json!({ "uri": "aegis://global/peers", "name": "Global Workstation Peers Across All Repositories" }),
+                    json!({ "uri": "aegis://a2a/agent-cards", "name": "Google A2A Agent Cards Across Workstation" }),
+                    json!({ "uri": "aegis://a2a/tasks", "name": "Google A2A Stateful Tasks" }),
+                    json!({ "uri": "aegis://org/shared/catalog", "name": "Organization CAS Artifact Catalog" }),
+                ];
+                if profile == GatewayToolProfile::LegacyFull {
+                    resources.push(json!({
+                        "uri": "aegis://apps/catalog",
+                        "name": "AAP-1.0 Application Ecosystem Catalog & Installed Apps"
+                    }));
                 }
-            }),
+                json!({
+                    "jsonrpc": "2.0",
+                    "id": id,
+                    "result": {
+                        "resources": resources
+                    }
+                })
+            }
             "resources/read" => {
                 let params = req.get("params").cloned().unwrap_or_else(|| json!({}));
                 let uri = params.get("uri").and_then(|v| v.as_str()).unwrap_or("");
@@ -12259,6 +12380,80 @@ mod tests {
         for (name, ..) in TOOL_ANNOTATIONS {
             assert!(names.contains(name), "annotation for unknown tool {name}");
         }
+    }
+
+    #[tokio::test]
+    async fn gateway_tool_profile_slims_schema_without_breaking_annotations() {
+        let minimal = AegisRuntimeKernel::mcp_tools_schema_for_profile(GatewayToolProfile::Minimal);
+        let collab = AegisRuntimeKernel::mcp_tools_schema_for_profile(GatewayToolProfile::Collab);
+        let standard =
+            AegisRuntimeKernel::mcp_tools_schema_for_profile(GatewayToolProfile::Standard);
+        let legacy =
+            AegisRuntimeKernel::mcp_tools_schema_for_profile(GatewayToolProfile::LegacyFull);
+
+        let min_names: Vec<&str> = minimal["tools"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|t| t["name"].as_str().unwrap())
+            .collect();
+        let col_names: Vec<&str> = collab["tools"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|t| t["name"].as_str().unwrap())
+            .collect();
+        let std_names: Vec<&str> = standard["tools"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|t| t["name"].as_str().unwrap())
+            .collect();
+        let leg_names: Vec<&str> = legacy["tools"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|t| t["name"].as_str().unwrap())
+            .collect();
+
+        assert_eq!(min_names.len(), 10);
+        assert!(min_names.contains(&"policy_list_escalations"));
+        assert!(min_names.contains(&"workspace_commit"));
+        assert_eq!(col_names.len(), 27);
+        assert_eq!(std_names.len(), 50);
+        assert_eq!(leg_names.len(), 53);
+        assert!(!std_names.contains(&"app_catalog_search"));
+        assert!(!std_names.contains(&"app_mount_session"));
+        assert!(!std_names.contains(&"app_call_tool"));
+
+        // Default runtime `tools/list` advertises Standard profile (hides deprecated app_* tools and catalog resource).
+        let temp = tempfile::tempdir().unwrap();
+        let kernel = AegisRuntimeKernel::new(&temp.path().join("rt")).await.unwrap();
+        let agent = AgentIdentity::new("acme", "coder-1", "Engineer");
+        let list = kernel
+            .handle_jsonrpc_message(&agent, json!({ "jsonrpc": "2.0", "id": 1, "method": "tools/list" }))
+            .await
+            .unwrap();
+        let live_names: Vec<&str> = list["result"]["tools"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|t| t["name"].as_str().unwrap())
+            .collect();
+        assert!(!live_names.contains(&"app_call_tool"));
+        assert!(live_names.contains(&"policy_list_escalations"));
+
+        let res_list = kernel
+            .handle_jsonrpc_message(&agent, json!({ "jsonrpc": "2.0", "id": 2, "method": "resources/list" }))
+            .await
+            .unwrap();
+        let res_uris: Vec<&str> = res_list["result"]["resources"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|r| r["uri"].as_str().unwrap())
+            .collect();
+        assert!(!res_uris.contains(&"aegis://apps/catalog"));
     }
 
     async fn raw_http(addr: std::net::SocketAddr, method: &str, path: &str, auth: Option<&str>, body: Option<Value>) -> (String, Value) {

@@ -691,6 +691,7 @@ pub struct AegisEgressGateway {
     breakers: Arc<RwLock<HashMap<String, Arc<SessionBreakerState>>>>,
     pricing: Arc<RwLock<ModelPricingTable>>,
     event_sink: Arc<RwLock<Option<EgressEventSink>>>,
+    local_mcp_broker_endpoint: Arc<RwLock<Option<String>>>,
     tls_config: Arc<ClientConfig>,
 }
 
@@ -724,8 +725,16 @@ impl AegisEgressGateway {
             breakers: Arc::new(RwLock::new(HashMap::new())),
             pricing: Arc::new(RwLock::new(ModelPricingTable::new())),
             event_sink: Arc::new(RwLock::new(None)),
+            local_mcp_broker_endpoint: Arc::new(RwLock::new(None)),
             tls_config,
         }
+    }
+
+    /// Binds or clears the local `SessionBroker` control endpoint (`tcp://127.0.0.1:<port>` or Unix
+    /// socket path) so confined agents (including `--isolated` MicroVM guests over `AF_VSOCK:18080`)
+    /// can call `/__aegis/mcp/<server_id>` and `/__aegis/mcp/_kernel` through this gateway.
+    pub async fn set_local_mcp_broker_endpoint(&self, endpoint: Option<String>) {
+        *self.local_mcp_broker_endpoint.write().await = endpoint;
     }
 
     /// Configures intelligent DLP pseudonymization and/or budget/loop circuit breaking for a
@@ -1329,6 +1338,64 @@ impl AegisEgressGateway {
             }
         }
         None
+    }
+
+    fn local_mcp_broker_route(raw_target: &str) -> Option<String> {
+        let origin = Self::extract_origin_path_and_query(raw_target);
+        let (path_only, query_suffix) = match origin.split_once('?') {
+            Some((p, q)) => (p, format!("?{q}")),
+            None => (origin.as_str(), String::new()),
+        };
+        let rest = path_only.strip_prefix("/__aegis/mcp/")?;
+        let trimmed = rest.trim_matches('/');
+        if trimmed.is_empty() || trimmed.contains('/') {
+            return None;
+        }
+        if trimmed == "_kernel" {
+            Some(format!("/v1/mcp{query_suffix}"))
+        } else {
+            Some(format!("/v1/mcp-proxy/{trimmed}{query_suffix}"))
+        }
+    }
+
+    async fn relay_to_local_broker_stream<B>(
+        broker_stream: &mut B,
+        client_stream: &mut TcpStream,
+        method: &str,
+        broker_path: &str,
+        headers: &HashMap<String, String>,
+        req_body: &[u8],
+    ) -> anyhow::Result<()>
+    where
+        B: AsyncRead + AsyncWrite + Unpin,
+    {
+        let mut head = format!(
+            "{method} {broker_path} HTTP/1.1\r\nHost: aegis-session-broker\r\nConnection: close\r\n"
+        );
+        for (k, v) in headers {
+            let low = k.to_ascii_lowercase();
+            if matches!(
+                low.as_str(),
+                "host" | "connection" | "content-length" | "transfer-encoding" | "proxy-connection"
+            ) {
+                continue;
+            }
+            if k.chars().any(|c| matches!(c, '\r' | '\n' | '\0'))
+                || v.chars().any(|c| matches!(c, '\r' | '\n' | '\0'))
+            {
+                continue;
+            }
+            head.push_str(&format!("{k}: {v}\r\n"));
+        }
+        head.push_str(&format!("Content-Length: {}\r\n\r\n", req_body.len()));
+        broker_stream.write_all(head.as_bytes()).await?;
+        if !req_body.is_empty() {
+            broker_stream.write_all(req_body).await?;
+        }
+        broker_stream.flush().await?;
+        let _ = tokio::io::copy(broker_stream, client_stream).await?;
+        let _ = client_stream.flush().await;
+        Ok(())
     }
 
     fn split_host_and_port(authority: &str, default_port: u16) -> (String, u16) {
@@ -2115,6 +2182,69 @@ impl AegisEgressGateway {
                             .unwrap_or_else(|| "sandbox-agent".to_string());
                         AgentIdentity::new(org_id, agent_id, "Sandboxed Process")
                     };
+
+                    // Internal local MCP broker relay (`/ __aegis/mcp/_kernel` and `/__aegis/mcp/<server_id>`).
+                    if let Some(broker_path) = Self::local_mcp_broker_route(&raw_target) {
+                        let endpoint_opt = gw_conn.local_mcp_broker_endpoint.read().await.clone();
+                        let Some(endpoint) = endpoint_opt else {
+                            let b = json!({ "error": "Local MCP broker relay is not active in this session" })
+                                .to_string();
+                            let resp = format!(
+                                "HTTP/1.1 503 Service Unavailable\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{b}",
+                                b.len()
+                            );
+                            let _ = stream.write_all(resp.as_bytes()).await;
+                            return;
+                        };
+                        let relay_res = if let Some(tcp_addr) = endpoint.strip_prefix("tcp://") {
+                            match TcpStream::connect(tcp_addr).await {
+                                Ok(mut bs) => {
+                                    Self::relay_to_local_broker_stream(
+                                        &mut bs,
+                                        &mut stream,
+                                        &method,
+                                        &broker_path,
+                                        &headers,
+                                        &req_body,
+                                    )
+                                    .await
+                                }
+                                Err(e) => Err(e.into()),
+                            }
+                        } else {
+                            #[cfg(unix)]
+                            {
+                                match tokio::net::UnixStream::connect(&endpoint).await {
+                                    Ok(mut bs) => {
+                                        Self::relay_to_local_broker_stream(
+                                            &mut bs,
+                                            &mut stream,
+                                            &method,
+                                            &broker_path,
+                                            &headers,
+                                            &req_body,
+                                        )
+                                        .await
+                                    }
+                                    Err(e) => Err(e.into()),
+                                }
+                            }
+                            #[cfg(not(unix))]
+                            {
+                                Err(anyhow::anyhow!("Unix socket broker not supported on this platform"))
+                            }
+                        };
+                        if let Err(err) = relay_res {
+                            let b = json!({ "error": format!("Local MCP broker relay failed: {err}") })
+                                .to_string();
+                            let resp = format!(
+                                "HTTP/1.1 502 Bad Gateway\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{b}",
+                                b.len()
+                            );
+                            let _ = stream.write_all(resp.as_bytes()).await;
+                        }
+                        return;
+                    }
 
                     // Base-URL reverse proxy: the client speaks plain HTTP to loopback, and the
                     // gateway performs L7 allowlist/DLP/secret injection before opening TLS to the

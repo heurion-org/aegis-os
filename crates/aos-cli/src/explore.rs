@@ -975,6 +975,7 @@ pub(crate) async fn execute_explore_run(
         isolated: req.isolated,
         vcpus: req.vcpus,
         mem_mb: req.mem_mb,
+        tool_profile: None,
     };
     let (mut dlp_cfg, pricing_overrides) =
         launcher::resolve_session_dlp_settings(&project, &egress_opts)?;
@@ -2440,6 +2441,7 @@ async fn resume_exploration_path(
         isolated: record.spec.isolated,
         vcpus: record.spec.vcpus,
         mem_mb: record.spec.mem_mb,
+        tool_profile: None,
     };
     let code = launcher::run_with_options(
         &record.spec.host_source_root,

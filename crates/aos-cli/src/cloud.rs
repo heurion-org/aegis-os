@@ -2713,10 +2713,11 @@ pub async fn serve_unified_stdio(
         }
 
         if method == "tools/list" {
+            let tool_profile = aos_mcp_gateway::GatewayToolProfile::from_str_or_env(None);
             let mut response = json!({
                 "jsonrpc": "2.0",
                 "id": id,
-                "result": AegisRuntimeKernel::mcp_tools_schema()
+                "result": AegisRuntimeKernel::mcp_tools_schema_for_profile(tool_profile)
             });
             if let Some(newer_bin) = find_newer_installed_aegis_binary(startup_bin_mtime, None) {
                 if let Ok(delegated) = delegate_mcp_rpc_to_binary(

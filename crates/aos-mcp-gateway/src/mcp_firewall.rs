@@ -18,6 +18,11 @@
 //!    Records `UntrustedExternal` session taint in `AegisPolicyKernel` and appends hash-chained
 //!    `AuditEvent` entries in `AegisFlightRecorder`.
 
+use crate::mcp_http::{
+    send_http_jsonrpc_streaming, validate_mcp_http_url_syntax, HttpRpcOutcome,
+    DEFAULT_IDLE_READ_TIMEOUT_MS,
+};
+use crate::mcp_oauth::{sanitize_realm_id, McpOAuthManager};
 use anyhow::{bail, Context};
 use aos_core::{AgentIdentity, AuditEvent, FlightRecorder};
 use aos_egress::{redact_dlp_secrets, PseudonymMode, PseudonymSessionTable};
@@ -98,6 +103,8 @@ pub struct McpServerPolicy {
     pub strip_prompt_injection: bool,
     #[serde(default = "default_true")]
     pub isolate_upstream_home: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub request_timeout_ms: Option<u64>,
     #[serde(default)]
     pub tool_overrides: BTreeMap<String, McpToolRiskClass>,
 }
@@ -109,6 +116,7 @@ impl Default for McpServerPolicy {
             dlp_mode: PseudonymMode::Pseudonymize,
             strip_prompt_injection: true,
             isolate_upstream_home: true,
+            request_timeout_ms: None,
             tool_overrides: BTreeMap::new(),
         }
     }
@@ -129,6 +137,12 @@ pub struct AdoptedMcpServerRecord {
     pub transport: UpstreamTransportSpec,
     #[serde(default)]
     pub policy: McpServerPolicy,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub auth_realm: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub bundle_id: Option<String>,
+    #[serde(default)]
+    pub allow_local_http: bool,
     #[serde(default)]
     pub adopted_origins: Vec<AdoptedConfigOrigin>,
     pub created_at_ms: i64,
@@ -747,7 +761,7 @@ fn summarize_args_for_taint(args: &Value) -> String {
     }
 }
 
-fn is_already_aegis_proxy_entry(server_key: &str, entry: &Value) -> bool {
+pub fn is_already_aegis_proxy_entry(server_key: &str, entry: &Value) -> bool {
     if server_key == "aegis-os" {
         return true;
     }
@@ -1180,19 +1194,31 @@ fn format_toml_key(key: &str) -> String {
     }
 }
 
-fn render_codex_proxy_block(server_key: &str, bin_str: &str, proxy_args: &[String]) -> String {
+fn render_codex_proxy_block(
+    server_key: &str,
+    bin_str: &str,
+    proxy_args: &[String],
+    extra_env: Option<&BTreeMap<String, String>>,
+) -> String {
     let args_json = proxy_args
         .iter()
         .map(|a| serde_json::to_string(a).unwrap_or_else(|_| format!("\"{}\"", a)))
         .collect::<Vec<_>>()
         .join(", ");
     let bin_json = serde_json::to_string(bin_str).unwrap_or_else(|_| format!("\"{}\"", bin_str));
-    format!(
+    let fmt_key = format_toml_key(server_key);
+    let mut out = format!(
         "[mcp_servers.{}]\ncommand = {}\nargs = [{}]\nenabled = true\n",
-        format_toml_key(server_key),
-        bin_json,
-        args_json
-    )
+        fmt_key, bin_json, args_json
+    );
+    if let Some(env_map) = extra_env.filter(|m| !m.is_empty()) {
+        out.push_str(&format!("[mcp_servers.{}.env]\n", fmt_key));
+        for (k, v) in env_map {
+            let v_json = serde_json::to_string(v).unwrap_or_else(|_| format!("\"{}\"", v));
+            out.push_str(&format!("{} = {}\n", format_toml_key(k), v_json));
+        }
+    }
+    out
 }
 
 fn replace_toml_line_range(src: &str, start_line: usize, end_line: usize, replacement: &str) -> String {
@@ -1202,8 +1228,10 @@ fn replace_toml_line_range(src: &str, start_line: usize, end_line: usize, replac
         out.push_str(line);
         out.push('\n');
     }
-    out.push_str(replacement.trim_end_matches('\n'));
-    out.push('\n');
+    if !replacement.is_empty() {
+        out.push_str(replacement.trim_end_matches('\n'));
+        out.push('\n');
+    }
     for line in lines.iter().skip(end_line) {
         out.push_str(line);
         out.push('\n');
@@ -1212,19 +1240,30 @@ fn replace_toml_line_range(src: &str, start_line: usize, end_line: usize, replac
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum ConfigFormatKind {
+pub enum ConfigFormatKind {
     McpServersJson,
     OpenCodeJson,
     CodexToml,
 }
 
-fn client_config_candidates(home_dir: &Path, workspace: &Path) -> Vec<(&'static str, PathBuf, ConfigFormatKind)> {
+pub fn client_config_candidates(
+    home_dir: &Path,
+    workspace: &Path,
+) -> Vec<(&'static str, PathBuf, ConfigFormatKind)> {
     let mut out = vec![
         ("claude", home_dir.join(".claude.json"), ConfigFormatKind::McpServersJson),
         ("project-mcp", workspace.join(".mcp.json"), ConfigFormatKind::McpServersJson),
         (
             "agy",
             home_dir.join(".gemini").join("config").join("mcp_config.json"),
+            ConfigFormatKind::McpServersJson,
+        ),
+        (
+            "agy-cli",
+            home_dir
+                .join(".gemini")
+                .join("antigravity-cli")
+                .join("mcp_config.json"),
             ConfigFormatKind::McpServersJson,
         ),
         (
@@ -1366,6 +1405,7 @@ pub struct McpFirewallRegistry {
     state: RwLock<PersistedMcpFirewallState>,
     io_gate: Mutex<()>,
     key_store: Arc<VaultKeyStore>,
+    oauth: Arc<McpOAuthManager>,
     policy: Arc<AegisPolicyKernel>,
     recorder: Arc<AegisFlightRecorder>,
 }
@@ -1407,12 +1447,14 @@ impl McpFirewallRegistry {
             .ok()
             .and_then(|b| serde_json::from_slice::<PersistedMcpFirewallState>(&b).ok())
             .unwrap_or_default();
+        let oauth = Arc::new(McpOAuthManager::new(&root, key_store.clone()));
         Self {
             runtime_data_root: root,
             state_file,
             state: RwLock::new(initial),
             io_gate: Mutex::new(()),
             key_store,
+            oauth,
             policy,
             recorder,
         }
@@ -1420,6 +1462,10 @@ impl McpFirewallRegistry {
 
     pub fn key_store(&self) -> &Arc<VaultKeyStore> {
         &self.key_store
+    }
+
+    pub fn oauth(&self) -> &Arc<McpOAuthManager> {
+        &self.oauth
     }
 
     pub fn policy_kernel(&self) -> &Arc<AegisPolicyKernel> {
@@ -1527,6 +1573,9 @@ impl McpFirewallRegistry {
                 org_id: org_id.to_string(),
                 transport,
                 policy,
+                auth_realm: None,
+                bundle_id: None,
+                allow_local_http: false,
                 adopted_origins: Vec::new(),
                 created_at_ms: now_ms,
                 updated_at_ms: now_ms,
@@ -1547,9 +1596,44 @@ impl McpFirewallRegistry {
         headers: BTreeMap<String, String>,
         policy: McpServerPolicy,
     ) -> anyhow::Result<AdoptedMcpServerRecord> {
+        self.register_http_server_with_options(
+            org_id,
+            server_id,
+            url,
+            headers,
+            policy,
+            None,
+            None,
+            false,
+        )
+        .await
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub async fn register_http_server_with_options(
+        &self,
+        org_id: &str,
+        server_id: &str,
+        url: &str,
+        headers: BTreeMap<String, String>,
+        policy: McpServerPolicy,
+        auth_realm: Option<&str>,
+        bundle_id: Option<&str>,
+        allow_local_http: bool,
+    ) -> anyhow::Result<AdoptedMcpServerRecord> {
         let clean_id = sanitize_server_id(server_id);
         let trimmed_url = url.trim().to_string();
-        validate_upstream_http_url(&trimmed_url)?;
+        validate_mcp_http_url_syntax(&trimmed_url, allow_local_http)?;
+        let clean_realm = auth_realm
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .map(sanitize_realm_id)
+            .transpose()?;
+        let clean_bundle = bundle_id
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .map(str::to_string);
+
         let mut plain_headers = BTreeMap::new();
         let mut sealed_headers = BTreeMap::new();
         for (k, v) in headers {
@@ -1582,6 +1666,9 @@ impl McpFirewallRegistry {
                 org_id: org_id.to_string(),
                 transport,
                 policy,
+                auth_realm: clean_realm.clone(),
+                bundle_id: clean_bundle.clone(),
+                allow_local_http,
                 adopted_origins: Vec::new(),
                 created_at_ms: now_ms,
                 updated_at_ms: now_ms,
@@ -1600,6 +1687,16 @@ impl McpFirewallRegistry {
         server_id: &str,
         mutator: impl FnOnce(&mut McpServerPolicy),
     ) -> anyhow::Result<AdoptedMcpServerRecord> {
+        self.update_server_config(org_id, server_id, |rec| mutator(&mut rec.policy))
+            .await
+    }
+
+    pub async fn update_server_config(
+        &self,
+        org_id: &str,
+        server_id: &str,
+        mutator: impl FnOnce(&mut AdoptedMcpServerRecord),
+    ) -> anyhow::Result<AdoptedMcpServerRecord> {
         let now_ms = Utc::now().timestamp_millis();
         self.with_state_mut(|st| {
             let idx = st
@@ -1609,9 +1706,19 @@ impl McpFirewallRegistry {
                 .or_else(|| st.servers.iter().position(|s| s.server_id == server_id))
                 .with_context(|| format!("Adopted MCP server '{}' not found", server_id))?;
             let rec = &mut st.servers[idx];
-            mutator(&mut rec.policy);
+            mutator(rec);
             rec.updated_at_ms = now_ms;
             Ok(rec.clone())
+        })
+        .await
+    }
+
+    pub async fn remove_server(&self, org_id: &str, server_id: &str) -> anyhow::Result<bool> {
+        self.with_state_mut(|st| {
+            let before = st.servers.len();
+            st.servers
+                .retain(|s| !(s.org_id == org_id && s.server_id == server_id));
+            Ok(st.servers.len() != before)
         })
         .await
     }
@@ -1683,10 +1790,16 @@ impl McpFirewallRegistry {
                 }
             }
 
+            let is_adopted_local_http = parsed_entry
+                .get("url")
+                .or_else(|| parsed_entry.get("serverUrl"))
+                .and_then(|v| v.as_str())
+                .is_some_and(is_loopback_http_url);
             let transport = self.build_sealed_transport_from_entry(
                 org_id,
                 &target_id,
                 &parsed_entry,
+                is_adopted_local_http,
             )?;
 
             if dry_run {
@@ -1737,6 +1850,9 @@ impl McpFirewallRegistry {
                         trust_level,
                         ..McpServerPolicy::default()
                     },
+                    auth_realm: None,
+                    bundle_id: None,
+                    allow_local_http: is_adopted_local_http,
                     adopted_origins: vec![origin.clone()],
                     created_at_ms: now_ms,
                     updated_at_ms: now_ms,
@@ -1745,12 +1861,13 @@ impl McpFirewallRegistry {
             })
             .await?;
 
-            rewrite_client_config_for_adopt(
+            upsert_client_proxy_entry(
                 &item.client,
                 &item.config_path,
                 &item.server_key,
                 &bin_str,
                 &proxy_args,
+                None,
             )?;
 
             let _ = self
@@ -1794,6 +1911,7 @@ impl McpFirewallRegistry {
         org_id: &str,
         server_id: &str,
         entry: &Value,
+        allow_local_http: bool,
     ) -> anyhow::Result<UpstreamTransportSpec> {
         if let Some(url) = entry
             .get("url")
@@ -1802,7 +1920,7 @@ impl McpFirewallRegistry {
             .map(str::trim)
             .filter(|s| !s.is_empty())
         {
-            validate_upstream_http_url(url)?;
+            validate_mcp_http_url_syntax(url, allow_local_http)?;
             let mut plain_headers = BTreeMap::new();
             let mut sealed_headers = BTreeMap::new();
             for key_name in ["headers", "http_headers"] {
@@ -2107,9 +2225,15 @@ impl McpFirewallRegistry {
             })?;
 
         let started = std::time::Instant::now();
-        let dispatch_res =
-            dispatch_single_tool_call(&self.key_store, &self.runtime_data_root, &server, &ticket.tool_name, &exec_args)
-                .await;
+        let dispatch_res = dispatch_single_tool_call(
+            &self.key_store,
+            &self.oauth,
+            &self.runtime_data_root,
+            &server,
+            &ticket.tool_name,
+            &exec_args,
+        )
+        .await;
         let latency_ms = started.elapsed().as_millis() as u64;
         let now_ms = Utc::now().timestamp_millis();
 
@@ -2296,6 +2420,7 @@ impl Drop for UpstreamStdioProcess {
 
 struct UpstreamHttpSession {
     mcp_session_id: Option<String>,
+    cached_init_request: Option<Value>,
     tool_annotations: BTreeMap<String, CachedToolAnnotations>,
     annotations_loaded: bool,
 }
@@ -2345,6 +2470,7 @@ impl McpProxySessionPool {
             )),
             UpstreamTransportSpec::Http { .. } => UpstreamBackend::Http(UpstreamHttpSession {
                 mcp_session_id: None,
+                cached_init_request: None,
                 tool_annotations: BTreeMap::new(),
                 annotations_loaded: false,
             }),
@@ -2372,6 +2498,31 @@ impl McpProxySessionPool {
         request: &Value,
         pseudonym_table: &PseudonymSessionTable,
         dry_run_only: bool,
+    ) -> anyhow::Result<Option<Value>> {
+        self.handle_jsonrpc_streaming(
+            identity,
+            session_id,
+            server_id,
+            request,
+            pseudonym_table,
+            dry_run_only,
+            None,
+        )
+        .await
+    }
+
+    /// Streaming variant of [`handle_jsonrpc`] that forwards upstream HTTP SSE server
+    /// notifications (`notifications/progress`, etc.) through `on_notification` as they arrive.
+    #[allow(clippy::too_many_arguments)]
+    pub async fn handle_jsonrpc_streaming(
+        &self,
+        identity: &AgentIdentity,
+        session_id: &str,
+        server_id: &str,
+        request: &Value,
+        pseudonym_table: &PseudonymSessionTable,
+        dry_run_only: bool,
+        on_notification: Option<tokio::sync::mpsc::UnboundedSender<Value>>,
     ) -> anyhow::Result<Option<Value>> {
         let method = request
             .get("method")
@@ -2415,18 +2566,57 @@ impl McpProxySessionPool {
         // Notifications (`id` absent) write and flush without awaiting a response.
         if req_id.is_none() || method.starts_with("notifications/") {
             let mut backend = backend_arc.lock().await;
-            if let UpstreamBackend::Stdio(proc_state) = &mut *backend {
-                if method == "notifications/initialized" && proc_state.initialized {
-                    if !proc_state.annotations_loaded {
-                        let _ = warm_stdio_tool_annotations(proc_state, self.timeout).await;
+            match &mut *backend {
+                UpstreamBackend::Stdio(proc_state) => {
+                    if method == "notifications/initialized" && proc_state.initialized {
+                        if !proc_state.annotations_loaded {
+                            let _ = warm_stdio_tool_annotations(proc_state, self.timeout).await;
+                        }
+                        return Ok(None);
                     }
-                    return Ok(None);
+                    let _ = write_jsonrpc_line(&mut proc_state.stdin, request).await;
+                    if method == "notifications/initialized" {
+                        proc_state.initialized = true;
+                        if !proc_state.annotations_loaded {
+                            let _ = warm_stdio_tool_annotations(proc_state, self.timeout).await;
+                        }
+                    }
                 }
-                let _ = write_jsonrpc_line(&mut proc_state.stdin, request).await;
-                if method == "notifications/initialized" {
-                    proc_state.initialized = true;
-                    if !proc_state.annotations_loaded {
-                        let _ = warm_stdio_tool_annotations(proc_state, self.timeout).await;
+                UpstreamBackend::Http(http_sess) => {
+                    let _ = dispatch_http_session_request(
+                        &self.registry.key_store,
+                        &self.registry.oauth,
+                        &server,
+                        http_sess,
+                        request,
+                        false,
+                        None,
+                    )
+                    .await;
+                    if method == "notifications/initialized" && !http_sess.annotations_loaded {
+                        let list_req = json!({
+                            "jsonrpc": "2.0",
+                            "id": format!("warm-{}", Uuid::new_v4()),
+                            "method": "tools/list"
+                        });
+                        if let Ok(Some(list_resp)) = dispatch_http_session_request(
+                            &self.registry.key_store,
+                            &self.registry.oauth,
+                            &server,
+                            http_sess,
+                            &list_req,
+                            true,
+                            None,
+                        )
+                        .await
+                        {
+                            if let Some(tools) =
+                                list_resp.pointer("/result/tools").and_then(|v| v.as_array())
+                            {
+                                http_sess.tool_annotations = extract_annotations_map(tools);
+                            }
+                            http_sess.annotations_loaded = true;
+                        }
                     }
                 }
             }
@@ -2456,13 +2646,18 @@ impl McpProxySessionPool {
                     return Ok(Some(resp));
                 }
                 UpstreamBackend::Http(http_sess) => {
-                    let resp = dispatch_http_jsonrpc(
+                    http_sess.cached_init_request = Some(request.clone());
+                    let resp = dispatch_http_session_request(
                         &self.registry.key_store,
+                        &self.registry.oauth,
                         &server,
+                        http_sess,
                         request,
-                        &mut http_sess.mcp_session_id,
+                        true,
+                        on_notification,
                     )
-                    .await?;
+                    .await?
+                    .unwrap_or(Value::Null);
                     return Ok(Some(with_id(resp, id)));
                 }
             }
@@ -2481,13 +2676,17 @@ impl McpProxySessionPool {
                     resp
                 }
                 UpstreamBackend::Http(http_sess) => {
-                    let resp = dispatch_http_jsonrpc(
+                    let resp = dispatch_http_session_request(
                         &self.registry.key_store,
+                        &self.registry.oauth,
                         &server,
+                        http_sess,
                         request,
-                        &mut http_sess.mcp_session_id,
+                        true,
+                        on_notification,
                     )
-                    .await?;
+                    .await?
+                    .unwrap_or(Value::Null);
                     if let Some(tools) = resp.pointer("/result/tools").and_then(|v| v.as_array()) {
                         http_sess.tool_annotations = extract_annotations_map(tools);
                         http_sess.annotations_loaded = true;
@@ -2509,6 +2708,7 @@ impl McpProxySessionPool {
                     request,
                     pseudonym_table,
                     dry_run_only,
+                    on_notification,
                 )
                 .await
                 .map(Some);
@@ -2524,6 +2724,7 @@ impl McpProxySessionPool {
                     id,
                     request,
                     pseudonym_table,
+                    on_notification,
                 )
                 .await
                 .map(Some);
@@ -2536,15 +2737,17 @@ impl McpProxySessionPool {
                 ensure_stdio_initialized(proc_state, self.timeout).await?;
                 send_stdio_rpc(proc_state, request, self.timeout).await?
             }
-            UpstreamBackend::Http(http_sess) => {
-                dispatch_http_jsonrpc(
-                    &self.registry.key_store,
-                    &server,
-                    request,
-                    &mut http_sess.mcp_session_id,
-                )
-                .await?
-            }
+            UpstreamBackend::Http(http_sess) => dispatch_http_session_request(
+                &self.registry.key_store,
+                &self.registry.oauth,
+                &server,
+                http_sess,
+                request,
+                true,
+                on_notification,
+            )
+            .await?
+            .unwrap_or(Value::Null),
         };
         Ok(Some(with_id(resp, id)))
     }
@@ -2560,6 +2763,7 @@ impl McpProxySessionPool {
         request: &Value,
         pseudonym_table: &PseudonymSessionTable,
         dry_run_only: bool,
+        on_notification: Option<tokio::sync::mpsc::UnboundedSender<Value>>,
     ) -> anyhow::Result<Value> {
         let started = std::time::Instant::now();
         let params = request.get("params").cloned().unwrap_or_else(|| json!({}));
@@ -2594,11 +2798,14 @@ impl McpProxySessionPool {
                     if !http_sess.annotations_loaded {
                         let list_req =
                             json!({"jsonrpc": "2.0", "id": format!("warm-{}", Uuid::new_v4()), "method": "tools/list"});
-                        if let Ok(list_resp) = dispatch_http_jsonrpc(
+                        if let Ok(Some(list_resp)) = dispatch_http_session_request(
                             &self.registry.key_store,
+                            &self.registry.oauth,
                             server,
+                            http_sess,
                             &list_req,
-                            &mut http_sess.mcp_session_id,
+                            true,
+                            None,
                         )
                         .await
                         {
@@ -2607,8 +2814,8 @@ impl McpProxySessionPool {
                             {
                                 http_sess.tool_annotations = extract_annotations_map(tools);
                             }
+                            http_sess.annotations_loaded = true;
                         }
-                        http_sess.annotations_loaded = true;
                     }
                     http_sess.tool_annotations.get(&tool_name).cloned()
                 }
@@ -2792,15 +2999,19 @@ impl McpProxySessionPool {
                 UpstreamBackend::Stdio(proc_state) => {
                     send_stdio_rpc(proc_state, &upstream_req, self.timeout).await
                 }
-                UpstreamBackend::Http(http_sess) => {
-                    dispatch_http_jsonrpc(
-                        &self.registry.key_store,
-                        server,
-                        &upstream_req,
-                        &mut http_sess.mcp_session_id,
-                    )
-                    .await
-                }
+                UpstreamBackend::Http(http_sess) => dispatch_http_session_request(
+                    &self.registry.key_store,
+                    &self.registry.oauth,
+                    server,
+                    http_sess,
+                    &upstream_req,
+                    true,
+                    on_notification.clone(),
+                )
+                .await
+                .and_then(|opt| {
+                    opt.context("upstream MCP HTTP returned empty body for tools/call")
+                }),
             }
         };
 
@@ -2924,6 +3135,7 @@ impl McpProxySessionPool {
         id: Value,
         request: &Value,
         pseudonym_table: &PseudonymSessionTable,
+        on_notification: Option<tokio::sync::mpsc::UnboundedSender<Value>>,
     ) -> anyhow::Result<Value> {
         let started = std::time::Instant::now();
         let uri = request
@@ -2938,15 +3150,17 @@ impl McpProxySessionPool {
                     ensure_stdio_initialized(proc_state, self.timeout).await?;
                     send_stdio_rpc(proc_state, request, self.timeout).await?
                 }
-                UpstreamBackend::Http(http_sess) => {
-                    dispatch_http_jsonrpc(
-                        &self.registry.key_store,
-                        server,
-                        request,
-                        &mut http_sess.mcp_session_id,
-                    )
-                    .await?
-                }
+                UpstreamBackend::Http(http_sess) => dispatch_http_session_request(
+                    &self.registry.key_store,
+                    &self.registry.oauth,
+                    server,
+                    http_sess,
+                    request,
+                    true,
+                    on_notification,
+                )
+                .await?
+                .unwrap_or(Value::Null),
             }
         };
 
@@ -3037,15 +3251,12 @@ fn extract_annotations_map(tools: &[Value]) -> BTreeMap<String, CachedToolAnnota
     map
 }
 
-fn validate_upstream_http_url(raw_url: &str) -> anyhow::Result<()> {
-    let lower = raw_url.trim().to_ascii_lowercase();
-    if !(lower.starts_with("http://") || lower.starts_with("https://")) {
-        bail!("Unsupported MCP HTTP URL '{}': expected http:// or https://", raw_url);
-    }
-    if lower.contains("169.254.169.254") {
-        bail!("Cloud metadata SSRF target '{}' is forbidden", raw_url);
-    }
-    Ok(())
+fn is_loopback_http_url(raw: &str) -> bool {
+    crate::mcp_oauth::parse_url_scheme_and_host(raw)
+        .map(|(is_https, host)| {
+            !is_https && matches!(host.as_str(), "127.0.0.1" | "::1" | "localhost")
+        })
+        .unwrap_or(false)
 }
 
 fn redact_url_userinfo(raw: &str) -> String {
@@ -3285,12 +3496,29 @@ async fn warm_stdio_tool_annotations(
     Ok(())
 }
 
-async fn dispatch_http_jsonrpc(
+fn default_http_init_request() -> Value {
+    json!({
+        "jsonrpc": "2.0",
+        "id": format!("aegis-init-{}", Uuid::new_v4().simple()),
+        "method": "initialize",
+        "params": {
+            "protocolVersion": "2024-11-05",
+            "capabilities": {},
+            "clientInfo": {
+                "name": "aegis-os-mcp-firewall",
+                "version": env!("CARGO_PKG_VERSION")
+            }
+        }
+    })
+}
+
+async fn resolve_http_target_and_headers(
     key_store: &VaultKeyStore,
+    oauth: &McpOAuthManager,
     server: &AdoptedMcpServerRecord,
-    request: &Value,
-    mcp_session_id: &mut Option<String>,
-) -> anyhow::Result<Value> {
+    mcp_session_id: Option<&str>,
+    force_oauth_refresh: bool,
+) -> anyhow::Result<(String, Vec<(String, String)>)> {
     let UpstreamTransportSpec::Http {
         url,
         plain_headers,
@@ -3307,7 +3535,7 @@ async fn dispatch_http_jsonrpc(
     } else {
         url.clone()
     };
-    validate_upstream_http_url(&target_url)?;
+    validate_mcp_http_url_syntax(&target_url, server.allow_local_http)?;
 
     let mut headers: Vec<(String, String)> = plain_headers
         .iter()
@@ -3323,57 +3551,189 @@ async fn dispatch_http_jsonrpc(
             .with_context(|| format!("unsealed header '{}' is not UTF-8", k))?;
         headers.push((k.clone(), val));
     }
-    if let Some(ref sid) = mcp_session_id {
-        headers.push(("Mcp-Session-Id".to_string(), sid.clone()));
+
+    let has_explicit_auth = headers
+        .iter()
+        .any(|(k, _)| k.eq_ignore_ascii_case("authorization"));
+    if !has_explicit_auth {
+        if let Some(ref realm_id) = server.auth_realm {
+            let bearer = oauth
+                .resolve_bearer_for_server(
+                    &server.org_id,
+                    realm_id,
+                    &target_url,
+                    server.allow_local_http,
+                    force_oauth_refresh,
+                )
+                .await?;
+            headers.push(("Authorization".to_string(), format!("Bearer {}", bearer.as_str())));
+        }
     }
 
-    let body_json = request.clone();
-    let (resp_val, returned_sid) = tokio::task::spawn_blocking(move || -> anyhow::Result<(Value, Option<String>)> {
-        let agent = ureq::AgentBuilder::new()
-            .timeout_connect(std::time::Duration::from_secs(10))
-            .timeout_read(std::time::Duration::from_secs(30))
-            .build();
-        let mut req = agent
-            .post(&target_url)
-            .set("Content-Type", "application/json")
-            .set("Accept", "application/json, text/event-stream");
-        for (k, v) in &headers {
-            req = req.set(k, v);
-        }
-        let resp = match req.send_json(&body_json) {
-            Ok(r) => r,
-            Err(ureq::Error::Status(code, r)) => {
-                let txt = r.into_string().unwrap_or_default();
-                bail!("upstream MCP HTTP returned {}: {}", code, txt);
-            }
-            Err(e) => bail!("upstream MCP HTTP request failed: {}", e),
-        };
-        let sid = resp.header("Mcp-Session-Id").map(str::to_string);
-        let raw_text = resp.into_string().unwrap_or_default();
-        let trimmed = raw_text.trim();
-        if let Ok(parsed) = serde_json::from_str::<Value>(trimmed) {
-            return Ok((parsed, sid));
-        }
-        // Handle SSE `data: {...}` single-event response from Streamable HTTP servers.
-        for line in trimmed.lines().rev() {
-            if let Some(data) = line.strip_prefix("data:") {
-                if let Ok(parsed) = serde_json::from_str::<Value>(data.trim()) {
-                    return Ok((parsed, sid));
+    if let Some(sid) = mcp_session_id {
+        headers.push(("Mcp-Session-Id".to_string(), sid.to_string()));
+    }
+    Ok((target_url, headers))
+}
+
+async fn send_http_once_with_auth_retry(
+    key_store: &VaultKeyStore,
+    oauth: &McpOAuthManager,
+    server: &AdoptedMcpServerRecord,
+    mcp_session_id: &mut Option<String>,
+    request: &Value,
+    expect_response: bool,
+    on_notification: Option<tokio::sync::mpsc::UnboundedSender<Value>>,
+) -> anyhow::Result<HttpRpcOutcome> {
+    let idle_timeout = std::time::Duration::from_millis(
+        server
+            .policy
+            .request_timeout_ms
+            .unwrap_or(DEFAULT_IDLE_READ_TIMEOUT_MS),
+    );
+    let mut force_refresh = false;
+    for attempt in 0..2 {
+        let (target_url, headers) = resolve_http_target_and_headers(
+            key_store,
+            oauth,
+            server,
+            mcp_session_id.as_deref(),
+            force_refresh,
+        )
+        .await?;
+        let outcome = send_http_jsonrpc_streaming(
+            &target_url,
+            &headers,
+            request,
+            mcp_session_id.as_deref(),
+            expect_response,
+            server.allow_local_http,
+            idle_timeout,
+            on_notification.clone(),
+        )
+        .await?;
+
+        match outcome {
+            HttpRpcOutcome::Unauthorized { www_authenticate } => {
+                if attempt == 0 && server.auth_realm.is_some() {
+                    force_refresh = true;
+                    continue;
                 }
+                bail!(
+                    "upstream MCP HTTP returned 401 Unauthorized{}",
+                    www_authenticate
+                        .map(|w| format!(" ({w})"))
+                        .unwrap_or_default()
+                );
             }
+            HttpRpcOutcome::Accepted {
+                mcp_session_id: sid,
+            } => {
+                if let Some(new_sid) = sid {
+                    *mcp_session_id = Some(new_sid);
+                }
+                return Ok(HttpRpcOutcome::Accepted {
+                    mcp_session_id: mcp_session_id.clone(),
+                });
+            }
+            HttpRpcOutcome::Response {
+                payload,
+                mcp_session_id: sid,
+                notifications,
+            } => {
+                if let Some(new_sid) = sid {
+                    *mcp_session_id = Some(new_sid);
+                }
+                return Ok(HttpRpcOutcome::Response {
+                    payload,
+                    mcp_session_id: mcp_session_id.clone(),
+                    notifications,
+                });
+            }
+            HttpRpcOutcome::SessionExpired => return Ok(HttpRpcOutcome::SessionExpired),
         }
-        bail!("upstream MCP HTTP returned non-JSON payload: {}", trimmed)
-    })
-    .await??;
-
-    if let Some(sid) = returned_sid {
-        *mcp_session_id = Some(sid);
     }
-    Ok(resp_val)
+    unreachable!("loop always returns in 1 or 2 iterations")
+}
+
+async fn dispatch_http_session_request(
+    key_store: &VaultKeyStore,
+    oauth: &McpOAuthManager,
+    server: &AdoptedMcpServerRecord,
+    http_sess: &mut UpstreamHttpSession,
+    request: &Value,
+    expect_response: bool,
+    on_notification: Option<tokio::sync::mpsc::UnboundedSender<Value>>,
+) -> anyhow::Result<Option<Value>> {
+    let first = send_http_once_with_auth_retry(
+        key_store,
+        oauth,
+        server,
+        &mut http_sess.mcp_session_id,
+        request,
+        expect_response,
+        on_notification.clone(),
+    )
+    .await?;
+
+    let final_outcome = match first {
+        HttpRpcOutcome::SessionExpired => {
+            // Re-handshake `initialize` + `notifications/initialized` transparently once.
+            http_sess.mcp_session_id = None;
+            let init_req = http_sess
+                .cached_init_request
+                .clone()
+                .unwrap_or_else(default_http_init_request);
+            let _ = send_http_once_with_auth_retry(
+                key_store,
+                oauth,
+                server,
+                &mut http_sess.mcp_session_id,
+                &init_req,
+                true,
+                None,
+            )
+            .await?;
+            let notif = json!({ "jsonrpc": "2.0", "method": "notifications/initialized" });
+            let _ = send_http_once_with_auth_retry(
+                key_store,
+                oauth,
+                server,
+                &mut http_sess.mcp_session_id,
+                &notif,
+                false,
+                None,
+            )
+            .await;
+            send_http_once_with_auth_retry(
+                key_store,
+                oauth,
+                server,
+                &mut http_sess.mcp_session_id,
+                request,
+                expect_response,
+                on_notification,
+            )
+            .await?
+        }
+        other => other,
+    };
+
+    match final_outcome {
+        HttpRpcOutcome::Accepted { .. } => Ok(None),
+        HttpRpcOutcome::Response { payload, .. } => Ok(Some(payload)),
+        HttpRpcOutcome::SessionExpired => {
+            bail!("upstream MCP HTTP returned 404 after re-initializing session")
+        }
+        HttpRpcOutcome::Unauthorized { .. } => {
+            bail!("upstream MCP HTTP returned 401 Unauthorized")
+        }
+    }
 }
 
 async fn dispatch_single_tool_call(
     key_store: &VaultKeyStore,
+    oauth: &McpOAuthManager,
     runtime_data_root: &Path,
     server: &AdoptedMcpServerRecord,
     tool_name: &str,
@@ -3396,11 +3756,9 @@ async fn dispatch_single_tool_call(
             send_stdio_rpc(&mut proc_state, &call_req, timeout).await
         }
         UpstreamTransportSpec::Http { .. } => {
-            let mut sid = None;
-            let _ = dispatch_http_jsonrpc(
-                key_store,
-                server,
-                &json!({
+            let mut http_sess = UpstreamHttpSession {
+                mcp_session_id: None,
+                cached_init_request: Some(json!({
                     "jsonrpc": "2.0",
                     "id": "outbox-init",
                     "method": "initialize",
@@ -3409,21 +3767,58 @@ async fn dispatch_single_tool_call(
                         "capabilities": {},
                         "clientInfo": { "name": "aegis-os-outbox", "version": env!("CARGO_PKG_VERSION") }
                     }
-                }),
-                &mut sid,
+                })),
+                tool_annotations: BTreeMap::new(),
+                annotations_loaded: false,
+            };
+            let init_req = http_sess.cached_init_request.clone().unwrap();
+            let _ = dispatch_http_session_request(
+                key_store,
+                oauth,
+                server,
+                &mut http_sess,
+                &init_req,
+                true,
+                None,
             )
             .await;
-            dispatch_http_jsonrpc(key_store, server, &call_req, &mut sid).await
+            let notif = json!({ "jsonrpc": "2.0", "method": "notifications/initialized" });
+            let _ = dispatch_http_session_request(
+                key_store,
+                oauth,
+                server,
+                &mut http_sess,
+                &notif,
+                false,
+                None,
+            )
+            .await;
+            dispatch_http_session_request(
+                key_store,
+                oauth,
+                server,
+                &mut http_sess,
+                &call_req,
+                true,
+                None,
+            )
+            .await?
+            .context("upstream MCP HTTP returned empty body for outbox tool dispatch")
         }
     }
 }
 
 // ============================================================================
-// Client Config Writers for `adopt` / `unadopt`
+// Client Config Writers for `adopt` / `unadopt` / `bundle` / Confined Staging
 // ============================================================================
 
-fn build_json_proxy_entry(client: &str, bin_str: &str, proxy_args: &[String]) -> Value {
-    match client {
+fn build_json_proxy_entry(
+    client: &str,
+    bin_str: &str,
+    proxy_args: &[String],
+    extra_env: Option<&BTreeMap<String, String>>,
+) -> Value {
+    let mut entry = match client {
         "opencode" => {
             let mut cmd = Vec::with_capacity(proxy_args.len() + 1);
             cmd.push(bin_str.to_string());
@@ -3442,62 +3837,154 @@ fn build_json_proxy_entry(client: &str, bin_str: &str, proxy_args: &[String]) ->
             "command": bin_str,
             "args": proxy_args,
         }),
+    };
+    if let Some(env_map) = extra_env.filter(|m| !m.is_empty()) {
+        if let Some(obj) = entry.as_object_mut() {
+            let key = if client == "opencode" {
+                "environment"
+            } else {
+                "env"
+            };
+            obj.insert(key.to_string(), json!(env_map));
+        }
     }
+    entry
 }
 
-fn rewrite_client_config_for_adopt(
+/// Inserts or updates a managed `aegis-os mcp proxy <server_id>` entry across all supported
+/// client config formats (JSON `mcpServers`, OpenCode `mcp.servers`/`mcp`, and Codex TOML).
+/// Creates the file with minimal valid structure if it does not yet exist.
+pub fn upsert_client_proxy_entry(
     client: &str,
     config_path: &Path,
     server_key: &str,
     bin_str: &str,
     proxy_args: &[String],
-) -> anyhow::Result<()> {
-    let text = std::fs::read_to_string(config_path)
-        .with_context(|| format!("reading client MCP config '{}'", config_path.display()))?;
+    extra_env: Option<&BTreeMap<String, String>>,
+) -> anyhow::Result<bool> {
+    if let Some(parent) = config_path.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
+    let text = if config_path.is_file() {
+        std::fs::read_to_string(config_path)
+            .with_context(|| format!("reading client MCP config '{}'", config_path.display()))?
+    } else {
+        String::new()
+    };
     match client {
         "codex" => {
+            let replacement = render_codex_proxy_block(server_key, bin_str, proxy_args, extra_env);
             let sections = scan_codex_mcp_sections(&text);
-            let target = sections
-                .into_iter()
-                .find(|s| s.server_key == server_key)
-                .with_context(|| {
-                    format!(
-                        "Codex section [mcp_servers.{}] not found in {}",
-                        server_key,
-                        config_path.display()
-                    )
-                })?;
-            let replacement = render_codex_proxy_block(server_key, bin_str, proxy_args);
-            let updated =
-                replace_toml_line_range(&text, target.start_line, target.end_line, &replacement);
+            let updated = if let Some(target) =
+                sections.into_iter().find(|s| s.server_key == server_key)
+            {
+                replace_toml_line_range(&text, target.start_line, target.end_line, &replacement)
+            } else if text.trim().is_empty() {
+                replacement
+            } else {
+                let mut out = text.trim_end().to_string();
+                out.push_str("\n\n");
+                out.push_str(&replacement);
+                out
+            };
             std::fs::write(config_path, updated)?;
         }
         "opencode" => {
-            let mut root: Value = serde_json::from_str(&text)?;
-            let proxy_entry = build_json_proxy_entry(client, bin_str, proxy_args);
+            let mut root: Value = if text.trim().is_empty() {
+                json!({ "mcp": { "servers": {} } })
+            } else {
+                serde_json::from_str(&text)
+                    .with_context(|| format!("parsing JSON config '{}'", config_path.display()))?
+            };
+            let proxy_entry = build_json_proxy_entry(client, bin_str, proxy_args, extra_env);
             if let Some(servers) = root.pointer_mut("/mcp/servers").and_then(|v| v.as_object_mut()) {
                 servers.insert(server_key.to_string(), proxy_entry);
             } else if let Some(mcp_obj) = root.get_mut("mcp").and_then(|v| v.as_object_mut()) {
                 mcp_obj.insert(server_key.to_string(), proxy_entry);
+            } else if let Some(root_obj) = root.as_object_mut() {
+                root_obj.insert("mcp".to_string(), json!({ "servers": { server_key: proxy_entry } }));
             } else {
-                bail!("opencode.json missing `mcp` table in {}", config_path.display());
+                bail!("opencode.json root is not an object in {}", config_path.display());
             }
             std::fs::write(config_path, format!("{}\n", serde_json::to_string_pretty(&root)?))?;
         }
         _ => {
-            let mut root: Value = serde_json::from_str(&text)?;
-            let servers = root
-                .get_mut("mcpServers")
-                .and_then(|v| v.as_object_mut())
-                .with_context(|| format!("JSON config missing mcpServers in {}", config_path.display()))?;
+            let mut root: Value = if text.trim().is_empty() {
+                json!({ "mcpServers": {} })
+            } else {
+                serde_json::from_str(&text)
+                    .with_context(|| format!("parsing JSON config '{}'", config_path.display()))?
+            };
+            let root_obj = root
+                .as_object_mut()
+                .with_context(|| format!("JSON config root is not an object in {}", config_path.display()))?;
+            let servers_val = root_obj
+                .entry("mcpServers")
+                .or_insert_with(|| json!({}));
+            if !servers_val.is_object() {
+                *servers_val = json!({});
+            }
+            let servers = servers_val
+                .as_object_mut()
+                .expect("mcpServers normalized to object");
             servers.insert(
                 server_key.to_string(),
-                build_json_proxy_entry(client, bin_str, proxy_args),
+                build_json_proxy_entry(client, bin_str, proxy_args, extra_env),
             );
             std::fs::write(config_path, format!("{}\n", serde_json::to_string_pretty(&root)?))?;
         }
     }
-    Ok(())
+    Ok(true)
+}
+
+/// Removes `server_key` from a client MCP configuration file without disturbing unrelated keys.
+pub fn remove_client_proxy_entry(
+    client: &str,
+    config_path: &Path,
+    server_key: &str,
+) -> anyhow::Result<bool> {
+    if !config_path.is_file() {
+        return Ok(false);
+    }
+    let text = std::fs::read_to_string(config_path)?;
+    if text.trim().is_empty() {
+        return Ok(false);
+    }
+    match client {
+        "codex" => {
+            let sections = scan_codex_mcp_sections(&text);
+            if let Some(target) = sections.into_iter().find(|s| s.server_key == server_key) {
+                let updated = replace_toml_line_range(&text, target.start_line, target.end_line, "");
+                std::fs::write(config_path, updated)?;
+                return Ok(true);
+            }
+            Ok(false)
+        }
+        "opencode" => {
+            let mut root: Value = serde_json::from_str(&text)?;
+            let mut removed = false;
+            if let Some(servers) = root.pointer_mut("/mcp/servers").and_then(|v| v.as_object_mut()) {
+                removed = servers.remove(server_key).is_some();
+            } else if let Some(mcp_obj) = root.get_mut("mcp").and_then(|v| v.as_object_mut()) {
+                removed = mcp_obj.remove(server_key).is_some();
+            }
+            if removed {
+                std::fs::write(config_path, format!("{}\n", serde_json::to_string_pretty(&root)?))?;
+            }
+            Ok(removed)
+        }
+        _ => {
+            let mut root: Value = serde_json::from_str(&text)?;
+            let removed = root
+                .get_mut("mcpServers")
+                .and_then(|v| v.as_object_mut())
+                .is_some_and(|m| m.remove(server_key).is_some());
+            if removed {
+                std::fs::write(config_path, format!("{}\n", serde_json::to_string_pretty(&root)?))?;
+            }
+            Ok(removed)
+        }
+    }
 }
 
 fn restore_client_config_from_origin(
@@ -4159,5 +4646,275 @@ for line in sys.stdin:
             .await
             .unwrap();
         assert!(mcp_events.len() >= 5);
+    }
+
+    #[tokio::test]
+    async fn streamable_http_auto_refreshes_oauth_rehandshakes_404_and_streams_sse() {
+        use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader};
+        use tokio::net::TcpListener;
+
+        let tmp = tempfile::tempdir().unwrap();
+        let rt = tmp.path().join("runtime");
+        let policy = Arc::new(AegisPolicyKernel::with_state_file(Some(
+            rt.join("policy_state.json"),
+        )));
+        let recorder = Arc::new(AegisFlightRecorder::new(Some(
+            rt.join("audit/flight_recorder.jsonl"),
+        )));
+        let reg = Arc::new(McpFirewallRegistry::with_kek_provider(
+            &rt,
+            Arc::new(InMemoryKekProvider::new([0x33u8; 32])),
+            policy,
+            recorder,
+        ));
+
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let base_url = format!("http://{addr}");
+
+        let call_step = Arc::new(std::sync::atomic::AtomicU32::new(0));
+        let cs = call_step.clone();
+        let valid_token = Arc::new(tokio::sync::RwLock::new("tok_stale".to_string()));
+        let vt = valid_token.clone();
+
+        tokio::spawn(async move {
+            loop {
+                let Ok((mut sock, _)) = listener.accept().await else {
+                    break;
+                };
+                let cs = cs.clone();
+                let vt = vt.clone();
+                tokio::spawn(async move {
+                    let mut reader = BufReader::new(&mut sock);
+                    let mut req_line = String::new();
+                    if reader.read_line(&mut req_line).await.unwrap_or(0) == 0 {
+                        return;
+                    }
+                    let mut content_len = 0usize;
+                    let mut auth_hdr = String::new();
+                    let mut sid_hdr = String::new();
+                    loop {
+                        let mut h = String::new();
+                        if reader.read_line(&mut h).await.unwrap_or(0) == 0 || h.trim().is_empty() {
+                            break;
+                        }
+                        if let Some((k, v)) = h.split_once(':') {
+                            if k.eq_ignore_ascii_case("content-length") {
+                                content_len = v.trim().parse().unwrap_or(0);
+                            } else if k.eq_ignore_ascii_case("authorization") {
+                                auth_hdr = v.trim().to_string();
+                            } else if k.eq_ignore_ascii_case("mcp-session-id") {
+                                sid_hdr = v.trim().to_string();
+                            }
+                        }
+                    }
+                    let mut body = vec![0u8; content_len];
+                    if content_len > 0 {
+                        let _ = reader.read_exact(&mut body).await;
+                    }
+                    let target = req_line.split_whitespace().nth(1).unwrap_or("/");
+                    if target == "/token" {
+                        *vt.write().await = "tok_fresh_ok".to_string();
+                        let b = json!({
+                            "access_token": "tok_fresh_ok",
+                            "refresh_token": "rt_fresh_2",
+                            "token_type": "Bearer",
+                            "expires_in": 3600
+                        })
+                        .to_string();
+                        let resp = format!(
+                            "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{b}",
+                            b.len()
+                        );
+                        let _ = sock.write_all(resp.as_bytes()).await;
+                        return;
+                    }
+
+                    // Expect `/mcp`: require `Bearer tok_fresh_ok` (first call arrives with `tok_stale` -> 401!)
+                    if auth_hdr != format!("Bearer {}", *vt.read().await) || auth_hdr == "Bearer tok_stale" {
+                        // First time seeing stale token, reject 401 once
+                        if auth_hdr == "Bearer tok_stale" {
+                            let resp = "HTTP/1.1 401 Unauthorized\r\nWWW-Authenticate: Bearer realm=\"heurion\"\r\nContent-Length: 0\r\nConnection: close\r\n\r\n";
+                            let _ = sock.write_all(resp.as_bytes()).await;
+                            return;
+                        }
+                    }
+
+                    let rpc: Value = serde_json::from_slice(&body).unwrap_or(Value::Null);
+                    let method = rpc.get("method").and_then(|v| v.as_str()).unwrap_or("");
+                    let rid = rpc.get("id").cloned().unwrap_or(Value::Null);
+
+                    if method == "initialize" {
+                        let b = json!({
+                            "jsonrpc": "2.0",
+                            "id": rid,
+                            "result": { "protocolVersion": "2024-11-05", "capabilities": { "tools": {} } }
+                        })
+                        .to_string();
+                        let resp = format!(
+                            "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nMcp-Session-Id: sid-live-2\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{b}",
+                            b.len()
+                        );
+                        let _ = sock.write_all(resp.as_bytes()).await;
+                        return;
+                    }
+                    if method == "notifications/initialized" {
+                        let _ = sock
+                            .write_all(b"HTTP/1.1 202 Accepted\r\nContent-Length: 0\r\nConnection: close\r\n\r\n")
+                            .await;
+                        return;
+                    }
+                    if method == "tools/list" {
+                        let b = json!({
+                            "jsonrpc": "2.0",
+                            "id": rid,
+                            "result": {
+                                "tools": [{
+                                    "name": "run_biostats",
+                                    "annotations": { "readOnlyHint": true }
+                                }]
+                            }
+                        })
+                        .to_string();
+                        let resp = format!(
+                            "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{b}",
+                            b.len()
+                        );
+                        let _ = sock.write_all(resp.as_bytes()).await;
+                        return;
+                    }
+
+                    // For tools/call: if sid is `"sid-expired"`, return 404 SessionExpired once!
+                    let step = cs.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                    if step == 0 || sid_hdr == "sid-expired" {
+                        let _ = sock
+                            .write_all(b"HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\nConnection: close\r\n\r\n")
+                            .await;
+                        return;
+                    }
+
+                    // Otherwise stream chunked SSE with notifications/progress + final result!
+                    let head = "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nTransfer-Encoding: chunked\r\nConnection: close\r\n\r\n";
+                    let _ = sock.write_all(head.as_bytes()).await;
+                    let ev1 = format!(
+                        "data: {}\n\n",
+                        json!({ "jsonrpc": "2.0", "method": "notifications/progress", "params": { "progress": 1, "total": 2 } })
+                    );
+                    let ev2 = format!(
+                        "data: {}\n\n",
+                        json!({ "jsonrpc": "2.0", "id": rid, "result": { "content": [{ "type": "text", "text": "hr=0.62 patient=alice@clinic.org" }] } })
+                    );
+                    for ev in [ev1, ev2] {
+                        let chunk = format!("{:x}\r\n{}\r\n", ev.len(), ev);
+                        let _ = sock.write_all(chunk.as_bytes()).await;
+                    }
+                    let _ = sock.write_all(b"0\r\n\r\n").await;
+                });
+            }
+        });
+
+        // Pre-seed OAuth realm with an expired/stale token + valid refresh_token
+        reg.oauth()
+            .upsert_realm_config(
+                "acme",
+                "heurion",
+                crate::mcp_oauth::RealmUpsertSpec {
+                    allowed_hosts: vec!["127.0.0.1".to_string()],
+                    issuer_url: Some(base_url.clone()),
+                    token_endpoint: Some(format!("{base_url}/token")),
+                    client_id: Some("cli-1".to_string()),
+                    allow_local_http: true,
+                    ..Default::default()
+                },
+            )
+            .await
+            .unwrap();
+        // Force persist stale access token + refresh_token directly via persist helper:
+        // Perform a device/static seed via `login_static_token` won't set refresh_token, so
+        // test OAuth refresh path by doing a quick token write using key_store? Wait: resolve_bearer_for_server
+        // works via `login_device_code` / `login_pkce_loopback`, OR let's test `login_static_token` vs expired.
+        // Better: drive a simulated PKCE login or directly invoke `oauth.login_pkce_loopback`?
+        // Actually in unit tests inside the crate we can call `with_state_mut` or test full `login_pkce_loopback`!
+        let stale_access = reg
+            .key_store()
+            .seal_secret("mcp-realm:acme:heurion:access_token", b"tok_stale")
+            .unwrap();
+        let valid_refresh = reg
+            .key_store()
+            .seal_secret("mcp-realm:acme:heurion:refresh_token", b"rt_seed_1")
+            .unwrap();
+        let realm_path = rt.join("mcp_auth_realms.json");
+        let mut on_disk: Value =
+            serde_json::from_str(&std::fs::read_to_string(&realm_path).unwrap()).unwrap();
+        on_disk["realms"][0]["sealed_access_token"] = serde_json::to_value(&stale_access).unwrap();
+        on_disk["realms"][0]["sealed_refresh_token"] =
+            serde_json::to_value(&valid_refresh).unwrap();
+        on_disk["realms"][0]["expires_at_ms"] = json!(Utc::now().timestamp_millis() - 10_000);
+        std::fs::write(&realm_path, serde_json::to_vec_pretty(&on_disk).unwrap()).unwrap();
+
+        reg.register_http_server_with_options(
+            "acme",
+            "heurion-biostats",
+            &format!("{base_url}/mcp"),
+            BTreeMap::new(),
+            McpServerPolicy::default(),
+            Some("heurion"),
+            None,
+            true,
+        )
+        .await
+        .unwrap();
+
+        let agent = AgentIdentity::new("acme", "claude-1", "Researcher");
+        let pool = McpProxySessionPool::new(reg.clone());
+        let ptable = PseudonymSessionTable::new();
+
+        // Prime session with an expired `Mcp-Session-Id` to exercise 404 re-handshake too!
+        {
+            let srv = reg.get_server("acme", "heurion-biostats").await.unwrap();
+            let b = pool.get_or_spawn_backend(&srv).await.unwrap();
+            let mut g = b.lock().await;
+            if let UpstreamBackend::Http(ref mut hs) = *g {
+                hs.mcp_session_id = Some("sid-expired".to_string());
+                hs.annotations_loaded = true;
+                hs.tool_annotations.insert(
+                    "run_biostats".to_string(),
+                    CachedToolAnnotations {
+                        read_only_hint: Some(true),
+                        destructive_hint: None,
+                    },
+                );
+            }
+        }
+
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+        let resp = pool
+            .handle_jsonrpc_streaming(
+                &agent,
+                "ses-http-1",
+                "heurion-biostats",
+                &json!({
+                    "jsonrpc": "2.0",
+                    "id": 9,
+                    "method": "tools/call",
+                    "params": { "name": "run_biostats", "arguments": {} }
+                }),
+                &ptable,
+                false,
+                Some(tx),
+            )
+            .await
+            .unwrap()
+            .unwrap();
+        let mut streamed_notes = Vec::new();
+        while let Ok(n) = rx.try_recv() {
+            streamed_notes.push(n);
+        }
+
+        assert_eq!(streamed_notes.len(), 1);
+        assert_eq!(streamed_notes[0]["method"], "notifications/progress");
+        let txt = resp["result"]["content"][0]["text"].as_str().unwrap();
+        assert!(txt.contains("hr=0.62"));
+        assert!(!txt.contains("alice@clinic.org"), "PII must be pseudonymized before returning");
     }
 }
