@@ -97,7 +97,7 @@ Host User Space (Trusted Control Plane & Supervisor)
 | `aos-memory-store` | 基于 SQLite (`WAL` + `busy_timeout(5s)`) 的记忆持久化、`BEGIN IMMEDIATE` 原子审批 `staged_writes` 与密文 payload 存储 | SQLite (`WAL` + `busy_timeout`) memory store with `BEGIN IMMEDIATE` `staged_writes` approval and encrypted payload blobs |
 | `aos-memory-server` | 本地 UOMP Memory Guard HTTP 服务：Ed25519 JWT 签发/验证、`verify_active_session`（`token_hash`+库内 scope）、consent 流 | Local UOMP Memory Guard server (`EdDSA` JWT issuer, `verify_active_session` DB binding, consent & payload APIs) |
 | `aos-memory-gateway` | 面向远程 Agent 的 TLS 1.3 / mTLS UOMP 代理网关：限流、并发信号量、I/O 超时、防 HTTP 走私帧校验 | TLS 1.3 / mTLS UOMP remote memory gateway with concurrency semaphore, rate limiting, timeouts, and framing checks |
-| `aos-mcp-gateway` | 默认 50 项（3 档 `GatewayToolProfile`）MCP 工具 + 7 动态资源、Streamable HTTP 异步客户端（`mcp_http.rs`）、OAuth 2.1 Auth Realms（`mcp_oauth.rs`）、声明式 MCP Bundle（`mcp_bundle.rs`）、双令牌控制面、零信任 MCP 防火墙/暂存箱（`mcp_firewall.rs`） | MCP JSON-RPC + A2A server (3 `GatewayToolProfile` tiers: 10/27/50 default tools, 7 resources), async Streamable HTTP (`mcp_http.rs`), OAuth 2.1 Auth Realms (`mcp_oauth.rs`), Declarative Bundles (`mcp_bundle.rs`), Zero-Trust MCP Firewall/Outbox (`mcp_firewall.rs`) |
+| `aos-mcp-gateway` | 默认 55 项（3 档 `GatewayToolProfile`）MCP 工具 + 8 动态资源、Streamable HTTP 异步客户端（`mcp_http.rs`）、开放 MCP Registry 发现（`mcp_registry.rs`）、OAuth 2.1 Auth Realms（`mcp_oauth.rs`）、声明式 MCP Bundle（`mcp_bundle.rs`）、双令牌控制面、零信任 MCP 防火墙/暂存箱（`mcp_firewall.rs`）与方案 B 会话热桥接 | MCP JSON-RPC + A2A server (3 `GatewayToolProfile` tiers: 10/27/55 default tools, 8 resources), async Streamable HTTP (`mcp_http.rs`), Open MCP Registry (`mcp_registry.rs`), OAuth 2.1 Auth Realms (`mcp_oauth.rs`), Declarative Bundles (`mcp_bundle.rs`), Zero-Trust MCP Firewall/Outbox (`mcp_firewall.rs`) & Option B Hot Session Bridge |
 | `aos-cli` | `aegis-os` 单一二进制入口：`install`、`run`（含 `--isolated`/`--tool-profile` 及 `agy`/`claude` 沙箱 MCP 桥接）、`vm`、`explore`、`mcp`（`scan`/`adopt`/`add`/`policy`/`proxy`/`login`/`logout`/`auth-status`/`bundle`/`outbox`/`audit`/`taint`）、`approve`、`diff`/`verify`/`commit`、`vault`、`cloud`、`upgrade`/`uninstall` | Single `aegis-os` binary: installer, `run` (`--isolated`, `--tool-profile`, confined `agy`/`claude` MCP bridge), `vm`, `explore`, `mcp` Firewall/OAuth/Bundles/Audit, unified `approve`, CoW `diff`/`commit`/`verify`, `vault`, `cloud`, `upgrade`/`uninstall` |
 
 ---
@@ -142,13 +142,14 @@ Host User Space (Trusted Control Plane & Supervisor)
 | **R3** | 声明式 Cedar `permit` 绿区（如自己 CoW 工作区 `fs_*`、`proc_exec`、同组织 IPC/CAS） | Declarative Cedar green-zone rules (`policy/default.cedar` + custom) |
 | **R4** | 黄区边界升级：生成带结构化 `evidence` 的待批工单（CLI / Web `/approve` / Cloud TOTP） | Human escalation with 30m default ticket TTL |
 
-**协议能力总览 | Protocol Surface (3 `GatewayToolProfile` Tiers: `standard`=50 default, `collab`=27, `minimal`=10 + 7 Resources)**:
+**协议能力总览 | Protocol Surface (3 `GatewayToolProfile` Tiers: `standard`=55 default, `collab`=27, `minimal`=10 + 8 Resources)**:
 - **VFS 与宿主机桥 (15)**：`fs_read`、`fs_write`、`fs_edit`、`fs_delete`、`fs_glob`、`fs_export_file`、`fs_import_file`、`workspace_status`、`workspace_sync`、`workspace_snapshot`、`workspace_diff`、`workspace_rollback`、`workspace_commit`、`workspace_export_pr`、`workspace_switch`。
 - **Git / GitHub 宿主机代理 (9)**：`workspace_git_inspect`、`workspace_git`、`github_ci_inspect`、`github_ci_rerun`、`github_pr_inspect`、`github_issue_inspect`、`github_pr_create`、`github_comment_create`、`github_pr_merge`。
 - **沙箱执行与包管理 (3)**：`proc_exec`、`pkg_install`（`npm`/`pnpm`/`yarn`/`bun`/`pip`/`uv`/`cargo`/`go`）、`host_exec`。
 - **IPC / 文件认领 / A2A / 组织 CAS (19)**：`ipc_{send,recv,request,reply,ack,wait,publish,subscribe,list_peers}`、`coord_{claim,release}`、`ipc_{update_card,task_update,task_get,task_list}`、`org_{artifact_publish,artifact_fetch,kv_put,kv_get}`；含 HTTP A2A 端点 `/.well-known/agent.json`、`/a2a`、`/v1/a2a`。
 - **Egress / Policy / UOMP (4)**：`egress_http_request`、`policy_list_escalations`、`runtime_configure_mode`、`memory_policy_evaluate`。
-- **7 个动态 MCP 资源**：`aegis://workspace/status`、`aegis://ipc/inbox`、`aegis://org/peers`、`aegis://global/peers`、`aegis://a2a/agent-cards`、`aegis://a2a/tasks`、`aegis://org/shared/catalog`。
+- **外部 MCP 控制面与方案 B 热桥接 (5)**：`mcp_list_installed`、`mcp_discover`、`mcp_request_install`（SHA-256 锁定 + Web `/approve` 宿主机内联 Vault 凭据直封）、`mcp_hot_list_tools`、`mcp_hot_call_tool`。
+- **8 个动态 MCP 资源**：`aegis://workspace/status`、`aegis://ipc/inbox`、`aegis://org/peers`、`aegis://global/peers`、`aegis://a2a/agent-cards`、`aegis://a2a/tasks`、`aegis://org/shared/catalog`、`aegis://mcp/installed`。
 - **外部 MCP 数据面与控制面边界 | External MCP Data/Control Plane**：受限沙箱内的 `agy`、`claude`、`opencode`、`codex`、`cursor` 通过无凭证 1:1 代理桩（`aegis-os mcp proxy <id>` / `/__aegis/mcp/<id>`）经宿主机 `SessionBroker` (`McpProxySessionPool`) 原生调用外部 MCP；开放生态发现（Official MCP Registry / `.well-known`）、审批安装与 `v0.10.0` **方案 B（会话内临时热桥接 + 下次启动自动扶正）** 详见 [外部 MCP 对接架构设计 (`EXTERNAL_MCP_DESIGN.md`)](EXTERNAL_MCP_DESIGN.md)。
 
 ---
@@ -481,6 +482,13 @@ aegis-os memory revoke <session-id>
 > 启动 `aegis-os run` 时，`stage_confined_mcp_configs()` 会自动清洗 `$AGENT_HOME` 中的明文凭据并按原生格式（`.claude.json`、`mcp_config.json`、`opencode.json`、`config.toml` 等）下发无凭证 1:1 转发桩（`aegis-os mcp proxy <id>` 或 MicroVM `/__aegis/mcp/<id>`）；所有防火墙裁决、DLP 假名化、会话污点、Outbox 审批与 Vault 令牌注入均在宿主机 `SessionBroker` 执行，且宿主端登录后正在运行的会话自动热加载凭据。面向 `v0.10.0` 的开放 Registry 发现、审批页内联 OAuth/Vault 录入及 **方案 B（会话内临时热桥接 + 下次启动自动扶正）** 完整规范详见 [docs/EXTERNAL_MCP_DESIGN.md](EXTERNAL_MCP_DESIGN.md)。
 
 ```bash
+# 0. 开放 MCP Registry 发现、场景推荐、统一安装与四层状态体检
+aegis-os mcp status                                    # 统一清单、Auth 到期、Outbox、污点与未收编配置漂移告警
+aegis-os mcp doctor                                    # 过期凭据、明文暴露与 stdio 沙箱就绪度体检
+aegis-os mcp search linear                             # 按 Trust Tier 1->2->3 检索 Official MCP Registry
+aegis-os mcp recommend                                 # 基于 .aegis/mcp.json / .mcp.json 与项目上下文推荐
+aegis-os mcp install app.linear/mcp --scope workspace  # 统一安装（Registry/Bundle/URL/npm/pypi）与自动鉴权瀑布流
+
 # 1. 一键安装声明式开放 MCP Bundle (`aegis-mcp-bundle/v1`)：同步 Auth Realm、多云端服务、SKILL.md 与本地客户端配置
 aegis-os mcp bundle install heurion                     # 等价于 https://heurion.org/.well-known/mcp-bundle.json
 aegis-os mcp bundle install heurion --profile trading   # 按 profile 过滤子集服务；加 --no-client-sync 可跳过修改本地客户端

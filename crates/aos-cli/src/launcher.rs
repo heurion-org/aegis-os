@@ -1564,6 +1564,24 @@ pub(crate) fn stage_confined_mcp_configs(
     let broker_path = run_dir.join("aegis-broker.json");
     let broker_bytes = format!("{}\n", serde_json::to_string_pretty(&broker_file)?);
     write_mode_0600_no_symlink(&broker_path, broker_bytes.as_bytes())?;
+    restage_confined_mcp_client_configs(
+        agent_home,
+        identity,
+        servers,
+        session_token,
+        tool_profile,
+        transport,
+    )
+}
+
+pub(crate) fn restage_confined_mcp_client_configs(
+    agent_home: &Path,
+    identity: &AgentIdentity,
+    servers: &[aos_mcp_gateway::mcp_firewall::AdoptedMcpServerRecord],
+    session_token: &str,
+    tool_profile: Option<&str>,
+    transport: ConfinedMcpTransport<'_>,
+) -> anyhow::Result<()> {
 
     let client_targets = [
         ("claude", agent_home.join(".claude.json")),
@@ -1652,6 +1670,128 @@ pub(crate) fn stage_confined_mcp_configs(
         }
     }
     Ok(())
+}
+
+#[derive(Clone)]
+enum OwnedConfinedMcpTransport {
+    EnforcedStdio {
+        bin_path: String,
+        runtime_dir: PathBuf,
+        control_socket: String,
+    },
+    IsolatedHttp {
+        proxy_addr: String,
+    },
+}
+
+async fn register_confined_mcp_post_install_hook(
+    kernel: std::sync::Arc<AegisRuntimeKernel>,
+    agent_home: PathBuf,
+    identity: AgentIdentity,
+    session_token: String,
+    tool_profile: Option<String>,
+    owned_transport: OwnedConfinedMcpTransport,
+) {
+    let k_for_hook = kernel.clone();
+    kernel
+        .set_mcp_post_install_hook(std::sync::Arc::new(move |hook_org, _hook_srv| {
+            let k = k_for_hook.clone();
+            let agent_home = agent_home.clone();
+            let identity = identity.clone();
+            let session_token = session_token.clone();
+            let tool_profile = tool_profile.clone();
+            let owned_transport = owned_transport.clone();
+            Box::pin(async move {
+                let servers = k.mcp_firewall.list_servers(Some(&hook_org)).await;
+                let t = match &owned_transport {
+                    OwnedConfinedMcpTransport::EnforcedStdio {
+                        bin_path,
+                        runtime_dir,
+                        control_socket,
+                    } => ConfinedMcpTransport::EnforcedStdio {
+                        bin_path,
+                        runtime_dir,
+                        control_socket,
+                    },
+                    OwnedConfinedMcpTransport::IsolatedHttp { proxy_addr } => {
+                        ConfinedMcpTransport::IsolatedHttp { proxy_addr }
+                    }
+                };
+                let _ = restage_confined_mcp_client_configs(
+                    &agent_home,
+                    &identity,
+                    &servers,
+                    &session_token,
+                    tool_profile.as_deref(),
+                    t,
+                );
+            })
+        }))
+        .await;
+}
+
+/// Prints a concise external MCP inventory + `.mcp.json` recommendation line into the
+/// `aegis-os run` startup banner using only local cached/Vault state (zero network calls).
+async fn print_mcp_startup_banner(
+    kernel: &AegisRuntimeKernel,
+    org_id: &str,
+    project: impl AsRef<Path>,
+) {
+    let project = project.as_ref();
+    let inv = kernel.build_installed_mcp_inventory(org_id, None).await;
+    let servers = inv["servers"].as_array().cloned().unwrap_or_default();
+    let mut installed_ids = std::collections::BTreeSet::new();
+    let mut ready = Vec::new();
+    let mut needs_login = Vec::new();
+
+    for s in &servers {
+        let sid = s["server_id"].as_str().unwrap_or("").to_string();
+        if sid.is_empty() {
+            continue;
+        }
+        installed_ids.insert(sid.clone());
+        if s["status"].as_str() == Some("needs_auth") {
+            let realm = s["auth_realm"].as_str().unwrap_or(&sid).to_string();
+            needs_login.push((sid, realm));
+        } else {
+            ready.push(sid);
+        }
+    }
+
+    if !servers.is_empty() {
+        let mut parts = Vec::new();
+        if !ready.is_empty() {
+            let shown: Vec<&str> = ready.iter().take(5).map(String::as_str).collect();
+            let suffix = if ready.len() > 5 { ", …" } else { "" };
+            parts.push(format!("{} ready ({}{suffix})", ready.len(), shown.join(", ")));
+        }
+        if !needs_login.is_empty() {
+            let shown: Vec<String> = needs_login
+                .iter()
+                .take(3)
+                .map(|(sid, realm)| format!("{sid} -> aegis-os mcp login {realm}"))
+                .collect();
+            parts.push(format!("{} needs login: {}", needs_login.len(), shown.join("; ")));
+        }
+        eprintln!("  mcps:    {}", parts.join(" | "));
+    }
+
+    let hints = aos_mcp_gateway::mcp_registry::McpRegistryClient::recommend_for_workspace(
+        project,
+        &installed_ids,
+    );
+    let uninstalled_manifest_hints: Vec<String> = hints
+        .into_iter()
+        .filter(|h| !h.already_installed && h.source.starts_with("repo_manifest:"))
+        .map(|h| h.server_id)
+        .collect();
+    if !uninstalled_manifest_hints.is_empty() {
+        eprintln!(
+            "  mcp-hint: repo declares {} uninstalled MCP(s) ({}) -> aegis-os mcp recommend",
+            uninstalled_manifest_hints.len(),
+            uninstalled_manifest_hints.join(", ")
+        );
+    }
 }
 
 pub(crate) fn rewrite_hermes_config_for_l7(agent_home: &Path, proxy: &str, pinned_port: Option<u16>) {
@@ -7724,6 +7864,19 @@ async fn run_inner(
             control_socket: crate::session_broker::CONTROL_SOCKET_IN_SANDBOX,
         },
     )?;
+    register_confined_mcp_post_install_hook(
+        broker.kernel.clone(),
+        agent_home.clone(),
+        identity.clone(),
+        broker.agent_token.clone(),
+        egress_opts.tool_profile.clone(),
+        OwnedConfinedMcpTransport::EnforcedStdio {
+            bin_path: sandbox_bin_path.clone(),
+            runtime_dir: runtime_dir.to_path_buf(),
+            control_socket: crate::session_broker::CONTROL_SOCKET_IN_SANDBOX.to_string(),
+        },
+    )
+    .await;
 
     let mut fds = Vec::new();
     fds.push(fd_mount(&project, format!("{HOST_STAGE}/{host_name}"), true)?);
@@ -7843,6 +7996,7 @@ async fn run_inner(
         if plan.project_readonly { " (project read-only)" } else { "" }
     );
     eprintln!("  broker:  session control socket (adapter.evaluate / effect / heartbeat)");
+    print_mcp_startup_banner(&broker.kernel, &identity.org_id, &project).await;
     eprintln!("  approvals: commit-time tickets + live policy escalations");
 
     let mut envs: Vec<(String, String)> = plan.envs();
@@ -8176,6 +8330,17 @@ async fn run_isolated_inner(
         egress_opts.tool_profile.as_deref(),
         ConfinedMcpTransport::IsolatedHttp { proxy_addr: &guest_proxy },
     )?;
+    register_confined_mcp_post_install_hook(
+        broker.kernel.clone(),
+        agent_home.clone(),
+        identity.clone(),
+        broker.agent_token.clone(),
+        egress_opts.tool_profile.clone(),
+        OwnedConfinedMcpTransport::IsolatedHttp {
+            proxy_addr: guest_proxy.clone(),
+        },
+    )
+    .await;
     rewrite_hermes_config_for_l7(&agent_home, &guest_proxy, None);
     rewrite_opencode_config_for_l7(&agent_home, &guest_proxy);
 
@@ -8253,6 +8418,7 @@ async fn run_isolated_inner(
     eprintln!("  session: {session_id}");
     eprintln!("  shadow:  {}", shadow.display());
     eprintln!("  network: zero-NIC virtio-vsock -> Stage 1 egress + L7 DLP gateway");
+    print_mcp_startup_banner(&broker.kernel, &identity.org_id, &project).await;
 
     if std::io::stdin().is_terminal() && std::io::stdout().is_terminal() {
         use aos_core::SandboxInstance;
@@ -8556,6 +8722,19 @@ async fn run_macos_inner(
             control_socket: &broker_ep,
         },
     )?;
+    register_confined_mcp_post_install_hook(
+        broker.kernel.clone(),
+        agent_home.clone(),
+        identity.clone(),
+        broker.agent_token.clone(),
+        tool_profile.map(str::to_string),
+        OwnedConfinedMcpTransport::EnforcedStdio {
+            bin_path: sandbox_bin_path.clone(),
+            runtime_dir: runtime_dir.to_path_buf(),
+            control_socket: broker_ep.clone(),
+        },
+    )
+    .await;
 
     let org_shared = runtime_dir
         .join("orgs")
@@ -8830,6 +9009,7 @@ async fn run_macos_inner(
         );
     }
     eprintln!("  broker:  {}", broker.control_endpoint());
+    print_mcp_startup_banner(&broker.kernel, &identity.org_id, &project).await;
     eprintln!("  warning: macOS v1 uses the shadow as cwd (no path remapping)");
 
     let mut args = vec!["-p".to_string(), seatbelt];

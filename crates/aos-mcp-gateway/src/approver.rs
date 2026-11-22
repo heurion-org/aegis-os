@@ -548,6 +548,14 @@ pub const APPROVE_PAGE_HTML: &str = r##"<!doctype html>
     <div id="escalations-root">
       <div class="card"><p>Loading pending escalations…</p></div>
     </div>
+
+    <div class="card" id="mcp-inventory-card" style="display:none">
+      <p class="label-caps">ZERO-TRUST MCP FIREWALL · ORG INVENTORY</p>
+      <h2>Installed External MCP Servers</h2>
+      <p style="font-size:13px;">Active servers staged into confined sessions, authentication posture, and quick revocation controls.</p>
+      <div id="mcp-inventory-body"></div>
+      <p id="mcp-inventory-msg"></p>
+    </div>
   </main>
 
   <footer class="foot" role="contentinfo">
@@ -690,16 +698,34 @@ pub const APPROVE_PAGE_HTML: &str = r##"<!doctype html>
     msgEl.className = '';
     msgEl.textContent = 'Submitting decision…';
     try {
+      const payload = {
+        escalation_id: escId,
+        decision,
+        ttl_secs: ttlSecs,
+        totp: totp || undefined,
+        approved_by: mode === 'local' ? 'local-web-console' : 'web-approval-console'
+      };
+      const tokEl = document.getElementById('mcp-token-' + escId);
+      if (tokEl && tokEl.value.trim()) {
+        payload.inline_auth_token = tokEl.value.trim();
+      }
+      const trustEl = document.getElementById('mcp-trust-' + escId);
+      if (trustEl && trustEl.value) {
+        payload.trust_override = trustEl.value;
+      }
+      const envEls = document.querySelectorAll('[data-mcp-env-esc="' + escId + '"]');
+      if (envEls && envEls.length > 0) {
+        const envMap = {};
+        envEls.forEach(inp => {
+          const k = inp.getAttribute('data-mcp-env-key');
+          if (k && inp.value.trim()) envMap[k] = inp.value.trim();
+        });
+        if (Object.keys(envMap).length > 0) payload.inline_env_secrets = envMap;
+      }
       const res = await fetch(apiBase + '/v1/approvals/decide', {
         method: 'POST',
         headers: headers(),
-        body: JSON.stringify({
-          escalation_id: escId,
-          decision,
-          ttl_secs: ttlSecs,
-          totp: totp || undefined,
-          approved_by: mode === 'local' ? 'local-web-console' : 'web-approval-console'
-        })
+        body: JSON.stringify(payload)
       });
       const data = await res.json();
       if (!res.ok) throw new Error(data.error || res.statusText);
@@ -736,7 +762,8 @@ pub const APPROVE_PAGE_HTML: &str = r##"<!doctype html>
       github_pr_create: 'Approve GitHub Pull Request Creation',
       github_pr_merge: 'DESTRUCTIVE: Approve GitHub Pull Request Merge',
       github_comment_create: 'Approve GitHub Issue / PR Comment',
-      github_ci_rerun: 'Approve GitHub Actions Workflow Rerun'
+      github_ci_rerun: 'Approve GitHub Actions Workflow Rerun',
+      mcp_request_install: 'Approve External MCP Installation'
     };
     return titles[action] || ('Approve Boundary Action: ' + (action || 'syscall'));
   }
@@ -852,12 +879,68 @@ pub const APPROVE_PAGE_HTML: &str = r##"<!doctype html>
     if (Array.isArray(ev.pass_env_keys) && ev.pass_env_keys.length > 0) {
       fields.push(['Pass Env Keys', ev.pass_env_keys.join(', ')]);
     }
+    if (esc.action === 'mcp_request_install') {
+      if (ev.target) fields.push(['MCP Target', ev.target]);
+      if (ev.server_id) fields.push(['Server Alias', ev.server_id]);
+      if (ev.trust_tier) fields.push(['Trust Tier', ev.trust_tier]);
+      if (ev.transport_kind) fields.push(['Transport', ev.transport_kind]);
+      if (ev.remote_url) fields.push(['Endpoint URL', ev.remote_url]);
+      if (Array.isArray(ev.allowed_hosts) && ev.allowed_hosts.length > 0) {
+        fields.push(['Pinned Hosts', ev.allowed_hosts.join(', ')]);
+      }
+      if (ev.package_spec && ev.package_spec.identifier) {
+        fields.push(['Package (Sandboxed)', (ev.package_spec.registry_type || 'pkg') + ':' + ev.package_spec.identifier]);
+      }
+      fields.push(['Default Posture', 'untrusted · DLP pseudonymize · writes staged to Outbox']);
+    }
     for (const [k, v] of fields) {
       const dt = document.createElement('dt'); dt.textContent = k;
       const dd = document.createElement('dd'); dd.textContent = v;
       dl.appendChild(dt); dl.appendChild(dd);
     }
     card.appendChild(dl);
+
+    if (esc.action === 'mcp_request_install') {
+      const box = document.createElement('div');
+      box.style.margin = '12px 0';
+      box.style.padding = '12px';
+      box.style.border = '1px solid #d1d5db';
+      box.style.borderRadius = '8px';
+      const note = document.createElement('p');
+      note.style.margin = '0 0 8px 0';
+      note.style.fontSize = '13px';
+      note.textContent = 'Host Custody Auth (optional): paste API Key / Bearer token or env secrets here to seal directly into AES-256-GCM Vault without exposing secrets to the agent or chat.';
+      box.appendChild(note);
+
+      if (ev.transport_kind !== 'stdio') {
+        const tokInp = document.createElement('input');
+        tokInp.type = 'password';
+        tokInp.id = 'mcp-token-' + esc.escalation_id;
+        tokInp.placeholder = 'Optional static Bearer token / API key (sealed into Vault on approve)';
+        tokInp.style.width = '100%';
+        tokInp.style.marginBottom = '8px';
+        box.appendChild(tokInp);
+      }
+
+      if (Array.isArray(ev.required_env_vars)) {
+        for (const envName of ev.required_env_vars) {
+          const envInp = document.createElement('input');
+          envInp.type = 'password';
+          envInp.setAttribute('data-mcp-env-esc', esc.escalation_id);
+          envInp.setAttribute('data-mcp-env-key', envName);
+          envInp.placeholder = envName + ' (Vault-sealed upstream env)';
+          envInp.style.width = '100%';
+          envInp.style.marginBottom = '6px';
+          box.appendChild(envInp);
+        }
+      }
+
+      const trustSel = document.createElement('select');
+      trustSel.id = 'mcp-trust-' + esc.escalation_id;
+      trustSel.innerHTML = '<option value=\"untrusted\">Trust: Untrusted External (DLP + Outbox + Taint)</option><option value=\"trusted\">Trust: Trusted Internal</option>';
+      box.appendChild(trustSel);
+      card.appendChild(box);
+    }
 
     const row = document.createElement('div');
     row.className = 'row';
@@ -877,7 +960,7 @@ pub const APPROVE_PAGE_HTML: &str = r##"<!doctype html>
     btnOnce.onclick = () => decide(esc.escalation_id, 'approve', 0);
     row.appendChild(btnOnce);
 
-    if (!isHighRisk || esc.action === 'host_exec') {
+    if ((!isHighRisk && esc.action !== 'mcp_request_install') || esc.action === 'host_exec') {
       const btn15m = document.createElement('button');
       btn15m.className = 'secondary';
       btn15m.textContent = 'Approve 15m';
@@ -955,14 +1038,72 @@ pub const APPROVE_PAGE_HTML: &str = r##"<!doctype html>
         empty.className = 'card';
         empty.innerHTML = '<h1 class="ok">All clear</h1><p>No pending boundary escalations require approval right now.</p>';
         root.appendChild(empty);
-        return;
+      } else {
+        for (const esc of list) {
+          root.appendChild(renderEscalation(esc));
+        }
       }
-      for (const esc of list) {
-        root.appendChild(renderEscalation(esc));
-      }
+      await loadMcpInventory(isOperatorKey || mode === 'local');
     } catch (e) {
       root.innerHTML = '<div class="card"><p class="err">Failed to load escalations: ' + e.message + '</p></div>';
     }
+  }
+
+  async function mcpLogoutRealm(orgId, realmId) {
+    const msg = document.getElementById('mcp-inventory-msg');
+    try {
+      const res = await fetch(apiBase + '/v1/mcp/logout', {
+        method: 'POST',
+        headers: headers(),
+        body: JSON.stringify({ org_id: orgId, realm_id: realmId })
+      });
+      const data = await res.json();
+      if (!res.ok) throw new Error(data.error || res.statusText);
+      msg.className = 'ok';
+      msg.textContent = 'Revoked credentials for realm: ' + realmId;
+      await loadMcpInventory(true);
+    } catch (e) {
+      msg.className = 'err';
+      msg.textContent = e.message;
+    }
+  }
+
+  async function loadMcpInventory(canManage) {
+    const card = document.getElementById('mcp-inventory-card');
+    const body = document.getElementById('mcp-inventory-body');
+    if (!card || !body || !canManage) return;
+    try {
+      const url = apiBase + '/v1/mcp/inventory' + (targetOrg ? '?org_id=' + encodeURIComponent(targetOrg) : '');
+      const res = await fetch(url, { headers: headers() });
+      if (!res.ok) return;
+      const inv = await res.json();
+      const servers = Array.isArray(inv.servers) ? inv.servers : [];
+      card.style.display = 'block';
+      body.innerHTML = '';
+      if (servers.length === 0) {
+        body.innerHTML = '<p style="font-size:13px;color:#6b7280;">No external MCP servers registered for this organization yet.</p>';
+        return;
+      }
+      for (const s of servers) {
+        const item = document.createElement('div');
+        item.style.display = 'flex';
+        item.style.justifyContent = 'space-between';
+        item.style.alignItems = 'center';
+        item.style.padding = '8px 0';
+        item.style.borderTop = '1px solid #e5e7eb';
+        const info = document.createElement('div');
+        info.textContent = s.server_id + ' · ' + s.transport + ' · auth=' + s.auth_state + ' · status=' + s.status + ' · trust=' + s.trust_level;
+        item.appendChild(info);
+        if (s.auth_realm) {
+          const btn = document.createElement('button');
+          btn.className = 'secondary';
+          btn.textContent = 'Revoke Auth';
+          btn.onclick = () => mcpLogoutRealm(inv.org_id || targetOrg || 'default-org', s.auth_realm);
+          item.appendChild(btn);
+        }
+        body.appendChild(item);
+      }
+    } catch (_) {}
   }
 
   loadState();

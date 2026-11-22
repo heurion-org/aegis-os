@@ -187,7 +187,7 @@ pub fn sanitize_bundle_slug(raw: &str) -> anyhow::Result<String> {
     Ok(trimmed.to_string())
 }
 
-fn resolve_bundle_source_url(source: &str) -> String {
+pub fn resolve_bundle_source_url(source: &str) -> String {
     let trimmed = source.trim();
     if trimmed.eq_ignore_ascii_case("heurion") {
         return std::env::var("HEURION_BUNDLE_URL")

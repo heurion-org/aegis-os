@@ -620,7 +620,13 @@ fn infer_builtin_resource_type(action: &str) -> Option<&'static str> {
     } else if action.starts_with("ipc_")
         || action == "egress_http_request"
         || action.starts_with("coord_")
-        || action.starts_with("app_")
+        || matches!(
+            action,
+            "mcp_list_installed"
+                | "mcp_discover"
+                | "mcp_hot_list_tools"
+                | "mcp_hot_call_tool"
+        )
     {
         Some("IpcResource")
     } else {
@@ -2219,6 +2225,7 @@ impl PolicyEngine for AegisPolicyKernel {
                 | "workspace_git_sensitive"
                 | "fs_export_file"
                 | "egress_unlisted_domain"
+                | "mcp_request_install"
                 | "github_pr_create"
                 | "github_pr_merge"
                 | "github_comment_create"
@@ -2228,7 +2235,10 @@ impl PolicyEngine for AegisPolicyKernel {
                 .get_active_taint(&ctx.principal.org_id, &ctx.principal.agent_id)
                 .await
             {
-                let disallow_wildcard = ctx.action == "egress_unlisted_domain";
+                let disallow_wildcard = matches!(
+                    ctx.action.as_str(),
+                    "egress_unlisted_domain" | "mcp_request_install"
+                );
                 if let Some(lease) = self
                     .check_active_lease_with_constraints(
                         ctx,
@@ -2784,6 +2794,37 @@ impl PolicyEngine for AegisPolicyKernel {
                 .await
             }
 
+            "mcp_request_install" => {
+                let tier = ctx
+                    .metadata
+                    .get("trust_tier")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("external");
+                let transport = ctx
+                    .metadata
+                    .get("transport_kind")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("unknown");
+                let ev_hash = ctx
+                    .metadata
+                    .get("evidence_hash")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("-");
+                let short_hash = &ev_hash[..12.min(ev_hash.len())];
+                self.record_escalation(
+                    ctx,
+                    format!(
+                        "Agent '{}' requests to install external MCP '{}' [{} · {} · sha256:{}]",
+                        ctx.principal.agent_id, ctx.target_resource, tier, transport, short_hash
+                    ),
+                    format!(
+                        "action=mcp_request_install, resource={}#sha256:{}",
+                        ctx.target_resource, ev_hash
+                    ),
+                )
+                .await
+            }
+
             other => {
                 if let Some(permit_rule) = self.cedar_policies.find_permit(ctx) {
                     return Ok(PolicyDecision::Allow {
@@ -2804,6 +2845,13 @@ impl PolicyEngine for AegisPolicyKernel {
         if lease.action_pattern == "host_exec" || lease.action_pattern.starts_with("host_exec") {
             anyhow::bail!(
                 "Direct grant_lease for 'host_exec' is forbidden; approve a SHA-256 pinned escalation instead"
+            );
+        }
+        if lease.action_pattern == "mcp_request_install"
+            || lease.action_pattern.starts_with("mcp_request_install")
+        {
+            anyhow::bail!(
+                "Direct grant_lease for 'mcp_request_install' is forbidden; approve a SHA-256 pinned escalation instead"
             );
         }
         if lease.created_at_ms <= 0 {
@@ -2887,7 +2935,7 @@ impl PolicyEngine for AegisPolicyKernel {
             item.clone()
         };
 
-        let is_oneshot = ttl_secs <= 0;
+        let is_oneshot = ttl_secs <= 0 || target.action == "mcp_request_install";
         let active_taint_ms = self
             .taints
             .read()
@@ -2929,6 +2977,7 @@ impl PolicyEngine for AegisPolicyKernel {
                 | "host_exec"
                 | "egress_unlisted_domain"
                 | "mcp_mount_server"
+                | "mcp_request_install"
                 | "org_artifact_fetch"
                 | "org_kv_get"
         ) || target.action.starts_with("memory.")
@@ -4906,5 +4955,91 @@ mod stage2_security_tests {
             PolicyDecision::Allow { .. }
         ));
         let _ = std::fs::remove_dir_all(&tmp_dir);
+    }
+
+    #[tokio::test]
+    async fn external_mcp_control_plane_policy_pins_install_sha256_and_allows_discovery() {
+        let kernel = AegisPolicyKernel::new();
+        let agent = AgentIdentity::new("acme", "coder-1", "Engineer");
+
+        for ro_action in [
+            "mcp_list_installed",
+            "mcp_discover",
+            "mcp_hot_list_tools",
+            "mcp_hot_call_tool",
+        ] {
+            let ctx = PolicyContext {
+                principal: agent.clone(),
+                action: ro_action.to_string(),
+                target_org_id: "acme".to_string(),
+                target_resource: "linear".to_string(),
+                metadata: json!({}),
+            };
+            assert!(
+                matches!(kernel.evaluate(&ctx).await.unwrap(), PolicyDecision::Allow { .. }),
+                "{ro_action} should auto-allow within org"
+            );
+        }
+
+        // Direct lease grant for `mcp_request_install` must be rejected.
+        assert!(kernel
+            .grant_lease(LeaseGrant {
+                lease_id: "l-direct".to_string(),
+                org_id: "acme".to_string(),
+                agent_id: "coder-1".to_string(),
+                action_pattern: "mcp_request_install".to_string(),
+                resource_pattern: "*".to_string(),
+                created_at_ms: 1,
+                expires_at_ms: i64::MAX / 2,
+                granted_by: "spoof".to_string(),
+                kind: LeaseKind::Ttl,
+                task_id: None,
+            })
+            .await
+            .is_err());
+
+        // `mcp_request_install` always escalates and pins SHA-256 on one-shot approval.
+        let hash_v1 = "a".repeat(64);
+        let req_ctx = PolicyContext {
+            principal: agent.clone(),
+            action: "mcp_request_install".to_string(),
+            target_org_id: "acme".to_string(),
+            target_resource: "linear".to_string(),
+            metadata: json!({
+                "trust_tier": "tier1_verified_remote_oauth",
+                "transport_kind": "streamable_http",
+                "evidence_hash": hash_v1,
+            }),
+        };
+        let esc_id = match kernel.evaluate(&req_ctx).await.unwrap() {
+            PolicyDecision::Ask { escalation_id, .. } => escalation_id,
+            other => panic!("Expected Ask for mcp_request_install, got {other:?}"),
+        };
+        let lease = kernel
+            .approve_escalation(&esc_id, 3600, "human-operator")
+            .await
+            .unwrap();
+        assert_eq!(lease.kind, LeaseKind::OneShot);
+        assert_eq!(lease.resource_pattern, format!("linear#sha256:{}", "a".repeat(64)));
+
+        // Swapped manifest hash fails the pinned lease.
+        let tampered_ctx = PolicyContext {
+            metadata: json!({ "evidence_hash": "b".repeat(64) }),
+            ..req_ctx.clone()
+        };
+        assert!(matches!(
+            kernel.evaluate(&tampered_ctx).await.unwrap(),
+            PolicyDecision::Ask { .. }
+        ));
+
+        // Exact matching manifest succeeds once and consumes the OneShot lease.
+        assert!(matches!(
+            kernel.evaluate(&req_ctx).await.unwrap(),
+            PolicyDecision::Allow { .. }
+        ));
+        assert!(matches!(
+            kernel.evaluate(&req_ctx).await.unwrap(),
+            PolicyDecision::Ask { .. }
+        ));
     }
 }
