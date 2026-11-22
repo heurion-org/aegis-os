@@ -1,27 +1,27 @@
 class AegisOs < Formula
   desc "Multi-tenant Agent OS Runtime & Cloud PaaS with CoW VFS, Sandbox & IPC for AGY, Claude Code, and Codex"
   homepage "https://github.com/heurion-org/aegis-os"
-  version "0.4.5"
+  version "0.9.3"
   license "Apache-2.0"
   head "https://github.com/heurion-org/aegis-os.git", branch: "main"
 
   on_macos do
     if Hardware::CPU.arm?
-      url "https://github.com/heurion-org/aegis-os/releases/download/v0.4.5/aegis-os-v0.4.5-aarch64-apple-darwin.tar.gz"
-      sha256 "3a07ff1d0f1773917ae75a4806ddf47969c4f934cc2317c27e92ff9687adddfe"
+      url "https://github.com/heurion-org/aegis-os/releases/download/v0.9.3/aegis-os-v0.9.3-aarch64-apple-darwin.tar.gz"
+      sha256 "8a157af2d2bdac16b7978884792614731cb162322c4fb1a5a4ee30f7bb248c26"
     else
-      url "https://github.com/heurion-org/aegis-os/releases/download/v0.4.5/aegis-os-v0.4.5-x86_64-apple-darwin.tar.gz"
-      sha256 "c6aeb6305236c4a5f62038e3f82c5c9193e8b98c5d29671d4aed2c6d6d955b14"
+      url "https://github.com/heurion-org/aegis-os/releases/download/v0.9.3/aegis-os-v0.9.3-x86_64-apple-darwin.tar.gz"
+      sha256 "ed24b35c8c077f9a65a6b28bfced7ba62c49de0e02152cb7d4945a099ab2e254"
     end
   end
 
   on_linux do
     if Hardware::CPU.arm?
-      url "https://github.com/heurion-org/aegis-os/releases/download/v0.4.5/aegis-os-v0.4.5-aarch64-unknown-linux-gnu.tar.gz"
-      sha256 "4ead8a6379f3a6d9657c1425688e12d13cb48229e6013c35b81238738d70b590"
+      url "https://github.com/heurion-org/aegis-os/releases/download/v0.9.3/aegis-os-v0.9.3-aarch64-unknown-linux-gnu.tar.gz"
+      sha256 "a041c30abdba0845d9b75eb811e7c34ad0c35b698b13807d977c3e53be49cde5"
     else
-      url "https://github.com/heurion-org/aegis-os/releases/download/v0.4.5/aegis-os-v0.4.5-x86_64-unknown-linux-gnu.tar.gz"
-      sha256 "3c8504734293276ccf7b5685bb7fd11fb8de07899edbe80ae7a2675b076fb4fa"
+      url "https://github.com/heurion-org/aegis-os/releases/download/v0.9.3/aegis-os-v0.9.3-x86_64-unknown-linux-gnu.tar.gz"
+      sha256 "b98cf8ccf544539d7fd50951ab7cf99264cb04b961aa1b9873b8052d3ca6ac34"
     end
   end
 
