@@ -1,3 +1,11 @@
+<p align="center">
+  <picture>
+    <source media="(prefers-color-scheme: dark)" srcset="assets/aegis-logo-dark.svg">
+    <source media="(prefers-color-scheme: light)" srcset="assets/aegis-logo-light.svg">
+    <img alt="Aegis OS" src="assets/aegis-logo-light.svg" width="380">
+  </picture>
+</p>
+
 # Aegis OS (`aegis-os`)
 
 **[English](README.md) | [简体中文](README_CN.md) | [Aegis OS 官网](https://heurion.org/aegis-os/) | [使用教程](https://heurion.org/aegis-os/tutorial/) | [论文一 (arXiv:2611.08516)](https://arxiv.org/abs/2611.08516) | [论文二 (DOI: 10.5281/zenodo.24170505)](https://doi.org/10.5281/zenodo.24170505) | [技术博客](https://heurion.org/blog) | [云端控制台与 Pro ($29/月)](https://heurion.org/aegis-cloud/dashboard) | [边界审批台](https://heurion.org/aegis-cloud/approve)**
@@ -72,7 +80,7 @@ Enforced 模式提供：
 - **双令牌权限分离 `SessionBroker` 与冻结暂存区（Frozen-Stage）SHA-256 提交门禁**：严格隔离 `agent.token` 与 `human.token`，对 Diff 中的 VT100 CSI / Unicode Bidi 控制字符进行转义防欺骗，落盘前快照至 `commit_frozen_stage` 并运行 6 大 `DomainProfile` 校验器（`code`、`docs`、`data`、`binary`、`app_state`、`memory`）。
 - **Fail closed**：缺少 `bwrap`/`sandbox-exec`（或 Ubuntu 24.04 AppArmor 限制未配置 profile）、代理或 broker 时直接拒绝启动，绝不静默降级。
 
-会话与可观测控制：`aegis-os status` · `aegis-os diff --json` · `aegis-os verify` · `aegis-os commit --expected-diff-hash` · `aegis-os discard` · `aegis-os publish` · `aegis-os approvals` · `aegis-os why` · `aegis-os a2a board` · `aegis-os policy watch` · `aegis-os memory ui` · `aegis-os app list` · `aegis-os audit-me --share` · `aegis-os vault status` · `aegis-os upgrade --check` · `aegis-os uninstall`。
+会话与可观测控制：`aegis-os status` · `aegis-os diff --json` · `aegis-os verify` · `aegis-os commit --expected-diff-hash` · `aegis-os discard` · `aegis-os publish` · `aegis-os approvals` · `aegis-os why` · `aegis-os a2a board` · `aegis-os policy watch` · `aegis-os memory ui` · `aegis-os mcp list` · `aegis-os audit-me --share` · `aegis-os vault status` · `aegis-os upgrade --check` · `aegis-os uninstall`。
 
 当前限制：
 
@@ -106,6 +114,7 @@ aegis-os uninstall           # 或彻底清理: aegis-os uninstall --workspace-c
 - **宿主代理 Git / GitHub 全闭环** — `workspace_git_inspect`、事务型 `workspace_git`（支持 `auto_commit_shadow`、投毒/强推守卫）以及 `github_ci_inspect`、`github_ci_rerun`、`github_pr_inspect`、`github_pr_create`、`github_comment_create`、`github_pr_merge`、`github_issue_inspect`（同仓库只读免弹窗、跨仓库/写操作严格审批及结构化 Web 高危审批卡）。
 - **A2A IPC 与 CAS** — 同伴发现、层级任务、任务绑定文件锁、`artifact://sha256` 内容寻址接力。
 - **Cedar 策略、租约与审计** — 效果级审批、TTL / 单次租约、`evidence_hash` 锁定、哈希链审计账本，以及 `Aegis-OS-Verified` Commit/PR 审计凭证。
+- **零信任外部 MCP 防火墙与受限 Agent 桥接** — `aegis-os mcp` 为沙箱内的 `claude`、`agy`、`opencode`、`codex`、`cursor` 自动分发无凭证 1:1 代理桩（`aegis-os mcp proxy <id>` / `/__aegis/mcp/<id>`），并在宿主机侧统一执行策略与 SQL 风险分级、DLP 假名化、会话污点追踪、SHA-256 发件箱审批、AES-256-GCM Vault 加密、OAuth 2.1 Auth Realms（支持会话不停机热加载）与声明式 Bundles（`aegis-mcp-bundle/v1`）；开放生态发现与 `v0.10.0` 方案 B 热桥接设计详见 [`docs/EXTERNAL_MCP_DESIGN.md`](docs/EXTERNAL_MCP_DESIGN.md)。
 - **云端 PaaS** — 多租户工作区、Git-to-PR、密码学级 Scale-to-Zero 休眠（空闲自动 `umount` + `cryptsetup close` 卸载卷密钥、删库密码学擦除）、网页审批台。
 
 ## 关键基准
@@ -124,6 +133,7 @@ aegis-os uninstall           # 或彻底清理: aegis-os uninstall --workspace-c
 ## 文档
 
 - **完整技术架构、威胁模型、实现对照与用户手册** — [`docs/DOC.md`](docs/DOC.md)
+- **外部 MCP 对接架构与方案 B 设计规范（开放发现 / 热桥接 / 原生扶正）** — [`docs/EXTERNAL_MCP_DESIGN.md`](docs/EXTERNAL_MCP_DESIGN.md)
 - **基准报告** — [`BENCHMARK_REPORT.md`](BENCHMARK_REPORT.md) · [`paper2/ENFORCED_RUNTIME_BENCH_REPORT.json`](paper2/ENFORCED_RUNTIME_BENCH_REPORT.json) · [`scripts/p2_live/README.md`](scripts/p2_live/README.md)
 - **论文一（事务型多租户 Agent OS · arXiv:2611.08516）** — [https://arxiv.org/abs/2611.08516](https://arxiv.org/abs/2611.08516)（[PDF](https://arxiv.org/pdf/2611.08516) · 本地副本：[`paper/aegis_os_arxiv_preprint.pdf`](paper/aegis_os_arxiv_preprint.pdf)）
 - **论文二（Enforced 内核运行时与插件安全边界 · DOI: 10.5281/zenodo.24170505）** — [https://doi.org/10.5281/zenodo.24170505](https://doi.org/10.5281/zenodo.24170505)（[Zenodo 页面](https://zenodo.org/records/24170505) · 本地副本：[`paper2/aegis_enforced_runtime_arxiv_preprint.pdf`](paper2/aegis_enforced_runtime_arxiv_preprint.pdf) · [LaTeX](paper2/main.tex)）

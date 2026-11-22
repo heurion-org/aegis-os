@@ -1,0 +1,47 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 128 128" width="128" height="128" role="img" aria-label="Aegis OS Icon">
+  <defs>
+    <linearGradient id="icon-bg-grad" x1="0" y1="0" x2="0" y2="1">
+      <stop offset="0%" stop-color="#131C31"/>
+      <stop offset="100%" stop-color="#090F1D"/>
+    </linearGradient>
+    <linearGradient id="icon-rim-grad" x1="0" y1="0" x2="1" y2="1">
+      <stop offset="0%" stop-color="#10B981"/>
+      <stop offset="50%" stop-color="#06B6D4"/>
+      <stop offset="100%" stop-color="#3B82F6"/>
+    </linearGradient>
+    <linearGradient id="icon-facet-left" x1="0" y1="0" x2="0" y2="1">
+      <stop offset="0%" stop-color="#34D399"/>
+      <stop offset="100%" stop-color="#06B6D4"/>
+    </linearGradient>
+    <linearGradient id="icon-facet-right" x1="0" y1="0" x2="0" y2="1">
+      <stop offset="0%" stop-color="#0EA5E9"/>
+      <stop offset="100%" stop-color="#2563EB"/>
+    </linearGradient>
+    <linearGradient id="icon-chev-grad" x1="0" y1="0" x2="1" y2="0">
+      <stop offset="0%" stop-color="#34D399"/>
+      <stop offset="50%" stop-color="#06B6D4"/>
+      <stop offset="100%" stop-color="#3B82F6"/>
+    </linearGradient>
+  </defs>
+
+  <!-- Architectural Octagonal Shield -->
+  <path d="M 64 8 L 112 26 L 112 68 L 98 96 L 64 120 L 30 96 L 16 68 L 16 26 Z"
+        fill="url(#icon-bg-grad)" stroke="url(#icon-rim-grad)" stroke-width="3.4" stroke-linejoin="round"/>
+
+  <!-- Subtle Inner Kernel Rim -->
+  <path d="M 64 15 L 105 30.5 L 105 66.5 L 92.5 91.5 L 64 112 L 35.5 91.5 L 23 66.5 L 23 30.5 Z"
+        fill="none" stroke="#38BDF8" stroke-width="1" stroke-opacity="0.18" stroke-linejoin="round"/>
+
+  <!-- Dual-Plane Monolith 'A' (Trusted Host Plane vs. Confined Sandbox Plane) -->
+  <path d="M 64 26 L 38 84 L 49.5 84 L 64 51 Z" fill="url(#icon-facet-left)"/>
+  <path d="M 64 26 L 90 84 L 78.5 84 L 64 51 Z" fill="url(#icon-facet-right)"/>
+
+  <!-- CoW Crossbar & Kernel Trust Core -->
+  <path d="M 51.5 68 L 76.5 68 L 74 74.5 L 54 74.5 Z" fill="#E0F2FE" fill-opacity="0.9"/>
+  <path d="M 64 62.5 L 70 71 L 64 79.5 L 58 71 Z"
+        fill="#FFFFFF" stroke="#34D399" stroke-width="1" stroke-linejoin="round"/>
+
+  <!-- Lower CoW-Layer Chevron -->
+  <path d="M 47 92 L 64 102 L 81 92"
+        fill="none" stroke="url(#icon-chev-grad)" stroke-width="2.8" stroke-linecap="round" stroke-linejoin="round" stroke-opacity="0.85"/>
+</svg>

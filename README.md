@@ -1,3 +1,11 @@
+<p align="center">
+  <picture>
+    <source media="(prefers-color-scheme: dark)" srcset="assets/aegis-logo-dark.svg">
+    <source media="(prefers-color-scheme: light)" srcset="assets/aegis-logo-light.svg">
+    <img alt="Aegis OS" src="assets/aegis-logo-light.svg" width="380">
+  </picture>
+</p>
+
 # Aegis OS (`aegis-os`)
 
 **[English](README.md) | [简体中文](README_CN.md) | [Aegis OS Website](https://heurion.org/en/aegis-os/) | [Tutorial](https://heurion.org/en/aegis-os/tutorial/) | [Paper 1 (arXiv:2611.08516)](https://arxiv.org/abs/2611.08516) | [Paper 2 (DOI: 10.5281/zenodo.24170505)](https://doi.org/10.5281/zenodo.24170505) | [Technical Blog](https://heurion.org/en/blog) | [Cloud Console & Pro ($29/mo)](https://heurion.org/aegis-cloud/dashboard) | [Approval Console](https://heurion.org/aegis-cloud/approve)**
@@ -107,6 +115,7 @@ aegis-os uninstall           # or: aegis-os uninstall --workspace-clean --purge 
 - **Host-brokered Git & GitHub CI/PR/Issue bridge** — `workspace_git_inspect`, transactional `workspace_git` (`auto_commit_shadow`, force-push & poisoning guards), `github_ci_inspect`, `github_ci_rerun`, `github_pr_inspect`, `github_pr_create`, `github_comment_create`, `github_pr_merge`, and `github_issue_inspect` with same-repo read auto-allow, cross-repo escalation, and structured Web Approval cards.
 - **A2A IPC & CAS** — peer discovery, hierarchical tasks, task-bound file claims, `artifact://sha256` content-addressed hand-offs.
 - **Cedar policy, leases & audit** — effect-level approvals, TTL/one-shot leases, `evidence_hash` pinning, hash-chained audit ledger, and `Aegis-OS-Verified` commit/PR receipts.
+- **Zero-Trust External MCP Firewall & Confined Agent Bridge** — `aegis-os mcp` stages credential-free 1:1 proxy stubs (`aegis-os mcp proxy <id>` / `/__aegis/mcp/<id>`) into confined `claude`, `agy`, `opencode`, `codex`, and `cursor` sessions while enforcing host-side policy/SQL risk tiering, DLP pseudonymization, session tainting, SHA-256 Outbox approvals, AES-256-GCM Vault sealing, OAuth 2.1 Auth Realms (live hot-reload without restarting agents), and Declarative Bundles (`aegis-mcp-bundle/v1`); see [`docs/EXTERNAL_MCP_DESIGN.md`](docs/EXTERNAL_MCP_DESIGN.md) for the `v0.10.0` Option B open-registry & hot-bridge spec.
 - **Cloud PaaS** — multi-tenant workspaces, Git-to-PR export, cryptographic scale-to-zero hibernation (`umount` + `cryptsetup close` on idle, crypto-erasure on delete), web approval console.
 
 ## Key benchmarks
@@ -125,6 +134,7 @@ aegis-os uninstall           # or: aegis-os uninstall --workspace-clean --purge 
 ## Documentation
 
 - **Complete Technical Reference & User Manual (Architecture, Threat Model, Countermeasures & CLI Guide)** — [`docs/DOC.md`](docs/DOC.md)
+- **External MCP Integration Architecture & Option B Spec** — [`docs/EXTERNAL_MCP_DESIGN.md`](docs/EXTERNAL_MCP_DESIGN.md)
 - **Benchmark reports** — [`BENCHMARK_REPORT.md`](BENCHMARK_REPORT.md) · [`paper2/ENFORCED_RUNTIME_BENCH_REPORT.json`](paper2/ENFORCED_RUNTIME_BENCH_REPORT.json) · [`scripts/p2_live/README.md`](scripts/p2_live/README.md)
 - **Paper 1 (Transactional Agent OS · arXiv:2611.08516)** — [https://arxiv.org/abs/2611.08516](https://arxiv.org/abs/2611.08516) ([PDF](https://arxiv.org/pdf/2611.08516) · local copy: [`paper/aegis_os_arxiv_preprint.pdf`](paper/aegis_os_arxiv_preprint.pdf))
 - **Paper 2 (Enforced Runtime & Plugin Security Boundary · DOI: 10.5281/zenodo.24170505)** — [https://doi.org/10.5281/zenodo.24170505](https://doi.org/10.5281/zenodo.24170505) ([Zenodo Record](https://zenodo.org/records/24170505) · local PDF: [`paper2/aegis_enforced_runtime_arxiv_preprint.pdf`](paper2/aegis_enforced_runtime_arxiv_preprint.pdf) · [LaTeX](paper2/main.tex))

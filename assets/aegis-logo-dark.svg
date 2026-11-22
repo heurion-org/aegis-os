@@ -1,0 +1,67 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 436 112" width="436" height="112" role="img" aria-label="Aegis OS">
+  <defs>
+    <linearGradient id="dark-bg-grad" x1="0" y1="0" x2="0" y2="1">
+      <stop offset="0%" stop-color="#131C31"/>
+      <stop offset="100%" stop-color="#090F1D"/>
+    </linearGradient>
+    <linearGradient id="dark-rim-grad" x1="0" y1="0" x2="1" y2="1">
+      <stop offset="0%" stop-color="#34D399"/>
+      <stop offset="50%" stop-color="#06B6D4"/>
+      <stop offset="100%" stop-color="#60A5FA"/>
+    </linearGradient>
+    <linearGradient id="dark-facet-left" x1="0" y1="0" x2="0" y2="1">
+      <stop offset="0%" stop-color="#34D399"/>
+      <stop offset="100%" stop-color="#06B6D4"/>
+    </linearGradient>
+    <linearGradient id="dark-facet-right" x1="0" y1="0" x2="0" y2="1">
+      <stop offset="0%" stop-color="#0EA5E9"/>
+      <stop offset="100%" stop-color="#2563EB"/>
+    </linearGradient>
+    <linearGradient id="dark-chev-grad" x1="0" y1="0" x2="1" y2="0">
+      <stop offset="0%" stop-color="#34D399"/>
+      <stop offset="50%" stop-color="#06B6D4"/>
+      <stop offset="100%" stop-color="#60A5FA"/>
+    </linearGradient>
+    <linearGradient id="dark-os-pill" x1="0" y1="0" x2="1" y2="1">
+      <stop offset="0%" stop-color="#10B981"/>
+      <stop offset="50%" stop-color="#06B6D4"/>
+      <stop offset="100%" stop-color="#2563EB"/>
+    </linearGradient>
+  </defs>
+
+  <!-- Shield Emblem -->
+  <g transform="translate(8, 6) scale(0.78125)">
+    <path d="M 64 8 L 112 26 L 112 68 L 98 96 L 64 120 L 30 96 L 16 68 L 16 26 Z"
+          fill="url(#dark-bg-grad)" stroke="url(#dark-rim-grad)" stroke-width="3.4" stroke-linejoin="round"/>
+    <path d="M 64 15 L 105 30.5 L 105 66.5 L 92.5 91.5 L 64 112 L 35.5 91.5 L 23 66.5 L 23 30.5 Z"
+          fill="none" stroke="#38BDF8" stroke-width="1" stroke-opacity="0.18" stroke-linejoin="round"/>
+    <path d="M 64 26 L 38 84 L 49.5 84 L 64 51 Z" fill="url(#dark-facet-left)"/>
+    <path d="M 64 26 L 90 84 L 78.5 84 L 64 51 Z" fill="url(#dark-facet-right)"/>
+    <path d="M 51.5 68 L 76.5 68 L 74 74.5 L 54 74.5 Z" fill="#E0F2FE" fill-opacity="0.9"/>
+    <path d="M 64 62.5 L 70 71 L 64 79.5 L 58 71 Z"
+          fill="#FFFFFF" stroke="#34D399" stroke-width="1" stroke-linejoin="round"/>
+    <path d="M 47 92 L 64 102 L 81 92"
+          fill="none" stroke="url(#dark-chev-grad)" stroke-width="2.8" stroke-linecap="round" stroke-linejoin="round" stroke-opacity="0.85"/>
+  </g>
+
+  <!-- Geometric Vector Wordmark: AEGIS (Crisp Off-White for Dark Mode) -->
+  <g fill="none" stroke="#F8FAFC" stroke-width="6.2" stroke-linecap="round" stroke-linejoin="round">
+    <!-- A -->
+    <path d="M 132 78 L 148 36 L 164 78 M 138 64 L 158 64"/>
+    <!-- E -->
+    <path d="M 207 36 L 180 36 L 180 78 L 207 78 M 180 57 L 202 57"/>
+    <!-- G -->
+    <path d="M 255 44 C 251 38 245 36 239 36 C 228 36 222 44 222 57 C 222 70 228 78 240 78 C 249 78 256 73 256 64 L 256 58 L 241 58"/>
+    <!-- I -->
+    <path d="M 274 36 L 274 78"/>
+    <!-- S -->
+    <path d="M 322 43 C 319 37.5 313 36 306.5 36 C 296.5 36 291.5 40 291.5 46.5 C 291.5 53 296.5 55.5 307 57.5 C 318 59.5 323 62.5 323 69 C 323 75 317 78 306.5 78 C 298 78 292 75 289.5 70"/>
+  </g>
+
+  <!-- OS Pill Badge -->
+  <rect x="342" y="33" width="80" height="48" rx="12" fill="url(#dark-os-pill)"/>
+  <g fill="none" stroke="#FFFFFF" stroke-width="4.4" stroke-linecap="round" stroke-linejoin="round">
+    <rect x="357" y="45" width="20" height="24" rx="9"/>
+    <path d="M 405.5 49 C 403.5 46 400 45 396 45 C 391 45 388 47.5 388 51 C 388 54.5 391 56 396.5 57.2 C 402.5 58.4 406 60 406 63.8 C 406 67.2 402.5 69 396.5 69 C 391.5 69 388.5 67.4 387 64.8"/>
+  </g>
+</svg>
