@@ -31,14 +31,80 @@ pub(crate) enum McpAction {
         json: bool,
     },
 
-    /// Check MCP health: expired OAuth tokens, missing logins, unadopted plaintext configs, and sandbox readiness
+    /// Check MCP health: expired OAuth tokens, missing logins, unadopted plaintext configs, sandbox readiness, and live server probes
     Doctor {
         /// Optional custom home directory (defaults to `$HOME`)
         #[arg(long)]
         home_dir: Option<PathBuf>,
+        /// Run live read-only `initialize` + `tools/list` probes against every registered MCP server
+        #[arg(long, default_value_t = false)]
+        probe: bool,
+        /// Per-server timeout in milliseconds when `--probe` is enabled (500..=30000)
+        #[arg(long, default_value_t = 5000)]
+        probe_timeout_ms: u64,
         /// Output raw JSON diagnostics
         #[arg(long, default_value_t = false)]
         json: bool,
+    },
+
+    /// Sync zero-secret workspace `.aegis/mcp.json` (and optional client configs) into Aegis MCP Vault
+    Sync {
+        /// Optional custom home directory for client config sync (defaults to `$HOME`)
+        #[arg(long)]
+        home_dir: Option<PathBuf>,
+        /// Also sync `aegis-os mcp proxy <server_id>` entries into detected client configs
+        #[arg(long, default_value_t = false)]
+        clients: bool,
+        /// Allow plaintext http:// loopback URLs when installing local entries
+        #[arg(long, default_value_t = false)]
+        allow_local_http: bool,
+        /// Preview sync changes without mutating Vault or client configs
+        #[arg(long, default_value_t = false)]
+        dry_run: bool,
+        /// Output raw JSON report
+        #[arg(long, default_value_t = false)]
+        json: bool,
+    },
+
+    /// Remove a registered external MCP server, clean client proxy entries, and optionally purge unused auth
+    Remove {
+        server_id: String,
+        /// Purge stored OAuth/static credentials for this server's Auth Realm if unused by remaining servers
+        #[arg(long, default_value_t = false)]
+        purge_auth: bool,
+        /// Keep client config proxy entries intact instead of removing/restoring them
+        #[arg(long, default_value_t = false)]
+        keep_client_configs: bool,
+        /// Optional custom home directory for client config cleanup
+        #[arg(long)]
+        home_dir: Option<PathBuf>,
+        /// Output raw JSON result
+        #[arg(long, default_value_t = false)]
+        json: bool,
+    },
+
+    /// Check/apply upstream version updates for Registry/package/bundle MCPs while preserving Vault secrets & policy
+    Upgrade {
+        /// Server ID to upgrade (omit with `--all` to check every managed server)
+        server_id: Option<String>,
+        /// Upgrade all registered servers that have upstream Registry/package/bundle provenance
+        #[arg(long, default_value_t = false)]
+        all: bool,
+        /// Allow plaintext http:// loopback registries/URLs
+        #[arg(long, default_value_t = false)]
+        allow_local_http: bool,
+        /// Preview available upgrades without mutating Vault
+        #[arg(long, default_value_t = false)]
+        dry_run: bool,
+        /// Output raw JSON report
+        #[arg(long, default_value_t = false)]
+        json: bool,
+    },
+
+    /// Manage private Enterprise MCP Registries and air-gapped public registry lockouts
+    Registry {
+        #[command(subcommand)]
+        action: McpRegistryAction,
     },
 
     /// Search Official MCP Registry (and configured registries) ranked by Aegis Trust Tier (1 -> 2 -> 3)
@@ -193,6 +259,12 @@ pub(crate) enum McpAction {
         /// Allow plaintext http:// on local loopback addresses (testing/local dev only)
         #[arg(long, default_value_t = false)]
         allow_local_http: bool,
+        /// Isolate upstream stdio child outbound network (offline unless `--allow-host` is specified)
+        #[arg(long, default_value_t = false)]
+        isolate_network: bool,
+        /// Allowed outbound hosts for isolated stdio MCP server (implies `--isolate-network`)
+        #[arg(long = "allow-host")]
+        allow_hosts: Vec<String>,
     },
 
     /// List all Aegis-managed MCP servers and their security policies
@@ -219,11 +291,20 @@ pub(crate) enum McpAction {
         #[arg(long)]
         isolate_home: Option<bool>,
         #[arg(long)]
+        isolate_network: Option<bool>,
+        #[arg(long = "allow-host")]
+        allow_hosts: Vec<String>,
+        #[arg(long, default_value_t = false)]
+        clear_allowed_hosts: bool,
+        #[arg(long)]
         auth_realm: Option<String>,
         #[arg(long)]
         timeout_ms: Option<u64>,
         #[arg(long)]
         allow_local_http: Option<bool>,
+        /// Allow server-initiated `elicitation/create` / `sampling/*` requests (default: false)
+        #[arg(long)]
+        allow_elicitation: Option<bool>,
         #[arg(long, default_value_t = false)]
         json: bool,
     },
@@ -353,6 +434,37 @@ pub(crate) enum McpTaintAction {
     Clear {
         #[arg(long)]
         agent: Option<String>,
+        #[arg(long, default_value_t = false)]
+        json: bool,
+    },
+}
+
+#[derive(Subcommand, Debug, Clone)]
+pub(crate) enum McpRegistryAction {
+    /// List configured MCP registries and effective air-gapped policy state
+    List {
+        #[arg(long, default_value_t = false)]
+        json: bool,
+    },
+    /// Add a private Enterprise MCP Registry URL (`https://...`)
+    Add {
+        url: String,
+        #[arg(long, default_value_t = false)]
+        allow_local_http: bool,
+        #[arg(long, default_value_t = false)]
+        json: bool,
+    },
+    /// Remove a configured MCP Registry URL
+    Remove {
+        url: String,
+        #[arg(long, default_value_t = false)]
+        json: bool,
+    },
+    /// Enable or disable air-gapped mode (blocks public registry fallback and arbitrary external URLs)
+    Airgapped {
+        /// `true` to disable public registry and enforce private registries only; `false` to re-enable
+        #[arg(action = clap::ArgAction::Set)]
+        enabled: bool,
         #[arg(long, default_value_t = false)]
         json: bool,
     },
@@ -592,12 +704,20 @@ pub(crate) async fn handle_mcp_command(
             auth_realm,
             timeout_ms,
             allow_local_http,
+            isolate_network,
+            allow_hosts,
         } => {
             let trust_level = parse_trust_level(&trust)?;
             let dlp_mode: PseudonymMode = dlp.parse().map_err(|e: String| anyhow::anyhow!(e))?;
+            let clean_hosts =
+                aos_mcp_gateway::mcp_firewall::normalize_and_validate_stdio_allowed_hosts(
+                    &allow_hosts,
+                )?;
             let policy = McpServerPolicy {
                 trust_level,
                 dlp_mode,
+                isolate_upstream_network: isolate_network || !clean_hosts.is_empty(),
+                allowed_hosts: clean_hosts,
                 request_timeout_ms: timeout_ms,
                 ..McpServerPolicy::default()
             };
@@ -688,9 +808,13 @@ pub(crate) async fn handle_mcp_command(
             forbid_tools,
             strip_injection,
             isolate_home,
+            isolate_network,
+            allow_hosts,
+            clear_allowed_hosts,
             auth_realm,
             timeout_ms,
             allow_local_http,
+            allow_elicitation,
             json,
         } => {
             let parsed_trust = trust.as_deref().map(parse_trust_level).transpose()?;
@@ -698,6 +822,10 @@ pub(crate) async fn handle_mcp_command(
                 .as_deref()
                 .map(|d| d.parse::<PseudonymMode>().map_err(|e| anyhow::anyhow!(e)))
                 .transpose()?;
+            let clean_hosts =
+                aos_mcp_gateway::mcp_firewall::normalize_and_validate_stdio_allowed_hosts(
+                    &allow_hosts,
+                )?;
             let clean_realm = match auth_realm.as_deref() {
                 Some("") | Some("none") => Some(None),
                 Some(r) => Some(Some(sanitize_realm_id(r)?)),
@@ -720,6 +848,19 @@ pub(crate) async fn handle_mcp_command(
                     if let Some(ih) = isolate_home {
                         pol.isolate_upstream_home = ih;
                     }
+                    if clear_allowed_hosts {
+                        pol.allowed_hosts.clear();
+                    }
+                    for h in clean_hosts {
+                        if !pol.allowed_hosts.iter().any(|existing| existing == &h) {
+                            pol.allowed_hosts.push(h);
+                        }
+                    }
+                    if let Some(inet) = isolate_network {
+                        pol.isolate_upstream_network = inet;
+                    } else if !allow_hosts.is_empty() {
+                        pol.isolate_upstream_network = true;
+                    }
                     if let Some(ms) = timeout_ms {
                         pol.request_timeout_ms = if ms == 0 { None } else { Some(ms) };
                     }
@@ -738,16 +879,22 @@ pub(crate) async fn handle_mcp_command(
                     if let Some(alh) = allow_local_http {
                         rec.allow_local_http = alh;
                     }
+                    if let Some(ae) = allow_elicitation {
+                        pol.allow_elicitation = ae;
+                    }
                 })
                 .await?;
             if json {
                 println!("{}", serde_json::to_string_pretty(&updated)?);
             } else {
                 println!(
-                    "Updated policy for '{}': trust={:?}, dlp={:?}, realm={}, timeout_ms={:?}, overrides={}",
+                    "Updated policy for '{}': trust={:?}, dlp={:?}, net_iso={}, allowed_hosts={:?}, allow_elicitation={}, realm={}, timeout_ms={:?}, overrides={}",
                     updated.server_id,
                     updated.policy.trust_level,
                     updated.policy.dlp_mode,
+                    updated.policy.isolate_upstream_network,
+                    updated.policy.allowed_hosts,
+                    updated.policy.allow_elicitation,
                     updated.auth_realm.as_deref().unwrap_or("-"),
                     updated.policy.request_timeout_ms,
                     updated.policy.tool_overrides.len()
@@ -1302,11 +1449,36 @@ pub(crate) async fn handle_mcp_command(
             print_mcp_status_table(&report);
         }
 
-        McpAction::Doctor { home_dir, json } => {
+        McpAction::Doctor {
+            home_dir,
+            probe,
+            probe_timeout_ms,
+            json,
+        } => {
             let home = resolve_home_dir(home_dir);
             let kernel = AegisRuntimeKernel::new(runtime_dir).await?;
-            let (_, diag) =
+            let (_, mut diag) =
                 collect_mcp_status_and_drift(&kernel, &identity.org_id, &home, workspace).await;
+            if probe {
+                let (probes, extra_findings) = probe_org_mcp_servers(
+                    &kernel,
+                    identity,
+                    std::time::Duration::from_millis(probe_timeout_ms.clamp(500, 30_000)),
+                )
+                .await;
+                if let Some(obj) = diag.as_object_mut() {
+                    obj.insert("probes".to_string(), json!(probes));
+                    if !extra_findings.is_empty() {
+                        let mut merged = obj
+                            .get("findings")
+                            .and_then(|v| v.as_array())
+                            .cloned()
+                            .unwrap_or_default();
+                        merged.extend(extra_findings);
+                        obj.insert("findings".to_string(), json!(merged));
+                    }
+                }
+            }
             if json {
                 println!("{}", serde_json::to_string_pretty(&diag)?);
                 return Ok(());
@@ -1317,6 +1489,21 @@ pub(crate) async fn handle_mcp_command(
                 identity.org_id,
                 diag["stdio_sandbox_backend"].as_str().unwrap_or("env_isolated")
             );
+            if let Some(probes) = diag.get("probes").and_then(|v| v.as_array()) {
+                for p in probes {
+                    println!(
+                        "  [probe] {:<18} reachable={} tools={} latency={}ms{}",
+                        p["server_id"].as_str().unwrap_or("-"),
+                        p["reachable"].as_bool().unwrap_or(false),
+                        p["tool_count"].as_u64().unwrap_or(0),
+                        p["latency_ms"].as_u64().unwrap_or(0),
+                        p["error"]
+                            .as_str()
+                            .map(|e| format!(" ({e})"))
+                            .unwrap_or_default()
+                    );
+                }
+            }
             if findings.is_empty() {
                 println!("  ✓ All registered external MCP servers, Vault realms, and client configs look healthy.");
             } else {
@@ -1331,6 +1518,118 @@ pub(crate) async fn handle_mcp_command(
                         println!("      fix: {fix}");
                     }
                 }
+            }
+        }
+
+        McpAction::Sync {
+            home_dir,
+            clients,
+            allow_local_http,
+            dry_run,
+            json,
+        } => {
+            let home = resolve_home_dir(home_dir);
+            let res = run_mcp_sync_lifecycle(
+                &identity.org_id,
+                &home,
+                workspace,
+                runtime_dir,
+                clients,
+                allow_local_http,
+                dry_run,
+            )
+            .await?;
+            if json {
+                println!("{}", serde_json::to_string_pretty(&res)?);
+            } else {
+                println!(
+                    "MCP sync (org='{}', dry_run={}, installed={}, up_to_date={}, synced_client_files={}):",
+                    identity.org_id,
+                    dry_run,
+                    res["installed_count"].as_u64().unwrap_or(0),
+                    res["up_to_date_count"].as_u64().unwrap_or(0),
+                    res["synced_client_entries"].as_u64().unwrap_or(0)
+                );
+            }
+        }
+
+        McpAction::Remove {
+            server_id,
+            purge_auth,
+            keep_client_configs,
+            home_dir,
+            json,
+        } => {
+            let home = resolve_home_dir(home_dir);
+            let res = run_mcp_remove_lifecycle(
+                &identity.org_id,
+                &server_id,
+                &home,
+                workspace,
+                runtime_dir,
+                purge_auth,
+                keep_client_configs,
+            )
+            .await?;
+            if json {
+                println!("{}", serde_json::to_string_pretty(&res)?);
+            } else {
+                println!(
+                    "Removed MCP server '{}' (removed_client_entries={}, purged_auth={}).",
+                    res["server_id"].as_str().unwrap_or("-"),
+                    res["removed_client_entries"].as_u64().unwrap_or(0),
+                    res["purged_auth"].as_bool().unwrap_or(false)
+                );
+            }
+        }
+
+        McpAction::Upgrade {
+            server_id,
+            all,
+            allow_local_http,
+            dry_run,
+            json,
+        } => {
+            if server_id.is_none() && !all {
+                bail!("Specify `<server_id>` or pass `--all` to upgrade managed MCP servers");
+            }
+            let res = run_mcp_upgrade_lifecycle(
+                &identity.org_id,
+                server_id.as_deref(),
+                workspace,
+                runtime_dir,
+                allow_local_http,
+                dry_run,
+            )
+            .await?;
+            if json {
+                println!("{}", serde_json::to_string_pretty(&res)?);
+            } else {
+                println!(
+                    "MCP upgrade complete (dry_run={}, checked={}).",
+                    dry_run,
+                    res["checked"].as_u64().unwrap_or(0)
+                );
+            }
+        }
+
+        McpAction::Registry { action } => {
+            let want_json = match &action {
+                McpRegistryAction::List { json }
+                | McpRegistryAction::Add { json, .. }
+                | McpRegistryAction::Remove { json, .. }
+                | McpRegistryAction::Airgapped { json, .. } => *json,
+            };
+            let res = run_mcp_registry_action(runtime_dir, action).await?;
+            if want_json {
+                println!("{}", serde_json::to_string_pretty(&res)?);
+            } else {
+                println!(
+                    "MCP Registries (airgapped={}, effective={:?}, configured={:?})",
+                    res["effective_disable_public_registry"].as_bool().unwrap_or(false),
+                    res["effective_registries"],
+                    res["registries"]
+                );
             }
         }
 
@@ -1728,27 +2027,79 @@ async fn run_unified_mcp_install(
                     ));
                 }
             } else if let Some(ref pkg) = cand.package_spec {
+                let mut stdio_policy = policy;
+                stdio_policy.isolate_upstream_network = true;
+                stdio_policy.allowed_hosts =
+                    aos_mcp_gateway::mcp_firewall::normalize_and_validate_stdio_allowed_hosts(
+                        &cand.allowed_hosts,
+                    )?;
+                let (spawn_cmd, spawn_args, spawn_cwd, env_vars, req_envs) =
+                    if pkg.registry_type == "mcpb" {
+                        let installed = aos_mcp_gateway::mcp_mcpb::install_mcpb_archive(
+                            &pkg.identifier,
+                            pkg.file_sha256.as_deref(),
+                            &cand.server_id,
+                            kernel.mcp_registry.runtime_data_root(),
+                            args.allow_local_http,
+                        )
+                        .await?;
+                        let mut merged_req = pkg.required_env_vars.clone();
+                        for k in installed.required_env_vars {
+                            if !merged_req.iter().any(|existing| existing == &k) {
+                                merged_req.push(k);
+                            }
+                        }
+                        (
+                            installed.command,
+                            installed.args,
+                            Some(installed.cwd.display().to_string()),
+                            installed.env,
+                            merged_req,
+                        )
+                    } else {
+                        (
+                            pkg.command.clone(),
+                            pkg.args.clone(),
+                            Some(workspace.display().to_string()),
+                            BTreeMap::new(),
+                            pkg.required_env_vars.clone(),
+                        )
+                    };
                 kernel
                     .mcp_firewall
                     .register_stdio_server(
                         &identity.org_id,
                         &cand.server_id,
-                        &pkg.command,
-                        pkg.args.clone(),
-                        Some(workspace.display().to_string()),
-                        BTreeMap::new(),
-                        policy,
+                        &spawn_cmd,
+                        spawn_args,
+                        spawn_cwd,
+                        env_vars,
+                        stdio_policy,
                     )
                     .await?;
-                if !pkg.required_env_vars.is_empty() {
+                if !req_envs.is_empty() {
                     auth_status = "needs_env_secret".to_string();
                     next_hint = Some(format!(
                         "Required env vars [{}] can be Vault-sealed via `aegis-os mcp add {} ... --env KEY=VAL`.",
-                        pkg.required_env_vars.join(", "),
+                        req_envs.join(", "),
                         cand.server_id
                     ));
                 }
             }
+
+            let cand_ver = cand
+                .version
+                .clone()
+                .or_else(|| cand.package_spec.as_ref().and_then(|p| p.version.clone()));
+            let _ = kernel
+                .mcp_firewall
+                .update_server_config(&identity.org_id, &cand.server_id, |rec| {
+                    rec.registry_name = Some(cand.name.clone());
+                    rec.installed_version = cand_ver;
+                    rec.source_target = Some(args.target.clone());
+                    rec.manifest_sha256 = Some(cand.manifest_sha256.clone());
+                })
+                .await;
 
             let workspace_manifest = if scope == "workspace" {
                 Some(
@@ -1774,6 +2125,757 @@ async fn run_unified_mcp_install(
             }))
         }
     }
+}
+
+async fn run_mcp_registry_action(
+    runtime_dir: &Path,
+    action: McpRegistryAction,
+) -> anyhow::Result<Value> {
+    let client = McpRegistryClient::new(runtime_dir);
+    match action {
+        McpRegistryAction::List { .. } => Ok(client.registry_status()),
+        McpRegistryAction::Add {
+            url,
+            allow_local_http,
+            ..
+        } => {
+            client.add_registry(&url, allow_local_http).await?;
+            Ok(client.registry_status())
+        }
+        McpRegistryAction::Remove { url, .. } => {
+            client.remove_registry(&url).await?;
+            Ok(client.registry_status())
+        }
+        McpRegistryAction::Airgapped { enabled, .. } => {
+            client.set_disable_public_registry(enabled).await?;
+            Ok(client.registry_status())
+        }
+    }
+}
+
+async fn remove_dir_if_non_symlink(path: &Path) {
+    if let Ok(meta) = tokio::fs::symlink_metadata(path).await {
+        if !meta.file_type().is_symlink() && meta.is_dir() {
+            let _ = tokio::fs::remove_dir_all(path).await;
+        }
+    }
+}
+
+async fn run_mcp_remove_lifecycle(
+    org_id: &str,
+    server_id: &str,
+    home: &Path,
+    workspace: &Path,
+    runtime_dir: &Path,
+    purge_auth: bool,
+    keep_client_configs: bool,
+) -> anyhow::Result<Value> {
+    let kernel = AegisRuntimeKernel::new(runtime_dir).await?;
+    let clean_target = aos_mcp_gateway::mcp_firewall::sanitize_server_id(server_id);
+    let rec = kernel
+        .mcp_firewall
+        .get_server(org_id, server_id)
+        .await
+        .or(kernel.mcp_firewall.get_server(org_id, &clean_target).await)
+        .with_context(|| format!("MCP server '{}' is not registered in org '{}'", server_id, org_id))?;
+
+    let mut removed_client_entries = 0usize;
+    if !rec.adopted_origins.is_empty() && !keep_client_configs {
+        let unadopted = kernel
+            .mcp_firewall
+            .unadopt_servers(org_id, Some(&rec.server_id), true)
+            .await?;
+        for u in unadopted {
+            removed_client_entries += u["restored_origins"].as_u64().unwrap_or(0) as usize;
+        }
+    } else {
+        if !keep_client_configs {
+            for (client, cfg_path, _) in
+                aos_mcp_gateway::mcp_firewall::client_config_candidates(home, workspace)
+            {
+                if aos_mcp_gateway::mcp_firewall::remove_client_proxy_entry(
+                    client,
+                    &cfg_path,
+                    &rec.server_id,
+                )
+                .unwrap_or(false)
+                {
+                    removed_client_entries += 1;
+                }
+            }
+        }
+        kernel.mcp_firewall.remove_server(org_id, &rec.server_id).await?;
+    }
+
+    let safe_id = aos_mcp_gateway::mcp_firewall::sanitize_server_id(&rec.server_id);
+    remove_dir_if_non_symlink(&runtime_dir.join("mcp_homes").join(&safe_id)).await;
+    remove_dir_if_non_symlink(&runtime_dir.join("mcp_bundles_bin").join(&safe_id)).await;
+
+    let mut purged_auth = false;
+    if purge_auth {
+        if let Some(ref realm_id) = rec.auth_realm {
+            let still_used = kernel
+                .mcp_firewall
+                .list_servers(Some(org_id))
+                .await
+                .into_iter()
+                .any(|s| s.auth_realm.as_deref() == Some(realm_id.as_str()));
+            if !still_used {
+                purged_auth = kernel.mcp_oauth.purge_realm(org_id, realm_id).await?;
+            }
+        }
+    }
+
+    Ok(json!({
+        "status": "removed",
+        "org_id": org_id,
+        "server_id": rec.server_id,
+        "removed_client_entries": removed_client_entries,
+        "purged_auth": purged_auth,
+    }))
+}
+
+fn should_sync_detected_client_config(home: &Path, client: &str, cfg_path: &Path) -> bool {
+    if cfg_path.is_file() {
+        return true;
+    }
+    match client {
+        "claude" => home.join(".claude").is_dir(),
+        "agy" => home.join(".gemini").join("config").is_dir(),
+        "agy-cli" => home.join(".gemini").join("antigravity-cli").is_dir(),
+        "cursor-global" => home.join(".cursor").is_dir(),
+        "opencode" => home.join(".config").join("opencode").is_dir(),
+        "codex" => home.join(".codex").is_dir(),
+        _ => false,
+    }
+}
+
+async fn run_mcp_sync_lifecycle(
+    org_id: &str,
+    home: &Path,
+    workspace: &Path,
+    runtime_dir: &Path,
+    sync_clients: bool,
+    allow_local_http: bool,
+    dry_run: bool,
+) -> anyhow::Result<Value> {
+    let kernel = AegisRuntimeKernel::new(runtime_dir).await?;
+    let mut installed_ids: BTreeSet<String> = kernel
+        .mcp_firewall
+        .list_servers(Some(org_id))
+        .await
+        .into_iter()
+        .map(|s| s.server_id)
+        .collect();
+
+    let mut results = Vec::<Value>::new();
+    let mut installed_count = 0usize;
+    let mut up_to_date_count = 0usize;
+    let mut seen_manifest_ids = BTreeSet::<String>::new();
+
+    for rel in [".aegis/mcp.json", ".mcp.json"] {
+        let manifest_path = workspace.join(rel);
+        let Ok(raw) = std::fs::read_to_string(&manifest_path) else {
+            continue;
+        };
+        let Ok(doc) = serde_json::from_str::<Value>(&raw) else {
+            continue;
+        };
+        let Some(servers) = doc.get("mcpServers").and_then(|v| v.as_object()) else {
+            continue;
+        };
+        for (raw_id, entry) in servers {
+            let sid = aos_mcp_gateway::mcp_firewall::sanitize_server_id(raw_id);
+            if sid == "aegis-os" || !seen_manifest_ids.insert(sid.clone()) {
+                continue;
+            }
+            if installed_ids.contains(&sid) {
+                up_to_date_count += 1;
+                results.push(json!({
+                    "server_id": sid,
+                    "source": rel,
+                    "status": "up_to_date",
+                }));
+                continue;
+            }
+            if dry_run {
+                results.push(json!({
+                    "server_id": sid,
+                    "source": rel,
+                    "status": "would_install",
+                }));
+                continue;
+            }
+
+            let registry_name = entry
+                .get("registryName")
+                .and_then(|v| v.as_str())
+                .map(str::trim)
+                .filter(|s| !s.is_empty())
+                .map(str::to_string);
+            let declared_hosts: Vec<String> = entry
+                .get("allowedHosts")
+                .and_then(|v| v.as_array())
+                .map(|arr| {
+                    arr.iter()
+                        .filter_map(|x| x.as_str().map(str::trim).filter(|s| !s.is_empty()).map(str::to_string))
+                        .collect()
+                })
+                .unwrap_or_default();
+
+            if let Some(url) = entry.get("url").and_then(|v| v.as_str()).map(str::trim).filter(|s| !s.is_empty()) {
+                let effective_hosts = if declared_hosts.is_empty() {
+                    aos_mcp_gateway::mcp_registry::derive_exact_allowed_hosts(url)
+                } else {
+                    declared_hosts
+                };
+                kernel
+                    .mcp_oauth
+                    .upsert_realm_config(
+                        org_id,
+                        &sid,
+                        RealmUpsertSpec {
+                            allowed_hosts: effective_hosts,
+                            allow_local_http,
+                            ..Default::default()
+                        },
+                    )
+                    .await?;
+                kernel
+                    .mcp_firewall
+                    .register_http_server_with_options(
+                        org_id,
+                        &sid,
+                        url,
+                        BTreeMap::new(),
+                        McpServerPolicy::default(),
+                        Some(&sid),
+                        None,
+                        allow_local_http,
+                    )
+                    .await?;
+                let _ = kernel
+                    .mcp_firewall
+                    .update_server_config(org_id, &sid, |rec| {
+                        rec.registry_name = registry_name.clone();
+                        rec.source_target = Some(url.to_string());
+                    })
+                    .await;
+                installed_ids.insert(sid.clone());
+                installed_count += 1;
+                results.push(json!({
+                    "server_id": sid,
+                    "source": rel,
+                    "status": "installed",
+                    "transport": "http",
+                }));
+            } else if let Some(cmd) = entry.get("command").and_then(|v| v.as_str()).map(str::trim).filter(|s| !s.is_empty()) {
+                let cmd_args: Vec<String> = entry
+                    .get("args")
+                    .and_then(|v| v.as_array())
+                    .map(|arr| {
+                        arr.iter()
+                            .filter_map(|x| x.as_str().map(str::to_string))
+                            .collect()
+                    })
+                    .unwrap_or_default();
+                let clean_hosts =
+                    aos_mcp_gateway::mcp_firewall::normalize_and_validate_stdio_allowed_hosts(
+                        &declared_hosts,
+                    )?;
+                let stdio_policy = McpServerPolicy {
+                    isolate_upstream_network: true,
+                    allowed_hosts: clean_hosts,
+                    ..McpServerPolicy::default()
+                };
+                kernel
+                    .mcp_firewall
+                    .register_stdio_server(
+                        org_id,
+                        &sid,
+                        cmd,
+                        cmd_args,
+                        Some(workspace.display().to_string()),
+                        BTreeMap::new(),
+                        stdio_policy,
+                    )
+                    .await?;
+                let _ = kernel
+                    .mcp_firewall
+                    .update_server_config(org_id, &sid, |rec| {
+                        rec.registry_name = registry_name.clone();
+                    })
+                    .await;
+                installed_ids.insert(sid.clone());
+                installed_count += 1;
+                results.push(json!({
+                    "server_id": sid,
+                    "source": rel,
+                    "status": "installed",
+                    "transport": "stdio",
+                }));
+            } else if let Some(ref reg_name) = registry_name {
+                let resolved = kernel
+                    .mcp_registry
+                    .resolve_install_target(reg_name, Some(&sid), allow_local_http)
+                    .await?;
+                if let ResolvedInstallTarget::Candidate(cand) = resolved {
+                    if let Some(ref url) = cand.remote_url {
+                        kernel
+                            .mcp_oauth
+                            .upsert_realm_config(
+                                org_id,
+                                &cand.server_id,
+                                RealmUpsertSpec {
+                                    allowed_hosts: cand.allowed_hosts.clone(),
+                                    allow_local_http,
+                                    ..Default::default()
+                                },
+                            )
+                            .await?;
+                        kernel
+                            .mcp_firewall
+                            .register_http_server_with_options(
+                                org_id,
+                                &cand.server_id,
+                                url,
+                                BTreeMap::new(),
+                                McpServerPolicy::default(),
+                                Some(&cand.server_id),
+                                None,
+                                allow_local_http,
+                            )
+                            .await?;
+                    } else if let Some(ref pkg) = cand.package_spec {
+                        let stdio_policy = McpServerPolicy {
+                            isolate_upstream_network: true,
+                            allowed_hosts:
+                                aos_mcp_gateway::mcp_firewall::normalize_and_validate_stdio_allowed_hosts(
+                                    &cand.allowed_hosts,
+                                )?,
+                            ..McpServerPolicy::default()
+                        };
+                        kernel
+                            .mcp_firewall
+                            .register_stdio_server(
+                                org_id,
+                                &cand.server_id,
+                                &pkg.command,
+                                pkg.args.clone(),
+                                Some(workspace.display().to_string()),
+                                BTreeMap::new(),
+                                stdio_policy,
+                            )
+                            .await?;
+                    }
+                    installed_ids.insert(cand.server_id.clone());
+                    installed_count += 1;
+                    results.push(json!({
+                        "server_id": cand.server_id,
+                        "source": rel,
+                        "status": "installed",
+                        "transport": cand.transport_kind,
+                    }));
+                }
+            }
+        }
+    }
+
+    let mut synced_client_entries = 0usize;
+    if sync_clients && !dry_run {
+        let bin_str = std::env::current_exe()
+            .unwrap_or_else(|_| PathBuf::from("aegis-os"))
+            .display()
+            .to_string();
+        let rt_str = runtime_dir.display().to_string();
+        let org_servers = kernel.mcp_firewall.list_servers(Some(org_id)).await;
+        for (client, cfg_path, _) in
+            aos_mcp_gateway::mcp_firewall::client_config_candidates(home, workspace)
+        {
+            if !should_sync_detected_client_config(home, client, &cfg_path) {
+                continue;
+            }
+            for srv in &org_servers {
+                let proxy_args = vec![
+                    "--org".to_string(),
+                    org_id.to_string(),
+                    "--agent".to_string(),
+                    "auto".to_string(),
+                    "--runtime-dir".to_string(),
+                    rt_str.clone(),
+                    "mcp".to_string(),
+                    "proxy".to_string(),
+                    srv.server_id.clone(),
+                ];
+                if aos_mcp_gateway::mcp_firewall::upsert_client_proxy_entry(
+                    client,
+                    &cfg_path,
+                    &srv.server_id,
+                    &bin_str,
+                    &proxy_args,
+                    None,
+                )
+                .unwrap_or(false)
+                {
+                    synced_client_entries += 1;
+                }
+            }
+        }
+    }
+
+    Ok(json!({
+        "status": "synced",
+        "org_id": org_id,
+        "dry_run": dry_run,
+        "installed_count": installed_count,
+        "up_to_date_count": up_to_date_count,
+        "synced_client_entries": synced_client_entries,
+        "items": results,
+    }))
+}
+
+async fn run_mcp_upgrade_lifecycle(
+    org_id: &str,
+    server_id_filter: Option<&str>,
+    workspace: &Path,
+    runtime_dir: &Path,
+    allow_local_http: bool,
+    dry_run: bool,
+) -> anyhow::Result<Value> {
+    let kernel = AegisRuntimeKernel::new(runtime_dir).await?;
+    kernel.mcp_registry.clear_cache().await;
+
+    let servers = kernel.mcp_firewall.list_servers(Some(org_id)).await;
+    let mut outcomes = Vec::<Value>::new();
+    let mut upgraded_bundles = BTreeSet::<String>::new();
+
+    for srv in servers {
+        if let Some(target_id) = server_id_filter {
+            if srv.server_id != target_id {
+                continue;
+            }
+        }
+
+        if let Some(ref bid) = srv.bundle_id {
+            if !upgraded_bundles.insert(bid.clone()) {
+                continue;
+            }
+            if let Some(existing_bundle) = kernel.mcp_bundles.get_bundle(org_id, bid).await {
+                let eff_local = allow_local_http || srv.allow_local_http;
+                let latest = kernel
+                    .mcp_bundles
+                    .install_bundle(
+                        org_id,
+                        &existing_bundle.source,
+                        BundleInstallOptions {
+                            profile: existing_bundle.profile.clone(),
+                            sync_clients: false,
+                            sync_skills: !dry_run,
+                            workspace_dir: Some(workspace.to_path_buf()),
+                            home_dir: None,
+                            proxy_bin_path: None,
+                            allow_local_http: eff_local,
+                            dry_run,
+                        },
+                    )
+                    .await?;
+                let changed = latest.version != existing_bundle.version
+                    || serde_json::to_vec(&latest.manifest).ok()
+                        != serde_json::to_vec(&existing_bundle.manifest).ok();
+                let st = if !changed {
+                    "up_to_date"
+                } else if dry_run {
+                    "upgrade_available"
+                } else {
+                    "upgraded"
+                };
+                outcomes.push(json!({
+                    "server_id": srv.server_id,
+                    "bundle_id": bid,
+                    "status": st,
+                    "from_version": existing_bundle.version,
+                    "to_version": latest.version,
+                }));
+                continue;
+            }
+        }
+
+        let lookup_target = srv
+            .registry_name
+            .as_deref()
+            .filter(|n| n.contains('/') || n.starts_with("npm:") || n.starts_with("pypi:") || n.starts_with("oci:") || n.starts_with("mcpb:"))
+            .or(srv.source_target.as_deref());
+        let Some(lookup) = lookup_target else {
+            outcomes.push(json!({
+                "server_id": srv.server_id,
+                "status": "skipped",
+                "reason": "no_upstream_source",
+            }));
+            continue;
+        };
+
+        let eff_local = allow_local_http || srv.allow_local_http;
+        let ResolvedInstallTarget::Candidate(cand) = kernel
+            .mcp_registry
+            .resolve_install_target(lookup, Some(&srv.server_id), eff_local)
+            .await?
+        else {
+            outcomes.push(json!({
+                "server_id": srv.server_id,
+                "status": "skipped",
+                "reason": "resolved_non_candidate",
+            }));
+            continue;
+        };
+
+        let next_ver = cand
+            .version
+            .clone()
+            .or_else(|| cand.package_spec.as_ref().and_then(|p| p.version.clone()));
+        let same_manifest = srv.manifest_sha256.as_deref() == Some(cand.manifest_sha256.as_str())
+            && srv.installed_version == next_ver;
+        if same_manifest {
+            outcomes.push(json!({
+                "server_id": srv.server_id,
+                "status": "up_to_date",
+                "version": srv.installed_version,
+                "manifest_sha256": srv.manifest_sha256,
+            }));
+            continue;
+        }
+        if dry_run {
+            outcomes.push(json!({
+                "server_id": srv.server_id,
+                "status": "upgrade_available",
+                "from_version": srv.installed_version,
+                "to_version": next_ver,
+                "from_manifest_sha256": srv.manifest_sha256,
+                "to_manifest_sha256": cand.manifest_sha256,
+            }));
+            continue;
+        }
+
+        if let Some(ref url) = cand.remote_url {
+            kernel
+                .mcp_firewall
+                .upgrade_server_transport(
+                    org_id,
+                    &srv.server_id,
+                    Some(url),
+                    None,
+                    Some(&cand.allowed_hosts),
+                    next_ver.clone(),
+                    Some(cand.manifest_sha256.clone()),
+                    Some(cand.name.clone()),
+                )
+                .await?;
+        } else if let Some(ref pkg) = cand.package_spec {
+            if pkg.registry_type == "mcpb" {
+                let installed = aos_mcp_gateway::mcp_mcpb::install_mcpb_archive(
+                    &pkg.identifier,
+                    pkg.file_sha256.as_deref(),
+                    &srv.server_id,
+                    kernel.mcp_registry.runtime_data_root(),
+                    eff_local,
+                )
+                .await?;
+                kernel
+                    .mcp_firewall
+                    .upgrade_server_transport(
+                        org_id,
+                        &srv.server_id,
+                        None,
+                        Some((
+                            &installed.command,
+                            installed.args,
+                            Some(installed.cwd.display().to_string()),
+                            installed.env,
+                        )),
+                        Some(&cand.allowed_hosts),
+                        next_ver.clone(),
+                        Some(cand.manifest_sha256.clone()),
+                        Some(cand.name.clone()),
+                    )
+                    .await?;
+            } else {
+                kernel
+                    .mcp_firewall
+                    .upgrade_server_transport(
+                        org_id,
+                        &srv.server_id,
+                        None,
+                        Some((
+                            &pkg.command,
+                            pkg.args.clone(),
+                            None,
+                            BTreeMap::new(),
+                        )),
+                        Some(&cand.allowed_hosts),
+                        next_ver.clone(),
+                        Some(cand.manifest_sha256.clone()),
+                        Some(cand.name.clone()),
+                    )
+                    .await?;
+            }
+        }
+        outcomes.push(json!({
+            "server_id": srv.server_id,
+            "status": "upgraded",
+            "from_version": srv.installed_version,
+            "to_version": next_ver,
+            "manifest_sha256": cand.manifest_sha256,
+        }));
+    }
+
+    Ok(json!({
+        "status": "ok",
+        "org_id": org_id,
+        "dry_run": dry_run,
+        "checked": outcomes.len(),
+        "servers": outcomes,
+    }))
+}
+
+fn command_exists_in_path(cmd: &str) -> bool {
+    let p = Path::new(cmd);
+    if p.is_absolute() || cmd.contains('/') {
+        return p.is_file();
+    }
+    let Some(path_env) = std::env::var_os("PATH") else {
+        return false;
+    };
+    std::env::split_paths(&path_env).any(|dir| dir.join(cmd).is_file())
+}
+
+async fn probe_org_mcp_servers(
+    kernel: &AegisRuntimeKernel,
+    identity: &AgentIdentity,
+    timeout: std::time::Duration,
+) -> (Vec<Value>, Vec<Value>) {
+    let servers = kernel
+        .mcp_firewall
+        .list_servers(Some(&identity.org_id))
+        .await;
+    let pool = McpProxySessionPool::new(kernel.mcp_firewall.clone());
+    let ptable = PseudonymSessionTable::new();
+    let mut probes = Vec::<Value>::new();
+    let mut findings = Vec::<Value>::new();
+
+    for srv in servers {
+        if let aos_mcp_gateway::mcp_firewall::UpstreamTransportSpec::Stdio { ref command, .. } =
+            srv.transport
+        {
+            if !command_exists_in_path(command) {
+                let err_msg = format!("stdio binary '{}' not found", command);
+                probes.push(json!({
+                    "server_id": srv.server_id,
+                    "reachable": false,
+                    "tool_count": 0,
+                    "latency_ms": 0,
+                    "error": err_msg,
+                }));
+                findings.push(json!({
+                    "severity": "error",
+                    "code": "stdio_binary_missing",
+                    "message": format!("Server '{}' binary '{}' is missing or unreachable", srv.server_id, command),
+                    "fix": format!("Install '{}' or update server via `aegis-os mcp upgrade {}`", command, srv.server_id),
+                }));
+                continue;
+            }
+        }
+
+        let start = std::time::Instant::now();
+        let sid = format!("probe-{}", uuid::Uuid::new_v4().simple());
+        let init_req = json!({
+            "jsonrpc": "2.0",
+            "id": 1,
+            "method": "initialize",
+            "params": {
+                "protocolVersion": "2024-11-05",
+                "capabilities": {},
+                "clientInfo": { "name": "aegis-doctor", "version": env!("CARGO_PKG_VERSION") }
+            }
+        });
+        let probe_res: anyhow::Result<usize> = tokio::time::timeout(timeout, async {
+            let init_resp = pool
+                .handle_jsonrpc(identity, &sid, &srv.server_id, &init_req, &ptable, false)
+                .await?
+                .context("empty initialize response")?;
+            if init_resp.get("error").is_some()
+                || init_resp.pointer("/result/isError").and_then(|v| v.as_bool()) == Some(true)
+            {
+                let msg = init_resp
+                    .pointer("/error/message")
+                    .or_else(|| init_resp.pointer("/result/content/0/text"))
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("initialize failed");
+                bail!("{msg}");
+            }
+            let _ = pool
+                .handle_jsonrpc(
+                    identity,
+                    &sid,
+                    &srv.server_id,
+                    &json!({ "jsonrpc": "2.0", "method": "notifications/initialized" }),
+                    &ptable,
+                    false,
+                )
+                .await;
+            let list_resp = pool
+                .handle_jsonrpc(
+                    identity,
+                    &sid,
+                    &srv.server_id,
+                    &json!({ "jsonrpc": "2.0", "id": 2, "method": "tools/list", "params": {} }),
+                    &ptable,
+                    false,
+                )
+                .await?
+                .context("empty tools/list response")?;
+            if let Some(msg) = list_resp.pointer("/error/message").and_then(|v| v.as_str()) {
+                bail!("{msg}");
+            }
+            let cnt = list_resp
+                .pointer("/result/tools")
+                .and_then(|v| v.as_array())
+                .map(|a| a.len())
+                .unwrap_or(0);
+            Ok(cnt)
+        })
+        .await
+        .map_err(|_| anyhow::anyhow!("probe timed out after {}ms", timeout.as_millis()))
+        .and_then(|inner| inner);
+
+        let latency_ms = start.elapsed().as_millis() as u64;
+        match probe_res {
+            Ok(tool_count) => {
+                probes.push(json!({
+                    "server_id": srv.server_id,
+                    "reachable": true,
+                    "tool_count": tool_count,
+                    "latency_ms": latency_ms,
+                }));
+            }
+            Err(e) => {
+                let err_str = e.to_string();
+                probes.push(json!({
+                    "server_id": srv.server_id,
+                    "reachable": false,
+                    "tool_count": 0,
+                    "latency_ms": latency_ms,
+                    "error": err_str,
+                }));
+                findings.push(json!({
+                    "severity": "warn",
+                    "code": "probe_failed",
+                    "message": format!("Live probe failed for '{}': {}", srv.server_id, err_str),
+                    "fix": format!("Check connectivity/credentials for '{}'", srv.server_id),
+                }));
+            }
+        }
+    }
+
+    (probes, findings)
 }
 
 async fn collect_mcp_status_and_drift(
@@ -2086,8 +3188,40 @@ async fn run_mcp_stdio_proxy(
     let ptable = PseudonymSessionTable::new();
     let session_id = format!("mcp-proxy-{}", &uuid::Uuid::new_v4().simple().to_string()[..8]);
     let dry_run = std::env::var("AOS_MCP_DRY_RUN").as_deref() == Ok("1");
+    let mut idle_rx: Option<tokio::sync::broadcast::Receiver<Value>> = None;
 
-    while let Some(line) = lines.next_line().await? {
+    loop {
+        let next_line_opt = match idle_rx.as_mut() {
+            Some(rx_idle) => {
+                tokio::select! {
+                    res = lines.next_line() => res?,
+                    recv = rx_idle.recv() => {
+                        match recv {
+                            Ok(raw_note) => {
+                                if let Some(clean_note) = pool
+                                    .sanitize_idle_notification(identity, &session_id, server_id, raw_note, &ptable)
+                                    .await
+                                {
+                                    stdout
+                                        .write_all(format!("{}\n", serde_json::to_string(&clean_note)?).as_bytes())
+                                        .await?;
+                                    stdout.flush().await?;
+                                }
+                            }
+                            Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => {}
+                            Err(tokio::sync::broadcast::error::RecvError::Closed) => {
+                                idle_rx = None;
+                            }
+                        }
+                        continue;
+                    }
+                }
+            }
+            None => lines.next_line().await?,
+        };
+        let Some(line) = next_line_opt else {
+            break;
+        };
         let trimmed = line.trim();
         if trimmed.is_empty() {
             continue;
@@ -2123,6 +3257,11 @@ async fn run_mcp_stdio_proxy(
             stdout
                 .write_all(format!("{}\n", serde_json::to_string(&n)?).as_bytes())
                 .await?;
+        }
+        if idle_rx.is_none() {
+            idle_rx = pool
+                .subscribe_stdio_idle_notifications(&identity.org_id, server_id)
+                .await;
         }
 
         let resp = match rpc_res {
@@ -3069,5 +4208,395 @@ for line in sys.stdin:
         assert_eq!(report["summary"]["total"], 1);
         assert_eq!(report["summary"]["ready"], 1);
         assert!(!diag["stdio_sandbox_backend"].as_str().unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn cli_mcp_lifecycle_sync_upgrade_doctor_probe_registry_and_remove_e2e() {
+        use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+        use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader};
+        use tokio::net::TcpListener;
+
+        let tmp = tempfile::tempdir().unwrap();
+        let ws_dir = tmp.path().join("ws");
+        let rt_dir = tmp.path().join("rt");
+        let home_dir = tmp.path().join("home");
+        std::fs::create_dir_all(ws_dir.join(".aegis")).unwrap();
+        std::fs::create_dir_all(&rt_dir).unwrap();
+        std::fs::create_dir_all(&home_dir).unwrap();
+        std::fs::write(home_dir.join(".claude.json"), "{ \"mcpServers\": {} }\n").unwrap();
+
+        // 1. Live mock HTTP MCP server (v1 at /mcp, v2 at /mcp-v2) verifying Bearer token & recording v2 hit.
+        let hit_v2 = Arc::new(AtomicBool::new(false));
+        let mcp_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let mcp_addr = mcp_listener.local_addr().unwrap();
+        let hit_v2_srv = hit_v2.clone();
+        tokio::spawn(async move {
+            loop {
+                let Ok((mut stream, _)) = mcp_listener.accept().await else {
+                    break;
+                };
+                let hit_v2_conn = hit_v2_srv.clone();
+                tokio::spawn(async move {
+                    let mut reader = BufReader::new(&mut stream);
+                    let mut req_line = String::new();
+                    if reader.read_line(&mut req_line).await.unwrap_or(0) == 0 {
+                        return;
+                    }
+                    let path = req_line.split_whitespace().nth(1).unwrap_or("/");
+                    if path.starts_with("/mcp-v2") {
+                        hit_v2_conn.store(true, Ordering::SeqCst);
+                    }
+                    let mut cl = 0usize;
+                    let mut auth_hdr = String::new();
+                    loop {
+                        let mut h = String::new();
+                        if reader.read_line(&mut h).await.unwrap_or(0) == 0 || h.trim().is_empty() {
+                            break;
+                        }
+                        if let Some((k, v)) = h.split_once(':') {
+                            let kl = k.trim().to_ascii_lowercase();
+                            if kl == "content-length" {
+                                cl = v.trim().parse().unwrap_or(0);
+                            } else if kl == "authorization" {
+                                auth_hdr = v.trim().to_string();
+                            }
+                        }
+                    }
+                    let mut body = vec![0u8; cl];
+                    if cl > 0 {
+                        let _ = reader.read_exact(&mut body).await;
+                    }
+                    let rpc: Value = serde_json::from_slice(&body).unwrap_or(Value::Null);
+                    let method = rpc.get("method").and_then(|v| v.as_str()).unwrap_or("");
+                    let rid = rpc.get("id").cloned().unwrap_or(Value::Null);
+                    if auth_hdr != "Bearer tok_upgrade_keep_123" {
+                        let _ = stream
+                            .write_all(b"HTTP/1.1 401 Unauthorized\r\nContent-Length: 0\r\nConnection: close\r\n\r\n")
+                            .await;
+                        return;
+                    }
+                    let resp_body = if method == "initialize" {
+                        json!({
+                            "jsonrpc": "2.0",
+                            "id": rid,
+                            "result": { "protocolVersion": "2024-11-05", "capabilities": { "tools": {} } }
+                        })
+                        .to_string()
+                    } else if method == "notifications/initialized" {
+                        let _ = stream
+                            .write_all(b"HTTP/1.1 202 Accepted\r\nContent-Length: 0\r\nConnection: close\r\n\r\n")
+                            .await;
+                        return;
+                    } else if method == "tools/list" {
+                        json!({
+                            "jsonrpc": "2.0",
+                            "id": rid,
+                            "result": {
+                                "tools": [
+                                    { "name": "read_doc", "annotations": { "readOnlyHint": true } },
+                                    { "name": "dangerous_op", "annotations": { "readOnlyHint": true } }
+                                ]
+                            }
+                        })
+                        .to_string()
+                    } else {
+                        "{}".to_string()
+                    };
+                    let resp = format!(
+                        "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{resp_body}",
+                        resp_body.len()
+                    );
+                    let _ = stream.write_all(resp.as_bytes()).await;
+                });
+            }
+        });
+
+        // 2. Mock private Enterprise Registry supporting dynamic bump from v1.0.0 -> v2.0.0.
+        let bump_flag = Arc::new(AtomicUsize::new(1));
+        let reg_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let reg_addr = reg_listener.local_addr().unwrap();
+        let bump_srv = bump_flag.clone();
+        tokio::spawn(async move {
+            loop {
+                let Ok((mut stream, _)) = reg_listener.accept().await else {
+                    break;
+                };
+                let bump_conn = bump_srv.clone();
+                tokio::spawn(async move {
+                    let mut buf = [0u8; 4096];
+                    let _ = stream.read(&mut buf).await;
+                    let ver = if bump_conn.load(Ordering::SeqCst) == 1 {
+                        "1.0.0"
+                    } else {
+                        "2.0.0"
+                    };
+                    let endpoint = if bump_conn.load(Ordering::SeqCst) == 1 {
+                        format!("http://{mcp_addr}/mcp")
+                    } else {
+                        format!("http://{mcp_addr}/mcp-v2")
+                    };
+                    let body = json!({
+                        "server": {
+                            "name": "app.demo/mcp",
+                            "title": "Demo Enterprise MCP",
+                            "version": ver,
+                            "remotes": [{
+                                "type": "streamable-http",
+                                "url": endpoint
+                            }]
+                        }
+                    })
+                    .to_string();
+                    let resp = format!(
+                        "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                        body.len()
+                    );
+                    let _ = stream.write_all(resp.as_bytes()).await;
+                });
+            }
+        });
+
+        // 3. Configure Private Registry + Air-Gapped mode.
+        run_mcp_registry_action(
+            &rt_dir,
+            McpRegistryAction::Add {
+                url: format!("http://{reg_addr}"),
+                allow_local_http: true,
+                json: true,
+            },
+        )
+        .await
+        .unwrap();
+        let reg_state = run_mcp_registry_action(
+            &rt_dir,
+            McpRegistryAction::Airgapped {
+                enabled: true,
+                json: true,
+            },
+        )
+        .await
+        .unwrap();
+        assert_eq!(reg_state["effective_disable_public_registry"], true);
+
+        // 4. Write zero-secret `.aegis/mcp.json` with a live mock Python stdio MCP server and test `sync`.
+        let py_script = tmp.path().join("sync_stdio.py");
+        std::fs::write(
+            &py_script,
+            r#"import json, sys
+for line in sys.stdin:
+    line = line.strip()
+    if not line: continue
+    msg = json.loads(line)
+    m, rid = msg.get("method"), msg.get("id")
+    if m == "initialize":
+        sys.stdout.write(json.dumps({"jsonrpc":"2.0","id":rid,"result":{"protocolVersion":"2024-11-05","capabilities":{"tools":{}}}}) + "\n")
+        sys.stdout.flush()
+    elif m == "tools/list":
+        sys.stdout.write(json.dumps({"jsonrpc":"2.0","id":rid,"result":{"tools":[{"name":"local_ping","annotations":{"readOnlyHint":True}}]}}) + "\n")
+        sys.stdout.flush()
+"#,
+        )
+        .unwrap();
+        std::fs::write(
+            ws_dir.join(".aegis/mcp.json"),
+            json!({
+                "mcpServers": {
+                    "local-py": {
+                        "type": "stdio",
+                        "command": "python3",
+                        "args": [py_script.display().to_string()]
+                    }
+                }
+            })
+            .to_string(),
+        )
+        .unwrap();
+
+        let sync_dry = run_mcp_sync_lifecycle(
+            "ent-org",
+            &home_dir,
+            &ws_dir,
+            &rt_dir,
+            true,
+            true,
+            true,
+        )
+        .await
+        .unwrap();
+        assert_eq!(sync_dry["items"][0]["status"], "would_install");
+
+        let sync_live = run_mcp_sync_lifecycle(
+            "ent-org",
+            &home_dir,
+            &ws_dir,
+            &rt_dir,
+            true,
+            true,
+            false,
+        )
+        .await
+        .unwrap();
+        assert_eq!(sync_live["installed_count"], 1);
+        assert!(sync_live["synced_client_entries"].as_u64().unwrap() >= 1);
+        let claude_cfg = std::fs::read_to_string(home_dir.join(".claude.json")).unwrap();
+        assert!(claude_cfg.contains("local-py"));
+
+        // 5. Install `app.demo/mcp` (v1.0.0) with a Vault-sealed static token & customize tool_overrides.
+        let identity = AgentIdentity::new("ent-org", "coder-1", "Engineer");
+        let installed = run_unified_mcp_install(
+            &identity,
+            &ws_dir,
+            &rt_dir,
+            UnifiedMcpInstallArgs {
+                target: "app.demo/mcp".to_string(),
+                server_id: Some("demo".to_string()),
+                scope: "org".to_string(),
+                trust: "untrusted".to_string(),
+                dlp: "pseudonymize".to_string(),
+                token: Some("tok_upgrade_keep_123".to_string()),
+                token_stdin: false,
+                device_code: false,
+                no_login: false,
+                no_browser: true,
+                no_client_sync: false,
+                allow_local_http: true,
+                home_dir: Some(home_dir.clone()),
+                dry_run: false,
+            },
+        )
+        .await
+        .unwrap();
+        assert_eq!(installed["server_id"], "demo");
+        assert_eq!(installed["auth_status"], "authenticated");
+
+        let kernel = AegisRuntimeKernel::new(&rt_dir).await.unwrap();
+        kernel
+            .mcp_firewall
+            .update_server_policy("ent-org", "demo", |pol| {
+                pol.tool_overrides
+                    .insert("dangerous_op".to_string(), McpToolRiskClass::Forbidden);
+            })
+            .await
+            .unwrap();
+        // Also disable stdio home isolation for local-py inside test harness so nested bwrap doesn't interfere.
+        kernel
+            .mcp_firewall
+            .update_server_policy("ent-org", "local-py", |pol| {
+                pol.isolate_upstream_home = false;
+                pol.isolate_upstream_network = false;
+            })
+            .await
+            .unwrap();
+
+        // Sync `--clients` pushes `demo` into `.claude.json` as well.
+        run_mcp_sync_lifecycle("ent-org", &home_dir, &ws_dir, &rt_dir, true, true, false)
+            .await
+            .unwrap();
+        assert!(std::fs::read_to_string(home_dir.join(".claude.json"))
+            .unwrap()
+            .contains("\"demo\""));
+
+        // 6. Doctor `--probe` connects to both `local-py` and `demo` and counts tools.
+        let (probes, probe_findings) = probe_org_mcp_servers(
+            &kernel,
+            &identity,
+            std::time::Duration::from_millis(5000),
+        )
+        .await;
+        assert!(probe_findings.is_empty(), "unexpected probe findings: {probe_findings:?}");
+        assert_eq!(probes.len(), 2);
+        let demo_probe = probes.iter().find(|p| p["server_id"] == "demo").unwrap();
+        assert_eq!(demo_probe["reachable"], true);
+        assert_eq!(demo_probe["tool_count"], 2);
+        let py_probe = probes.iter().find(|p| p["server_id"] == "local-py").unwrap();
+        assert_eq!(py_probe["reachable"], true);
+        assert_eq!(py_probe["tool_count"], 1);
+
+        // 7. Bump mock registry to v2.0.0 -> dry-run & live upgrade preserving Vault token & policy overrides.
+        bump_flag.store(2, Ordering::SeqCst);
+        let upg_dry = run_mcp_upgrade_lifecycle(
+            "ent-org",
+            Some("demo"),
+            &ws_dir,
+            &rt_dir,
+            true,
+            true,
+        )
+        .await
+        .unwrap();
+        assert_eq!(upg_dry["servers"][0]["status"], "upgrade_available");
+        assert_eq!(upg_dry["servers"][0]["from_version"], "1.0.0");
+        assert_eq!(upg_dry["servers"][0]["to_version"], "2.0.0");
+
+        let upg_live = run_mcp_upgrade_lifecycle(
+            "ent-org",
+            Some("demo"),
+            &ws_dir,
+            &rt_dir,
+            true,
+            false,
+        )
+        .await
+        .unwrap();
+        assert_eq!(upg_live["servers"][0]["status"], "upgraded");
+        let upgraded_rec = kernel.mcp_firewall.get_server("ent-org", "demo").await.unwrap();
+        assert_eq!(upgraded_rec.installed_version.as_deref(), Some("2.0.0"));
+        assert_eq!(
+            upgraded_rec.policy.tool_overrides.get("dangerous_op"),
+            Some(&McpToolRiskClass::Forbidden)
+        );
+        assert!(kernel
+            .mcp_oauth
+            .get_realm("ent-org", "demo")
+            .await
+            .unwrap()
+            .sealed_access_token
+            .is_some());
+
+        // Probing again hits `/mcp-v2` using the preserved Vault Bearer token!
+        let kernel_reloaded = AegisRuntimeKernel::new(&rt_dir).await.unwrap();
+        let (probes_v2, _) = probe_org_mcp_servers(
+            &kernel_reloaded,
+            &identity,
+            std::time::Duration::from_millis(5000),
+        )
+        .await;
+        assert!(hit_v2.load(Ordering::SeqCst), "upgraded server must hit /mcp-v2");
+        assert_eq!(
+            probes_v2
+                .iter()
+                .find(|p| p["server_id"] == "demo")
+                .unwrap()["reachable"],
+            true
+        );
+
+        // 8. `mcp remove --purge-auth` removes `demo`, cleans `.claude.json`, and purges `demo` realm.
+        let rem = run_mcp_remove_lifecycle(
+            "ent-org",
+            "demo",
+            &home_dir,
+            &ws_dir,
+            &rt_dir,
+            true,
+            false,
+        )
+        .await
+        .unwrap();
+        assert_eq!(rem["status"], "removed");
+        assert_eq!(rem["purged_auth"], true);
+        assert!(rem["removed_client_entries"].as_u64().unwrap() >= 1);
+        assert!(kernel_reloaded
+            .mcp_firewall
+            .get_server("ent-org", "demo")
+            .await
+            .is_none());
+        assert!(kernel_reloaded
+            .mcp_oauth
+            .get_realm("ent-org", "demo")
+            .await
+            .is_none());
+        assert!(!std::fs::read_to_string(home_dir.join(".claude.json"))
+            .unwrap()
+            .contains("\"demo\""));
     }
 }

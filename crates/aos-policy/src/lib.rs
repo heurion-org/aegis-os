@@ -33,6 +33,7 @@ pub enum CedarOperand {
     ResourceOwnerAgentId,
     ResourceId,
     ResourcePath,
+    ContextAttr(String),
     Literal(String),
 }
 
@@ -395,6 +396,11 @@ impl<'a> CedarParser<'a> {
         match self.next()?.clone() {
             CedarToken::Str(s) => Ok(CedarOperand::Literal(s)),
             CedarToken::Ident(root) => {
+                if (root == "true" || root == "false")
+                    && !matches!(self.peek(), Some(CedarToken::Dot))
+                {
+                    return Ok(CedarOperand::Literal(root));
+                }
                 self.expect(&CedarToken::Dot)?;
                 let field = self.expect_ident_value()?;
                 match (root.as_str(), field.as_str()) {
@@ -405,6 +411,7 @@ impl<'a> CedarParser<'a> {
                     ("resource", "owner_agent_id") => Ok(CedarOperand::ResourceOwnerAgentId),
                     ("resource", "id") => Ok(CedarOperand::ResourceId),
                     ("resource", "path") => Ok(CedarOperand::ResourcePath),
+                    ("context", _) => Ok(CedarOperand::ContextAttr(field)),
                     _ => anyhow::bail!("Unsupported Cedar attribute '{}.{}'", root, field),
                 }
             }
@@ -575,19 +582,29 @@ fn expr_contains_org_cmp(expr: &CedarExpr, same: bool) -> bool {
     }
 }
 
-fn resolve_cedar_operand<'a>(op: &'a CedarOperand, ctx: &'a PolicyContext) -> &'a str {
+fn resolve_cedar_operand<'a>(op: &'a CedarOperand, ctx: &'a PolicyContext) -> std::borrow::Cow<'a, str> {
+    use std::borrow::Cow;
     match op {
-        CedarOperand::PrincipalOrgId => ctx.principal.org_id.as_str(),
-        CedarOperand::PrincipalAgentId => ctx.principal.agent_id.as_str(),
-        CedarOperand::PrincipalRole => ctx.principal.role.as_str(),
-        CedarOperand::ResourceOrgId => ctx.target_org_id.as_str(),
-        CedarOperand::ResourceOwnerAgentId => ctx
-            .metadata
-            .get("owner_agent_id")
-            .and_then(|v| v.as_str())
-            .unwrap_or(ctx.principal.agent_id.as_str()),
-        CedarOperand::ResourceId | CedarOperand::ResourcePath => ctx.target_resource.as_str(),
-        CedarOperand::Literal(s) => s.as_str(),
+        CedarOperand::PrincipalOrgId => Cow::Borrowed(ctx.principal.org_id.as_str()),
+        CedarOperand::PrincipalAgentId => Cow::Borrowed(ctx.principal.agent_id.as_str()),
+        CedarOperand::PrincipalRole => Cow::Borrowed(ctx.principal.role.as_str()),
+        CedarOperand::ResourceOrgId => Cow::Borrowed(ctx.target_org_id.as_str()),
+        CedarOperand::ResourceOwnerAgentId => Cow::Borrowed(
+            ctx.metadata
+                .get("owner_agent_id")
+                .and_then(|v| v.as_str())
+                .unwrap_or(ctx.principal.agent_id.as_str()),
+        ),
+        CedarOperand::ResourceId | CedarOperand::ResourcePath => {
+            Cow::Borrowed(ctx.target_resource.as_str())
+        }
+        CedarOperand::ContextAttr(key) => match ctx.metadata.get(key) {
+            Some(serde_json::Value::String(s)) => Cow::Borrowed(s.as_str()),
+            Some(serde_json::Value::Bool(b)) => Cow::Borrowed(if *b { "true" } else { "false" }),
+            Some(serde_json::Value::Number(n)) => Cow::Owned(n.to_string()),
+            _ => Cow::Borrowed(""),
+        },
+        CedarOperand::Literal(s) => Cow::Borrowed(s.as_str()),
     }
 }
 
@@ -596,10 +613,14 @@ fn eval_cedar_expr(expr: &CedarExpr, ctx: &PolicyContext) -> bool {
         CedarExpr::And(a, b) => eval_cedar_expr(a, ctx) && eval_cedar_expr(b, ctx),
         CedarExpr::Or(a, b) => eval_cedar_expr(a, ctx) || eval_cedar_expr(b, ctx),
         CedarExpr::Not(inner) => !eval_cedar_expr(inner, ctx),
-        CedarExpr::Eq(lhs, rhs) => resolve_cedar_operand(lhs, ctx) == resolve_cedar_operand(rhs, ctx),
-        CedarExpr::Ne(lhs, rhs) => resolve_cedar_operand(lhs, ctx) != resolve_cedar_operand(rhs, ctx),
+        CedarExpr::Eq(lhs, rhs) => {
+            resolve_cedar_operand(lhs, ctx).as_ref() == resolve_cedar_operand(rhs, ctx).as_ref()
+        }
+        CedarExpr::Ne(lhs, rhs) => {
+            resolve_cedar_operand(lhs, ctx).as_ref() != resolve_cedar_operand(rhs, ctx).as_ref()
+        }
         CedarExpr::Like(lhs, pat) => {
-            AegisPolicyKernel::matches_pattern(pat, resolve_cedar_operand(lhs, ctx))
+            AegisPolicyKernel::matches_pattern(pat, resolve_cedar_operand(lhs, ctx).as_ref())
         }
     }
 }
@@ -5039,6 +5060,69 @@ mod stage2_security_tests {
         ));
         assert!(matches!(
             kernel.evaluate(&req_ctx).await.unwrap(),
+            PolicyDecision::Ask { .. }
+        ));
+    }
+
+    #[tokio::test]
+    async fn cedar_tier_admission_forbids_tier3_stdio_and_unverified_mcp_installs() {
+        let cedar_src = r#"
+forbid(principal is Agent, action == Action::"mcp_request_install", resource) when {
+    context.trust_tier == "tier3_local_sandboxed_stdio"
+};
+forbid(principal is Agent, action == Action::"mcp_request_install", resource) when {
+    context.domain_verified == false && context.registry_type == "npm"
+};
+"#;
+        let mut kernel = AegisPolicyKernel::new();
+        kernel.try_add_cedar_policies(cedar_src).unwrap();
+        let agent = AgentIdentity::new("acme", "coder-1", "Engineer");
+
+        // 1. Tier 3 local stdio install is denied by Cedar Tier admission rule.
+        let tier3_ctx = PolicyContext {
+            principal: agent.clone(),
+            action: "mcp_request_install".to_string(),
+            target_org_id: "acme".to_string(),
+            target_resource: "filesystem".to_string(),
+            metadata: serde_json::json!({
+                "trust_tier": "tier3_local_sandboxed_stdio",
+                "domain_verified": false,
+                "registry_type": "npm",
+                "evidence_hash": "c".repeat(64),
+            }),
+        };
+        assert!(matches!(
+            kernel.evaluate(&tier3_ctx).await.unwrap(),
+            PolicyDecision::Deny { .. }
+        ));
+
+        // 2. Unverified domain + npm package is denied even if tier label differed.
+        let unverified_npm_ctx = PolicyContext {
+            metadata: serde_json::json!({
+                "trust_tier": "tier2_remote_static_auth",
+                "domain_verified": false,
+                "registry_type": "npm",
+                "evidence_hash": "d".repeat(64),
+            }),
+            ..tier3_ctx.clone()
+        };
+        assert!(matches!(
+            kernel.evaluate(&unverified_npm_ctx).await.unwrap(),
+            PolicyDecision::Deny { .. }
+        ));
+
+        // 3. Verified Tier 1 remote OAuth install still escalates (`Ask`) for human SHA-256 confirmation.
+        let tier1_ctx = PolicyContext {
+            metadata: serde_json::json!({
+                "trust_tier": "tier1_verified_remote_oauth",
+                "domain_verified": true,
+                "registry_type": "remote",
+                "evidence_hash": "e".repeat(64),
+            }),
+            ..tier3_ctx
+        };
+        assert!(matches!(
+            kernel.evaluate(&tier1_ctx).await.unwrap(),
             PolicyDecision::Ask { .. }
         ));
     }

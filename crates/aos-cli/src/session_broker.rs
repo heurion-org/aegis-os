@@ -801,7 +801,8 @@ where
 }
 
 /// In-sandbox MCP stdio bridge: one JSON-RPC object per line, forwarded to the host broker.
-/// This lets existing MCP clients keep using `aegis-os mcp-bridge` without host runtime access.
+/// This lets existing MCP clients keep using `aegis-os mcp-bridge` without host runtime access,
+/// and streams host kernel push notifications (e.g. `notifications/tools/list_changed`) live.
 pub async fn serve_mcp_stdio() -> Result<()> {
     let mut lines = BufReader::new(tokio::io::stdin()).lines();
     let mut stdout = tokio::io::stdout();
@@ -816,7 +817,32 @@ pub async fn serve_mcp_stdio() -> Result<()> {
         if request.get("id").is_none() {
             continue;
         }
-        let response = match control_request("POST", "/v1/mcp", Some(&request)).await {
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+        let mut rpc_fut = std::pin::pin!(control_request_mcp_streaming(
+            "/v1/mcp",
+            &request,
+            false,
+            tx,
+        ));
+        let rpc_res = loop {
+            tokio::select! {
+                res = &mut rpc_fut => break res,
+                maybe_n = rx.recv() => {
+                    if let Some(n) = maybe_n {
+                        stdout
+                            .write_all(format!("{}\n", serde_json::to_string(&n)?).as_bytes())
+                            .await?;
+                        stdout.flush().await?;
+                    }
+                }
+            }
+        };
+        while let Ok(n) = rx.try_recv() {
+            stdout
+                .write_all(format!("{}\n", serde_json::to_string(&n)?).as_bytes())
+                .await?;
+        }
+        let response = match rpc_res {
             Ok(value) => value,
             Err(err) => json!({
                 "jsonrpc": "2.0",
@@ -825,6 +851,7 @@ pub async fn serve_mcp_stdio() -> Result<()> {
             }),
         };
         if response.is_null() {
+            stdout.flush().await?;
             continue;
         }
         stdout
@@ -1035,6 +1062,7 @@ where
             if payload.get("id").is_none() {
                 return write_empty_status(&mut stream, "202 Accepted").await;
             }
+            let mut notif_rx = state.kernel.subscribe_mcp_notifications();
             let (response, delegated_bin) = crate::cloud::handle_jsonrpc_with_hot_reload(
                 &state.kernel,
                 &state.runtime_dir,
@@ -1048,11 +1076,26 @@ where
             let response =
                 maybe_handle_mcp_escalation(&state, &payload, response, delegated_bin.as_deref())
                     .await;
+            let mut notes = Vec::new();
+            while let Ok(n) = notif_rx.try_recv() {
+                notes.push(n);
+            }
             let accepts_sse = headers
                 .get("accept")
                 .is_some_and(|v| v.to_ascii_lowercase().contains("text/event-stream"));
             if accepts_sse {
-                write_sse_single(&mut stream, &response).await
+                let head = "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nCache-Control: no-cache\r\nConnection: close\r\n\r\n";
+                stream.write_all(head.as_bytes()).await?;
+                for n in &notes {
+                    let frame = format!("data: {}\n\n", serde_json::to_string(n)?);
+                    stream.write_all(frame.as_bytes()).await?;
+                }
+                if !response.is_null() {
+                    let frame = format!("data: {}\n\n", serde_json::to_string(&response)?);
+                    stream.write_all(frame.as_bytes()).await?;
+                }
+                stream.flush().await?;
+                Ok(())
             } else {
                 write_json(&mut stream, "200 OK", response).await
             }
@@ -2015,24 +2058,6 @@ where
     Ok(())
 }
 
-async fn write_sse_single<S>(stream: &mut S, value: &Value) -> Result<()>
-where
-    S: AsyncRead + AsyncWrite + Unpin + Send,
-{
-    let frame = if value.is_null() {
-        String::new()
-    } else {
-        format!("data: {}\n\n", serde_json::to_string(value)?)
-    };
-    let head = "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nCache-Control: no-cache\r\nConnection: close\r\n\r\n";
-    stream.write_all(head.as_bytes()).await?;
-    if !frame.is_empty() {
-        stream.write_all(frame.as_bytes()).await?;
-    }
-    stream.flush().await?;
-    Ok(())
-}
-
 async fn write_json<S>(stream: &mut S, status: &str, value: Value) -> Result<()>
 where
     S: AsyncRead + AsyncWrite + Unpin + Send,
@@ -2974,5 +2999,215 @@ print("BROKER_PROBE_DONE")
         s2.read_to_end(&mut raw2).await.unwrap();
         let txt2 = String::from_utf8_lossy(&raw2);
         assert!(txt2.contains("400 Bad Request"), "{txt2}");
+    }
+
+    #[tokio::test]
+    async fn post_v1_mcp_accept_sse_streams_kernel_list_changed_notifications() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        use tokio::net::TcpListener;
+
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let mcp_addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            loop {
+                let Ok((mut stream, _)) = listener.accept().await else {
+                    break;
+                };
+                tokio::spawn(async move {
+                    let mut buf = Vec::new();
+                    let mut tmp = [0u8; 4096];
+                    loop {
+                        let n = stream.read(&mut tmp).await.unwrap_or(0);
+                        if n == 0 {
+                            break;
+                        }
+                        buf.extend_from_slice(&tmp[..n]);
+                        let s = String::from_utf8_lossy(&buf);
+                        if let Some((head, body)) = s.split_once("\r\n\r\n") {
+                            let clen: usize = head
+                                .lines()
+                                .find_map(|l| {
+                                    let (k, v) = l.split_once(':')?;
+                                    k.eq_ignore_ascii_case("content-length")
+                                        .then(|| v.trim().parse().ok())?
+                                })
+                                .unwrap_or(0);
+                            if body.len() >= clen {
+                                let req: Value =
+                                    serde_json::from_str(&body[..clen]).unwrap_or_default();
+                                let rid = req.get("id").cloned().unwrap_or(json!(1));
+                                let method =
+                                    req.get("method").and_then(|v| v.as_str()).unwrap_or("");
+                                if method == "notifications/initialized" {
+                                    let _ = stream
+                                        .write_all(b"HTTP/1.1 202 Accepted\r\nContent-Length: 0\r\nConnection: close\r\n\r\n")
+                                        .await;
+                                    return;
+                                }
+                                if method == "tools/list" {
+                                    let sse = format!(
+                                        "data: {}\n\ndata: {}\n\n",
+                                        json!({ "jsonrpc": "2.0", "method": "notifications/progress", "params": { "progress": 1, "total": 1 } }),
+                                        json!({
+                                            "jsonrpc": "2.0",
+                                            "id": rid,
+                                            "result": { "tools": [{ "name": "ping", "inputSchema": { "type": "object", "properties": {} } }] }
+                                        })
+                                    );
+                                    let out = format!(
+                                        "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nMcp-Session-Id: sid-sb\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                                        sse.len(),
+                                        sse
+                                    );
+                                    let _ = stream.write_all(out.as_bytes()).await;
+                                    return;
+                                }
+                                let body_str = json!({
+                                    "jsonrpc": "2.0",
+                                    "id": rid,
+                                    "result": {
+                                        "protocolVersion": "2024-11-05",
+                                        "serverInfo": { "name": "mock-sb-sse", "version": "1.0.0" },
+                                        "capabilities": { "tools": { "listChanged": true } }
+                                    }
+                                })
+                                .to_string();
+                                let out = format!(
+                                    "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nMcp-Session-Id: sid-sb\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                                    body_str.len(),
+                                    body_str
+                                );
+                                let _ = stream.write_all(out.as_bytes()).await;
+                                return;
+                            }
+                        }
+                    }
+                });
+            }
+        });
+
+        let tmp = tempfile::tempdir().unwrap();
+        let runtime = tmp.path().join("rt");
+        let workspace = tmp.path().join("ws");
+        let shadow = tmp.path().join("shadow");
+        let agent_home = tmp.path().join("agent_home");
+        let session_dir = tmp.path().join("session");
+        for d in [&runtime, &workspace, &shadow, &agent_home, &session_dir] {
+            std::fs::create_dir_all(d).unwrap();
+        }
+        let identity = AgentIdentity::new("acme", "coder-sb-sse", "Engineer");
+        let gw = Arc::new(aos_egress::AegisEgressGateway::new());
+        let broker = SessionBroker::start_with_egress(
+            &runtime,
+            &session_dir,
+            tmp.path().join("ctrl"),
+            BrokerSession {
+                session_id: "ses_sb_sse".to_string(),
+                mode: "implement".to_string(),
+                enforcement: "enforced".to_string(),
+                workspace: workspace.display().to_string(),
+                shadow: shadow.display().to_string(),
+                agent_home: agent_home.display().to_string(),
+            },
+            identity,
+            Some("127.0.0.1:18080".to_string()),
+            false,
+            Some(gw),
+        )
+        .await
+        .unwrap();
+
+        let install_rpc = json!({
+            "jsonrpc": "2.0",
+            "id": 11,
+            "method": "tools/call",
+            "params": {
+                "name": "mcp_request_install",
+                "arguments": {
+                    "target": format!("http://{mcp_addr}/mcp"),
+                    "server_id": "sbsse",
+                    "allow_local_http": true
+                }
+            }
+        });
+
+        // 1. First install proposal returns escalation_id.
+        let ep = broker.control_endpoint();
+        let ask_resp = control_request_at(&ep, &broker.agent_token, "POST", "/v1/mcp", Some(&install_rpc))
+            .await
+            .unwrap();
+        let ask_inner: Value = serde_json::from_str(
+            ask_resp["result"]["content"][0]["text"].as_str().unwrap(),
+        )
+        .unwrap();
+        let esc_id = ask_inner["escalation_id"].as_str().unwrap();
+
+        // 2. Approve escalation directly on host kernel.
+        broker
+            .kernel
+            .policy
+            .approve_escalation(esc_id, 0, "human-operator")
+            .await
+            .unwrap();
+
+        // 3. Re-send `mcp_request_install` with `Accept: text/event-stream` -> receives push frames BEFORE result!
+        let (tx1, mut rx1) = tokio::sync::mpsc::unbounded_channel();
+        let final_install = control_request_mcp_streaming_at(
+            &ep,
+            &broker.agent_token,
+            "/v1/mcp",
+            &install_rpc,
+            false,
+            tx1,
+        )
+        .await
+        .unwrap();
+        assert_eq!(final_install["id"], 11);
+        let mut install_notes = Vec::new();
+        while let Ok(n) = rx1.try_recv() {
+            install_notes.push(n["method"].as_str().unwrap().to_string());
+        }
+        assert!(install_notes.contains(&"notifications/tools/list_changed".to_string()));
+        assert!(install_notes.contains(&"notifications/resources/list_changed".to_string()));
+
+        broker
+            .kernel
+            .mcp_oauth
+            .login_static_token("acme", "sbsse", "tok-sb-p3", vec![], true)
+            .await
+            .unwrap();
+
+        // 4. `mcp_hot_list_tools` also streams upstream SSE `notifications/progress` via SessionBroker.
+        let hot_list_rpc = json!({
+            "jsonrpc": "2.0",
+            "id": 12,
+            "method": "tools/call",
+            "params": {
+                "name": "mcp_hot_list_tools",
+                "arguments": { "server_id": "sbsse" }
+            }
+        });
+        let (tx2, mut rx2) = tokio::sync::mpsc::unbounded_channel();
+        let hot_resp = control_request_mcp_streaming_at(
+            &ep,
+            &broker.agent_token,
+            "/v1/mcp",
+            &hot_list_rpc,
+            false,
+            tx2,
+        )
+        .await
+        .unwrap();
+        assert_eq!(hot_resp["id"], 12);
+        let mut hot_notes = Vec::new();
+        while let Ok(n) = rx2.try_recv() {
+            hot_notes.push(n);
+        }
+        assert!(hot_notes.is_empty(), "kernel tools/call emits kernel bus notifications; upstream notes are inside tool result");
+        let hot_inner: Value = serde_json::from_str(
+            hot_resp["result"]["content"][0]["text"].as_str().unwrap(),
+        )
+        .unwrap();
+        assert_eq!(hot_inner["notifications"][0]["method"], "notifications/progress");
     }
 }

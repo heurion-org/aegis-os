@@ -78,37 +78,38 @@ Aegis OS 已在 **`v0.9.3`** 彻底移除早期的静态封闭目录模型（`AA
 当前开放 MCP 生态以 **Official MCP Registry (`registry.modelcontextprotocol.io`)** 作为标准元数据根目录，同时涵盖 **Remote Streamable HTTP + OAuth 2.1**、**包管理器 (`npm` / `pypi`)**、**单文件扩展 (`.mcpb`)**、**OCI 容器镜像** 与 **域名自描述（`.well-known/mcp-bundle.json`、SEP-2127 `/.well-known/ai-catalog.json` / `<url>/server-card`、仓库 `.mcp.json`）**。Aegis 按以下 4 个支柱对齐：
 
 ### 3.1 多源联邦发现 | Federated Discovery
-1. **官方注册中心与私有镜像 `[Implemented v0.10.0]`**：通过 `crates/aos-mcp-gateway/src/mcp_registry.rs` (`McpRegistryClient`) 查询 `https://registry.modelcontextprotocol.io/v0.1/servers`（支持 `AOS_MCP_REGISTRY_URL` / `mcp_registries.json` 私有目录与 15 分钟 TTL 本地缓存 `mcp_registry_cache.json`）。
+1. **官方注册中心与企业私有镜像 `[Implemented v0.10.0+]`**：通过 `crates/aos-mcp-gateway/src/mcp_registry.rs` (`McpRegistryClient`) 查询 `https://registry.modelcontextprotocol.io/v0.1/servers`（支持 `metadata.nextCursor` 多页游标翻页、conditional `ETag` / `304 Not Modified`、15 分钟 TTL 本地缓存 `mcp_registry_cache.json`、`isLatest` 优先及 `deprecated`/`deleted` 去重过滤）。支持通过 `aegis-os mcp registry add/remove/list/airgapped` 管理 `mcp_registries.json` 企业私有目录，并可开启**气隙模式 (`disable_public_registry: true`)** 强制阻断公共 Registry 回退及任意未授权外网 URL 安装。
 2. **域名自描述与直连端点**：
    - 开放声明式 Bundle（`https://<domain>/.well-known/mcp-bundle.json`，`aegis-mcp-bundle/v1`，含多端点、Auth Realm 与 `.agents/skills/<id>/SKILL.md`）**`[Implemented v0.9.3]`**。
-   - 任意 Streamable HTTP URL 自动探测 `/.well-known/oauth-protected-resource`（RFC 9728）、`401 WWW-Authenticate` 与 SEP-2127 `<url>/server-card` **`[Implemented v0.10.0]`**。
-3. **仓库级团队清单（Zero-Secret） `[Implemented v0.10.0]`**：识别项目根目录 `.aegis/mcp.json` / `.mcp.json`，启动 `aegis-os run` 时只做差异提示（`mcp-hint` Banner），确认后才安装绑定，绝不静默加载或读取明文秘钥。
+   - 任意 Streamable HTTP URL 自动探测 `/.well-known/oauth-protected-resource`（RFC 9728）、origin-root 回退探测（RFC 9728 / RFC 8414）、`401 WWW-Authenticate` 与 SEP-2127 `<url>/server-card` **`[Implemented v0.10.0]`**。
+3. **仓库级团队清单（Zero-Secret）与全生命周期运维 `[Implemented v0.10.0+]`**：识别项目根目录 `.aegis/mcp.json` / `.mcp.json`，启动 `aegis-os run` 时只做差异提示（`mcp-hint` Banner）；支持 `aegis-os mcp sync [--clients] [--dry-run]`、`aegis-os mcp upgrade [<id> | --all]`（保留 Vault 密文与策略覆盖）、`aegis-os mcp remove <id> [--purge-auth]` 与 `aegis-os mcp doctor --probe` 实机连通性探测。
 4. **本机存量收编 `[Implemented v0.9.3]`**：通过 `aegis-os mcp scan` 与 `aegis-os mcp adopt --all` 发现并收编已有 `claude` / `agy` / `opencode` / `cursor` / `codex` 配置，将明文凭据迁移至 Vault 并无损备份。
 
 ### 3.2 安全优先筛选与上下文推荐 | Security-First Selection & Context Recommendation `[Implemented v0.10.0]`
-针对开源社区同名实现杂乱、本地脚本黑盒执行的痛点，检索结果与候选卡片按 **Aegis Trust Tier** 排序：
+针对开源社区同名实现杂乱、本地脚本黑盒执行的痛点，检索结果与候选卡片按 **Aegis Trust Tier** 排序，并由 Cedar 策略引擎（`context.mcp_trust_tier`、`context.mcp_domain_verified`、`context.mcp_registry_type`）强制把关准入：
 
 | 信任分级 | 分发载体与鉴权形态 | 安全与摩擦特征 | 默认建议 |
 |---|---|---|---|
 | **Tier 1（首选）** | 域名/OIDC 所有权已验证的 **Remote Streamable HTTP + OAuth 2.1** | 零本地第三方代码执行、支持 RFC 9728/8414 自动发现与 host-pinning | 优先推荐 |
 | **Tier 2（次选）** | **Remote HTTP + Static Token / API Key** | 零本地代码执行，宿主机一次性密封入 AES-256-GCM Vault | 稳健可用 |
-| **Tier 3（需强隔离）** | 本地 `stdio`（`npm` / `pypi` / `.mcpb` / `oci`） | 需本地拉起包进程；强制显示风险警告并默认入 Aegis 沙箱运行 | 审慎安装 |
+| **Tier 3（需强隔离）** | 本地 `stdio`（`npm` / `pypi` 精确版本钉住、`.mcpb` ZIP 包、`oci` 镜像） | 需本地拉起包进程；强制显示风险警告，Cedar 默认拦截自动放行并默认入 Aegis 沙箱运行 | 审慎安装 |
 
 - **上下文推荐 (`aegis-os mcp recommend`)**：基于仓库只读特征（如 `.git/config` 托管平台、数据库配置或项目 `.mcp.json`）推荐 2–3 个高匹配官方实现。
-- **安装前风险预检卡（Pre-Install Dry-Run）**：展示域名白名单、默认零信任策略（`trust=untrusted`、`dlp=pseudonymize`、写操作进 Outbox），并在端点允许时预检读写工具分类数量。
+- **安装前风险预检卡（Pre-Install Dry-Run）**：展示域名白名单、精确包版本、`allowed_hosts` 与默认零信任策略（`trust=untrusted`、`dlp=pseudonymize`、`allow_elicitation=false`、写操作进 Outbox），并在端点允许时预检读写工具分类数量。
 
 ### 3.3 统一安装、零配置鉴权瀑布流与 `stdio` 沙箱化 | Unified Install, Auto-Auth Waterfall & Sandboxed `stdio`
-- **Auth Realms 与 AES-256-GCM Vault `[Implemented v0.9.3]`**：`crates/aos-mcp-gateway/src/mcp_oauth.rs` 已实现组织级 Auth Realm、`allowed_hosts` DNS 标签锁定、RFC 9728/8414 自动发现、RFC 7591 动态注册、PKCE 浏览器登录、RFC 8628 Device Code 登录、静态 `--token-stdin` 密封，以及**磁盘 Vault 热重载（运行中会话免重启恢复授权）**。
-- **单一安装入口 (`aegis-os mcp install <target>`) `[Implemented v0.10.0]`**：统一收敛现有 `bundle install` / `add` / `adopt` 入口，支持 `--scope org`（默认全局共享）或 `--scope workspace`（写入无密钥 `.aegis/mcp.json`），自动识别短名、Bundle URL、Streamable HTTP URL 与 `npm:`/`pypi:` 包坐标，并自动推导包含 apex 域名在内的精确 `allowed_hosts` 衔接 OAuth PKCE / Device Code / `--token-stdin`。
-- **本地 `stdio` MCP 沙箱化 `[Implemented v0.10.0]`**：`mcp_firewall.rs` (`build_stdio_sandbox_plan` + `spawn_upstream_stdio`) 在宿主机支持时自动以 Linux `bwrap --tmpfs $HOME --bind <iso_home>` 或 macOS `sandbox-exec` 收紧 `~/.ssh`、`~/.aws`、`~/.gnupg`、`~/.kube`、`~/.aegis`，并严格 `env_clear()` 仅注入 Vault 解封环境。
+- **Auth Realms 与 AES-256-GCM Vault `[Implemented v0.9.3]`**：`crates/aos-mcp-gateway/src/mcp_oauth.rs` 已实现组织级 Auth Realm、`allowed_hosts` DNS 标签锁定、RFC 9728/8414（含 origin-root 回退）自动发现、RFC 7591 动态注册、PKCE 浏览器登录、RFC 8628 Device Code 登录、静态 `--token-stdin` 密封，以及**磁盘 Vault 热重载（运行中会话免重启恢复授权）**。
+- **单一安装入口 (`aegis-os mcp install <target>`) `[Implemented v0.10.0+]`**：统一收敛现有 `bundle install` / `add` / `adopt` 入口，支持 `--scope org`（默认全局共享）或 `--scope workspace`（写入无密钥 `.aegis/mcp.json`），自动识别短名、Bundle URL、Streamable HTTP URL、`npm:<pkg>@<ver>`、`pypi:<pkg>==<ver>`、`.mcpb` 归档（`crates/aos-mcp-gateway/src/mcp_mcpb.rs` 抗 Zip-Slip/Symlink 校验与不可变解压）与 `oci:<image>@sha256:...`（强制 `--cap-drop=ALL --security-opt=no-new-privileges --read-only` 加固容器标志），并自动推导包含 apex 域名在内的精确 `allowed_hosts` 与记录来源溯源字段（`registry_name` / `installed_version` / `manifest_sha256`）。
+- **本地 `stdio` OS 与网络白名单沙箱化 `[Implemented v0.10.0+]`**：`mcp_firewall.rs` (`build_stdio_sandbox_plan_full` + `spawn_upstream_stdio`) 在宿主机支持时自动以 Linux `bwrap --tmpfs $HOME --bind <iso_home>` 或 macOS `sandbox-exec` 收紧 `~/.ssh`、`~/.aws`、`~/.gnupg`、`~/.kube`、`~/.aegis`，并严格 `env_clear()` 仅注入 Vault 解封环境；通过 `--isolate-network` / `--allow-host <host>`（Linux `--unshare-net` + `egress-shim` 宿主机 `AegisEgressGateway` 代理桥；macOS Seatbelt localhost 白名单代理）切断 `stdio` 子进程任意外网连接。
 
-### 3.4 四层统一可见性 | Four-Layer Inventory & Observability
-| 可见性层次 | 载体与内容 | 状态 |
+### 3.4 四层统一可见性与动态推送 / 全通道治理 | Four-Layer Inventory, Push & Full-Channel Governance
+| 可见性 / 治理维度 | 载体与内容 | 状态 |
 |---|---|---|
-| **1. CLI 统一总览** | `aegis-os mcp status` 与 `aegis-os mcp doctor`（合并 Server、来源、Auth 状态、策略、同步/漂移告警与沙箱体检） | `[Implemented v0.10.0]` |
-| **2. 启动态 Banner** | `aegis-os run` 启动横幅打印 `mcps:` 状态与 `mcp-hint:` 仓库清单提示（零网络调用） | `[Implemented v0.10.0]` |
-| **3. 宿主机 Web 控制台** | `/approve` 本地 Web 审批台集成 `Installed External MCP Servers` 面板与一键 `Revoke Auth` | `[Implemented v0.10.0]` |
-| **4. Agent 侧只读自省** | `aegis://mcp/installed` 资源 + `mcp_list_installed` 工具，零凭证暴露，消除“未装 vs 未登录”歧义 | `[Implemented v0.10.0]` |
+| **1. CLI 统一总览与运维** | `aegis-os mcp status`、`doctor [--probe]`、`sync`、`upgrade`、`remove`、`registry`、`search`、`recommend` | `[Implemented]` |
+| **2. 启动态 Banner** | `aegis-os run` 启动横幅打印 `mcps:` 状态与 `mcp-hint:` 仓库清单提示（零网络调用） | `[Implemented]` |
+| **3. 宿主机 Web `/approve` 全功能控制台** | `/approve` 集成 `Installed External MCP Servers` 面板、OAuth 2.1 PKCE/Device Code/Static Token 录入、策略在线编辑（`trust`/`dlp`/`tool_overrides`/`allowed_hosts`/`net_iso`）与 Outbox 审批队列 | `[Implemented]` |
+| **4. Agent 侧自省与热推送** | `aegis://mcp/installed` 资源 + `mcp_list_installed` 工具 + `notifications/{tools,resources}/list_changed` 热推送与工具注解缓存失效重建 | `[Implemented]` |
+| **5. 全 MCP 通道统一防线** | `tools/list`、`resources/{read,list}`、`resources/templates/list`、`prompts/{list,get}`、`completion/complete` 与 SSE/`stdio` 通知统一执行注入清洗、`Pseudonymize`/`Block` (`-32004`)、参数假名还原、污点传播与防篡改审计；`elicitation/create` 与 `sampling/*` 默认 Fail-Closed 拦截（`-32601`） | `[Implemented]` |
 
 ---
 
@@ -170,11 +171,13 @@ User (in agy/claude/opencode)       Confined Agent           Host SessionBroker 
 | **凭据零触达沙箱与 LLM** | OAuth 2.1 PKCE / Device Code 与静态 Key 输入全在宿主机端完成并封装进 Vault，沙箱内外只传递会话临时 Token。 |
 | **默认不可信隔离边界** | 外部新装 MCP 默认策略强制 `trust=untrusted`、`dlp=pseudonymize`、写操作进 Outbox 审批并触发动态会话污点保护。 |
 | **热桥接作用域最小化** | `mcp_hot_list_tools` / `mcp_hot_call_tool` 严格 Fail-Closed：仅允许调用“当前会话由人类刚刚批准新装”的 `server_id`，禁止任意跨服跳转。 |
+| **非工具通道与主动请求隔离** | `tools/list`、`resources/*`、`prompts/*`、`completion/complete` 与 SSE/`stdio` 通知统一执行净室清洗、DLP 假名化/阻断（`dlp_mode=block` → `-32004`）、会话污点传播与哈希链审计；`elicitation/create` 等服务端主动请求默认 Fail-Closed 拦截（`-32601`）。 |
 
 ---
 
 ## 5. 实现交付状态 | Implementation Status
 
-1. **Phase 1 — 统一可见性与安装收敛 `[Done]`**：`aegis-os mcp status`、`aegis-os mcp doctor`、`aegis-os mcp install`、`aegis-os run` 启动 Banner 摘要（`print_mcp_startup_banner`）、`aegis://mcp/installed` 与 `mcp_list_installed`。
-2. **Phase 2 — 开放发现与宿主机一体化审批鉴权 `[Done]`**：`mcp_registry.rs` 接入 Official MCP Registry (`v0.1`)、SEP-2127 `/server-card`、RFC 9728 探测与 `.aegis/mcp.json` / `.mcp.json` 上下文推荐（`mcp search` / `mcp recommend` / `mcp_discover`），`mcp_request_install` SHA-256 审批门控与 `/approve` 页内 Vault 秘密直封及 `Installed MCPs` 管理面板。
-3. **Phase 3 — 方案 B 热桥接与本地 `stdio` 沙箱化 `[Done]`**：`mcp_hot_list_tools` / `mcp_hot_call_tool`（共享 `SessionBroker` `McpProxySessionPool`，严格限制当前会话已批准服务器 ACL）+ `mcp_post_install_hook` 同步写回隔离 `$AGENT_HOME` 客户端配置并在下次启动自动扶正，配合 `build_stdio_sandbox_plan` 对本地 `stdio` MCP 实施 OS 沙箱隔离。
+1. **Phase 1 — 统一可见性与安装收敛 `[Done]`**：`aegis-os mcp status`、`aegis-os mcp doctor`（含 `--probe`）、`aegis-os mcp install`、`aegis-os run` 启动 Banner 摘要（`print_mcp_startup_banner`）、`aegis://mcp/installed` 与 `mcp_list_installed`。
+2. **Phase 2 — 开放发现与宿主机一体化审批鉴权 `[Done]`**：`mcp_registry.rs` 接入 Official MCP Registry (`v0.1` `nextCursor` 翻页 / `ETag` `304` 缓存 / `isLatest` 去重)、SEP-2127 `/server-card`、RFC 9728/8414 origin-root 回退探测与 `.aegis/mcp.json` / `.mcp.json` 上下文推荐（`mcp search` / `mcp recommend` / `mcp_discover`），`mcp_request_install` SHA-256 审批门控与 `/approve` 全功能控制台（OAuth 2.1 PKCE/Device Code、Vault API Key 直封、Policy 在线编辑、`Installed MCPs` 与 Outbox 管理）。
+3. **Phase 3 — 方案 B 热桥接与本地 `stdio` 沙箱化 `[Done]`**：`mcp_hot_list_tools` / `mcp_hot_call_tool`（共享 `SessionBroker` `McpProxySessionPool`，严格限制当前会话已批准服务器 ACL）+ `mcp_post_install_hook` 同步写回隔离 `$AGENT_HOME` 客户端配置并在下次启动自动扶正，配合 `build_stdio_sandbox_plan_full` 对本地 `stdio` MCP 实施 Home 与 `--isolate-network` / `--allow-host` 出网白名单隔离、`.mcpb` ZIP 安全校验（`mcp_mcpb.rs`）及加固 `oci:` 容器标志。
+4. **Phase 4 — 企业治理、运行时动态推送与全通道防线 `[Done]`**：私有 Enterprise Registry 气隙锁定（`mcp registry`）、Cedar `context.mcp_*` 信任分级准入、溯源元数据与保密升级生命周期（`mcp sync` / `upgrade` / `remove`）、`notifications/{tools,resources}/list_changed` 热推送与注解缓存重建（`stdio` 后台读线程 + Streamable HTTP `POST`/`GET` SSE + Option B/`SessionBroker` SSE）、非工具 MCP 通道统一净化/DLP/污点/审计与 `elicitation/create` 默认 Fail-Closed 拦截。

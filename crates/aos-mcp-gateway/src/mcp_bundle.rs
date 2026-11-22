@@ -620,6 +620,7 @@ impl McpBundleManager {
                 isolate_upstream_home: true,
                 request_timeout_ms: s.request_timeout_ms,
                 tool_overrides: s.tool_overrides.clone(),
+                ..McpServerPolicy::default()
             };
             let rec = self
                 .firewall

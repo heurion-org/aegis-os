@@ -118,6 +118,16 @@ pub struct WorkspaceMcpHint {
     pub already_installed: bool,
 }
 
+const MAX_SEARCH_PAGES: usize = 3;
+
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct McpRegistryConfigFile {
+    #[serde(default)]
+    pub registries: Vec<String>,
+    #[serde(default)]
+    pub disable_public_registry: bool,
+}
+
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 struct RegistryCacheFile {
     #[serde(default)]
@@ -127,7 +137,27 @@ struct RegistryCacheFile {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 struct CachedSearchEntry {
     fetched_at_ms: i64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    etag: Option<String>,
     candidates: Vec<McpRegistryCandidate>,
+}
+
+fn registry_entry_status_and_latest(meta: Option<&Value>) -> (bool, bool, bool) {
+    let official = meta
+        .and_then(|m| m.get("io.modelcontextprotocol.registry/official"))
+        .or(meta);
+    let status = official
+        .and_then(|o| o.get("status"))
+        .and_then(|v| v.as_str())
+        .map(|s| s.trim().to_ascii_lowercase())
+        .unwrap_or_default();
+    let is_deleted = status == "deleted";
+    let is_deprecated = status == "deprecated";
+    let is_latest = official
+        .and_then(|o| o.get("isLatest"))
+        .and_then(|v| v.as_bool())
+        .unwrap_or(false);
+    (is_deleted, is_deprecated, is_latest)
 }
 
 /// Derives exact pinned hosts (always preserving apex hosts, never wildcard-only) from a URL.
@@ -192,27 +222,149 @@ pub fn derive_server_id_from_name(raw_name: &str) -> String {
     sanitize_server_id(chosen)
 }
 
-fn infer_package_command(reg_type: &str, identifier: &str) -> anyhow::Result<(String, Vec<String>)> {
+fn is_disallowed_pkg_char(c: char) -> bool {
+    c.is_control()
+        || c.is_whitespace()
+        || matches!(c, ';' | '|' | '&' | '$' | '`' | '\'' | '"' | '\\' | '<' | '>')
+}
+
+pub fn validate_package_identifier<'a>(
+    reg_type: &str,
+    identifier: &'a str,
+    allow_local_http: bool,
+) -> anyhow::Result<&'a str> {
     let clean_id = identifier.trim();
-    if clean_id.is_empty() {
-        bail!("Registry package identifier cannot be empty");
+    let kind = reg_type.trim().to_ascii_lowercase();
+    if kind == "mcpb" {
+        if clean_id.is_empty() || clean_id.len() > 1024 || clean_id.contains('\0') {
+            bail!("Invalid .mcpb bundle source '{clean_id}'");
+        }
+        if clean_id.starts_with("https://") || clean_id.starts_with("http://") {
+            validate_mcp_http_url_syntax(clean_id, allow_local_http)?;
+            return Ok(clean_id);
+        }
+        if !clean_id.to_ascii_lowercase().ends_with(".mcpb") {
+            bail!("Local .mcpb bundle source '{clean_id}' must use a `.mcpb` file extension");
+        }
+        return Ok(clean_id);
     }
+
+    if clean_id.is_empty() || clean_id.len() > 256 {
+        bail!("Registry package identifier cannot be empty or exceed 256 characters");
+    }
+    if clean_id.starts_with('-') {
+        bail!("Refusing flag-like package identifier '{clean_id}'");
+    }
+    if clean_id.chars().any(is_disallowed_pkg_char) {
+        bail!("Refusing unsafe characters in package identifier '{clean_id}'");
+    }
+    if clean_id.contains("..") || clean_id.contains("://") {
+        bail!("Refusing path traversal or embedded URL in package identifier '{clean_id}'");
+    }
+    if matches!(kind.as_str(), "npm" | "pypi")
+        && (clean_id.contains("git+") || clean_id.contains("file:") || clean_id.contains("ssh:"))
+    {
+        bail!("Refusing VCS/file URL specifier in package identifier '{clean_id}'");
+    }
+    Ok(clean_id)
+}
+
+fn validate_package_version(raw: &str) -> Option<&str> {
+    let trimmed = raw.trim();
+    if trimmed.is_empty() || trimmed.len() > 128 || trimmed.starts_with('-') {
+        return None;
+    }
+    if !trimmed.chars().all(|c| {
+        c.is_ascii_alphanumeric() || matches!(c, '.' | '_' | '+' | ':' | '~' | '-')
+    }) {
+        return None;
+    }
+    Some(trimmed)
+}
+
+pub fn pin_package_identifier(reg_type: &str, identifier: &str, version: Option<&str>) -> String {
+    let clean_id = identifier.trim();
+    let Some(ver) = version.and_then(validate_package_version) else {
+        return clean_id.to_string();
+    };
+    match reg_type.trim().to_ascii_lowercase().as_str() {
+        "npm" => {
+            let already_pinned = if let Some(rest) = clean_id.strip_prefix('@') {
+                rest.split_once('/').is_some_and(|(_, pkg)| pkg.contains('@'))
+            } else {
+                clean_id.contains('@')
+            };
+            if already_pinned {
+                clean_id.to_string()
+            } else {
+                format!("{clean_id}@{ver}")
+            }
+        }
+        "pypi" => {
+            if clean_id.contains("==")
+                || clean_id.contains('@')
+                || clean_id.contains(">=")
+                || clean_id.contains("<=")
+                || clean_id.contains("~=")
+            {
+                clean_id.to_string()
+            } else {
+                format!("{clean_id}=={ver}")
+            }
+        }
+        "oci" | "docker" => {
+            let last_seg = clean_id.rsplit('/').next().unwrap_or(clean_id);
+            if clean_id.contains("@sha256:") || last_seg.contains(':') {
+                clean_id.to_string()
+            } else if ver.starts_with("sha256:") {
+                format!("{clean_id}@{ver}")
+            } else {
+                format!("{clean_id}:{ver}")
+            }
+        }
+        _ => clean_id.to_string(),
+    }
+}
+
+fn infer_package_command(
+    reg_type: &str,
+    identifier: &str,
+    version: Option<&str>,
+    allow_local_http: bool,
+) -> anyhow::Result<(String, Vec<String>, Vec<String>)> {
+    let clean_id = validate_package_identifier(reg_type, identifier, allow_local_http)?;
+    let pinned = pin_package_identifier(reg_type, clean_id, version);
     match reg_type.to_ascii_lowercase().as_str() {
-        "npm" => Ok(("npx".to_string(), vec!["-y".to_string(), clean_id.to_string()])),
-        "pypi" => Ok(("uvx".to_string(), vec![clean_id.to_string()])),
+        "npm" => Ok((
+            "npx".to_string(),
+            vec!["-y".to_string(), pinned],
+            vec!["registry.npmjs.org".to_string()],
+        )),
+        "pypi" => Ok((
+            "uvx".to_string(),
+            vec![pinned],
+            vec![
+                "pypi.org".to_string(),
+                "files.pythonhosted.org".to_string(),
+            ],
+        )),
         "oci" | "docker" => Ok((
             "docker".to_string(),
             vec![
                 "run".to_string(),
                 "-i".to_string(),
                 "--rm".to_string(),
-                clean_id.to_string(),
+                "--read-only".to_string(),
+                "--tmpfs".to_string(),
+                "/tmp:rw,noexec,nosuid,size=64m".to_string(),
+                "--cap-drop=ALL".to_string(),
+                "--security-opt=no-new-privileges".to_string(),
+                "--network=none".to_string(),
+                pinned,
             ],
+            Vec::new(),
         )),
-        "mcpb" => Ok((
-            "aegis-mcpb".to_string(),
-            vec![clean_id.to_string()],
-        )),
+        "mcpb" => Ok(("mcpb".to_string(), vec![clean_id.to_string()], Vec::new())),
         other => bail!("Unsupported registry package type '{}'", other),
     }
 }
@@ -275,6 +427,10 @@ pub fn parse_registry_server_entry(
 ) -> Option<McpRegistryCandidate> {
     let server_obj = entry.get("server").unwrap_or(entry);
     let meta_obj = entry.get("_meta").or_else(|| server_obj.get("_meta"));
+    let (is_deleted, _, _) = registry_entry_status_and_latest(meta_obj);
+    if is_deleted {
+        return None;
+    }
     let name = server_obj.get("name")?.as_str()?.trim();
     if name.is_empty() {
         return None;
@@ -396,6 +552,18 @@ pub fn parse_registry_server_entry(
     // 2. Fallback to `packages[]` (Tier 3 Local Sandboxed Stdio).
     if let Some(packages) = server_obj.get("packages").and_then(|v| v.as_array()) {
         for pkg in packages {
+            let pkg_transport = pkg
+                .pointer("/transport/type")
+                .or_else(|| pkg.get("transportType"))
+                .and_then(|v| v.as_str())
+                .map(|s| s.trim().to_ascii_lowercase());
+            if packages.len() > 1
+                && pkg_transport
+                    .as_deref()
+                    .is_some_and(|t| !t.is_empty() && t != "stdio")
+            {
+                continue;
+            }
             let reg_type = pkg
                 .get("registryType")
                 .or_else(|| pkg.get("registry_name"))
@@ -407,9 +575,6 @@ pub fn parse_registry_server_entry(
                 Some(id) if !id.is_empty() => id,
                 _ => continue,
             };
-            let Ok((command, args)) = infer_package_command(&reg_type, identifier) else {
-                continue;
-            };
             let pkg_version = pkg
                 .get("version")
                 .and_then(|v| v.as_str())
@@ -417,6 +582,24 @@ pub fn parse_registry_server_entry(
                 .filter(|s| !s.is_empty())
                 .map(str::to_string)
                 .or_else(|| version.clone());
+            let runtime_hint = pkg
+                .get("runtimeHint")
+                .and_then(|v| v.as_str())
+                .map(|s| s.trim().to_ascii_lowercase());
+            let effective_reg_type = match (reg_type.as_str(), runtime_hint.as_deref()) {
+                ("npm", Some("npx")) => "npm",
+                ("pypi", Some("uvx")) => "pypi",
+                ("oci" | "docker", Some("docker")) => "oci",
+                _ => reg_type.as_str(),
+            };
+            let Ok((command, args, pkg_allowed_hosts)) = infer_package_command(
+                effective_reg_type,
+                identifier,
+                pkg_version.as_deref(),
+                allow_local_http,
+            ) else {
+                continue;
+            };
             let file_sha256 = pkg
                 .get("fileSha256")
                 .and_then(|v| v.as_str())
@@ -457,7 +640,7 @@ pub fn parse_registry_server_entry(
                 "stdio",
                 None,
                 Some(&package_spec),
-                &[],
+                &pkg_allowed_hosts,
             );
             return Some(McpRegistryCandidate {
                 name: name.to_string(),
@@ -474,7 +657,7 @@ pub fn parse_registry_server_entry(
                 remote_url: None,
                 package_spec: Some(package_spec),
                 auth_mode,
-                allowed_hosts: Vec::new(),
+                allowed_hosts: pkg_allowed_hosts,
                 manifest_sha256,
             });
         }
@@ -509,7 +692,111 @@ impl McpRegistryClient {
         }
     }
 
-    /// Configured registry base URLs (`AOS_MCP_REGISTRY_URL`, `<runtime>/mcp_registries.json`, or official default).
+    async fn save_cache(&self) {
+        let cache = self.cache.read().await.clone();
+        if let Some(parent) = self.cache_path.parent() {
+            let _ = std::fs::create_dir_all(parent);
+        }
+        let _ = aos_core::session::write_json_pretty_atomic(&self.cache_path, &cache).await;
+    }
+
+    pub fn load_registry_config(&self) -> McpRegistryConfigFile {
+        let Ok(raw) = std::fs::read(&self.registries_path) else {
+            return McpRegistryConfigFile::default();
+        };
+        if let Ok(cfg) = serde_json::from_slice::<McpRegistryConfigFile>(&raw) {
+            return cfg;
+        }
+        if let Ok(list) = serde_json::from_slice::<Vec<String>>(&raw) {
+            return McpRegistryConfigFile {
+                registries: list,
+                disable_public_registry: false,
+            };
+        }
+        McpRegistryConfigFile::default()
+    }
+
+    async fn save_registry_config(&self, cfg: &McpRegistryConfigFile) -> anyhow::Result<()> {
+        if let Some(parent) = self.registries_path.parent() {
+            let _ = std::fs::create_dir_all(parent);
+        }
+        aos_core::session::write_json_pretty_atomic(&self.registries_path, cfg).await
+    }
+
+    pub fn is_public_registry_disabled(&self) -> bool {
+        let env_disabled = std::env::var("AOS_MCP_DISABLE_PUBLIC_REGISTRY")
+            .ok()
+            .is_some_and(|v| {
+                matches!(
+                    v.trim().to_ascii_lowercase().as_str(),
+                    "1" | "true" | "yes" | "on"
+                )
+            });
+        env_disabled || self.load_registry_config().disable_public_registry
+    }
+
+    pub async fn add_registry(
+        &self,
+        url: &str,
+        allow_local_http: bool,
+    ) -> anyhow::Result<McpRegistryConfigFile> {
+        let clean = url.trim().trim_end_matches('/');
+        validate_mcp_http_url_syntax(clean, allow_local_http)?;
+        let mut cfg = self.load_registry_config();
+        if !cfg.registries.iter().any(|u| u.trim_end_matches('/') == clean) {
+            cfg.registries.push(clean.to_string());
+        }
+        self.save_registry_config(&cfg).await?;
+        self.clear_cache().await;
+        Ok(cfg)
+    }
+
+    pub async fn remove_registry(&self, url: &str) -> anyhow::Result<McpRegistryConfigFile> {
+        let clean = url.trim().trim_end_matches('/');
+        let mut cfg = self.load_registry_config();
+        cfg.registries
+            .retain(|u| u.trim().trim_end_matches('/') != clean);
+        self.save_registry_config(&cfg).await?;
+        self.clear_cache().await;
+        Ok(cfg)
+    }
+
+    pub async fn set_disable_public_registry(
+        &self,
+        disabled: bool,
+    ) -> anyhow::Result<McpRegistryConfigFile> {
+        let mut cfg = self.load_registry_config();
+        cfg.disable_public_registry = disabled;
+        self.save_registry_config(&cfg).await?;
+        self.clear_cache().await;
+        Ok(cfg)
+    }
+
+    pub fn registry_status(&self) -> Value {
+        let cfg = self.load_registry_config();
+        let env_disabled = std::env::var("AOS_MCP_DISABLE_PUBLIC_REGISTRY")
+            .ok()
+            .is_some_and(|v| {
+                matches!(
+                    v.trim().to_ascii_lowercase().as_str(),
+                    "1" | "true" | "yes" | "on"
+                )
+            });
+        json!({
+            "registries": cfg.registries,
+            "disable_public_registry": cfg.disable_public_registry,
+            "env_disable_public_registry": env_disabled,
+            "effective_disable_public_registry": env_disabled || cfg.disable_public_registry,
+            "effective_registries": self.configured_registries(),
+        })
+    }
+
+    pub async fn clear_cache(&self) {
+        self.cache.write().await.entries.clear();
+        self.save_cache().await;
+    }
+
+    /// Configured registry base URLs (`AOS_MCP_REGISTRY_URL`, `<runtime>/mcp_registries.json`, or official default unless disabled).
     pub fn configured_registries(&self) -> Vec<String> {
         let mut urls = Vec::new();
         if let Ok(env_val) = std::env::var("AOS_MCP_REGISTRY_URL") {
@@ -520,28 +807,16 @@ impl McpRegistryClient {
                 }
             }
         }
-        if let Ok(raw) = std::fs::read(&self.registries_path) {
-            if let Ok(list) = serde_json::from_slice::<Vec<String>>(&raw) {
-                for u in list {
-                    let clean = u.trim().trim_end_matches('/');
-                    if !clean.is_empty() && !urls.iter().any(|existing| existing == clean) {
-                        urls.push(clean.to_string());
-                    }
-                }
+        for u in self.load_registry_config().registries {
+            let clean = u.trim().trim_end_matches('/');
+            if !clean.is_empty() && !urls.iter().any(|existing| existing == clean) {
+                urls.push(clean.to_string());
             }
         }
-        if urls.is_empty() {
+        if urls.is_empty() && !self.is_public_registry_disabled() {
             urls.push(DEFAULT_MCP_REGISTRY_URL.to_string());
         }
         urls
-    }
-
-    async fn save_cache(&self) {
-        let cache = self.cache.read().await.clone();
-        if let Some(parent) = self.cache_path.parent() {
-            let _ = std::fs::create_dir_all(parent);
-        }
-        let _ = aos_core::session::write_json_pretty_atomic(&self.cache_path, &cache).await;
     }
 
     /// Searches configured MCP Registries, ranks by Trust Tier (1 -> 2 -> 3), and caches results.
@@ -554,10 +829,15 @@ impl McpRegistryClient {
         let q = query.trim();
         let capped_limit = limit.clamp(1, 50);
         let registries = self.configured_registries();
+        if registries.is_empty() && self.is_public_registry_disabled() {
+            bail!(
+                "Public MCP registry is disabled (air-gapped mode) and no private registry URL is configured. Run `aegis-os mcp registry add <url>` or set `AOS_MCP_REGISTRY_URL`."
+            );
+        }
         let cache_key = format!("{}|{}|{}", registries.join(","), q.to_ascii_lowercase(), allow_local_http);
         let now_ms = Utc::now().timestamp_millis();
 
-        {
+        let stale_entry: Option<CachedSearchEntry> = {
             let guard = self.cache.read().await;
             if let Some(hit) = guard.entries.get(&cache_key) {
                 if now_ms.saturating_sub(hit.fetched_at_ms) <= CACHE_TTL_MS {
@@ -565,83 +845,172 @@ impl McpRegistryClient {
                     list.truncate(capped_limit);
                     return Ok(list);
                 }
+                Some(hit.clone())
+            } else {
+                None
             }
-        }
+        };
 
-        let mut all_candidates = Vec::new();
+        let single_registry = registries.len() == 1;
+        let stale_etag = if single_registry {
+            stale_entry.as_ref().and_then(|e| e.etag.clone())
+        } else {
+            None
+        };
+        let mut captured_etag: Option<String> = None;
+
+        // Deduplicate by `cand.name` preferring `(!is_deprecated, is_latest, Reverse(trust_tier))`.
+        let mut by_name: BTreeMap<String, (McpRegistryCandidate, bool, bool)> = BTreeMap::new();
         let mut last_err: Option<anyhow::Error> = None;
         for base in &registries {
             let allow_http = allow_local_http
                 || base.starts_with("http://127.0.0.1")
                 || base.starts_with("http://localhost");
-            let url = if q.is_empty() {
-                format!("{base}/v0.1/servers?limit={capped_limit}")
-            } else {
-                format!(
-                    "{base}/v0.1/servers?search={}&limit={capped_limit}",
-                    percent_encode_component(q)
+            let mut next_cursor: Option<String> = None;
+            for page in 0..MAX_SEARCH_PAGES {
+                let mut url = if q.is_empty() {
+                    format!("{base}/v0.1/servers?limit={capped_limit}")
+                } else {
+                    format!(
+                        "{base}/v0.1/servers?search={}&limit={capped_limit}",
+                        percent_encode_component(q)
+                    )
+                };
+                if let Some(ref cur) = next_cursor {
+                    url.push_str("&cursor=");
+                    url.push_str(&percent_encode_component(cur));
+                }
+                if validate_mcp_http_url_syntax(&url, allow_http).is_err() {
+                    break;
+                }
+                let mut req_headers = vec![("Accept".to_string(), "application/json".to_string())];
+                if page == 0 {
+                    if let Some(ref tag) = stale_etag {
+                        req_headers.push(("If-None-Match".to_string(), tag.clone()));
+                    }
+                }
+                match simple_http_request(
+                    "GET",
+                    &url,
+                    &req_headers,
+                    None,
+                    allow_http,
+                    REGISTRY_TIMEOUT_MS,
                 )
-            };
-            if validate_mcp_http_url_syntax(&url, allow_http).is_err() {
-                continue;
-            }
-            match simple_http_request(
-                "GET",
-                &url,
-                &[("Accept".to_string(), "application/json".to_string())],
-                None,
-                allow_http,
-                REGISTRY_TIMEOUT_MS,
-            )
-            .await
-            {
-                Ok((status, _, bytes)) if (200..300).contains(&status) => {
-                    if let Ok(doc) = serde_json::from_slice::<Value>(&bytes) {
-                        if let Some(servers) = doc.get("servers").and_then(|v| v.as_array()) {
-                            for item in servers {
-                                if let Some(cand) =
-                                    parse_registry_server_entry(item, base, allow_http)
-                                {
-                                    if !all_candidates
-                                        .iter()
-                                        .any(|existing: &McpRegistryCandidate| existing.name == cand.name)
-                                    {
-                                        all_candidates.push(cand);
+                .await
+                {
+                    Ok((304, _, _)) if page == 0 && single_registry => {
+                        if let Some(mut refreshed) = stale_entry.clone() {
+                            refreshed.fetched_at_ms = now_ms;
+                            {
+                                let mut guard = self.cache.write().await;
+                                guard.entries.insert(cache_key.clone(), refreshed.clone());
+                            }
+                            self.save_cache().await;
+                            let mut list = refreshed.candidates;
+                            list.truncate(capped_limit);
+                            return Ok(list);
+                        }
+                        break;
+                    }
+                    Ok((status, resp_headers, bytes)) if (200..300).contains(&status) => {
+                        if page == 0 && single_registry {
+                            captured_etag = resp_headers
+                                .iter()
+                                .find(|(k, _)| k.eq_ignore_ascii_case("etag"))
+                                .map(|(_, v)| v.trim().to_string())
+                                .filter(|s| !s.is_empty());
+                        }
+                        let Ok(doc) = serde_json::from_slice::<Value>(&bytes) else {
+                            break;
+                        };
+                        let servers = doc
+                            .get("servers")
+                            .and_then(|v| v.as_array())
+                            .cloned()
+                            .unwrap_or_default();
+                        let page_empty = servers.is_empty();
+                        for item in &servers {
+                            let item_meta = item
+                                .get("_meta")
+                                .or_else(|| item.get("server").and_then(|s| s.get("_meta")));
+                            let (_, is_deprecated, is_latest) =
+                                registry_entry_status_and_latest(item_meta);
+                            if let Some(cand) = parse_registry_server_entry(item, base, allow_http)
+                            {
+                                let key = cand.name.clone();
+                                let new_key = (
+                                    !is_deprecated,
+                                    is_latest,
+                                    std::cmp::Reverse(cand.trust_tier.rank()),
+                                );
+                                match by_name.get(&key) {
+                                    Some((cur_cand, cur_dep, cur_latest)) => {
+                                        let cur_key = (
+                                            !*cur_dep,
+                                            *cur_latest,
+                                            std::cmp::Reverse(cur_cand.trust_tier.rank()),
+                                        );
+                                        if new_key > cur_key {
+                                            by_name.insert(key, (cand, is_deprecated, is_latest));
+                                        }
+                                    }
+                                    None => {
+                                        by_name.insert(key, (cand, is_deprecated, is_latest));
                                     }
                                 }
                             }
                         }
+                        next_cursor = doc
+                            .pointer("/metadata/nextCursor")
+                            .or_else(|| doc.get("nextCursor"))
+                            .and_then(|v| v.as_str())
+                            .map(str::trim)
+                            .filter(|s| !s.is_empty())
+                            .map(str::to_string);
+                        let non_dep_count = by_name.values().filter(|(_, dep, _)| !*dep).count();
+                        if next_cursor.is_none() || page_empty || non_dep_count >= capped_limit {
+                            break;
+                        }
                     }
-                }
-                Ok((status, _, _)) => {
-                    last_err = Some(anyhow::anyhow!("Registry '{}' returned HTTP {}", base, status));
-                }
-                Err(e) => {
-                    last_err = Some(e);
+                    Ok((status, _, _)) => {
+                        last_err = Some(anyhow::anyhow!("Registry '{}' returned HTTP {}", base, status));
+                        break;
+                    }
+                    Err(e) => {
+                        last_err = Some(e);
+                        break;
+                    }
                 }
             }
         }
 
-        if all_candidates.is_empty() {
+        if by_name.is_empty() {
             if let Some(err) = last_err {
                 return Err(err);
             }
         }
 
         let lower_q = q.to_ascii_lowercase();
-        all_candidates.sort_by(|a, b| {
+        let mut ranked_entries: Vec<(McpRegistryCandidate, bool)> = by_name
+            .into_values()
+            .map(|(cand, dep, _)| (cand, dep))
+            .collect();
+        ranked_entries.sort_by(|(a, a_dep), (b, b_dep)| {
             let a_exact = !lower_q.is_empty()
                 && (a.server_id.eq_ignore_ascii_case(&lower_q)
                     || a.name.eq_ignore_ascii_case(&lower_q));
             let b_exact = !lower_q.is_empty()
                 && (b.server_id.eq_ignore_ascii_case(&lower_q)
                     || b.name.eq_ignore_ascii_case(&lower_q));
-            a.trust_tier
-                .rank()
-                .cmp(&b.trust_tier.rank())
+            a_dep
+                .cmp(b_dep)
+                .then_with(|| a.trust_tier.rank().cmp(&b.trust_tier.rank()))
                 .then_with(|| b_exact.cmp(&a_exact))
                 .then_with(|| a.name.cmp(&b.name))
         });
+        let mut all_candidates: Vec<McpRegistryCandidate> =
+            ranked_entries.into_iter().map(|(c, _)| c).collect();
 
         {
             let mut guard = self.cache.write().await;
@@ -652,6 +1021,7 @@ impl McpRegistryClient {
                 cache_key,
                 CachedSearchEntry {
                     fetched_at_ms: now_ms,
+                    etag: captured_etag,
                     candidates: all_candidates.clone(),
                 },
             );
@@ -887,7 +1257,7 @@ impl McpRegistryClient {
             .or_else(|| trimmed.strip_prefix("npx:"))
         {
             return self
-                .build_package_candidate("npm", pkg.trim(), explicit_server_id)
+                .build_package_candidate("npm", pkg.trim(), explicit_server_id, allow_local_http)
                 .map(Box::new)
                 .map(ResolvedInstallTarget::Candidate);
         }
@@ -896,12 +1266,54 @@ impl McpRegistryClient {
             .or_else(|| trimmed.strip_prefix("uvx:"))
         {
             return self
-                .build_package_candidate("pypi", pkg.trim(), explicit_server_id)
+                .build_package_candidate("pypi", pkg.trim(), explicit_server_id, allow_local_http)
+                .map(Box::new)
+                .map(ResolvedInstallTarget::Candidate);
+        }
+        if let Some(pkg) = trimmed
+            .strip_prefix("oci:")
+            .or_else(|| trimmed.strip_prefix("docker:"))
+        {
+            return self
+                .build_package_candidate("oci", pkg.trim(), explicit_server_id, allow_local_http)
+                .map(Box::new)
+                .map(ResolvedInstallTarget::Candidate);
+        }
+        if let Some(pkg) = trimmed.strip_prefix("mcpb:") {
+            return self
+                .build_package_candidate("mcpb", pkg.trim(), explicit_server_id, allow_local_http)
+                .map(Box::new)
+                .map(ResolvedInstallTarget::Candidate);
+        }
+        if trimmed.to_ascii_lowercase().ends_with(".mcpb")
+            && (trimmed.starts_with("https://")
+                || trimmed.starts_with("http://")
+                || Path::new(trimmed).is_file())
+        {
+            if (trimmed.starts_with("https://") || trimmed.starts_with("http://"))
+                && self.is_public_registry_disabled()
+                && !self.is_airgap_allowed_direct_url(trimmed, allow_local_http)?
+            {
+                bail!(
+                    "Refusing external .mcpb URL '{}' in air-gapped MCP registry mode (host not in configured private registries)",
+                    trimmed
+                );
+            }
+            return self
+                .build_package_candidate("mcpb", trimmed, explicit_server_id, allow_local_http)
                 .map(Box::new)
                 .map(ResolvedInstallTarget::Candidate);
         }
 
         if trimmed.starts_with("https://") || trimmed.starts_with("http://") {
+            if self.is_public_registry_disabled()
+                && !self.is_airgap_allowed_direct_url(trimmed, allow_local_http)?
+            {
+                bail!(
+                    "Refusing external MCP URL '{}' in air-gapped MCP registry mode (host not in configured private registries)",
+                    trimmed
+                );
+            }
             let cand = self
                 .build_http_candidate_with_probe(trimmed, explicit_server_id, allow_local_http)
                 .await?;
@@ -928,30 +1340,54 @@ impl McpRegistryClient {
             }
         }
 
-        // Fallback to `.well-known/mcp-bundle.json` shorthand (e.g. `heurion` -> `https://heurion.org/.well-known/mcp-bundle.json`).
-        let bundle_url = resolve_bundle_source_url(trimmed);
-        if validate_mcp_http_url_syntax(&bundle_url, allow_local_http).is_ok() {
-            if let Ok((200..=299, _, _)) = simple_http_request(
-                "GET",
-                &bundle_url,
-                &[("Accept".to_string(), "application/json".to_string())],
-                None,
-                allow_local_http,
-                PROBE_TIMEOUT_MS,
-            )
-            .await
-            {
-                return Ok(ResolvedInstallTarget::Bundle {
-                    source: trimmed.to_string(),
+        // Fallback to `.well-known/mcp-bundle.json` shorthand only when public registry discovery is enabled.
+        if !self.is_public_registry_disabled() {
+            let bundle_url = resolve_bundle_source_url(trimmed);
+            if validate_mcp_http_url_syntax(&bundle_url, allow_local_http).is_ok() {
+                if let Ok((200..=299, _, _)) = simple_http_request(
+                    "GET",
+                    &bundle_url,
+                    &[("Accept".to_string(), "application/json".to_string())],
+                    None,
                     allow_local_http,
-                });
+                    PROBE_TIMEOUT_MS,
+                )
+                .await
+                {
+                    return Ok(ResolvedInstallTarget::Bundle {
+                        source: trimmed.to_string(),
+                        allow_local_http,
+                    });
+                }
             }
         }
 
         bail!(
-            "Could not resolve MCP target '{}' from configured registries or `.well-known/mcp-bundle.json`. Pass a full URL (`https://...`), Registry name (`ns/server`), `npm:<pkg>`, `pypi:<pkg>`, or local bundle `.json`.",
-            trimmed
+            "Could not resolve MCP target '{}' from configured registries{}. Pass a full URL (`https://...`), Registry name (`ns/server`), `npm:<pkg>`, `pypi:<pkg>`, `oci:<image>`, `.mcpb`, or local bundle `.json`.",
+            trimmed,
+            if self.is_public_registry_disabled() {
+                " (air-gapped mode enabled)"
+            } else {
+                " or `.well-known/mcp-bundle.json`"
+            }
         )
+    }
+
+    fn is_airgap_allowed_direct_url(&self, raw_url: &str, allow_local_http: bool) -> anyhow::Result<bool> {
+        let (_, target_host) = parse_url_scheme_and_host(raw_url)?;
+        if allow_local_http
+            && matches!(target_host.as_str(), "127.0.0.1" | "localhost" | "::1")
+        {
+            return Ok(true);
+        }
+        for reg in self.configured_registries() {
+            if let Ok((_, reg_host)) = parse_url_scheme_and_host(&reg) {
+                if reg_host.eq_ignore_ascii_case(&target_host) {
+                    return Ok(true);
+                }
+            }
+        }
+        Ok(false)
     }
 
     fn build_package_candidate(
@@ -959,11 +1395,32 @@ impl McpRegistryClient {
         reg_type: &str,
         pkg: &str,
         explicit_server_id: Option<&str>,
+        allow_local_http: bool,
     ) -> anyhow::Result<McpRegistryCandidate> {
-        let (command, args) = infer_package_command(reg_type, pkg)?;
+        let (command, args, allowed_hosts) =
+            infer_package_command(reg_type, pkg, None, allow_local_http)?;
+        let alias_seed = if reg_type == "mcpb" {
+            pkg.strip_suffix(".mcpb")
+                .or_else(|| pkg.strip_suffix(".MCPB"))
+                .unwrap_or(pkg)
+        } else if reg_type == "oci" || reg_type == "docker" {
+            let no_digest = pkg.split('@').next().unwrap_or(pkg);
+            match no_digest.rsplit_once('/') {
+                Some((prefix, tail)) => match tail.split_once(':') {
+                    Some((img, _)) => prefix_and_img_or(tail, img, prefix),
+                    None => no_digest,
+                },
+                None => no_digest.split(':').next().unwrap_or(no_digest),
+            }
+        } else {
+            pkg
+        };
+        fn prefix_and_img_or<'a>(tail: &'a str, img: &'a str, _prefix: &'a str) -> &'a str {
+            if img.is_empty() { tail } else { img }
+        }
         let server_id = explicit_server_id
             .map(sanitize_server_id)
-            .unwrap_or_else(|| derive_server_id_from_name(pkg));
+            .unwrap_or_else(|| derive_server_id_from_name(alias_seed));
         let name = format!("{reg_type}:{pkg}");
         let package_spec = RegistryPackageSpec {
             registry_type: reg_type.to_string(),
@@ -980,7 +1437,7 @@ impl McpRegistryClient {
             "stdio",
             None,
             Some(&package_spec),
-            &[],
+            &allowed_hosts,
         );
         Ok(McpRegistryCandidate {
             name,
@@ -997,7 +1454,7 @@ impl McpRegistryClient {
             remote_url: None,
             package_spec: Some(package_spec),
             auth_mode: "none".to_string(),
-            allowed_hosts: Vec::new(),
+            allowed_hosts,
             manifest_sha256,
         })
     }
@@ -1488,5 +1945,364 @@ mod tests {
         let written = std::fs::read_to_string(decl).unwrap();
         assert!(written.contains("DB_TOKEN"));
         assert!(!written.contains("env\""));
+    }
+
+    #[tokio::test]
+    async fn search_paginates_next_cursor_prefers_is_latest_and_revalidates_etag_304() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        use std::sync::Arc;
+
+        let calls = Arc::new(AtomicUsize::new(0));
+        let seen_if_none_match = Arc::new(tokio::sync::Mutex::new(Vec::<String>::new()));
+
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let calls_srv = calls.clone();
+        let inm_srv = seen_if_none_match.clone();
+        tokio::spawn(async move {
+            loop {
+                let Ok((mut stream, _)) = listener.accept().await else {
+                    break;
+                };
+                let calls_srv = calls_srv.clone();
+                let inm_srv = inm_srv.clone();
+                tokio::spawn(async move {
+                    let mut buf = [0u8; 4096];
+                    let n = stream.read(&mut buf).await.unwrap_or(0);
+                    let req = String::from_utf8_lossy(&buf[..n]).to_string();
+                    let target = req
+                        .lines()
+                        .next()
+                        .and_then(|l| l.split_whitespace().nth(1))
+                        .unwrap_or("/");
+                    for line in req.lines() {
+                        if let Some((k, v)) = line.split_once(':') {
+                            if k.eq_ignore_ascii_case("if-none-match") {
+                                inm_srv.lock().await.push(v.trim().to_string());
+                            }
+                        }
+                    }
+                    calls_srv.fetch_add(1, Ordering::SeqCst);
+
+                    if req.to_ascii_lowercase().contains("if-none-match: \"etag-page1-v1\"")
+                        && !target.contains("cursor=")
+                    {
+                        let resp = "HTTP/1.1 304 Not Modified\r\nETag: \"etag-page1-v1\"\r\nContent-Length: 0\r\nConnection: close\r\n\r\n";
+                        let _ = stream.write_all(resp.as_bytes()).await;
+                        return;
+                    }
+
+                    if target.contains("cursor=page2") {
+                        let body = json!({
+                            "servers": [
+                                {
+                                    "server": {
+                                        "name": "io.github.test/helper",
+                                        "title": "Latest Stdio Helper",
+                                        "version": "2.0.0",
+                                        "packages": [
+                                            {
+                                                "registryType": "npm",
+                                                "identifier": "@test/helper-sse",
+                                                "transport": { "type": "sse" }
+                                            },
+                                            {
+                                                "registryType": "npm",
+                                                "identifier": "@test/helper-stdio",
+                                                "runtimeHint": "npx",
+                                                "transport": { "type": "stdio" }
+                                            }
+                                        ]
+                                    },
+                                    "_meta": {
+                                        "io.modelcontextprotocol.registry/official": {
+                                            "status": "active",
+                                            "isLatest": true
+                                        }
+                                    }
+                                },
+                                {
+                                    "server": {
+                                        "name": "app.acme/mcp",
+                                        "title": "Acme Official MCP",
+                                        "version": "1.5.0",
+                                        "websiteUrl": "https://acme.example.com",
+                                        "remotes": [{
+                                            "type": "streamable-http",
+                                            "url": "https://mcp.acme.example.com/mcp"
+                                        }]
+                                    },
+                                    "_meta": {
+                                        "io.modelcontextprotocol.registry/official": {
+                                            "status": "active",
+                                            "isLatest": true,
+                                            "verified": true
+                                        }
+                                    }
+                                }
+                            ]
+                        })
+                        .to_string();
+                        let resp = format!(
+                            "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                            body.len()
+                        );
+                        let _ = stream.write_all(resp.as_bytes()).await;
+                        return;
+                    }
+
+                    let body = json!({
+                        "servers": [
+                            {
+                                "server": {
+                                    "name": "io.github.test/deleted",
+                                    "title": "Deleted Entry",
+                                    "packages": [{ "registryType": "npm", "identifier": "@test/del" }]
+                                },
+                                "_meta": { "io.modelcontextprotocol.registry/official": { "status": "deleted" } }
+                            },
+                            {
+                                "server": {
+                                    "name": "app.acme/mcp",
+                                    "title": "Acme Deprecated",
+                                    "version": "0.9.0",
+                                    "packages": [{ "registryType": "npm", "identifier": "@acme/old-stdio" }]
+                                },
+                                "_meta": {
+                                    "io.modelcontextprotocol.registry/official": {
+                                        "status": "deprecated",
+                                        "isLatest": false
+                                    }
+                                }
+                            }
+                        ],
+                        "metadata": { "nextCursor": "page2" }
+                    })
+                    .to_string();
+                    let resp = format!(
+                        "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nETag: \"etag-page1-v1\"\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                        body.len()
+                    );
+                    let _ = stream.write_all(resp.as_bytes()).await;
+                });
+            }
+        });
+
+        let tmp = tempfile::tempdir().unwrap();
+        std::fs::write(
+            tmp.path().join("mcp_registries.json"),
+            serde_json::to_vec(&vec![format!("http://{addr}")]).unwrap(),
+        )
+        .unwrap();
+        let client = McpRegistryClient::new(tmp.path());
+        let first = client.search("acme", 10, true).await.unwrap();
+        assert!(!first.iter().any(|c| c.name == "io.github.test/deleted"));
+        let acme = first.iter().find(|c| c.name == "app.acme/mcp").unwrap();
+        assert_eq!(acme.trust_tier, McpTrustTier::Tier1VerifiedRemoteOAuth);
+        assert_eq!(acme.version.as_deref(), Some("1.5.0"));
+        let helper = first.iter().find(|c| c.name == "io.github.test/helper").unwrap();
+        assert_eq!(
+            helper.package_spec.as_ref().unwrap().identifier,
+            "@test/helper-stdio"
+        );
+        assert_eq!(calls.load(Ordering::SeqCst), 2);
+
+        // Expire cache TTL on disk & in memory to verify conditional `If-None-Match` -> `304`.
+        {
+            let mut guard = client.cache.write().await;
+            for entry in guard.entries.values_mut() {
+                assert_eq!(entry.etag.as_deref(), Some("\"etag-page1-v1\""));
+                entry.fetched_at_ms = 0;
+            }
+        }
+        let refreshed = client.search("acme", 10, true).await.unwrap();
+        assert_eq!(refreshed.len(), 2);
+        assert_eq!(calls.load(Ordering::SeqCst), 3);
+        let inm = seen_if_none_match.lock().await;
+        assert_eq!(inm.as_slice(), &["\"etag-page1-v1\""]);
+    }
+
+    #[tokio::test]
+    #[ignore = "requires live network access to registry.modelcontextprotocol.io"]
+    async fn live_official_registry_search_and_parse_smoke() {
+        let tmp = tempfile::tempdir().unwrap();
+        let client = McpRegistryClient::new(tmp.path());
+        let results = client.search("github", 5, false).await.unwrap();
+        assert!(!results.is_empty());
+    }
+
+    #[test]
+    fn package_version_pinning_handles_npm_scoped_pypi_and_oci_hardened_flags() {
+        // 1. Scoped npm gets `@version` pinned, while already-pinned stays untouched.
+        let (cmd, args, hosts) =
+            infer_package_command("npm", "@acme/mcp-server", Some("1.2.3"), false).unwrap();
+        assert_eq!(cmd, "npx");
+        assert_eq!(args, vec!["-y", "@acme/mcp-server@1.2.3"]);
+        assert_eq!(hosts, vec!["registry.npmjs.org".to_string()]);
+
+        let (_, already_npm, _) =
+            infer_package_command("npm", "@acme/mcp-server@2.0.0", Some("1.2.3"), false).unwrap();
+        assert_eq!(already_npm, vec!["-y", "@acme/mcp-server@2.0.0"]);
+
+        // 2. PyPI gets `==version` pinned, while already-pinned stays untouched.
+        let (py_cmd, py_args, py_hosts) =
+            infer_package_command("pypi", "mcp-server-sqlite", Some("0.9.1"), false).unwrap();
+        assert_eq!(py_cmd, "uvx");
+        assert_eq!(py_args, vec!["mcp-server-sqlite==0.9.1"]);
+        assert_eq!(
+            py_hosts,
+            vec!["pypi.org".to_string(), "files.pythonhosted.org".to_string()]
+        );
+
+        let (_, already_py, _) =
+            infer_package_command("pypi", "mcp-server-sqlite==0.8.0", Some("0.9.1"), false)
+                .unwrap();
+        assert_eq!(already_py, vec!["mcp-server-sqlite==0.8.0"]);
+
+        // 3. OCI gets `:version` or `@sha256:...` digest + hardened read-only/no-net/cap-drop flags.
+        let (oci_cmd, oci_args, oci_hosts) =
+            infer_package_command("oci", "ghcr.io/acme/mcp-git", Some("1.4.0"), false).unwrap();
+        assert_eq!(oci_cmd, "docker");
+        assert!(oci_hosts.is_empty());
+        assert!(oci_args.contains(&"--read-only".to_string()));
+        assert!(oci_args.contains(&"--cap-drop=ALL".to_string()));
+        assert!(oci_args.contains(&"--security-opt=no-new-privileges".to_string()));
+        assert!(oci_args.contains(&"--network=none".to_string()));
+        assert_eq!(oci_args.last().unwrap(), "ghcr.io/acme/mcp-git:1.4.0");
+
+        let (_, digest_args, _) = infer_package_command(
+            "oci",
+            "ghcr.io/acme/mcp-git",
+            Some("sha256:abcdef0123456789"),
+            false,
+        )
+        .unwrap();
+        assert_eq!(
+            digest_args.last().unwrap(),
+            "ghcr.io/acme/mcp-git@sha256:abcdef0123456789"
+        );
+    }
+
+    #[test]
+    fn package_identifier_validation_rejects_flag_injection_and_url_smuggling() {
+        assert!(infer_package_command("npm", "--eval=evil", None, false).is_err());
+        assert!(infer_package_command("npm", "pkg;rm -rf /", None, false).is_err());
+        assert!(infer_package_command("npm", "git+https://evil.example/repo", None, false).is_err());
+        assert!(infer_package_command("pypi", "file:/etc/passwd", None, false).is_err());
+        assert!(infer_package_command("oci", "../escape:latest", None, false).is_err());
+    }
+
+    #[tokio::test]
+    async fn resolve_install_target_handles_local_and_https_mcpb_and_oci_prefixes() {
+        let tmp = tempfile::tempdir().unwrap();
+        let client = McpRegistryClient::new(tmp.path());
+
+        let local_mcpb = tmp.path().join("my-local-server.mcpb");
+        std::fs::write(&local_mcpb, b"PK").unwrap();
+
+        match client
+            .resolve_install_target(local_mcpb.to_str().unwrap(), None, false)
+            .await
+            .unwrap()
+        {
+            ResolvedInstallTarget::Candidate(c) => {
+                assert_eq!(c.server_id, "my-local-server");
+                assert_eq!(c.transport_kind, "stdio");
+                let pkg = c.package_spec.unwrap();
+                assert_eq!(pkg.registry_type, "mcpb");
+                assert_eq!(pkg.command, "mcpb");
+                assert_eq!(pkg.identifier, local_mcpb.to_str().unwrap());
+            }
+            other => panic!("Expected candidate for local .mcpb, got {other:?}"),
+        }
+
+        match client
+            .resolve_install_target("https://downloads.example.com/tools/git-helper.mcpb", None, false)
+            .await
+            .unwrap()
+        {
+            ResolvedInstallTarget::Candidate(c) => {
+                assert_eq!(c.server_id, "git-helper");
+                let pkg = c.package_spec.unwrap();
+                assert_eq!(pkg.registry_type, "mcpb");
+                assert_eq!(
+                    pkg.identifier,
+                    "https://downloads.example.com/tools/git-helper.mcpb"
+                );
+            }
+            other => panic!("Expected candidate for https .mcpb, got {other:?}"),
+        }
+
+        match client
+            .resolve_install_target("oci:ghcr.io/acme/mcp-fs:2.1.0", None, false)
+            .await
+            .unwrap()
+        {
+            ResolvedInstallTarget::Candidate(c) => {
+                assert_eq!(c.server_id, "fs");
+                let pkg = c.package_spec.unwrap();
+                assert_eq!(pkg.registry_type, "oci");
+                assert_eq!(pkg.command, "docker");
+                assert!(pkg.args.contains(&"--network=none".to_string()));
+                assert_eq!(pkg.args.last().unwrap(), "ghcr.io/acme/mcp-fs:2.1.0");
+            }
+            other => panic!("Expected candidate for oci target, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn airgapped_mode_disables_public_fallback_and_blocks_external_urls() {
+        let payload = json!({
+            "servers": [{
+                "server": {
+                    "name": "corp.internal/docs-mcp",
+                    "title": "Internal Docs MCP",
+                    "version": "1.0.0",
+                    "remotes": [{
+                        "type": "streamable-http",
+                        "url": "https://docs.corp.internal/mcp"
+                    }]
+                }
+            }]
+        });
+        let addr = spawn_mock_http_server(vec![(
+            "/v0.1/servers",
+            200,
+            "application/json",
+            payload.to_string(),
+        )])
+        .await;
+
+        let tmp = tempfile::tempdir().unwrap();
+        let client = McpRegistryClient::new(tmp.path());
+
+        // 1. Enabling air-gapped mode with no private registry configured fails closed.
+        let cfg = client.set_disable_public_registry(true).await.unwrap();
+        assert!(cfg.disable_public_registry);
+        assert!(client.configured_registries().is_empty());
+        let search_err = client.search("docs", 5, true).await.unwrap_err();
+        assert!(search_err.to_string().contains("air-gapped"), "{search_err}");
+
+        // 2. Arbitrary external URLs and remote `.mcpb` URLs are blocked in air-gapped mode.
+        let url_err = client
+            .resolve_install_target("https://evil.example.com/mcp", None, false)
+            .await
+            .unwrap_err();
+        assert!(url_err.to_string().contains("air-gapped"), "{url_err}");
+        let mcpb_err = client
+            .resolve_install_target("https://evil.example.com/tool.mcpb", None, false)
+            .await
+            .unwrap_err();
+        assert!(mcpb_err.to_string().contains("air-gapped"), "{mcpb_err}");
+
+        // 3. Configuring an enterprise private registry enables discovery strictly against it.
+        client
+            .add_registry(&format!("http://{addr}"), true)
+            .await
+            .unwrap();
+        let results = client.search("docs", 5, true).await.unwrap();
+        assert_eq!(results.len(), 1);
+        assert_eq!(results[0].name, "corp.internal/docs-mcp");
+        assert_eq!(results[0].allowed_hosts, vec!["docs.corp.internal".to_string()]);
     }
 }

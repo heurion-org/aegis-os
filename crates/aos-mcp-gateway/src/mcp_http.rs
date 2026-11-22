@@ -784,6 +784,61 @@ impl<R: AsyncBufRead + Unpin> BoundedBodyReader<R> {
 /// Dispatches an asynchronous HTTP/1.1 / HTTPS JSON-RPC request or notification with full
 /// MCP Streamable HTTP semantics (`202 Accepted`, `401 Unauthorized`, `404` expired session,
 /// chunked `text/event-stream` SSE incremental notification delivery, and per-frame idle timeout).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum SseStreamExit {
+    Closed,
+    Unsupported(u16),
+}
+
+fn append_custom_http_headers(
+    req_head: &mut String,
+    headers: &[(String, String)],
+    mcp_session_id: Option<&str>,
+    skip_headers: &[&str],
+) -> anyhow::Result<bool> {
+    let mut sent_session_header = false;
+    for (k, v) in headers {
+        validate_header_kv(k, v)?;
+        let lower = k.to_ascii_lowercase();
+        if skip_headers.contains(&lower.as_str()) {
+            continue;
+        }
+        if lower == "mcp-session-id" {
+            sent_session_header = true;
+        }
+        req_head.push_str(&format!("{k}: {v}\r\n"));
+    }
+    if let Some(sid) = mcp_session_id.filter(|s| !s.trim().is_empty()) {
+        if !sent_session_header {
+            validate_header_kv("Mcp-Session-Id", sid)?;
+            req_head.push_str(&format!("Mcp-Session-Id: {}\r\n", sid.trim()));
+            sent_session_header = true;
+        }
+    }
+    Ok(sent_session_header)
+}
+
+fn flush_sse_json_event(ev_name: &mut String, data_lines: &mut Vec<String>) -> Option<Value> {
+    let event_type = std::mem::take(ev_name);
+    if data_lines.is_empty() {
+        return None;
+    }
+    let joined = data_lines.join("\n");
+    data_lines.clear();
+    if !event_type.is_empty() && event_type != "message" {
+        return None;
+    }
+    let trimmed = joined.trim();
+    if trimmed.is_empty() || trimmed == "[DONE]" {
+        return None;
+    }
+    serde_json::from_str::<Value>(trimmed).ok()
+}
+
+fn is_server_initiated_jsonrpc(val: &Value) -> bool {
+    val.get("method").is_some() && val.get("result").is_none() && val.get("error").is_none()
+}
+
 #[allow(clippy::too_many_arguments)]
 pub async fn send_http_jsonrpc_streaming(
     raw_url: &str,
@@ -807,34 +862,20 @@ pub async fn send_http_jsonrpc_streaming(
         body_bytes.len()
     );
 
-    let mut sent_session_header = false;
-    for (k, v) in headers {
-        validate_header_kv(k, v)?;
-        let lower = k.to_ascii_lowercase();
-        if matches!(
-            lower.as_str(),
-            "host"
-                | "content-length"
-                | "transfer-encoding"
-                | "connection"
-                | "accept-encoding"
-                | "content-type"
-                | "accept"
-        ) {
-            continue;
-        }
-        if lower == "mcp-session-id" {
-            sent_session_header = true;
-        }
-        req_head.push_str(&format!("{k}: {v}\r\n"));
-    }
-    if let Some(sid) = mcp_session_id.filter(|s| !s.trim().is_empty()) {
-        if !sent_session_header {
-            validate_header_kv("Mcp-Session-Id", sid)?;
-            req_head.push_str(&format!("Mcp-Session-Id: {}\r\n", sid.trim()));
-            sent_session_header = true;
-        }
-    }
+    let sent_session_header = append_custom_http_headers(
+        &mut req_head,
+        headers,
+        mcp_session_id,
+        &[
+            "host",
+            "content-length",
+            "transfer-encoding",
+            "connection",
+            "accept-encoding",
+            "content-type",
+            "accept",
+        ],
+    )?;
     req_head.push_str("\r\n");
 
     tokio::time::timeout(Duration::from_millis(DEFAULT_CONNECT_TIMEOUT_MS), async {
@@ -894,43 +935,27 @@ pub async fn send_http_jsonrpc_streaming(
                               ev_name: &mut String,
                               notifications: &mut Vec<Value>,
                               final_payload: &mut Option<Value>| {
-            let event_type = std::mem::take(ev_name);
-            if lines.is_empty() {
+            let Some(val) = flush_sse_json_event(ev_name, lines) else {
                 return;
-            }
-            let joined = lines.join("\n");
-            lines.clear();
-            if !event_type.is_empty() && event_type != "message" {
-                return;
-            }
-            let trimmed = joined.trim();
-            if trimmed.is_empty() || trimmed == "[DONE]" {
-                return;
-            }
-            if let Ok(val) = serde_json::from_str::<Value>(trimmed) {
-                let is_notification = val.get("method").is_some()
-                    && (val.get("id").is_none() || val.get("id") == Some(&Value::Null))
-                    && val.get("result").is_none()
-                    && val.get("error").is_none();
-                if is_notification {
-                    notifications.push(val.clone());
-                    if let Some(ref tx) = on_notification {
-                        let _ = tx.send(val);
-                    }
-                    return;
+            };
+            if is_server_initiated_jsonrpc(&val) {
+                notifications.push(val.clone());
+                if let Some(ref tx) = on_notification {
+                    let _ = tx.send(val);
                 }
-                let is_response =
-                    (val.get("result").is_some() || val.get("error").is_some())
-                        && val.get("method").is_none();
-                if is_response {
-                    let id_matches = match (&expected_id, val.get("id")) {
-                        (Some(exp), Some(got)) => exp == got,
-                        (Some(_), None) => false,
-                        (None, _) => true,
-                    };
-                    if id_matches {
-                        *final_payload = Some(val);
-                    }
+                return;
+            }
+            let is_response =
+                (val.get("result").is_some() || val.get("error").is_some())
+                    && val.get("method").is_none();
+            if is_response {
+                let id_matches = match (&expected_id, val.get("id")) {
+                    (Some(exp), Some(got)) => exp == got,
+                    (Some(_), None) => false,
+                    (None, _) => true,
+                };
+                if id_matches {
+                    *final_payload = Some(val);
                 }
             }
         };
@@ -1015,6 +1040,96 @@ pub async fn send_http_jsonrpc_streaming(
         }
     }
     bail!("upstream MCP HTTP returned non-JSON payload: {}", trimmed)
+}
+
+/// Opens an optional MCP Streamable HTTP `GET` SSE server-notification stream with strict SSRF
+/// DNS-pinning and bounded line parsing, emitting server notifications and requests to `on_event`.
+pub async fn open_http_sse_notification_stream(
+    url: &str,
+    headers: &[(String, String)],
+    mcp_session_id: Option<&str>,
+    allow_local_http: bool,
+    idle_timeout: Duration,
+    on_event: tokio::sync::mpsc::UnboundedSender<Value>,
+) -> anyhow::Result<SseStreamExit> {
+    let resolved = resolve_and_validate_mcp_endpoint_strict(url, allow_local_http).await?;
+    let mut stream =
+        connect_endpoint(&resolved, Duration::from_millis(DEFAULT_CONNECT_TIMEOUT_MS)).await?;
+
+    let mut req_head = format!(
+        "GET {} HTTP/1.1\r\nHost: {}\r\nAccept: text/event-stream\r\nCache-Control: no-cache\r\nAccept-Encoding: identity\r\nConnection: close\r\n",
+        resolved.path_and_query,
+        resolved.host_header()
+    );
+    let _ = append_custom_http_headers(
+        &mut req_head,
+        headers,
+        mcp_session_id,
+        &[
+            "host",
+            "content-length",
+            "transfer-encoding",
+            "connection",
+            "accept-encoding",
+            "accept",
+            "cache-control",
+        ],
+    )?;
+    req_head.push_str("\r\n");
+
+    tokio::time::timeout(Duration::from_millis(DEFAULT_CONNECT_TIMEOUT_MS), async {
+        stream.write_all(req_head.as_bytes()).await?;
+        stream.flush().await
+    })
+    .await
+    .map_err(|_| anyhow::anyhow!("Timed out sending MCP HTTP GET SSE request"))??;
+
+    let mut reader = BufReader::new(stream);
+    let (status, resp_headers) = read_http_head(&mut reader, idle_timeout).await?;
+    let content_type = resp_headers
+        .get("content-type")
+        .map(|s| s.to_ascii_lowercase())
+        .unwrap_or_default();
+
+    if status == 401 {
+        bail!("upstream MCP HTTP GET SSE returned 401 Unauthorized");
+    }
+    if matches!(status, 204 | 404 | 405) || !content_type.contains("text/event-stream") {
+        return Ok(SseStreamExit::Unsupported(status));
+    }
+
+    let body_kind = BodyKind::from_headers(&resp_headers)?;
+    let mut sse_reader = BoundedBodyReader::new(reader, body_kind);
+    let mut data_lines: Vec<String> = Vec::new();
+    let mut current_event = String::new();
+
+    while let Some(line) = sse_reader.next_line(idle_timeout).await? {
+        if line.is_empty() {
+            if let Some(val) = flush_sse_json_event(&mut current_event, &mut data_lines) {
+                if is_server_initiated_jsonrpc(&val) && on_event.send(val).is_err() {
+                    return Ok(SseStreamExit::Closed);
+                }
+            }
+            if on_event.is_closed() {
+                return Ok(SseStreamExit::Closed);
+            }
+            continue;
+        }
+        if line.starts_with(':') {
+            continue;
+        }
+        if let Some(ev) = line.strip_prefix("event:") {
+            current_event = ev.trim().to_string();
+        } else if let Some(data) = line.strip_prefix("data:") {
+            data_lines.push(data.trim_start().to_string());
+        }
+    }
+    if let Some(val) = flush_sse_json_event(&mut current_event, &mut data_lines) {
+        if is_server_initiated_jsonrpc(&val) {
+            let _ = on_event.send(val);
+        }
+    }
+    Ok(SseStreamExit::Closed)
 }
 
 /// Simple bounded async HTTP/1.1 / HTTPS helper for OAuth discovery/token/device flows and
@@ -1271,5 +1386,146 @@ mod tests {
         .await
         .unwrap();
         assert!(matches!(r3, HttpRpcOutcome::SessionExpired));
+    }
+
+    #[tokio::test]
+    async fn http_sse_captures_server_initiated_elicitation_and_get_sse_streams_list_changed() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+
+        tokio::spawn(async move {
+            for idx in 0..3 {
+                let (mut sock, _) = listener.accept().await.unwrap();
+                let mut req_buf = vec![0u8; 4096];
+                let n = tokio::io::AsyncReadExt::read(&mut sock, &mut req_buf)
+                    .await
+                    .unwrap_or(0);
+                let raw = String::from_utf8_lossy(&req_buf[..n]).to_string();
+                let write_chunk = |data: &str| format!("{:x}\r\n{}\r\n", data.len(), data);
+
+                match idx {
+                    0 => {
+                        assert!(raw.starts_with("POST /mcp "), "{raw}");
+                        let head = concat!(
+                            "HTTP/1.1 200 OK\r\n",
+                            "Content-Type: text/event-stream\r\n",
+                            "Transfer-Encoding: chunked\r\n",
+                            "Mcp-Session-Id: sid-sse\r\n",
+                            "\r\n"
+                        );
+                        sock.write_all(head.as_bytes()).await.unwrap();
+                        let e1 = format!(
+                            "data: {}\n\n",
+                            json!({ "jsonrpc": "2.0", "method": "notifications/tools/list_changed" })
+                        );
+                        let e2 = format!(
+                            "data: {}\n\n",
+                            json!({
+                                "jsonrpc": "2.0",
+                                "id": 77,
+                                "method": "elicitation/create",
+                                "params": { "message": "enter secret" }
+                            })
+                        );
+                        let final_ev = format!(
+                            "data: {}\n\n",
+                            json!({
+                                "jsonrpc": "2.0",
+                                "id": 10,
+                                "result": { "content": [{ "type": "text", "text": "done" }] }
+                            })
+                        );
+                        sock.write_all(write_chunk(&e1).as_bytes()).await.unwrap();
+                        sock.write_all(write_chunk(&e2).as_bytes()).await.unwrap();
+                        sock.write_all(write_chunk(&final_ev).as_bytes()).await.unwrap();
+                        sock.write_all(b"0\r\n\r\n").await.unwrap();
+                    }
+                    1 => {
+                        assert!(raw.starts_with("GET /mcp "), "{raw}");
+                        assert!(raw.to_ascii_lowercase().contains("mcp-session-id: sid-sse"));
+                        let body = format!(
+                            ": keepalive\n\ndata: {}\n\n",
+                            json!({ "jsonrpc": "2.0", "method": "notifications/resources/list_changed" })
+                        );
+                        let resp = format!(
+                            "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                            body.len(),
+                            body
+                        );
+                        sock.write_all(resp.as_bytes()).await.unwrap();
+                    }
+                    _ => {
+                        assert!(raw.starts_with("GET /mcp "), "{raw}");
+                        let resp = "HTTP/1.1 405 Method Not Allowed\r\nAllow: POST\r\nContent-Length: 0\r\nConnection: close\r\n\r\n";
+                        sock.write_all(resp.as_bytes()).await.unwrap();
+                    }
+                }
+                sock.flush().await.unwrap();
+            }
+        });
+
+        let url = format!("http://{addr}/mcp");
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+        let outcome = send_http_jsonrpc_streaming(
+            &url,
+            &[],
+            &json!({ "jsonrpc": "2.0", "id": 10, "method": "tools/call", "params": {} }),
+            None,
+            true,
+            true,
+            Duration::from_secs(5),
+            Some(tx),
+        )
+        .await
+        .unwrap();
+
+        match outcome {
+            HttpRpcOutcome::Response {
+                payload,
+                mcp_session_id,
+                notifications,
+            } => {
+                assert_eq!(mcp_session_id.as_deref(), Some("sid-sse"));
+                assert_eq!(payload["id"], 10);
+                assert_eq!(notifications.len(), 2);
+                assert_eq!(notifications[0]["method"], "notifications/tools/list_changed");
+                assert_eq!(notifications[1]["method"], "elicitation/create");
+                assert_eq!(notifications[1]["id"], 77);
+            }
+            other => panic!("expected Response, got {other:?}"),
+        }
+        let mut live = Vec::new();
+        while let Ok(v) = rx.try_recv() {
+            live.push(v);
+        }
+        assert_eq!(live.len(), 2);
+
+        let (get_tx, mut get_rx) = tokio::sync::mpsc::unbounded_channel();
+        let exit1 = open_http_sse_notification_stream(
+            &url,
+            &[],
+            Some("sid-sse"),
+            true,
+            Duration::from_secs(5),
+            get_tx,
+        )
+        .await
+        .unwrap();
+        assert_eq!(exit1, SseStreamExit::Closed);
+        let ev = get_rx.try_recv().unwrap();
+        assert_eq!(ev["method"], "notifications/resources/list_changed");
+
+        let (get_tx2, _get_rx2) = tokio::sync::mpsc::unbounded_channel();
+        let exit2 = open_http_sse_notification_stream(
+            &url,
+            &[],
+            Some("sid-sse"),
+            true,
+            Duration::from_secs(5),
+            get_tx2,
+        )
+        .await
+        .unwrap();
+        assert_eq!(exit2, SseStreamExit::Unsupported(405));
     }
 }

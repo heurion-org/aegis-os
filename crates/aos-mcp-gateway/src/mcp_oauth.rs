@@ -367,47 +367,53 @@ impl McpOAuthManager {
     ) -> anyhow::Result<OAuthServerMetadata> {
         let (origin, path) = split_origin_and_path(issuer_or_resource_url)?;
 
-        // 1. Optional RFC 9728 Protected Resource Metadata lookup
-        let pr_url = if path.is_empty() {
-            format!("{origin}/.well-known/oauth-protected-resource")
+        // 1. Optional RFC 9728 Protected Resource Metadata lookup (path-suffixed first, then origin root)
+        let pr_urls = if path.is_empty() {
+            vec![format!("{origin}/.well-known/oauth-protected-resource")]
         } else {
-            format!("{origin}/.well-known/oauth-protected-resource{path}")
+            vec![
+                format!("{origin}/.well-known/oauth-protected-resource{path}"),
+                format!("{origin}/.well-known/oauth-protected-resource"),
+            ]
         };
         let mut issuer_base = issuer_or_resource_url.trim().trim_end_matches('/').to_string();
-        if let Ok((status, _, body)) = simple_http_request(
-            "GET",
-            &pr_url,
-            &[("Accept".to_string(), "application/json".to_string())],
-            None,
-            allow_local_http,
-            10_000,
-        )
-        .await
-        {
-            if (200..300).contains(&status) {
-                if let Ok(pr_json) = serde_json::from_slice::<Value>(&body) {
-                    let resource_ok = pr_json
-                        .get("resource")
-                        .and_then(|v| v.as_str())
-                        .is_none_or(|res_url| {
-                            split_origin_and_path(res_url)
-                                .is_ok_and(|(ro, _)| ro == origin)
-                        });
-                    if resource_ok {
-                        if let Some(first_auth) = pr_json
-                            .get("authorization_servers")
-                            .and_then(|v| v.as_array())
-                            .and_then(|arr| arr.first())
+        'pr_probe: for pr_url in pr_urls {
+            if let Ok((status, _, body)) = simple_http_request(
+                "GET",
+                &pr_url,
+                &[("Accept".to_string(), "application/json".to_string())],
+                None,
+                allow_local_http,
+                10_000,
+            )
+            .await
+            {
+                if (200..300).contains(&status) {
+                    if let Ok(pr_json) = serde_json::from_slice::<Value>(&body) {
+                        let resource_ok = pr_json
+                            .get("resource")
                             .and_then(|v| v.as_str())
-                        {
-                            let cand = first_auth.trim().trim_end_matches('/').to_string();
-                            if crate::mcp_http::validate_mcp_http_url_syntax(
-                                &cand,
-                                allow_local_http,
-                            )
-                            .is_ok()
+                            .is_none_or(|res_url| {
+                                split_origin_and_path(res_url)
+                                    .is_ok_and(|(ro, _)| ro == origin)
+                            });
+                        if resource_ok {
+                            if let Some(first_auth) = pr_json
+                                .get("authorization_servers")
+                                .and_then(|v| v.as_array())
+                                .and_then(|arr| arr.first())
+                                .and_then(|v| v.as_str())
                             {
-                                issuer_base = cand;
+                                let cand = first_auth.trim().trim_end_matches('/').to_string();
+                                if crate::mcp_http::validate_mcp_http_url_syntax(
+                                    &cand,
+                                    allow_local_http,
+                                )
+                                .is_ok()
+                                {
+                                    issuer_base = cand;
+                                    break 'pr_probe;
+                                }
                             }
                         }
                     }
@@ -415,24 +421,50 @@ impl McpOAuthManager {
             }
         }
 
-        // 2. RFC 8414 & OIDC discovery candidates
+        // 2. RFC 8414 & OIDC discovery candidates (path-scoped first, then origin-root fallback)
         let (iss_origin, iss_path) = split_origin_and_path(&issuer_base)?;
         let expected_iss = if iss_path.is_empty() {
             iss_origin.clone()
         } else {
             format!("{iss_origin}{iss_path}")
         };
-        let mut candidates = Vec::new();
-        if iss_path.is_empty() {
-            candidates.push(format!("{iss_origin}/.well-known/oauth-authorization-server"));
-            candidates.push(format!("{iss_origin}/.well-known/openid-configuration"));
+        let candidates: Vec<(String, String)> = if iss_path.is_empty() {
+            vec![
+                (
+                    format!("{iss_origin}/.well-known/oauth-authorization-server"),
+                    iss_origin.clone(),
+                ),
+                (
+                    format!("{iss_origin}/.well-known/openid-configuration"),
+                    iss_origin.clone(),
+                ),
+            ]
         } else {
-            candidates.push(format!("{iss_origin}/.well-known/oauth-authorization-server{iss_path}"));
-            candidates.push(format!("{iss_origin}{iss_path}/.well-known/oauth-authorization-server"));
-            candidates.push(format!("{iss_origin}{iss_path}/.well-known/openid-configuration"));
-        }
+            vec![
+                (
+                    format!("{iss_origin}/.well-known/oauth-authorization-server{iss_path}"),
+                    expected_iss.clone(),
+                ),
+                (
+                    format!("{iss_origin}{iss_path}/.well-known/oauth-authorization-server"),
+                    expected_iss.clone(),
+                ),
+                (
+                    format!("{iss_origin}{iss_path}/.well-known/openid-configuration"),
+                    expected_iss.clone(),
+                ),
+                (
+                    format!("{iss_origin}/.well-known/oauth-authorization-server"),
+                    iss_origin.clone(),
+                ),
+                (
+                    format!("{iss_origin}/.well-known/openid-configuration"),
+                    iss_origin.clone(),
+                ),
+            ]
+        };
 
-        for url in candidates {
+        for (url, cand_expected_iss) in candidates {
             let Ok((status, _, body)) = simple_http_request(
                 "GET",
                 &url,
@@ -449,7 +481,7 @@ impl McpOAuthManager {
                 if let Ok(meta) = serde_json::from_slice::<OAuthServerMetadata>(&body) {
                     if let Some(ref got_iss) = meta.issuer {
                         let norm_got = got_iss.trim().trim_end_matches('/').to_ascii_lowercase();
-                        if norm_got != expected_iss.to_ascii_lowercase() {
+                        if norm_got != cand_expected_iss.to_ascii_lowercase() {
                             continue;
                         }
                     }

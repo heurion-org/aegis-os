@@ -40,15 +40,16 @@ pub mod approver;
 pub mod mcp_bundle;
 pub mod mcp_firewall;
 pub mod mcp_http;
+pub mod mcp_mcpb;
 pub mod mcp_oauth;
 pub mod mcp_registry;
 pub mod paas;
 use mcp_bundle::{BundleInstallOptions, McpBundleManager};
 use mcp_firewall::{
-    sanitize_server_id, McpProxySessionPool, McpServerPolicy, McpTrustLevel, OutboxStatus,
-    UpstreamTransportSpec,
+    sanitize_server_id, McpProxySessionPool, McpServerPolicy, McpToolRiskClass, McpTrustLevel,
+    OutboxStatus, UpstreamTransportSpec,
 };
-use mcp_oauth::RealmUpsertSpec;
+use mcp_oauth::{AuthorizeUrlCallback, DevicePromptCallback, RealmUpsertSpec};
 use mcp_registry::{
     derive_exact_allowed_hosts, McpRegistryClient, ResolvedInstallTarget,
 };
@@ -3289,9 +3290,7 @@ fn is_operator_only_route(method: &str, target: &str) -> bool {
         || path.starts_with("/v1/orgs")
         || path.starts_with("/v1/workspaces/gc-idle")
         || path.starts_with("/v1/telemetry/stats")
-        || path.starts_with("/v1/mcp/inventory")
-        || path.starts_with("/v1/mcp/logout")
-        || path.starts_with("/v1/mcp/policy")
+        || path.starts_with("/v1/mcp/")
         || ((path.starts_with("/api/status") || path.starts_with("/v1/status"))
             && requested_orgs(target, "").iter().any(|o| o == "*"))
 }
@@ -3362,6 +3361,27 @@ pub type PostInstallHookFn = Arc<
         + Sync,
 >;
 
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct McpWebOAuthSession {
+    pub session_id: String,
+    pub org_id: String,
+    pub realm_id: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub server_id: Option<String>,
+    pub flow: String,
+    pub status: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub authorize_url: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub verification_uri: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub user_code: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub error: Option<String>,
+    pub created_at_ms: i64,
+    pub updated_at_ms: i64,
+}
+
 type HotBridgedMcpMap = HashMap<(String, String), BTreeSet<String>>;
 
 pub struct AegisRuntimeKernel {
@@ -3385,7 +3405,9 @@ pub struct AegisRuntimeKernel {
     mounted_mcp_servers: Arc<RwLock<Vec<MountedMcpServer>>>,
     hot_bridged_mcp_servers: Arc<RwLock<HotBridgedMcpMap>>,
     pending_mcp_inline_creds: Arc<RwLock<HashMap<String, InlineMcpApprovalCreds>>>,
+    mcp_oauth_sessions: Arc<RwLock<HashMap<String, McpWebOAuthSession>>>,
     mcp_post_install_hook: Arc<RwLock<Option<PostInstallHookFn>>>,
+    mcp_notifications_tx: tokio::sync::broadcast::Sender<Value>,
     active_host_exec_runs: Arc<std::sync::atomic::AtomicUsize>,
     host_exec_config: RwLock<Option<HostExecBrokerConfig>>,
 }
@@ -3534,10 +3556,368 @@ impl AegisRuntimeKernel {
             mounted_mcp_servers: Arc::new(RwLock::new(Vec::new())),
             hot_bridged_mcp_servers: Arc::new(RwLock::new(HashMap::new())),
             pending_mcp_inline_creds: Arc::new(RwLock::new(HashMap::new())),
+            mcp_oauth_sessions: Arc::new(RwLock::new(HashMap::new())),
             mcp_post_install_hook: Arc::new(RwLock::new(None)),
+            mcp_notifications_tx: tokio::sync::broadcast::channel(64).0,
             active_host_exec_runs: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
             host_exec_config: RwLock::new(None),
         })
+    }
+
+    pub fn subscribe_mcp_notifications(&self) -> tokio::sync::broadcast::Receiver<Value> {
+        self.mcp_notifications_tx.subscribe()
+    }
+
+    pub fn emit_mcp_notification(&self, method: &str, params: Option<Value>) {
+        let mut msg = json!({
+            "jsonrpc": "2.0",
+            "method": method,
+        });
+        if let Some(p) = params {
+            if let Some(obj) = msg.as_object_mut() {
+                obj.insert("params".to_string(), p);
+            }
+        }
+        let _ = self.mcp_notifications_tx.send(msg);
+    }
+
+    pub async fn get_web_mcp_oauth_session(&self, session_id: &str) -> Option<McpWebOAuthSession> {
+        let now_ms = Utc::now().timestamp_millis();
+        let mut guard = self.mcp_oauth_sessions.write().await;
+        guard.retain(|_, s| now_ms.saturating_sub(s.created_at_ms) <= 900_000);
+        guard.get(session_id.trim()).cloned()
+    }
+
+    fn redact_outbox_ticket_json(t: &mcp_firewall::McpOutboxTicket) -> Value {
+        json!({
+            "ticket_id": t.ticket_id,
+            "org_id": t.org_id,
+            "agent_id": t.agent_id,
+            "session_id": t.session_id,
+            "server_id": t.server_id,
+            "tool_name": t.tool_name,
+            "risk_class": t.risk_class,
+            "preview_arguments": t.preview_arguments,
+            "payload_sha256": t.payload_sha256,
+            "tainted": t.taint_snapshot.is_some(),
+            "taint_snapshot": t.taint_snapshot,
+            "dry_run_only": t.dry_run_only,
+            "status": t.status,
+            "dispatch_result": t.dispatch_result,
+            "dispatch_error": t.dispatch_error,
+            "created_at_ms": t.created_at_ms,
+            "decided_at_ms": t.decided_at_ms,
+            "decided_by": t.decided_by,
+        })
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub async fn start_web_mcp_oauth_session(
+        self: &Arc<Self>,
+        org_id: &str,
+        server_id: Option<&str>,
+        realm_id: Option<&str>,
+        remote_url: Option<&str>,
+        issuer_url: Option<&str>,
+        client_id: Option<&str>,
+        allowed_hosts: Vec<String>,
+        scopes: Vec<String>,
+        flow_mode: &str,
+        allow_local_http: bool,
+    ) -> anyhow::Result<McpWebOAuthSession> {
+        let srv_opt = if let Some(sid) = server_id.map(str::trim).filter(|s| !s.is_empty()) {
+            self.mcp_firewall.get_server(org_id, sid).await
+        } else {
+            None
+        };
+
+        let mut eff_remote_url = remote_url
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .map(str::to_string);
+        let mut eff_local = allow_local_http;
+        let mut srv_realm: Option<String> = None;
+        let resolved_server_id = srv_opt
+            .as_ref()
+            .map(|s| s.server_id.clone())
+            .or_else(|| {
+                server_id
+                    .map(str::trim)
+                    .filter(|s| !s.is_empty())
+                    .map(sanitize_server_id)
+            });
+
+        if let Some(ref srv) = srv_opt {
+            eff_local |= srv.allow_local_http;
+            srv_realm = srv.auth_realm.clone();
+            match &srv.transport {
+                UpstreamTransportSpec::Http { url, .. } => {
+                    if eff_remote_url.is_none() {
+                        eff_remote_url = Some(url.clone());
+                    }
+                }
+                UpstreamTransportSpec::Stdio { .. } => {
+                    bail!(
+                        "MCP server '{}' uses stdio transport and does not support OAuth 2.1",
+                        srv.server_id
+                    );
+                }
+            }
+        }
+
+        let raw_realm = realm_id
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .or(srv_realm.as_deref())
+            .or(resolved_server_id.as_deref())
+            .context("Missing `server_id` or `realm_id` for OAuth flow")?;
+        let clean_realm = mcp_oauth::sanitize_realm_id(raw_realm)?;
+
+        let mut hosts = allowed_hosts;
+        if hosts.is_empty() {
+            if let Some(ref u) = eff_remote_url {
+                hosts.extend(derive_exact_allowed_hosts(u));
+            }
+            if let Some(iss) = issuer_url.map(str::trim).filter(|s| !s.is_empty()) {
+                for h in derive_exact_allowed_hosts(iss) {
+                    if !hosts.contains(&h) {
+                        hosts.push(h);
+                    }
+                }
+            }
+        }
+
+        let clean_issuer = issuer_url
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .map(str::to_string);
+        let clean_client = client_id
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .map(str::to_string);
+
+        let existing = self.mcp_oauth.get_realm(org_id, &clean_realm).await;
+        if existing.is_none() && eff_remote_url.is_none() && clean_issuer.is_none() {
+            bail!(
+                "OAuth realm '{}' has no endpoint metadata or remote_url",
+                clean_realm
+            );
+        }
+
+        self.mcp_oauth
+            .upsert_realm_config(
+                org_id,
+                &clean_realm,
+                RealmUpsertSpec {
+                    allowed_hosts: hosts.clone(),
+                    issuer_url: clean_issuer.clone().or_else(|| {
+                        existing
+                            .as_ref()
+                            .and_then(|r| r.issuer_url.clone())
+                            .or_else(|| eff_remote_url.clone())
+                    }),
+                    client_id: clean_client.clone(),
+                    scopes: scopes.clone(),
+                    allow_local_http: eff_local,
+                    ..Default::default()
+                },
+            )
+            .await?;
+
+        let realm = self
+            .mcp_oauth
+            .get_realm(org_id, &clean_realm)
+            .await
+            .context("loading updated OAuth realm")?;
+        eff_local |= realm.allow_local_http;
+        let issuer_hint = clean_issuer
+            .or_else(|| realm.issuer_url.clone())
+            .or_else(|| eff_remote_url.clone());
+
+        let chosen_flow = match flow_mode.trim().to_ascii_lowercase().as_str() {
+            "pkce" => "pkce".to_string(),
+            "device" | "device_code" => "device_code".to_string(),
+            _ => {
+                if realm.authorization_endpoint.is_some() {
+                    "pkce".to_string()
+                } else if realm.device_authorization_endpoint.is_some() {
+                    "device_code".to_string()
+                } else if let Some(ref target) = issuer_hint {
+                    let meta =
+                        McpOAuthManager::discover_oauth_metadata(target, eff_local).await?;
+                    if meta.authorization_endpoint.is_some() {
+                        "pkce".to_string()
+                    } else if meta.device_authorization_endpoint.is_some() {
+                        "device_code".to_string()
+                    } else {
+                        bail!("Discovered OAuth metadata exposes neither authorization_endpoint nor device_authorization_endpoint");
+                    }
+                } else {
+                    bail!("OAuth endpoints missing for realm '{}'", clean_realm);
+                }
+            }
+        };
+
+        let now_ms = Utc::now().timestamp_millis();
+        let session_id = format!("oauth-{}", Uuid::new_v4().simple());
+        let init_session = McpWebOAuthSession {
+            session_id: session_id.clone(),
+            org_id: org_id.to_string(),
+            realm_id: clean_realm.clone(),
+            server_id: resolved_server_id.clone(),
+            flow: chosen_flow.clone(),
+            status: "starting".to_string(),
+            authorize_url: None,
+            verification_uri: None,
+            user_code: None,
+            error: None,
+            created_at_ms: now_ms,
+            updated_at_ms: now_ms,
+        };
+        {
+            let mut guard = self.mcp_oauth_sessions.write().await;
+            guard.retain(|_, s| now_ms.saturating_sub(s.created_at_ms) <= 900_000);
+            guard.insert(session_id.clone(), init_session.clone());
+        }
+
+        let kernel = Arc::clone(self);
+        let sid_task = session_id.clone();
+        let org_task = org_id.to_string();
+        let realm_task = clean_realm.clone();
+        let srv_task = resolved_server_id.clone();
+
+        if chosen_flow == "device_code" {
+            let (prompt_tx, prompt_rx) = tokio::sync::oneshot::channel::<(String, String)>();
+            let prompt_cb: DevicePromptCallback = Box::new(move |uri, code| {
+                let _ = prompt_tx.send((uri.to_string(), code.to_string()));
+            });
+            tokio::spawn(async move {
+                let res = kernel
+                    .mcp_oauth
+                    .login_device_code(
+                        &org_task,
+                        &realm_task,
+                        issuer_hint.as_deref(),
+                        clean_client.as_deref(),
+                        hosts,
+                        scopes,
+                        eff_local,
+                        300,
+                        Some(prompt_cb),
+                    )
+                    .await;
+                let done_ms = Utc::now().timestamp_millis();
+                match res {
+                    Ok(_) => {
+                        if let Some(ref srv_id) = srv_task {
+                            let _ = kernel
+                                .mcp_firewall
+                                .update_server_config(&org_task, srv_id, |rec| {
+                                    if rec.auth_realm.is_none() {
+                                        rec.auth_realm = Some(realm_task.clone());
+                                    }
+                                })
+                                .await;
+                        }
+                        if let Some(s) = kernel.mcp_oauth_sessions.write().await.get_mut(&sid_task) {
+                            s.status = "completed".to_string();
+                            s.updated_at_ms = done_ms;
+                        }
+                    }
+                    Err(e) => {
+                        let (redacted, _) = aos_egress::redact_dlp_secrets(&e.to_string());
+                        if let Some(s) = kernel.mcp_oauth_sessions.write().await.get_mut(&sid_task) {
+                            s.status = "failed".to_string();
+                            s.error = Some(redacted);
+                            s.updated_at_ms = done_ms;
+                        }
+                    }
+                }
+            });
+            if let Ok(Ok((uri, code))) =
+                tokio::time::timeout(std::time::Duration::from_secs(8), prompt_rx).await
+            {
+                let mut guard = self.mcp_oauth_sessions.write().await;
+                if let Some(s) = guard.get_mut(&session_id) {
+                    s.verification_uri = Some(uri);
+                    s.user_code = Some(code);
+                    if s.status == "starting" {
+                        s.status = "awaiting_user".to_string();
+                    }
+                    s.updated_at_ms = Utc::now().timestamp_millis();
+                }
+            }
+        } else {
+            let (url_tx, url_rx) = tokio::sync::oneshot::channel::<String>();
+            let url_cb: AuthorizeUrlCallback = Box::new(move |url| {
+                let _ = url_tx.send(url.to_string());
+            });
+            tokio::spawn(async move {
+                let res = kernel
+                    .mcp_oauth
+                    .login_pkce_loopback(
+                        &org_task,
+                        &realm_task,
+                        issuer_hint.as_deref(),
+                        clean_client.as_deref(),
+                        hosts,
+                        scopes,
+                        eff_local,
+                        false,
+                        300,
+                        Some(url_cb),
+                    )
+                    .await;
+                let done_ms = Utc::now().timestamp_millis();
+                match res {
+                    Ok(_) => {
+                        if let Some(ref srv_id) = srv_task {
+                            let _ = kernel
+                                .mcp_firewall
+                                .update_server_config(&org_task, srv_id, |rec| {
+                                    if rec.auth_realm.is_none() {
+                                        rec.auth_realm = Some(realm_task.clone());
+                                    }
+                                })
+                                .await;
+                        }
+                        if let Some(s) = kernel.mcp_oauth_sessions.write().await.get_mut(&sid_task) {
+                            s.status = "completed".to_string();
+                            s.updated_at_ms = done_ms;
+                        }
+                    }
+                    Err(e) => {
+                        let (redacted, _) = aos_egress::redact_dlp_secrets(&e.to_string());
+                        if let Some(s) = kernel.mcp_oauth_sessions.write().await.get_mut(&sid_task) {
+                            s.status = "failed".to_string();
+                            s.error = Some(redacted);
+                            s.updated_at_ms = done_ms;
+                        }
+                    }
+                }
+            });
+            if let Ok(Ok(auth_url)) =
+                tokio::time::timeout(std::time::Duration::from_secs(8), url_rx).await
+            {
+                let mut guard = self.mcp_oauth_sessions.write().await;
+                if let Some(s) = guard.get_mut(&session_id) {
+                    s.authorize_url = Some(auth_url);
+                    if s.status == "starting" {
+                        s.status = "awaiting_user".to_string();
+                    }
+                    s.updated_at_ms = Utc::now().timestamp_millis();
+                }
+            }
+        }
+
+        tokio::task::yield_now().await;
+        Ok(self
+            .mcp_oauth_sessions
+            .read()
+            .await
+            .get(&session_id)
+            .cloned()
+            .unwrap_or(init_session))
     }
 
     pub fn active_host_exec_runs(&self) -> usize {
@@ -6505,7 +6885,7 @@ impl AegisRuntimeKernel {
                     if let UpstreamTransportSpec::Http { url, .. } = &srv.transport {
                         json!(derive_exact_allowed_hosts(url))
                     } else {
-                        json!([])
+                        json!(srv.policy.allowed_hosts)
                     }
                 });
 
@@ -6547,6 +6927,9 @@ impl AegisRuntimeKernel {
             entries.push(json!({
                 "server_id": srv.server_id,
                 "source": source,
+                "registry_name": srv.registry_name,
+                "installed_version": srv.installed_version,
+                "manifest_sha256": srv.manifest_sha256,
                 "transport": transport_kind,
                 "target": endpoint_or_cmd,
                 "status": status,
@@ -6558,6 +6941,8 @@ impl AegisRuntimeKernel {
                 "dlp_mode": srv.policy.dlp_mode,
                 "strip_prompt_injection": srv.policy.strip_prompt_injection,
                 "isolate_upstream_home": srv.policy.isolate_upstream_home,
+                "isolate_upstream_network": srv.policy.isolate_upstream_network,
+                "tool_overrides": srv.policy.tool_overrides,
                 "writes_require_outbox": srv.policy.trust_level == McpTrustLevel::UntrustedExternal,
                 "hot_bridged": hot_bridged,
                 "skill_paths": skill_paths,
@@ -6829,9 +7214,18 @@ impl AegisRuntimeKernel {
                     })
                 };
 
+                let (notif_tx, mut notif_rx) = tokio::sync::mpsc::unbounded_channel();
                 let rpc_resp = self
                     .mcp_proxy_pool
-                    .handle_jsonrpc(identity, &session_id, &server_id, &rpc_req, &ptable, dry_run)
+                    .handle_jsonrpc_streaming(
+                        identity,
+                        &session_id,
+                        &server_id,
+                        &rpc_req,
+                        &ptable,
+                        dry_run,
+                        Some(notif_tx),
+                    )
                     .await?
                     .with_context(|| {
                         format!(
@@ -6839,6 +7233,27 @@ impl AegisRuntimeKernel {
                             server_id
                         )
                     })?;
+                let mut notifications = Vec::new();
+                let mut tools_list_changed = false;
+                let mut resources_list_changed = false;
+                while let Ok(note) = notif_rx.try_recv() {
+                    match note.get("method").and_then(|v| v.as_str()) {
+                        Some("notifications/tools/list_changed") => {
+                            tools_list_changed = true;
+                        }
+                        Some("notifications/resources/list_changed" | "notifications/resources/updated") => {
+                            resources_list_changed = true;
+                        }
+                        _ => {}
+                    }
+                    notifications.push(note);
+                }
+                if tools_list_changed {
+                    self.emit_mcp_notification("notifications/tools/list_changed", None);
+                }
+                if resources_list_changed {
+                    self.emit_mcp_notification("notifications/resources/list_changed", None);
+                }
                 if let Some(err) = rpc_resp.get("error") {
                     bail!(
                         "Hot-bridge upstream '{}' returned JSON-RPC error: {}",
@@ -6846,11 +7261,23 @@ impl AegisRuntimeKernel {
                         err
                     );
                 }
-                Ok(Some(json!({
+                let mut out = json!({
                     "server_id": server_id,
                     "bridge_mode": "option_b_hot_session_bridge",
                     "result": rpc_resp.get("result").cloned().unwrap_or(rpc_resp),
-                })))
+                });
+                if let Some(obj) = out.as_object_mut() {
+                    if !notifications.is_empty() {
+                        obj.insert("notifications".to_string(), json!(notifications));
+                    }
+                    if tools_list_changed {
+                        obj.insert("tools_list_changed".to_string(), json!(true));
+                    }
+                    if resources_list_changed {
+                        obj.insert("resources_list_changed".to_string(), json!(true));
+                    }
+                }
+                Ok(Some(out))
             }
 
             _ => Ok(None),
@@ -6925,6 +7352,9 @@ impl AegisRuntimeKernel {
                     "scope": scope,
                     "reason": reason,
                     "trust_tier": "bundle",
+                    "domain_verified": false,
+                    "registry_type": "bundle",
+                    "source": "bundle",
                     "transport_kind": "streamable_http",
                     "evidence_hash": sha,
                     "evidence": {
@@ -6933,7 +7363,11 @@ impl AegisRuntimeKernel {
                         "scope": scope,
                         "reason": reason,
                         "trust_tier": "bundle",
+                        "domain_verified": false,
+                        "registry_type": "bundle",
+                        "source": "bundle",
                         "transport_kind": "streamable_http",
+                        "allow_local_http": allow_local_http,
                         "evidence_hash": sha,
                     }
                 });
@@ -6945,6 +7379,11 @@ impl AegisRuntimeKernel {
             ResolvedInstallTarget::Candidate(cand) => {
                 let sid = cand.server_id.clone();
                 let sha = cand.manifest_sha256.clone();
+                let reg_type = cand
+                    .package_spec
+                    .as_ref()
+                    .map(|p| p.registry_type.as_str())
+                    .unwrap_or("remote");
                 let meta = json!({
                     "target": target,
                     "server_id": sid,
@@ -6954,12 +7393,15 @@ impl AegisRuntimeKernel {
                     "reason": reason,
                     "trust_tier": cand.trust_tier,
                     "domain_verified": cand.domain_verified,
+                    "registry_type": reg_type,
+                    "source": cand.source,
                     "transport_kind": cand.transport_kind,
                     "remote_url": cand.remote_url,
                     "package_spec": cand.package_spec,
                     "allowed_hosts": cand.allowed_hosts,
                     "auth_mode": cand.auth_mode,
                     "required_env_vars": cand.package_spec.as_ref().map(|p| p.required_env_vars.clone()).unwrap_or_default(),
+                    "allow_local_http": allow_local_http,
                     "evidence_hash": sha,
                     "evidence": {
                         "target": target,
@@ -6969,12 +7411,15 @@ impl AegisRuntimeKernel {
                         "reason": reason,
                         "trust_tier": cand.trust_tier.label(),
                         "domain_verified": cand.domain_verified,
+                        "registry_type": reg_type,
+                        "source": cand.source,
                         "transport_kind": cand.transport_kind,
                         "remote_url": cand.remote_url,
                         "package_spec": cand.package_spec,
                         "allowed_hosts": cand.allowed_hosts,
                         "auth_mode": cand.auth_mode,
                         "required_env_vars": cand.package_spec.as_ref().map(|p| p.required_env_vars.clone()).unwrap_or_default(),
+                        "allow_local_http": allow_local_http,
                         "evidence_hash": sha,
                     }
                 });
@@ -7095,6 +7540,13 @@ impl AegisRuntimeKernel {
                             )
                             .await?;
                         auth_state = "valid".to_string();
+                    } else if self
+                        .mcp_oauth
+                        .get_realm(&identity.org_id, realm_id)
+                        .await
+                        .is_some_and(|r| r.sealed_access_token.is_some())
+                    {
+                        auth_state = "valid".to_string();
                     } else {
                         auth_state = "needs_auth".to_string();
                     }
@@ -7140,11 +7592,55 @@ impl AegisRuntimeKernel {
                             )
                             .await?;
                         auth_state = "valid".to_string();
+                    } else if self
+                        .mcp_oauth
+                        .get_realm(&identity.org_id, &realm_id)
+                        .await
+                        .is_some_and(|r| r.sealed_access_token.is_some())
+                    {
+                        auth_state = "valid".to_string();
                     } else if cand.auth_mode != "none" {
                         auth_state = "needs_auth".to_string();
                     }
                 } else if let Some(ref pkg) = cand.package_spec {
-                    let mut env_vars = BTreeMap::new();
+                    let mut stdio_policy = policy;
+                    stdio_policy.isolate_upstream_network = true;
+                    stdio_policy.allowed_hosts =
+                        crate::mcp_firewall::normalize_and_validate_stdio_allowed_hosts(
+                            &cand.allowed_hosts,
+                        )?;
+                    let (spawn_cmd, spawn_args, spawn_cwd, mut env_vars, req_envs) =
+                        if pkg.registry_type == "mcpb" {
+                            let installed = crate::mcp_mcpb::install_mcpb_archive(
+                                &pkg.identifier,
+                                pkg.file_sha256.as_deref(),
+                                &cand.server_id,
+                                self.mcp_registry.runtime_data_root(),
+                                allow_local_http,
+                            )
+                            .await?;
+                            let mut merged_req = pkg.required_env_vars.clone();
+                            for k in installed.required_env_vars {
+                                if !merged_req.iter().any(|existing| existing == &k) {
+                                    merged_req.push(k);
+                                }
+                            }
+                            (
+                                installed.command,
+                                installed.args,
+                                Some(installed.cwd.display().to_string()),
+                                installed.env,
+                                merged_req,
+                            )
+                        } else {
+                            (
+                                pkg.command.clone(),
+                                pkg.args.clone(),
+                                workspace_root.map(|p| p.display().to_string()),
+                                BTreeMap::new(),
+                                pkg.required_env_vars.clone(),
+                            )
+                        };
                     if let Some(ref creds) = inline_creds {
                         for (k, v) in &creds.env_secrets {
                             env_vars.insert(k.clone(), v.clone());
@@ -7154,25 +7650,39 @@ impl AegisRuntimeKernel {
                         .register_stdio_server(
                             &identity.org_id,
                             &cand.server_id,
-                            &pkg.command,
-                            pkg.args.clone(),
-                            workspace_root.map(|p| p.display().to_string()),
+                            &spawn_cmd,
+                            spawn_args,
+                            spawn_cwd,
                             env_vars,
-                            policy,
+                            stdio_policy,
                         )
                         .await?;
-                    if !pkg.required_env_vars.is_empty()
+                    if !req_envs.is_empty()
                         && inline_creds
                             .as_ref()
                             .is_none_or(|c| c.env_secrets.is_empty())
                     {
                         auth_state = "needs_env_secret".to_string();
-                    } else if !pkg.required_env_vars.is_empty() {
+                    } else if !req_envs.is_empty() {
                         auth_state = "static_vault".to_string();
                     }
                 } else {
                     bail!("Resolved MCP candidate '{}' has neither remote URL nor package spec", cand.name);
                 }
+
+                let cand_ver = cand
+                    .version
+                    .clone()
+                    .or_else(|| cand.package_spec.as_ref().and_then(|p| p.version.clone()));
+                let _ = self
+                    .mcp_firewall
+                    .update_server_config(&identity.org_id, &cand.server_id, |rec| {
+                        rec.registry_name = Some(cand.name.clone());
+                        rec.installed_version = cand_ver;
+                        rec.source_target = Some(target.to_string());
+                        rec.manifest_sha256 = Some(cand.manifest_sha256.clone());
+                    })
+                    .await;
 
                 if scope == "workspace" {
                     if let Some(ws) = workspace_root {
@@ -7201,6 +7711,8 @@ impl AegisRuntimeKernel {
                 hook(identity.org_id.clone(), id.clone()).await;
             }
         }
+        self.emit_mcp_notification("notifications/tools/list_changed", None);
+        self.emit_mcp_notification("notifications/resources/list_changed", None);
 
         let _ = self
             .recorder
@@ -10813,7 +11325,7 @@ impl AegisRuntimeKernel {
                     },
                     "capabilities": {
                         "tools": { "listChanged": true },
-                        "resources": { "subscribe": true }
+                        "resources": { "subscribe": true, "listChanged": true }
                     }
                 }
             }),
@@ -11375,7 +11887,26 @@ impl AegisRuntimeKernel {
             }
         }
 
-        while let Some(line) = reader.next_line().await? {
+        let mut notif_rx = self.subscribe_mcp_notifications();
+        loop {
+            let next_line_opt = tokio::select! {
+                res = reader.next_line() => res?,
+                recv = notif_rx.recv() => {
+                    match recv {
+                        Ok(note) => {
+                            let out_line = format!("{}\n", serde_json::to_string(&note)?);
+                            stdout.write_all(out_line.as_bytes()).await?;
+                            stdout.flush().await?;
+                        }
+                        Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => {}
+                        Err(tokio::sync::broadcast::error::RecvError::Closed) => {}
+                    }
+                    continue;
+                }
+            };
+            let Some(line) = next_line_opt else {
+                break;
+            };
             if line.trim().is_empty() {
                 continue;
             }
@@ -11513,6 +12044,10 @@ impl AegisRuntimeKernel {
             };
             let out_line = format!("{}\n", serde_json::to_string(&response)?);
             stdout.write_all(out_line.as_bytes()).await?;
+            while let Ok(note) = notif_rx.try_recv() {
+                let note_line = format!("{}\n", serde_json::to_string(&note)?);
+                stdout.write_all(note_line.as_bytes()).await?;
+            }
             stdout.flush().await?;
         }
         Ok(())
@@ -13024,12 +13559,12 @@ impl AegisRuntimeKernel {
                                 ),
                             }
                         }
-                    } else if method == "GET" && full_target.starts_with("/v1/mcp/inventory") {
+                    } else if method == "GET" && route_path(full_target) == "/v1/mcp/inventory" {
                         let inv_org = requested_org(full_target, &body_str)
                             .unwrap_or_else(|| org_id.clone());
                         let inv = k.build_installed_mcp_inventory(&inv_org, None).await;
                         ("HTTP/1.1 200 OK", inv.to_string())
-                    } else if method == "POST" && full_target.starts_with("/v1/mcp/logout") {
+                    } else if method == "POST" && route_path(full_target) == "/v1/mcp/logout" {
                         let payload: Value =
                             serde_json::from_str(body_str.trim()).unwrap_or_else(|_| json!({}));
                         let target_org = payload
@@ -13050,7 +13585,218 @@ impl AegisRuntimeKernel {
                                 json!({ "error": e.to_string() }).to_string(),
                             ),
                         }
-                    } else if method == "POST" && full_target.starts_with("/v1/mcp/policy") {
+                    } else if method == "POST" && route_path(full_target) == "/v1/mcp/oauth/start" {
+                        let payload: Value =
+                            serde_json::from_str(body_str.trim()).unwrap_or_else(|_| json!({}));
+                        let target_org = payload
+                            .get("org_id")
+                            .and_then(|v| v.as_str())
+                            .map(str::trim)
+                            .filter(|s| !s.is_empty())
+                            .unwrap_or(&org_id);
+                        let srv_id = payload.get("server_id").and_then(|v| v.as_str());
+                        let realm_id = payload.get("realm_id").and_then(|v| v.as_str());
+                        let remote_url = payload.get("remote_url").and_then(|v| v.as_str());
+                        let issuer_url = payload.get("issuer_url").and_then(|v| v.as_str());
+                        let client_id = payload.get("client_id").and_then(|v| v.as_str());
+                        let allowed_hosts: Vec<String> = payload
+                            .get("allowed_hosts")
+                            .and_then(|v| v.as_array())
+                            .map(|arr| {
+                                arr.iter()
+                                    .filter_map(|x| x.as_str().map(str::trim).filter(|s| !s.is_empty()).map(str::to_string))
+                                    .collect()
+                            })
+                            .unwrap_or_default();
+                        let scopes: Vec<String> = payload
+                            .get("scopes")
+                            .and_then(|v| v.as_array())
+                            .map(|arr| {
+                                arr.iter()
+                                    .filter_map(|x| x.as_str().map(str::trim).filter(|s| !s.is_empty()).map(str::to_string))
+                                    .collect()
+                            })
+                            .unwrap_or_default();
+                        let mode = payload
+                            .get("mode")
+                            .and_then(|v| v.as_str())
+                            .unwrap_or("auto");
+                        let allow_local = payload
+                            .get("allow_local_http")
+                            .and_then(|v| v.as_bool())
+                            .unwrap_or(false);
+                        match k
+                            .start_web_mcp_oauth_session(
+                                target_org,
+                                srv_id,
+                                realm_id,
+                                remote_url,
+                                issuer_url,
+                                client_id,
+                                allowed_hosts,
+                                scopes,
+                                mode,
+                                allow_local,
+                            )
+                            .await
+                        {
+                            Ok(sess) => (
+                                "HTTP/1.1 200 OK",
+                                serde_json::to_string(&sess).unwrap_or_else(|_| "{}".to_string()),
+                            ),
+                            Err(e) => (
+                                "HTTP/1.1 400 Bad Request",
+                                json!({ "error": e.to_string() }).to_string(),
+                            ),
+                        }
+                    } else if method == "GET" && route_path(full_target) == "/v1/mcp/oauth/status" {
+                        let mut session_id = String::new();
+                        if let Some((_, qs)) = full_target.split_once('?') {
+                            for pair in qs.split('&') {
+                                if let Some(("session_id", v)) = pair.split_once('=') {
+                                    session_id = v
+                                        .trim()
+                                        .chars()
+                                        .filter(|c| c.is_ascii_alphanumeric() || *c == '-' || *c == '_')
+                                        .collect();
+                                }
+                            }
+                        }
+                        if session_id.is_empty() {
+                            (
+                                "HTTP/1.1 400 Bad Request",
+                                json!({ "error": "Missing `session_id` query parameter" }).to_string(),
+                            )
+                        } else if let Some(sess) = k.get_web_mcp_oauth_session(&session_id).await {
+                            (
+                                "HTTP/1.1 200 OK",
+                                serde_json::to_string(&sess).unwrap_or_else(|_| "{}".to_string()),
+                            )
+                        } else {
+                            (
+                                "HTTP/1.1 404 Not Found",
+                                json!({ "error": format!("OAuth session '{}' not found or expired", session_id) }).to_string(),
+                            )
+                        }
+                    } else if method == "POST" && route_path(full_target) == "/v1/mcp/login-token" {
+                        let payload: Value =
+                            serde_json::from_str(body_str.trim()).unwrap_or_else(|_| json!({}));
+                        let target_org = payload
+                            .get("org_id")
+                            .and_then(|v| v.as_str())
+                            .map(str::trim)
+                            .filter(|s| !s.is_empty())
+                            .unwrap_or(&org_id);
+                        let srv_id = payload
+                            .get("server_id")
+                            .and_then(|v| v.as_str())
+                            .map(str::trim)
+                            .filter(|s| !s.is_empty());
+                        let realm_id = payload
+                            .get("realm_id")
+                            .and_then(|v| v.as_str())
+                            .map(str::trim)
+                            .filter(|s| !s.is_empty());
+                        let token_opt = payload
+                            .get("token")
+                            .and_then(|v| v.as_str())
+                            .map(str::trim)
+                            .filter(|s| !s.is_empty());
+                        let allow_local_req = payload
+                            .get("allow_local_http")
+                            .and_then(|v| v.as_bool())
+                            .unwrap_or(false);
+                        let mut hosts: Vec<String> = payload
+                            .get("allowed_hosts")
+                            .and_then(|v| v.as_array())
+                            .map(|arr| {
+                                arr.iter()
+                                    .filter_map(|x| x.as_str().map(str::trim).filter(|s| !s.is_empty()).map(str::to_string))
+                                    .collect()
+                            })
+                            .unwrap_or_default();
+
+                        let srv_opt = if let Some(sid) = srv_id {
+                            k.mcp_firewall.get_server(target_org, sid).await
+                        } else {
+                            None
+                        };
+                        let eff_local =
+                            allow_local_req || srv_opt.as_ref().is_some_and(|s| s.allow_local_http);
+                        if hosts.is_empty() {
+                            if let Some(UpstreamTransportSpec::Http { ref url, .. }) =
+                                srv_opt.as_ref().map(|s| &s.transport)
+                            {
+                                hosts = derive_exact_allowed_hosts(url);
+                            }
+                        }
+                        let raw_realm = realm_id
+                            .or_else(|| srv_opt.as_ref().and_then(|s| s.auth_realm.as_deref()))
+                            .or(srv_id)
+                            .unwrap_or("");
+                        if let Some(token_val) = token_opt {
+                            if raw_realm.is_empty() {
+                                (
+                                    "HTTP/1.1 400 Bad Request",
+                                    json!({ "error": "Missing `realm_id` or `server_id`" }).to_string(),
+                                )
+                            } else {
+                                match mcp_oauth::sanitize_realm_id(raw_realm) {
+                                    Ok(clean_realm) => {
+                                        match k
+                                            .mcp_oauth
+                                            .login_static_token(
+                                                target_org,
+                                                &clean_realm,
+                                                token_val,
+                                                hosts,
+                                                eff_local,
+                                            )
+                                            .await
+                                        {
+                                            Ok(_) => {
+                                                if let Some(sid) = srv_id {
+                                                    if srv_opt.is_some() {
+                                                        let _ = k
+                                                            .mcp_firewall
+                                                            .update_server_config(target_org, sid, |rec| {
+                                                                if rec.auth_realm.is_none() {
+                                                                    rec.auth_realm = Some(clean_realm.clone());
+                                                                }
+                                                            })
+                                                            .await;
+                                                    }
+                                                }
+                                                (
+                                                    "HTTP/1.1 200 OK",
+                                                    json!({
+                                                        "status": "authenticated",
+                                                        "org_id": target_org,
+                                                        "realm_id": clean_realm,
+                                                        "server_id": srv_id,
+                                                    })
+                                                    .to_string(),
+                                                )
+                                            }
+                                            Err(e) => (
+                                                "HTTP/1.1 400 Bad Request",
+                                                json!({ "error": e.to_string() }).to_string(),
+                                            ),
+                                        }
+                                    }
+                                    Err(e) => (
+                                        "HTTP/1.1 400 Bad Request",
+                                        json!({ "error": e.to_string() }).to_string(),
+                                    ),
+                                }
+                            }
+                        } else {
+                            (
+                                "HTTP/1.1 400 Bad Request",
+                                json!({ "error": "Missing non-empty `token`" }).to_string(),
+                            )
+                        }
+                    } else if method == "POST" && route_path(full_target) == "/v1/mcp/policy" {
                         let payload: Value =
                             serde_json::from_str(body_str.trim()).unwrap_or_else(|_| json!({}));
                         let target_org = payload
@@ -13076,7 +13822,57 @@ impl AegisRuntimeKernel {
                                 "off" => aos_egress::PseudonymMode::Off,
                                 _ => aos_egress::PseudonymMode::Pseudonymize,
                             });
-                        if k.mcp_firewall.get_server(target_org, srv_id).await.is_some() {
+                        let strip_pi = payload
+                            .get("strip_prompt_injection")
+                            .and_then(|v| v.as_bool());
+                        let isolate_home = payload
+                            .get("isolate_upstream_home")
+                            .and_then(|v| v.as_bool());
+                        let isolate_net = payload
+                            .get("isolate_upstream_network")
+                            .and_then(|v| v.as_bool());
+                        let parsed_hosts: Result<Option<Vec<String>>, String> =
+                            match payload.get("allowed_hosts") {
+                                None => Ok(None),
+                                Some(v) if v.is_null() => Ok(None),
+                                Some(v) => match v.as_array() {
+                                    Some(arr) => {
+                                        let raw: Vec<String> = arr
+                                            .iter()
+                                            .filter_map(|x| x.as_str().map(str::to_string))
+                                            .collect();
+                                        crate::mcp_firewall::normalize_and_validate_stdio_allowed_hosts(
+                                            &raw,
+                                        )
+                                        .map(Some)
+                                        .map_err(|e| e.to_string())
+                                    }
+                                    None => Err(
+                                        "allowed_hosts must be an array of hostnames".to_string()
+                                    ),
+                                },
+                            };
+                        let collect_names = |key: &str| -> Vec<String> {
+                            payload
+                                .get(key)
+                                .and_then(|v| v.as_array())
+                                .map(|arr| {
+                                    arr.iter()
+                                        .filter_map(|x| x.as_str().map(str::trim).filter(|s| !s.is_empty()).map(str::to_string))
+                                        .collect()
+                                })
+                                .unwrap_or_default()
+                        };
+                        let allow_tools = collect_names("allow_tools");
+                        let stage_tools = collect_names("stage_tools");
+                        let forbid_tools = collect_names("forbid_tools");
+                        if let Err(err_msg) = parsed_hosts {
+                            (
+                                "HTTP/1.1 400 Bad Request",
+                                json!({ "error": err_msg }).to_string(),
+                            )
+                        } else if k.mcp_firewall.get_server(target_org, srv_id).await.is_some() {
+                            let hosts_opt = parsed_hosts.unwrap_or(None);
                             match k
                                 .mcp_firewall
                                 .update_server_policy(target_org, srv_id, |policy| {
@@ -13085,6 +13881,30 @@ impl AegisRuntimeKernel {
                                     }
                                     if let Some(dm) = new_dlp {
                                         policy.dlp_mode = dm;
+                                    }
+                                    if let Some(sp) = strip_pi {
+                                        policy.strip_prompt_injection = sp;
+                                    }
+                                    if let Some(ih) = isolate_home {
+                                        policy.isolate_upstream_home = ih;
+                                    }
+                                    if let Some(ref hosts) = hosts_opt {
+                                        policy.allowed_hosts = hosts.clone();
+                                        if isolate_net.is_none() && !hosts.is_empty() {
+                                            policy.isolate_upstream_network = true;
+                                        }
+                                    }
+                                    if let Some(inet) = isolate_net {
+                                        policy.isolate_upstream_network = inet;
+                                    }
+                                    for t in &allow_tools {
+                                        policy.tool_overrides.insert(t.clone(), McpToolRiskClass::ReadOnly);
+                                    }
+                                    for t in &stage_tools {
+                                        policy.tool_overrides.insert(t.clone(), McpToolRiskClass::StagedWrite);
+                                    }
+                                    for t in &forbid_tools {
+                                        policy.tool_overrides.insert(t.clone(), McpToolRiskClass::Forbidden);
                                     }
                                 })
                                 .await
@@ -13100,6 +13920,94 @@ impl AegisRuntimeKernel {
                                 "HTTP/1.1 404 Not Found",
                                 json!({ "error": format!("MCP server '{}' not found in org '{}'", srv_id, target_org) }).to_string(),
                             )
+                        }
+                    } else if method == "GET" && route_path(full_target) == "/v1/mcp/outbox" {
+                        let target_org = requested_org(full_target, &body_str)
+                            .unwrap_or_else(|| org_id.clone());
+                        let mut status_param = "pending".to_string();
+                        if let Some((_, qs)) = full_target.split_once('?') {
+                            for pair in qs.split('&') {
+                                if let Some(("status", v)) = pair.split_once('=') {
+                                    let clean = v.trim().to_ascii_lowercase();
+                                    if !clean.is_empty() {
+                                        status_param = clean;
+                                    }
+                                }
+                            }
+                        }
+                        let filter = match status_param.as_str() {
+                            "all" => None,
+                            "dispatched" => Some(OutboxStatus::Dispatched),
+                            "denied" => Some(OutboxStatus::Denied),
+                            "failed" => Some(OutboxStatus::Failed),
+                            "dry_run_recorded" => Some(OutboxStatus::DryRunRecorded),
+                            _ => Some(OutboxStatus::Pending),
+                        };
+                        let raw_tickets = k
+                            .mcp_firewall
+                            .list_outbox_tickets(Some(&target_org), filter)
+                            .await;
+                        let redacted: Vec<Value> = raw_tickets
+                            .iter()
+                            .map(AegisRuntimeKernel::redact_outbox_ticket_json)
+                            .collect();
+                        (
+                            "HTTP/1.1 200 OK",
+                            json!({ "org_id": target_org, "tickets": redacted }).to_string(),
+                        )
+                    } else if method == "POST" && route_path(full_target) == "/v1/mcp/outbox/decide" {
+                        let payload: Value =
+                            serde_json::from_str(body_str.trim()).unwrap_or_else(|_| json!({}));
+                        let target_org = payload
+                            .get("org_id")
+                            .and_then(|v| v.as_str())
+                            .map(str::trim)
+                            .filter(|s| !s.is_empty())
+                            .unwrap_or(&org_id);
+                        let ticket_id = payload
+                            .get("ticket_id")
+                            .and_then(|v| v.as_str())
+                            .map(str::trim)
+                            .unwrap_or("");
+                        let approve = payload
+                            .get("approve")
+                            .and_then(|v| v.as_bool())
+                            .unwrap_or(false);
+                        let reviewed_by = payload
+                            .get("reviewed_by")
+                            .and_then(|v| v.as_str())
+                            .map(str::trim)
+                            .filter(|s| !s.is_empty())
+                            .unwrap_or("web-approval-console");
+                        if ticket_id.is_empty() {
+                            (
+                                "HTTP/1.1 400 Bad Request",
+                                json!({ "error": "Missing `ticket_id`" }).to_string(),
+                            )
+                        } else {
+                            let res = if approve {
+                                k.mcp_firewall
+                                    .approve_outbox_ticket(target_org, ticket_id, reviewed_by)
+                                    .await
+                            } else {
+                                k.mcp_firewall
+                                    .deny_outbox_ticket(target_org, ticket_id, reviewed_by)
+                                    .await
+                            };
+                            match res {
+                                Ok(t) => (
+                                    "HTTP/1.1 200 OK",
+                                    json!({
+                                        "status": if approve { "approved" } else { "denied" },
+                                        "ticket": AegisRuntimeKernel::redact_outbox_ticket_json(&t),
+                                    })
+                                    .to_string(),
+                                ),
+                                Err(e) => (
+                                    "HTTP/1.1 404 Not Found",
+                                    json!({ "error": e.to_string() }).to_string(),
+                                ),
+                            }
                         }
                     } else if method == "POST" && full_target.starts_with("/v1/approvals/simulate") {
                         let payload: Value = serde_json::from_str(body_str.trim()).unwrap_or_else(|_| json!({}));
@@ -18266,5 +19174,619 @@ time.sleep(60)
         let inv_str = inv_body.to_string();
         assert!(!inv_str.contains("lin_secret_tok_999"));
         assert!(inv_str.contains("linear"));
+    }
+
+    #[tokio::test]
+    async fn web_console_mcp_oauth_pkce_policy_token_and_outbox_e2e() {
+        let seen_dispatches = Arc::new(tokio::sync::Mutex::new(Vec::<(String, String, Value)>::new()));
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let mock_addr = listener.local_addr().unwrap();
+        let auth_base = format!("http://{mock_addr}");
+        let dispatches_srv = seen_dispatches.clone();
+
+        tokio::spawn(async move {
+            loop {
+                let Ok((mut stream, _)) = listener.accept().await else {
+                    break;
+                };
+                let auth_base = auth_base.clone();
+                let dispatches_srv = dispatches_srv.clone();
+                tokio::spawn(async move {
+                    let mut raw = Vec::new();
+                    let mut tmp_buf = [0u8; 4096];
+                    let mut hdr_end = None;
+                    let mut clen = 0usize;
+                    loop {
+                        let Ok(n) = tokio::io::AsyncReadExt::read(&mut stream, &mut tmp_buf).await else {
+                            return;
+                        };
+                        if n == 0 {
+                            break;
+                        }
+                        raw.extend_from_slice(&tmp_buf[..n]);
+                        if hdr_end.is_none() {
+                            if let Some(pos) = raw.windows(4).position(|w| w == b"\r\n\r\n") {
+                                hdr_end = Some(pos + 4);
+                                let head = String::from_utf8_lossy(&raw[..pos]);
+                                for line in head.lines() {
+                                    if let Some((k, v)) = line.split_once(':') {
+                                        if k.eq_ignore_ascii_case("content-length") {
+                                            clen = v.trim().parse().unwrap_or(0);
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                        if let Some(he) = hdr_end {
+                            if raw.len() >= he + clen {
+                                break;
+                            }
+                        }
+                    }
+                    let he = hdr_end.unwrap_or(raw.len());
+                    let head = String::from_utf8_lossy(&raw[..he]).to_string();
+                    let body_end = (he + clen).min(raw.len());
+                    let body = String::from_utf8_lossy(&raw[he..body_end]).to_string();
+                    let target = head
+                        .lines()
+                        .next()
+                        .and_then(|l| l.split_whitespace().nth(1))
+                        .unwrap_or("/");
+                    let auth_hdr = head
+                        .lines()
+                        .find_map(|l| {
+                            l.split_once(':').and_then(|(k, v)| {
+                                k.eq_ignore_ascii_case("authorization")
+                                    .then(|| v.trim().to_string())
+                            })
+                        })
+                        .unwrap_or_default();
+
+                    let (status_line, json_body) = match target {
+                        "/.well-known/oauth-authorization-server" => (
+                            "200 OK",
+                            json!({
+                                "issuer": auth_base,
+                                "authorization_endpoint": format!("{auth_base}/authorize"),
+                                "token_endpoint": format!("{auth_base}/token"),
+                                "device_authorization_endpoint": format!("{auth_base}/device"),
+                                "registration_endpoint": format!("{auth_base}/register"),
+                                "scopes_supported": ["mcp:read", "mcp:write"]
+                            }),
+                        ),
+                        "/register" => (
+                            "201 Created",
+                            json!({
+                                "client_id": "dyn-web-client-1",
+                                "token_endpoint_auth_method": "none"
+                            }),
+                        ),
+                        "/token" => {
+                            assert!(body.contains("grant_type=authorization_code"));
+                            assert!(body.contains("code=pkce-web-code"));
+                            (
+                                "200 OK",
+                                json!({
+                                    "access_token": "tok_web_pkce_999",
+                                    "refresh_token": "rt_web_999",
+                                    "token_type": "Bearer",
+                                    "expires_in": 3600
+                                }),
+                            )
+                        }
+                        "/mcp" => {
+                            if auth_hdr != "Bearer tok_web_pkce_999"
+                                && auth_hdr != "Bearer tok_static_web_777"
+                            {
+                                let unauth = "HTTP/1.1 401 Unauthorized\r\nWWW-Authenticate: Bearer\r\nContent-Length: 0\r\nConnection: close\r\n\r\n";
+                                let _ = tokio::io::AsyncWriteExt::write_all(&mut stream, unauth.as_bytes()).await;
+                                return;
+                            }
+                            let req: Value = serde_json::from_str(&body).unwrap_or_default();
+                            let rid = req.get("id").cloned().unwrap_or(json!(1));
+                            let rpc_method = req.get("method").and_then(|v| v.as_str()).unwrap_or("");
+                            let resp = match rpc_method {
+                                "initialize" => json!({
+                                    "jsonrpc": "2.0",
+                                    "id": rid,
+                                    "result": {
+                                        "protocolVersion": "2024-11-05",
+                                        "serverInfo": { "name": "mock-notion", "version": "1.0.0" },
+                                        "capabilities": { "tools": {} }
+                                    }
+                                }),
+                                "tools/call" => {
+                                    let tname = req["params"]["name"].as_str().unwrap_or("").to_string();
+                                    let targs = req["params"]["arguments"].clone();
+                                    dispatches_srv.lock().await.push((auth_hdr, tname.clone(), targs));
+                                    json!({
+                                        "jsonrpc": "2.0",
+                                        "id": rid,
+                                        "result": {
+                                            "content": [{ "type": "text", "text": format!("dispatched:{tname}") }]
+                                        }
+                                    })
+                                }
+                                _ => json!({ "jsonrpc": "2.0", "id": rid, "result": { "tools": [] } }),
+                            };
+                            ("200 OK", resp)
+                        }
+                        _ => ("404 Not Found", json!({ "error": "not found" })),
+                    };
+
+                    let s = json_body.to_string();
+                    let out = format!(
+                        "HTTP/1.1 {status_line}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{s}",
+                        s.len()
+                    );
+                    let _ = tokio::io::AsyncWriteExt::write_all(&mut stream, out.as_bytes()).await;
+                });
+            }
+        });
+
+        let temp = tempfile::tempdir().unwrap();
+        let rt_dir = temp.path().join("rt");
+        let repo = temp.path().join("repo");
+        std::fs::create_dir_all(&rt_dir).unwrap();
+        std::fs::create_dir_all(&repo).unwrap();
+
+        let kernel = Arc::new(AegisRuntimeKernel::new(&rt_dir).await.unwrap());
+        let addr = kernel.clone().start_http_daemon("127.0.0.1:0", repo).await.unwrap();
+        let op = kernel.operator_token();
+        let (tenant_key, _) = kernel
+            .paas
+            .issue_api_key("acme", "coder-web", "Engineer", None, "test-web")
+            .await
+            .unwrap();
+
+        kernel
+            .mcp_firewall
+            .register_http_server_with_options(
+                "acme",
+                "notion",
+                &format!("http://{mock_addr}/mcp"),
+                BTreeMap::new(),
+                McpServerPolicy::default(),
+                Some("notion"),
+                None,
+                true,
+            )
+            .await
+            .unwrap();
+
+        // 1. Tenant API key MUST receive 403 on all `/v1/mcp/*` operator admin routes.
+        for (m, p, b) in [
+            ("GET", "/v1/mcp/inventory?org_id=acme", None),
+            ("POST", "/v1/mcp/logout", Some(json!({ "org_id": "acme", "realm_id": "notion" }))),
+            ("POST", "/v1/mcp/oauth/start", Some(json!({ "org_id": "acme", "server_id": "notion" }))),
+            ("GET", "/v1/mcp/oauth/status?session_id=oauth-x", None),
+            ("POST", "/v1/mcp/login-token", Some(json!({ "org_id": "acme", "server_id": "notion", "token": "bad" }))),
+            ("POST", "/v1/mcp/policy", Some(json!({ "org_id": "acme", "server_id": "notion", "trust_level": "trusted" }))),
+            ("GET", "/v1/mcp/outbox?org_id=acme", None),
+            ("POST", "/v1/mcp/outbox/decide", Some(json!({ "org_id": "acme", "ticket_id": "outbox-x", "approve": true }))),
+        ] {
+            let (h, _) = raw_http(addr, m, p, Some(&tenant_key), b).await;
+            assert!(h.contains("403"), "tenant key must be blocked on {m} {p}: {h}");
+        }
+
+        // 2. Verify `/approve` Web Console UI renders new OAuth, Policy, and Outbox hooks.
+        let (html_head, html_body) = raw_http(addr, "GET", "/approve?mode=local", None, None).await;
+        assert!(html_head.contains("200 OK"), "{html_head}");
+        let html = html_body["html"].as_str().unwrap_or("");
+        for needle in [
+            "/v1/mcp/oauth/start",
+            "/v1/mcp/policy",
+            "/v1/mcp/login-token",
+            "/v1/mcp/outbox/decide",
+            "safeAuthUrl",
+            "mcp-outbox-card",
+        ] {
+            assert!(html.contains(needle), "/approve HTML missing {needle}");
+        }
+
+        // 3. Start async PKCE OAuth flow from Web Console route and complete callback.
+        let (oauth_head, oauth_start) = raw_http(
+            addr,
+            "POST",
+            "/v1/mcp/oauth/start",
+            Some(&op),
+            Some(json!({
+                "org_id": "acme",
+                "server_id": "notion",
+                "mode": "auto",
+                "allow_local_http": true
+            })),
+        )
+        .await;
+        assert!(oauth_head.contains("200 OK"), "{oauth_head} {oauth_start}");
+        assert_eq!(oauth_start["flow"], "pkce");
+        let sess_id = oauth_start["session_id"].as_str().unwrap().to_string();
+        let auth_url = oauth_start["authorize_url"].as_str().unwrap().to_string();
+
+        fn pct_decode(raw: &str) -> String {
+            let mut out = String::with_capacity(raw.len());
+            let bytes = raw.as_bytes();
+            let mut i = 0usize;
+            while i < bytes.len() {
+                if bytes[i] == b'%' && i + 2 < bytes.len() {
+                    if let Ok(hex_s) = std::str::from_utf8(&bytes[i + 1..i + 3]) {
+                        if let Ok(b) = u8::from_str_radix(hex_s, 16) {
+                            out.push(b as char);
+                            i += 3;
+                            continue;
+                        }
+                    }
+                } else if bytes[i] == b'+' {
+                    out.push(' ');
+                    i += 1;
+                    continue;
+                }
+                out.push(bytes[i] as char);
+                i += 1;
+            }
+            out
+        }
+        let query = auth_url.split_once('?').unwrap().1;
+        let mut redirect_uri = String::new();
+        let mut oauth_state = String::new();
+        for pair in query.split('&') {
+            if let Some((k, v)) = pair.split_once('=') {
+                if k == "redirect_uri" {
+                    redirect_uri = pct_decode(v);
+                } else if k == "state" {
+                    oauth_state = pct_decode(v);
+                }
+            }
+        }
+        let cb_url = format!("{redirect_uri}?code=pkce-web-code&state={oauth_state}");
+        let (cb_status, _, _) =
+            mcp_http::simple_http_request("GET", &cb_url, &[], None, true, 5000)
+                .await
+                .unwrap();
+        assert_eq!(cb_status, 200);
+
+        let mut completed = false;
+        for _ in 0..40 {
+            let (_, st_json) = raw_http(
+                addr,
+                "GET",
+                &format!("/v1/mcp/oauth/status?session_id={sess_id}"),
+                Some(&op),
+                None,
+            )
+            .await;
+            if st_json["status"] == "completed" {
+                completed = true;
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+        }
+        assert!(completed, "Web OAuth PKCE session did not complete in time");
+
+        let (_, inv_json) = raw_http(addr, "GET", "/v1/mcp/inventory?org_id=acme", Some(&op), None).await;
+        assert!(!inv_json.to_string().contains("tok_web_pkce_999"));
+        let notion = inv_json["servers"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|s| s["server_id"] == "notion")
+            .unwrap();
+        assert_eq!(notion["auth_state"], "valid");
+
+        // 4. Static token login + granular policy update via `/v1/mcp/login-token` and `/v1/mcp/policy`.
+        let (tok_head, tok_res) = raw_http(
+            addr,
+            "POST",
+            "/v1/mcp/login-token",
+            Some(&op),
+            Some(json!({
+                "org_id": "acme",
+                "server_id": "notion",
+                "token": "tok_static_web_777"
+            })),
+        )
+        .await;
+        assert!(tok_head.contains("200 OK"), "{tok_head} {tok_res}");
+        assert!(!tok_res.to_string().contains("tok_static_web_777"));
+
+        let (pol_head, pol_res) = raw_http(
+            addr,
+            "POST",
+            "/v1/mcp/policy",
+            Some(&op),
+            Some(json!({
+                "org_id": "acme",
+                "server_id": "notion",
+                "trust_level": "trusted_internal",
+                "dlp_mode": "block",
+                "allow_tools": ["list_items"],
+                "forbid_tools": ["nuke_all"]
+            })),
+        )
+        .await;
+        assert!(pol_head.contains("200 OK"), "{pol_head} {pol_res}");
+        assert_eq!(pol_res["server"]["policy"]["trust_level"], "trusted_internal");
+        assert_eq!(pol_res["server"]["policy"]["dlp_mode"], "block");
+        assert_eq!(pol_res["server"]["policy"]["tool_overrides"]["list_items"], "read_only");
+        assert_eq!(pol_res["server"]["policy"]["tool_overrides"]["nuke_all"], "forbidden");
+
+        // Reset to untrusted + inspect & dispatch Outbox ticket via `/v1/mcp/outbox` + `/v1/mcp/outbox/decide`.
+        let _ = raw_http(
+            addr,
+            "POST",
+            "/v1/mcp/policy",
+            Some(&op),
+            Some(json!({
+                "org_id": "acme",
+                "server_id": "notion",
+                "trust_level": "untrusted_external"
+            })),
+        )
+        .await;
+
+        let agent = AgentIdentity::new("acme", "coder-web", "Engineer");
+        let staged = kernel
+            .mcp_firewall
+            .stage_outbox_ticket(
+                &agent,
+                "ses-web-1",
+                "notion",
+                "create_item",
+                McpToolRiskClass::StagedWrite,
+                json!({ "title": "demo" }),
+                json!({ "title": "demo" }),
+                None,
+                false,
+            )
+            .await
+            .unwrap();
+
+        let (ob_head, ob_json) = raw_http(
+            addr,
+            "GET",
+            "/v1/mcp/outbox?org_id=acme&status=pending",
+            Some(&op),
+            None,
+        )
+        .await;
+        assert!(ob_head.contains("200 OK"), "{ob_head}");
+        assert!(!ob_json.to_string().contains("sealed_exec_arguments"));
+        assert_eq!(ob_json["tickets"][0]["ticket_id"], staged.ticket_id);
+
+        let (dec_head, dec_json) = raw_http(
+            addr,
+            "POST",
+            "/v1/mcp/outbox/decide",
+            Some(&op),
+            Some(json!({
+                "org_id": "acme",
+                "ticket_id": staged.ticket_id,
+                "approve": true
+            })),
+        )
+        .await;
+        assert!(dec_head.contains("200 OK"), "{dec_head} {dec_json}");
+        assert!(!dec_json.to_string().contains("sealed_exec_arguments"));
+        assert_eq!(dec_json["ticket"]["status"], "dispatched");
+        let dispatches = seen_dispatches.lock().await;
+        assert_eq!(dispatches.len(), 1);
+        assert_eq!(dispatches[0].0, "Bearer tok_static_web_777");
+        assert_eq!(dispatches[0].1, "create_item");
+    }
+
+    #[tokio::test]
+    async fn option_b_install_and_hot_bridge_emit_list_changed_notifications() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        use tokio::net::TcpListener;
+
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let mcp_addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            loop {
+                let Ok((mut stream, _)) = listener.accept().await else {
+                    break;
+                };
+                tokio::spawn(async move {
+                    let mut buf = Vec::new();
+                    let mut tmp = [0u8; 4096];
+                    loop {
+                        let n = stream.read(&mut tmp).await.unwrap_or(0);
+                        if n == 0 {
+                            break;
+                        }
+                        buf.extend_from_slice(&tmp[..n]);
+                        let raw = String::from_utf8_lossy(&buf);
+                        if let Some((head, body)) = raw.split_once("\r\n\r\n") {
+                            let clen: usize = head
+                                .lines()
+                                .find_map(|l| {
+                                    let (k, v) = l.split_once(':')?;
+                                    k.eq_ignore_ascii_case("content-length")
+                                        .then(|| v.trim().parse().ok())?
+                                })
+                                .unwrap_or(0);
+                            if body.len() >= clen {
+                                let req: Value =
+                                    serde_json::from_str(&body[..clen]).unwrap_or_default();
+                                let rid = req.get("id").cloned().unwrap_or(json!(1));
+                                let method = req.get("method").and_then(|v| v.as_str()).unwrap_or("");
+                                if method == "notifications/initialized" {
+                                    let _ = stream
+                                        .write_all(b"HTTP/1.1 202 Accepted\r\nContent-Length: 0\r\nConnection: close\r\n\r\n")
+                                        .await;
+                                    return;
+                                }
+                                if method == "tools/list" {
+                                    let sse = format!(
+                                        "data: {}\n\ndata: {}\n\n",
+                                        json!({ "jsonrpc": "2.0", "method": "notifications/tools/list_changed" }),
+                                        json!({
+                                            "jsonrpc": "2.0",
+                                            "id": rid,
+                                            "result": {
+                                                "tools": [{
+                                                    "name": "list_issues",
+                                                    "description": "Read issues",
+                                                    "inputSchema": { "type": "object", "properties": {} },
+                                                    "annotations": { "readOnlyHint": true }
+                                                }]
+                                            }
+                                        })
+                                    );
+                                    let out = format!(
+                                        "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nMcp-Session-Id: ses-p3-optb\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                                        sse.len(),
+                                        sse
+                                    );
+                                    let _ = stream.write_all(out.as_bytes()).await;
+                                    return;
+                                }
+                                if method == "tools/call" {
+                                    let sse = format!(
+                                        "data: {}\n\ndata: {}\n\n",
+                                        json!({ "jsonrpc": "2.0", "method": "notifications/resources/list_changed" }),
+                                        json!({
+                                            "jsonrpc": "2.0",
+                                            "id": rid,
+                                            "result": {
+                                                "content": [{ "type": "text", "text": "issue-101" }]
+                                            }
+                                        })
+                                    );
+                                    let out = format!(
+                                        "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nMcp-Session-Id: ses-p3-optb\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                                        sse.len(),
+                                        sse
+                                    );
+                                    let _ = stream.write_all(out.as_bytes()).await;
+                                    return;
+                                }
+                                let init_body = json!({
+                                    "jsonrpc": "2.0",
+                                    "id": rid,
+                                    "result": {
+                                        "protocolVersion": "2024-11-05",
+                                        "serverInfo": { "name": "mock-optb-push", "version": "1.0.0" },
+                                        "capabilities": { "tools": { "listChanged": true } }
+                                    }
+                                })
+                                .to_string();
+                                let out = format!(
+                                    "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nMcp-Session-Id: ses-p3-optb\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                                    init_body.len(),
+                                    init_body
+                                );
+                                let _ = stream.write_all(out.as_bytes()).await;
+                                return;
+                            }
+                        }
+                    }
+                });
+            }
+        });
+
+        let temp = tempfile::tempdir().unwrap();
+        let rt_dir = temp.path().join("rt");
+        let repo = temp.path().join("repo");
+        std::fs::create_dir_all(&rt_dir).unwrap();
+        std::fs::create_dir_all(&repo).unwrap();
+
+        let kernel = Arc::new(AegisRuntimeKernel::new(&rt_dir).await.unwrap());
+        let addr = kernel.clone().start_http_daemon("127.0.0.1:0", repo).await.unwrap();
+        let op = kernel.operator_token();
+        let agent = AgentIdentity::new("acme", "coder-p3", "Engineer");
+
+        // 1. Kernel `initialize` advertises `tools.listChanged` & `resources.listChanged`.
+        let init_resp = kernel
+            .handle_jsonrpc_message(
+                &agent,
+                json!({ "jsonrpc": "2.0", "id": 1, "method": "initialize", "params": {} }),
+            )
+            .await
+            .unwrap();
+        assert_eq!(init_resp["result"]["capabilities"]["tools"]["listChanged"], true);
+        assert_eq!(init_resp["result"]["capabilities"]["resources"]["listChanged"], true);
+
+        let mut rx = kernel.subscribe_mcp_notifications();
+
+        // 2. Propose install -> approve -> reinstall emits `tools/list_changed` + `resources/list_changed`.
+        let ask = kernel
+            .call_tool(
+                &agent,
+                "mcp_request_install",
+                json!({
+                    "target": format!("http://{mcp_addr}/mcp"),
+                    "server_id": "pushdemo",
+                    "reason": "Test Option B notifications",
+                    "allow_local_http": true
+                }),
+            )
+            .await
+            .unwrap();
+        assert_eq!(ask["status"], "approval_required");
+        let esc_id = ask["escalation_id"].as_str().unwrap();
+
+        let (ok_head, _) = raw_http(
+            addr,
+            "POST",
+            "/v1/approvals/decide",
+            Some(&op),
+            Some(json!({
+                "escalation_id": esc_id,
+                "decision": "approve",
+                "ttl_secs": 0,
+                "inline_auth_token": "tok-optb-p3"
+            })),
+        )
+        .await;
+        assert!(ok_head.contains("200 OK"), "{ok_head}");
+
+        let installed = kernel
+            .call_tool(
+                &agent,
+                "mcp_request_install",
+                json!({
+                    "target": format!("http://{mcp_addr}/mcp"),
+                    "server_id": "pushdemo",
+                    "reason": "Test Option B notifications",
+                    "allow_local_http": true
+                }),
+            )
+            .await
+            .unwrap();
+        assert_eq!(installed["status"], "installed");
+
+        let mut install_methods = Vec::new();
+        while let Ok(ev) = rx.try_recv() {
+            install_methods.push(ev["method"].as_str().unwrap().to_string());
+        }
+        assert!(install_methods.contains(&"notifications/tools/list_changed".to_string()));
+        assert!(install_methods.contains(&"notifications/resources/list_changed".to_string()));
+
+        // 3. Hot-bridge `mcp_hot_list_tools` forwards SSE `tools/list_changed` & re-emits on kernel bus.
+        let tools_res = kernel
+            .call_tool(&agent, "mcp_hot_list_tools", json!({ "server_id": "pushdemo" }))
+            .await
+            .unwrap();
+        assert_eq!(tools_res["tools_list_changed"], true);
+        assert_eq!(
+            tools_res["notifications"][0]["method"],
+            "notifications/tools/list_changed"
+        );
+        let bus_tools_ev = rx.try_recv().unwrap();
+        assert_eq!(bus_tools_ev["method"], "notifications/tools/list_changed");
+
+        // 4. Hot-bridge `mcp_hot_call_tool` forwards SSE `resources/list_changed` & re-emits on kernel bus.
+        let call_res = kernel
+            .call_tool(
+                &agent,
+                "mcp_hot_call_tool",
+                json!({ "server_id": "pushdemo", "tool_name": "list_issues", "arguments": {} }),
+            )
+            .await
+            .unwrap();
+        assert_eq!(call_res["resources_list_changed"], true);
+        let bus_res_ev = rx.try_recv().unwrap();
+        assert_eq!(bus_res_ev["method"], "notifications/resources/list_changed");
     }
 }

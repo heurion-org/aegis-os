@@ -552,9 +552,17 @@ pub const APPROVE_PAGE_HTML: &str = r##"<!doctype html>
     <div class="card" id="mcp-inventory-card" style="display:none">
       <p class="label-caps">ZERO-TRUST MCP FIREWALL · ORG INVENTORY</p>
       <h2>Installed External MCP Servers</h2>
-      <p style="font-size:13px;">Active servers staged into confined sessions, authentication posture, and quick revocation controls.</p>
+      <p style="font-size:13px;">Active servers staged into confined sessions, authentication posture, trust/DLP policy, and inline credential controls.</p>
       <div id="mcp-inventory-body"></div>
       <p id="mcp-inventory-msg"></p>
+    </div>
+
+    <div class="card" id="mcp-outbox-card" style="display:none">
+      <p class="label-caps">ACTION OUTBOX · SHA-256 STAGED WRITES</p>
+      <h2>Pending External MCP Writes</h2>
+      <p style="font-size:13px;">Write/mutating calls intercepted from untrusted MCP servers. Review exact arguments before host dispatch.</p>
+      <div id="mcp-outbox-body"></div>
+      <p id="mcp-outbox-msg"></p>
     </div>
   </main>
 
@@ -685,7 +693,147 @@ pub const APPROVE_PAGE_HTML: &str = r##"<!doctype html>
     }
   }
 
-  async function decide(escId, decision, ttlSecs) {
+  function safeAuthUrl(raw) {
+    try {
+      const u = new URL(String(raw || '').trim());
+      if (u.protocol === 'https:') return u.toString();
+      if (u.protocol === 'http:' && (u.hostname === '127.0.0.1' || u.hostname === 'localhost')) {
+        return u.toString();
+      }
+    } catch (_) {}
+    return '';
+  }
+
+  async function startMcpOAuth(opts, containerEl, msgEl) {
+    if (!containerEl) return;
+    containerEl.textContent = 'Discovering OAuth 2.1 metadata…';
+    if (msgEl) {
+      msgEl.className = '';
+      msgEl.textContent = 'Starting OAuth 2.1 flow…';
+    }
+    try {
+      const res = await fetch(apiBase + '/v1/mcp/oauth/start', {
+        method: 'POST',
+        headers: headers(),
+        body: JSON.stringify(opts || {})
+      });
+      const sess = await res.json();
+      if (!res.ok) throw new Error(sess.error || res.statusText);
+
+      containerEl.innerHTML = '';
+      const info = document.createElement('div');
+      info.style.marginTop = '8px';
+      info.style.padding = '10px';
+      info.style.border = '1px solid #d1d5db';
+      info.style.borderRadius = '8px';
+
+      if (sess.flow === 'pkce' && sess.authorize_url) {
+        const safeUrl = safeAuthUrl(sess.authorize_url);
+        if (!safeUrl) throw new Error('Unsafe authorize URL rejected');
+        const p = document.createElement('p');
+        p.style.margin = '0 0 6px 0';
+        p.textContent = 'Complete authorization in the sign-in window, then return here:';
+        info.appendChild(p);
+        const a = document.createElement('a');
+        a.href = safeUrl;
+        a.target = '_blank';
+        a.rel = 'noopener noreferrer';
+        a.textContent = 'Open Provider Sign-In →';
+        a.style.fontWeight = '600';
+        info.appendChild(a);
+      } else if (sess.verification_uri) {
+        const safeUri = safeAuthUrl(sess.verification_uri);
+        if (!safeUri) throw new Error('Unsafe verification URI rejected');
+        const p = document.createElement('p');
+        p.style.margin = '0 0 6px 0';
+        p.textContent = 'Open the verification link and enter the code below:';
+        info.appendChild(p);
+        const a = document.createElement('a');
+        a.href = safeUri;
+        a.target = '_blank';
+        a.rel = 'noopener noreferrer';
+        a.textContent = safeUri;
+        info.appendChild(a);
+        if (sess.user_code) {
+          const codeEl = document.createElement('div');
+          codeEl.style.marginTop = '6px';
+          codeEl.style.fontFamily = 'monospace';
+          codeEl.style.fontSize = '15px';
+          codeEl.style.fontWeight = '700';
+          codeEl.textContent = 'User Code: ' + sess.user_code;
+          info.appendChild(codeEl);
+        }
+      } else {
+        const p = document.createElement('p');
+        p.textContent = 'OAuth status: ' + (sess.status || 'starting');
+        info.appendChild(p);
+      }
+
+      const stEl = document.createElement('p');
+      stEl.style.margin = '8px 0 0 0';
+      stEl.style.fontSize = '13px';
+      stEl.textContent = 'Waiting for OAuth completion… (' + (sess.status || 'awaiting_user') + ')';
+      info.appendChild(stEl);
+      containerEl.appendChild(info);
+
+      if (sess.status === 'completed') {
+        stEl.className = 'ok';
+        stEl.textContent = 'OAuth authenticated and sealed in host Vault.';
+        if (msgEl) { msgEl.className = 'ok'; msgEl.textContent = 'Signed in.'; }
+        await loadMcpInventory(true);
+        return;
+      }
+      if (sess.status === 'failed') {
+        stEl.className = 'err';
+        stEl.textContent = 'OAuth failed: ' + (sess.error || 'unknown error');
+        return;
+      }
+
+      let polls = 0;
+      const pollTimer = setInterval(async () => {
+        if (++polls > 220) {
+          clearInterval(pollTimer);
+          stEl.className = 'err';
+          stEl.textContent = 'Timed out waiting for OAuth callback.';
+          return;
+        }
+        try {
+          const sres = await fetch(
+            apiBase + '/v1/mcp/oauth/status?session_id=' + encodeURIComponent(sess.session_id),
+            { headers: headers() }
+          );
+          const sdata = await sres.json();
+          if (!sres.ok) throw new Error(sdata.error || sres.statusText);
+          if (sdata.status === 'completed') {
+            clearInterval(pollTimer);
+            stEl.className = 'ok';
+            stEl.textContent = 'OAuth authenticated and sealed in host Vault! Agent session will hot-reload automatically.';
+            if (msgEl) { msgEl.className = 'ok'; msgEl.textContent = 'OAuth complete.'; }
+            await loadMcpInventory(true);
+          } else if (sdata.status === 'failed') {
+            clearInterval(pollTimer);
+            stEl.className = 'err';
+            stEl.textContent = 'OAuth failed: ' + (sdata.error || 'unknown error');
+            if (msgEl) { msgEl.className = 'err'; msgEl.textContent = sdata.error || 'OAuth failed'; }
+          } else {
+            stEl.textContent = 'Waiting for OAuth completion… (' + sdata.status + ')';
+          }
+        } catch (pe) {
+          clearInterval(pollTimer);
+          stEl.className = 'err';
+          stEl.textContent = 'Status poll error: ' + pe.message;
+        }
+      }, 1500);
+    } catch (e) {
+      containerEl.innerHTML = '';
+      if (msgEl) {
+        msgEl.className = 'err';
+        msgEl.textContent = 'OAuth error: ' + e.message;
+      }
+    }
+  }
+
+  async function decide(escId, decision, ttlSecs, opts) {
     const totpInput = document.getElementById('totp-' + escId);
     const msgEl = document.getElementById('msg-' + escId);
     const totp = totpInput ? totpInput.value.trim() : '';
@@ -737,11 +885,22 @@ pub const APPROVE_PAGE_HTML: &str = r##"<!doctype html>
         ? 'Escalation Denied (' + escId + ')'
         : 'Approved (' + escId + ')';
       const p = document.createElement('p');
-      p.textContent = decision === 'deny'
-        ? 'The blocked operation was rejected and recorded in the SHA-256 audit chain.'
-        : 'Lease granted. Your agent session will automatically resume and complete the operation — you can close this tab.';
-      card.appendChild(h);
-      card.appendChild(p);
+      if (decision !== 'deny' && opts && opts.oauthAfter) {
+        p.textContent = 'Install approved. Complete OAuth sign-in below to seal credentials directly into host Vault:';
+        card.appendChild(h);
+        card.appendChild(p);
+        const oauthBox = document.createElement('div');
+        const oauthMsg = document.createElement('p');
+        card.appendChild(oauthBox);
+        card.appendChild(oauthMsg);
+        await startMcpOAuth(opts.oauthOpts, oauthBox, oauthMsg);
+      } else {
+        p.textContent = decision === 'deny'
+          ? 'The blocked operation was rejected and recorded in the SHA-256 audit chain.'
+          : 'Lease granted. Your agent session will automatically resume and complete the operation — you can close this tab.';
+        card.appendChild(h);
+        card.appendChild(p);
+      }
     } catch (e) {
       msgEl.className = 'err';
       msgEl.textContent = 'Error: ' + e.message;
@@ -889,7 +1048,8 @@ pub const APPROVE_PAGE_HTML: &str = r##"<!doctype html>
         fields.push(['Pinned Hosts', ev.allowed_hosts.join(', ')]);
       }
       if (ev.package_spec && ev.package_spec.identifier) {
-        fields.push(['Package (Sandboxed)', (ev.package_spec.registry_type || 'pkg') + ':' + ev.package_spec.identifier]);
+        const ver = ev.package_spec.version ? '@' + ev.package_spec.version : '';
+        fields.push(['Package (Sandboxed)', (ev.package_spec.registry_type || 'pkg') + ':' + ev.package_spec.identifier + ver]);
       }
       fields.push(['Default Posture', 'untrusted · DLP pseudonymize · writes staged to Outbox']);
     }
@@ -959,6 +1119,23 @@ pub const APPROVE_PAGE_HTML: &str = r##"<!doctype html>
     btnOnce.textContent = 'Approve Once (SHA-256 Pinned)';
     btnOnce.onclick = () => decide(esc.escalation_id, 'approve', 0);
     row.appendChild(btnOnce);
+
+    if (esc.action === 'mcp_request_install' && ev.transport_kind !== 'stdio') {
+      const btnOAuth = document.createElement('button');
+      btnOAuth.textContent = 'Approve & Sign in with OAuth';
+      btnOAuth.onclick = () => decide(esc.escalation_id, 'approve', 0, {
+        oauthAfter: true,
+        oauthOpts: {
+          org_id: esc.org_id || targetOrg || 'default-org',
+          server_id: ev.server_id || undefined,
+          remote_url: ev.remote_url || undefined,
+          allowed_hosts: Array.isArray(ev.allowed_hosts) ? ev.allowed_hosts : [],
+          allow_local_http: !!ev.allow_local_http,
+          mode: 'auto'
+        }
+      });
+      row.appendChild(btnOAuth);
+    }
 
     if ((!isHighRisk && esc.action !== 'mcp_request_install') || esc.action === 'host_exec') {
       const btn15m = document.createElement('button');
@@ -1043,7 +1220,9 @@ pub const APPROVE_PAGE_HTML: &str = r##"<!doctype html>
           root.appendChild(renderEscalation(esc));
         }
       }
-      await loadMcpInventory(isOperatorKey || mode === 'local');
+      const canManageMcp = isOperatorKey || mode === 'local';
+      await loadMcpInventory(canManageMcp);
+      await loadMcpOutbox(canManageMcp);
     } catch (e) {
       root.innerHTML = '<div class="card"><p class="err">Failed to load escalations: ' + e.message + '</p></div>';
     }
@@ -1068,39 +1247,286 @@ pub const APPROVE_PAGE_HTML: &str = r##"<!doctype html>
     }
   }
 
+  async function saveMcpPolicy(orgId, serverId, trustLevel, dlpMode, isolateNet, allowedHostsText) {
+    const msg = document.getElementById('mcp-inventory-msg');
+    try {
+      const payload = {
+        org_id: orgId,
+        server_id: serverId,
+        trust_level: trustLevel,
+        dlp_mode: dlpMode
+      };
+      if (typeof isolateNet === 'boolean') {
+        payload.isolate_upstream_network = isolateNet;
+      }
+      if (typeof allowedHostsText === 'string') {
+        payload.allowed_hosts = allowedHostsText
+          .split(',')
+          .map(x => x.trim())
+          .filter(Boolean);
+      }
+      const res = await fetch(apiBase + '/v1/mcp/policy', {
+        method: 'POST',
+        headers: headers(),
+        body: JSON.stringify(payload)
+      });
+      const data = await res.json();
+      if (!res.ok) throw new Error(data.error || res.statusText);
+      msg.className = 'ok';
+      msg.textContent = 'Updated policy for ' + serverId;
+      await loadMcpInventory(true);
+    } catch (e) {
+      msg.className = 'err';
+      msg.textContent = e.message;
+    }
+  }
+
+  async function saveMcpStaticToken(orgId, serverId, realmId, token) {
+    const msg = document.getElementById('mcp-inventory-msg');
+    const cleanTok = String(token || '').trim();
+    if (!cleanTok) {
+      msg.className = 'err';
+      msg.textContent = 'Enter a non-empty Bearer token or API key.';
+      return;
+    }
+    try {
+      const res = await fetch(apiBase + '/v1/mcp/login-token', {
+        method: 'POST',
+        headers: headers(),
+        body: JSON.stringify({
+          org_id: orgId,
+          server_id: serverId,
+          realm_id: realmId || serverId,
+          token: cleanTok
+        })
+      });
+      const data = await res.json();
+      if (!res.ok) throw new Error(data.error || res.statusText);
+      msg.className = 'ok';
+      msg.textContent = 'Sealed token into Vault for ' + serverId;
+      await loadMcpInventory(true);
+    } catch (e) {
+      msg.className = 'err';
+      msg.textContent = e.message;
+    }
+  }
+
+  async function decideMcpOutbox(orgId, ticketId, approve) {
+    const msg = document.getElementById('mcp-outbox-msg');
+    try {
+      const res = await fetch(apiBase + '/v1/mcp/outbox/decide', {
+        method: 'POST',
+        headers: headers(),
+        body: JSON.stringify({
+          org_id: orgId,
+          ticket_id: ticketId,
+          approve: !!approve,
+          reviewed_by: mode === 'local' ? 'local-web-console' : 'web-approval-console'
+        })
+      });
+      const data = await res.json();
+      if (!res.ok) throw new Error(data.error || res.statusText);
+      msg.className = approve ? 'ok' : 'err';
+      msg.textContent = (approve ? 'Dispatched ' : 'Denied ') + ticketId + ' (' + ((data.ticket && data.ticket.status) || data.status || 'done') + ')';
+      await loadMcpOutbox(true);
+      await loadMcpInventory(true);
+    } catch (e) {
+      msg.className = 'err';
+      msg.textContent = e.message;
+    }
+  }
+
+  async function loadMcpOutbox(canManage) {
+    const card = document.getElementById('mcp-outbox-card');
+    const body = document.getElementById('mcp-outbox-body');
+    if (!card || !body || !canManage) return;
+    try {
+      const url = apiBase + '/v1/mcp/outbox?status=pending' + (targetOrg ? '&org_id=' + encodeURIComponent(targetOrg) : '');
+      const res = await fetch(url, { headers: headers() });
+      if (!res.ok) return;
+      const data = await res.json();
+      const tickets = Array.isArray(data.tickets) ? data.tickets : [];
+      card.style.display = 'block';
+      body.innerHTML = '';
+      if (tickets.length === 0) {
+        const p = document.createElement('p');
+        p.style.fontSize = '13px';
+        p.style.color = '#6b7280';
+        p.textContent = 'No pending staged MCP writes.';
+        body.appendChild(p);
+        return;
+      }
+      const orgId = data.org_id || targetOrg || 'default-org';
+      for (const t of tickets) {
+        const item = document.createElement('div');
+        item.style.padding = '10px 0';
+        item.style.borderTop = '1px solid #e5e7eb';
+
+        const hdr = document.createElement('div');
+        hdr.style.fontWeight = '600';
+        const shaShort = String(t.payload_sha256 || '').slice(0, 12);
+        hdr.textContent = t.server_id + ' · ' + t.tool_name + ' [' + t.risk_class + '] · sha256:' + shaShort + (t.tainted ? ' · tainted' : '');
+        item.appendChild(hdr);
+
+        const pre = document.createElement('pre');
+        pre.style.fontSize = '12px';
+        pre.style.margin = '6px 0';
+        pre.style.padding = '8px';
+        pre.style.background = '#f9fafb';
+        pre.style.borderRadius = '6px';
+        pre.style.overflowX = 'auto';
+        pre.textContent = JSON.stringify(t.preview_arguments || {}, null, 2);
+        item.appendChild(pre);
+
+        const btnRow = document.createElement('div');
+        btnRow.className = 'row';
+        const btnApp = document.createElement('button');
+        btnApp.textContent = 'Approve & Dispatch';
+        btnApp.onclick = () => decideMcpOutbox(t.org_id || orgId, t.ticket_id, true);
+        btnRow.appendChild(btnApp);
+
+        const btnDen = document.createElement('button');
+        btnDen.className = 'danger';
+        btnDen.textContent = 'Deny';
+        btnDen.onclick = () => decideMcpOutbox(t.org_id || orgId, t.ticket_id, false);
+        btnRow.appendChild(btnDen);
+
+        item.appendChild(btnRow);
+        body.appendChild(item);
+      }
+    } catch (_) {}
+  }
+
   async function loadMcpInventory(canManage) {
     const card = document.getElementById('mcp-inventory-card');
     const body = document.getElementById('mcp-inventory-body');
+    const msg = document.getElementById('mcp-inventory-msg');
     if (!card || !body || !canManage) return;
     try {
       const url = apiBase + '/v1/mcp/inventory' + (targetOrg ? '?org_id=' + encodeURIComponent(targetOrg) : '');
       const res = await fetch(url, { headers: headers() });
       if (!res.ok) return;
       const inv = await res.json();
+      const orgId = inv.org_id || targetOrg || 'default-org';
       const servers = Array.isArray(inv.servers) ? inv.servers : [];
       card.style.display = 'block';
       body.innerHTML = '';
       if (servers.length === 0) {
-        body.innerHTML = '<p style="font-size:13px;color:#6b7280;">No external MCP servers registered for this organization yet.</p>';
+        const p = document.createElement('p');
+        p.style.fontSize = '13px';
+        p.style.color = '#6b7280';
+        p.textContent = 'No external MCP servers registered for this organization yet.';
+        body.appendChild(p);
         return;
       }
       for (const s of servers) {
         const item = document.createElement('div');
-        item.style.display = 'flex';
-        item.style.justifyContent = 'space-between';
-        item.style.alignItems = 'center';
-        item.style.padding = '8px 0';
+        item.style.padding = '10px 0';
         item.style.borderTop = '1px solid #e5e7eb';
+
         const info = document.createElement('div');
-        info.textContent = s.server_id + ' · ' + s.transport + ' · auth=' + s.auth_state + ' · status=' + s.status + ' · trust=' + s.trust_level;
+        info.style.fontWeight = '600';
+        info.textContent = s.server_id + ' · ' + s.transport + ' · auth=' + s.auth_state + ' · status=' + s.status;
         item.appendChild(info);
-        if (s.auth_realm) {
-          const btn = document.createElement('button');
-          btn.className = 'secondary';
-          btn.textContent = 'Revoke Auth';
-          btn.onclick = () => mcpLogoutRealm(inv.org_id || targetOrg || 'default-org', s.auth_realm);
-          item.appendChild(btn);
+
+        const ctrl = document.createElement('div');
+        ctrl.className = 'row';
+        ctrl.style.marginTop = '8px';
+        ctrl.style.flexWrap = 'wrap';
+        ctrl.style.gap = '8px';
+
+        const trustSel = document.createElement('select');
+        const tOptU = document.createElement('option');
+        tOptU.value = 'untrusted_external';
+        tOptU.textContent = 'untrusted';
+        const tOptT = document.createElement('option');
+        tOptT.value = 'trusted_internal';
+        tOptT.textContent = 'trusted';
+        trustSel.appendChild(tOptU);
+        trustSel.appendChild(tOptT);
+        trustSel.value = s.trust_level === 'trusted_internal' ? 'trusted_internal' : 'untrusted_external';
+        ctrl.appendChild(trustSel);
+
+        const dlpSel = document.createElement('select');
+        for (const dv of ['pseudonymize', 'block', 'off']) {
+          const opt = document.createElement('option');
+          opt.value = dv;
+          opt.textContent = 'dlp:' + dv;
+          dlpSel.appendChild(opt);
         }
+        dlpSel.value = ['pseudonymize', 'block', 'off'].includes(s.dlp_mode) ? s.dlp_mode : 'pseudonymize';
+        ctrl.appendChild(dlpSel);
+
+        let netSel = null;
+        let hostsInp = null;
+        if (s.transport === 'stdio') {
+          netSel = document.createElement('select');
+          const nOptIso = document.createElement('option');
+          nOptIso.value = 'isolated';
+          nOptIso.textContent = 'net:isolated';
+          const nOptHost = document.createElement('option');
+          nOptHost.value = 'host';
+          nOptHost.textContent = 'net:host';
+          netSel.appendChild(nOptIso);
+          netSel.appendChild(nOptHost);
+          netSel.value = s.isolate_upstream_network ? 'isolated' : 'host';
+          ctrl.appendChild(netSel);
+
+          hostsInp = document.createElement('input');
+          hostsInp.type = 'text';
+          hostsInp.placeholder = 'Allowed hosts (comma-sep)';
+          hostsInp.style.width = '200px';
+          hostsInp.value = Array.isArray(s.allowed_hosts) ? s.allowed_hosts.join(', ') : '';
+          ctrl.appendChild(hostsInp);
+        }
+
+        const btnSave = document.createElement('button');
+        btnSave.className = 'secondary';
+        btnSave.textContent = 'Save Policy';
+        btnSave.onclick = () => saveMcpPolicy(
+          orgId,
+          s.server_id,
+          trustSel.value,
+          dlpSel.value,
+          netSel ? netSel.value === 'isolated' : undefined,
+          hostsInp ? hostsInp.value : undefined
+        );
+        ctrl.appendChild(btnSave);
+
+        const oauthSlot = document.createElement('div');
+        if (s.transport !== 'stdio') {
+          const btnSign = document.createElement('button');
+          btnSign.textContent = 'OAuth Sign-In';
+          btnSign.onclick = () => startMcpOAuth(
+            { org_id: orgId, server_id: s.server_id, realm_id: s.auth_realm || s.server_id, mode: 'auto' },
+            oauthSlot,
+            msg
+          );
+          ctrl.appendChild(btnSign);
+
+          const tokInp = document.createElement('input');
+          tokInp.type = 'password';
+          tokInp.placeholder = 'Set Bearer / API key';
+          tokInp.style.width = '180px';
+          ctrl.appendChild(tokInp);
+
+          const btnTok = document.createElement('button');
+          btnTok.className = 'secondary';
+          btnTok.textContent = 'Set Token';
+          btnTok.onclick = () => saveMcpStaticToken(orgId, s.server_id, s.auth_realm || s.server_id, tokInp.value);
+          ctrl.appendChild(btnTok);
+        }
+
+        if (s.auth_realm) {
+          const btnRev = document.createElement('button');
+          btnRev.className = 'danger';
+          btnRev.textContent = 'Revoke Auth';
+          btnRev.onclick = () => mcpLogoutRealm(orgId, s.auth_realm);
+          ctrl.appendChild(btnRev);
+        }
+
+        item.appendChild(ctrl);
+        item.appendChild(oauthSlot);
         body.appendChild(item);
       }
     } catch (_) {}
