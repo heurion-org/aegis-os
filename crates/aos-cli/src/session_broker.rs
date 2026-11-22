@@ -29,6 +29,25 @@ pub const CONTROL_DIR_IN_SANDBOX: &str = "/run/aegis/control";
 pub const CONTROL_SOCKET_IN_SANDBOX: &str = "/run/aegis/control/control.sock";
 const MAX_BODY_BYTES: usize = 16 * 1024 * 1024;
 
+async fn should_continue_after_accept_error(err: &std::io::Error) -> bool {
+    if matches!(
+        err.raw_os_error(),
+        Some(libc::EBADF) | Some(libc::EINVAL) | Some(libc::ENOTSOCK) | Some(libc::EOPNOTSUPP)
+    ) {
+        return false;
+    }
+    if !matches!(
+        err.kind(),
+        std::io::ErrorKind::Interrupted
+            | std::io::ErrorKind::ConnectionAborted
+            | std::io::ErrorKind::ConnectionReset
+            | std::io::ErrorKind::WouldBlock
+    ) {
+        tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+    }
+    true
+}
+
 #[derive(Debug, Clone)]
 pub struct BrokerSession {
     pub session_id: String,
@@ -377,8 +396,14 @@ impl SessionBroker {
             let addr = listener.local_addr()?;
             let task = tokio::spawn(async move {
                 loop {
-                    let Ok((stream, _)) = listener.accept().await else {
-                        break;
+                    let (stream, _) = match listener.accept().await {
+                        Ok(v) => v,
+                        Err(err) => {
+                            if should_continue_after_accept_error(&err).await {
+                                continue;
+                            }
+                            break;
+                        }
                     };
                     let state = state.clone();
                     tokio::spawn(async move {
@@ -399,8 +424,14 @@ impl SessionBroker {
             }
             let task = tokio::spawn(async move {
                 loop {
-                    let Ok((stream, _)) = listener.accept().await else {
-                        break;
+                    let (stream, _) = match listener.accept().await {
+                        Ok(v) => v,
+                        Err(err) => {
+                            if should_continue_after_accept_error(&err).await {
+                                continue;
+                            }
+                            break;
+                        }
                     };
                     let state = state.clone();
                     tokio::spawn(async move {

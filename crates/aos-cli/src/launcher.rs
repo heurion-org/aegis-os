@@ -42,7 +42,9 @@ use std::os::fd::{AsRawFd, FromRawFd};
 use std::os::unix::process::CommandExt;
 use std::path::{Path, PathBuf};
 use std::process::{ExitStatus, Stdio};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::Arc;
+use std::time::{Duration, Instant};
 use tokio::process::Command;
 
 const STAGE_ROOT: &str = "/run/aegis";
@@ -2059,10 +2061,129 @@ fn git_view(
     )?))
 }
 
+const DEFAULT_NON_REFLINK_MAX_FILES: usize = 25_000;
+const DEFAULT_NON_REFLINK_MAX_BYTES: u64 = 1024 * 1024 * 1024; // 1 GiB
+
+fn allow_large_workspace_override() -> bool {
+    std::env::var("AOS_ALLOW_LARGE_WORKSPACE")
+        .ok()
+        .is_some_and(|v| matches!(v.trim().to_ascii_lowercase().as_str(), "1" | "true" | "yes"))
+}
+
+fn env_usize(key: &str, default: usize) -> usize {
+    std::env::var(key)
+        .ok()
+        .and_then(|v| v.trim().parse::<usize>().ok())
+        .filter(|&v| v > 0)
+        .unwrap_or(default)
+}
+
+fn env_u64(key: &str, default: u64) -> u64 {
+    std::env::var(key)
+        .ok()
+        .and_then(|v| v.trim().parse::<u64>().ok())
+        .filter(|&v| v > 0)
+        .unwrap_or(default)
+}
+
+fn detect_umbrella_workspace(project: &Path) -> Option<Vec<String>> {
+    if !project.is_dir() {
+        return None;
+    }
+    const PROJECT_ROOT_MARKERS: &[&str] = &[
+        ".git",
+        ".hg",
+        ".svn",
+        ".jj",
+        ".aegis",
+        "Cargo.toml",
+        "package.json",
+        "pyproject.toml",
+        "setup.py",
+        "setup.cfg",
+        "go.mod",
+        "Makefile",
+        "GNUmakefile",
+        "CMakeLists.txt",
+        "meson.build",
+        "BUILD",
+        "BUILD.bazel",
+        "WORKSPACE",
+        "WORKSPACE.bazel",
+        "MODULE.bazel",
+        "pom.xml",
+        "build.gradle",
+        "build.gradle.kts",
+        "settings.gradle",
+        "settings.gradle.kts",
+        "Gemfile",
+        "composer.json",
+        "mix.exs",
+        "flake.nix",
+        "deno.json",
+        "deno.jsonc",
+        "bun.lock",
+        "pnpm-workspace.yaml",
+        "lerna.json",
+        "nx.json",
+        "turbo.json",
+        "justfile",
+        "Justfile",
+    ];
+    if PROJECT_ROOT_MARKERS
+        .iter()
+        .any(|marker| project.join(marker).exists())
+    {
+        return None;
+    }
+    let Ok(rd) = std::fs::read_dir(project) else {
+        return None;
+    };
+    let mut has_root_regular_file = false;
+    let mut child_repos = Vec::new();
+    for entry in rd.take(512).flatten() {
+        let name = entry.file_name().to_string_lossy().to_string();
+        if name.starts_with('.') || CoWWorkspace::is_ignored_dir_name(&name) {
+            continue;
+        }
+        let Ok(ft) = entry.file_type() else {
+            continue;
+        };
+        if ft.is_symlink() {
+            continue;
+        }
+        if ft.is_file() {
+            has_root_regular_file = true;
+        } else if ft.is_dir() && child_repos.len() < 6 && entry.path().join(".git").exists() {
+            child_repos.push(name);
+        }
+    }
+    child_repos.sort();
+    if child_repos.len() >= 2 || (child_repos.len() == 1 && !has_root_regular_file) {
+        Some(child_repos)
+    } else {
+        None
+    }
+}
+
 pub(crate) fn validate_workspace_roots(
     project: &Path,
     host_home: &Path,
     runtime_dir: &Path,
+) -> anyhow::Result<()> {
+    validate_workspace_roots_inner(
+        project,
+        host_home,
+        runtime_dir,
+        allow_large_workspace_override(),
+    )
+}
+
+pub(crate) fn validate_workspace_roots_inner(
+    project: &Path,
+    host_home: &Path,
+    runtime_dir: &Path,
+    allow_large: bool,
 ) -> anyhow::Result<()> {
     if project == Path::new("/") {
         bail!("aos run: refusing to use / as the workspace; choose a project directory");
@@ -2091,7 +2212,196 @@ pub(crate) fn validate_workspace_roots(
             runtime.display()
         );
     }
+    if !allow_large {
+        if let Some(child_repos) = detect_umbrella_workspace(project) {
+            let sample = child_repos.join(", ");
+            let hint_repo = child_repos
+                .first()
+                .map(|r| project.join(r).display().to_string())
+                .unwrap_or_else(|| project.join("<repo>").display().to_string());
+            bail!(
+                "aos run: workspace {} looks like a multi-repo parent directory (no project root marker; found child git repos: {sample}). \
+                 Initializing a CoW shadow over a parent folder copies all child repos; run inside a specific repository (e.g. `cd {hint_repo}`) \
+                 or set `AOS_ALLOW_LARGE_WORKSPACE=1` to override.",
+                project.display()
+            );
+        }
+    }
     Ok(())
+}
+
+pub(crate) fn preflight_cow_workspace(project: &Path, runtime_dir: &Path) -> anyhow::Result<()> {
+    preflight_cow_workspace_with_limits(
+        project,
+        runtime_dir,
+        env_usize("AOS_MAX_COW_FILES", DEFAULT_NON_REFLINK_MAX_FILES),
+        env_u64("AOS_MAX_COW_BYTES", DEFAULT_NON_REFLINK_MAX_BYTES),
+        allow_large_workspace_override(),
+    )
+}
+
+pub(crate) fn preflight_cow_workspace_with_limits(
+    project: &Path,
+    runtime_dir: &Path,
+    max_files: usize,
+    max_bytes: u64,
+    allow_large: bool,
+) -> anyhow::Result<()> {
+    if allow_large || !project.is_dir() {
+        return Ok(());
+    }
+    let stats = CoWWorkspace::preflight_cow_footprint(project, runtime_dir, max_files, max_bytes)?;
+    if !stats.reflink_supported && stats.limit_exceeded {
+        let size_mib = stats.total_bytes / (1024 * 1024);
+        let max_mib = max_bytes / (1024 * 1024);
+        bail!(
+            "aos run: workspace {} exceeds CoW copy preflight limits on a non-reflink filesystem \
+             (>= {} files, >= {} MiB; limit: {} files / {} MiB). \
+             Run inside a specific project directory, use `AOS_ENFORCEMENT=advisory`, \
+             or set `AOS_ALLOW_LARGE_WORKSPACE=1` (or adjust `AOS_MAX_COW_FILES` / `AOS_MAX_COW_BYTES`) to override.",
+            project.display(),
+            stats.file_count,
+            size_mib,
+            max_files,
+            max_mib
+        );
+    }
+    Ok(())
+}
+
+struct SessionInitCleanupGuard {
+    session_dir: PathBuf,
+    vault_session_dir: Option<PathBuf>,
+    armed: bool,
+}
+
+impl SessionInitCleanupGuard {
+    fn new(session_dir: PathBuf) -> Self {
+        Self {
+            session_dir,
+            vault_session_dir: None,
+            armed: true,
+        }
+    }
+
+    fn track_vault_cow_base(&mut self, cow_base: &Path, encrypted: bool) {
+        if encrypted {
+            self.vault_session_dir = cow_base.parent().map(Path::to_path_buf);
+        }
+    }
+
+    fn disarm(&mut self) {
+        self.armed = false;
+    }
+}
+
+impl Drop for SessionInitCleanupGuard {
+    fn drop(&mut self) {
+        if !self.armed {
+            return;
+        }
+        let _ = std::fs::remove_dir_all(&self.session_dir);
+        if let Some(ref vault_dir) = self.vault_session_dir {
+            let _ = std::fs::remove_dir_all(vault_dir);
+        }
+    }
+}
+
+async fn init_cow_workspace_with_progress(
+    project: &Path,
+    cow_base: &Path,
+) -> anyhow::Result<CoWWorkspace> {
+    let cancel = Arc::new(AtomicBool::new(false));
+    let progress = Arc::new(AtomicUsize::new(0));
+    let is_tty = std::io::stderr().is_terminal();
+    if is_tty {
+        let mut err = io::stderr().lock();
+        let _ = write!(
+            err,
+            "\rAegis · preparing CoW shadow workspace for {}...",
+            project.display()
+        );
+        let _ = err.flush();
+    }
+
+    let mut init_fut = Box::pin(CoWWorkspace::init_with_cancel_and_progress(
+        project,
+        cow_base,
+        Some(cancel.clone()),
+        Some(progress.clone()),
+    ));
+    let mut ctrl_c = Box::pin(tokio::signal::ctrl_c());
+    let mut ctrl_c_enabled = true;
+    let mut ticker = tokio::time::interval(Duration::from_millis(250));
+    ticker.tick().await;
+    let started = Instant::now();
+    let mut logged_slow = false;
+
+    loop {
+        tokio::select! {
+            res = &mut init_fut => {
+                if is_tty {
+                    let mut err = io::stderr().lock();
+                    let _ = write!(err, "\r\x1b[2K");
+                    let _ = err.flush();
+                }
+                return res.with_context(|| format!("creating CoW workspace for {}", project.display()));
+            }
+            _ = ticker.tick() => {
+                let n = progress.load(Ordering::Relaxed);
+                if is_tty {
+                    let mut err = io::stderr().lock();
+                    let _ = write!(
+                        err,
+                        "\r\x1b[2KAegis · preparing CoW shadow workspace ({n} files, Ctrl-C to cancel)..."
+                    );
+                    let _ = err.flush();
+                } else if !logged_slow && started.elapsed() >= Duration::from_secs(2) {
+                    eprintln!(
+                        "Aegis · preparing CoW shadow workspace for {} ({n} files so far)...",
+                        project.display()
+                    );
+                    logged_slow = true;
+                }
+            }
+            sig = &mut ctrl_c, if ctrl_c_enabled => {
+                match sig {
+                    Ok(()) => {
+                        cancel.store(true, Ordering::SeqCst);
+                        if is_tty {
+                            let mut err = io::stderr().lock();
+                            let _ = writeln!(
+                                err,
+                                "\r\x1b[2KAegis · startup cancelled (Ctrl-C); cleaning up partial workspace..."
+                            );
+                            let _ = err.flush();
+                        } else {
+                            eprintln!(
+                                "Aegis · startup cancelled (Ctrl-C); cleaning up partial workspace..."
+                            );
+                        }
+                        let _ = tokio::time::timeout(Duration::from_secs(5), &mut init_fut).await;
+                        anyhow::bail!(
+                            "aos run: startup interrupted while preparing CoW shadow workspace for {}",
+                            project.display()
+                        );
+                    }
+                    Err(_) => {
+                        ctrl_c_enabled = false;
+                    }
+                }
+            }
+        }
+    }
+}
+
+fn set_fd_cloexec(fd: libc::c_int) {
+    unsafe {
+        let flags = libc::fcntl(fd, libc::F_GETFD);
+        if flags != -1 {
+            let _ = libc::fcntl(fd, libc::F_SETFD, flags | libc::FD_CLOEXEC);
+        }
+    }
 }
 
 fn infer_identity(identity: &AgentIdentity, command: &[String]) -> AgentIdentity {
@@ -7129,7 +7439,19 @@ async fn run_inner(
         return Ok(exit_code(status));
     }
 
-    if let Err(ws_err) = validate_workspace_roots(&project, host_home, runtime_dir) {
+    let preflight_project = project.clone();
+    let preflight_runtime = runtime_dir.to_path_buf();
+    let check_workspace = async {
+        validate_workspace_roots(&project, host_home, runtime_dir)?;
+        if egress_opts.seed_from_cow_base.is_none() {
+            tokio::task::spawn_blocking(move || {
+                preflight_cow_workspace(&preflight_project, &preflight_runtime)
+            })
+            .await??;
+        }
+        anyhow::Ok(())
+    };
+    if let Err(ws_err) = check_workspace.await {
         if let Some(info) = classify_pure_info_subcommand(&command) {
             return run_host_lifecycle_command(
                 &identity,
@@ -7220,6 +7542,7 @@ async fn run_inner(
     let session_dir = runtime_dir.join("sessions").join(&session_id);
     let agent_home = session_dir.join("agent_home");
     std::fs::create_dir_all(&agent_home)?;
+    let mut cleanup_guard = SessionInitCleanupGuard::new(session_dir.clone());
     use std::os::unix::fs::PermissionsExt;
     let _ = std::fs::set_permissions(runtime_dir, std::fs::Permissions::from_mode(0o700));
     let _ = std::fs::set_permissions(&session_dir, std::fs::Permissions::from_mode(0o700));
@@ -7238,12 +7561,11 @@ async fn run_inner(
 
     let (cow_base, vault_status) =
         prepare_session_cow_base(runtime_dir, &identity.org_id, &session_id, &session_dir)?;
+    cleanup_guard.track_vault_cow_base(&cow_base, vault_status.encrypted);
     if let Some(src_base) = egress_opts.seed_from_cow_base.as_deref() {
         seed_cow_base_from_existing(src_base, &cow_base).await?;
     }
-    let cow = CoWWorkspace::init(&project, &cow_base)
-        .await
-        .with_context(|| format!("creating CoW workspace for {}", project.display()))?;
+    let cow = init_cow_workspace_with_progress(&project, &cow_base).await?;
     let shadow = cow.shadow_root().to_path_buf();
 
     // Phase 1 egress: a private netns plus the existing identity-pinned CONNECT proxy, relayed
@@ -7493,6 +7815,7 @@ async fn run_inner(
         &session_dir.join("session.json"),
         &serde_json::to_vec_pretty(&session_meta)?,
     )?;
+    cleanup_guard.disarm();
 
     eprintln!(
         "Aegis · enforced (filesystem) · {}/{}",
@@ -7746,6 +8069,7 @@ async fn run_isolated_inner(
     let session_dir = runtime_dir.join("sessions").join(&session_id);
     let agent_home = session_dir.join("agent_home");
     std::fs::create_dir_all(&agent_home)?;
+    let mut cleanup_guard = SessionInitCleanupGuard::new(session_dir.clone());
     use std::os::unix::fs::PermissionsExt;
     let _ = std::fs::set_permissions(runtime_dir, std::fs::Permissions::from_mode(0o700));
     let _ = std::fs::set_permissions(&session_dir, std::fs::Permissions::from_mode(0o700));
@@ -7760,12 +8084,11 @@ async fn run_isolated_inner(
 
     let (cow_base, vault_status) =
         prepare_session_cow_base(runtime_dir, &identity.org_id, &session_id, &session_dir)?;
+    cleanup_guard.track_vault_cow_base(&cow_base, vault_status.encrypted);
     if let Some(src_base) = egress_opts.seed_from_cow_base.as_deref() {
         seed_cow_base_from_existing(src_base, &cow_base).await?;
     }
-    let cow = CoWWorkspace::init(project, &cow_base)
-        .await
-        .with_context(|| format!("creating CoW workspace for {}", project.display()))?;
+    let cow = init_cow_workspace_with_progress(project, &cow_base).await?;
     let shadow = cow.shadow_root().to_path_buf();
 
     let (egress_guard, proxy, _bridge_token) = start_egress(
@@ -7816,7 +8139,7 @@ async fn run_isolated_inner(
     std::fs::create_dir_all(&org_shared)?;
     std::fs::create_dir_all(&org_pub)?;
 
-    let sandbox = match aos_sandbox::microvm::MicroVmSandboxInstance::launch_real(
+    let sandbox = aos_sandbox::microvm::MicroVmSandboxInstance::launch_real(
         SandboxConfig {
             identity: identity.clone(),
             tier: IsolationTier::MicroVm,
@@ -7837,14 +8160,7 @@ async fn run_isolated_inner(
         },
         runtime_dir,
     )
-    .await
-    {
-        Ok(sbx) => sbx,
-        Err(err) => {
-            let _ = std::fs::remove_dir_all(&session_dir);
-            return Err(err);
-        }
-    };
+    .await?;
 
     let guest_proxy = format!("127.0.0.1:{}", sandbox.guest_proxy_port());
     let org_mcp_servers = broker
@@ -7928,6 +8244,7 @@ async fn run_isolated_inner(
         &session_dir.join("session.json"),
         &serde_json::to_vec_pretty(&meta)?,
     )?;
+    cleanup_guard.disarm();
 
     eprintln!(
         "Aegis · isolated (MicroVM {} vCPU / {} MiB) · {}/{}",
@@ -8129,6 +8446,7 @@ async fn run_macos_inner(
     let session_dir = runtime_dir.join("sessions").join(&session_id);
     let agent_home = session_dir.join("agent_home");
     std::fs::create_dir_all(&agent_home)?;
+    let mut cleanup_guard = SessionInitCleanupGuard::new(session_dir.clone());
     use std::os::unix::fs::PermissionsExt;
     let _ = std::fs::set_permissions(runtime_dir, std::fs::Permissions::from_mode(0o700));
     let _ = std::fs::set_permissions(&session_dir, std::fs::Permissions::from_mode(0o700));
@@ -8164,12 +8482,11 @@ async fn run_macos_inner(
 
     let (cow_base, vault_status) =
         prepare_session_cow_base(runtime_dir, &identity.org_id, &session_id, &session_dir)?;
+    cleanup_guard.track_vault_cow_base(&cow_base, vault_status.encrypted);
     if let Some(src_base) = seed_from_cow_base {
         seed_cow_base_from_existing(src_base, &cow_base).await?;
     }
-    let cow = CoWWorkspace::init(project, &cow_base)
-        .await
-        .with_context(|| format!("creating CoW workspace for {}", project.display()))?;
+    let cow = init_cow_workspace_with_progress(project, &cow_base).await?;
     let shadow = cow.shadow_root().to_path_buf();
 
     // macOS has no mount namespace; keep the agent cwd in the shadow and use GIT_DIR for
@@ -8489,6 +8806,7 @@ async fn run_macos_inner(
         &session_dir.join("session.json"),
         &serde_json::to_vec_pretty(&meta)?,
     )?;
+    cleanup_guard.disarm();
 
     eprintln!(
         "Aegis · enforced (macOS Seatbelt) · {}/{}",
@@ -8661,6 +8979,8 @@ async fn run_pty_command(
     {
         return Err(std::io::Error::last_os_error()).context("allocating a PTY");
     }
+    set_fd_cloexec(master);
+    set_fd_cloexec(slave);
 
     // Seed the slave PTY with the caller's initial termios before switching the host terminal
     // into raw passthrough mode (`cfmakeraw`), so arrow keys, Esc, and terminal capability
@@ -8718,28 +9038,36 @@ async fn run_pty_command(
         use std::io::{Read, Write};
         let mut buf = [0u8; 8192];
         let mut out = std::io::stdout();
-        while let Ok(n) = reader.read(&mut buf) {
-            if n == 0 {
-                break;
+        loop {
+            match reader.read(&mut buf) {
+                Ok(0) => break,
+                Ok(n) => {
+                    if out.write_all(&buf[..n]).is_err() {
+                        break;
+                    }
+                    let _ = out.flush();
+                }
+                Err(err) if err.kind() == std::io::ErrorKind::Interrupted => continue,
+                Err(_) => break,
             }
-            if out.write_all(&buf[..n]).is_err() {
-                break;
-            }
-            let _ = out.flush();
         }
     });
     std::thread::spawn(move || {
         use std::io::{Read, Write};
         let mut buf = [0u8; 1024];
         let mut input = std::io::stdin();
-        while let Ok(n) = input.read(&mut buf) {
-            if n == 0 {
-                break;
+        loop {
+            match input.read(&mut buf) {
+                Ok(0) => break,
+                Ok(n) => {
+                    if writer.write_all(&buf[..n]).is_err() {
+                        break;
+                    }
+                    let _ = writer.flush();
+                }
+                Err(err) if err.kind() == std::io::ErrorKind::Interrupted => continue,
+                Err(_) => break,
             }
-            if writer.write_all(&buf[..n]).is_err() {
-                break;
-            }
-            let _ = writer.flush();
         }
     });
 
@@ -11655,5 +11983,128 @@ env = { SECRET_KEY = "tok_inline_secret" }
         .unwrap();
         let codex_after = std::fs::read_to_string(agent_home.join(".codex/config.toml")).unwrap();
         assert_eq!(codex_after.matches("[mcp_servers.aegis-os]").count(), 1);
+    }
+
+    #[test]
+    fn validate_workspace_roots_rejects_umbrella_multi_repo_dir_and_allows_override() {
+        let tmp = tempfile::tempdir().unwrap();
+        let home = tmp.path().join("home");
+        let rt = tmp.path().join("rt");
+        std::fs::create_dir_all(&home).unwrap();
+        std::fs::create_dir_all(&rt).unwrap();
+
+        // 1. Umbrella dir with 2 child git repos and no root marker -> rejected.
+        let multi = tmp.path().join("multi");
+        std::fs::create_dir_all(multi.join("repo-a/.git")).unwrap();
+        std::fs::create_dir_all(multi.join("repo-b/.git")).unwrap();
+        let err = validate_workspace_roots_inner(&multi, &home, &rt, false)
+            .expect_err("multi-repo umbrella dir must be rejected");
+        let msg = err.to_string();
+        assert!(msg.contains("multi-repo"), "{msg}");
+        assert!(msg.contains("repo-a"), "{msg}");
+        assert!(msg.contains("repo-b"), "{msg}");
+        assert!(validate_workspace_roots_inner(&multi, &home, &rt, true).is_ok());
+
+        // 2. Umbrella dir with 1 child git repo and no root files -> rejected.
+        let single_child = tmp.path().join("single_child");
+        std::fs::create_dir_all(single_child.join("repo-only/.git")).unwrap();
+        assert!(validate_workspace_roots_inner(&single_child, &home, &rt, false).is_err());
+
+        // 3. Monorepo / submodule root with Cargo.toml or .git marker -> allowed.
+        let cargo_root = tmp.path().join("cargo_root");
+        std::fs::create_dir_all(cargo_root.join("sub-a/.git")).unwrap();
+        std::fs::create_dir_all(cargo_root.join("sub-b/.git")).unwrap();
+        std::fs::write(cargo_root.join("Cargo.toml"), "[workspace]\n").unwrap();
+        assert!(validate_workspace_roots_inner(&cargo_root, &home, &rt, false).is_ok());
+
+        let git_root = tmp.path().join("git_root");
+        std::fs::create_dir_all(git_root.join(".git")).unwrap();
+        std::fs::create_dir_all(git_root.join("sub/.git")).unwrap();
+        assert!(validate_workspace_roots_inner(&git_root, &home, &rt, false).is_ok());
+
+        // 4. Plain directory with regular files and no child git repos -> allowed.
+        let plain = tmp.path().join("plain");
+        std::fs::create_dir_all(&plain).unwrap();
+        std::fs::write(plain.join("main.py"), "print('hi')\n").unwrap();
+        assert!(validate_workspace_roots_inner(&plain, &home, &rt, false).is_ok());
+    }
+
+    #[test]
+    fn preflight_cow_workspace_rejects_oversized_non_reflink_tree_and_allows_override() {
+        let tmp = tempfile::tempdir().unwrap();
+        let proj = tmp.path().join("proj");
+        let rt = tmp.path().join("rt");
+        std::fs::create_dir_all(&proj).unwrap();
+        std::fs::create_dir_all(&rt).unwrap();
+        for i in 0..5 {
+            std::fs::write(proj.join(format!("f{i}.txt")), "hello world\n").unwrap();
+        }
+
+        if !CoWWorkspace::probe_reflink_supported(&proj, &rt) {
+            let err = preflight_cow_workspace_with_limits(&proj, &rt, 3, 1024 * 1024, false)
+                .expect_err("non-reflink workspace above file limit must fail preflight");
+            assert!(
+                err.to_string().contains("preflight limits"),
+                "unexpected preflight error: {err:#}"
+            );
+        }
+        assert!(preflight_cow_workspace_with_limits(&proj, &rt, 3, 1024 * 1024, true).is_ok());
+    }
+
+    #[test]
+    fn session_init_cleanup_guard_removes_on_drop_unless_disarmed() {
+        let tmp = tempfile::tempdir().unwrap();
+
+        let armed_ses = tmp.path().join("ses_armed");
+        let armed_vault_ses = tmp.path().join("vault/ses_armed");
+        let armed_vault_cow = armed_vault_ses.join("cow_workspace");
+        std::fs::create_dir_all(armed_ses.join("agent_home")).unwrap();
+        std::fs::create_dir_all(&armed_vault_cow).unwrap();
+        {
+            let mut guard = SessionInitCleanupGuard::new(armed_ses.clone());
+            guard.track_vault_cow_base(&armed_vault_cow, true);
+        }
+        assert!(!armed_ses.exists(), "armed guard must remove session_dir");
+        assert!(
+            !armed_vault_ses.exists(),
+            "armed guard must remove encrypted vault session dir"
+        );
+
+        let disarmed_ses = tmp.path().join("ses_disarmed");
+        let disarmed_vault_ses = tmp.path().join("vault/ses_disarmed");
+        let disarmed_vault_cow = disarmed_vault_ses.join("cow_workspace");
+        std::fs::create_dir_all(disarmed_ses.join("agent_home")).unwrap();
+        std::fs::create_dir_all(&disarmed_vault_cow).unwrap();
+        {
+            let mut guard = SessionInitCleanupGuard::new(disarmed_ses.clone());
+            guard.track_vault_cow_base(&disarmed_vault_cow, true);
+            guard.disarm();
+        }
+        assert!(
+            disarmed_ses.exists(),
+            "disarmed guard must preserve session_dir"
+        );
+        assert!(
+            disarmed_vault_ses.exists(),
+            "disarmed guard must preserve vault session dir"
+        );
+    }
+
+    #[test]
+    fn pty_cloexec_flag_is_set() {
+        let mut fds = [-1 as libc::c_int; 2];
+        assert_eq!(unsafe { libc::pipe(fds.as_mut_ptr()) }, 0);
+        set_fd_cloexec(fds[0]);
+        set_fd_cloexec(fds[1]);
+        let f0 = unsafe { libc::fcntl(fds[0], libc::F_GETFD) };
+        let f1 = unsafe { libc::fcntl(fds[1], libc::F_GETFD) };
+        unsafe {
+            libc::close(fds[0]);
+            libc::close(fds[1]);
+        }
+        assert_ne!(f0, -1);
+        assert_ne!(f1, -1);
+        assert_ne!(f0 & libc::FD_CLOEXEC, 0);
+        assert_ne!(f1 & libc::FD_CLOEXEC, 0);
     }
 }

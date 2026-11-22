@@ -10777,10 +10777,38 @@ impl AegisRuntimeKernel {
             }
         });
 
+        async fn should_continue_after_accept_error(err: &std::io::Error) -> bool {
+            if matches!(
+                err.raw_os_error(),
+                Some(libc::EBADF)
+                    | Some(libc::EINVAL)
+                    | Some(libc::ENOTSOCK)
+                    | Some(libc::EOPNOTSUPP)
+            ) {
+                return false;
+            }
+            if !matches!(
+                err.kind(),
+                std::io::ErrorKind::Interrupted
+                    | std::io::ErrorKind::ConnectionAborted
+                    | std::io::ErrorKind::ConnectionReset
+                    | std::io::ErrorKind::WouldBlock
+            ) {
+                tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+            }
+            true
+        }
+
         tokio::spawn(async move {
             loop {
-                let Ok((mut stream, _)) = listener.accept().await else {
-                    break;
+                let (mut stream, _) = match listener.accept().await {
+                    Ok(v) => v,
+                    Err(err) => {
+                        if should_continue_after_accept_error(&err).await {
+                            continue;
+                        }
+                        break;
+                    }
                 };
                 let k = kernel.clone();
                 let ws_path = default_workspace.clone();

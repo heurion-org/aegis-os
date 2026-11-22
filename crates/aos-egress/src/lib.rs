@@ -1968,6 +1968,25 @@ impl AegisEgressGateway {
         Ok(addr)
     }
 
+    async fn should_continue_after_accept_error(err: &std::io::Error) -> bool {
+        if matches!(
+            err.kind(),
+            std::io::ErrorKind::InvalidInput | std::io::ErrorKind::Unsupported
+        ) {
+            return false;
+        }
+        if !matches!(
+            err.kind(),
+            std::io::ErrorKind::Interrupted
+                | std::io::ErrorKind::ConnectionAborted
+                | std::io::ErrorKind::ConnectionReset
+                | std::io::ErrorKind::WouldBlock
+        ) {
+            tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+        }
+        true
+    }
+
     /// Variant of [`Self::start_local_proxy_with_bound_identity`] that also returns the background
     /// accept-loop task handle so short-lived package-install sandboxes can abort it on teardown.
     pub async fn start_local_proxy_abortable(
@@ -1981,8 +2000,14 @@ impl AegisEgressGateway {
 
         let handle = tokio::spawn(async move {
             loop {
-                let Ok((mut stream, _)) = listener.accept().await else {
-                    break;
+                let (mut stream, _) = match listener.accept().await {
+                    Ok(v) => v,
+                    Err(err) => {
+                        if Self::should_continue_after_accept_error(&err).await {
+                            continue;
+                        }
+                        break;
+                    }
                 };
                 let gw_conn = gw.clone();
                 let bound_id = pinned_identity.clone();

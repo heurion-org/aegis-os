@@ -30,6 +30,34 @@ const PIPE_DRAIN_GRACE: Duration = Duration::from_secs(2);
 const MAX_RPC_LINE_BYTES: usize = 8 * 1024 * 1024;
 const TIMEOUT_TAIL_BYTES: usize = 4096;
 
+fn set_fd_cloexec(fd: libc::c_int) {
+    unsafe {
+        let flags = libc::fcntl(fd, libc::F_GETFD);
+        if flags != -1 {
+            let _ = libc::fcntl(fd, libc::F_SETFD, flags | libc::FD_CLOEXEC);
+        }
+    }
+}
+
+async fn should_continue_after_accept_error(err: &std::io::Error) -> bool {
+    if matches!(
+        err.raw_os_error(),
+        Some(libc::EBADF) | Some(libc::EINVAL) | Some(libc::ENOTSOCK) | Some(libc::EOPNOTSUPP)
+    ) {
+        return false;
+    }
+    if !matches!(
+        err.kind(),
+        std::io::ErrorKind::Interrupted
+            | std::io::ErrorKind::ConnectionAborted
+            | std::io::ErrorKind::ConnectionReset
+            | std::io::ErrorKind::WouldBlock
+    ) {
+        tokio::time::sleep(Duration::from_millis(25)).await;
+    }
+    true
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct GuestBootConfig {
     pub ws_dest: PathBuf,
@@ -716,6 +744,9 @@ async fn handle_exec_pty_session<R, W>(
         return;
     }
 
+    set_fd_cloexec(master_fd);
+    set_fd_cloexec(slave_fd);
+
     let master_file = unsafe { std::fs::File::from_raw_fd(master_fd) };
     let slave_file = unsafe { std::fs::File::from_raw_fd(slave_fd) };
     let Ok((master_reader_f, master_writer_f)) =
@@ -818,12 +849,14 @@ async fn handle_exec_pty_session<R, W>(
         let mut buf = [0u8; 8192];
         loop {
             match r.read(&mut buf) {
-                Ok(0) | Err(_) => break,
+                Ok(0) => break,
                 Ok(n) => {
                     if tx.blocking_send(buf[..n].to_vec()).is_err() {
                         break;
                     }
                 }
+                Err(err) if err.kind() == std::io::ErrorKind::Interrupted => continue,
+                Err(_) => break,
             }
         }
     });
@@ -1022,7 +1055,16 @@ pub async fn serve_guest_unix(
             .with_context(|| format!("binding guest egress listener {proxy_bind_addr}"))?;
         let local_addr = tcp_listener.local_addr()?;
         proxy_handle = Some(tokio::spawn(async move {
-            while let Ok((mut tcp, _)) = tcp_listener.accept().await {
+            loop {
+                let (mut tcp, _) = match tcp_listener.accept().await {
+                    Ok(v) => v,
+                    Err(err) => {
+                        if should_continue_after_accept_error(&err).await {
+                            continue;
+                        }
+                        break;
+                    }
+                };
                 let target = target_sock.clone();
                 let tok = bridge_tok.clone();
                 tokio::spawn(async move {
@@ -1457,7 +1499,16 @@ pub async fn serve_guest_vsock(cfg: GuestBootConfig) -> anyhow::Result<()> {
         let local_port = tcp_listener.local_addr()?.port();
         let tok = bt.clone();
         proxy_handle = Some(tokio::spawn(async move {
-            while let Ok((mut tcp, _)) = tcp_listener.accept().await {
+            loop {
+                let (mut tcp, _) = match tcp_listener.accept().await {
+                    Ok(v) => v,
+                    Err(err) => {
+                        if should_continue_after_accept_error(&err).await {
+                            continue;
+                        }
+                        break;
+                    }
+                };
                 let tok = tok.clone();
                 tokio::spawn(async move {
                     if let Ok(mut vsock) =

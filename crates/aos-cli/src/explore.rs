@@ -903,6 +903,12 @@ pub(crate) async fn execute_explore_run(
         bail!("explore: workspace {} is not a directory", project.display());
     }
     launcher::validate_workspace_roots(&project, &host_home, runtime_dir)?;
+    let preflight_project = project.clone();
+    let preflight_runtime = runtime_dir.to_path_buf();
+    tokio::task::spawn_blocking(move || {
+        launcher::preflight_cow_workspace(&preflight_project, &preflight_runtime)
+    })
+    .await??;
 
     let profile = launcher::workspace_profile_name(&project)
         .unwrap_or_else(|| launcher::detect_profile(&project).to_string());

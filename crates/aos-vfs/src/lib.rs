@@ -20,11 +20,22 @@ use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::collections::{BTreeMap, HashMap};
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::Arc;
 use tokio::sync::RwLock;
 use uuid::Uuid;
 
 pub mod vault;
+
+pub const COW_CANCELLED_MSG: &str = "CoW workspace initialization cancelled";
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct WorkspacePreflightStats {
+    pub file_count: usize,
+    pub total_bytes: u64,
+    pub reflink_supported: bool,
+    pub limit_exceeded: bool,
+}
 
 // ============================================================================
 // 1. Copy-on-Write Shadow Workspace Implementation (with APFS clonefile & 3-Way Merge)
@@ -65,6 +76,19 @@ impl CoWWorkspace {
         host_source_root: impl AsRef<Path>,
         runtime_workspace_base: impl AsRef<Path>,
     ) -> anyhow::Result<Self> {
+        Self::init_with_cancel_and_progress(host_source_root, runtime_workspace_base, None, None)
+            .await
+    }
+
+    /// Initialize or resume a Copy-on-Write shadow workspace, supporting cooperative cancellation
+    /// and progress counting (number of files populated).
+    pub async fn init_with_cancel_and_progress(
+        host_source_root: impl AsRef<Path>,
+        runtime_workspace_base: impl AsRef<Path>,
+        cancel: Option<Arc<AtomicBool>>,
+        progress: Option<Arc<AtomicUsize>>,
+    ) -> anyhow::Result<Self> {
+        Self::check_cancelled(cancel.as_deref())?;
         let host_source_root = host_source_root.as_ref().to_path_buf();
         let base = runtime_workspace_base.as_ref().to_path_buf();
         let shadow_root = base.join("upper_workspace");
@@ -87,11 +111,25 @@ impl CoWWorkspace {
             (init_marker.exists() && shadow_root.exists() && baseline_root.exists())
                 || has_legacy_populated;
         if !is_existing {
+            Self::check_cancelled(cancel.as_deref())?;
             tokio::fs::create_dir_all(&shadow_root).await?;
             tokio::fs::create_dir_all(&baseline_root).await?;
-            Self::cow_sync_dir(&host_source_root, &shadow_root).await?;
-            Self::cow_sync_dir(&shadow_root, &baseline_root).await?;
-            tokio::fs::write(&init_marker, Utc::now().to_rfc3339()).await?;
+            Self::cow_sync_dir_with_cancel(
+                &host_source_root,
+                &shadow_root,
+                cancel.clone(),
+                progress.clone(),
+            )
+            .await?;
+            Self::check_cancelled(cancel.as_deref())?;
+            Self::cow_sync_dir_with_cancel(
+                &shadow_root,
+                &baseline_root,
+                cancel.clone(),
+                progress.clone(),
+            )
+            .await?;
+            Self::check_cancelled(cancel.as_deref())?;
         } else if !init_marker.exists() {
             let _ = tokio::fs::write(&init_marker, Utc::now().to_rfc3339()).await;
         }
@@ -114,7 +152,31 @@ impl CoWWorkspace {
         };
 
         if !is_existing {
-            ws.create_snapshot("baseline-init").await?;
+            Self::check_cancelled(cancel.as_deref())?;
+            let snapshot_id = format!("snap-{}", &Uuid::new_v4().to_string()[..8]);
+            let snap_dir = ws.snapshots_root.join(&snapshot_id);
+            let baseline_clone = ws.baseline_root.clone();
+            let snap_dir_clone = snap_dir.clone();
+            let cancel_clone = cancel.clone();
+            let progress_clone = progress.clone();
+            let file_count = tokio::task::spawn_blocking(move || {
+                Self::hardlink_or_cow_sync_dir_blocking(
+                    &baseline_clone,
+                    &snap_dir_clone,
+                    cancel_clone.as_deref(),
+                    progress_clone.as_deref(),
+                )
+            })
+            .await??;
+            let meta = SnapshotMeta {
+                snapshot_id,
+                label: "baseline-init".to_string(),
+                created_at_ms: Utc::now().timestamp_millis(),
+                file_count,
+            };
+            ws.snapshots.write().await.push(meta);
+            ws.flush_snapshots().await?;
+            tokio::fs::write(&init_marker, Utc::now().to_rfc3339()).await?;
         }
         Ok(ws)
     }
@@ -678,7 +740,7 @@ impl CoWWorkspace {
                     }
                     stack.push((entry_src, entry_dst));
                 } else if ft.is_file() {
-                    Self::cow_clone_file_inner(&entry_src, &entry_dst, true, &mut allow_reflink)?;
+                    Self::cow_clone_file_inner(&entry_src, &entry_dst, true, &mut allow_reflink, None)?;
                 }
             }
         }
@@ -770,15 +832,48 @@ impl CoWWorkspace {
     /// Blocking implementation of [`Self::cow_clone_file`]. Directory-level callers use it directly
     /// so a whole tree is cloned on one thread instead of hopping to the blocking pool per file.
     pub fn cow_clone_file_blocking(src: &Path, dst: &Path) -> anyhow::Result<()> {
-        Self::cow_clone_file_inner(src, dst, false, &mut true)
+        Self::cow_clone_file_inner(src, dst, false, &mut true, None)
+    }
+
+    fn check_cancelled(cancel: Option<&AtomicBool>) -> anyhow::Result<()> {
+        if cancel.is_some_and(|c| c.load(Ordering::Relaxed)) {
+            anyhow::bail!("{COW_CANCELLED_MSG}");
+        }
+        Ok(())
+    }
+
+    fn copy_file_cancellable(
+        src_file: &mut std::fs::File,
+        dst_file: &mut std::fs::File,
+        cancel: Option<&AtomicBool>,
+    ) -> anyhow::Result<()> {
+        use std::io::{Read, Write};
+        let Some(flag) = cancel else {
+            std::io::copy(src_file, dst_file)?;
+            return Ok(());
+        };
+        let mut buf = [0u8; 65536];
+        loop {
+            if flag.load(Ordering::Relaxed) {
+                anyhow::bail!("{COW_CANCELLED_MSG}");
+            }
+            match src_file.read(&mut buf) {
+                Ok(0) => return Ok(()),
+                Ok(n) => dst_file.write_all(&buf[..n])?,
+                Err(err) if err.kind() == std::io::ErrorKind::Interrupted => continue,
+                Err(err) => return Err(err.into()),
+            }
+        }
     }
 
     fn cow_clone_file_inner(
         src: &Path,
         dst: &Path,
-        _dst_is_fresh: bool,
+        dst_is_fresh: bool,
         allow_reflink: &mut bool,
+        cancel: Option<&AtomicBool>,
     ) -> anyhow::Result<()> {
+        Self::check_cancelled(cancel)?;
         #[cfg(not(target_os = "linux"))]
         let _ = allow_reflink;
 
@@ -802,24 +897,30 @@ impl CoWWorkspace {
             .filter(|p| !p.as_os_str().is_empty())
             .unwrap_or_else(|| Path::new("."));
         std::fs::create_dir_all(dst_parent)?;
-        let tmp_dst = dst_parent.join(format!(
-            ".aegis.cow.{}.{}",
-            std::process::id(),
-            uuid::Uuid::new_v4().simple()
-        ));
+        let target = if dst_is_fresh {
+            dst.to_path_buf()
+        } else {
+            dst_parent.join(format!(
+                ".aegis.cow.{}.{}",
+                std::process::id(),
+                uuid::Uuid::new_v4().simple()
+            ))
+        };
+        let mut created_target = false;
 
         let res: anyhow::Result<()> = (|| {
             #[cfg(target_os = "macos")]
             {
                 use std::ffi::CString;
                 use std::os::unix::ffi::OsStrExt;
-                if let (Ok(c_src), Ok(c_tmp)) = (
+                if let (Ok(c_src), Ok(c_target)) = (
                     CString::new(src.as_os_str().as_bytes()),
-                    CString::new(tmp_dst.as_os_str().as_bytes()),
+                    CString::new(target.as_os_str().as_bytes()),
                 ) {
                     const CLONE_NOFOLLOW: libc::c_uint = 0x0001;
-                    let rc =
-                        unsafe { libc::clonefile(c_src.as_ptr(), c_tmp.as_ptr(), CLONE_NOFOLLOW) };
+                    let rc = unsafe {
+                        libc::clonefile(c_src.as_ptr(), c_target.as_ptr(), CLONE_NOFOLLOW)
+                    };
                     if rc == 0 {
                         return Ok(());
                     }
@@ -849,13 +950,14 @@ impl CoWWorkspace {
                     .write(true)
                     .create_new(true)
                     .mode(meta.mode())
-                    .open(&tmp_dst)?
+                    .open(&target)?
             };
             #[cfg(not(unix))]
             let mut dst_file = std::fs::OpenOptions::new()
                 .write(true)
                 .create_new(true)
-                .open(&tmp_dst)?;
+                .open(&target)?;
+            created_target = true;
 
             #[cfg(target_os = "linux")]
             let cloned = {
@@ -920,27 +1022,36 @@ impl CoWWorkspace {
             let cloned = false;
 
             if !cloned {
-                std::io::copy(&mut src_file, &mut dst_file)?;
+                Self::copy_file_cancellable(&mut src_file, &mut dst_file, cancel)?;
             }
             if let Ok(m) = meta.modified() {
                 let _ = dst_file.set_modified(m);
             }
-            dst_file.sync_all()?;
+            // Only fsync and atomic-rename on existing targets (e.g. host commits & baseline updates).
+            // Bulk fresh-tree creation writes to a staging directory protected by `.initialized`,
+            // avoiding per-file `fsync()` stalls on ext4.
+            if !dst_is_fresh {
+                dst_file.sync_all()?;
+            }
             Ok(())
         })();
 
         if let Err(err) = res {
-            let _ = std::fs::remove_file(&tmp_dst);
+            if created_target {
+                let _ = std::fs::remove_file(&target);
+            }
             return Err(err);
         }
-        if let Err(err) = std::fs::rename(&tmp_dst, dst) {
-            let _ = std::fs::remove_file(&tmp_dst);
-            return Err(err.into());
+        if !dst_is_fresh {
+            if let Err(err) = std::fs::rename(&target, dst) {
+                let _ = std::fs::remove_file(&target);
+                return Err(err.into());
+            }
         }
         Ok(())
     }
 
-    fn is_ignored_dir_name(name: &str) -> bool {
+    pub fn is_ignored_dir_name(name: &str) -> bool {
         matches!(
             name,
             ".aegis_os"
@@ -971,6 +1082,195 @@ impl CoWWorkspace {
                 | ".turbo"
                 | "coverage"
         )
+    }
+
+    #[cfg(target_os = "linux")]
+    fn probe_ficlone_sample_file(src: &Path, dst_dir: &Path) -> bool {
+        use std::os::unix::fs::OpenOptionsExt;
+        use std::os::unix::io::AsRawFd;
+        const FICLONE: libc::c_ulong = 0x40049409;
+
+        let mut stack = vec![src.to_path_buf()];
+        let mut scanned_dirs = 0usize;
+        while let Some(dir) = stack.pop() {
+            scanned_dirs += 1;
+            if scanned_dirs > 512 {
+                break;
+            }
+            let Ok(rd) = std::fs::read_dir(&dir) else {
+                continue;
+            };
+            for entry in rd.flatten() {
+                let name = entry.file_name().to_string_lossy().to_string();
+                if Self::is_ignored_dir_name(&name) {
+                    continue;
+                }
+                let Ok(ft) = entry.file_type() else {
+                    continue;
+                };
+                if ft.is_symlink() {
+                    continue;
+                }
+                if ft.is_dir() {
+                    stack.push(entry.path());
+                } else if ft.is_file() {
+                    let Ok(src_file) = std::fs::OpenOptions::new()
+                        .read(true)
+                        .custom_flags(libc::O_NOFOLLOW)
+                        .open(entry.path())
+                    else {
+                        continue;
+                    };
+                    let probe = dst_dir.join(format!(
+                        ".aegis.reflink_probe.{}.{}",
+                        std::process::id(),
+                        Uuid::new_v4().simple()
+                    ));
+                    let Ok(dst_file) = std::fs::OpenOptions::new()
+                        .write(true)
+                        .create_new(true)
+                        .open(&probe)
+                    else {
+                        return false;
+                    };
+                    let rc =
+                        unsafe { libc::ioctl(dst_file.as_raw_fd(), FICLONE, src_file.as_raw_fd()) };
+                    drop(dst_file);
+                    let _ = std::fs::remove_file(&probe);
+                    return rc == 0;
+                }
+            }
+        }
+        false
+    }
+
+    /// Probes whether `dst_base` supports zero-copy CoW cloning (`clonefile` / `FICLONE`) from `src`.
+    pub fn probe_reflink_supported(src: &Path, dst_base: &Path) -> bool {
+        #[cfg(target_os = "linux")]
+        {
+            use std::ffi::CString;
+            use std::os::unix::ffi::OsStrExt;
+            use std::os::unix::fs::MetadataExt;
+
+            let Some(dst_anchor) = dst_base.ancestors().find(|p| p.exists()) else {
+                return false;
+            };
+            let (Ok(src_meta), Ok(dst_meta)) =
+                (std::fs::metadata(src), std::fs::metadata(dst_anchor))
+            else {
+                return false;
+            };
+            if src_meta.dev() != dst_meta.dev() {
+                return false;
+            }
+            let Ok(c_src) = CString::new(src.as_os_str().as_bytes()) else {
+                return false;
+            };
+            let mut st: libc::statfs = unsafe { std::mem::zeroed() };
+            if unsafe { libc::statfs(c_src.as_ptr(), &mut st) } != 0 {
+                return false;
+            }
+            const BTRFS_SUPER_MAGIC: u64 = 0x9123_683e;
+            const XFS_SB_MAGIC: u64 = 0x5846_5342;
+            const BCACHEFS_SUPER_MAGIC: u64 = 0xca45_1a4e;
+            const OCFS2_SUPER_MAGIC: u64 = 0x7461_636f;
+            match st.f_type as u64 {
+                BTRFS_SUPER_MAGIC => true,
+                XFS_SB_MAGIC | BCACHEFS_SUPER_MAGIC | OCFS2_SUPER_MAGIC => {
+                    if !dst_base.is_dir() {
+                        return false;
+                    }
+                    Self::probe_ficlone_sample_file(src, dst_base)
+                }
+                _ => false,
+            }
+        }
+        #[cfg(target_os = "macos")]
+        {
+            use std::ffi::{CStr, CString};
+            use std::os::unix::ffi::OsStrExt;
+            use std::os::unix::fs::MetadataExt;
+
+            let Some(dst_anchor) = dst_base.ancestors().find(|p| p.exists()) else {
+                return false;
+            };
+            let (Ok(src_meta), Ok(dst_meta)) =
+                (std::fs::metadata(src), std::fs::metadata(dst_anchor))
+            else {
+                return false;
+            };
+            if src_meta.dev() != dst_meta.dev() {
+                return false;
+            }
+            let Ok(c_src) = CString::new(src.as_os_str().as_bytes()) else {
+                return false;
+            };
+            let mut st: libc::statfs = unsafe { std::mem::zeroed() };
+            if unsafe { libc::statfs(c_src.as_ptr(), &mut st) } != 0 {
+                return false;
+            }
+            let fs_name = unsafe { CStr::from_ptr(st.f_fstypename.as_ptr()) };
+            fs_name.to_str().is_ok_and(|s| s == "apfs")
+        }
+        #[cfg(not(any(target_os = "linux", target_os = "macos")))]
+        {
+            let _ = (src, dst_base);
+            false
+        }
+    }
+
+    /// Bounded walk over `src` mirroring `cow_sync_dir` ignore rules to estimate copy footprint
+    /// and stop early if `max_files` or `max_bytes` is exceeded.
+    pub fn preflight_cow_footprint(
+        src: &Path,
+        dst_base: &Path,
+        max_files: usize,
+        max_bytes: u64,
+    ) -> anyhow::Result<WorkspacePreflightStats> {
+        let reflink_supported = Self::probe_reflink_supported(src, dst_base);
+        let mut file_count = 0usize;
+        let mut total_bytes = 0u64;
+        let mut limit_exceeded = false;
+        let mut stack = vec![src.to_path_buf()];
+
+        while let Some(dir) = stack.pop() {
+            let Ok(rd) = std::fs::read_dir(&dir) else {
+                continue;
+            };
+            for entry in rd.flatten() {
+                let name = entry.file_name().to_string_lossy().to_string();
+                if Self::is_ignored_dir_name(&name) {
+                    continue;
+                }
+                let Ok(ft) = entry.file_type() else {
+                    continue;
+                };
+                if ft.is_symlink() {
+                    continue;
+                }
+                if ft.is_dir() {
+                    stack.push(entry.path());
+                } else if ft.is_file() {
+                    file_count += 1;
+                    total_bytes = total_bytes
+                        .saturating_add(entry.metadata().map(|m| m.len()).unwrap_or(0));
+                    if file_count > max_files || total_bytes > max_bytes {
+                        limit_exceeded = true;
+                        break;
+                    }
+                }
+            }
+            if limit_exceeded {
+                break;
+            }
+        }
+
+        Ok(WorkspacePreflightStats {
+            file_count,
+            total_bytes,
+            reflink_supported,
+            limit_exceeded,
+        })
     }
 
     #[cfg(any(target_os = "macos", target_os = "linux"))]
@@ -1132,11 +1432,34 @@ impl CoWWorkspace {
     /// `BTRFS_IOC_SNAP_CREATE_V2` in a single atomic kernel metadata operation (O(1) time & zero disk
     /// blocks) while automatically skipping heavy build/VCS directories (`.git`, `target`, `node_modules`).
     pub async fn cow_sync_dir(src: &Path, dst: &Path) -> anyhow::Result<()> {
-        let (src, dst) = (src.to_path_buf(), dst.to_path_buf());
-        tokio::task::spawn_blocking(move || Self::cow_sync_dir_blocking(&src, &dst)).await?
+        Self::cow_sync_dir_with_cancel(src, dst, None, None).await
     }
 
+    pub async fn cow_sync_dir_with_cancel(
+        src: &Path,
+        dst: &Path,
+        cancel: Option<Arc<AtomicBool>>,
+        progress: Option<Arc<AtomicUsize>>,
+    ) -> anyhow::Result<()> {
+        let (src, dst) = (src.to_path_buf(), dst.to_path_buf());
+        tokio::task::spawn_blocking(move || {
+            Self::cow_sync_dir_blocking_inner(&src, &dst, cancel.as_deref(), progress.as_deref())
+        })
+        .await?
+    }
+
+    #[allow(dead_code)]
     fn cow_sync_dir_blocking(src: &Path, dst: &Path) -> anyhow::Result<()> {
+        Self::cow_sync_dir_blocking_inner(src, dst, None, None)
+    }
+
+    fn cow_sync_dir_blocking_inner(
+        src: &Path,
+        dst: &Path,
+        cancel: Option<&AtomicBool>,
+        progress: Option<&AtomicUsize>,
+    ) -> anyhow::Result<()> {
+        Self::check_cancelled(cancel)?;
         if let Ok(meta) = std::fs::symlink_metadata(dst) {
             if meta.file_type().is_symlink() || meta.file_type().is_file() {
                 let _ = std::fs::remove_file(dst);
@@ -1158,6 +1481,11 @@ impl CoWWorkspace {
             ) {
                 let rc = unsafe { libc::clonefile(c_src.as_ptr(), c_dst.as_ptr(), 0) };
                 if rc == 0 {
+                    if let Some(p) = progress {
+                        if let Ok(files) = Self::collect_files_blocking(dst) {
+                            p.fetch_add(files.len(), Ordering::Relaxed);
+                        }
+                    }
                     return Ok(());
                 }
             }
@@ -1166,6 +1494,11 @@ impl CoWWorkspace {
         #[cfg(target_os = "linux")]
         if std::env::var_os("AOS_BTRFS_SUBVOL").is_some() {
             if !Self::contains_ignored_subdir(src, 4) && Self::try_btrfs_subvol_snapshot(src, dst) {
+                if let Some(p) = progress {
+                    if let Ok(files) = Self::collect_files_blocking(dst) {
+                        p.fetch_add(files.len(), Ordering::Relaxed);
+                    }
+                }
                 return Ok(());
             }
             if !Self::try_btrfs_subvol_create(dst) {
@@ -1180,10 +1513,12 @@ impl CoWWorkspace {
         let mut allow_reflink = true;
         let mut stack = vec![(src.to_path_buf(), dst.to_path_buf())];
         while let Some((cur_src, cur_dst)) = stack.pop() {
+            Self::check_cancelled(cancel)?;
             let Ok(rd) = std::fs::read_dir(&cur_src) else {
                 continue;
             };
             for entry in rd.flatten() {
+                Self::check_cancelled(cancel)?;
                 let name = entry.file_name().to_string_lossy().to_string();
                 if Self::is_ignored_dir_name(&name) {
                     continue;
@@ -1206,6 +1541,11 @@ impl CoWWorkspace {
                             CString::new(entry_dst.as_os_str().as_bytes()),
                         ) {
                             if unsafe { libc::clonefile(c_src.as_ptr(), c_dst.as_ptr(), 0) } == 0 {
+                                if let Some(p) = progress {
+                                    if let Ok(files) = Self::collect_files_blocking(&entry_dst) {
+                                        p.fetch_add(files.len(), Ordering::Relaxed);
+                                    }
+                                }
                                 continue;
                             }
                         }
@@ -1217,11 +1557,136 @@ impl CoWWorkspace {
                     }
                     stack.push((entry_src, entry_dst));
                 } else if ft.is_file() {
-                    Self::cow_clone_file_inner(&entry_src, &entry_dst, true, &mut allow_reflink)?;
+                    Self::cow_clone_file_inner(
+                        &entry_src,
+                        &entry_dst,
+                        true,
+                        &mut allow_reflink,
+                        cancel,
+                    )?;
+                    if let Some(p) = progress {
+                        p.fetch_add(1, Ordering::Relaxed);
+                    }
                 }
             }
         }
         Ok(())
+    }
+
+    /// Populates `dst` from `src` (specifically immutable `baseline_root` -> initial snapshot)
+    /// using hardlinks when on the same filesystem so non-reflink ext4 does not perform a redundant
+    /// third byte copy during `CoWWorkspace::init`. Safe because all subsequent updates to
+    /// `baseline_root` replace files atomically via temp-file + `rename()` instead of mutating
+    /// in-place. Falls back to `cow_clone_file_inner` across devices/filesystems.
+    fn hardlink_or_cow_sync_dir_blocking(
+        src: &Path,
+        dst: &Path,
+        cancel: Option<&AtomicBool>,
+        progress: Option<&AtomicUsize>,
+    ) -> anyhow::Result<usize> {
+        Self::check_cancelled(cancel)?;
+        if let Ok(meta) = std::fs::symlink_metadata(dst) {
+            if meta.file_type().is_symlink() || meta.file_type().is_file() {
+                let _ = std::fs::remove_file(dst);
+            } else if meta.file_type().is_dir() {
+                std::fs::remove_dir_all(dst)?;
+            }
+        }
+        if let Some(parent) = dst.parent() {
+            std::fs::create_dir_all(parent)?;
+        }
+
+        #[cfg(target_os = "macos")]
+        if !Self::contains_ignored_subdir(src, 4) {
+            use std::ffi::CString;
+            use std::os::unix::ffi::OsStrExt;
+            if let (Ok(c_src), Ok(c_dst)) = (
+                CString::new(src.as_os_str().as_bytes()),
+                CString::new(dst.as_os_str().as_bytes()),
+            ) {
+                let rc = unsafe { libc::clonefile(c_src.as_ptr(), c_dst.as_ptr(), 0) };
+                if rc == 0 {
+                    let count = Self::collect_files_blocking(dst)?.len();
+                    if let Some(p) = progress {
+                        p.fetch_add(count, Ordering::Relaxed);
+                    }
+                    return Ok(count);
+                }
+            }
+        }
+
+        std::fs::create_dir_all(dst)?;
+        let mut allow_hardlink = true;
+        let mut allow_reflink = true;
+        let mut file_count = 0usize;
+        let mut stack = vec![(src.to_path_buf(), dst.to_path_buf())];
+        while let Some((cur_src, cur_dst)) = stack.pop() {
+            Self::check_cancelled(cancel)?;
+            let Ok(rd) = std::fs::read_dir(&cur_src) else {
+                continue;
+            };
+            for entry in rd.flatten() {
+                Self::check_cancelled(cancel)?;
+                let name = entry.file_name().to_string_lossy().to_string();
+                if Self::is_ignored_dir_name(&name) {
+                    continue;
+                }
+                let entry_src = entry.path();
+                let entry_dst = cur_dst.join(&name);
+                let Ok(ft) = entry.file_type() else {
+                    continue;
+                };
+                if ft.is_symlink() {
+                    continue;
+                }
+                if ft.is_dir() {
+                    if let Err(e) = std::fs::create_dir(&entry_dst) {
+                        if e.kind() != std::io::ErrorKind::AlreadyExists {
+                            return Err(e.into());
+                        }
+                    }
+                    stack.push((entry_src, entry_dst));
+                } else if ft.is_file() {
+                    let mut linked = false;
+                    if allow_hardlink {
+                        match std::fs::hard_link(&entry_src, &entry_dst) {
+                            Ok(()) => linked = true,
+                            Err(err) => {
+                                #[cfg(unix)]
+                                if matches!(
+                                    err.raw_os_error(),
+                                    Some(libc::EXDEV)
+                                        | Some(libc::EPERM)
+                                        | Some(libc::EOPNOTSUPP)
+                                        | Some(libc::ENOSYS)
+                                ) {
+                                    allow_hardlink = false;
+                                }
+                                #[cfg(not(unix))]
+                                {
+                                    let _ = err;
+                                    allow_hardlink = false;
+                                }
+                            }
+                        }
+                    }
+                    if !linked {
+                        Self::cow_clone_file_inner(
+                            &entry_src,
+                            &entry_dst,
+                            true,
+                            &mut allow_reflink,
+                            cancel,
+                        )?;
+                    }
+                    file_count += 1;
+                    if let Some(p) = progress {
+                        p.fetch_add(1, Ordering::Relaxed);
+                    }
+                }
+            }
+        }
+        Ok(file_count)
     }
 
     pub async fn collect_files(root: &Path) -> anyhow::Result<Vec<(String, PathBuf)>> {
@@ -3087,5 +3552,115 @@ mod frozen_stage_tests {
             .await
             .expect_err("corrupted CAS blob must fail SHA-256 verification");
         assert!(fetch_err.to_string().contains("integrity mismatch"), "{fetch_err}");
+    }
+
+    #[tokio::test]
+    async fn test_baseline_init_snapshot_survives_commit_and_rollback() {
+        let tmp = tempfile::tempdir().unwrap();
+        let host = tmp.path().join("host");
+        let rt = tmp.path().join("rt");
+        std::fs::create_dir_all(host.join("sub")).unwrap();
+        std::fs::write(host.join("sub/file.txt"), "initial host content\n").unwrap();
+
+        let ws = CoWWorkspace::init(&host, &rt).await.unwrap();
+        let snaps = ws.list_snapshots().await.unwrap();
+        let init_snap = snaps
+            .iter()
+            .find(|s| s.label == "baseline-init")
+            .expect("baseline-init snapshot must exist");
+        assert_eq!(init_snap.file_count, 1);
+
+        // Modify shadow and commit back to host (which atomically replaces baseline_root/sub/file.txt).
+        std::fs::write(ws.shadow_root().join("sub/file.txt"), "committed v2\n").unwrap();
+        let committed = ws.commit_to_host(None).await.unwrap();
+        assert_eq!(committed, vec!["sub/file.txt".to_string()]);
+        assert_eq!(
+            std::fs::read_to_string(host.join("sub/file.txt")).unwrap(),
+            "committed v2\n"
+        );
+
+        // Verify the baseline-init snapshot still retains the original content (not mutated in-place).
+        let snap_file = ws
+            .snapshots_root
+            .join(&init_snap.snapshot_id)
+            .join("sub/file.txt");
+        assert_eq!(
+            std::fs::read_to_string(&snap_file).unwrap(),
+            "initial host content\n"
+        );
+
+        // Verify rollback restores original content without corrupting baseline_root or snapshot.
+        ws.rollback(&init_snap.snapshot_id).await.unwrap();
+        assert_eq!(
+            std::fs::read_to_string(ws.shadow_root().join("sub/file.txt")).unwrap(),
+            "initial host content\n"
+        );
+        assert_eq!(
+            std::fs::read_to_string(&snap_file).unwrap(),
+            "initial host content\n"
+        );
+        assert_eq!(
+            std::fs::read_to_string(ws.baseline_root.join("sub/file.txt")).unwrap(),
+            "committed v2\n"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_cow_workspace_init_cancels_cleanly() {
+        let tmp = tempfile::tempdir().unwrap();
+        let host = tmp.path().join("host");
+        let rt = tmp.path().join("rt");
+        std::fs::create_dir_all(&host).unwrap();
+        std::fs::write(host.join("a.txt"), "hello\n").unwrap();
+
+        let cancel = Arc::new(AtomicBool::new(true));
+        let err = match CoWWorkspace::init_with_cancel_and_progress(&host, &rt, Some(cancel), None)
+            .await
+        {
+            Ok(_) => panic!("cancelled init must return an error"),
+            Err(err) => err,
+        };
+        assert!(
+            err.to_string().contains(COW_CANCELLED_MSG),
+            "unexpected cancellation error: {err:#}"
+        );
+        assert!(
+            !rt.join(".initialized").exists(),
+            ".initialized marker must not exist after cancelled init"
+        );
+    }
+
+    #[test]
+    fn test_preflight_cow_footprint_respects_ignores_and_stops_early() {
+        let tmp = tempfile::tempdir().unwrap();
+        let host = tmp.path().join("host");
+        let rt = tmp.path().join("rt");
+        std::fs::create_dir_all(&host).unwrap();
+        std::fs::create_dir_all(&rt).unwrap();
+
+        for ignored in [".git", "target", "node_modules"] {
+            let dir = host.join(ignored).join("nested");
+            std::fs::create_dir_all(&dir).unwrap();
+            for i in 0..10 {
+                std::fs::write(dir.join(format!("ignored_{i}.bin")), vec![b'x'; 4096]).unwrap();
+            }
+        }
+        std::fs::create_dir_all(host.join("src")).unwrap();
+        for i in 0..4 {
+            std::fs::write(host.join("src").join(format!("f{i}.rs")), b"fn f() {}\n").unwrap();
+        }
+
+        let ok_stats = CoWWorkspace::preflight_cow_footprint(&host, &rt, 10, 1024 * 1024).unwrap();
+        assert_eq!(ok_stats.file_count, 4);
+        assert_eq!(ok_stats.total_bytes, 40);
+        assert!(!ok_stats.limit_exceeded);
+
+        let file_cap = CoWWorkspace::preflight_cow_footprint(&host, &rt, 2, 1024 * 1024).unwrap();
+        assert!(file_cap.limit_exceeded);
+        assert_eq!(file_cap.file_count, 3);
+
+        let byte_cap = CoWWorkspace::preflight_cow_footprint(&host, &rt, 100, 15).unwrap();
+        assert!(byte_cap.limit_exceeded);
+        assert!(byte_cap.total_bytes > 15);
     }
 }

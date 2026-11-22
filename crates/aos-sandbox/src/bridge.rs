@@ -35,6 +35,27 @@ pub const TOKEN_LEN: usize = 32;
 /// Conservative limit for `sockaddr_un.sun_path` (108 on Linux, 104 on macOS).
 pub const MAX_SOCKET_PATH: usize = 100;
 
+/// Handles transient `accept()` errors so temporary kernel/resource failures
+/// (e.g. `ECONNABORTED`, `EINTR`, `EMFILE`) do not permanently kill a listener loop.
+async fn should_continue_after_accept_error(err: &std::io::Error) -> bool {
+    if matches!(
+        err.raw_os_error(),
+        Some(libc::EBADF) | Some(libc::EINVAL) | Some(libc::ENOTSOCK) | Some(libc::EOPNOTSUPP)
+    ) {
+        return false;
+    }
+    if !matches!(
+        err.kind(),
+        std::io::ErrorKind::Interrupted
+            | std::io::ErrorKind::ConnectionAborted
+            | std::io::ErrorKind::ConnectionReset
+            | std::io::ErrorKind::WouldBlock
+    ) {
+        tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+    }
+    true
+}
+
 /// Strips a URL scheme and trailing slash: `http://127.0.0.1:1234/` -> `127.0.0.1:1234`.
 pub fn proxy_host_port(proxy_url: &str) -> String {
     proxy_url
@@ -87,7 +108,16 @@ pub fn spawn_host_bridge(
         let _ = std::fs::set_permissions(sock, std::fs::Permissions::from_mode(0o600));
     }
     Ok(tokio::spawn(async move {
-        while let Ok((mut conn, _)) = listener.accept().await {
+        loop {
+            let (mut conn, _) = match listener.accept().await {
+                Ok(v) => v,
+                Err(err) => {
+                    if should_continue_after_accept_error(&err).await {
+                        continue;
+                    }
+                    break;
+                }
+            };
             let proxy_addr = proxy_addr.clone();
             let token = token.clone();
             tokio::spawn(async move {
@@ -172,7 +202,16 @@ pub fn spawn_host_preview_bridge(
     std_listener.set_nonblocking(true)?;
     let listener = TcpListener::from_std(std_listener)?;
     let handle = tokio::spawn(async move {
-        while let Ok((mut tcp, _)) = listener.accept().await {
+        loop {
+            let (mut tcp, _) = match listener.accept().await {
+                Ok(v) => v,
+                Err(err) => {
+                    if should_continue_after_accept_error(&err).await {
+                        continue;
+                    }
+                    break;
+                }
+            };
             let sock = unix_sock.clone();
             let token = token.clone();
             tokio::spawn(async move {
@@ -215,7 +254,16 @@ pub(crate) fn spawn_inward_preview_relay(
         let _ = std::fs::set_permissions(preview_sock, std::fs::Permissions::from_mode(0o600));
     }
     Ok(tokio::spawn(async move {
-        while let Ok((mut unix, _)) = listener.accept().await {
+        loop {
+            let (mut unix, _) = match listener.accept().await {
+                Ok(v) => v,
+                Err(err) => {
+                    if should_continue_after_accept_error(&err).await {
+                        continue;
+                    }
+                    break;
+                }
+            };
             let expected = token.clone();
             tokio::spawn(async move {
                 let mut presented = [0u8; TOKEN_LEN];
@@ -259,7 +307,16 @@ pub async fn run_shim_with_previews(
         let sock = sock.to_path_buf();
         let relay_token = token.clone();
         relays.push(tokio::spawn(async move {
-            while let Ok((mut tcp, _)) = listener.accept().await {
+            loop {
+                let (mut tcp, _) = match listener.accept().await {
+                    Ok(v) => v,
+                    Err(err) => {
+                        if should_continue_after_accept_error(&err).await {
+                            continue;
+                        }
+                        break;
+                    }
+                };
                 let sock = sock.clone();
                 let token = relay_token.clone();
                 tokio::spawn(async move {
