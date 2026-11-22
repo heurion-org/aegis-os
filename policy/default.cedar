@@ -72,9 +72,10 @@ permit (
         Action::"ipc_task_get",
         Action::"ipc_task_list",
         Action::"ipc_wait",
-        Action::"app_catalog_search",
-        Action::"app_mount_session",
-        Action::"app_call_tool"
+        Action::"mcp_list_installed",
+        Action::"mcp_discover",
+        Action::"mcp_hot_list_tools",
+        Action::"mcp_hot_call_tool"
     ],
     resource is IpcResource
 ) when {

@@ -334,7 +334,7 @@ pub fn mask_secrets_for_preview(val: &Value) -> Value {
     }
 }
 
-fn sanitize_server_id(raw: &str) -> String {
+pub fn sanitize_server_id(raw: &str) -> String {
     let clean: String = raw
         .chars()
         .map(|c| {
@@ -3643,6 +3643,253 @@ fn redact_url_userinfo(raw: &str) -> String {
     raw.to_string()
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct StdioSandboxPlan {
+    pub program: String,
+    pub args: Vec<String>,
+    pub sandbox_mode: &'static str,
+    pub isolated_tmp_dir: Option<PathBuf>,
+}
+
+#[cfg(target_os = "linux")]
+fn is_unsafe_home_subpath(host_home: &Path, path: &Path) -> bool {
+    let Ok(rel) = path.strip_prefix(host_home) else {
+        return false;
+    };
+    let first = rel
+        .components()
+        .next()
+        .and_then(|c| c.as_os_str().to_str())
+        .unwrap_or("")
+        .to_ascii_lowercase();
+    matches!(first.as_str(), ".ssh" | ".aws" | ".gnupg" | ".kube" | ".aegis" | ".config")
+}
+
+fn stdio_os_sandbox_available() -> bool {
+    static AVAILABLE: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *AVAILABLE.get_or_init(|| {
+        if std::env::var("AOS_MCP_STDIO_SANDBOX")
+            .ok()
+            .is_some_and(|v| v.eq_ignore_ascii_case("off") || v == "0")
+        {
+            return false;
+        }
+        #[cfg(target_os = "linux")]
+        {
+            let Some(bwrap) = aos_sandbox::linux_bwrap_path() else {
+                return false;
+            };
+            std::process::Command::new(bwrap)
+                .args([
+                    "--ro-bind",
+                    "/",
+                    "/",
+                    "--dev",
+                    "/dev",
+                    "--proc",
+                    "/proc",
+                    "--tmpfs",
+                    "/tmp",
+                    "--die-with-parent",
+                    "/bin/true",
+                ])
+                .stdout(Stdio::null())
+                .stderr(Stdio::null())
+                .status()
+                .is_ok_and(|s| s.success())
+        }
+        #[cfg(target_os = "macos")]
+        {
+            return Path::new("/usr/bin/sandbox-exec").is_file();
+        }
+        #[cfg(not(any(target_os = "linux", target_os = "macos")))]
+        {
+            false
+        }
+    })
+}
+
+/// Builds an OS-confined command plan for an upstream `stdio` MCP child (`npx` / `uvx` / local bin)
+/// that masks host `$HOME` credentials (`~/.ssh`, `~/.aws`, `~/.gnupg`, `~/.kube`, `~/.aegis`).
+pub fn build_stdio_sandbox_plan_with_mode(
+    command: &str,
+    args: &[String],
+    cwd: Option<&Path>,
+    iso_home: &Path,
+    host_home: Option<&Path>,
+    use_os_sandbox: bool,
+) -> StdioSandboxPlan {
+    if !use_os_sandbox {
+        return StdioSandboxPlan {
+            program: command.to_string(),
+            args: args.to_vec(),
+            sandbox_mode: "env_isolated",
+            isolated_tmp_dir: None,
+        };
+    }
+
+    #[cfg(target_os = "linux")]
+    {
+        if let Some(bwrap) = aos_sandbox::linux_bwrap_path() {
+            let iso_tmp = iso_home.join("tmp");
+            let mut bargs = vec![
+                "--ro-bind".to_string(),
+                "/".to_string(),
+                "/".to_string(),
+                "--dev".to_string(),
+                "/dev".to_string(),
+                "--proc".to_string(),
+                "/proc".to_string(),
+                "--tmpfs".to_string(),
+                "/tmp".to_string(),
+            ];
+            let mut rw_tmp_paths = std::collections::BTreeSet::<PathBuf>::new();
+            for a in args {
+                let ap = Path::new(a);
+                if ap.is_absolute()
+                    && ap.starts_with("/tmp")
+                    && ap != Path::new("/tmp")
+                    && !ap
+                        .components()
+                        .any(|c| matches!(c, std::path::Component::ParentDir))
+                    && host_home
+                        .is_none_or(|hh| ap != hh && !ap.starts_with(hh) && !is_unsafe_home_subpath(hh, ap))
+                {
+                    if ap.exists() {
+                        rw_tmp_paths.insert(ap.to_path_buf());
+                    } else if let Some(parent) = ap.parent() {
+                        if parent != Path::new("/tmp")
+                            && parent.starts_with("/tmp")
+                            && parent.is_dir()
+                            && host_home.is_none_or(|hh| parent != hh && !parent.starts_with(hh))
+                        {
+                            rw_tmp_paths.insert(parent.to_path_buf());
+                        }
+                    }
+                }
+            }
+            for path in &rw_tmp_paths {
+                let covered_by_parent_dir = rw_tmp_paths
+                    .iter()
+                    .any(|anc| anc != path && anc.is_dir() && path.starts_with(anc));
+                if !covered_by_parent_dir {
+                    bargs.push("--bind".to_string());
+                    bargs.push(path.display().to_string());
+                    bargs.push(path.display().to_string());
+                }
+            }
+            if let Some(hh) = host_home {
+                if hh != iso_home && hh.is_absolute() {
+                    bargs.push("--tmpfs".to_string());
+                    bargs.push(hh.display().to_string());
+                    // Preserve explicit safe binary under $HOME (e.g. ~/.nvm, ~/.local) without exposing secrets.
+                    let cmd_p = Path::new(command);
+                    if cmd_p.is_absolute()
+                        && cmd_p.starts_with(hh)
+                        && !is_unsafe_home_subpath(hh, cmd_p)
+                        && cmd_p.exists()
+                    {
+                        bargs.push("--ro-bind".to_string());
+                        bargs.push(cmd_p.display().to_string());
+                        bargs.push(cmd_p.display().to_string());
+                    }
+                }
+            }
+            bargs.push("--bind".to_string());
+            bargs.push(iso_home.display().to_string());
+            bargs.push(iso_home.display().to_string());
+            if let Some(dir) = cwd {
+                if dir.is_absolute() && dir.exists() && host_home.is_none_or(|hh| !is_unsafe_home_subpath(hh, dir)) {
+                    bargs.push("--bind".to_string());
+                    bargs.push(dir.display().to_string());
+                    bargs.push(dir.display().to_string());
+                    bargs.push("--chdir".to_string());
+                    bargs.push(dir.display().to_string());
+                } else {
+                    bargs.push("--chdir".to_string());
+                    bargs.push(iso_home.display().to_string());
+                }
+            } else {
+                bargs.push("--chdir".to_string());
+                bargs.push(iso_home.display().to_string());
+            }
+            bargs.push("--setenv".to_string());
+            bargs.push("HOME".to_string());
+            bargs.push(iso_home.display().to_string());
+            bargs.push("--setenv".to_string());
+            bargs.push("USERPROFILE".to_string());
+            bargs.push(iso_home.display().to_string());
+            bargs.push("--setenv".to_string());
+            bargs.push("TMPDIR".to_string());
+            bargs.push(iso_tmp.display().to_string());
+            bargs.push("--die-with-parent".to_string());
+            bargs.push("--new-session".to_string());
+            bargs.push("--".to_string());
+            bargs.push(command.to_string());
+            bargs.extend(args.iter().cloned());
+            return StdioSandboxPlan {
+                program: bwrap.to_string(),
+                args: bargs,
+                sandbox_mode: "linux_bwrap",
+                isolated_tmp_dir: Some(iso_tmp),
+            };
+        }
+    }
+
+    #[cfg(target_os = "macos")]
+    {
+        if Path::new("/usr/bin/sandbox-exec").is_file() {
+            let mut sb = String::from("(version 1)\n(allow default)\n");
+            if let Some(hh) = host_home {
+                for sub in [".ssh", ".aws", ".gnupg", ".kube", ".aegis", ".config"] {
+                    let p = hh.join(sub).display().to_string().replace('"', "\\\"");
+                    sb.push_str(&format!("(deny file-read* file-write* (subpath \"{p}\"))\n"));
+                }
+            }
+            let iso_q = iso_home.display().to_string().replace('"', "\\\"");
+            sb.push_str(&format!("(allow file-read* file-write* (subpath \"{iso_q}\"))\n"));
+            if iso_q.starts_with("/var/") || iso_q.starts_with("/tmp/") {
+                sb.push_str(&format!(
+                    "(allow file-read* file-write* (subpath \"/private{iso_q}\"))\n"
+                ));
+            }
+            let mut pargs = vec!["-p".to_string(), sb, command.to_string()];
+            pargs.extend(args.iter().cloned());
+            return StdioSandboxPlan {
+                program: "/usr/bin/sandbox-exec".to_string(),
+                args: pargs,
+                sandbox_mode: "macos_seatbelt",
+                isolated_tmp_dir: None,
+            };
+        }
+    }
+
+    let _ = (host_home, cwd, iso_home);
+    StdioSandboxPlan {
+        program: command.to_string(),
+        args: args.to_vec(),
+        sandbox_mode: "env_isolated",
+        isolated_tmp_dir: None,
+    }
+}
+
+pub fn build_stdio_sandbox_plan(
+    command: &str,
+    args: &[String],
+    cwd: Option<&Path>,
+    iso_home: &Path,
+    host_home: Option<&Path>,
+) -> StdioSandboxPlan {
+    build_stdio_sandbox_plan_with_mode(
+        command,
+        args,
+        cwd,
+        iso_home,
+        host_home,
+        stdio_os_sandbox_available(),
+    )
+}
+
 async fn spawn_upstream_stdio(
     key_store: &VaultKeyStore,
     runtime_data_root: &Path,
@@ -3659,15 +3906,48 @@ async fn spawn_upstream_stdio(
         bail!("Expected stdio transport for server '{}'", server.server_id);
     };
 
-    let mut cmd = tokio::process::Command::new(command);
-    cmd.args(args)
+    let iso_home = runtime_data_root
+        .join("mcp_homes")
+        .join(sanitize_server_id(&server.server_id));
+    if server.policy.isolate_upstream_home {
+        tokio::fs::create_dir_all(&iso_home).await?;
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let _ = tokio::fs::set_permissions(
+                &iso_home,
+                std::fs::Permissions::from_mode(0o700),
+            )
+            .await;
+        }
+    }
+
+    let host_home = std::env::var_os("HOME").map(PathBuf::from);
+    let cwd_path = cwd.as_deref().map(Path::new);
+    let use_sbx = server.policy.isolate_upstream_home && stdio_os_sandbox_available();
+    let plan = build_stdio_sandbox_plan_with_mode(
+        command,
+        args,
+        cwd_path,
+        &iso_home,
+        host_home.as_deref(),
+        use_sbx,
+    );
+    if let Some(ref tmp_dir) = plan.isolated_tmp_dir {
+        let _ = tokio::fs::create_dir_all(tmp_dir).await;
+    }
+
+    let mut cmd = tokio::process::Command::new(&plan.program);
+    cmd.args(&plan.args)
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .env_clear();
 
-    if let Some(ref dir) = cwd {
-        cmd.current_dir(dir);
+    if plan.sandbox_mode != "linux_bwrap" {
+        if let Some(ref dir) = cwd {
+            cmd.current_dir(dir);
+        }
     }
 
     for pass_var in [
@@ -3687,22 +3967,12 @@ async fn spawn_upstream_stdio(
     }
 
     if server.policy.isolate_upstream_home {
-        let iso_home = runtime_data_root
-            .join("mcp_homes")
-            .join(sanitize_server_id(&server.server_id));
-        tokio::fs::create_dir_all(&iso_home).await?;
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::PermissionsExt;
-            let _ = tokio::fs::set_permissions(
-                &iso_home,
-                std::fs::Permissions::from_mode(0o700),
-            )
-            .await;
-        }
         cmd.env("HOME", &iso_home);
         cmd.env("USERPROFILE", &iso_home);
-    } else if let Some(home) = std::env::var_os("HOME") {
+        if let Some(ref tmp_dir) = plan.isolated_tmp_dir {
+            cmd.env("TMPDIR", tmp_dir);
+        }
+    } else if let Some(ref home) = host_home {
         cmd.env("HOME", home);
     }
 
@@ -5774,5 +6044,96 @@ for line in sys.stdin:
             !hdrs.iter().any(|(k, _)| k == "x-aegis-org-id"),
             "must NOT forward X-Aegis-Org-Id by default: {hdrs:?}"
         );
+    }
+
+    #[test]
+    fn stdio_sandbox_plan_masks_host_home_and_binds_isolated_home() {
+        let tmp = tempfile::tempdir().unwrap();
+        let host_home = tmp.path().join("host-home");
+        let iso_home = tmp.path().join("iso-home");
+        std::fs::create_dir_all(&host_home).unwrap();
+        std::fs::create_dir_all(&iso_home).unwrap();
+
+        let plan = build_stdio_sandbox_plan_with_mode(
+            "npx",
+            &["-y".to_string(), "@acme/mcp".to_string()],
+            None,
+            &iso_home,
+            Some(&host_home),
+            true,
+        );
+        #[cfg(target_os = "linux")]
+        if aos_sandbox::linux_bwrap_path().is_some() {
+            assert_eq!(plan.sandbox_mode, "linux_bwrap");
+            let joined = plan.args.join(" ");
+            assert!(joined.contains(&format!("--tmpfs {}", host_home.display())));
+            assert!(joined.contains(&format!("--bind {} {}", iso_home.display(), iso_home.display())));
+            assert!(joined.contains("--die-with-parent"));
+            assert!(joined.ends_with("-- npx -y @acme/mcp"));
+
+            // Case 1: Explicit `/tmp/.../out.log` whose parent exists under `/tmp` binds its parent RW
+            // BEFORE masking `host_home`.
+            let work_sub = tmp.path().join("work-sub");
+            std::fs::create_dir_all(&work_sub).unwrap();
+            let script_py = work_sub.join("server.py");
+            std::fs::write(&script_py, "print('ok')\n").unwrap();
+            let out_log = work_sub.join("out.log");
+            let tmp_plan = build_stdio_sandbox_plan_with_mode(
+                "python3",
+                &[
+                    script_py.display().to_string(),
+                    out_log.display().to_string(),
+                ],
+                None,
+                &iso_home,
+                Some(&host_home),
+                true,
+            );
+            let tjoined = tmp_plan.args.join(" ");
+            let bind_sub = format!("--bind {} {}", work_sub.display(), work_sub.display());
+            let tmpfs_str = format!("--tmpfs {}", host_home.display());
+            let bind_pos = tjoined.find(&bind_sub).expect("expected --bind for /tmp parent dir");
+            let tmpfs_pos = tjoined.find(&tmpfs_str).expect("expected --tmpfs for host_home");
+            assert!(bind_pos < tmpfs_pos, "tmp bind must precede host_home mask");
+
+            // Case 2: Once `out.log` already exists on disk (2nd spawn), BOTH existing `/tmp` files
+            // bind RW (`--bind`, not `--ro-bind`) before masking `host_home`.
+            std::fs::write(&out_log, "line1\n").unwrap();
+            let tmp_plan_2 = build_stdio_sandbox_plan_with_mode(
+                "python3",
+                &[
+                    script_py.display().to_string(),
+                    out_log.display().to_string(),
+                ],
+                None,
+                &iso_home,
+                Some(&host_home),
+                true,
+            );
+            let tjoined2 = tmp_plan_2.args.join(" ");
+            let bind_script = format!("--bind {} {}", script_py.display(), script_py.display());
+            let bind_log = format!("--bind {} {}", out_log.display(), out_log.display());
+            let tmpfs_pos2 = tjoined2.find(&tmpfs_str).expect("expected --tmpfs for host_home");
+            let s_pos = tjoined2.find(&bind_script).expect("expected --bind for existing script");
+            let l_pos = tjoined2.find(&bind_log).expect("expected --bind for existing out_log");
+            assert!(s_pos < tmpfs_pos2 && l_pos < tmpfs_pos2, "existing /tmp binds must precede host_home mask");
+            assert!(!tjoined2.contains(&format!("--ro-bind {}", out_log.display())));
+        }
+        #[cfg(target_os = "macos")]
+        if Path::new("/usr/bin/sandbox-exec").is_file() {
+            assert_eq!(plan.sandbox_mode, "macos_seatbelt");
+            assert!(plan.args[1].contains(&format!("{}/.ssh", host_home.display())));
+        }
+
+        let off_plan = build_stdio_sandbox_plan_with_mode(
+            "npx",
+            &["-y".to_string(), "@acme/mcp".to_string()],
+            None,
+            &iso_home,
+            Some(&host_home),
+            false,
+        );
+        assert_eq!(off_plan.sandbox_mode, "env_isolated");
+        assert_eq!(off_plan.program, "npx");
     }
 }

@@ -367,9 +367,7 @@ impl SessionBroker {
             })
             .await;
 
-        let mcp_proxy_pool = Arc::new(aos_mcp_gateway::mcp_firewall::McpProxySessionPool::new(
-            kernel.mcp_firewall.clone(),
-        ));
+        let mcp_proxy_pool = kernel.mcp_proxy_pool.clone();
         let fallback_pseudonym_table = Arc::new(aos_egress::PseudonymSessionTable::new());
 
         let state = Arc::new(BrokerState {

@@ -9,17 +9,107 @@ use aos_mcp_gateway::mcp_firewall::{
     OutboxStatus,
 };
 use aos_mcp_gateway::mcp_oauth::{parse_url_scheme_and_host, sanitize_realm_id, RealmUpsertSpec};
+use aos_mcp_gateway::mcp_registry::{McpRegistryClient, ResolvedInstallTarget};
 use aos_mcp_gateway::AegisRuntimeKernel;
 use clap::Subcommand;
 use serde_json::{json, Value};
-use std::collections::BTreeMap;
-use std::io::Read;
+use std::collections::{BTreeMap, BTreeSet};
+use std::io::{IsTerminal, Read};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 
 #[derive(Subcommand, Debug, Clone)]
 pub(crate) enum McpAction {
+    /// Unified zero-trust inventory across org servers, auth expiry, bundles, outbox, taint, and drift warnings
+    Status {
+        /// Optional custom home directory for drift scan (defaults to `$HOME`)
+        #[arg(long)]
+        home_dir: Option<PathBuf>,
+        /// Output raw JSON report (never exposes secrets)
+        #[arg(long, default_value_t = false)]
+        json: bool,
+    },
+
+    /// Check MCP health: expired OAuth tokens, missing logins, unadopted plaintext configs, and sandbox readiness
+    Doctor {
+        /// Optional custom home directory (defaults to `$HOME`)
+        #[arg(long)]
+        home_dir: Option<PathBuf>,
+        /// Output raw JSON diagnostics
+        #[arg(long, default_value_t = false)]
+        json: bool,
+    },
+
+    /// Search Official MCP Registry (and configured registries) ranked by Aegis Trust Tier (1 -> 2 -> 3)
+    Search {
+        /// Search query or capability intent (e.g. `linear`, `postgres`, `sentry`)
+        query: String,
+        /// Maximum number of candidates to display (1..=50)
+        #[arg(long, default_value_t = 10)]
+        limit: usize,
+        /// Allow plaintext http:// loopback registries for local testing
+        #[arg(long, default_value_t = false)]
+        allow_local_http: bool,
+        /// Output raw JSON candidates
+        #[arg(long, default_value_t = false)]
+        json: bool,
+    },
+
+    /// Recommend MCP servers based on `.aegis/mcp.json`, `.mcp.json`, and local workspace signals
+    Recommend {
+        #[arg(long, default_value_t = false)]
+        json: bool,
+    },
+
+    /// Unified installer for external MCPs (Registry name, `.well-known` bundle, HTTPS URL, `npm:<pkg>`, `pypi:<pkg>`)
+    Install {
+        /// Target spec (`app.linear/mcp`, `heurion`, `https://...`, `npm:<pkg>`, `pypi:<pkg>`, or local bundle `.json`)
+        target: String,
+        /// Optional explicit server alias ID
+        #[arg(long)]
+        server_id: Option<String>,
+        /// Installation scope: `org` (global across repos) or `workspace` (also writes zero-secret `.aegis/mcp.json`)
+        #[arg(long, default_value = "org")]
+        scope: String,
+        /// Data trust posture (`untrusted` or `trusted`)
+        #[arg(long, default_value = "untrusted")]
+        trust: String,
+        /// DLP pseudonymization mode (`pseudonymize`, `block`, `off`)
+        #[arg(long, default_value = "pseudonymize")]
+        dlp: String,
+        /// Optional static Bearer token / API key to seal directly into Vault
+        #[arg(long)]
+        token: Option<String>,
+        /// Read static Bearer token / API key from stdin (avoids shell history)
+        #[arg(long, default_value_t = false)]
+        token_stdin: bool,
+        /// Use RFC 8628 Device Authorization Grant for OAuth 2.1 login
+        #[arg(long, default_value_t = false)]
+        device_code: bool,
+        /// Skip immediate authentication step after registering
+        #[arg(long, default_value_t = false)]
+        no_login: bool,
+        /// Do not auto-open system browser during PKCE OAuth flow
+        #[arg(long, default_value_t = false)]
+        no_browser: bool,
+        /// Skip syncing bundle entries into local client configs
+        #[arg(long, default_value_t = false)]
+        no_client_sync: bool,
+        /// Allow plaintext http:// loopback endpoints (local testing only)
+        #[arg(long, default_value_t = false)]
+        allow_local_http: bool,
+        /// Optional custom home directory for client config sync
+        #[arg(long)]
+        home_dir: Option<PathBuf>,
+        /// Preview Trust Tier, transport, pinned hosts, and risks without mutating state
+        #[arg(long, default_value_t = false)]
+        dry_run: bool,
+        /// Output raw JSON
+        #[arg(long, default_value_t = false)]
+        json: bool,
+    },
+
     /// Scan client configs (`claude`, `.mcp.json`, `agy`, `cursor`, `opencode`, `codex`) for MCP servers and exposed secrets
     Scan {
         /// Optional custom home directory (defaults to `$HOME`)
@@ -1199,8 +1289,625 @@ pub(crate) async fn handle_mcp_command(
                 }
             }
         }
+
+        McpAction::Status { home_dir, json } => {
+            let home = resolve_home_dir(home_dir);
+            let kernel = AegisRuntimeKernel::new(runtime_dir).await?;
+            let (report, _) =
+                collect_mcp_status_and_drift(&kernel, &identity.org_id, &home, workspace).await;
+            if json {
+                println!("{}", serde_json::to_string_pretty(&report)?);
+                return Ok(());
+            }
+            print_mcp_status_table(&report);
+        }
+
+        McpAction::Doctor { home_dir, json } => {
+            let home = resolve_home_dir(home_dir);
+            let kernel = AegisRuntimeKernel::new(runtime_dir).await?;
+            let (_, diag) =
+                collect_mcp_status_and_drift(&kernel, &identity.org_id, &home, workspace).await;
+            if json {
+                println!("{}", serde_json::to_string_pretty(&diag)?);
+                return Ok(());
+            }
+            let findings = diag["findings"].as_array().cloned().unwrap_or_default();
+            println!(
+                "Aegis MCP Doctor (org='{}', stdio_sandbox={}):",
+                identity.org_id,
+                diag["stdio_sandbox_backend"].as_str().unwrap_or("env_isolated")
+            );
+            if findings.is_empty() {
+                println!("  ✓ All registered external MCP servers, Vault realms, and client configs look healthy.");
+            } else {
+                for f in findings {
+                    println!(
+                        "  [{}] {}: {}",
+                        f["severity"].as_str().unwrap_or("warn"),
+                        f["code"].as_str().unwrap_or("issue"),
+                        f["message"].as_str().unwrap_or("-")
+                    );
+                    if let Some(fix) = f["fix"].as_str() {
+                        println!("      fix: {fix}");
+                    }
+                }
+            }
+        }
+
+        McpAction::Search {
+            query,
+            limit,
+            allow_local_http,
+            json,
+        } => {
+            let kernel = AegisRuntimeKernel::new(runtime_dir).await?;
+            let installed_ids: BTreeSet<String> = kernel
+                .mcp_firewall
+                .list_servers(Some(&identity.org_id))
+                .await
+                .into_iter()
+                .map(|s| s.server_id)
+                .collect();
+            let candidates = kernel
+                .mcp_registry
+                .search(&query, limit, allow_local_http)
+                .await?;
+            if json {
+                println!("{}", serde_json::to_string_pretty(&candidates)?);
+                return Ok(());
+            }
+            if candidates.is_empty() {
+                println!("No MCP candidates found matching '{}'.", query);
+                return Ok(());
+            }
+            println!("Discovered {} MCP server(s) matching '{}':", candidates.len(), query);
+            for c in candidates {
+                let tag = if installed_ids.contains(&c.server_id) {
+                    " [installed]"
+                } else {
+                    ""
+                };
+                println!(
+                    "  • {}{} — {}\n    tier: {} | transport: {} | auth: {} | install: aegis-os mcp install {}",
+                    c.server_id,
+                    tag,
+                    c.title,
+                    c.trust_tier.label(),
+                    c.transport_kind,
+                    c.auth_mode,
+                    c.name
+                );
+            }
+        }
+
+        McpAction::Recommend { json } => {
+            let kernel = AegisRuntimeKernel::new(runtime_dir).await?;
+            let installed_ids: BTreeSet<String> = kernel
+                .mcp_firewall
+                .list_servers(Some(&identity.org_id))
+                .await
+                .into_iter()
+                .map(|s| s.server_id)
+                .collect();
+            let hints = McpRegistryClient::recommend_for_workspace(workspace, &installed_ids);
+            if json {
+                println!("{}", serde_json::to_string_pretty(&hints)?);
+                return Ok(());
+            }
+            if hints.is_empty() {
+                println!("No workspace MCP manifest declarations or project signals detected.");
+                return Ok(());
+            }
+            println!("Workspace MCP recommendations for '{}':", workspace.display());
+            for h in hints {
+                let state = if h.already_installed {
+                    "installed"
+                } else {
+                    "recommended"
+                };
+                println!(
+                    "  • [{state}] {} ({}) — {}\n      cmd: {}",
+                    h.server_id, h.source, h.reason, h.suggested_install
+                );
+            }
+        }
+
+        McpAction::Install {
+            target,
+            server_id,
+            scope,
+            trust,
+            dlp,
+            token,
+            token_stdin,
+            device_code,
+            no_login,
+            no_browser,
+            no_client_sync,
+            allow_local_http,
+            home_dir,
+            dry_run,
+            json,
+        } => {
+            let res = run_unified_mcp_install(
+                identity,
+                workspace,
+                runtime_dir,
+                UnifiedMcpInstallArgs {
+                    target,
+                    server_id,
+                    scope,
+                    trust,
+                    dlp,
+                    token,
+                    token_stdin,
+                    device_code,
+                    no_login,
+                    no_browser,
+                    no_client_sync,
+                    allow_local_http,
+                    home_dir,
+                    dry_run,
+                },
+            )
+            .await?;
+            if json {
+                println!("{}", serde_json::to_string_pretty(&res)?);
+            } else {
+                println!(
+                    "Installed MCP '{}' (kind={}, trust_tier={}, auth_status={}, scope={}).",
+                    res["server_id"].as_str().unwrap_or("-"),
+                    res["kind"].as_str().unwrap_or("-"),
+                    res["trust_tier"].as_str().unwrap_or("-"),
+                    res["auth_status"].as_str().unwrap_or("-"),
+                    res["scope"].as_str().unwrap_or("-")
+                );
+                if let Some(decl) = res["workspace_manifest"].as_str() {
+                    println!("  wrote zero-secret repo manifest: {decl}");
+                }
+                if let Some(hint) = res["next_hint"].as_str() {
+                    println!("  next: {hint}");
+                }
+            }
+        }
     }
     Ok(())
+}
+
+struct UnifiedMcpInstallArgs {
+    target: String,
+    server_id: Option<String>,
+    scope: String,
+    trust: String,
+    dlp: String,
+    token: Option<String>,
+    token_stdin: bool,
+    device_code: bool,
+    no_login: bool,
+    no_browser: bool,
+    no_client_sync: bool,
+    allow_local_http: bool,
+    home_dir: Option<PathBuf>,
+    dry_run: bool,
+}
+
+async fn run_unified_mcp_install(
+    identity: &AgentIdentity,
+    workspace: &Path,
+    runtime_dir: &Path,
+    args: UnifiedMcpInstallArgs,
+) -> anyhow::Result<Value> {
+    let scope = args.scope.trim().to_ascii_lowercase();
+    if !matches!(scope.as_str(), "org" | "workspace") {
+        bail!("Invalid `--scope '{}'`: expected 'org' or 'workspace'", scope);
+    }
+    let trust_level = parse_trust_level(&args.trust)?;
+    let dlp_mode: PseudonymMode = args.dlp.parse().map_err(|e: String| anyhow::anyhow!(e))?;
+    let home = resolve_home_dir(args.home_dir);
+
+    let static_token = if args.token_stdin {
+        let mut buf = String::new();
+        std::io::stdin().read_to_string(&mut buf)?;
+        Some(buf.trim().to_string())
+    } else {
+        args.token.clone()
+    };
+
+    let kernel = AegisRuntimeKernel::new(runtime_dir).await?;
+    let resolved = kernel
+        .mcp_registry
+        .resolve_install_target(&args.target, args.server_id.as_deref(), args.allow_local_http)
+        .await?;
+
+    if args.dry_run {
+        return Ok(json!({
+            "dry_run": true,
+            "scope": scope,
+            "trust": format!("{trust_level:?}"),
+            "dlp": format!("{dlp_mode:?}"),
+            "resolved": resolved,
+        }));
+    }
+
+    match resolved {
+        ResolvedInstallTarget::Bundle {
+            source,
+            allow_local_http,
+        } => {
+            let rec = kernel
+                .mcp_bundles
+                .install_bundle(
+                    &identity.org_id,
+                    &source,
+                    BundleInstallOptions {
+                        profile: None,
+                        sync_clients: !args.no_client_sync,
+                        sync_skills: true,
+                        workspace_dir: Some(workspace.to_path_buf()),
+                        home_dir: Some(home),
+                        proxy_bin_path: std::env::current_exe().ok(),
+                        allow_local_http,
+                        dry_run: false,
+                    },
+                )
+                .await?;
+
+            let mut auth_status = "none".to_string();
+            let mut next_hint: Option<String> = None;
+            if let Some(ref realm_id) = rec.auth_realm_id {
+                if let Some(ref raw_tok) = static_token {
+                    kernel
+                        .mcp_oauth
+                        .login_static_token(
+                            &identity.org_id,
+                            realm_id,
+                            raw_tok,
+                            vec![],
+                            allow_local_http,
+                        )
+                        .await?;
+                    auth_status = "authenticated".to_string();
+                } else if !args.no_login {
+                    let use_device = args.device_code || !std::io::stdin().is_terminal();
+                    let login_res = if use_device {
+                        kernel
+                            .mcp_oauth
+                            .login_device_code(
+                                &identity.org_id,
+                                realm_id,
+                                None,
+                                None,
+                                vec![],
+                                vec![],
+                                allow_local_http,
+                                180,
+                                None,
+                            )
+                            .await
+                    } else {
+                        kernel
+                            .mcp_oauth
+                            .login_pkce_loopback(
+                                &identity.org_id,
+                                realm_id,
+                                None,
+                                None,
+                                vec![],
+                                vec![],
+                                allow_local_http,
+                                !args.no_browser,
+                                180,
+                                None,
+                            )
+                            .await
+                    };
+                    match login_res {
+                        Ok(_) => auth_status = "authenticated".to_string(),
+                        Err(e) => {
+                            auth_status = "needs_login".to_string();
+                            next_hint = Some(format!(
+                                "Bundle registered, but OAuth login did not complete ({e}). Run `aegis-os mcp login {realm_id}`."
+                            ));
+                        }
+                    }
+                } else {
+                    auth_status = "needs_login".to_string();
+                    next_hint = Some(format!("Run `aegis-os mcp login {realm_id}` to authenticate."));
+                }
+            }
+
+            Ok(json!({
+                "status": "installed",
+                "kind": "bundle",
+                "server_id": rec.bundle_id,
+                "server_ids": rec.server_ids,
+                "trust_tier": "bundle",
+                "auth_status": auth_status,
+                "scope": scope,
+                "next_hint": next_hint,
+            }))
+        }
+        ResolvedInstallTarget::Candidate(cand) => {
+            let policy = McpServerPolicy {
+                trust_level,
+                dlp_mode,
+                ..McpServerPolicy::default()
+            };
+            let mut auth_status = "none".to_string();
+            let mut next_hint: Option<String> = None;
+
+            if let Some(ref url) = cand.remote_url {
+                let realm_id = cand.server_id.clone();
+                kernel
+                    .mcp_oauth
+                    .upsert_realm_config(
+                        &identity.org_id,
+                        &realm_id,
+                        RealmUpsertSpec {
+                            allowed_hosts: cand.allowed_hosts.clone(),
+                            allow_local_http: args.allow_local_http,
+                            ..Default::default()
+                        },
+                    )
+                    .await?;
+                kernel
+                    .mcp_firewall
+                    .register_http_server_with_options(
+                        &identity.org_id,
+                        &cand.server_id,
+                        url,
+                        BTreeMap::new(),
+                        policy,
+                        Some(&realm_id),
+                        None,
+                        args.allow_local_http,
+                    )
+                    .await?;
+
+                if let Some(ref raw_tok) = static_token {
+                    kernel
+                        .mcp_oauth
+                        .login_static_token(
+                            &identity.org_id,
+                            &realm_id,
+                            raw_tok,
+                            cand.allowed_hosts.clone(),
+                            args.allow_local_http,
+                        )
+                        .await?;
+                    auth_status = "authenticated".to_string();
+                } else if cand.auth_mode == "oauth2_or_auto" && !args.no_login {
+                    let use_device = args.device_code || !std::io::stdin().is_terminal();
+                    let login_res = if use_device {
+                        kernel
+                            .mcp_oauth
+                            .login_device_code(
+                                &identity.org_id,
+                                &realm_id,
+                                Some(url.as_str()),
+                                None,
+                                cand.allowed_hosts.clone(),
+                                vec![],
+                                args.allow_local_http,
+                                180,
+                                None,
+                            )
+                            .await
+                    } else {
+                        kernel
+                            .mcp_oauth
+                            .login_pkce_loopback(
+                                &identity.org_id,
+                                &realm_id,
+                                Some(url.as_str()),
+                                None,
+                                cand.allowed_hosts.clone(),
+                                vec![],
+                                args.allow_local_http,
+                                !args.no_browser,
+                                180,
+                                None,
+                            )
+                            .await
+                    };
+                    match login_res {
+                        Ok(_) => auth_status = "authenticated".to_string(),
+                        Err(e) => {
+                            auth_status = "needs_login".to_string();
+                            next_hint = Some(format!(
+                                "Registered '{}'; run `aegis-os mcp login {}` or `--token-stdin` ({e}).",
+                                cand.server_id, realm_id
+                            ));
+                        }
+                    }
+                } else if cand.auth_mode != "none" {
+                    auth_status = "needs_login".to_string();
+                    next_hint = Some(format!(
+                        "Authenticate with `aegis-os mcp login {} --token-stdin`.",
+                        realm_id
+                    ));
+                }
+            } else if let Some(ref pkg) = cand.package_spec {
+                kernel
+                    .mcp_firewall
+                    .register_stdio_server(
+                        &identity.org_id,
+                        &cand.server_id,
+                        &pkg.command,
+                        pkg.args.clone(),
+                        Some(workspace.display().to_string()),
+                        BTreeMap::new(),
+                        policy,
+                    )
+                    .await?;
+                if !pkg.required_env_vars.is_empty() {
+                    auth_status = "needs_env_secret".to_string();
+                    next_hint = Some(format!(
+                        "Required env vars [{}] can be Vault-sealed via `aegis-os mcp add {} ... --env KEY=VAL`.",
+                        pkg.required_env_vars.join(", "),
+                        cand.server_id
+                    ));
+                }
+            }
+
+            let workspace_manifest = if scope == "workspace" {
+                Some(
+                    McpRegistryClient::write_workspace_mcp_declaration(workspace, &cand)?
+                        .display()
+                        .to_string(),
+                )
+            } else {
+                None
+            };
+
+            Ok(json!({
+                "status": "installed",
+                "kind": cand.transport_kind,
+                "server_id": cand.server_id,
+                "registry_name": cand.name,
+                "trust_tier": cand.trust_tier.label(),
+                "allowed_hosts": cand.allowed_hosts,
+                "auth_status": auth_status,
+                "scope": scope,
+                "workspace_manifest": workspace_manifest,
+                "next_hint": next_hint,
+            }))
+        }
+    }
+}
+
+async fn collect_mcp_status_and_drift(
+    kernel: &AegisRuntimeKernel,
+    org_id: &str,
+    home: &Path,
+    workspace: &Path,
+) -> (Value, Value) {
+    let inv = kernel.build_installed_mcp_inventory(org_id, None).await;
+    let discovered = scan_client_configs(home, workspace);
+    let mut unadopted_clients = Vec::new();
+    for d in &discovered {
+        if !d.already_adopted {
+            unadopted_clients.push(json!({
+                "server_id": d.server_id,
+                "client": d.client,
+                "config_path": d.config_path.display().to_string(),
+                "plaintext_secret_keys": d.plaintext_secret_keys,
+            }));
+        }
+    }
+
+    let mut findings = Vec::new();
+    if let Some(servers) = inv["servers"].as_array() {
+        for s in servers {
+            if s["status"].as_str() == Some("needs_auth") {
+                let sid = s["server_id"].as_str().unwrap_or("-");
+                let realm = s["auth_realm"].as_str().unwrap_or(sid);
+                let state = s["auth_state"].as_str().unwrap_or("missing");
+                findings.push(json!({
+                    "severity": "warn",
+                    "code": format!("auth_{state}"),
+                    "message": format!("Server '{}' has '{}' authentication for realm '{}'", sid, state, realm),
+                    "fix": format!("aegis-os mcp login {realm}"),
+                }));
+            }
+        }
+    }
+    if !unadopted_clients.is_empty() {
+        findings.push(json!({
+            "severity": "warn",
+            "code": "unadopted_client_configs",
+            "message": format!("{} unadopted external MCP entry/entries found across local client configs", unadopted_clients.len()),
+            "fix": "aegis-os mcp adopt --all",
+        }));
+    }
+    let pending_outbox = inv["summary"]["pending_outbox"].as_u64().unwrap_or(0);
+    if pending_outbox > 0 {
+        findings.push(json!({
+            "severity": "info",
+            "code": "pending_outbox_tickets",
+            "message": format!("{pending_outbox} staged external MCP write(s) awaiting human approval"),
+            "fix": "aegis-os mcp outbox list",
+        }));
+    }
+
+    #[cfg(target_os = "linux")]
+    let sandbox_backend = if aos_sandbox::linux_bwrap_path().is_some() {
+        "linux_bwrap"
+    } else {
+        "env_isolated_only (bwrap not found)"
+    };
+    #[cfg(target_os = "macos")]
+    let sandbox_backend = if Path::new("/usr/bin/sandbox-exec").is_file() {
+        "macos_seatbelt"
+    } else {
+        "env_isolated_only"
+    };
+    #[cfg(not(any(target_os = "linux", target_os = "macos")))]
+    let sandbox_backend = "env_isolated";
+
+    let mut report = inv;
+    if let Some(obj) = report.as_object_mut() {
+        obj.insert("unadopted_client_configs".to_string(), json!(unadopted_clients));
+        obj.insert("findings".to_string(), json!(findings));
+    }
+    let diag = json!({
+        "org_id": org_id,
+        "stdio_sandbox_backend": sandbox_backend,
+        "findings": findings,
+        "unadopted_client_configs": unadopted_clients,
+    });
+    (report, diag)
+}
+
+fn print_mcp_status_table(report: &Value) {
+    let org_id = report["org_id"].as_str().unwrap_or("-");
+    let summary = &report["summary"];
+    println!(
+        "Aegis MCP Status (org='{}' · total={} · ready={} · needs_auth={} · pending_outbox={} · taint={}):",
+        org_id,
+        summary["total"].as_u64().unwrap_or(0),
+        summary["ready"].as_u64().unwrap_or(0),
+        summary["needs_auth"].as_u64().unwrap_or(0),
+        summary["pending_outbox"].as_u64().unwrap_or(0),
+        summary["active_taint"].as_bool().unwrap_or(false),
+    );
+    let servers = report["servers"].as_array().cloned().unwrap_or_default();
+    if servers.is_empty() {
+        println!("  (no external MCP servers registered; run `aegis-os mcp search <query>` or `aegis-os mcp recommend`)");
+    } else {
+        println!(
+            "  ID                 SOURCE             TYPE    AUTH          POLICY             STATUS"
+        );
+        for s in servers {
+            let sid = s["server_id"].as_str().unwrap_or("-");
+            let src = s["source"].as_str().unwrap_or("-");
+            let tr = s["transport"].as_str().unwrap_or("-");
+            let auth = s["auth_state"].as_str().unwrap_or("-");
+            let trust = if s["writes_require_outbox"].as_bool() == Some(true) {
+                "untrusted+outbox"
+            } else {
+                "trusted"
+            };
+            let st = s["status"].as_str().unwrap_or("-");
+            println!(
+                "  {:<18} {:<18} {:<7} {:<13} {:<18} {}",
+                sid, src, tr, auth, trust, st
+            );
+        }
+    }
+    if let Some(findings) = report["findings"].as_array() {
+        if !findings.is_empty() {
+            println!("Drift / Actionable Warnings:");
+            for f in findings {
+                println!(
+                    "  • [{}] {} -> {}",
+                    f["severity"].as_str().unwrap_or("warn"),
+                    f["message"].as_str().unwrap_or("-"),
+                    f["fix"].as_str().unwrap_or("-")
+                );
+            }
+        }
+    }
 }
 
 async fn resolve_login_target_context(
@@ -2153,7 +2860,7 @@ for line in sys.stdin:
         let kernel_body: Value =
             serde_json::from_str(kernel_raw.split("\r\n\r\n").nth(1).unwrap()).unwrap();
         let tools = kernel_body["result"]["tools"].as_array().unwrap();
-        assert_eq!(tools.len(), 50);
+        assert_eq!(tools.len(), 55);
         assert!(
             !tools.iter().any(|t| t["name"] == "app_catalog_search"),
             "Standard profile must not expose removed app_catalog_search"
@@ -2263,5 +2970,104 @@ for line in sys.stdin:
 
         server_task.abort();
         egress_task.abort();
+    }
+
+    #[tokio::test]
+    async fn unified_mcp_install_status_doctor_and_recommend_work_end_to_end() {
+        let temp = tempfile::tempdir().unwrap();
+        let rt_dir = temp.path().join("rt");
+        let ws_dir = temp.path().join("ws");
+        let home_dir = temp.path().join("home");
+        std::fs::create_dir_all(&rt_dir).unwrap();
+        std::fs::create_dir_all(ws_dir.join(".git")).unwrap();
+        std::fs::create_dir_all(&home_dir).unwrap();
+        std::fs::write(
+            ws_dir.join(".mcp.json"),
+            json!({
+                "mcpServers": {
+                    "linear": { "url": "https://mcp.linear.app/mcp" }
+                }
+            })
+            .to_string(),
+        )
+        .unwrap();
+
+        let identity = AgentIdentity::new("cli-org", "coder-1", "Engineer");
+
+        // 1. Recommend sees repo `.mcp.json` declaration before install.
+        handle_mcp_command(
+            McpAction::Recommend { json: true },
+            &identity,
+            &ws_dir,
+            &rt_dir,
+        )
+        .await
+        .unwrap();
+
+        // 2. Dry-run install resolves npm package cleanly without mutating Vault.
+        handle_mcp_command(
+            McpAction::Install {
+                target: "npm:@acme/test-mcp".to_string(),
+                server_id: Some("acme-test".to_string()),
+                scope: "org".to_string(),
+                trust: "untrusted".to_string(),
+                dlp: "pseudonymize".to_string(),
+                token: None,
+                token_stdin: false,
+                device_code: false,
+                no_login: true,
+                no_browser: true,
+                no_client_sync: true,
+                allow_local_http: false,
+                home_dir: Some(home_dir.clone()),
+                dry_run: true,
+                json: true,
+            },
+            &identity,
+            &ws_dir,
+            &rt_dir,
+        )
+        .await
+        .unwrap();
+        let kernel = AegisRuntimeKernel::new(&rt_dir).await.unwrap();
+        assert!(kernel.mcp_firewall.list_servers(Some("cli-org")).await.is_empty());
+
+        // 3. Workspace-scoped HTTP install with static token writes `.aegis/mcp.json` (zero-secret)
+        //    and registers Vault-sealed realm.
+        let installed = run_unified_mcp_install(
+            &identity,
+            &ws_dir,
+            &rt_dir,
+            UnifiedMcpInstallArgs {
+                target: "http://127.0.0.1:19999/mcp".to_string(),
+                server_id: Some("local-linear".to_string()),
+                scope: "workspace".to_string(),
+                trust: "untrusted".to_string(),
+                dlp: "pseudonymize".to_string(),
+                token: Some("tok_workspace_secret".to_string()),
+                token_stdin: false,
+                device_code: false,
+                no_login: false,
+                no_browser: true,
+                no_client_sync: true,
+                allow_local_http: true,
+                home_dir: Some(home_dir.clone()),
+                dry_run: false,
+            },
+        )
+        .await
+        .unwrap();
+        assert_eq!(installed["status"], "installed");
+        assert_eq!(installed["auth_status"], "authenticated");
+        let decl_text = std::fs::read_to_string(ws_dir.join(".aegis/mcp.json")).unwrap();
+        assert!(decl_text.contains("local-linear"));
+        assert!(!decl_text.contains("tok_workspace_secret"));
+
+        // 4. Unified `status` & `doctor` execute cleanly on the populated org.
+        let (report, diag) =
+            collect_mcp_status_and_drift(&kernel, "cli-org", &home_dir, &ws_dir).await;
+        assert_eq!(report["summary"]["total"], 1);
+        assert_eq!(report["summary"]["ready"], 1);
+        assert!(!diag["stdio_sandbox_backend"].as_str().unwrap().is_empty());
     }
 }
