@@ -2141,7 +2141,7 @@ for line in sys.stdin:
             String::from_utf8_lossy(&raw).to_string()
         }
 
-        // 3. `/__aegis/mcp/_kernel` exposes slim Standard profile (50 tools, hides `app_catalog_search`).
+        // 3. `/__aegis/mcp/_kernel` exposes slim Standard profile (50 tools, hides removed `app_catalog_search`).
         let kernel_raw = post_proxy_raw(
             proxy_sock,
             &broker.agent_token,
@@ -2156,7 +2156,7 @@ for line in sys.stdin:
         assert_eq!(tools.len(), 50);
         assert!(
             !tools.iter().any(|t| t["name"] == "app_catalog_search"),
-            "Standard profile must hide deprecated app_catalog_search"
+            "Standard profile must not expose removed app_catalog_search"
         );
 
         // 4. Before host login, calling `/__aegis/mcp/heurion-macro` fails with an actionable `mcp login` hint.

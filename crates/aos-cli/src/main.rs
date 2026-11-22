@@ -445,7 +445,7 @@ enum Commands {
         /// Memory size in MiB allocated to MicroVM when `--isolated` is enabled
         #[arg(long, default_value_t = 2048)]
         mem_mb: u64,
-        /// MCP Gateway tool exposure profile (`minimal`, `collab`, `standard`, `legacy-full`)
+        /// MCP Gateway tool exposure profile (`minimal`, `collab`, `standard`)
         #[arg(long)]
         tool_profile: Option<String>,
         /// Agent command and arguments, after `--`
@@ -745,12 +745,6 @@ enum Commands {
     Mcp {
         #[command(subcommand)]
         action: mcp_guard::McpAction,
-    },
-
-    /// Discover, install, authenticate (`aegis_at_<app_id>.*`), and invoke AAP-1.0 Ecosystem Applications (e.g. `heurion` Heurion 2.0)
-    App {
-        #[command(subcommand)]
-        action: AppAction,
     },
 
     /// Start the persistent Aegis OS HTTP MCP Daemon & Egress Proxy Server
@@ -1155,114 +1149,6 @@ enum A2aAction {
         /// Machine-readable JSON
         #[arg(long, default_value_t = false)]
         json: bool,
-    },
-}
-
-#[derive(Subcommand)]
-enum AppAction {
-    /// List all AAP-1.0 applications in the 3-tier ecosystem catalog and their installation/login status
-    List {
-        /// Optional trust tier filter (`first_party`, `verified`, `community`)
-        #[arg(long)]
-        tier: Option<String>,
-        /// Optional category filter (`medical`, `clinical-research`, `biostatistics`, etc.)
-        #[arg(long)]
-        category: Option<String>,
-    },
-
-    /// Search the AAP-1.0 application catalog by keyword
-    Search {
-        /// Search keyword (e.g. `heurion`, `medical`, `biostatistics`)
-        query: Option<String>,
-    },
-
-    /// Inspect the AAP-1.0 manifest (`/.well-known/aegis-app.json`), capabilities, skills, and auth status of an app
-    Info {
-        /// Application ID (e.g. `heurion`)
-        app_id: String,
-    },
-
-    /// Install an AAP-1.0 application by ID or endpoint URL and sync its declared SOP skills into `.agents/skills/`
-    Install {
-        /// Application ID (e.g. `heurion`) or base endpoint URL
-        app_id_or_url: String,
-        /// Optional endpoint URL override (e.g. `http://127.0.0.1:8787`)
-        #[arg(long)]
-        url: Option<String>,
-    },
-
-    /// Authenticate and bind a user-scoped `aegis_at_<app_id>.*` token via RFC 8628 Device Code, direct token, or credentials
-    Login {
-        /// Application ID (e.g. `heurion`)
-        app_id: String,
-        /// Optional endpoint URL override
-        #[arg(long)]
-        url: Option<String>,
-        /// Direct `aegis_at_<app_id>.*` token or web session token to exchange
-        #[arg(long)]
-        token: Option<String>,
-        /// Username for credential exchange
-        #[arg(long)]
-        username: Option<String>,
-        /// Password for credential exchange
-        #[arg(long)]
-        password: Option<String>,
-        /// Use RFC 8628 Device Code Flow (`POST /api/aegis/auth/device`)
-        #[arg(long, default_value_t = false)]
-        device_code: bool,
-        /// Seconds to poll for Device Code approval (0 = return code immediately without blocking)
-        #[arg(long, default_value_t = 60)]
-        wait_secs: u64,
-        /// Comma-separated scopes (e.g. `projects:read,projects:write,biostats:run,artifacts:publish`)
-        #[arg(long, default_value = "")]
-        scopes: String,
-    },
-
-    /// Revoke and remove the stored `aegis_at_<app_id>.*` credential for an application
-    Logout {
-        /// Application ID (e.g. `heurion`)
-        app_id: String,
-    },
-
-    /// Mount an AAP-1.0 application into the current Agent session (`app_mount_session`)
-    Mount {
-        /// Application ID (e.g. `heurion`)
-        app_id: String,
-        /// Optional endpoint URL override
-        #[arg(long)]
-        url: Option<String>,
-    },
-
-    /// One-step install + login + session mount for an AAP-1.0 application (e.g. `aegis-os app connect heurion`)
-    Connect {
-        /// Application ID (e.g. `heurion`)
-        app_id: String,
-        /// Optional endpoint URL override
-        #[arg(long)]
-        url: Option<String>,
-        /// Direct `aegis_at_<app_id>.*` token or web session token
-        #[arg(long)]
-        token: Option<String>,
-        /// Seconds to poll for Device Code approval
-        #[arg(long, default_value_t = 60)]
-        wait_secs: u64,
-    },
-
-    /// Invoke an MCP tool on an AAP-1.0 application over `POST /api/aegis/mcp` (`app_call_tool`)
-    Call {
-        /// Application ID (e.g. `heurion`)
-        app_id: String,
-        /// Remote MCP tool name (e.g. `heurion_system_overview`, `heurion_list_projects`, `heurion_run_biostats`)
-        tool_name: String,
-        /// JSON arguments string (e.g. `'{"project_id":"prj-1"}'`)
-        #[arg(long, default_value = "{}")]
-        args: String,
-        /// Optional endpoint URL override
-        #[arg(long)]
-        url: Option<String>,
-        /// Optional explicit lease token for `lease_gated` tools
-        #[arg(long)]
-        lease_token: Option<String>,
     },
 }
 
@@ -2839,12 +2725,9 @@ async fn main() -> anyhow::Result<()> {
             }
             if let Some(ref tp) = tool_profile {
                 let norm = tp.trim().to_ascii_lowercase();
-                if !matches!(
-                    norm.as_str(),
-                    "minimal" | "collab" | "standard" | "legacy-full" | "legacy_full" | "full"
-                ) {
+                if !matches!(norm.as_str(), "minimal" | "collab" | "standard") {
                     anyhow::bail!(
-                        "aos run: invalid --tool-profile '{}' (expected minimal, collab, standard, or legacy-full)",
+                        "aos run: invalid --tool-profile '{}' (expected minimal, collab, or standard)",
                         tp
                     );
                 }
@@ -3074,165 +2957,6 @@ async fn main() -> anyhow::Result<()> {
         Commands::Mcp { action } => {
             mcp_guard::handle_mcp_command(action, &identity, &workspace, &cli.runtime_dir)
                 .await?;
-        }
-
-        Commands::App { action } => {
-            eprintln!(
-                "[DEPRECATED] 'aegis-os app' (AAP-1.0) is deprecated in v0.9.0; migrate to 'aegis-os mcp bundle' and 'aegis-os mcp login'."
-            );
-            let kernel = AegisRuntimeKernel::new(&cli.runtime_dir).await?;
-            match action {
-                AppAction::List { tier, category } => {
-                    let res = kernel
-                        .app_store
-                        .search_catalog_for_org(
-                            &identity.org_id,
-                            None,
-                            category.as_deref(),
-                            tier.as_deref(),
-                        )
-                        .await;
-                    println!("{}", serde_json::to_string_pretty(&res)?);
-                }
-                AppAction::Search { query } => {
-                    let res = kernel
-                        .app_store
-                        .search_catalog_for_org(&identity.org_id, query.as_deref(), None, None)
-                        .await;
-                    println!("{}", serde_json::to_string_pretty(&res)?);
-                }
-                AppAction::Info { app_id } => {
-                    let res = kernel
-                        .app_store
-                        .get_app_info(&identity.org_id, &app_id)
-                        .await?;
-                    println!("{}", serde_json::to_string_pretty(&res)?);
-                }
-                AppAction::Install { app_id_or_url, url } => {
-                    let res = kernel
-                        .app_store
-                        .install_app(&identity.org_id, &app_id_or_url, url.as_deref(), Some(&workspace))
-                        .await?;
-                    println!("{}", serde_json::to_string_pretty(&res)?);
-                }
-                AppAction::Login {
-                    app_id,
-                    url,
-                    token,
-                    username,
-                    password,
-                    device_code,
-                    wait_secs,
-                    scopes,
-                } => {
-                    let scope_vec: Vec<String> = scopes
-                        .split(',')
-                        .map(|s| s.trim().to_string())
-                        .filter(|s| !s.is_empty())
-                        .collect();
-                    let res = if device_code || (token.is_none() && username.is_none()) {
-                        kernel
-                            .app_store
-                            .login_app_device_code(
-                                &identity.org_id,
-                                &app_id,
-                                url.as_deref(),
-                                scope_vec,
-                                wait_secs,
-                                token.as_deref(),
-                            )
-                            .await?
-                    } else {
-                        kernel
-                            .app_store
-                            .login_app(
-                                &identity.org_id,
-                                &app_id,
-                                url.as_deref(),
-                                token.as_deref(),
-                                username.as_deref(),
-                                password.as_deref(),
-                                scope_vec,
-                            )
-                            .await?
-                    };
-                    println!("{}", serde_json::to_string_pretty(&res)?);
-                }
-                AppAction::Logout { app_id } => {
-                    let res = kernel
-                        .app_store
-                        .logout_app(&identity.org_id, &app_id)
-                        .await?;
-                    println!("{}", serde_json::to_string_pretty(&res)?);
-                }
-                AppAction::Mount { app_id, url } => {
-                    let res = kernel
-                        .app_store
-                        .mount_session(&identity, &app_id, url.as_deref())
-                        .await?;
-                    println!("{}", serde_json::to_string_pretty(&res)?);
-                }
-                AppAction::Connect {
-                    app_id,
-                    url,
-                    token,
-                    wait_secs,
-                } => {
-                    let install_res = kernel
-                        .app_store
-                        .install_app(&identity.org_id, &app_id, url.as_deref(), Some(&workspace))
-                        .await?;
-                    let login_res = kernel
-                        .app_store
-                        .login_app_device_code(
-                            &identity.org_id,
-                            &app_id,
-                            url.as_deref(),
-                            Vec::new(),
-                            wait_secs,
-                            token.as_deref(),
-                        )
-                        .await?;
-                    let mount_res = kernel
-                        .app_store
-                        .mount_session(&identity, &app_id, url.as_deref())
-                        .await
-                        .unwrap_or_else(|e| json!({ "status": "pending_token", "detail": e.to_string() }));
-                    println!(
-                        "{}",
-                        serde_json::to_string_pretty(&json!({
-                            "status": "app_connected",
-                            "app_id": app_id,
-                            "install": install_res.get("status").cloned().unwrap_or(json!("installed")),
-                            "login": login_res,
-                            "session": mount_res
-                        }))?
-                    );
-                }
-                AppAction::Call {
-                    app_id,
-                    tool_name,
-                    args,
-                    url,
-                    lease_token,
-                } => {
-                    let parsed_args: Value = serde_json::from_str(&args)
-                        .unwrap_or_else(|_| json!({}));
-                    let res = kernel
-                        .app_store
-                        .call_app_tool(
-                            &kernel,
-                            &identity,
-                            &app_id,
-                            &tool_name,
-                            parsed_args,
-                            url.as_deref(),
-                            lease_token.as_deref(),
-                        )
-                        .await?;
-                    println!("{}", serde_json::to_string_pretty(&res)?);
-                }
-            }
         }
 
         Commands::AgyHook { ref event, strict_cow } => {

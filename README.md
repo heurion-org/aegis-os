@@ -73,7 +73,7 @@ Enforced mode gives you:
 - **Principal-separated `SessionBroker` & frozen-stage SHA-256 commit gate**: Isolates `agent.token` from `human.token`, escapes VT100 CSI / Unicode Bidi control sequences in diffs, snapshots candidate files into `commit_frozen_stage`, and runs 6 `DomainProfile` verifiers (`code`, `docs`, `data`, `binary`, `app_state`, `memory`) before promoting to the host.
 - **Fail closed**: missing `bwrap`/`sandbox-exec` (or restricted Ubuntu 24.04 AppArmor userns without profile), proxy, or broker refuses startup instead of silently degrading.
 
-Session & observability controls: `aegis-os status` · `aegis-os diff --json` · `aegis-os verify` · `aegis-os commit --expected-diff-hash` · `aegis-os discard` · `aegis-os publish` · `aegis-os approvals` · `aegis-os why` · `aegis-os a2a board` · `aegis-os policy watch` · `aegis-os memory ui` · `aegis-os app list` · `aegis-os audit-me --share` · `aegis-os vault status` · `aegis-os upgrade --check` · `aegis-os uninstall`.
+Session & observability controls: `aegis-os status` · `aegis-os diff --json` · `aegis-os verify` · `aegis-os commit --expected-diff-hash` · `aegis-os discard` · `aegis-os publish` · `aegis-os approvals` · `aegis-os why` · `aegis-os a2a board` · `aegis-os policy watch` · `aegis-os memory ui` · `aegis-os mcp list` · `aegis-os audit-me --share` · `aegis-os vault status` · `aegis-os upgrade --check` · `aegis-os uninstall`.
 
 Current enforced-runtime limits:
 

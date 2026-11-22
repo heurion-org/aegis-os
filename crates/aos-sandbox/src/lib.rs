@@ -23,6 +23,56 @@ use uuid::Uuid;
 pub mod bridge;
 pub mod microvm;
 
+/// Resolves a `current_exe()` path that may carry Linux's `" (deleted)"` suffix after an in-place
+/// or Homebrew Cellar upgrade while the broker daemon is still running.
+fn resolve_live_exe_from(
+    raw: PathBuf,
+    path_env: Option<&std::ffi::OsStr>,
+) -> Option<PathBuf> {
+    let raw_str = raw.to_string_lossy();
+    let stripped = match raw_str.strip_suffix(" (deleted)") {
+        Some(s) => s,
+        None => return raw.is_file().then_some(raw),
+    };
+    let candidate = PathBuf::from(stripped);
+    if candidate.is_file() {
+        return Some(candidate);
+    }
+    let exe_name = candidate.file_name()?.to_os_string();
+    let comps: Vec<std::path::Component<'_>> = candidate.components().collect();
+    if let Some(cellar_idx) = comps.iter().position(|c| {
+        matches!(c, std::path::Component::Normal(s) if *s == std::ffi::OsStr::new("Cellar"))
+    }) {
+        if cellar_idx > 0 {
+            let mut prefix = PathBuf::new();
+            for comp in &comps[..cellar_idx] {
+                prefix.push(comp.as_os_str());
+            }
+            let linked = prefix.join("bin").join(&exe_name);
+            if linked.is_file() {
+                return Some(linked);
+            }
+        }
+    }
+    if let Some(paths) = path_env {
+        for dir in std::env::split_paths(paths) {
+            if dir.file_name() == Some(std::ffi::OsStr::new(".aegis-bin")) {
+                continue;
+            }
+            let alt = dir.join(&exe_name);
+            if alt.is_file() {
+                return Some(alt);
+            }
+        }
+    }
+    None
+}
+
+fn resolve_live_current_exe() -> Option<PathBuf> {
+    let raw = std::env::current_exe().ok()?;
+    resolve_live_exe_from(raw, std::env::var_os("PATH").as_deref())
+}
+
 /// Host-side half of the Linux egress bridge for one `exec` call (see [`bridge`]). Dropping it
 /// stops the relay and removes the socket, including on timeout / early-return paths.
 struct EgressBridge {
@@ -435,7 +485,7 @@ impl NativeOsSandboxInstance {
                 if let Some(ref host_src) = self.config.host_source_dir {
                     rules.push_str(&format!("\n    (subpath \"{}\")", Self::sbpl_path(host_src)));
                 }
-                let cur_exe = std::env::current_exe().ok();
+                let cur_exe = resolve_live_current_exe();
                 for h in &mac_homes {
                     for sub in Self::SAFE_TOOLCHAIN_SUBDIRS {
                         let p = h.join(sub);
@@ -667,7 +717,7 @@ impl NativeOsSandboxInstance {
     /// the in-sandbox shim (`aegis-os egress-shim`). Returns `None` otherwise, in which case the
     /// sandbox stays in an isolated network namespace with no route out (fail closed).
     fn start_egress_bridge(&self, proxy_url: &str) -> Option<(EgressBridge, PathBuf)> {
-        let exe = std::env::current_exe().ok()?;
+        let exe = resolve_live_current_exe()?;
         if !exe
             .file_name()?
             .to_string_lossy()
@@ -729,7 +779,7 @@ impl NativeOsSandboxInstance {
         if ports.is_empty() {
             return None;
         }
-        let exe = std::env::current_exe().ok()?;
+        let exe = resolve_live_current_exe()?;
         let exe_name = exe.file_name()?.to_string_lossy();
         if !matches!(exe_name.as_ref(), "aegis-os" | "aos" | "aegis-os.exe")
             && !exe_name.starts_with("aegis-os-")
@@ -927,7 +977,7 @@ impl NativeOsSandboxInstance {
         // while preserving access to `.rustup` and `.cargo/{bin,registry,git}`.
         let homes = Self::candidate_homes();
         if !aos_core::ablated("cred_mask") {
-            let cur_exe = std::env::current_exe().ok();
+            let cur_exe = resolve_live_current_exe();
             for home in &homes {
                 let home_str = home.to_string_lossy().into_owned();
                 args.extend(["--tmpfs".to_string(), home_str]);
@@ -2753,5 +2803,56 @@ t.join(timeout=2)
                 assert!(!super::current_process_is_macos_sandboxed());
             }
         }
+    }
+
+    #[test]
+    fn resolve_live_exe_recovers_from_linux_deleted_suffix_and_cellar_upgrade() {
+        let tmp = tempfile::tempdir().unwrap();
+
+        // 1. Live path without "(deleted)" is returned directly.
+        let direct_bin = tmp.path().join("direct/aegis-os");
+        std::fs::create_dir_all(direct_bin.parent().unwrap()).unwrap();
+        std::fs::write(&direct_bin, b"bin").unwrap();
+        assert_eq!(
+            super::resolve_live_exe_from(direct_bin.clone(), None),
+            Some(direct_bin.clone())
+        );
+
+        // 2. In-place overwrite leaving "<path> (deleted)" resolves to replacement at <path>.
+        let deleted_direct = PathBuf::from(format!("{} (deleted)", direct_bin.display()));
+        assert_eq!(
+            super::resolve_live_exe_from(deleted_direct, None),
+            Some(direct_bin)
+        );
+
+        // 3. Homebrew Cellar upgrade "<prefix>/Cellar/aegis-os/0.9.1/bin/aegis-os (deleted)"
+        //    resolves to "<prefix>/bin/aegis-os".
+        let brew_prefix = tmp.path().join("linuxbrew");
+        let brew_bin = brew_prefix.join("bin/aegis-os");
+        std::fs::create_dir_all(brew_bin.parent().unwrap()).unwrap();
+        std::fs::write(&brew_bin, b"new-bin").unwrap();
+        let old_cellar_deleted = PathBuf::from(format!(
+            "{}/Cellar/aegis-os/0.9.1/bin/aegis-os (deleted)",
+            brew_prefix.display()
+        ));
+        assert_eq!(
+            super::resolve_live_exe_from(old_cellar_deleted, None),
+            Some(brew_bin)
+        );
+
+        // 4. Fallback to $PATH when neither stripped nor Cellar prefix exists, skipping `.aegis-bin`.
+        let shim_dir = tmp.path().join(".aegis-bin");
+        let real_dir = tmp.path().join("usr_bin");
+        std::fs::create_dir_all(&shim_dir).unwrap();
+        std::fs::create_dir_all(&real_dir).unwrap();
+        std::fs::write(shim_dir.join("aegis-os"), b"shim").unwrap();
+        let real_bin = real_dir.join("aegis-os");
+        std::fs::write(&real_bin, b"real").unwrap();
+        let joined_path = std::env::join_paths([&shim_dir, &real_dir]).unwrap();
+        let gone_deleted = tmp.path().join("gone/aegis-os (deleted)");
+        assert_eq!(
+            super::resolve_live_exe_from(gone_deleted, Some(joined_path.as_os_str())),
+            Some(real_bin)
+        );
     }
 }

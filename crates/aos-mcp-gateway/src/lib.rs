@@ -36,14 +36,12 @@ use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::sync::RwLock;
 use uuid::Uuid;
 
-pub mod app_store;
 pub mod approver;
 pub mod mcp_bundle;
 pub mod mcp_firewall;
 pub mod mcp_http;
 pub mod mcp_oauth;
 pub mod paas;
-use app_store::AppStoreRegistry;
 use mcp_bundle::McpBundleManager;
 use mcp_firewall::McpFirewallRegistry;
 use mcp_oauth::McpOAuthManager;
@@ -3209,9 +3207,6 @@ pub const TOOL_ANNOTATIONS: &[(&str, bool, bool, bool, bool)] = &[
     ("policy_list_escalations", true, false, true, false),
     ("memory_policy_evaluate", true, false, true, false),
     ("runtime_configure_mode", false, false, true, true),
-    ("app_catalog_search", true, false, true, false),
-    ("app_mount_session", false, false, true, true),
-    ("app_call_tool", false, true, false, true),
 ];
 
 /// Upper bound for leases minted through `call_tool`; never permanent (`ttl <= 0` used to mean
@@ -3341,7 +3336,6 @@ pub struct AegisRuntimeKernel {
     pub egress: Arc<AegisEgressGateway>,
     pub recorder: Arc<dyn FlightRecorder>,
     pub paas: Arc<PaasControlPlane>,
-    pub app_store: Arc<AppStoreRegistry>,
     pub mcp_firewall: Arc<McpFirewallRegistry>,
     pub mcp_oauth: Arc<McpOAuthManager>,
     pub mcp_bundles: Arc<McpBundleManager>,
@@ -3362,11 +3356,9 @@ pub enum GatewayToolProfile {
     Minimal,
     /// Core 10 + 17 multi-agent coordination / IPC / Org CAS / Git PR collaboration tools (27 tools).
     Collab,
-    /// Default `v0.9.0` profile: all active runtime tools excluding deprecated `AAP-1.0` `app_*` wrappers (50 tools).
+    /// Default profile: all active runtime tools (50 tools).
     #[default]
     Standard,
-    /// Full legacy surface including deprecated `app_catalog_search`, `app_mount_session`, `app_call_tool` (53 tools).
-    LegacyFull,
 }
 
 impl GatewayToolProfile {
@@ -3380,7 +3372,6 @@ impl GatewayToolProfile {
         match raw.as_str() {
             "minimal" => Self::Minimal,
             "collab" => Self::Collab,
-            "legacy-full" | "legacy_full" | "full" => Self::LegacyFull,
             _ => Self::Standard,
         }
     }
@@ -3390,7 +3381,6 @@ impl GatewayToolProfile {
             Self::Minimal => "minimal",
             Self::Collab => "collab",
             Self::Standard => "standard",
-            Self::LegacyFull => "legacy-full",
         }
     }
 
@@ -3426,17 +3416,11 @@ impl GatewayToolProfile {
             "workspace_git",
             "github_pr_create",
         ];
-        const DEPRECATED_APP_TOOLS: &[&str] = &[
-            "app_catalog_search",
-            "app_mount_session",
-            "app_call_tool",
-        ];
 
         match self {
             Self::Minimal => MINIMAL_TOOLS.contains(&name),
             Self::Collab => MINIMAL_TOOLS.contains(&name) || COLLAB_EXTRA_TOOLS.contains(&name),
-            Self::Standard => !DEPRECATED_APP_TOOLS.contains(&name),
-            Self::LegacyFull => true,
+            Self::Standard => true,
         }
     }
 }
@@ -3468,7 +3452,6 @@ impl AegisRuntimeKernel {
         let audit_path = root.join("audit").join("flight_recorder.jsonl");
         let recorder = Arc::new(AegisFlightRecorder::new(Some(audit_path)));
         let paas = Arc::new(PaasControlPlane::new(&root));
-        let app_store = Arc::new(AppStoreRegistry::new(&root));
         let mcp_firewall = Arc::new(McpFirewallRegistry::new(
             &root,
             policy.clone(),
@@ -3489,7 +3472,6 @@ impl AegisRuntimeKernel {
             egress: Arc::new(AegisEgressGateway::new()),
             recorder,
             paas,
-            app_store,
             mcp_firewall,
             mcp_oauth,
             mcp_bundles,
@@ -8766,140 +8748,12 @@ impl AegisRuntimeKernel {
                 Ok(serde_json::to_value(srv)?)
             }
 
-            // ----------------------------------------------------------------
-            // 6. AAP-1.0 Application Ecosystem & Progressive MCP Proxy Tools
-            // ----------------------------------------------------------------
-            "app_catalog_search" => {
-                let query = args.get("query").and_then(|v| v.as_str());
-                let category = args.get("category").and_then(|v| v.as_str());
-                let trust_tier = args.get("trust_tier").and_then(|v| v.as_str());
-                Ok(self
-                    .app_store
-                    .search_catalog_for_org(&identity.org_id, query, category, trust_tier)
-                    .await)
-            }
-
-            "app_mount_session" => {
-                let app_id = args
-                    .get("app_id")
-                    .and_then(|v| v.as_str())
-                    .context("Missing 'app_id' (e.g. 'heurion')")?;
-                let endpoint = args.get("endpoint").and_then(|v| v.as_str());
-                if let Some(custom_ep) = self
-                    .app_store
-                    .requires_custom_endpoint_approval(&identity.org_id, app_id, endpoint)
-                    .await
-                {
-                    match self
-                        .authorize_and_audit(
-                            identity,
-                            "app_custom_endpoint",
-                            &identity.org_id,
-                            &custom_ep,
-                            json!({ "app_id": app_id, "endpoint": custom_ep, "via": "app_mount_session" }),
-                        )
-                        .await?
-                    {
-                        PolicyDecision::Allow { .. } => {}
-                        PolicyDecision::Ask {
-                            escalation_id,
-                            reason,
-                            suggested_lease_scope,
-                        } => {
-                            let ticket = self
-                                .paas
-                                .issue_escalation_ticket(&identity.org_id, &escalation_id, 1_800_000)
-                                .await;
-                            return Ok(json!({
-                                "status": "approval_required",
-                                "escalation_id": escalation_id,
-                                "approval_ticket": ticket,
-                                "reason": reason,
-                                "suggested_lease_scope": suggested_lease_scope
-                            }));
-                        }
-                        PolicyDecision::Deny { reason } => {
-                            bail!("Policy Denied custom AAP endpoint '{}': {}", custom_ep, reason);
-                        }
-                    }
-                }
-                self.app_store.mount_session(identity, app_id, endpoint).await
-            }
-
-            "app_call_tool" => {
-                let app_id = args
-                    .get("app_id")
-                    .and_then(|v| v.as_str())
-                    .context("Missing 'app_id' (e.g. 'heurion')")?;
-                let remote_tool = args
-                    .get("tool_name")
-                    .or_else(|| args.get("tool"))
-                    .and_then(|v| v.as_str())
-                    .context("Missing 'tool_name'")?;
-                let tool_args = args
-                    .get("arguments")
-                    .or_else(|| args.get("args"))
-                    .cloned()
-                    .unwrap_or_else(|| json!({}));
-                let endpoint = args.get("endpoint").and_then(|v| v.as_str());
-                let lease_token = args.get("lease_token").and_then(|v| v.as_str());
-                if let Some(custom_ep) = self
-                    .app_store
-                    .requires_custom_endpoint_approval(&identity.org_id, app_id, endpoint)
-                    .await
-                {
-                    match self
-                        .authorize_and_audit(
-                            identity,
-                            "app_custom_endpoint",
-                            &identity.org_id,
-                            &custom_ep,
-                            json!({ "app_id": app_id, "tool_name": remote_tool, "endpoint": custom_ep, "via": "app_call_tool" }),
-                        )
-                        .await?
-                    {
-                        PolicyDecision::Allow { .. } => {}
-                        PolicyDecision::Ask {
-                            escalation_id,
-                            reason,
-                            suggested_lease_scope,
-                        } => {
-                            let ticket = self
-                                .paas
-                                .issue_escalation_ticket(&identity.org_id, &escalation_id, 1_800_000)
-                                .await;
-                            return Ok(json!({
-                                "status": "approval_required",
-                                "escalation_id": escalation_id,
-                                "approval_ticket": ticket,
-                                "reason": reason,
-                                "suggested_lease_scope": suggested_lease_scope
-                            }));
-                        }
-                        PolicyDecision::Deny { reason } => {
-                            bail!("Policy Denied custom AAP endpoint '{}': {}", custom_ep, reason);
-                        }
-                    }
-                }
-                self.app_store
-                    .call_app_tool(
-                        self,
-                        identity,
-                        app_id,
-                        remote_tool,
-                        tool_args,
-                        endpoint,
-                        lease_token,
-                    )
-                    .await
-            }
-
             other => bail!("Unknown Aegis OS MCP tool '{}'", other),
         }
     }
 
     pub fn mcp_tools_schema() -> Value {
-        Self::mcp_tools_schema_for_profile(GatewayToolProfile::LegacyFull)
+        Self::mcp_tools_schema_for_profile(GatewayToolProfile::Standard)
     }
 
     pub fn mcp_tools_schema_for_profile(profile: GatewayToolProfile) -> Value {
@@ -9916,75 +9770,6 @@ impl AegisRuntimeKernel {
                         },
                         "required": ["mode"]
                     }
-                },
-                {
-                    "name": "app_catalog_search",
-                    "description": "[Zero-Prompt] Search the Aegis Application Protocol (AAP-1.0) 3-tier ecosystem catalog (`first_party` e.g. `heurion` Heurion 2.0, `verified`, `community`) and inspect installed & user-authenticated applications.",
-                    "inputSchema": {
-                        "type": "object",
-                        "properties": {
-                            "query": {
-                                "type": "string",
-                                "description": "Optional keyword filter (e.g. `heurion`, `medical`, `biostatistics`, `clinical`)."
-                            },
-                            "category": {
-                                "type": "string",
-                                "description": "Optional category filter (`first-party`, `medical`, `clinical-research`, `biostatistics`, `verified`)."
-                            },
-                            "trust_tier": {
-                                "type": "string",
-                                "enum": ["first_party", "verified", "community"]
-                            }
-                        }
-                    }
-                },
-                {
-                    "name": "app_mount_session",
-                    "description": "[Zero-Prompt] Mount an AAP-1.0 application (e.g. `heurion` for Heurion 2.0 Clinical & Biomedical Research) into the current Agent session and inspect its `zero_prompt` vs `lease_gated` MCP tools, bound user account, and recommended SOP skills.",
-                    "inputSchema": {
-                        "type": "object",
-                        "properties": {
-                            "app_id": {
-                                "type": "string",
-                                "description": "AAP-1.0 application identifier (e.g. `heurion`)."
-                            },
-                            "endpoint": {
-                                "type": "string",
-                                "description": "Optional endpoint URL override (defaults to installed endpoint or `http://127.0.0.1:8787`)."
-                            }
-                        },
-                        "required": ["app_id"]
-                    }
-                },
-                {
-                    "name": "app_call_tool",
-                    "description": "[AAP-1.0 Proxy] Invoke an MCP tool on an AAP-1.0 application (e.g. `heurion`) over `POST /api/aegis/mcp` with automatic AAP-1.0 app token header injection, `X-Aegis-Agent-Id`, `X-Aegis-Session-Id`, and Policy Kernel `X-Aegis-Lease-Token` for `lease_gated` tools.",
-                    "inputSchema": {
-                        "type": "object",
-                        "properties": {
-                            "app_id": {
-                                "type": "string",
-                                "description": "AAP-1.0 application identifier (e.g. `heurion`)."
-                            },
-                            "tool_name": {
-                                "type": "string",
-                                "description": "Remote MCP tool name on the target app (e.g. `heurion_run_biostats`, `heurion_list_projects`, `heurion_publish_artifact`)."
-                            },
-                            "arguments": {
-                                "type": "object",
-                                "description": "JSON arguments object for the remote MCP tool."
-                            },
-                            "endpoint": {
-                                "type": "string",
-                                "description": "Optional endpoint URL override."
-                            },
-                            "lease_token": {
-                                "type": "string",
-                                "description": "Optional explicit lease token override for `lease_gated` tools."
-                            }
-                        },
-                        "required": ["app_id", "tool_name"]
-                    }
                 }
             ]
         })
@@ -10037,7 +9822,7 @@ impl AegisRuntimeKernel {
                 })
             }
             "resources/list" => {
-                let mut resources = vec![
+                let resources = vec![
                     json!({ "uri": "aegis://workspace/status", "name": "CoW Workspace Status & Diffs" }),
                     json!({ "uri": "aegis://ipc/inbox", "name": "Agent IPC Mailbox" }),
                     json!({ "uri": "aegis://org/peers", "name": "Organization Active Peers" }),
@@ -10046,12 +9831,6 @@ impl AegisRuntimeKernel {
                     json!({ "uri": "aegis://a2a/tasks", "name": "Google A2A Stateful Tasks" }),
                     json!({ "uri": "aegis://org/shared/catalog", "name": "Organization CAS Artifact Catalog" }),
                 ];
-                if profile == GatewayToolProfile::LegacyFull {
-                    resources.push(json!({
-                        "uri": "aegis://apps/catalog",
-                        "name": "AAP-1.0 Application Ecosystem Catalog & Installed Apps"
-                    }));
-                }
                 json!({
                     "jsonrpc": "2.0",
                     "id": id,
@@ -10064,9 +9843,6 @@ impl AegisRuntimeKernel {
                 let params = req.get("params").cloned().unwrap_or_else(|| json!({}));
                 let uri = params.get("uri").and_then(|v| v.as_str()).unwrap_or("");
                 let resource_denied = match uri {
-                    "aegis://apps/catalog" => {
-                        matches!(profile, GatewayToolProfile::Minimal | GatewayToolProfile::Collab)
-                    }
                     "aegis://ipc/inbox"
                     | "agentos://ipc/inbox"
                     | "aegis://org/peers"
@@ -10110,9 +9886,6 @@ impl AegisRuntimeKernel {
                     "aegis://org/shared/catalog" | "agentos://org/shared/catalog" => {
                         let arts = self.org_storage.list_artifacts(&identity.org_id).await?;
                         json!({ "artifacts": arts })
-                    }
-                    "aegis://apps/catalog" => {
-                        self.app_store.search_catalog(None, None, None).await
                     }
                     _ => json!({ "error": "Unknown resource URI" }),
                 };
@@ -12474,8 +12247,6 @@ mod tests {
         let collab = AegisRuntimeKernel::mcp_tools_schema_for_profile(GatewayToolProfile::Collab);
         let standard =
             AegisRuntimeKernel::mcp_tools_schema_for_profile(GatewayToolProfile::Standard);
-        let legacy =
-            AegisRuntimeKernel::mcp_tools_schema_for_profile(GatewayToolProfile::LegacyFull);
 
         let min_names: Vec<&str> = minimal["tools"]
             .as_array()
@@ -12495,24 +12266,17 @@ mod tests {
             .iter()
             .map(|t| t["name"].as_str().unwrap())
             .collect();
-        let leg_names: Vec<&str> = legacy["tools"]
-            .as_array()
-            .unwrap()
-            .iter()
-            .map(|t| t["name"].as_str().unwrap())
-            .collect();
 
         assert_eq!(min_names.len(), 10);
         assert!(min_names.contains(&"policy_list_escalations"));
         assert!(min_names.contains(&"workspace_commit"));
         assert_eq!(col_names.len(), 27);
         assert_eq!(std_names.len(), 50);
-        assert_eq!(leg_names.len(), 53);
         assert!(!std_names.contains(&"app_catalog_search"));
         assert!(!std_names.contains(&"app_mount_session"));
         assert!(!std_names.contains(&"app_call_tool"));
 
-        // Default runtime `tools/list` advertises Standard profile (hides deprecated app_* tools and catalog resource).
+        // Default runtime `tools/list` advertises Standard profile (no deprecated app_* tools or catalog resource).
         let temp = tempfile::tempdir().unwrap();
         let kernel = AegisRuntimeKernel::new(&temp.path().join("rt")).await.unwrap();
         let agent = AgentIdentity::new("acme", "coder-1", "Engineer");
@@ -12528,6 +12292,7 @@ mod tests {
             .collect();
         assert!(!live_names.contains(&"app_call_tool"));
         assert!(live_names.contains(&"policy_list_escalations"));
+        assert!(kernel.call_tool(&agent, "app_call_tool", json!({})).await.is_err());
 
         let res_list = kernel
             .handle_jsonrpc_message(&agent, json!({ "jsonrpc": "2.0", "id": 2, "method": "resources/list" }))
@@ -17051,7 +16816,7 @@ time.sleep(60)
                     "jsonrpc": "2.0",
                     "id": 2,
                     "method": "resources/read",
-                    "params": { "uri": "aegis://apps/catalog" }
+                    "params": { "uri": "aegis://ipc/inbox" }
                 }),
                 GatewayToolProfile::Minimal,
             )
