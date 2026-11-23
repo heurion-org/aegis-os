@@ -5,6 +5,7 @@
 > **状态标注约定 | Status Legend**：
 > - **`[Implemented v0.9.3]`**：已在 `v0.9.3` 底座实现的能力。
 > - **`[Implemented v0.10.0]`**：本次 `v0.10.0` 落地完成的开放发现、统一安装/可见性、`stdio` 沙箱化与 **方案 B 控制面/热桥接** 能力（见 §4 与 §5）。
+> - **`[Implemented v0.11.0]`**：本次 `v0.11.0` 完整落地的企业私有 Registry 气隙锁定、`.mcpb`/加固 `oci:` 统一安装、本地 `stdio` 网络白名单隔离、Web `/approve` 全功能控制台、`list_changed` 动态热推送与全 MCP 通道统一防线。
 
 ---
 
@@ -78,11 +79,11 @@ Aegis OS 已在 **`v0.9.3`** 彻底移除早期的静态封闭目录模型（`AA
 当前开放 MCP 生态以 **Official MCP Registry (`registry.modelcontextprotocol.io`)** 作为标准元数据根目录，同时涵盖 **Remote Streamable HTTP + OAuth 2.1**、**包管理器 (`npm` / `pypi`)**、**单文件扩展 (`.mcpb`)**、**OCI 容器镜像** 与 **域名自描述（`.well-known/mcp-bundle.json`、SEP-2127 `/.well-known/ai-catalog.json` / `<url>/server-card`、仓库 `.mcp.json`）**。Aegis 按以下 4 个支柱对齐：
 
 ### 3.1 多源联邦发现 | Federated Discovery
-1. **官方注册中心与企业私有镜像 `[Implemented v0.10.0+]`**：通过 `crates/aos-mcp-gateway/src/mcp_registry.rs` (`McpRegistryClient`) 查询 `https://registry.modelcontextprotocol.io/v0.1/servers`（支持 `metadata.nextCursor` 多页游标翻页、conditional `ETag` / `304 Not Modified`、15 分钟 TTL 本地缓存 `mcp_registry_cache.json`、`isLatest` 优先及 `deprecated`/`deleted` 去重过滤）。支持通过 `aegis-os mcp registry add/remove/list/airgapped` 管理 `mcp_registries.json` 企业私有目录，并可开启**气隙模式 (`disable_public_registry: true`)** 强制阻断公共 Registry 回退及任意未授权外网 URL 安装。
+1. **官方注册中心与企业私有镜像 `[Implemented v0.11.0]`**：通过 `crates/aos-mcp-gateway/src/mcp_registry.rs` (`McpRegistryClient`) 查询 `https://registry.modelcontextprotocol.io/v0.1/servers`（支持 `metadata.nextCursor` 多页游标翻页、conditional `ETag` / `304 Not Modified`、15 分钟 TTL 本地缓存 `mcp_registry_cache.json`、`isLatest` 优先及 `deprecated`/`deleted` 去重过滤）。支持通过 `aegis-os mcp registry add/remove/list/airgapped` 管理 `mcp_registries.json` 企业私有目录，并可开启**气隙模式 (`disable_public_registry: true`)** 强制阻断公共 Registry 回退及任意未授权外网 URL 安装。
 2. **域名自描述与直连端点**：
    - 开放声明式 Bundle（`https://<domain>/.well-known/mcp-bundle.json`，`aegis-mcp-bundle/v1`，含多端点、Auth Realm 与 `.agents/skills/<id>/SKILL.md`）**`[Implemented v0.9.3]`**。
    - 任意 Streamable HTTP URL 自动探测 `/.well-known/oauth-protected-resource`（RFC 9728）、origin-root 回退探测（RFC 9728 / RFC 8414）、`401 WWW-Authenticate` 与 SEP-2127 `<url>/server-card` **`[Implemented v0.10.0]`**。
-3. **仓库级团队清单（Zero-Secret）与全生命周期运维 `[Implemented v0.10.0+]`**：识别项目根目录 `.aegis/mcp.json` / `.mcp.json`，启动 `aegis-os run` 时只做差异提示（`mcp-hint` Banner）；支持 `aegis-os mcp sync [--clients] [--dry-run]`、`aegis-os mcp upgrade [<id> | --all]`（保留 Vault 密文与策略覆盖）、`aegis-os mcp remove <id> [--purge-auth]` 与 `aegis-os mcp doctor --probe` 实机连通性探测。
+3. **仓库级团队清单（Zero-Secret）与全生命周期运维 `[Implemented v0.11.0]`**：识别项目根目录 `.aegis/mcp.json` / `.mcp.json`，启动 `aegis-os run` 时只做差异提示（`mcp-hint` Banner）；支持 `aegis-os mcp sync [--clients] [--dry-run]`、`aegis-os mcp upgrade [<id> | --all]`（保留 Vault 密文与策略覆盖）、`aegis-os mcp remove <id> [--purge-auth]` 与 `aegis-os mcp doctor --probe` 实机连通性探测。
 4. **本机存量收编 `[Implemented v0.9.3]`**：通过 `aegis-os mcp scan` 与 `aegis-os mcp adopt --all` 发现并收编已有 `claude` / `agy` / `opencode` / `cursor` / `codex` 配置，将明文凭据迁移至 Vault 并无损备份。
 
 ### 3.2 安全优先筛选与上下文推荐 | Security-First Selection & Context Recommendation `[Implemented v0.10.0]`
@@ -99,17 +100,17 @@ Aegis OS 已在 **`v0.9.3`** 彻底移除早期的静态封闭目录模型（`AA
 
 ### 3.3 统一安装、零配置鉴权瀑布流与 `stdio` 沙箱化 | Unified Install, Auto-Auth Waterfall & Sandboxed `stdio`
 - **Auth Realms 与 AES-256-GCM Vault `[Implemented v0.9.3]`**：`crates/aos-mcp-gateway/src/mcp_oauth.rs` 已实现组织级 Auth Realm、`allowed_hosts` DNS 标签锁定、RFC 9728/8414（含 origin-root 回退与强制 `issuer` 校验）自动发现、RFC 7591 动态注册、PKCE 浏览器登录、RFC 8628 Device Code 登录、静态 `--token-stdin` 密封，以及**磁盘 Vault 热重载（运行中会话免重启恢复授权）**。
-- **单一安装入口 (`aegis-os mcp install <target>`) `[Implemented v0.10.0+]`**：统一收敛现有 `bundle install` / `add` / `adopt` 入口，支持 `--scope org`（默认全局共享）或 `--scope workspace`（写入无密钥 `.aegis/mcp.json`），自动识别短名、Bundle URL、Streamable HTTP URL、`npm:<pkg>@<ver>`、`pypi:<pkg>==<ver>`、`.mcpb` 归档（`crates/aos-mcp-gateway/src/mcp_mcpb.rs` 抗 Zip-Slip/Symlink 校验、禁止高危 loader/proxy 环境变量并记录 `sha256_verified`）与 `oci:<image>@sha256:...`（强制 `--cap-drop=ALL --security-opt=no-new-privileges --pids-limit=256 --memory=512m --ipc=none --read-only` 加固容器标志），并自动推导包含 apex 域名在内的精确 `allowed_hosts` 与记录来源溯源字段（`registry_name` / `installed_version` / `manifest_sha256`）。
-- **本地 `stdio` OS 与网络白名单沙箱化 `[Implemented v0.10.0+]`**：`mcp_firewall.rs` (`build_stdio_sandbox_plan_full` + `spawn_upstream_stdio`) 在宿主机支持时自动以 Linux `bwrap --tmpfs $HOME --bind <iso_home>`（屏蔽 `$HOME` 本身及其祖先目录、`.ssh`/`.aws`/`.netrc`/`.npmrc`/`.pypirc`/`.git-credentials`/`.docker` 等凭据路径，并最后强制覆写 `HOME`/`TMPDIR`/`*_PROXY` 以防环境注入）或 macOS `sandbox-exec` 收紧凭据目录；开启 `--isolate-network` 时缺省强制 Fail-Closed 校验沙箱与 Linux `egress-shim`（经 `AegisEgressGateway` 代理桥或 macOS Seatbelt localhost 白名单代理切断任意外网）。
+- **单一安装入口 (`aegis-os mcp install <target>`) `[Implemented v0.11.0]`**：统一收敛现有 `bundle install` / `add` / `adopt` 入口，支持 `--scope org`（默认全局共享）或 `--scope workspace`（写入无密钥 `.aegis/mcp.json`），自动识别短名、Bundle URL、Streamable HTTP URL、`npm:<pkg>@<ver>`、`pypi:<pkg>==<ver>`、`.mcpb` 归档（`crates/aos-mcp-gateway/src/mcp_mcpb.rs` 抗 Zip-Slip/Symlink 校验、禁止高危 loader/proxy 环境变量并记录 `sha256_verified`）与 `oci:<image>@sha256:...`（强制 `--cap-drop=ALL --security-opt=no-new-privileges --pids-limit=256 --memory=512m --ipc=none --read-only` 加固容器标志），并自动推导包含 apex 域名在内的精确 `allowed_hosts` 与记录来源溯源字段（`registry_name` / `installed_version` / `manifest_sha256`）。
+- **本地 `stdio` OS 与网络白名单沙箱化 `[Implemented v0.11.0]`**：`mcp_firewall.rs` (`build_stdio_sandbox_plan_full` + `spawn_upstream_stdio`) 在宿主机支持时自动以 Linux `bwrap --tmpfs $HOME --bind <iso_home>`（屏蔽 `$HOME` 本身及其祖先目录、`.ssh`/`.aws`/`.netrc`/`.npmrc`/`.pypirc`/`.git-credentials`/`.docker` 等凭据路径，并最后强制覆写 `HOME`/`TMPDIR`/`*_PROXY` 以防环境注入）或 macOS `sandbox-exec` 收紧凭据目录；开启 `--isolate-network` 时缺省强制 Fail-Closed 校验沙箱与 Linux `egress-shim`（经 `AegisEgressGateway` 代理桥或 macOS Seatbelt localhost 白名单代理切断任意外网）。
 
 ### 3.4 四层统一可见性与动态推送 / 全通道治理 | Four-Layer Inventory, Push & Full-Channel Governance
 | 可见性 / 治理维度 | 载体与内容 | 状态 |
 |---|---|---|
-| **1. CLI 统一总览与运维** | `aegis-os mcp status`、`doctor [--probe]`、`sync`（含 `.mcpb` 归档）、`upgrade`（保留已定制 `policy` / `tool_overrides`）、`remove`、`registry`、`search`、`recommend` | `[Implemented]` |
-| **2. 启动态 Banner** | `aegis-os run` 启动横幅打印 `mcps:` 状态与 `mcp-hint:` 仓库清单提示（零网络调用） | `[Implemented]` |
-| **3. 宿主机 Web `/approve` 全功能控制台** | `/approve` 集成 `Installed External MCP Servers` 面板、OAuth 2.1 PKCE/Device Code/Static Token 录入（在线 inline 凭据严格按 `org_id` 隔离）、策略在线编辑（`trust`/`dlp`/`elicit`/`tool_overrides`/`allowed_hosts`/`net_iso`）与 Outbox 审批队列 | `[Implemented]` |
-| **4. Agent 侧自省与热推送** | `aegis://mcp/installed` 资源 + `mcp_list_installed` 工具 + 按 `(org_id, agent_id)` 隔离的 `notifications/{tools,resources}/list_changed` 热推送与基于 Epoch 的工具注解缓存失效重建 | `[Implemented]` |
-| **5. 全 MCP 通道统一防线** | `tools/list`、`resources/{read,list}`、`resources/templates/list`、`prompts/{list,get}`、`completion/complete`、未知/自定义 RPC 与 SSE/`stdio` 通知统一执行注入清洗、`Pseudonymize`/`Block`、参数假名还原、污点传播与防篡改审计（其中 `dlp_mode=block` 在 `tools/call` 返回 MCP `result.isError: true`，而在 `tools/list` 与非工具/自定义 RPC 通道返回 JSON-RPC `-32004`）；`elicitation/create` 与客户端应答仅在 `allow_elicitation=true` 时放行，默认 Fail-Closed 拦截（`-32601`） | `[Implemented]` |
+| **1. CLI 统一总览与运维** | `aegis-os mcp status`、`doctor [--probe]`、`sync`（含 `.mcpb` 归档）、`upgrade`（保留已定制 `policy` / `tool_overrides`）、`remove`、`registry`、`search`、`recommend` | `[Implemented v0.11.0]` |
+| **2. 启动态 Banner** | `aegis-os run` 启动横幅打印 `mcps:` 状态与 `mcp-hint:` 仓库清单提示（零网络调用） | `[Implemented v0.11.0]` |
+| **3. 宿主机 Web `/approve` 全功能控制台** | `/approve` 集成 `Installed External MCP Servers` 面板、OAuth 2.1 PKCE/Device Code/Static Token 录入（在线 inline 凭据严格按 `org_id` 隔离）、策略在线编辑（`trust`/`dlp`/`elicit`/`tool_overrides`/`allowed_hosts`/`net_iso`）与 Outbox 审批队列 | `[Implemented v0.11.0]` |
+| **4. Agent 侧自省与热推送** | `aegis://mcp/installed` 资源 + `mcp_list_installed` 工具 + 按 `(org_id, agent_id)` 隔离的 `notifications/{tools,resources}/list_changed` 热推送与基于 Epoch 的工具注解缓存失效重建 | `[Implemented v0.11.0]` |
+| **5. 全 MCP 通道统一防线** | `tools/list`、`resources/{read,list}`、`resources/templates/list`、`prompts/{list,get}`、`completion/complete`、未知/自定义 RPC 与 SSE/`stdio` 通知统一执行注入清洗、`Pseudonymize`/`Block`、参数假名还原、污点传播与防篡改审计（其中 `dlp_mode=block` 在 `tools/call` 返回 MCP `result.isError: true`，而在 `tools/list` 与非工具/自定义 RPC 通道返回 JSON-RPC `-32004`）；`elicitation/create` 与客户端应答仅在 `allow_elicitation=true` 时放行，默认 Fail-Closed 拦截（`-32601`） | `[Implemented v0.11.0]` |
 
 ---
 
