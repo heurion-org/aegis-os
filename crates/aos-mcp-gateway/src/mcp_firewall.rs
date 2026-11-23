@@ -4573,9 +4573,55 @@ pub struct StdioSandboxPlan {
     pub isolated_tmp_dir: Option<PathBuf>,
 }
 
+fn resolve_path_preserving_nonexistent(path: &Path) -> PathBuf {
+    if let Ok(canon) = std::fs::canonicalize(path) {
+        return canon;
+    }
+    let components: Vec<std::path::Component<'_>> = path.components().collect();
+    let mut deepest_idx = 0usize;
+    let mut probe = PathBuf::new();
+    let mut cur_resolved = PathBuf::new();
+    for (idx, comp) in components.iter().enumerate() {
+        probe.push(comp.as_os_str());
+        if let Ok(canon) = std::fs::canonicalize(&probe) {
+            cur_resolved = canon;
+            deepest_idx = idx + 1;
+        }
+    }
+    let mut out = if deepest_idx > 0 {
+        cur_resolved
+    } else {
+        PathBuf::new()
+    };
+    for comp in &components[deepest_idx..] {
+        match comp {
+            std::path::Component::Prefix(p) => out.push(p.as_os_str()),
+            std::path::Component::RootDir => out.push(std::path::MAIN_SEPARATOR_STR),
+            std::path::Component::CurDir => {}
+            std::path::Component::ParentDir => {
+                if out.as_os_str().is_empty()
+                    || matches!(out.components().next_back(), Some(std::path::Component::ParentDir))
+                {
+                    out.push("..");
+                } else {
+                    out.pop();
+                }
+            }
+            std::path::Component::Normal(seg) => {
+                out.push(seg);
+                if let Ok(canon) = std::fs::canonicalize(&out) {
+                    out = canon;
+                }
+            }
+        }
+    }
+    out
+}
+
+#[cfg_attr(not(any(target_os = "linux", target_os = "macos")), allow(dead_code))]
 pub(crate) fn is_unsafe_home_subpath(host_home: &Path, path: &Path) -> bool {
-    let hh = std::fs::canonicalize(host_home).unwrap_or_else(|_| host_home.to_path_buf());
-    let p = std::fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf());
+    let hh = resolve_path_preserving_nonexistent(host_home);
+    let p = resolve_path_preserving_nonexistent(path);
     if p == hh || hh.starts_with(&p) {
         return true;
     }
@@ -4647,7 +4693,7 @@ fn stdio_os_sandbox_available() -> bool {
         }
         #[cfg(target_os = "macos")]
         {
-            return Path::new("/usr/bin/sandbox-exec").is_file();
+            Path::new("/usr/bin/sandbox-exec").is_file()
         }
         #[cfg(not(any(target_os = "linux", target_os = "macos")))]
         {
@@ -4860,7 +4906,10 @@ pub fn build_stdio_sandbox_plan_full(
                 }
             }
             for dir in &opts.extra_ro_dirs {
-                if dir.is_absolute() && dir.exists() {
+                if dir.is_absolute()
+                    && dir.exists()
+                    && host_home.is_none_or(|hh| !is_unsafe_home_subpath(hh, dir))
+                {
                     let ds = dir.display().to_string();
                     bargs.extend(["--ro-bind".to_string(), ds.clone(), ds]);
                 }
@@ -4950,9 +4999,19 @@ pub fn build_stdio_sandbox_plan_full(
                 ] {
                     let p = hh.join(sub).display().to_string().replace('"', "\\\"");
                     sb.push_str(&format!("(deny file-read* file-write* (subpath \"{p}\"))\n"));
+                    if p.starts_with("/var/") || p.starts_with("/tmp/") {
+                        sb.push_str(&format!(
+                            "(deny file-read* file-write* (subpath \"/private{p}\"))\n"
+                        ));
+                    }
                 }
             }
             for dir in &opts.extra_ro_dirs {
+                if !dir.is_absolute()
+                    || host_home.is_some_and(|hh| is_unsafe_home_subpath(hh, dir))
+                {
+                    continue;
+                }
                 let d_q = dir.display().to_string().replace('"', "\\\"");
                 sb.push_str(&format!("(allow file-read* (subpath \"{d_q}\"))\n"));
                 if d_q.starts_with("/var/") || d_q.starts_with("/tmp/") {
@@ -5182,6 +5241,7 @@ async fn spawn_upstream_stdio(
         && sbx_avail;
 
     let mut network_guard: Option<StdioNetworkGuard> = None;
+    #[cfg_attr(not(target_os = "linux"), allow(unused_mut))]
     let mut bridge_token_env: Option<String> = None;
 
     if server.policy.isolate_upstream_network && !server.policy.allowed_hosts.is_empty() {
@@ -5200,8 +5260,11 @@ async fn spawn_upstream_stdio(
         let purl = format!("http://{proxy_addr}");
         sandbox_opts.proxy_url = Some(purl);
 
+        #[cfg_attr(not(target_os = "linux"), allow(unused_mut))]
         let mut bridge_handle = None;
+        #[cfg_attr(not(target_os = "linux"), allow(unused_mut))]
         let mut bridge_sock = None;
+        #[cfg_attr(not(target_os = "linux"), allow(unused_mut))]
         let mut bridge_temp_dir = None;
 
         #[cfg(target_os = "linux")]
@@ -8895,7 +8958,52 @@ while True:
         ] {
             assert!(is_unsafe_home_subpath(&hh, &hh.join(bad)), "{bad}");
         }
+        assert!(is_unsafe_home_subpath(&hh, &hh.join("nonexistent/../.ssh")));
+        assert!(is_unsafe_home_subpath(&hh, &hh.join("work/..")));
         assert!(!is_unsafe_home_subpath(&hh, &hh.join("work/proj")));
+
+        let existing_ssh = hh.join(".ssh");
+        std::fs::create_dir_all(&existing_ssh).unwrap();
+        let iso_home = tmp.path().join("iso");
+        std::fs::create_dir_all(&iso_home).unwrap();
+        let blocked_extra_plan = build_stdio_sandbox_plan_full(
+            "node",
+            &[],
+            None,
+            &iso_home,
+            Some(&hh),
+            true,
+            &StdioSandboxOptions {
+                extra_ro_dirs: vec![existing_ssh.clone(), hh.join("work/proj")],
+                ..Default::default()
+            },
+        );
+        let plan_text = blocked_extra_plan.args.join(" ");
+        assert!(
+            !plan_text.contains(&format!("--ro-bind {}", existing_ssh.display())),
+            "linux bwrap must not mount unsafe extra_ro_dirs: {plan_text}"
+        );
+        assert!(
+            !plan_text.contains(&format!(
+                "(allow file-read* (subpath \"{}\"))",
+                existing_ssh.display()
+            )),
+            "macos seatbelt must not allow unsafe extra_ro_dirs: {plan_text}"
+        );
+        if cfg!(target_os = "macos") && Path::new("/usr/bin/sandbox-exec").is_file() {
+            assert!(
+                plan_text.contains(&format!(
+                    "(allow file-read* (subpath \"{}\"))",
+                    hh.join("work/proj").display()
+                )),
+                "safe extra_ro_dirs under $HOME must remain readable: {plan_text}"
+            );
+            assert!(
+                plan_text.contains(&format!("(deny file-read* file-write* (subpath \"/private{}\"))", existing_ssh.display()))
+                    || !existing_ssh.display().to_string().starts_with("/var/"),
+                "macos seatbelt must mirror /private deny rules under /var TempDir: {plan_text}"
+            );
+        }
 
         for key in [
             "LD_PRELOAD",
