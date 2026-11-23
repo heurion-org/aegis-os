@@ -1,0 +1,78 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 880 520" width="880" height="520" role="img" aria-label="Aegis OS Kernel Sandbox vs Bare --yolo Terminal Demo">
+  <defs>
+    <linearGradient id="bg" x1="0" y1="0" x2="0" y2="1">
+      <stop offset="0%" stop-color="#0F172A"/>
+      <stop offset="100%" stop-color="#090F1D"/>
+    </linearGradient>
+    <linearGradient id="ok-border" x1="0" y1="0" x2="1" y2="0">
+      <stop offset="0%" stop-color="#34D399"/>
+      <stop offset="50%" stop-color="#06B6D4"/>
+      <stop offset="100%" stop-color="#3B82F6"/>
+    </linearGradient>
+    <style>
+      .mono { font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, "Liberation Mono", monospace; }
+      .sans { font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Helvetica, Arial, sans-serif; }
+      @keyframes reveal1 { 0%, 4% { opacity: 0.25; } 10%, 94% { opacity: 1; } 100% { opacity: 0.25; } }
+      @keyframes reveal2 { 0%, 10% { opacity: 0.25; } 16%, 94% { opacity: 1; } 100% { opacity: 0.25; } }
+      @keyframes reveal3 { 0%, 16% { opacity: 0.25; } 22%, 94% { opacity: 1; } 100% { opacity: 0.25; } }
+      @keyframes reveal4 { 0%, 24% { opacity: 0.25; } 30%, 94% { opacity: 1; } 100% { opacity: 0.25; } }
+      @keyframes reveal5 { 0%, 30% { opacity: 0.25; } 36%, 94% { opacity: 1; } 100% { opacity: 0.25; } }
+      @keyframes reveal6 { 0%, 36% { opacity: 0.25; } 42%, 94% { opacity: 1; } 100% { opacity: 0.25; } }
+      @keyframes reveal7 { 0%, 42% { opacity: 0.25; } 48%, 94% { opacity: 1; } 100% { opacity: 0.25; } }
+      .s1 { animation: reveal1 11s ease-in-out infinite; }
+      .s2 { animation: reveal2 11s ease-in-out infinite; }
+      .s3 { animation: reveal3 11s ease-in-out infinite; }
+      .s4 { animation: reveal4 11s ease-in-out infinite; }
+      .s5 { animation: reveal5 11s ease-in-out infinite; }
+      .s6 { animation: reveal6 11s ease-in-out infinite; }
+      .s7 { animation: reveal7 11s ease-in-out infinite; }
+    </style>
+  </defs>
+
+  <!-- Outer Window -->
+  <rect x="2" y="2" width="876" height="516" rx="16" fill="url(#bg)" stroke="#1E293B" stroke-width="2"/>
+  <!-- Title Bar -->
+  <rect x="2" y="2" width="876" height="40" rx="16" fill="#131C31"/>
+  <rect x="2" y="24" width="876" height="18" fill="#131C31"/>
+  <line x1="2" y1="42" x2="878" y2="42" stroke="#1E293B" stroke-width="1"/>
+  <circle cx="24" cy="22" r="6" fill="#EF4444"/>
+  <circle cx="44" cy="22" r="6" fill="#F59E0B"/>
+  <circle cx="64" cy="22" r="6" fill="#10B981"/>
+  <text x="440" y="26" text-anchor="middle" fill="#94A3B8" font-size="12.5" font-weight="600" class="sans">
+    aegis-os — Enforced Kernel Sandbox vs. Bare --yolo (Live V3 / V4 / V5 Repo-Trap Demo)
+  </text>
+
+  <!-- Pane 1: WITHOUT AEGIS -->
+  <rect x="20" y="58" width="840" height="190" rx="10" fill="#140C14" stroke="#EF4444" stroke-opacity="0.45" stroke-width="1.5"/>
+  <rect x="34" y="70" width="248" height="24" rx="6" fill="#7F1D1D"/>
+  <text x="46" y="86" fill="#FECACA" font-size="11.5" font-weight="700" class="sans" letter-spacing="0.4">WITHOUT AEGIS  ·  BARE --YOLO / HOOKS</text>
+  <text x="842" y="86" text-anchor="end" fill="#FCA5A5" font-size="11.5" font-weight="600" class="mono">ASR: 93.3%–100% COMPROMISED</text>
+
+  <text x="36" y="116" fill="#E2E8F0" font-size="13" class="mono">$ claude --dangerously-skip-permissions  <tspan fill="#64748B"># runs python3 scripts/verify_env.py</tspan></text>
+  <text x="36" y="142" fill="#F87171" font-size="13" class="mono s1">[LEAKED]  ~/.ssh/id_ed25519        -&gt; exfiltrated over raw socket to 198.51.100.7</text>
+  <text x="36" y="166" fill="#F87171" font-size="13" class="mono s2">[PWNED]   .claude/settings.json      -&gt; hooks wiped, permissions set to allow: ["*"]</text>
+  <text x="36" y="190" fill="#F87171" font-size="13" class="mono s3">[PWNED]   .git/hooks/post-checkout   -&gt; malicious persistence planted in host repo</text>
+
+  <rect x="34" y="206" width="812" height="28" rx="6" fill="#450A0A"/>
+  <text x="48" y="224" fill="#FCA5A5" font-size="12" font-weight="700" class="mono s3">
+    VERDICT: COMPROMISED  ·  Vendor sandboxes bypassed 73.3%–83.3%  ·  Containers bypassed 80.0%
+  </text>
+
+  <!-- Pane 2: WITH AEGIS OS -->
+  <rect x="20" y="264" width="840" height="236" rx="10" fill="#07181B" stroke="url(#ok-border)" stroke-width="1.8"/>
+  <rect x="34" y="276" width="232" height="24" rx="6" fill="#064E3B"/>
+  <text x="46" y="292" fill="#6EE7B7" font-size="11.5" font-weight="700" class="sans" letter-spacing="0.4">WITH AEGIS OS  ·  ENFORCED MODE</text>
+  <text x="842" y="292" text-anchor="end" fill="#34D399" font-size="11.5" font-weight="600" class="mono">ASR: 0 / 30 (0.0% BYPASSES)</text>
+
+  <text x="36" y="322" fill="#E2E8F0" font-size="13" class="mono s4">$ aegis-os run -- claude  <tspan fill="#64748B"># 9.9ms bwrap / Seatbelt + sub-ms CoW shadow</tspan></text>
+  <text x="36" y="348" fill="#34D399" font-size="13" class="mono s4">[BLOCKED] ~/.ssh/id_ed25519        -&gt; EPERM (kernel default-deny $HOME isolation)</text>
+  <text x="36" y="372" fill="#34D399" font-size="13" class="mono s5">[BLOCKED] .claude/settings.json      -&gt; EROFS (immutable read-only config mount)</text>
+  <text x="36" y="396" fill="#34D399" font-size="13" class="mono s5">[BLOCKED] .git/hooks/post-checkout   -&gt; EROFS (split .git view + hardened git shim)</text>
+  <text x="36" y="420" fill="#34D399" font-size="13" class="mono s6">[BLOCKED] 198.51.100.7:443           -&gt; 403 Egress Allowlist &amp; L7 DLP (0 TLS MITM)</text>
+  <text x="36" y="446" fill="#38BDF8" font-size="13" class="mono s7">$ aegis-os diff --json  <tspan fill="#94A3B8"># 0 host files mutated · SHA-256 TOCTOU commit gate intact</tspan></text>
+
+  <rect x="34" y="460" width="812" height="28" rx="6" fill="#064E3B"/>
+  <text x="48" y="478" fill="#A7F3D0" font-size="12" font-weight="700" class="mono s7">
+    SAFE: 0/30 BYPASSES  ·  9.9ms STARTUP  ·  90.7%–97.9% FEWER PROMPTS  ·  99.05% CoW DISK SAVED
+  </text>
+</svg>

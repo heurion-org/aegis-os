@@ -1,0 +1,93 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1000 440" width="1000" height="440" role="img" aria-label="Aegis OS Control Inversion Architecture">
+  <defs>
+    <linearGradient id="arch-bg" x1="0" y1="0" x2="0" y2="1">
+      <stop offset="0%" stop-color="#11192E"/>
+      <stop offset="100%" stop-color="#090F1D"/>
+    </linearGradient>
+    <linearGradient id="boundary-grad" x1="0" y1="0" x2="1" y2="0">
+      <stop offset="0%" stop-color="#10B981"/>
+      <stop offset="50%" stop-color="#06B6D4"/>
+      <stop offset="100%" stop-color="#3B82F6"/>
+    </linearGradient>
+    <marker id="arrow-cyan" viewBox="0 0 10 10" refX="5" refY="5" markerWidth="6" markerHeight="6" orient="auto-start-reverse">
+      <path d="M 0 1 L 10 5 L 0 9 z" fill="#38BDF8"/>
+    </marker>
+    <marker id="arrow-green" viewBox="0 0 10 10" refX="5" refY="5" markerWidth="6" markerHeight="6" orient="auto-start-reverse">
+      <path d="M 0 1 L 10 5 L 0 9 z" fill="#34D399"/>
+    </marker>
+    <style>
+      .sans { font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Helvetica, Arial, sans-serif; }
+      .mono { font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace; }
+    </style>
+  </defs>
+
+  <rect x="2" y="2" width="996" height="436" rx="16" fill="url(#arch-bg)" stroke="#1E293B" stroke-width="2"/>
+
+  <!-- Header -->
+  <text x="32" y="36" fill="#F8FAFC" font-size="16" font-weight="700" class="sans">AEGIS OS ARCHITECTURE — CONTROL INVERSION</text>
+  <text x="32" y="56" fill="#94A3B8" font-size="12.5" class="sans">
+    Parent-process OS supervisor sets up isolation before execve(). Agents cannot opt out, self-approve, or touch host secrets.
+  </text>
+
+  <!-- TOP PLANE: TRUSTED HOST PLANE -->
+  <rect x="24" y="72" width="952" height="132" rx="12" fill="#0F1B33" stroke="#38BDF8" stroke-opacity="0.35" stroke-width="1.5"/>
+  <text x="40" y="94" fill="#38BDF8" font-size="11.5" font-weight="700" letter-spacing="0.8" class="sans">TRUSTED HOST PLANE (OUTSIDE AGENT SANDBOX)</text>
+
+  <!-- Host Card 1 -->
+  <rect x="40" y="106" width="290" height="84" rx="8" fill="#13223F" stroke="#1E3A5F"/>
+  <text x="54" y="128" fill="#F8FAFC" font-size="13" font-weight="700" class="sans">Host Repo (RO) &amp; OrgVault</text>
+  <text x="54" y="148" fill="#94A3B8" font-size="11.5" class="mono">~/.ssh, ~/.aws, Keychain MASKED</text>
+  <text x="54" y="166" fill="#94A3B8" font-size="11.5" class="mono">AES-256-GCM encrypted shadows</text>
+  <text x="54" y="182" fill="#64748B" font-size="10.5" class="mono">Real .git objects RO + RO config locks</text>
+
+  <!-- Host Card 2 -->
+  <rect x="355" y="106" width="290" height="84" rx="8" fill="#13223F" stroke="#1E3A5F"/>
+  <text x="369" y="128" fill="#F8FAFC" font-size="13" font-weight="700" class="sans">SessionBroker &amp; Cedar Policy</text>
+  <text x="369" y="148" fill="#34D399" font-size="11.5" class="mono">Dual-token: human.token != agent</text>
+  <text x="369" y="166" fill="#94A3B8" font-size="11.5" class="mono">SHA-256 Frozen-Stage Commit Gate</text>
+  <text x="369" y="182" fill="#64748B" font-size="10.5" class="mono">VT100/Bidi escape + poison guards</text>
+
+  <!-- Host Card 3 -->
+  <rect x="670" y="106" width="290" height="84" rx="8" fill="#13223F" stroke="#1E3A5F"/>
+  <text x="684" y="128" fill="#F8FAFC" font-size="13" font-weight="700" class="sans">L4/L7 Proxy &amp; MCP Firewall</text>
+  <text x="684" y="148" fill="#38BDF8" font-size="11.5" class="mono">$AOS_SECRET_* boundary injection</text>
+  <text x="684" y="166" fill="#94A3B8" font-size="11.5" class="mono">64 KiB DLP + zero TLS MITM</text>
+  <text x="684" y="182" fill="#64748B" font-size="10.5" class="mono">OAuth 2.1, taint guard, 1:1 stubs</text>
+
+  <!-- MIDDLE BOUNDARY -->
+  <line x1="185" y1="204" x2="185" y2="274" stroke="#38BDF8" stroke-width="2" marker-end="url(#arrow-cyan)"/>
+  <line x1="500" y1="274" x2="500" y2="204" stroke="#34D399" stroke-width="2" marker-end="url(#arrow-green)"/>
+  <line x1="815" y1="204" x2="815" y2="274" stroke="#38BDF8" stroke-width="2" marker-start="url(#arrow-cyan)" marker-end="url(#arrow-cyan)"/>
+
+  <rect x="24" y="218" width="952" height="38" rx="19" fill="#064E3B" stroke="url(#boundary-grad)" stroke-width="2"/>
+  <text x="500" y="241" text-anchor="middle" fill="#ECFDF5" font-size="12.5" font-weight="700" class="sans">
+    OS KERNEL BOUNDARY  ·  Linux bwrap --bind-fd (9.9ms)  |  macOS Seatbelt (20.4ms)  |  Optional Zero-NIC MicroVM
+  </text>
+
+  <!-- BOTTOM PLANE: CONFINED AGENT PLANE -->
+  <rect x="24" y="272" width="952" height="146" rx="12" fill="#09191B" stroke="#10B981" stroke-opacity="0.45" stroke-width="1.5"/>
+  <text x="40" y="294" fill="#34D399" font-size="11.5" font-weight="700" letter-spacing="0.8" class="sans">
+    CONFINED AGENT PLANE (ZERO PER-ACTION PROMPTS INSIDE WORKSPACE)
+  </text>
+
+  <!-- Agent Card 1 -->
+  <rect x="40" y="308" width="290" height="94" rx="8" fill="#0D2327" stroke="#115E59"/>
+  <text x="54" y="330" fill="#F8FAFC" font-size="13" font-weight="700" class="sans">Autonomous Coding Agents</text>
+  <text x="54" y="350" fill="#A7F3D0" font-size="11.5" class="mono">claude · codex · opencode · agy · hermes</text>
+  <text x="54" y="368" fill="#94A3B8" font-size="11.5" class="mono">90.7%–97.9% fewer prompts</text>
+  <text x="54" y="386" fill="#64748B" font-size="10.5" class="mono">Sees $AOS_SECRET_* placeholders only</text>
+
+  <!-- Agent Card 2 -->
+  <rect x="355" y="308" width="290" height="94" rx="8" fill="#0D2327" stroke="#115E59"/>
+  <text x="369" y="330" fill="#F8FAFC" font-size="13" font-weight="700" class="sans">Sub-ms CoW Shadow VFS</text>
+  <text x="369" y="350" fill="#A7F3D0" font-size="11.5" class="mono">APFS clonefile / btrfs FICLONE</text>
+  <text x="369" y="368" fill="#94A3B8" font-size="11.5" class="mono">Split .git index (99.05% disk saved)</text>
+  <text x="369" y="386" fill="#64748B" font-size="10.5" class="mono">aegis-os diff -&gt; verify -&gt; commit</text>
+
+  <!-- Agent Card 3 -->
+  <rect x="670" y="308" width="290" height="94" rx="8" fill="#0D2327" stroke="#115E59"/>
+  <text x="684" y="330" fill="#F8FAFC" font-size="13" font-weight="700" class="sans">Multi-Agent A2A &amp; Merge</text>
+  <text x="684" y="350" fill="#A7F3D0" font-size="11.5" class="mono">Task-bound claims + SHA-256 CAS</text>
+  <text x="684" y="368" fill="#94A3B8" font-size="11.5" class="mono">98.7% 4-tier LCS auto-merge</text>
+  <text x="684" y="386" fill="#64748B" font-size="10.5" class="mono">0% silent overwrites vs 41.2% raw</text>
+</svg>

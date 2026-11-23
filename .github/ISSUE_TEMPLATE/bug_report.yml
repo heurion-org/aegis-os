@@ -1,0 +1,62 @@
+name: Bug Report
+description: Report a bug, regression, or compatibility issue with Aegis OS
+title: "[Bug]: "
+labels: ["bug"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Thanks for reporting a bug! If this is a **sandbox escape or security vulnerability in Enforced/Isolated mode**, please report it privately via [GitHub Security Advisories](https://github.com/heurion-org/aegis-os/security/advisories/new) instead of opening a public issue.
+  - type: input
+    id: version
+    attributes:
+      label: Aegis OS Version
+      description: Output of `aegis-os --version`
+      placeholder: "aegis-os 0.11.0"
+    validations:
+      required: true
+  - type: dropdown
+    id: os
+    attributes:
+      label: Operating System & Architecture
+      options:
+        - macOS (Apple Silicon / arm64)
+        - macOS (Intel / x86_64)
+        - Linux x86_64 (Ubuntu 24.04+)
+        - Linux x86_64 (Ubuntu 22.04 / Debian / Arch / Fedora)
+        - Linux arm64 / aarch64
+        - WSL2
+    validations:
+      required: true
+  - type: dropdown
+    id: mode
+    attributes:
+      label: Enforcement Mode
+      options:
+        - Enforced (`aegis-os run -- <agent>` or `install --enforce`)
+        - Isolated (`aegis-os run --isolated`)
+        - Advisory (`aegis-os install`)
+        - CLI / Installer / MCP Proxy (`audit-me`, `install`, `mcp`)
+    validations:
+      required: true
+  - type: input
+    id: agent
+    attributes:
+      label: Agent Client (if applicable)
+      placeholder: "claude / codex / opencode / agy / hermes / custom"
+  - type: textarea
+    id: reproduction
+    attributes:
+      label: Steps to Reproduce
+      description: Exact commands and minimal steps to reproduce the issue.
+      placeholder: |
+        1. Run `aegis-os run -- ...`
+        2. Observe error...
+    validations:
+      required: true
+  - type: textarea
+    id: logs
+    attributes:
+      label: Diagnostic Output / Logs
+      description: Paste output from `aegis-os doctor` or the failing command (redact any personal tokens!).
+      render: shell

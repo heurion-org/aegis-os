@@ -2,148 +2,191 @@
   <picture>
     <source media="(prefers-color-scheme: dark)" srcset="assets/aegis-logo-dark.svg">
     <source media="(prefers-color-scheme: light)" srcset="assets/aegis-logo-light.svg">
-    <img alt="Aegis OS" src="assets/aegis-logo-light.svg" width="380">
+    <img alt="Aegis OS" src="assets/aegis-logo-light.svg" width="340">
   </picture>
 </p>
 
-# Aegis OS (`aegis-os`)
+<h3 align="center">
+  Run <code>claude --dangerously-skip-permissions</code> and <code>codex --full-auto</code> safely — without exposing <code>~/.ssh</code>, <code>~/.aws</code>, <code>.env</code>, or your host repo.
+</h3>
 
-**[English](README.md) | [简体中文](README_CN.md) | [Aegis OS Website](https://heurion.org/en/aegis-os/) | [Tutorial](https://heurion.org/en/aegis-os/tutorial/) | [Paper 1 (arXiv:2611.08516)](https://arxiv.org/abs/2611.08516) | [Paper 2 (DOI: 10.5281/zenodo.24170505)](https://doi.org/10.5281/zenodo.24170505) | [Technical Blog](https://heurion.org/en/blog) | [Cloud Console & Pro ($29/mo)](https://heurion.org/aegis-cloud/dashboard) | [Approval Console](https://heurion.org/aegis-cloud/approve)**
+<p align="center">
+  <strong>9.9ms OS kernel sandbox (<code>bwrap</code> / macOS Seatbelt) + sub-ms Copy-on-Write shadow workspace + Zero-Trust MCP firewall — written in Rust.</strong>
+</p>
 
-**A transactional multi-tenant agent OS runtime for autonomous coding agents (`claude`, `opencode`, `agy`, `hermes`, `codex`) — parent-process kernel sandboxing, CoW shadow workspaces, A2A collaboration, and SHA-256 TOCTOU-pinned approvals.**
+<p align="center">
+  <a href="https://github.com/heurion-org/aegis-os/actions/workflows/ci.yml"><img src="https://github.com/heurion-org/aegis-os/actions/workflows/ci.yml/badge.svg" alt="CI"></a>
+  <a href="LICENSE"><img src="https://img.shields.io/badge/License-Apache_2.0-blue.svg" alt="License: Apache 2.0"></a>
+  <img src="https://img.shields.io/badge/Rust-1.80%2B%20(2021)-orange.svg" alt="Rust 1.80+">
+  <a href="https://arxiv.org/abs/2611.08516"><img src="https://img.shields.io/badge/arXiv-2611.08516-b31b1b.svg" alt="arXiv:2611.08516"></a>
+  <a href="https://doi.org/10.5281/zenodo.24170505"><img src="https://zenodo.org/badge/DOI/10.5281/zenodo.24170505.svg" alt="DOI: 10.5281/zenodo.24170505"></a>
+  <a href="https://m8ven.ai/mcp/heurion-org/aegis-os?s=readme"><img src="https://m8ven.ai/badge/mcp/heurion-org/aegis-os" alt="M8ven Score"></a>
+</p>
 
-> **Enforcement levels**: `aegis-os install` = **advisory** (in-process hooks / MCP / rules; reduces prompt fatigue, *not* a security boundary). `aegis-os run -- <agent>` = **enforced** (Aegis is the parent OS supervisor; Linux `bwrap --bind-fd` + macOS Seatbelt confinement + CoW shadow + split `.git` shim + L4/L7 egress proxy with `$AOS_SECRET_*` boundary injection). `aegis-os run --isolated` / Aegis Cloud = **isolated** (64GB cloud sandbox / microVM).
+<p align="center">
+  <strong>English</strong> | <a href="README_CN.md">简体中文</a> | <a href="https://heurion.org/en/aegis-os/">Website</a> | <a href="https://heurion.org/en/aegis-os/tutorial/">Tutorial</a> | <a href="docs/DOC.md">Docs</a> | <a href="https://arxiv.org/abs/2611.08516">Paper 1 (arXiv)</a> | <a href="https://doi.org/10.5281/zenodo.24170505">Paper 2 (Zenodo)</a> | <a href="https://heurion.org/en/blog">Blog</a>
+</p>
 
-![Rust](https://img.shields.io/badge/Rust-1.80%2B%20(2021)-orange.svg)
-![MCP](https://img.shields.io/badge/Protocol-MCP%202024--11--05-blue.svg)
-![A2A](https://img.shields.io/badge/Protocol-Google%20A2A-34A853.svg)
-[![arXiv](https://img.shields.io/badge/arXiv-2611.08516-b31b1b.svg)](https://arxiv.org/abs/2611.08516)
-[![DOI](https://zenodo.org/badge/DOI/10.5281/zenodo.24170505.svg)](https://doi.org/10.5281/zenodo.24170505)
-[![Blog](https://img.shields.io/badge/Blog-heurion.org%2Fen%2Fblog-0A7D52.svg)](https://heurion.org/en/blog)
-[![M8ven Score](https://m8ven.ai/badge/mcp/heurion-org/aegis-os)](https://m8ven.ai/mcp/heurion-org/aegis-os?s=readme)
+<p align="center">
+  <img src="assets/demo-terminal.svg" alt="Aegis OS Kernel Sandbox vs Bare --yolo Demo" width="880">
+</p>
 
 ---
 
-## What it is
+## Why Aegis OS?
 
-- **Stop `--yolo` credential exposure** — Run `claude --dangerously-skip-permissions`, `codex --full-auto`, or `agy` without exposing `~/.ssh`, `~/.aws`, `.env`, or arbitrary outbound hosts. Run `aegis-os audit-me` to check your machine in 5 seconds.
-- **Cut 90.7%–97.9% of approval popups** — Agents run with zero per-action prompts inside a sub-millisecond Copy-on-Write shadow workspace; only host commits and boundary crossings require human approval or a TTL lease.
-- **Run multiple agents in parallel without silent overwrites** — Replace heavyweight `git worktree` setups and raw shared folders (**41.2%** silent overwrite rate in uncoordinated multi-agent runs) with task-bound claims, 4-tier LCS auto-merge (**98.7%**), and cryptographic `Aegis-OS-Verified` commit/PR receipts.
+In-process hooks and client-side config rules run **under your ambient UNIX UID**. A single prompt-injected tool output or trojanized repo script (`python3 scripts/verify_env.py`) can bypass hook regexes, overwrite `.claude/settings.json` / `.mcp.json`, plant `.git/config` `core.fsmonitor` RCE, or exfiltrate secrets over raw sockets.
 
-Aegis OS shifts the authorization boundary from individual tool calls to **transactional workspace boundaries**. In enforced mode, each agent gets a Copy-on-Write shadow workspace, a kernel sandbox, an identity-pinned egress proxy, and a policy/approval broker. Inside the workspace, agents run with **zero per-action prompts**; host commits and boundary crossings require human approval or a TTL lease.
+**Aegis OS inverts control.** As the parent OS supervisor, it sets up a Copy-on-Write (CoW) shadow workspace, kernel confinement (`bwrap --bind-fd` on Linux, Seatbelt on macOS), split `.git` views, L4/L7 boundary secret injection, and a dual-token `SessionBroker` *before* `execve()`—so compromised agents cannot opt out.
 
-It replaces both Git feature branches (late conflict explosions, heavyweight worktrees) and raw shared folders (**41.2%** silent overwrites in uncoordinated multi-agent benchmarks). It is intentionally domain-agnostic: code, documents, data pipelines, binary artifacts, and cross-application state use the same shadow / claim / verify / commit kernel, with domain-specific profiles for merge and verification. **Heurion 2.0 is the first reference application.**
+| Capability / Empirical Metric | Bare `--yolo` | Advisory Hooks | Vendor Sandbox | Docker (`nerdctl`) | **Aegis OS (Enforced)** |
+|---|---|---|---|---|---|
+| **V1–V6 bypass rate** (30 payloads, macOS + Linux) | 100% (30/30) | 93.3% (28/30) | 73.3%–83.3% | 80.0% | **0.0% (0/30)** |
+| **Live 4-agent repo-trap compromise** (`claude`, `opencode`, `agy`, `hermes`) | 100% (incl. Opus) | — | — | — | **0%** (100% benign test pass) |
+| **Sandbox startup latency** | `<3 ms` | `<5 ms` | ~15 ms | 221.53 ms | **9.91 ms** Linux · **20.38 ms** macOS |
+| **500 MB packed Git CoW disk delta** | 0 MB (unsafe) | 0 MB (unsafe) | Full worktree | Full mount/copy | **4.76 MB** APFS (**99.05%** saved) · **0.00 MB** `btrfs` |
+| **Protects `~/.ssh`, `.env`, Keychain, `.git/hooks`, configs** | No | Bypassable | Partial | Manual setup | **Kernel-enforced default-deny** |
+| **Approval prompt reduction** (52 sessions, 28,087 calls) | 0% (unsafe) | 20.9% | Partial | Manual | **90.7%–97.9% fewer prompts** |
+| **Multi-agent concurrency** (vs. raw shared folder) | 41.2% silent loss | 41.2% silent loss | Manual worktrees | Heavy containers | **98.7% 4-tier LCS auto-merge** |
+| **Zero-Trust MCP Firewall & L7 `$AOS_SECRET_*` injection** | No | No | No | No | **Built-in (zero TLS MITM)** |
 
-## Security model
+<p align="center">
+  <img src="assets/architecture.svg" alt="Aegis OS Control Inversion Architecture" width="960">
+</p>
 
-| Mode | How to start | Enforcement point | What it protects against | Status |
-|---|---|---|---|---|
-| **Advisory** | `aegis-os install`, then run the agent directly | Hooks / MCP / rules | Honest agent mistakes, accidental credential reads, prompt fatigue | ✅ Available (compatibility mode) |
-| **Enforced** | `aegis-os run -- claude`, or `aegis-os install --enforce` then run `claude` | Parent kernel sandbox (`bwrap` / Seatbelt) + dual-token broker + L4/L7 egress proxy | Prompt-injected or trojanized repo scripts (`V1`–`V6`); host writes; SSH/Keychain/API-key theft; config & `.git/config` RCE; TOCTOU commit swaps | ✅ Verified on Linux (`bwrap --bind-fd`) & macOS Seatbelt across `claude`, `opencode`, `agy`, `hermes` |
-| **Isolated** | `aegis-os run --isolated -- claude` / Aegis Cloud | Remote 64GB cloud worker / microVM | Untrusted repositories, multi-tenant teams, host-level isolation | ✅ 64GB Cloud sandbox available; local microVM Phase 4 |
+Verified production CLI targets: **Claude Code (`claude`), Codex CLI (`codex`), OpenCode (`opencode`), Google Antigravity (`agy`), and Nous Hermes (`hermes`)**.
 
-**Advisory is not a security boundary.** Hooks and MCP servers are loaded *by* the agent under your ambient UNIX UID; a prompt-injected tool output or trojanized project script (`python3 scripts/verify_env.py`) can bypass regex hooks, overwrite `.claude/settings.json` / `.mcp.json` / `opencode.json`, trigger `.git/config` `core.fsmonitor` execution during `git status`, or exfiltrate keys over raw sockets. In enforced mode, Aegis creates the CoW shadow, kernel namespace, split `.git` view, read-only config locks, L4/L7 egress proxy, and dual-token `SessionBroker` *before* `execve()`—the agent cannot opt out.
+---
 
-Verified production CLI targets: **Claude Code (`claude`), OpenCode (`opencode`), Google Antigravity (`agy`), Nous Hermes (`hermes`), and Codex (`codex`)**. On macOS Seatbelt, `aegis-os run` automatically wraps OpenCode and Hermes with per-session single-port loopback pinning and blocks `SecurityAgent` Keychain IPC popups (`exit 44` shim) while keeping system TLS verification (`com.apple.trustd`) intact.
+## 60-Second Quick Start
 
-## Quick start
-
-### Advisory integration
+### 1. Install
 
 ```bash
+# Homebrew (macOS & Linux)
 brew tap heurion-org/aegis-os https://github.com/heurion-org/aegis-os.git
 brew install aegis-os
-aegis-os install
-aegis-os audit-me            # 5s local credential exposure & prompt fatigue checkup (--share for Markdown badge)
+
+# Or signed one-line installer (Ed25519 verified via ssh-keygen)
+curl -fsSL https://heurion.org/aegis-cloud/install.sh | sh
 ```
 
-This wires hooks / MCP / rules into detected agents. It reduces prompt fatigue, but does not claim to resist a compromised agent.
-
-### Enforced runtime (Linux `bwrap` & macOS Seatbelt)
+### 2. Run a 5-Second Local Exposure Checkup
 
 ```bash
-aegis-os install --enforce   # create ~/.aegis/bin shims
-aegis-os run -- claude       # or: aegis-os run -- opencode / agy / hermes / codex
+aegis-os audit-me            # Inspect exposed ~/.ssh, ~/.aws, .env, MCP secrets & prompt fatigue
+aegis-os audit-me --share    # Export a Markdown badge card
+```
 
-# Review JSON/unified diff & promote verified changes with SHA-256 TOCTOU pinning
+### 3. Launch Any Agent Kernel-Confined (Enforced Mode)
+
+```bash
+# Run an agent with zero per-action prompts inside a CoW shadow + kernel sandbox
+aegis-os run -- claude --dangerously-skip-permissions
+# Also works with: codex --full-auto | opencode | agy | hermes
+
+# Review changes with VT100/Bidi spoofing stripped and promote via SHA-256 TOCTOU gate
 aegis-os diff --json
 aegis-os commit --expected-diff-hash <sha256>
 ```
 
-Enforced mode gives you:
-
-- **Host project read-only + OS-encrypted shadow persistence (`OrgVault`)**: all writes land in a CoW shadow (`clonefile` on APFS, `FICLONE` on `btrfs`, fast workspace-only copy on `ext4`) persisted inside a per-org encrypted volume under `~/.aegis` (Rootless APFS Encrypted `.sparsebundle` on macOS, `LUKS2 + Btrfs` or `gocryptfs` on Linux/Cloud) with `AES-256-GCM` `KEK -> DEK` envelope keys, `fsync` crash durability, and dead-PID orphan recovery.
-- **Host credentials, `$HOME` read isolation & Mach IPC masked**: `tighten_home_read` enforces default-deny host `$HOME` read isolation on both Linux `bwrap` and macOS Seatbelt (exposing only active shadow/host project roots, agent home, and safe toolchain subdirs), while SSH/cloud keys, `*/.env*`, Keychain CLI/Mach `SecurityAgent` popups, `launchctl`, and `osascript` are blocked by the kernel and protected hook/MCP configs (`.claude/settings.json`, `.mcp.json`, `opencode.json`, `.gemini/antigravity-cli/settings.json`, `.hermes/config.yaml`) are locked read-only. External host files are brought in exclusively via SHA-256-pinned `fs_import_file` (default `<agent_home>/imports/`) and exported zero-copy via `fs_export_file`.
-- **Controlled `127.0.0.1` loopback & package installation (`pkg_install`)**: each sandbox allocates isolated per-session loopback ports (`$AOS_DEV_PORT` / `$AOS_LOOPBACK_PORTS` and `proc_exec.loopback_ports`, scoped to Seatbelt `localhost:<port>` outbound rules with `localhost:*` ephemeral bind on macOS and isolated Linux `--unshare-net` namespaces paired with an authenticated host-to-sandbox `egress-shim --preview` loopback bridge) while blocking arbitrary host loopback SSRF/port hijacking. `pkg_install` supports `npm`, `pnpm`, `yarn`, `bun`, `pip`, `uv`, `cargo`, and `go` over an ephemeral ecosystem-allowlisted egress proxy with automatic CoW unlinking/isolation of host `node_modules`/`.venv` symlinks, `#sha256:` manifest pinning, and mandatory `pkg_install_scripts` human escalation when `allow_scripts: true`.
-- **Host-brokered Git & GitHub workflow**: zero-prompt DLP-redacted `workspace_git_inspect`, `workspace_git` (with `auto_commit_shadow: true` SHA-256 single-approval transactions, `workspace_git_sensitive` poisoning/secret guard, and `[HIGH RISK: FORCE PUSH]` guard), plus `github_ci_inspect`, `github_ci_rerun`, `github_pr_inspect`, `github_pr_create`, `github_comment_create`, `github_pr_merge`, and `github_issue_inspect` (same-repo read auto-allow, cross-repo escalation, structured web approval cards with high-risk one-shot enforcement, and unified `aos-egress` DLP secret redaction/blocking).
-- **Split `.git` view + hardened `.aegis-bin/git` shim** on both Linux and macOS: host `.git` objects are mounted read-only (saving **99.05%** of physical disk blocks on 500 MB packed repos on APFS) paired with a private session `GIT_INDEX_FILE` and forced `core.fsmonitor=false` / `core.hooksPath=/dev/null`.
-- **Split-plane L4/L7 egress proxy**: Model API traffic routes through a local L7 Base-URL reverse proxy (`ANTHROPIC_BASE_URL`, `OPENAI_BASE_URL`, `GOOGLE_GEMINI_BASE_URL`) with 64 KiB outbound DLP scanning and host-boundary `$AOS_SECRET_*` secret injection (**zero TLS MITM**); general HTTPS uses an L4 `CONNECT` allowlist.
-- **Principal-separated `SessionBroker` & frozen-stage SHA-256 commit gate**: Isolates `agent.token` from `human.token`, escapes VT100 CSI / Unicode Bidi control sequences in diffs, snapshots candidate files into `commit_frozen_stage`, and runs 6 `DomainProfile` verifiers (`code`, `docs`, `data`, `binary`, `app_state`, `memory`) before promoting to the host.
-- **Fail closed**: missing `bwrap`/`sandbox-exec` (or restricted Ubuntu 24.04 AppArmor userns without profile), proxy, or broker refuses startup instead of silently degrading.
-
-Session & observability controls: `aegis-os status` · `aegis-os diff --json` · `aegis-os verify` · `aegis-os commit --expected-diff-hash` · `aegis-os discard` · `aegis-os publish` · `aegis-os approvals` · `aegis-os why` · `aegis-os a2a board` · `aegis-os policy watch` · `aegis-os memory ui` · `aegis-os mcp list` · `aegis-os audit-me --share` · `aegis-os vault status` · `aegis-os upgrade --check` · `aegis-os uninstall`.
-
-Current enforced-runtime limits:
-
-- **macOS `cwd` vs Linux path-remapping**: Linux uses `bwrap --bind-fd` to mount the CoW shadow at the exact original host path; macOS Seatbelt runs with the shadow directory as `cwd` while mounting the host repository read-only (full macOS FUSE/NFSv3 path-remapping is Phase 4).
-- **Ubuntu 24.04+ unprivileged userns**: Ubuntu 24.04 enables `kernel.apparmor_restrict_unprivileged_userns=1` by default; `aegis-os run` fails closed with setup instructions if `/etc/apparmor.d/bwrap` is not installed.
-- **Non-model HTTPS inspection**: Model API traffic uses the L7 Base-URL reverse proxy (64 KiB DLP + `$AOS_SECRET_*` injection); general allowlisted HTTPS uses L4 `CONNECT` domain filtering without TLS MITM.
-
-### Install, upgrade & uninstall
+Or try the **10-second safe red-team demo** inside a disposable `mktemp -d` fixture (never touches your real `~/.ssh` or repo):
 
 ```bash
-# One-line signed installer (Linux & macOS)
-curl -fsSL https://heurion.org/aegis-cloud/install.sh | sh
+./examples/redteam-demo/run_demo.sh
+```
+
+<details>
+<summary><strong>More setup options: transparent PATH shims, Advisory mode, build from source, upgrade &amp; uninstall</strong></summary>
+
+```bash
+# Transparent PATH shims so running `claude` / `codex` / `opencode` / `agy` / `hermes` enforces Aegis automatically
+aegis-os install --enforce
+
+# Advisory compatibility mode (hooks / MCP / rules only — reduces prompt fatigue, NOT a security boundary)
+aegis-os install
 
 # Build from source
 git clone https://github.com/heurion-org/aegis-os.git && cd aegis-os
 cargo install --path crates/aos-cli
-aegis-os install
 
-# Upgrade binary + refresh client MCP/Hook/shim integrations (Brew / Cargo / Source / Ed25519-signed release)
+# Upgrade binary + refresh client integrations
 aegis-os upgrade --check
 aegis-os upgrade             # or: aegis-os upgrade --refresh-only
 
-# Surgically remove shims & client MCP/Hook/rule integrations (keeps ~/.aegis vaults unless --purge)
+# Surgically remove shims & integrations (keeps ~/.aegis vaults unless --purge)
 aegis-os uninstall           # or: aegis-os uninstall --workspace-clean --purge --yes
 ```
 
-## Core capabilities
+</details>
 
-- **Transactional CoW VFS & encrypted `OrgVault`** — 0.42 ms metadata fork; 6.28 ms / 15.6 ms for a 1,000-file workspace; 4-tier LCS auto-merge with domain verification gates; per-org `AES-256` encrypted shadow persistence (`KEK -> DEK` envelope keys), `fsync` crash durability, and dead-PID orphan recovery.
-- **Kernel sandbox, loopback & dependency control** — Linux `bwrap` and macOS Seatbelt enforced launchers; default-tightened `$HOME` read isolation with SHA-256-pinned `fs_import_file`/`fs_export_file`; per-session `127.0.0.1` loopback port scoping (`$AOS_DEV_PORT`, incl. Linux `--unshare-net` preview bridge); `pkg_install` (`npm`/`pnpm`/`yarn`/`bun`/`pip`/`uv`/`cargo`/`go`) with CoW dependency unlinking and lifecycle-script gating; `host_exec` (enforced `SessionBroker`-only host sibling runner with SHA-256 frozen bundles, `#key=` `DaemonAuth::Required` approval gating, control-plane `423 Locked` interlock, token rotation, scrubbed environment, process-group `killpg`, and DLP-redacted output harvesting); Model API L7 reverse proxy + unified `aos-egress` DLP engine.
-- **Host-brokered Git & GitHub CI/PR/Issue bridge** — `workspace_git_inspect`, transactional `workspace_git` (`auto_commit_shadow`, force-push & poisoning guards), `github_ci_inspect`, `github_ci_rerun`, `github_pr_inspect`, `github_pr_create`, `github_comment_create`, `github_pr_merge`, and `github_issue_inspect` with same-repo read auto-allow, cross-repo escalation, and structured Web Approval cards.
-- **A2A IPC & CAS** — peer discovery, hierarchical tasks, task-bound file claims, `artifact://sha256` content-addressed hand-offs.
-- **Cedar policy, leases & audit** — effect-level approvals, TTL/one-shot leases, `evidence_hash` pinning, hash-chained audit ledger, and `Aegis-OS-Verified` commit/PR receipts.
-- **Zero-Trust External MCP Firewall & Confined Agent Bridge** — `aegis-os mcp` stages credential-free 1:1 proxy stubs (`aegis-os mcp proxy <id>` / `/__aegis/mcp/<id>`) into confined `claude`, `agy`, `opencode`, `codex`, and `cursor` sessions while enforcing host-side policy/SQL risk tiering, DLP pseudonymization, session tainting, SHA-256 Outbox approvals, AES-256-GCM Vault sealing, OAuth 2.1 Auth Realms (live hot-reload without restarting agents), and Declarative Bundles (`aegis-mcp-bundle/v1`); see [`docs/EXTERNAL_MCP_DESIGN.md`](docs/EXTERNAL_MCP_DESIGN.md) for the `v0.11.0` Option B open-registry & hot-bridge spec.
-- **Cloud PaaS** — multi-tenant workspaces, Git-to-PR export, cryptographic scale-to-zero hibernation (`umount` + `cryptsetup close` on idle, crypto-erasure on delete), web approval console.
+---
 
-## Key benchmarks
+## Core Capabilities
 
-| Metric | Result |
+### 1. Kernel-Enforced Sandbox & Transactional CoW VFS
+- **Host repo read-only + encrypted `OrgVault`**: Writes stay inside a sub-ms CoW shadow (`clonefile` on APFS, `FICLONE` on `btrfs`, fast copy fallback on `ext4`), persisted in per-org AES-256 encrypted volumes (`KEK -> DEK` envelope keys) with `fsync` durability and dead-PID orphan recovery.
+- **Default-deny `$HOME` & Mach IPC isolation**: Masks `~/.ssh`, `~/.aws`, `~/.kube`, `*/.env*`, Keychain/`SecurityAgent` popups (`exit 44` shim), `launchctl`, and `osascript`, while locking `.claude/settings.json`, `.mcp.json`, `opencode.json`, `.gemini/antigravity-cli/settings.json`, and `.hermes/config.yaml` read-only. External files cross solely via SHA-256-pinned `fs_import_file` and zero-copy `fs_export_file`.
+- **Split `.git` view + hardened `git` shim**: Mounts host `.git` objects read-only (**99.05%** disk saved on 500 MB packed repos) with a private `GIT_INDEX_FILE` and forced `core.fsmonitor=false` / `core.hooksPath=/dev/null`.
+- **Controlled `127.0.0.1` loopback & `pkg_install`**: Per-session isolated loopback ports (`$AOS_DEV_PORT`, incl. Linux `--unshare-net` preview bridge) and ecosystem-allowlisted dependency installation (`npm`/`pnpm`/`yarn`/`bun`/`pip`/`uv`/`cargo`/`go`) with `#sha256:` pinning and `allow_scripts: true` escalation.
+- **Split-plane L4/L7 proxy + `SessionBroker`**: Model API traffic goes through a local L7 Base-URL reverse proxy (`+0.221 ms` mean TTFT) performing 64 KiB outbound DLP scanning and host-boundary `$AOS_SECRET_*` injection with **zero TLS MITM**; general HTTPS uses L4 `CONNECT` allowlists. Commits pass through `commit_frozen_stage`, `human.token` separation, and 6 `DomainProfile` verifiers (`code`, `docs`, `data`, `binary`, `app_state`, `memory`).
+- **Brokered `host_exec` & Git/GitHub bridge**: `host_exec` runs approved sibling host commands with SHA-256 frozen bundles and `423` control-plane interlock; `workspace_git*` and `github_{ci,pr,issue}_*` provide DLP-redacted inspections and gated mutations.
+
+### 2. Zero-Trust External MCP Firewall (`aegis-os mcp`)
+- **Credential-free 1:1 proxy stubs**: Stages `aegis-os mcp proxy <id>` / `/__aegis/mcp/<id>` into confined `claude`, `agy`, `opencode`, `codex`, and `cursor` sessions while keeping real OAuth/API tokens sealed in host AES-256-GCM vaults.
+- **Full-channel inspection**: Enforces Cedar policies, SQL risk tiering, session tainting, bidirectional PII pseudonymization/blocking, SHA-256 Outbox approvals, live OAuth 2.1 Auth Realms hot-reload, and declarative bundles (`aegis-mcp-bundle/v1`).
+- **`v0.11.0` Option B Open Registry & Hot Bridge**: Stdio network isolation (`--isolate-network`), dynamic discovery, and live bridge promotion; see [`docs/EXTERNAL_MCP_DESIGN.md`](docs/EXTERNAL_MCP_DESIGN.md).
+
+### 3. Multi-Agent Collaboration Without `git worktree` Tax
+- **A2A IPC, file claims & SHA-256 CAS**: Peer discovery, hierarchical tasks, task-bound file locks, and `artifact://sha256` context handoffs (**99.85%** token reduction on 64 KB specs).
+- **4-tier LCS auto-merge & `aegis-os explore`**: **98.7%** automatic conflict-free merge across concurrent agents, atomic rollback (**8.68 ms** for 200 modules), and `Aegis-OS-Verified` commit/PR receipts.
+
+---
+
+## Security Model & Current Limits
+
+| Mode | Entrypoint | Security Boundary? | Protects Against | Status |
+|---|---|---|---|---|
+| **Advisory** | `aegis-os install` | No (compatibility only) | Honest agent mistakes, accidental reads, prompt fatigue | Available |
+| **Enforced** | `aegis-os run -- <agent>` / `install --enforce` | **Yes (OS Kernel)** | Prompt-injected scripts (`V1`–`V6`), host writes, `.ssh`/Keychain/API-key theft, config & `.git/config` RCE, TOCTOU commit swaps | Verified on Linux `bwrap` & macOS Seatbelt |
+| **Isolated** | `aegis-os run --isolated -- <agent>` / Cloud | **Yes (Hardware VM)** | Untrusted repositories, multi-tenant teams, host isolation | 64GB Cloud live; local microVM Phase 4 |
+
+**Known enforced-runtime limits (fail-closed, never silently degraded):**
+- **macOS `cwd` vs. Linux path-remapping**: Linux `bwrap --bind-fd` mounts the CoW shadow at the exact original host path; macOS Seatbelt runs with the shadow directory as `cwd` and mounts the host repo read-only (FUSE/NFSv3 path-remapping is Phase 4).
+- **Ubuntu 24.04+ unprivileged userns**: Fails closed with setup instructions if `kernel.apparmor_restrict_unprivileged_userns=1` is enabled without `/etc/apparmor.d/bwrap`.
+- **Non-model HTTPS inspection**: General allowlisted HTTPS uses L4 `CONNECT` domain filtering without TLS MITM decryption.
+
+<details>
+<summary><strong>Full CLI Command Reference</strong></summary>
+
+`aegis-os audit-me [--share|--json]` · `aegis-os run [--isolated] -- <agent>` · `aegis-os explore` · `aegis-os status` · `aegis-os diff [--json]` · `aegis-os verify` · `aegis-os commit [--expected-diff-hash]` · `aegis-os discard` · `aegis-os publish` · `aegis-os approvals` · `aegis-os why` · `aegis-os a2a board` · `aegis-os policy watch` · `aegis-os memory ui` · `aegis-os mcp {list,adopt,proxy,...}` · `aegis-os vault status` · `aegis-os doctor` · `aegis-os upgrade [--check]` · `aegis-os uninstall`
+
+</details>
+
+---
+
+## Benchmarks & Reproducibility
+
+| Benchmark Suite | Key Result |
 |---|---|
-| V1–V6 bypass coverage (30 executable payloads, macOS Seatbelt & Linux `bwrap`) | **0/30 (0.0%)** vs. **93.3%** advisory hooks · **73.3%–83.3%** vendor sandboxes · **80.0%** `nerdctl` devcontainer |
-| Live 4-agent repo-trap compromise (`claude`, `opencode`, `agy`, `hermes`, 54 executed cloud-API runs across 60-cell matrix) | **0%** (`aegis_enforced`) vs. **100%** (`vendor_default`, incl. Claude Opus) · **100% (8/8)** benign & multi-file `unittest` pass rate |
-| Enforced sandbox startup latency | **9.91 ms** Linux `bwrap` (**22.4× faster** than `nerdctl`'s 221.53 ms) · **20.38 ms** macOS Seatbelt |
-| Packed 500 MB Git CoW disk allocation (`git repack -ad`) | **4.76 MB** on APFS (**99.05% physical disk saved**) · **0.00 MB** net delta on `btrfs` |
-| Loopback L7 Egress Proxy overhead & CLI TOCTOU/VT100 gate | **+0.221 ms** mean TTFT (`0/40` FP, `25/25` DLP blocked) · **60/60 (100%)** TOCTOU swaps blocked (**7.54–7.92 ms** per-class median) |
-| Prompt reduction (52 real sessions, 28,087 tool calls) & 4-tier LCS auto-merge | **90.7%–97.9%** fewer prompts · **98.7%** auto-merge · **8.68 ms** 200-module rollback |
+| V1–V6 bypass payloads (`n = 30`, macOS Seatbelt & Linux `bwrap`) | **0/30 (0.0%)** vs. **93.3%** advisory hooks · **73.3%–83.3%** vendor sandboxes · **80.0%** `nerdctl` |
+| Live 4-agent repo-trap matrix (`claude`, `opencode`, `agy`, `hermes`, 54 API runs) | **0%** (`aegis_enforced`) vs. **100%** (`vendor_default`, incl. Claude Opus) · **100% (8/8)** benign test pass |
+| Sandbox startup & L7 proxy overhead | **9.91 ms** Linux `bwrap` (**22.4×** faster than `nerdctl`) · **20.38 ms** macOS Seatbelt · **+0.221 ms** L7 TTFT (`25/25` DLP blocked, `0/40` FP) |
+| Packed 500 MB Git CoW & CLI TOCTOU/VT100 gate | **4.76 MB** APFS (**99.05%** disk saved) · **0.00 MB** `btrfs` · **60/60 (100%)** TOCTOU swaps blocked (**7.54–7.92 ms** median) |
+| Prompt reduction & multi-agent merge (`52` sessions, `28,087` calls) | **90.7%–97.9%** fewer prompts · **98.7%** auto-merge · **8.68 ms** 200-module rollback |
 
-> See [`BENCHMARK_REPORT.md`](BENCHMARK_REPORT.md) (Paper 1 multi-agent & VFS suite) and [`paper2/ENFORCED_RUNTIME_BENCH_REPORT.json`](paper2/ENFORCED_RUNTIME_BENCH_REPORT.json) + [`scripts/p2_live/README.md`](scripts/p2_live/README.md) (Paper 2 cross-platform & live CLI agent suite) for full reproduction instructions.
+Full reproduction guides and raw datasets: [`BENCHMARK_REPORT.md`](BENCHMARK_REPORT.md) · [`paper2/ENFORCED_RUNTIME_BENCH_REPORT.json`](paper2/ENFORCED_RUNTIME_BENCH_REPORT.json) · [`scripts/p2_live/README.md`](scripts/p2_live/README.md).
 
-## Documentation
+---
 
-- **Complete Technical Reference & User Manual (Architecture, Threat Model, Countermeasures & CLI Guide)** — [`docs/DOC.md`](docs/DOC.md)
-- **External MCP Integration Architecture & Option B Spec** — [`docs/EXTERNAL_MCP_DESIGN.md`](docs/EXTERNAL_MCP_DESIGN.md)
-- **Benchmark reports** — [`BENCHMARK_REPORT.md`](BENCHMARK_REPORT.md) · [`paper2/ENFORCED_RUNTIME_BENCH_REPORT.json`](paper2/ENFORCED_RUNTIME_BENCH_REPORT.json) · [`scripts/p2_live/README.md`](scripts/p2_live/README.md)
-- **Paper 1 (Transactional Agent OS · arXiv:2611.08516)** — [https://arxiv.org/abs/2611.08516](https://arxiv.org/abs/2611.08516) ([PDF](https://arxiv.org/pdf/2611.08516) · local copy: [`paper/aegis_os_arxiv_preprint.pdf`](paper/aegis_os_arxiv_preprint.pdf))
-- **Paper 2 (Enforced Runtime & Plugin Security Boundary · DOI: 10.5281/zenodo.24170505)** — [https://doi.org/10.5281/zenodo.24170505](https://doi.org/10.5281/zenodo.24170505) ([Zenodo Record](https://zenodo.org/records/24170505) · local PDF: [`paper2/aegis_enforced_runtime_arxiv_preprint.pdf`](paper2/aegis_enforced_runtime_arxiv_preprint.pdf) · [LaTeX](paper2/main.tex))
-- **Technical monographs** — [Why Agent Plugins Are Not a Security Boundary](https://heurion.org/en/blog/from-agent-plugins-to-enforced-runtime) · [Beyond Git Branches & Shared Folders](https://heurion.org/en/blog/aegis-os-transactional-agent-kernel) · [Human-Agent Capability Parity](https://heurion.org/en/blog/human-agent-capability-parity-ai-native-software) · [Dual-Surface CRDT](https://heurion.org/en/blog/dual-surface-crdt-clinical-ai)
-- **Blog index** — https://heurion.org/en/blog (中文: https://heurion.org/blog)
+## Documentation, Papers & Citation
 
-## Citation
-
-If you use Aegis OS in your research or engineering workflows, please cite our papers:
+- **Complete Technical Reference & User Manual** — [`docs/DOC.md`](docs/DOC.md)
+- **External MCP Architecture & Option B Spec** — [`docs/EXTERNAL_MCP_DESIGN.md`](docs/EXTERNAL_MCP_DESIGN.md)
+- **10-Second Safe Red-Team Demo** — [`examples/redteam-demo/README.md`](examples/redteam-demo/README.md) ([`run_demo.sh`](examples/redteam-demo/run_demo.sh))
+- **Paper 1 (Transactional Agent OS · arXiv:2611.08516)** — [https://arxiv.org/abs/2611.08516](https://arxiv.org/abs/2611.08516) ([PDF](https://arxiv.org/pdf/2611.08516) · local: [`paper/aegis_os_arxiv_preprint.pdf`](paper/aegis_os_arxiv_preprint.pdf))
+- **Paper 2 (Enforced Runtime & Plugin Security Boundary · DOI: 10.5281/zenodo.24170505)** — [https://doi.org/10.5281/zenodo.24170505](https://doi.org/10.5281/zenodo.24170505) ([Zenodo](https://zenodo.org/records/24170505) · local: [`paper2/aegis_enforced_runtime_arxiv_preprint.pdf`](paper2/aegis_enforced_runtime_arxiv_preprint.pdf) · [LaTeX](paper2/main.tex))
+- **Technical Monographs** — [Why Agent Plugins Are Not a Security Boundary](https://heurion.org/en/blog/from-agent-plugins-to-enforced-runtime) · [Beyond Git Branches & Shared Folders](https://heurion.org/en/blog/aegis-os-transactional-agent-kernel) · [Human-Agent Capability Parity](https://heurion.org/en/blog/human-agent-capability-parity-ai-native-software) · [Dual-Surface CRDT](https://heurion.org/en/blog/dual-surface-crdt-clinical-ai) ([All Posts](https://heurion.org/en/blog))
 
 ```bibtex
 @article{zhao2026aegisos,
@@ -169,8 +212,11 @@ If you use Aegis OS in your research or engineering workflows, please cite our p
 }
 ```
 
-## Telemetry & license
+---
 
-Anonymous install/session ping only; no source, paths, prompts, or credentials. Opt out with `DO_NOT_TRACK=1`, `AOS_TELEMETRY_DISABLED=1`, or `touch ~/.gemini/aegis-telemetry-opt-out`. Details: [`docs/DOC.md`](docs/DOC.md).
+## Privacy, Optional Cloud, Contributing & License
 
-Apache License 2.0. See [`LICENSE`](LICENSE).
+- **100% Local & Zero Outbound Telemetry by Default:** `aegis-os` writes anonymous local counters only to your local `<runtime_dir>/paas_state.json` for `aegis-os stats`, and makes **zero** outbound telemetry requests unless you explicitly configure `AOS_TELEMETRY_URL` or `AOS_CLOUD_ENDPOINT`. Disable even local recording anytime via `DO_NOT_TRACK=1`, `AOS_TELEMETRY_DISABLED=1`, or `touch ~/.gemini/aegis-telemetry-opt-out`.
+- **Optional Aegis Cloud:** Need remote 64 GB microVM workers with cryptographic scale-to-zero hibernation and a web approval console? See [Cloud Dashboard](https://heurion.org/aegis-cloud/dashboard) and [Approval Console](https://heurion.org/aegis-cloud/approve) (or use `aegis-os approve --web` locally for free).
+- **Contributing & Security:** PRs and new agent adapters/bypass tests are welcome — see [`CONTRIBUTING.md`](CONTRIBUTING.md). Please disclose Enforced/Isolated bypasses privately via [`SECURITY.md`](SECURITY.md).
+- **License:** Apache License 2.0 ([`LICENSE`](LICENSE)).

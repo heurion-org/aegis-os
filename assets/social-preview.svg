@@ -1,0 +1,96 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1280 640" width="1280" height="640" role="img" aria-label="Aegis OS GitHub Social Preview">
+  <defs>
+    <radialGradient id="sp-glow" cx="0.82" cy="0.22" r="0.65">
+      <stop offset="0%" stop-color="#06B6D4" stop-opacity="0.22"/>
+      <stop offset="55%" stop-color="#10B981" stop-opacity="0.08"/>
+      <stop offset="100%" stop-color="#090F1D" stop-opacity="0"/>
+    </radialGradient>
+    <linearGradient id="sp-bg" x1="0" y1="0" x2="1" y2="1">
+      <stop offset="0%" stop-color="#131C31"/>
+      <stop offset="100%" stop-color="#090F1D"/>
+    </linearGradient>
+    <linearGradient id="sp-rim" x1="0" y1="0" x2="1" y2="1">
+      <stop offset="0%" stop-color="#34D399"/>
+      <stop offset="50%" stop-color="#06B6D4"/>
+      <stop offset="100%" stop-color="#60A5FA"/>
+    </linearGradient>
+    <linearGradient id="sp-left" x1="0" y1="0" x2="0" y2="1">
+      <stop offset="0%" stop-color="#34D399"/>
+      <stop offset="100%" stop-color="#06B6D4"/>
+    </linearGradient>
+    <linearGradient id="sp-right" x1="0" y1="0" x2="0" y2="1">
+      <stop offset="0%" stop-color="#0EA5E9"/>
+      <stop offset="100%" stop-color="#2563EB"/>
+    </linearGradient>
+    <style>
+      .sans { font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Helvetica, Arial, sans-serif; }
+      .mono { font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace; }
+    </style>
+  </defs>
+
+  <rect width="1280" height="640" fill="url(#sp-bg)"/>
+  <rect width="1280" height="640" fill="url(#sp-glow)"/>
+
+  <!-- Subtle Grid -->
+  <g stroke="#1E293B" stroke-width="1" stroke-opacity="0.35">
+    <line x1="0" y1="128" x2="1280" y2="128"/>
+    <line x1="0" y1="256" x2="1280" y2="256"/>
+    <line x1="0" y1="384" x2="1280" y2="384"/>
+    <line x1="0" y1="512" x2="1280" y2="512"/>
+    <line x1="256" y1="0" x2="256" y2="640"/>
+    <line x1="512" y1="0" x2="512" y2="640"/>
+    <line x1="768" y1="0" x2="768" y2="640"/>
+    <line x1="1024" y1="0" x2="1024" y2="640"/>
+  </g>
+
+  <!-- Top Brand Row -->
+  <g transform="translate(80, 68)">
+    <g transform="scale(0.62)">
+      <path d="M 64 8 L 112 26 L 112 68 L 98 96 L 64 120 L 30 96 L 16 68 L 16 26 Z"
+            fill="#090F1D" stroke="url(#sp-rim)" stroke-width="4" stroke-linejoin="round"/>
+      <path d="M 64 26 L 38 84 L 49.5 84 L 64 51 Z" fill="url(#sp-left)"/>
+      <path d="M 64 26 L 90 84 L 78.5 84 L 64 51 Z" fill="url(#sp-right)"/>
+      <path d="M 51.5 68 L 76.5 68 L 74 74.5 L 54 74.5 Z" fill="#E0F2FE"/>
+      <path d="M 64 62.5 L 70 71 L 64 79.5 L 58 71 Z" fill="#FFFFFF" stroke="#34D399" stroke-width="1.2"/>
+    </g>
+    <text x="96" y="47" fill="#F8FAFC" font-size="34" font-weight="800" letter-spacing="1.5" class="sans">AEGIS OS</text>
+    <rect x="278" y="21" width="236" height="32" rx="16" fill="#064E3B" stroke="#10B981" stroke-opacity="0.6"/>
+    <text x="396" y="42" text-anchor="middle" fill="#6EE7B7" font-size="14" font-weight="700" class="mono">KERNEL AGENT RUNTIME</text>
+  </g>
+
+  <!-- Main Headline -->
+  <text x="80" y="232" fill="#FFFFFF" font-size="54" font-weight="800" class="sans">
+    Run AI Coding Agents in
+  </text>
+  <text x="80" y="302" fill="url(#sp-rim)" font-size="54" font-weight="800" class="sans">
+    --yolo Mode Safely
+  </text>
+
+  <!-- Subtitle -->
+  <text x="80" y="362" fill="#CBD5E1" font-size="24" font-weight="400" class="sans">
+    9.9ms Kernel Sandbox (bwrap / Seatbelt) · CoW Shadow Workspaces · Zero-Trust MCP Firewall
+  </text>
+  <text x="80" y="400" fill="#94A3B8" font-size="19" class="mono">
+    For claude · codex · opencode · agy · hermes  —  protect ~/.ssh, ~/.aws, .env &amp; host repos
+  </text>
+
+  <!-- Three Metric Pills -->
+  <g transform="translate(80, 444)">
+    <rect x="0" y="0" width="350" height="92" rx="12" fill="#0F172A" stroke="#10B981" stroke-opacity="0.6" stroke-width="1.5"/>
+    <text x="24" y="42" fill="#34D399" font-size="32" font-weight="800" class="mono">0 / 30</text>
+    <text x="24" y="72" fill="#CBD5E1" font-size="16" font-weight="600" class="sans">Sandbox Bypasses (vs. 73%–93%)</text>
+
+    <rect x="385" y="0" width="350" height="92" rx="12" fill="#0F172A" stroke="#06B6D4" stroke-opacity="0.6" stroke-width="1.5"/>
+    <text x="409" y="42" fill="#38BDF8" font-size="32" font-weight="800" class="mono">90.7–97.9%</text>
+    <text x="409" y="72" fill="#CBD5E1" font-size="16" font-weight="600" class="sans">Fewer Approval Prompts via CoW</text>
+
+    <rect x="770" y="0" width="350" height="92" rx="12" fill="#0F172A" stroke="#60A5FA" stroke-opacity="0.6" stroke-width="1.5"/>
+    <text x="794" y="42" fill="#60A5FA" font-size="32" font-weight="800" class="mono">99.05%</text>
+    <text x="794" y="72" fill="#CBD5E1" font-size="16" font-weight="600" class="sans">Packed Git Disk Saved on APFS</text>
+  </g>
+
+  <!-- Footer -->
+  <text x="80" y="592" fill="#64748B" font-size="17" font-weight="600" class="mono">
+    github.com/heurion-org/aegis-os  ·  Apache-2.0  ·  Built in Rust
+  </text>
+</svg>

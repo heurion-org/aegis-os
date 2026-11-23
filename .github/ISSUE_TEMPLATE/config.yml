@@ -1,0 +1,8 @@
+blank_issues_enabled: false
+contact_links:
+  - name: Security Vulnerability or Sandbox Bypass (Private)
+    url: https://github.com/heurion-org/aegis-os/security/advisories/new
+    about: Please disclose Enforced/Isolated sandbox escapes or secret leaks privately rather than in public issues.
+  - name: Questions, Architecture & Ideas (Discussions)
+    url: https://github.com/heurion-org/aegis-os/discussions
+    about: Ask usage questions, share `aegis-os audit-me` scores, or discuss roadmap designs.

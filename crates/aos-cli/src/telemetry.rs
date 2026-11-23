@@ -1,9 +1,12 @@
-//! Privacy-Preserving Anonymous Telemetry & Product Growth Analytics (`aegis-os stats`)
+//! Privacy-Preserving Local Analytics & Product Growth Diagnostics (`aegis-os stats`, `audit-me`)
 //!
-//! Collects strictly anonymous adoption metrics (DAU / WAU / MAU, OS/Arch, and IDE Client breakdown)
-//! without ever transmitting source code, file paths, usernames, hostnames, or IP addresses.
+//! **100% local by default:** records anonymous local session metrics in `<runtime_dir>/paas_state.json`
+//! so `aegis-os stats` works out of the box without making outbound network requests.
+//! Outbound telemetry forwarding is **disabled unless** `AOS_TELEMETRY_URL` or
+//! `AOS_CLOUD_ENDPOINT` is explicitly configured, and never transmits source code, file paths,
+//! usernames, hostnames, prompts, credentials, or IP addresses.
 //!
-//! Opt-out anytime via:
+//! Disable even local recording anytime via:
 //! - `export DO_NOT_TRACK=1`
 //! - `export AOS_TELEMETRY_DISABLED=1`
 //! - `touch ~/.gemini/aegis-telemetry-opt-out`
@@ -11,6 +14,7 @@
 use aos_mcp_gateway::paas::{PaasControlPlane, TelemetryPingPayload};
 use chrono::Utc;
 use serde_json::{json, Value};
+use std::io::IsTerminal;
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
@@ -752,6 +756,29 @@ pub fn compute_audit_me_report(home_dir: &Path, workspace: &Path, runtime_dir: &
     })
 }
 
+fn audit_use_color() -> bool {
+    std::io::stdout().is_terminal() && std::env::var_os("NO_COLOR").is_none()
+}
+
+fn style_ansi(text: &str, code: &str, color: bool) -> String {
+    if color {
+        format!("\x1b[{code}m{text}\x1b[0m")
+    } else {
+        text.to_string()
+    }
+}
+
+fn format_audit_box_line(plain: &str, styled: &str, inner_width: usize) -> String {
+    let plain_len = plain.chars().count();
+    if plain_len <= inner_width {
+        let pad = inner_width - plain_len;
+        format!("│{styled}{}│", " ".repeat(pad))
+    } else {
+        let truncated: String = plain.chars().take(inner_width.saturating_sub(1)).collect();
+        format!("│{truncated}…│")
+    }
+}
+
 /// Renders the `aegis-os audit-me` diagnostic report to stdout (terminal box, `--share` Markdown, or `--json`).
 pub async fn render_audit_me_report(
     home_dir: &Path,
@@ -775,6 +802,7 @@ pub async fn render_audit_me_report(
         return Ok(());
     }
 
+    let color = audit_use_color();
     let score = report["score"].as_u64().unwrap_or(0);
     let grade = report["grade"].as_str().unwrap_or("-");
     let verdict = report["verdict"].as_str().unwrap_or("-");
@@ -797,18 +825,38 @@ pub async fn render_audit_me_report(
         .as_bool()
         .unwrap_or(false);
 
-    println!("┌──────────────────────────────────────────────────────────────────────────────┐");
-    println!("│  🛡️  AEGIS OS — CODING AGENT SECURITY & PROMPT FATIGUE AUDIT (`audit-me`)   │");
-    println!("├──────────────────────────────────────────────────────────────────────────────┤");
-    println!(
-        "│  Readiness Score: {:>3}/100 [Grade {}] — {:<38} │",
-        score,
-        grade,
-        &verdict[..verdict.len().min(38)]
-    );
-    println!("└──────────────────────────────────────────────────────────────────────────────┘");
+    let grade_code = match grade {
+        "S" | "A" => "1;32",
+        "B" => "1;36",
+        "C" => "1;33",
+        _ => "1;31",
+    };
 
-    println!("\n[1] Host Credential Exposure Surface (100% Local Metadata Check)");
+    const BOX_INNER: usize = 82;
+    let border_top = format!("┌{}┐", "─".repeat(BOX_INNER));
+    let border_mid = format!("├{}┤", "─".repeat(BOX_INNER));
+    let border_bot = format!("└{}┘", "─".repeat(BOX_INNER));
+    let title_plain = "  AEGIS OS — CODING AGENT SECURITY & PROMPT FATIGUE AUDIT (`audit-me`)";
+    let title_styled = style_ansi(title_plain, "1;36", color);
+    let score_plain = format!("  Readiness Score: {:>3}/100 [Grade {}]", score, grade);
+    let score_styled = format!(
+        "  Readiness Score: {}",
+        style_ansi(&format!("{:>3}/100 [Grade {}]", score, grade), grade_code, color)
+    );
+    let verdict_plain = format!("  Verdict: {verdict}");
+    let verdict_styled = format!("  Verdict: {}", style_ansi(verdict, grade_code, color));
+
+    println!("{}", style_ansi(&border_top, "36", color));
+    println!("{}", format_audit_box_line(title_plain, &title_styled, BOX_INNER));
+    println!("{}", style_ansi(&border_mid, "36", color));
+    println!("{}", format_audit_box_line(&score_plain, &score_styled, BOX_INNER));
+    println!("{}", format_audit_box_line(&verdict_plain, &verdict_styled, BOX_INNER));
+    println!("{}", style_ansi(&border_bot, "36", color));
+
+    println!(
+        "\n{}",
+        style_ansi("[1] Host Credential Exposure Surface (100% Local Metadata Check)", "1;36", color)
+    );
     println!(
         "  • Sensitive Credential Stores Found on Host: {} store(s)",
         exposed_count
@@ -817,9 +865,9 @@ pub async fn render_audit_me_report(
         for s in stores {
             if s["present_on_host"].as_bool().unwrap_or(false) {
                 let status = if has_shims {
-                    "MASKED by Enforced Shim (`0.0%` leak)"
+                    style_ansi("MASKED by Enforced Shim (`0.0%` leak)", "1;32", color)
                 } else {
-                    "EXPOSED to raw `--yolo` / un-sandboxed agents"
+                    style_ansi("EXPOSED to raw `--yolo` / un-sandboxed agents", "1;31", color)
                 };
                 println!(
                     "    - {:<52} -> [{}]",
@@ -830,29 +878,36 @@ pub async fn render_audit_me_report(
         }
     }
 
-    println!("\n[2] Approval Prompt Fatigue & Developer Flow Recovery");
+    println!(
+        "\n{}",
+        style_ansi("[2] Approval Prompt Fatigue & Developer Flow Recovery", "1;36", color)
+    );
     println!(
         "  • Estimated Manual Prompts Without Aegis:    ~{} confirmations",
         raw_prompts
     );
     println!(
-        "  • Prompts Eliminated by CoW Shadow VFS:      ~{} saved (-94.3% prompt reduction)",
-        saved_prompts
+        "  • Prompts Eliminated by CoW Shadow VFS:      ~{} saved ({})",
+        saved_prompts,
+        style_ansi("-94.3% prompt reduction", "32", color)
     );
     println!(
         "  • Developer Context-Switch Time Recovered:   ~{} minutes saved",
         mins_saved
     );
 
-    println!("\n[3] Multi-Agent Silent Overwrite & Workspace Posture");
+    println!(
+        "\n{}",
+        style_ansi("[3] Multi-Agent Silent Overwrite & Workspace Posture", "1;36", color)
+    );
     println!("  • Raw Shared-Folder Multi-Agent Overwrites:  41.2% silent loss (benchmark baseline)");
     println!("  • Aegis 4-Tier LCS CoW Auto-Merge Rate:      98.7% conflict-free merge");
     println!(
         "  • Current Repo Collaborator Rules (`.agents`): {}",
         if repo_rules {
-            "ACTIVE (`.agents/rules/aegis-os-workflow.md`)"
+            style_ansi("ACTIVE (`.agents/rules/aegis-os-workflow.md`)", "32", color)
         } else {
-            "MISSING (run `aegis-os setup-agy` to protect repo collaborators)"
+            style_ansi("MISSING (run `aegis-os setup-agy` to protect repo collaborators)", "33", color)
         }
     );
     if let Some(clients) = report["agent_posture"]["clients"].as_array() {
@@ -861,27 +916,38 @@ pub async fn render_audit_me_report(
             let adv = c["advisory_configured"].as_bool().unwrap_or(false);
             let enf = c["enforced_shim"].as_bool().unwrap_or(false);
             let badge = if enf {
-                "ENFORCED (Shim + CoW + MCP)"
+                style_ansi("ENFORCED (Shim + CoW + MCP)", "1;32", color)
             } else if adv {
-                "ADVISORY (CoW + MCP)"
+                style_ansi("ADVISORY (CoW + MCP)", "33", color)
             } else {
-                "UNPROTECTED"
+                style_ansi("UNPROTECTED", "31", color)
             };
             println!("    - {:<24} -> [{}]", name, badge);
         }
     }
 
-    println!("\n[4] Six-Vector Plugin Bypass Surface (V1–V6 Reference Monitor Audit)");
+    println!(
+        "\n{}",
+        style_ansi("[4] Six-Vector Plugin Bypass Surface (V1–V6 Reference Monitor Audit)", "1;36", color)
+    );
     if let Some(vectors) = report["plugin_bypass_surface"]["vectors"].as_array() {
         for v in vectors {
             let vid = v["id"].as_str().unwrap_or("-");
             let vname = v["name"].as_str().unwrap_or("-");
             let vstatus = v["status"].as_str().unwrap_or("-");
-            println!("    - [{}] {:<54} -> [{}]", vid, vname, vstatus);
+            let styled_status = if vstatus.starts_with("closed_") {
+                style_ansi(vstatus, "32", color)
+            } else {
+                style_ansi(vstatus, "1;31", color)
+            };
+            println!("    - [{}] {:<54} -> [{}]", vid, vname, styled_status);
         }
     }
 
-    println!("\n[5] MCP Server & Plaintext Secret Surface (`aegis-os mcp`)");
+    println!(
+        "\n{}",
+        style_ansi("[5] MCP Server & Plaintext Secret Surface (`aegis-os mcp`)", "1;36", color)
+    );
     let unprot = report["mcp_security"]["unprotected_servers_count"]
         .as_u64()
         .unwrap_or(0);
@@ -896,12 +962,21 @@ pub async fn render_audit_me_report(
         prot, unprot, exp_keys
     );
     if unprot > 0 {
-        println!("  👉 Adopt & seal plaintext MCP credentials: `aegis-os mcp adopt --all`");
+        println!(
+            "  {}",
+            style_ansi("👉 Adopt & seal plaintext MCP credentials: `aegis-os mcp adopt --all`", "33", color)
+        );
     }
 
-    println!("\n[6] Recommended Next Actions & Shareable Report");
+    println!(
+        "\n{}",
+        style_ansi("[6] Recommended Next Actions & Shareable Report", "1;36", color)
+    );
     if !has_shims {
-        println!("  👉 Upgrade to Grade S (Kernel Enforced): `aegis-os install --enforce`");
+        println!(
+            "  {}",
+            style_ansi("👉 Upgrade to Grade S (Kernel Enforced): `aegis-os install --enforce`", "1;32", color)
+        );
     }
     if !repo_rules {
         println!("  👉 Add Repo Team Onboarding Rules:       `aegis-os setup-agy`");
@@ -918,7 +993,7 @@ pub async fn render_audit_me_report(
 
 #[cfg(test)]
 mod audit_me_tests {
-    use super::compute_audit_me_report;
+    use super::{compute_audit_me_report, format_audit_box_line, style_ansi};
 
     #[test]
     fn audit_me_computes_score_and_share_card_without_reading_secrets() {
@@ -989,6 +1064,20 @@ mod audit_me_tests {
         assert!(!serde_json::to_string(&mcp_report)
             .unwrap()
             .contains("ghp_never_print_me"));
+    }
+
+    #[test]
+    fn audit_me_ansi_helpers_preserve_box_alignment_and_plain_mode() {
+        let plain = "  Verdict: ZERO-TRUST ENFORCED";
+        let styled = format!("  Verdict: {}", style_ansi("ZERO-TRUST ENFORCED", "1;32", true));
+        let line_color = format_audit_box_line(plain, &styled, 40);
+        assert!(line_color.starts_with('│'));
+        assert!(line_color.ends_with('│'));
+        assert!(line_color.contains("\x1b[1;32mZERO-TRUST ENFORCED\x1b[0m"));
+        assert_eq!(style_ansi("SAFE", "32", false), "SAFE");
+
+        let line_plain = format_audit_box_line(plain, plain, 40);
+        assert_eq!(line_plain.chars().count(), 42);
     }
 }
 

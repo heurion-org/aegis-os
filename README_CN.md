@@ -2,147 +2,191 @@
   <picture>
     <source media="(prefers-color-scheme: dark)" srcset="assets/aegis-logo-dark.svg">
     <source media="(prefers-color-scheme: light)" srcset="assets/aegis-logo-light.svg">
-    <img alt="Aegis OS" src="assets/aegis-logo-light.svg" width="380">
+    <img alt="Aegis OS" src="assets/aegis-logo-light.svg" width="340">
   </picture>
 </p>
 
-# Aegis OS (`aegis-os`)
+<h3 align="center">
+  放心运行 <code>claude --dangerously-skip-permissions</code> 与 <code>codex --full-auto</code> —— 不再把 <code>~/.ssh</code>、<code>~/.aws</code>、<code>.env</code> 和宿主机仓库暴露给 Agent。
+</h3>
 
-**[English](README.md) | [简体中文](README_CN.md) | [Aegis OS 官网](https://heurion.org/aegis-os/) | [使用教程](https://heurion.org/aegis-os/tutorial/) | [论文一 (arXiv:2611.08516)](https://arxiv.org/abs/2611.08516) | [论文二 (DOI: 10.5281/zenodo.24170505)](https://doi.org/10.5281/zenodo.24170505) | [技术博客](https://heurion.org/blog) | [云端控制台与 Pro ($29/月)](https://heurion.org/aegis-cloud/dashboard) | [边界审批台](https://heurion.org/aegis-cloud/approve)**
+<p align="center">
+  <strong>9.9ms OS 内核沙箱（<code>bwrap</code> / macOS Seatbelt）+ 亚毫秒级 CoW 影子工作区 + 零信任 MCP 防火墙 —— Rust 原生构建。</strong>
+</p>
 
-**面向自主编程 Agent（`claude`、`opencode`、`agy`、`hermes`、`codex`）的事务型多租户 Agent OS 运行时 —— 父进程内核沙箱、CoW 影子工作区、A2A 协同与 SHA-256 防 TOCTOU 篡改审批。**
+<p align="center">
+  <a href="https://github.com/heurion-org/aegis-os/actions/workflows/ci.yml"><img src="https://github.com/heurion-org/aegis-os/actions/workflows/ci.yml/badge.svg" alt="CI"></a>
+  <a href="LICENSE"><img src="https://img.shields.io/badge/License-Apache_2.0-blue.svg" alt="License: Apache 2.0"></a>
+  <img src="https://img.shields.io/badge/Rust-1.80%2B%20(2021)-orange.svg" alt="Rust 1.80+">
+  <a href="https://arxiv.org/abs/2611.08516"><img src="https://img.shields.io/badge/arXiv-2611.08516-b31b1b.svg" alt="arXiv:2611.08516"></a>
+  <a href="https://doi.org/10.5281/zenodo.24170505"><img src="https://zenodo.org/badge/DOI/10.5281/zenodo.24170505.svg" alt="DOI: 10.5281/zenodo.24170505"></a>
+  <a href="https://m8ven.ai/mcp/heurion-org/aegis-os?s=readme"><img src="https://m8ven.ai/badge/mcp/heurion-org/aegis-os" alt="M8ven Score"></a>
+</p>
 
-> **强制等级**：`aegis-os install` = **advisory**（进程内 Hook / MCP / 规则；缓解弹窗疲劳，但不是安全边界）。`aegis-os run -- <agent>` = **enforced**（Aegis 作为父进程 OS 监管器；Linux `bwrap --bind-fd` + macOS Seatbelt 内核隔离 + CoW 影子工作区 + 分离式 `.git` 垫片 + L4/L7 `$AOS_SECRET_*` 边界密钥注入代理）。`aegis-os run --isolated` / Aegis Cloud = **isolated**（64GB 云端沙箱 / microVM）。
+<p align="center">
+  <a href="README.md">English</a> | <strong>简体中文</strong> | <a href="https://heurion.org/aegis-os/">官网</a> | <a href="https://heurion.org/aegis-os/tutorial/">教程</a> | <a href="docs/DOC.md">技术文档</a> | <a href="https://arxiv.org/abs/2611.08516">论文一 (arXiv)</a> | <a href="https://doi.org/10.5281/zenodo.24170505">论文二 (Zenodo)</a> | <a href="https://heurion.org/blog">技术博客</a>
+</p>
 
-![Rust](https://img.shields.io/badge/Rust-1.80%2B%20(2021)-orange.svg)
-![MCP](https://img.shields.io/badge/Protocol-MCP%202024--11--05-blue.svg)
-![A2A](https://img.shields.io/badge/Protocol-Google%20A2A-34A853.svg)
-[![arXiv](https://img.shields.io/badge/arXiv-2611.08516-b31b1b.svg)](https://arxiv.org/abs/2611.08516)
-[![DOI](https://zenodo.org/badge/DOI/10.5281/zenodo.24170505.svg)](https://doi.org/10.5281/zenodo.24170505)
-[![Blog](https://img.shields.io/badge/Blog-heurion.org%2Fblog-0A7D52.svg)](https://heurion.org/blog)
+<p align="center">
+  <img src="assets/demo-terminal.svg" alt="Aegis OS 内核沙箱对比裸跑 --yolo 演示" width="880">
+</p>
 
 ---
 
-## 这是什么
+## 为什么需要 Aegis OS？
 
-- **终结 `--yolo` 凭据裸奔** — 放心运行 `claude --dangerously-skip-permissions`、`codex --full-auto` 或 `agy`，不再把 `~/.ssh`、`~/.aws`、`.env` 与任意外网暴露给被注入的命令；运行 `aegis-os audit-me` 即可 5 秒体检本机风险。
-- **砍掉 90.7%–97.9% 的授权确认弹窗** — Agent 在亚毫秒级写时复制（CoW）影子工作区内零逐条确认全速运行，只有落盘到宿主与跨边界操作需要人工审批或 TTL 租约。
-- **多 Agent 并行不再静默互踩** — 用任务级文件锁、四级 LCS 自动归并（**98.7%**）与 `Aegis-OS-Verified` 提交审计凭证，替代笨重的 `git worktree` 和存在 **41.2%** 静默覆盖率的共享目录直写。
+进程内 Hook 和客户端配置规则全部运行在**开发者自身的 UNIX UID 之下**。一条来自网页/文档的 Prompt 注入，或仓库里看似无害的构建/检查脚本（如 `python3 scripts/verify_env.py`），就能绕过正则 Hook、覆写 `.claude/settings.json` / `.mcp.json`、利用 `.git/config` `core.fsmonitor` 触发 RCE，或经裸 Socket 外泄密钥。
 
-Aegis OS 把授权边界从「单次工具调用」提升为**事务型工作区边界**。在 enforced 模式下，每个 Agent 获得独立的写时复制（CoW）影子工作区、内核沙箱、身份绑定的出站代理，以及策略 / 审批 broker。工作区内 Agent **零逐条确认**运行；只有落盘到宿主与跨边界操作需要人工审批或 TTL 租约。
+**Aegis OS 反转了控制权。** 作为父进程 OS 监管器，它在子进程 `execve()` **之前**就完成写时复制（CoW）影子工作区、内核隔离（Linux `bwrap --bind-fd` / macOS Seatbelt）、分离式 `.git` 视图、L4/L7 边界密钥注入代理与双令牌 `SessionBroker` 的装配——被攻陷的 Agent 无法退出、无法自批、也接触不到真实凭据。
 
-它同时替代 Git 分支（滞后冲突爆炸、重型 worktree）与共享目录直写（无协调多 Agent 基准中 **41.2%** 的并发写入被静默覆盖）。它不局限于代码：代码、文档、数据流水线、二进制资产与跨应用状态共用同一套 shadow / claim / verify / commit 内核，领域差异由 profile 决定。**Heurion 2.0 是第一个第一方参考应用。**
+| 能力 / 实测指标 | 裸跑 `--yolo` | Advisory Hook | 厂商自带沙箱 | Docker (`nerdctl`) | **Aegis OS (Enforced)** |
+|---|---|---|---|---|---|
+| **V1–V6 绕过载荷失守率**（30 项，macOS + Linux） | 100% (30/30) | 93.3% (28/30) | 73.3%–83.3% | 80.0% | **0.0% (0/30)** |
+| **4 款真实 CLI Agent 木马仓库沦陷率**（含 Claude Opus） | 100% | — | — | — | **0%**（良性重构测试 100% 通过） |
+| **沙箱启动延迟** | `<3 ms` | `<5 ms` | ~15 ms | 221.53 ms | **9.91 ms** Linux · **20.38 ms** macOS |
+| **500 MB 打包 Git 物理磁盘增量** | 0 MB（不安全） | 0 MB（不安全） | 完整 worktree | 完整挂载/拷贝 | **4.76 MB** APFS（**省 99.05%**）· **0.00 MB** `btrfs` |
+| **防窃取 `~/.ssh`、`.env`、Keychain、`.git/hooks`、配置** | 否 | 可绕过 | 部分防护 | 需手配隔离 | **内核级默认拒绝** |
+| **授权确认弹窗削减**（52 份会话，28,087 次调用） | 0%（裸奔） | 20.9% | 部分缓解 | 需手配 | **减少 90.7%–97.9%** |
+| **多 Agent 并发写保护**（对比共享目录直写） | 41.2% 静默覆盖 | 41.2% 静默覆盖 | 重型 worktree | 重型容器 | **98.7% 四级 LCS 自动归并** |
+| **零信任外部 MCP 防火墙与 L7 `$AOS_SECRET_*` 注入** | 无 | 无 | 无 | 无 | **原生内置（零 TLS MITM）** |
 
-## 安全模型
+<p align="center">
+  <img src="assets/architecture.svg" alt="Aegis OS 控制反转架构图" width="960">
+</p>
 
-| 模式 | 启动方式 | 强制点 | 能防住什么 | 状态 |
-|---|---|---|---|---|
-| **Advisory** | `aegis-os install` 后直接运行 Agent | Hook / MCP / 规则 | 诚实 Agent 的误删、误读、授权疲劳 | ✅ 可用（兼容模式） |
-| **Enforced** | `aegis-os run -- claude`，或 `aegis-os install --enforce` 后直接运行 `claude` | 父进程内核沙箱（`bwrap` / Seatbelt）+ 双令牌 Broker + L4/L7 出站代理 | Prompt 注入与项目脚本木马（`V1`–`V6`）；宿主越界写入；SSH/Keychain/API Key 窃取；配置与 `.git/config` 远程代码执行；提交时 TOCTOU 掉包 | ✅ 已在 Linux（`bwrap --bind-fd`）与 macOS Seatbelt 上完整实测验证 `claude`、`opencode`、`agy`、`hermes` |
-| **Isolated** | `aegis-os run --isolated -- claude` / Aegis Cloud | 远程 64GB 云端工作节点 / microVM | 不可信仓库、多租户团队、宿主级隔离 | ✅ 64GB 云端沙箱已上线；本地 microVM 在 Phase 4 |
+已实测验证的生产级 CLI 客户端：**Claude Code (`claude`)、Codex CLI (`codex`)、OpenCode (`opencode`)、Google Antigravity (`agy`) 与 Nous Hermes (`hermes`)**。
 
-**Advisory 不是安全边界。** Hook 和 MCP Server 由 Agent 在开发者自身 UNIX UID 下加载：一旦执行潜伏恶意逻辑的项目脚本（如 `python3 scripts/verify_env.py`），即可绕过正则 Hook、覆写 `.claude/settings.json` / `.mcp.json` / `opencode.json`、借 `git status` 触发 `.git/config` `core.fsmonitor` 代码执行，或经裸 Socket 外泄密钥。Enforced 模式下，Aegis 在 `execve()` 启动子进程前完成 CoW 影子工作区、内核命名空间、只读配置锁、分离式 `.git` 视图、L4/L7 网关与双令牌 `SessionBroker` 装配，Agent 无法绕过或退出。
+---
 
-已实测验证的生产级 CLI 客户端：**Claude Code（`claude`）、OpenCode（`opencode`）、Google Antigravity（`agy`）、Nous Hermes（`hermes`）与 Codex（`codex`）**。在 macOS Seatbelt 下，`aegis-os run` 会自动为 OpenCode 与 Hermes 注入单端口回环绑定及会话随机密钥，并阻断 `SecurityAgent` Keychain 鉴权弹窗（`exit 44` 垫片），同时保留系统 `com.apple.trustd` TLS 证书校验。
+## 60 秒快速开始
 
-## 快速开始
-
-### Advisory 集成
+### 1. 安装
 
 ```bash
+# Homebrew（macOS & Linux）
 brew tap heurion-org/aegis-os https://github.com/heurion-org/aegis-os.git
 brew install aegis-os
-aegis-os install
-aegis-os audit-me            # 5 秒本地凭据裸奔风险与弹窗疲劳体检（加 --share 导出 Markdown 分享卡）
+
+# 或使用 Ed25519 签名校验的一键安装脚本
+curl -fsSL https://heurion.org/aegis-cloud/install.sh | sh
 ```
 
-这会为检测到的 Agent 接入 Hook / MCP / 规则，降低授权疲劳，但不承诺抵抗被攻陷的 Agent。
-
-### Enforced 运行时（Linux `bwrap` & macOS Seatbelt）
+### 2. 5 秒本地凭据暴露与弹窗疲劳体检
 
 ```bash
-aegis-os install --enforce   # 创建 ~/.aegis/bin shim
-aegis-os run -- claude       # 或 opencode / agy / hermes / codex
+aegis-os audit-me            # 扫描本机暴露的 ~/.ssh、~/.aws、.env、明文 MCP 密钥与弹窗疲劳
+aegis-os audit-me --share    # 导出可分享的 Markdown 评分卡
+```
 
-# 查看 JSON / Unified Diff，并通过 SHA-256 哈希锚定提交回宿主机
+### 3. 在内核沙箱（Enforced 模式）下启动任意 Agent
+
+```bash
+# Agent 在 CoW 影子工作区与内核沙箱内零弹窗全速运行
+aegis-os run -- claude --dangerously-skip-permissions
+# 同样适用于: codex --full-auto | opencode | agy | hermes
+
+# 查看已转义 VT100/Bidi 欺骗字符的 Diff，并通过 SHA-256 锚定落盘到宿主机
 aegis-os diff --json
 aegis-os commit --expected-diff-hash <sha256>
 ```
 
-Enforced 模式提供：
-
-- **宿主项目只读保护 + 按组织 OS 加密落盘（`OrgVault`）**：所有写入落在 CoW 影子工作区（APFS `clonefile`、`btrfs` `FICLONE`、`ext4` 轻量工作树拷贝），默认持久化于 `~/.aegis` 下按组织隔离的加密卷（macOS 无 root APFS Encrypted `.sparsebundle`、Linux/Cloud `LUKS2 + Btrfs` 或 `gocryptfs`），具备 `AES-256-GCM` `KEK -> DEK` 信封密钥封装、`fsync` 原子刷盘与崩溃孤儿影子恢复。
-- **宿主 `$HOME` 默认收紧隔离、凭据与 Mach IPC 封堵**：在 Linux `bwrap` 与 macOS Seatbelt 上统一启用默认最小权限 `$HOME` 读隔离（仅放行当前 Shadow/宿主工程目录、Agent 私有目录与安全工具链子目录），内核级遮蔽 SSH/云凭据与 `*/.env*`，封堵 Keychain CLI / `SecurityAgent` 弹窗、`launchctl` 与 `osascript`，并对 `.claude/settings.json`、`.mcp.json`、`opencode.json`、`.gemini/antigravity-cli/settings.json`、`.hermes/config.yaml` 施加只读锁；工作区外文件通过 SHA-256 锚定的 `fs_import_file`（默认入 `<agent_home>/imports/`）与零拷贝 `fs_export_file` 双向受控流转。
-- **受控 `127.0.0.1` 回环网络与依赖安装（`pkg_install`）**：按会话由宿主机预分配回环端口（`$AOS_DEV_PORT` / `$AOS_LOOPBACK_PORTS` 与 `proc_exec.loopback_ports`），macOS Seatbelt 放行本地临时端口绑定（支持 `agy`/OAuth `127.0.0.1:0` 监听）并将出站连接严格限定在已分配的 `localhost:<port>` 端口，Linux `bwrap` 在隔离 `lo` 命名空间内运行并通过双向token认证的 `egress-shim --preview` 桥接支持宿主机浏览器访问 `$AOS_DEV_PORT`，阻断宿主机未授权回环服务探测与端口抢占；`pkg_install` 原生支持 `npm`/`pnpm`/`yarn`/`bun`/`pip`/`uv`/`cargo`/`go`，通过生态级官方源代理、Shadow 内 `node_modules`/`.venv` 自动解链、Manifest `#sha256:` 钉选与 `allow_scripts: true`（`pkg_install_scripts`）二次审批保障依赖安全且不污染 `workspace_diff`。
-- **宿主代理式 Git 与 GitHub 协作闭环**：提供零弹窗脱敏 `workspace_git_inspect`、支持 `auto_commit_shadow: true` 一键事务及敏感文件/强推（`[HIGH RISK: FORCE PUSH]`）拦截的 `workspace_git`，以及 `github_ci_inspect`、`github_ci_rerun`、`github_pr_inspect`、`github_pr_create`、`github_comment_create`、`github_pr_merge`、`github_issue_inspect`（同仓库只读自动放行，跨仓库与写入强审批，Web `/approve` 与 `/dashboard` 提供结构化审批卡片与高危单次锁定门控，统一走 `aos-egress` DLP 引擎脱敏与拦截）。
-- **双平台分离式 `.git` 视图 + `.aegis-bin/git` 加固垫片**：在 Linux 与 macOS 上均将宿主机 `.git` 对象库只读透传（500 MB 打包 Git 仓库在 APFS 上节省 **99.05%** 物理磁盘占用），配合独立会话 `GIT_INDEX_FILE` 并强制锁定 `core.fsmonitor=false` / `core.hooksPath=/dev/null`。
-- **L4/L7 双平面出站网关**：模型 API 流量经本地 L7 Base-URL 反向代理（`ANTHROPIC_BASE_URL`、`OPENAI_BASE_URL`、`GOOGLE_GEMINI_BASE_URL`）执行 64 KiB 出站 DLP 扫描并在宿主边界注入真实密钥（沙箱内仅见 `$AOS_SECRET_*` 占位符，**零 TLS MITM 证书破坏**）；常规 HTTPS 走 L4 `CONNECT` 域名白名单。
-- **双令牌权限分离 `SessionBroker` 与冻结暂存区（Frozen-Stage）SHA-256 提交门禁**：严格隔离 `agent.token` 与 `human.token`，对 Diff 中的 VT100 CSI / Unicode Bidi 控制字符进行转义防欺骗，落盘前快照至 `commit_frozen_stage` 并运行 6 大 `DomainProfile` 校验器（`code`、`docs`、`data`、`binary`、`app_state`、`memory`）。
-- **Fail closed**：缺少 `bwrap`/`sandbox-exec`（或 Ubuntu 24.04 AppArmor 限制未配置 profile）、代理或 broker 时直接拒绝启动，绝不静默降级。
-
-会话与可观测控制：`aegis-os status` · `aegis-os diff --json` · `aegis-os verify` · `aegis-os commit --expected-diff-hash` · `aegis-os discard` · `aegis-os publish` · `aegis-os approvals` · `aegis-os why` · `aegis-os a2a board` · `aegis-os policy watch` · `aegis-os memory ui` · `aegis-os mcp list` · `aegis-os audit-me --share` · `aegis-os vault status` · `aegis-os upgrade --check` · `aegis-os uninstall`。
-
-当前限制：
-
-- **macOS `cwd` 与 Linux 路径重映射差异**：Linux 通过 `bwrap --bind-fd` 将 CoW 影子工作区原位挂载回原宿主路径；macOS Seatbelt 将影子目录作为 `cwd` 并将宿主仓库只读挂载（macOS 完整 FUSE/NFSv3 路径重映射在 Phase 4）。
-- **Ubuntu 24.04+ 非特权 userns 限制**：Ubuntu 24.04 默认开启 `kernel.apparmor_restrict_unprivileged_userns=1`；若未安装 `/etc/apparmor.d/bwrap`，`aegis-os run` 会 fail-closed 并打印配置指引。
-- **非模型 HTTPS 审计范围**：模型 API 流量走本地 Base-URL L7 反向代理（64 KiB DLP + 密钥注入）；普通白名单第三方 HTTPS 走 L4 `CONNECT` 域名过滤，不做 TLS MITM 解密。
-
-### 其他安装、升级与卸载方式
+也可以直接运行 **10 秒安全红队对比演示**（全部在 `mktemp -d` 临时隔离目录中使用假 Canary 文件，绝不触碰你真实的 `~/.ssh` 或当前项目）：
 
 ```bash
-# 一键签名安装（Linux & macOS）
-curl -fsSL https://heurion.org/aegis-cloud/install.sh | sh
+./examples/redteam-demo/run_demo.sh
+```
 
-# 源码编译
-git clone https://github.com/heurion-org/aegis-os.git && cd aegis-os
-cargo install --path crates/aos-cli
+<details>
+<summary><strong>更多安装方式：透明 PATH 垫片、Advisory 模式、源码编译、升级与卸载</strong></summary>
+
+```bash
+# 创建 ~/.aegis/bin 垫片，此后直接运行 `claude` / `codex` / `opencode` / `agy` / `hermes` 自动进入内核沙箱
+aegis-os install --enforce
+
+# Advisory 兼容模式（仅 Hook / MCP / 规则；缓解弹窗疲劳，不作为安全边界）
 aegis-os install
 
-# 原地升级二进制并刷新全局客户端 MCP / Hook / Shim 集成（自动识别 Brew / Cargo / 源码 / Ed25519 签名发行版）
-aegis-os upgrade --check
-aegis-os upgrade             # 或仅刷新集成与配置: aegis-os upgrade --refresh-only
+# 源码编译安装
+git clone https://github.com/heurion-org/aegis-os.git && cd aegis-os
+cargo install --path crates/aos-cli
 
-# 精准清理 Shim 与客户端 MCP / Hook / 规则配置（默认保留 ~/.aegis 加密卷数据，--purge 一并销毁）
+# 升级二进制并刷新所有客户端集成
+aegis-os upgrade --check
+aegis-os upgrade             # 或仅刷新集成配置: aegis-os upgrade --refresh-only
+
+# 精准卸载垫片与客户端配置（默认保留 ~/.aegis 加密卷，加 --purge 一并清除）
 aegis-os uninstall           # 或彻底清理: aegis-os uninstall --workspace-clean --purge --yes
 ```
 
+</details>
+
+---
+
 ## 核心能力
 
-- **事务型 CoW VFS 与 `OrgVault` 加密卷** — 0.42ms 元数据派生；1,000 文件工作区 6.28ms / 15.6ms；四级 LCS 自动归并与领域预检门；按组织隔离的 `AES-256` 加密持久化（`KEK -> DEK` 信封加密）、`fsync` 崩溃一致性与孤儿影子接管恢复。
-- **内核沙箱、受控回环与依赖治理** — Linux `bwrap` 与 macOS Seatbelt enforced launcher；默认 `$HOME` 读收紧配合 SHA-256 锚定的 `fs_import_file`/`fs_export_file`；会话级 `127.0.0.1` 回环端口白名单与 Linux 命名空间预览转发桥（`$AOS_DEV_PORT`）；`pkg_install`（`npm`/`pnpm`/`yarn`/`bun`/`pip`/`uv`/`cargo`/`go`）自动 CoW 解链与生命周期脚本门控；`host_exec`（仅限 enforced `SessionBroker` 的宿主平级受审执行，支持只读包冻结与 SHA-256 钉选、`DaemonAuth::Required` `#key=` 防自批、运行期控制面 `423` 互锁、令牌轮换、`env_clear()` 清洗、进程组回收与 DLP 脱敏产物回流）；模型 API L7 反向代理 + 统一 `aos-egress` DLP 引擎。
-- **宿主代理 Git / GitHub 全闭环** — `workspace_git_inspect`、事务型 `workspace_git`（支持 `auto_commit_shadow`、投毒/强推守卫）以及 `github_ci_inspect`、`github_ci_rerun`、`github_pr_inspect`、`github_pr_create`、`github_comment_create`、`github_pr_merge`、`github_issue_inspect`（同仓库只读免弹窗、跨仓库/写操作严格审批及结构化 Web 高危审批卡）。
-- **A2A IPC 与 CAS** — 同伴发现、层级任务、任务绑定文件锁、`artifact://sha256` 内容寻址接力。
-- **Cedar 策略、租约与审计** — 效果级审批、TTL / 单次租约、`evidence_hash` 锁定、哈希链审计账本，以及 `Aegis-OS-Verified` Commit/PR 审计凭证。
-- **零信任外部 MCP 防火墙与受限 Agent 桥接** — `aegis-os mcp` 为沙箱内的 `claude`、`agy`、`opencode`、`codex`、`cursor` 自动分发无凭证 1:1 代理桩（`aegis-os mcp proxy <id>` / `/__aegis/mcp/<id>`），并在宿主机侧统一执行策略与 SQL 风险分级、DLP 假名化、会话污点追踪、SHA-256 发件箱审批、AES-256-GCM Vault 加密、OAuth 2.1 Auth Realms（支持会话不停机热加载）与声明式 Bundles（`aegis-mcp-bundle/v1`）；开放生态发现与 `v0.11.0` 方案 B 热桥接设计详见 [`docs/EXTERNAL_MCP_DESIGN.md`](docs/EXTERNAL_MCP_DESIGN.md)。
-- **云端 PaaS** — 多租户工作区、Git-to-PR、密码学级 Scale-to-Zero 休眠（空闲自动 `umount` + `cryptsetup close` 卸载卷密钥、删库密码学擦除）、网页审批台。
+### 1. 内核级沙箱与事务型 CoW VFS
+- **宿主仓库只读保护 + `OrgVault` 加密持久化**：所有修改落在亚毫秒级 CoW 影子工作区（APFS `clonefile`、`btrfs` `FICLONE`、`ext4` 轻量拷贝），默认存储于按组织隔离的 `AES-256` 加密卷（`KEK -> DEK` 信封加密），支持 `fsync` 崩溃耐久与孤儿影子恢复。
+- **默认收紧 `$HOME` 读隔离与 Mach IPC 封堵**：内核级遮蔽 `~/.ssh`、`~/.aws`、`~/.kube`、`*/.env*`、Keychain / `SecurityAgent` 弹窗（`exit 44` 垫片）、`launchctl` 与 `osascript`，并将 `.claude/settings.json`、`.mcp.json`、`opencode.json`、`.gemini/antigravity-cli/settings.json`、`.hermes/config.yaml` 锁定只读；工作区外文件仅通过 SHA-256 锚定的 `fs_import_file` 与零拷贝 `fs_export_file` 流转。
+- **分离式 `.git` 视图 + 加固 `git` 垫片**：宿主机 `.git` 对象库只读透传（500 MB 打包仓库在 APFS 仅占 **4.76 MB**），配合独立会话 `GIT_INDEX_FILE` 并强制锁定 `core.fsmonitor=false` / `core.hooksPath=/dev/null`。
+- **受控 `127.0.0.1` 回环端口与依赖治理（`pkg_install`）**：按会话分配回环端口（`$AOS_DEV_PORT`，含 Linux `--unshare-net` 预览转发桥），支持 `npm`/`pnpm`/`yarn`/`bun`/`pip`/`uv`/`cargo`/`go` 官方源代理、Shadow 内依赖解链、`#sha256:` 钉选与生命周期脚本二次审批。
+- **L4/L7 双平面代理 + `SessionBroker`**：模型 API 流量走本地 L7 Base-URL 反向代理（平均 TTFT 仅 **+0.221 ms**），执行 64 KiB 出站 DLP 扫描并在宿主边界注入 `$AOS_SECRET_*` 真实密钥（**零 TLS MITM**）；常规 HTTPS 走 L4 `CONNECT` 域名白名单。落盘需经过 `commit_frozen_stage`、`human.token` 隔离与 6 大 `DomainProfile` 校验器。
+- **受审 `host_exec` 与 Git/GitHub 协作桥**：`host_exec` 在只读冻结包 + `423` 控制面互锁下运行必要宿主命令；`workspace_git*` 与 `github_{ci,pr,issue}_*` 提供 DLP 脱敏检查与人工审批写入。
 
-## 关键基准
+### 2. 零信任外部 MCP 防火墙（`aegis-os mcp`）
+- **无凭证 1:1 代理桩**：向受限的 `claude`、`agy`、`opencode`、`codex`、`cursor` 会话注入 `aegis-os mcp proxy <id>` / `/__aegis/mcp/<id>`，真实 OAuth/API Token 全程封存在宿主机 AES-256-GCM Vault 中。
+- **全通道纵深防御**：统一执行 Cedar 策略与 SQL 风险分级、会话污点追踪、双向 PII 假名化/拦截、SHA-256 发件箱审批、OAuth 2.1 Auth Realms 会话不停机热加载与声明式 Bundles（`aegis-mcp-bundle/v1`）。
+- **`v0.11.0` 方案 B 开放生态发现与热桥接**：支持 `stdio` 网络隔离（`--isolate-network`）、动态注册表发现与热桥接扶正，详见 [`docs/EXTERNAL_MCP_DESIGN.md`](docs/EXTERNAL_MCP_DESIGN.md)。
 
-| 指标 | 结果 |
+### 3. 告别 `git worktree` 的多 Agent 并行协同
+- **A2A IPC、文件锁与 SHA-256 CAS**：支持同伴发现、层级任务、任务绑定文件认领及 `artifact://sha256` 内容寻址接力（64 KB 规格上下文压缩 **99.85%**）。
+- **四级 LCS 自动归并与 `aegis-os explore`**：并发多 Agent 归并成功率 **98.7%**，200 模块原子回滚仅 **8.68 ms**，并生成 `Aegis-OS-Verified` 密码学审计凭证。
+
+---
+
+## 安全模型与当前限制
+
+| 模式 | 启动方式 | 是否为安全边界？ | 防护范围 | 状态 |
+|---|---|---|---|---|
+| **Advisory** | `aegis-os install` | **否**（仅兼容辅助） | 诚实 Agent 误操作、减少确认弹窗疲劳 | 可用 |
+| **Enforced** | `aegis-os run -- <agent>` / `install --enforce` | **是（OS 内核）** | Prompt 注入脚本（`V1`–`V6`）、宿主越界写入、`.ssh`/Keychain/密钥窃取、配置与 `.git/config` RCE、TOCTOU 提交掉包 | 已在 Linux `bwrap` 与 macOS Seatbelt 完整实测 |
+| **Isolated** | `aegis-os run --isolated -- <agent>` / Cloud | **是（硬件虚拟化）** | 不可信仓库、多租户团队、宿主级隔离 | 64GB 云端可用；本地 microVM 在 Phase 4 |
+
+**当前 Enforced 运行时限制（严格 fail-closed，绝不静默降级）：**
+- **macOS `cwd` 与 Linux 路径重映射差异**：Linux `bwrap --bind-fd` 可将 CoW 影子原位挂载到原宿主路径；macOS Seatbelt 将影子目录作为 `cwd` 并将宿主仓库只读挂载（macOS 完整 FUSE/NFSv3 路径重映射在 Phase 4）。
+- **Ubuntu 24.04+ 非特权 userns 限制**：若系统开启 `kernel.apparmor_restrict_unprivileged_userns=1` 且未安装 `/etc/apparmor.d/bwrap`，`aegis-os run` 会主动拒绝启动并输出配置指引。
+- **非模型 HTTPS 审计范围**：常规白名单第三方 HTTPS 走 L4 `CONNECT` 域名过滤，不做 TLS MITM 解密。
+
+<details>
+<summary><strong>完整 CLI 命令速查</strong></summary>
+
+`aegis-os audit-me [--share|--json]` · `aegis-os run [--isolated] -- <agent>` · `aegis-os explore` · `aegis-os status` · `aegis-os diff [--json]` · `aegis-os verify` · `aegis-os commit [--expected-diff-hash]` · `aegis-os discard` · `aegis-os publish` · `aegis-os approvals` · `aegis-os why` · `aegis-os a2a board` · `aegis-os policy watch` · `aegis-os memory ui` · `aegis-os mcp {list,adopt,proxy,...}` · `aegis-os vault status` · `aegis-os doctor` · `aegis-os upgrade [--check]` · `aegis-os uninstall`
+
+</details>
+
+---
+
+## 基准评测与可复现套件
+
+| 评测项 | 实测结果 |
 |---|---|
-| V1–V6 绕过载荷失守率（30 项确定性载荷，macOS Seatbelt & Linux `bwrap`） | **0/30 (0.0%)** 对比 Advisory Hook **93.3%** · 厂商自带沙箱 **73.3%–83.3%** · `nerdctl` 容器 **80.0%** |
-| 4 款真实生产 CLI Agent 仓库木马沦陷率（`claude`、`opencode`、`agy`、`hermes`，60 格矩阵 54 次真实云端 API 运行） | **0%**（`aegis_enforced`）对比 **100%**（`vendor_default`，含 Claude Opus）· 良性及多文件重构测试通过率 **100% (8/8)** |
-| Enforced 内核沙箱启动延迟 | Linux `bwrap` **9.91 ms**（比 `nerdctl` 容器 221.53 ms **快 22.4 倍**）· macOS Seatbelt **20.38 ms** |
-| 500 MB 打包 Git 仓库（`git repack -ad`）物理磁盘增量 | APFS **4.76 MB**（**节省 99.05% 物理磁盘**）· `btrfs` **0.00 MB** 净块增量 |
-| 本地 L7 出站网关开销与 CLI TOCTOU / 终端转义门禁 | 回环 TTFT 仅 **+0.221 ms**（`0/40` 误报，`25/25` DLP 拦截）· **60/60 (100%)** 掉包攻击全部阻断（各类中位数 **7.54–7.92 ms**） |
-| 授权弹窗削减（52 份真实会话，28,087 次工具调用）与多 Agent 归并 | 减少 **90.7%–97.9%** 弹窗 · 四级 LCS 自动归并 **98.7%** · 200 模块回滚 **8.68 ms** |
+| V1–V6 绕过载荷（`n = 30`，macOS Seatbelt & Linux `bwrap`） | **0/30 (0.0%)** 对比 Advisory Hook **93.3%** · 厂商沙箱 **73.3%–83.3%** · `nerdctl` **80.0%** |
+| 4 款真实 CLI Agent 仓库木马矩阵（`claude`、`opencode`、`agy`、`hermes`，54 次真实 API 运行） | **0%**（`aegis_enforced`）对比 **100%**（`vendor_default`，含 Claude Opus）· 良性测试 **100% (8/8)** 通过 |
+| 启动延迟与 L7 代理开销 | Linux `bwrap` **9.91 ms**（比 `nerdctl` 快 **22.4×**）· macOS Seatbelt **20.38 ms** · L7 TTFT **+0.221 ms**（`25/25` DLP 拦截，`0/40` 误报） |
+| 500 MB 打包 Git CoW 与 CLI TOCTOU / VT100 门禁 | APFS **4.76 MB**（**省 99.05%**）· `btrfs` **0.00 MB** · **60/60 (100%)** 掉包阻断（中位数 **7.54–7.92 ms**） |
+| 弹窗削减与多 Agent 归并（52 份真实会话，28,087 次调用） | 减少 **90.7%–97.9%** 弹窗 · **98.7%** 自动归并 · 200 模块回滚 **8.68 ms** |
 
-> 完整复现方法详见 [`BENCHMARK_REPORT.md`](BENCHMARK_REPORT.md)（论文一多 Agent 与 VFS 基准）以及 [`paper2/ENFORCED_RUNTIME_BENCH_REPORT.json`](paper2/ENFORCED_RUNTIME_BENCH_REPORT.json) + [`scripts/p2_live/README.md`](scripts/p2_live/README.md)（论文二跨平台与真实 CLI Agent 评测套件）。
+完整复现说明与原始数据：[`BENCHMARK_REPORT.md`](BENCHMARK_REPORT.md) · [`paper2/ENFORCED_RUNTIME_BENCH_REPORT.json`](paper2/ENFORCED_RUNTIME_BENCH_REPORT.json) · [`scripts/p2_live/README.md`](scripts/p2_live/README.md)。
 
-## 文档
+---
 
-- **完整技术架构、威胁模型、实现对照与用户手册** — [`docs/DOC.md`](docs/DOC.md)
-- **外部 MCP 对接架构与方案 B 设计规范（开放发现 / 热桥接 / 原生扶正）** — [`docs/EXTERNAL_MCP_DESIGN.md`](docs/EXTERNAL_MCP_DESIGN.md)
-- **基准报告** — [`BENCHMARK_REPORT.md`](BENCHMARK_REPORT.md) · [`paper2/ENFORCED_RUNTIME_BENCH_REPORT.json`](paper2/ENFORCED_RUNTIME_BENCH_REPORT.json) · [`scripts/p2_live/README.md`](scripts/p2_live/README.md)
+## 文档、学术论文与引用
+
+- **完整技术架构与用户手册** — [`docs/DOC.md`](docs/DOC.md)
+- **外部 MCP 对接架构与方案 B 设计规范** — [`docs/EXTERNAL_MCP_DESIGN.md`](docs/EXTERNAL_MCP_DESIGN.md)
+- **10 秒安全红队演示** — [`examples/redteam-demo/README.md`](examples/redteam-demo/README.md)（[`run_demo.sh`](examples/redteam-demo/run_demo.sh)）
 - **论文一（事务型多租户 Agent OS · arXiv:2611.08516）** — [https://arxiv.org/abs/2611.08516](https://arxiv.org/abs/2611.08516)（[PDF](https://arxiv.org/pdf/2611.08516) · 本地副本：[`paper/aegis_os_arxiv_preprint.pdf`](paper/aegis_os_arxiv_preprint.pdf)）
-- **论文二（Enforced 内核运行时与插件安全边界 · DOI: 10.5281/zenodo.24170505）** — [https://doi.org/10.5281/zenodo.24170505](https://doi.org/10.5281/zenodo.24170505)（[Zenodo 页面](https://zenodo.org/records/24170505) · 本地副本：[`paper2/aegis_enforced_runtime_arxiv_preprint.pdf`](paper2/aegis_enforced_runtime_arxiv_preprint.pdf) · [LaTeX](paper2/main.tex)）
-- **技术专论** — [为什么 Agent 插件不是安全边界](https://heurion.org/blog/from-agent-plugins-to-enforced-runtime) · [超越 Git 分支与共享目录](https://heurion.org/blog/aegis-os-transactional-agent-kernel) · [人机权限与能力对等](https://heurion.org/blog/human-agent-capability-parity-ai-native-software) · [双表面 CRDT](https://heurion.org/blog/dual-surface-crdt-clinical-ai)
-- **技术博客总目录** — https://heurion.org/blog
-
-## 引用 (Citation)
-
-如果在研究或工程工作流中使用了 Aegis OS，欢迎引用我们的论文：
+- **论文二（Enforced 内核运行时与插件安全边界 · DOI: 10.5281/zenodo.24170505）** — [https://doi.org/10.5281/zenodo.24170505](https://doi.org/10.5281/zenodo.24170505)（[Zenodo](https://zenodo.org/records/24170505) · 本地副本：[`paper2/aegis_enforced_runtime_arxiv_preprint.pdf`](paper2/aegis_enforced_runtime_arxiv_preprint.pdf) · [LaTeX](paper2/main.tex)）
+- **技术专论** — [为什么 Agent 插件不是安全边界](https://heurion.org/blog/from-agent-plugins-to-enforced-runtime) · [超越 Git 分支与共享目录](https://heurion.org/blog/aegis-os-transactional-agent-kernel) · [人机权限与能力对等](https://heurion.org/blog/human-agent-capability-parity-ai-native-software) · [双表面 CRDT](https://heurion.org/blog/dual-surface-crdt-clinical-ai)（[全部文章](https://heurion.org/blog)）
 
 ```bibtex
 @article{zhao2026aegisos,
@@ -168,8 +212,11 @@ aegis-os uninstall           # 或彻底清理: aegis-os uninstall --workspace-c
 }
 ```
 
-## 遥测与许可证
+---
 
-仅在安装与每日首次会话发送匿名心跳；不包含源码、路径、Prompt 或凭据。设置 `DO_NOT_TRACK=1` / `AOS_TELEMETRY_DISABLED=1`，或 `touch ~/.gemini/aegis-telemetry-opt-out` 即可关闭。详见 [`docs/DOC.md`](docs/DOC.md)。
+## 隐私、可选云端、参与贡献与许可证
 
-Apache License 2.0，见 [`LICENSE`](LICENSE)。
+- **默认 100% 本地运行，零外传遥测**：`aegis-os` 默认仅在本地 `<runtime_dir>/paas_state.json` 记录匿名统计以支持 `aegis-os stats`，**除非用户显式配置 `AOS_TELEMETRY_URL` 或 `AOS_CLOUD_ENDPOINT`，绝不发送任何网络遥测**。随时可通过 `DO_NOT_TRACK=1`、`AOS_TELEMETRY_DISABLED=1` 或 `touch ~/.gemini/aegis-telemetry-opt-out` 彻底禁用。
+- **可选 Aegis Cloud**：如需支持空闲密码学休眠的远程 64 GB microVM 沙箱或 Web 审批台，可访问 [云端控制台](https://heurion.org/aegis-cloud/dashboard) 与 [边界审批台](https://heurion.org/aegis-cloud/approve)（本地亦可通过 `aegis-os approve --web` 免费启动审批台）。
+- **参与贡献与安全披露**：欢迎提交新 Agent 适配器、绕过测试与文档 PR，详见 [`CONTRIBUTING.md`](CONTRIBUTING.md)；若发现 Enforced / Isolated 模式逃逸漏洞，请通过 [`SECURITY.md`](SECURITY.md) 私密披露。
+- **许可证**：Apache License 2.0，见 [`LICENSE`](LICENSE)。
