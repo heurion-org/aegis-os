@@ -1,8 +1,8 @@
-# Aegis OS (`aegis-os`) 技术参考与用户手册 · Architecture, Threat Model & User Manual (`v0.10.0`)
+# Aegis OS (`aegis-os`) 技术参考与用户手册 · Architecture, Threat Model & User Manual (`v0.11.0`)
 
-> 本文档为 Aegis OS 仓库的唯一权威主文档（中文 + English 双语整合），涵盖 **架构设计**、**威胁模型**、**实际代码实现与威胁缓解对照（基线 `v0.9.1` + `v0.9.2`–`v0.10.0` 增量与外部 MCP 方案 B 实现）** 以及 **完整用户手册**。
+> 本文档为 Aegis OS 仓库的唯一权威主文档（中文 + English 双语整合），涵盖 **架构设计**、**威胁模型**、**实际代码实现与威胁缓解对照（基线 `v0.9.1` + `v0.9.2`–`v0.11.0` 增量与外部 MCP 全链路实现）** 以及 **完整用户手册**。
 >
-> *This is the single authoritative reference for Aegis OS (`v0.10.0`, bilingual Chinese + English), covering **Architecture Design**, **Threat Model**, **Actual Implementation & Threat Countermeasures**, and the **User Manual**.*
+> *This is the single authoritative reference for Aegis OS (`v0.11.0`, bilingual Chinese + English), covering **Architecture Design**, **Threat Model**, **Actual Implementation & Threat Countermeasures**, and the **User Manual**.*
 
 ---
 
@@ -237,7 +237,7 @@ Host User Space (Trusted Control Plane & Supervisor)
 2. **Ubuntu 24.04+ 非特权 Userns AppArmor 限制**：若系统开启 `kernel.apparmor_restrict_unprivileged_userns=1` 且未安装 `/etc/apparmor.d/bwrap`，`aegis-os run` 将 Fail-Closed 拒绝启动并打印配置指引。
 3. **非模型类普通 HTTPS**：模型提供商 API 走 L7 反向代理（无 TLS MITM，完整扫描请求体/头/URL）；其他白名单 HTTPS 站点走 L4 `CONNECT` 域名白名单过滤。
 4. **高级领域 CRDT 与非 MicroVM 下 macOS 路径重映射**：本地 `--isolated` Zero-NIC 硬件虚拟化 MicroVM（`vfkit`/`krunkit` & `cloud-hypervisor`+`virtiofsd`）、`virtio-vsock` 交互式流式 PTY 终端与镜像自动化构建打包（`./scripts/build_vm_images.sh` + CI 发布签名产物 `aegis-vm-*`）已完整就绪；Office/Data 块级 CRDT 与非 MicroVM 模式 macOS 用户态 VFS 路径重映射归入后续演进。
-5. **`v0.9.2`–`v0.9.3` 增量与 `v0.10.0` 外部 MCP 演进 | `v0.9.2`–`v0.9.3` Milestones & `v0.10.0` External MCP Roadmap**：`v0.9.2` 优化了 `ext4` CoW 启动复制与大仓库/嵌套多仓（umbrella workspace）启动卡死防护及 PTY `EINTR`/`FD_CLOEXEC` 加固；`v0.9.3` 彻底废弃移除旧 `AAP-1.0` / `app_store` / `aegis-os app` 子系统，修复热升级后 Linux `current_exe()` `(deleted)` 恢复，且 14-crate 全仓测试持续通过。`v0.10.0` 已完整落地开放 MCP Registry 发现、`stdio` OS 沙箱化、Web `/approve` 宿主机内联 Vault 凭据直封与 **方案 B 会话热桥接**，架构详情见 [EXTERNAL_MCP_DESIGN.md](EXTERNAL_MCP_DESIGN.md)。
+5. **`v0.9.2`–`v0.11.0` 增量与外部 MCP 演进 | `v0.9.2`–`v0.11.0` Milestones & External MCP Delivery**：`v0.9.2` 优化了 `ext4` CoW 启动复制与大仓库/嵌套多仓（umbrella workspace）启动卡死防护及 PTY `EINTR`/`FD_CLOEXEC` 加固；`v0.9.3` 彻底废弃移除旧 `AAP-1.0` / `app_store` / `aegis-os app` 子系统，修复热升级后 Linux `current_exe()` `(deleted)` 恢复；`v0.10.0`–`v0.11.0` 完整落地开放与企业私有 MCP Registry（含气隙锁定）、`.mcpb`/加固 `oci:` 统一安装、本地 `stdio` OS 与出网白名单沙箱、Web `/approve` 全功能控制台、`list_changed` 动态热推送、全 MCP 通道防线与 **方案 B 会话热桥接**，架构详情见 [EXTERNAL_MCP_DESIGN.md](EXTERNAL_MCP_DESIGN.md)。
 
 ---
 
@@ -478,8 +478,8 @@ aegis-os memory revoke <session-id>
 
 #### 3) 通用零信任 MCP 防火墙、云端 Streamable HTTP/OAuth 2.1 Auth Realms 与声明式 MCP Bundles (`aegis-os mcp`) | Zero-Trust MCP Firewall, Cloud MCP Auth Realms, Bundles & Aegis Cloud PaaS
 
-> **受限客户端协同机制与 `v0.10.0` 方案 B 设计 | Confined Client Topology & Option B Design**：
-> 启动 `aegis-os run` 时，`stage_confined_mcp_configs()` 会自动清洗 `$AGENT_HOME` 中的明文凭据并按原生格式（`.claude.json`、`mcp_config.json`、`opencode.json`、`config.toml` 等）下发无凭证 1:1 转发桩（`aegis-os mcp proxy <id>` 或 MicroVM `/__aegis/mcp/<id>`）；所有防火墙裁决、DLP 假名化、会话污点、Outbox 审批与 Vault 令牌注入均在宿主机 `SessionBroker` 执行，且宿主端登录后正在运行的会话自动热加载凭据。面向 `v0.10.0` 的开放 Registry 发现、审批页内联 OAuth/Vault 录入及 **方案 B（会话内临时热桥接 + 下次启动自动扶正）** 完整规范详见 [docs/EXTERNAL_MCP_DESIGN.md](EXTERNAL_MCP_DESIGN.md)。
+> **受限客户端协同机制与 `v0.10.0`–`v0.11.0` 方案 B 设计 | Confined Client Topology & Option B Design**：
+> 启动 `aegis-os run` 时，`stage_confined_mcp_configs()` 会自动清洗 `$AGENT_HOME` 中的明文凭据并按原生格式（`.claude.json`、`mcp_config.json`、`opencode.json`、`config.toml` 等）下发无凭证 1:1 转发桩（`aegis-os mcp proxy <id>` 或 MicroVM `/__aegis/mcp/<id>`）；所有防火墙裁决、DLP 假名化、会话污点、Outbox 审批与 Vault 令牌注入均在宿主机 `SessionBroker` 执行，且宿主端登录后正在运行的会话自动热加载凭据。面向 `v0.10.0`–`v0.11.0` 的开放 Registry 发现、审批页内联 OAuth/Vault 录入及 **方案 B（会话内临时热桥接 + 下次启动自动扶正）** 完整规范详见 [docs/EXTERNAL_MCP_DESIGN.md](EXTERNAL_MCP_DESIGN.md)。
 
 ```bash
 # 0. 开放/企业 MCP Registry 发现、场景推荐、统一安装与全生命周期运维
