@@ -582,29 +582,32 @@ fn expr_contains_org_cmp(expr: &CedarExpr, same: bool) -> bool {
     }
 }
 
-fn resolve_cedar_operand<'a>(op: &'a CedarOperand, ctx: &'a PolicyContext) -> std::borrow::Cow<'a, str> {
+fn resolve_cedar_operand<'a>(
+    op: &'a CedarOperand,
+    ctx: &'a PolicyContext,
+) -> Option<std::borrow::Cow<'a, str>> {
     use std::borrow::Cow;
     match op {
-        CedarOperand::PrincipalOrgId => Cow::Borrowed(ctx.principal.org_id.as_str()),
-        CedarOperand::PrincipalAgentId => Cow::Borrowed(ctx.principal.agent_id.as_str()),
-        CedarOperand::PrincipalRole => Cow::Borrowed(ctx.principal.role.as_str()),
-        CedarOperand::ResourceOrgId => Cow::Borrowed(ctx.target_org_id.as_str()),
-        CedarOperand::ResourceOwnerAgentId => Cow::Borrowed(
+        CedarOperand::PrincipalOrgId => Some(Cow::Borrowed(ctx.principal.org_id.as_str())),
+        CedarOperand::PrincipalAgentId => Some(Cow::Borrowed(ctx.principal.agent_id.as_str())),
+        CedarOperand::PrincipalRole => Some(Cow::Borrowed(ctx.principal.role.as_str())),
+        CedarOperand::ResourceOrgId => Some(Cow::Borrowed(ctx.target_org_id.as_str())),
+        CedarOperand::ResourceOwnerAgentId => Some(Cow::Borrowed(
             ctx.metadata
                 .get("owner_agent_id")
                 .and_then(|v| v.as_str())
                 .unwrap_or(ctx.principal.agent_id.as_str()),
-        ),
+        )),
         CedarOperand::ResourceId | CedarOperand::ResourcePath => {
-            Cow::Borrowed(ctx.target_resource.as_str())
+            Some(Cow::Borrowed(ctx.target_resource.as_str()))
         }
         CedarOperand::ContextAttr(key) => match ctx.metadata.get(key) {
-            Some(serde_json::Value::String(s)) => Cow::Borrowed(s.as_str()),
-            Some(serde_json::Value::Bool(b)) => Cow::Borrowed(if *b { "true" } else { "false" }),
-            Some(serde_json::Value::Number(n)) => Cow::Owned(n.to_string()),
-            _ => Cow::Borrowed(""),
+            Some(serde_json::Value::String(s)) => Some(Cow::Borrowed(s.as_str())),
+            Some(serde_json::Value::Bool(b)) => Some(Cow::Borrowed(if *b { "true" } else { "false" })),
+            Some(serde_json::Value::Number(n)) => Some(Cow::Owned(n.to_string())),
+            _ => None,
         },
-        CedarOperand::Literal(s) => Cow::Borrowed(s.as_str()),
+        CedarOperand::Literal(s) => Some(Cow::Borrowed(s.as_str())),
     }
 }
 
@@ -613,15 +616,16 @@ fn eval_cedar_expr(expr: &CedarExpr, ctx: &PolicyContext) -> bool {
         CedarExpr::And(a, b) => eval_cedar_expr(a, ctx) && eval_cedar_expr(b, ctx),
         CedarExpr::Or(a, b) => eval_cedar_expr(a, ctx) || eval_cedar_expr(b, ctx),
         CedarExpr::Not(inner) => !eval_cedar_expr(inner, ctx),
-        CedarExpr::Eq(lhs, rhs) => {
-            resolve_cedar_operand(lhs, ctx).as_ref() == resolve_cedar_operand(rhs, ctx).as_ref()
-        }
-        CedarExpr::Ne(lhs, rhs) => {
-            resolve_cedar_operand(lhs, ctx).as_ref() != resolve_cedar_operand(rhs, ctx).as_ref()
-        }
-        CedarExpr::Like(lhs, pat) => {
-            AegisPolicyKernel::matches_pattern(pat, resolve_cedar_operand(lhs, ctx).as_ref())
-        }
+        CedarExpr::Eq(lhs, rhs) => matches!(
+            (resolve_cedar_operand(lhs, ctx), resolve_cedar_operand(rhs, ctx)),
+            (Some(a), Some(b)) if a.as_ref() == b.as_ref()
+        ),
+        CedarExpr::Ne(lhs, rhs) => matches!(
+            (resolve_cedar_operand(lhs, ctx), resolve_cedar_operand(rhs, ctx)),
+            (Some(a), Some(b)) if a.as_ref() != b.as_ref()
+        ),
+        CedarExpr::Like(lhs, pat) => resolve_cedar_operand(lhs, ctx)
+            .is_some_and(|v| AegisPolicyKernel::matches_pattern(pat, v.as_ref())),
     }
 }
 
@@ -5125,5 +5129,55 @@ forbid(principal is Agent, action == Action::"mcp_request_install", resource) wh
             kernel.evaluate(&tier1_ctx).await.unwrap(),
             PolicyDecision::Ask { .. }
         ));
+    }
+
+    #[tokio::test]
+    async fn cedar_missing_context_attr_fails_closed_for_eq_ne_and_like() {
+        let cedar_src = r#"
+            permit(
+                principal,
+                action == Action::"mcp_request_install",
+                resource
+            ) when {
+                context.mcp_trust_tier != "tier3"
+            };
+        "#;
+        let policies = CedarPolicySet::try_parse(cedar_src).unwrap();
+        let identity = AgentIdentity::new("acme", "agent-1", "researcher");
+
+        let make_ctx = |metadata: serde_json::Value| PolicyContext {
+            principal: identity.clone(),
+            action: "mcp_request_install".to_string(),
+            target_org_id: "acme".to_string(),
+            target_resource: "srv".to_string(),
+            metadata,
+        };
+
+        // Missing or null attribute must fail closed (`Ne` evaluates to false).
+        assert!(policies.find_permit(&make_ctx(serde_json::json!({}))).is_none());
+        assert!(policies
+            .find_permit(&make_ctx(serde_json::json!({
+                "mcp_trust_tier": null
+            })))
+            .is_none());
+
+        // Explicit `Eq == ""` and `like "*"` also fail closed when attribute is absent.
+        let eq_like_policies = CedarPolicySet::try_parse(
+            r#"
+                permit(principal, action == Action::"mcp_request_install", resource)
+                when { context.mcp_trust_tier == "" || context.mcp_trust_tier like "*" };
+            "#,
+        )
+        .unwrap();
+        assert!(eq_like_policies
+            .find_permit(&make_ctx(serde_json::json!({})))
+            .is_none());
+
+        // Present non-matching value succeeds as expected.
+        assert!(policies
+            .find_permit(&make_ctx(serde_json::json!({
+                "mcp_trust_tier": "tier1"
+            })))
+            .is_some());
     }
 }

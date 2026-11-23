@@ -479,11 +479,12 @@ impl McpOAuthManager {
             };
             if (200..300).contains(&status) {
                 if let Ok(meta) = serde_json::from_slice::<OAuthServerMetadata>(&body) {
-                    if let Some(ref got_iss) = meta.issuer {
-                        let norm_got = got_iss.trim().trim_end_matches('/').to_ascii_lowercase();
-                        if norm_got != cand_expected_iss.to_ascii_lowercase() {
-                            continue;
-                        }
+                    let Some(ref got_iss) = meta.issuer else {
+                        continue;
+                    };
+                    let norm_got = got_iss.trim().trim_end_matches('/').to_ascii_lowercase();
+                    if norm_got != cand_expected_iss.to_ascii_lowercase() {
+                        continue;
                     }
                     if meta.authorization_endpoint.is_some()
                         || meta.token_endpoint.is_some()
@@ -1919,5 +1920,37 @@ mod tests {
         .unwrap();
         let after_issuer = mgr.get_realm("org-a", "r1").await.unwrap();
         assert!(after_issuer.sealed_access_token.is_none());
+    }
+
+    #[tokio::test]
+    async fn discover_oauth_metadata_rejects_missing_issuer() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            loop {
+                let Ok((mut stream, _)) = listener.accept().await else {
+                    break;
+                };
+                tokio::spawn(async move {
+                    let mut buf = [0u8; 2048];
+                    let _ = stream.read(&mut buf).await;
+                    let body = json!({
+                        "authorization_endpoint": format!("http://{addr}/authorize"),
+                        "token_endpoint": format!("http://{addr}/token")
+                    })
+                    .to_string();
+                    let resp = format!(
+                        "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                        body.len()
+                    );
+                    let _ = stream.write_all(resp.as_bytes()).await;
+                });
+            }
+        });
+
+        let err = McpOAuthManager::discover_oauth_metadata(&format!("http://{addr}"), true)
+            .await
+            .unwrap_err();
+        assert!(err.to_string().contains("Failed discovering"), "{err}");
     }
 }

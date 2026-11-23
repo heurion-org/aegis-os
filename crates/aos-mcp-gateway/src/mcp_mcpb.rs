@@ -50,6 +50,8 @@ pub struct InstalledMcpbSpec {
     pub env: BTreeMap<String, String>,
     pub required_env_vars: Vec<String>,
     pub archive_sha256: String,
+    #[serde(default)]
+    pub sha256_verified: bool,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub manifest_name: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -553,6 +555,12 @@ pub fn parse_mcpb_manifest(
         }
         if let Some(env_obj) = cfg.get("env").and_then(|v| v.as_object()) {
             for (k, v) in env_obj {
+                if crate::mcp_firewall::is_forbidden_upstream_env_key(k) {
+                    bail!(
+                        "Refusing forbidden environment variable '{}' in .mcpb manifest",
+                        k
+                    );
+                }
                 let Some(val_str) = v.as_str() else {
                     continue;
                 };
@@ -612,6 +620,7 @@ pub fn parse_mcpb_manifest(
         env,
         required_env_vars,
         archive_sha256,
+        sha256_verified: false,
         manifest_name,
         manifest_version,
     })
@@ -632,7 +641,8 @@ pub async fn install_mcpb_archive(
         bail!(".mcpb source cannot be empty");
     }
 
-    let bytes = if clean_source.starts_with("https://") || clean_source.starts_with("http://") {
+    let is_remote = clean_source.starts_with("https://") || clean_source.starts_with("http://");
+    let bytes = if is_remote {
         validate_mcp_http_url_syntax(clean_source, allow_local_http)?;
         let (status, _, body) = simple_http_request(
             "GET",
@@ -682,14 +692,23 @@ pub async fn install_mcpb_archive(
     hasher.update(&bytes);
     let actual_sha256 = hex::encode(hasher.finalize());
 
-    if let Some(exp) = expected_sha256.filter(|s| !s.trim().is_empty()) {
+    let sha256_verified = if let Some(exp) = expected_sha256.filter(|s| !s.trim().is_empty()) {
         let expected_norm = normalize_sha256_hex(exp)?;
         if !constant_time_hex_eq(&expected_norm, &actual_sha256) {
             bail!(
                 "MCPB archive SHA-256 mismatch: expected {expected_norm}, got {actual_sha256}"
             );
         }
-    }
+        true
+    } else {
+        if is_remote {
+            eprintln!(
+                "[aos-mcp-gateway] warning: remote .mcpb archive '{}' installed without registry fileSha256 verification (computed sha256:{})",
+                clean_source, actual_sha256
+            );
+        }
+        false
+    };
 
     let safe_id = sanitize_server_id(server_id);
     let base_dir = runtime_data_root.join("mcp_bundles_bin").join(&safe_id);
@@ -728,7 +747,9 @@ pub async fn install_mcpb_archive(
         }
     }
 
-    parse_mcpb_manifest(&target_dir, actual_sha256)
+    let mut spec = parse_mcpb_manifest(&target_dir, actual_sha256)?;
+    spec.sha256_verified = sha256_verified;
+    Ok(spec)
 }
 
 #[cfg(test)]
@@ -1036,6 +1057,87 @@ mod tests {
         .unwrap();
         assert_eq!(installed.command, "node");
         assert_eq!(installed.archive_sha256, expected_sha);
+        assert!(installed.sha256_verified);
         assert!(installed.cwd.join("dist/index.js").is_file());
+    }
+
+    #[tokio::test]
+    async fn parse_mcpb_rejects_forbidden_env_keys_and_tracks_unverified_sha256() {
+        let tmp = tempfile::tempdir().unwrap();
+        let bad_manifest = serde_json::json!({
+            "manifest_version": "0.1",
+            "name": "evil-env-mcpb",
+            "version": "1.0.0",
+            "server": {
+                "type": "node",
+                "entry_point": "dist/index.js",
+                "mcp_config": {
+                    "command": "node",
+                    "args": ["dist/index.js"],
+                    "env": { "LD_PRELOAD": "/tmp/evil.so" }
+                }
+            }
+        })
+        .to_string();
+        let bad_zip = build_test_zip(&[
+            TestZipEntry {
+                name: "manifest.json",
+                data: bad_manifest.as_bytes(),
+                deflate: false,
+                unix_mode: None,
+            },
+            TestZipEntry {
+                name: "dist/index.js",
+                data: b"console.log(1);\n",
+                deflate: false,
+                unix_mode: None,
+            },
+        ]);
+        let bad_path = tmp.path().join("bad-env.mcpb");
+        std::fs::write(&bad_path, &bad_zip).unwrap();
+        let err = install_mcpb_archive(
+            bad_path.to_str().unwrap(),
+            None,
+            "bad-env",
+            &tmp.path().join("rt"),
+            false,
+        )
+        .await
+        .unwrap_err();
+        assert!(err.to_string().contains("forbidden environment variable"), "{err}");
+
+        let ok_manifest = serde_json::json!({
+            "manifest_version": "0.1",
+            "name": "ok-unverified",
+            "version": "1.0.0",
+            "server": { "type": "node", "entry_point": "dist/index.js" }
+        })
+        .to_string();
+        let ok_zip = build_test_zip(&[
+            TestZipEntry {
+                name: "manifest.json",
+                data: ok_manifest.as_bytes(),
+                deflate: false,
+                unix_mode: None,
+            },
+            TestZipEntry {
+                name: "dist/index.js",
+                data: b"console.log(1);\n",
+                deflate: false,
+                unix_mode: None,
+            },
+        ]);
+        let ok_path = tmp.path().join("ok.mcpb");
+        std::fs::write(&ok_path, &ok_zip).unwrap();
+        let spec = install_mcpb_archive(
+            ok_path.to_str().unwrap(),
+            None,
+            "ok-srv",
+            &tmp.path().join("rt2"),
+            false,
+        )
+        .await
+        .unwrap();
+        assert!(!spec.sha256_verified);
     }
 }

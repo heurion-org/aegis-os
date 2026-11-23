@@ -269,6 +269,57 @@ pub fn validate_package_identifier<'a>(
     Ok(clean_id)
 }
 
+pub(crate) fn parse_url_origin(raw_url: &str) -> anyhow::Result<(String, String, u16)> {
+    let trimmed = raw_url.trim();
+    let (scheme, default_port, rest) = if let Some(r) = trimmed.strip_prefix("https://") {
+        ("https".to_string(), 443u16, r)
+    } else if let Some(r) = trimmed.strip_prefix("http://") {
+        ("http".to_string(), 80u16, r)
+    } else {
+        bail!("Expected http:// or https:// URL, got '{}'", raw_url);
+    };
+    let authority = rest.split(['/', '?', '#']).next().unwrap_or("");
+    let host_port = authority.rsplit_once('@').map(|(_, r)| r).unwrap_or(authority);
+    let (host, port) = if let Some(after_open) = host_port.strip_prefix('[') {
+        let (h, after_bracket) = after_open
+            .split_once(']')
+            .context("Malformed IPv6 host in URL")?;
+        let port = if let Some(ps) = after_bracket.strip_prefix(':') {
+            ps.parse::<u16>()
+                .with_context(|| format!("Invalid port in URL '{}'", raw_url))?
+        } else if after_bracket.is_empty() {
+            default_port
+        } else {
+            bail!("Malformed authority in URL '{}'", raw_url);
+        };
+        (h, port)
+    } else if let Some((h, ps)) = host_port.rsplit_once(':') {
+        if !h.contains(':') {
+            let port = ps
+                .parse::<u16>()
+                .with_context(|| format!("Invalid port in URL '{}'", raw_url))?;
+            (h, port)
+        } else {
+            (host_port, default_port)
+        }
+    } else {
+        (host_port, default_port)
+    };
+    if host.is_empty() || port == 0 {
+        bail!("Invalid host or port in URL '{}'", raw_url);
+    }
+    Ok((scheme, host.to_ascii_lowercase(), port))
+}
+
+pub(crate) fn url_matches_allowed_origins(raw_url: &str, allowed_origins: &[String]) -> bool {
+    let Ok(target) = parse_url_origin(raw_url) else {
+        return false;
+    };
+    allowed_origins
+        .iter()
+        .any(|orig| parse_url_origin(orig).is_ok_and(|allowed| allowed == target))
+}
+
 fn validate_package_version(raw: &str) -> Option<&str> {
     let trimmed = raw.trim();
     if trimmed.is_empty() || trimmed.len() > 128 || trimmed.starts_with('-') {
@@ -282,12 +333,19 @@ fn validate_package_version(raw: &str) -> Option<&str> {
     Some(trimmed)
 }
 
-pub fn pin_package_identifier(reg_type: &str, identifier: &str, version: Option<&str>) -> String {
+pub fn pin_package_identifier(
+    reg_type: &str,
+    identifier: &str,
+    version: Option<&str>,
+) -> anyhow::Result<String> {
     let clean_id = identifier.trim();
-    let Some(ver) = version.and_then(validate_package_version) else {
-        return clean_id.to_string();
+    let ver = match version {
+        None => return Ok(clean_id.to_string()),
+        Some(raw) if raw.trim().is_empty() => return Ok(clean_id.to_string()),
+        Some(raw) => validate_package_version(raw)
+            .with_context(|| format!("Invalid package version '{}' (refusing unpinned fallback)", raw))?,
     };
-    match reg_type.trim().to_ascii_lowercase().as_str() {
+    let pinned = match reg_type.trim().to_ascii_lowercase().as_str() {
         "npm" => {
             let already_pinned = if let Some(rest) = clean_id.strip_prefix('@') {
                 rest.split_once('/').is_some_and(|(_, pkg)| pkg.contains('@'))
@@ -323,7 +381,8 @@ pub fn pin_package_identifier(reg_type: &str, identifier: &str, version: Option<
             }
         }
         _ => clean_id.to_string(),
-    }
+    };
+    Ok(pinned)
 }
 
 fn infer_package_command(
@@ -333,7 +392,7 @@ fn infer_package_command(
     allow_local_http: bool,
 ) -> anyhow::Result<(String, Vec<String>, Vec<String>)> {
     let clean_id = validate_package_identifier(reg_type, identifier, allow_local_http)?;
-    let pinned = pin_package_identifier(reg_type, clean_id, version);
+    let pinned = pin_package_identifier(reg_type, clean_id, version)?;
     match reg_type.to_ascii_lowercase().as_str() {
         "npm" => Ok((
             "npx".to_string(),
@@ -359,6 +418,9 @@ fn infer_package_command(
                 "/tmp:rw,noexec,nosuid,size=64m".to_string(),
                 "--cap-drop=ALL".to_string(),
                 "--security-opt=no-new-privileges".to_string(),
+                "--pids-limit=256".to_string(),
+                "--memory=512m".to_string(),
+                "--ipc=none".to_string(),
                 "--network=none".to_string(),
                 pinned,
             ],
@@ -372,14 +434,11 @@ fn infer_package_command(
 fn is_reverse_dns_domain_verified(
     namespace_name: &str,
     remote_host: &str,
-    website_url: Option<&str>,
+    _website_url: Option<&str>,
     meta: Option<&Value>,
 ) -> bool {
     if meta
-        .and_then(|m| {
-            m.pointer("/io.modelcontextprotocol.registry~1official/verified")
-                .or_else(|| m.get("verified"))
-        })
+        .and_then(|m| m.pointer("/io.modelcontextprotocol.registry~1official/verified"))
         .and_then(|v| v.as_bool())
         == Some(true)
     {
@@ -402,15 +461,6 @@ fn is_reverse_dns_domain_verified(
                 {
                     return true;
                 }
-            }
-        }
-    }
-
-    if let Some(web) = website_url {
-        if let Ok((true, web_host)) = parse_url_scheme_and_host(web) {
-            let wh = web_host.trim_start_matches("www.");
-            if remote_host == wh || remote_host.ends_with(&format!(".{wh}")) {
-                return true;
             }
         }
     }
@@ -969,7 +1019,10 @@ impl McpRegistryClient {
                             .filter(|s| !s.is_empty())
                             .map(str::to_string);
                         let non_dep_count = by_name.values().filter(|(_, dep, _)| !*dep).count();
-                        if next_cursor.is_none() || page_empty || non_dep_count >= capped_limit {
+                        if next_cursor.is_none()
+                            || page_empty
+                            || non_dep_count >= capped_limit.saturating_mul(3).max(30)
+                        {
                             break;
                         }
                     }
@@ -1032,6 +1085,15 @@ impl McpRegistryClient {
         Ok(all_candidates)
     }
 
+    /// Returns the allowed registry origins when air-gapped mode is enabled (`None` otherwise).
+    pub fn airgap_allowed_origins(&self) -> Option<Vec<String>> {
+        if self.is_public_registry_disabled() {
+            Some(self.configured_registries())
+        } else {
+            None
+        }
+    }
+
     /// Fetches a specific server by exact Registry name (e.g. `app.linear/mcp`).
     pub async fn fetch_exact_server(
         &self,
@@ -1076,14 +1138,13 @@ impl McpRegistryClient {
         allow_local_http: bool,
     ) -> anyhow::Result<McpRegistryCandidate> {
         validate_mcp_http_url_syntax(raw_url, allow_local_http)?;
-        let (is_https, host) = parse_url_scheme_and_host(raw_url)?;
+        let (orig_scheme, orig_host, _orig_port) = parse_url_origin(raw_url)?;
         let mut endpoint_url = raw_url.trim().to_string();
-        let mut name = host.clone();
-        let mut title = format!("Remote MCP ({host})");
+        let mut name = orig_host.clone();
+        let mut title = format!("Remote MCP ({orig_host})");
         let mut description = String::new();
         let mut version = None;
         let mut website_url = None;
-        let mut card_verified = false;
 
         // Probe SEP-2127 `<url>/server-card` (best-effort, fast timeout).
         let card_url = format!("{}/server-card", endpoint_url.trim_end_matches('/'));
@@ -1099,30 +1160,43 @@ impl McpRegistryClient {
             .await
             {
                 if let Ok(card) = serde_json::from_slice::<Value>(&bytes) {
-                    card_verified = true;
-                    if let Some(n) = card.get("name").and_then(|v| v.as_str()).filter(|s| !s.is_empty()) {
-                        name = n.to_string();
-                    }
-                    if let Some(t) = card.get("title").and_then(|v| v.as_str()).filter(|s| !s.is_empty()) {
-                        title = t.to_string();
-                    }
-                    if let Some(d) = card.get("description").and_then(|v| v.as_str()) {
-                        description = d.to_string();
-                    }
-                    if let Some(v) = card.get("version").and_then(|v| v.as_str()).filter(|s| !s.is_empty()) {
-                        version = Some(v.to_string());
-                    }
-                    if let Some(w) = card.get("websiteUrl").and_then(|v| v.as_str()).filter(|s| !s.is_empty()) {
-                        website_url = Some(w.to_string());
-                    }
-                    if let Some(tu) = card
-                        .pointer("/transport/url")
-                        .and_then(|v| v.as_str())
-                        .map(str::trim)
-                        .filter(|s| !s.is_empty())
-                    {
-                        if validate_mcp_http_url_syntax(tu, allow_local_http).is_ok() {
-                            endpoint_url = tu.to_string();
+                    let has_card_shape = card.is_object()
+                        && (card
+                            .get("name")
+                            .and_then(|v| v.as_str())
+                            .is_some_and(|s| !s.trim().is_empty())
+                            || card.get("transport").is_some_and(|v| v.is_object()));
+                    if has_card_shape {
+                        if let Some(n) = card.get("name").and_then(|v| v.as_str()).filter(|s| !s.is_empty()) {
+                            name = n.to_string();
+                        }
+                        if let Some(t) = card.get("title").and_then(|v| v.as_str()).filter(|s| !s.is_empty()) {
+                            title = t.to_string();
+                        }
+                        if let Some(d) = card.get("description").and_then(|v| v.as_str()) {
+                            description = d.to_string();
+                        }
+                        if let Some(v) = card.get("version").and_then(|v| v.as_str()).filter(|s| !s.is_empty()) {
+                            version = Some(v.to_string());
+                        }
+                        if let Some(w) = card.get("websiteUrl").and_then(|v| v.as_str()).filter(|s| !s.is_empty()) {
+                            website_url = Some(w.to_string());
+                        }
+                        if let Some(tu) = card
+                            .pointer("/transport/url")
+                            .and_then(|v| v.as_str())
+                            .map(str::trim)
+                            .filter(|s| !s.is_empty())
+                        {
+                            if validate_mcp_http_url_syntax(tu, allow_local_http).is_ok() {
+                                if let Ok((tu_scheme, tu_host, _)) = parse_url_origin(tu) {
+                                    let same_or_subdomain = tu_host == orig_host
+                                        || tu_host.ends_with(&format!(".{orig_host}"));
+                                    if tu_scheme == orig_scheme && same_or_subdomain {
+                                        endpoint_url = tu.to_string();
+                                    }
+                                }
+                            }
                         }
                     }
                 }
@@ -1176,24 +1250,21 @@ impl McpRegistryClient {
         let server_id = explicit_server_id
             .map(sanitize_server_id)
             .unwrap_or_else(|| {
-                if name != host {
+                if name != orig_host {
                     derive_server_id_from_name(&name)
                 } else {
-                    let clean = host
+                    let clean = orig_host
                         .strip_prefix("mcp.")
-                        .unwrap_or(&host)
+                        .unwrap_or(&orig_host)
                         .split('.')
                         .next()
-                        .unwrap_or(&host);
+                        .unwrap_or(&orig_host);
                     sanitize_server_id(clean)
                 }
             });
-        let domain_verified = is_https && card_verified;
-        let trust_tier = if domain_verified && auth_mode == "oauth2_or_auto" {
-            McpTrustTier::Tier1VerifiedRemoteOAuth
-        } else {
-            McpTrustTier::Tier2RemoteStaticAuth
-        };
+        // Direct URL installs never auto-promote to Tier 1 without Registry / verified proof.
+        let domain_verified = false;
+        let trust_tier = McpTrustTier::Tier2RemoteStaticAuth;
         let manifest_sha256 = compute_candidate_manifest_sha256(
             &name,
             &server_id,
@@ -1237,8 +1308,18 @@ impl McpRegistryClient {
         }
 
         if let Some(bundle_src) = trimmed.strip_prefix("bundle:") {
+            let clean_src = bundle_src.trim();
+            if self.is_public_registry_disabled() && !Path::new(clean_src).is_file() {
+                let bundle_url = resolve_bundle_source_url(clean_src);
+                if !self.is_airgap_allowed_direct_url(&bundle_url, allow_local_http)? {
+                    bail!(
+                        "Refusing external bundle '{}' in air-gapped MCP registry mode (origin not in configured private registries)",
+                        clean_src
+                    );
+                }
+            }
             return Ok(ResolvedInstallTarget::Bundle {
-                source: bundle_src.trim().to_string(),
+                source: clean_src.to_string(),
                 allow_local_http,
             });
         }
@@ -1246,6 +1327,15 @@ impl McpRegistryClient {
         if trimmed.ends_with(".json")
             && (path_candidate.is_file() || trimmed.contains("mcp-bundle"))
         {
+            if self.is_public_registry_disabled() && !path_candidate.is_file() {
+                let bundle_url = resolve_bundle_source_url(trimmed);
+                if !self.is_airgap_allowed_direct_url(&bundle_url, allow_local_http)? {
+                    bail!(
+                        "Refusing external bundle '{}' in air-gapped MCP registry mode (origin not in configured private registries)",
+                        trimmed
+                    );
+                }
+            }
             return Ok(ResolvedInstallTarget::Bundle {
                 source: trimmed.to_string(),
                 allow_local_http,
@@ -1280,8 +1370,18 @@ impl McpRegistryClient {
                 .map(ResolvedInstallTarget::Candidate);
         }
         if let Some(pkg) = trimmed.strip_prefix("mcpb:") {
+            let clean_pkg = pkg.trim();
+            if (clean_pkg.starts_with("https://") || clean_pkg.starts_with("http://"))
+                && self.is_public_registry_disabled()
+                && !self.is_airgap_allowed_direct_url(clean_pkg, allow_local_http)?
+            {
+                bail!(
+                    "Refusing external .mcpb URL '{}' in air-gapped MCP registry mode (origin not in configured private registries)",
+                    clean_pkg
+                );
+            }
             return self
-                .build_package_candidate("mcpb", pkg.trim(), explicit_server_id, allow_local_http)
+                .build_package_candidate("mcpb", clean_pkg, explicit_server_id, allow_local_http)
                 .map(Box::new)
                 .map(ResolvedInstallTarget::Candidate);
         }
@@ -1373,21 +1473,9 @@ impl McpRegistryClient {
         )
     }
 
-    fn is_airgap_allowed_direct_url(&self, raw_url: &str, allow_local_http: bool) -> anyhow::Result<bool> {
-        let (_, target_host) = parse_url_scheme_and_host(raw_url)?;
-        if allow_local_http
-            && matches!(target_host.as_str(), "127.0.0.1" | "localhost" | "::1")
-        {
-            return Ok(true);
-        }
-        for reg in self.configured_registries() {
-            if let Ok((_, reg_host)) = parse_url_scheme_and_host(&reg) {
-                if reg_host.eq_ignore_ascii_case(&target_host) {
-                    return Ok(true);
-                }
-            }
-        }
-        Ok(false)
+    fn is_airgap_allowed_direct_url(&self, raw_url: &str, _allow_local_http: bool) -> anyhow::Result<bool> {
+        let _ = parse_url_origin(raw_url)?;
+        Ok(url_matches_allowed_origins(raw_url, &self.configured_registries()))
     }
 
     fn build_package_candidate(
@@ -2304,5 +2392,100 @@ mod tests {
         assert_eq!(results.len(), 1);
         assert_eq!(results[0].name, "corp.internal/docs-mcp");
         assert_eq!(results[0].allowed_hosts, vec!["docs.corp.internal".to_string()]);
+    }
+
+    #[tokio::test]
+    async fn website_url_cannot_spoof_tier1_and_server_card_blocks_cross_domain_redirect() {
+        // 1. Registry entry with `io.github.*` + `websiteUrl` claiming verified domain + generic `_meta.verified`
+        // must NOT promote to Tier 1.
+        let spoof_entry = json!({
+            "server": {
+                "name": "io.github.attacker/fake-linear",
+                "title": "Fake Linear",
+                "websiteUrl": "https://linear.app",
+                "remotes": [{ "type": "streamable-http", "url": "https://mcp.linear.app/mcp" }]
+            },
+            "_meta": { "verified": true }
+        });
+        let cand = parse_registry_server_entry(&spoof_entry, "https://registry.example", false).unwrap();
+        assert!(!cand.domain_verified);
+        assert_eq!(cand.trust_tier, McpTrustTier::Tier2RemoteStaticAuth);
+
+        // 2. Direct URL SEP-2127 `/server-card` trying to redirect `/transport/url` to evil domain must be ignored.
+        let card = json!({
+            "name": "com.example/srv",
+            "transport": { "type": "streamable-http", "url": "https://evil.attacker.example/mcp" }
+        });
+        let addr = spawn_mock_http_server(vec![
+            ("/mcp/server-card", 200, "application/json", card.to_string()),
+        ])
+        .await;
+        let tmp = tempfile::tempdir().unwrap();
+        let client = McpRegistryClient::new(tmp.path());
+        let orig = format!("http://{addr}/mcp");
+        let resolved = client.resolve_install_target(&orig, None, true).await.unwrap();
+        match resolved {
+            ResolvedInstallTarget::Candidate(c) => {
+                assert_eq!(c.remote_url.as_deref(), Some(orig.as_str()));
+                assert!(!c.domain_verified);
+                assert_eq!(c.trust_tier, McpTrustTier::Tier2RemoteStaticAuth);
+            }
+            other => panic!("Expected Candidate, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn airgap_blocks_bundle_mcpb_and_unconfigured_localhost_ports() {
+        let tmp = tempfile::tempdir().unwrap();
+        let client = McpRegistryClient::new(tmp.path());
+        client.set_disable_public_registry(true).await.unwrap();
+        client
+            .add_registry("http://127.0.0.1:49001", true)
+            .await
+            .unwrap();
+
+        for target in [
+            "bundle:heurion",
+            "bundle:http://127.0.0.1:49999/mcp-bundle.json",
+            "https://evil.example/mcp-bundle.json",
+            "mcpb:http://127.0.0.1:49999/tool.mcpb",
+            "http://127.0.0.1:49999/mcp",
+        ] {
+            let err = client
+                .resolve_install_target(target, None, true)
+                .await
+                .unwrap_err();
+            assert!(
+                err.to_string().contains("air-gapped"),
+                "expected airgap rejection for {target}: {err}"
+            );
+        }
+
+        // Configured origin matches exact (scheme, host, port) for bundle & mcpb!
+        assert!(matches!(
+            client
+                .resolve_install_target("bundle:http://127.0.0.1:49001/bundle.json", None, true)
+                .await
+                .unwrap(),
+            ResolvedInstallTarget::Bundle { .. }
+        ));
+        assert!(matches!(
+            client
+                .resolve_install_target("mcpb:http://127.0.0.1:49001/tool.mcpb", None, true)
+                .await
+                .unwrap(),
+            ResolvedInstallTarget::Candidate(_)
+        ));
+    }
+
+    #[test]
+    fn invalid_package_version_fails_closed_and_oci_includes_resource_limits() {
+        assert!(infer_package_command("npm", "@acme/mcp", Some("1.0.0;rm -rf /"), false).is_err());
+        assert!(pin_package_identifier("pypi", "mcp-pkg", Some("--evil")).is_err());
+        let (_, oci_args, _) =
+            infer_package_command("oci", "ghcr.io/acme/mcp-git", Some("1.4.0"), false).unwrap();
+        assert!(oci_args.contains(&"--pids-limit=256".to_string()));
+        assert!(oci_args.contains(&"--memory=512m".to_string()));
+        assert!(oci_args.contains(&"--ipc=none".to_string()));
     }
 }

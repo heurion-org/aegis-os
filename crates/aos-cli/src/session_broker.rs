@@ -813,8 +813,10 @@ pub async fn serve_mcp_stdio() -> Result<()> {
         let Ok(request) = serde_json::from_str::<Value>(&line) else {
             continue;
         };
-        // JSON-RPC notifications MUST NOT receive a response.
+        // JSON-RPC notifications MUST NOT receive a response, but must forward upstream/kernel-side.
         if request.get("id").is_none() {
+            let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
+            let _ = control_request_mcp_streaming("/v1/mcp", &request, false, tx).await;
             continue;
         }
         let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
@@ -1078,7 +1080,9 @@ where
                     .await;
             let mut notes = Vec::new();
             while let Ok(n) = notif_rx.try_recv() {
-                notes.push(n);
+                if n.matches_identity(&state.identity.org_id, &state.identity.agent_id) {
+                    notes.push(n.payload);
+                }
             }
             let accepts_sse = headers
                 .get("accept")
@@ -1319,6 +1323,9 @@ where
                 stream.flush().await?;
                 Ok(())
             } else {
+                let wants_envelope = headers
+                    .get("x-aegis-mcp-envelope")
+                    .is_some_and(|v| v.trim() == "1");
                 let res = state
                     .mcp_proxy_pool
                     .handle_jsonrpc_streaming(
@@ -1337,7 +1344,7 @@ where
                 }
                 match res {
                     Ok(Some(resp)) => {
-                        if notifications.is_empty() {
+                        if !wants_envelope || notifications.is_empty() {
                             write_json(&mut stream, "200 OK", resp).await
                         } else {
                             write_json(
@@ -3116,6 +3123,7 @@ print("BROKER_PROBE_DONE")
         )
         .await
         .unwrap();
+        broker.kernel.set_allow_agent_local_http(true);
 
         let install_rpc = json!({
             "jsonrpc": "2.0",
@@ -3209,5 +3217,191 @@ print("BROKER_PROBE_DONE")
         )
         .unwrap();
         assert_eq!(hot_inner["notifications"][0]["method"], "notifications/progress");
+    }
+
+    #[tokio::test]
+    async fn post_v1_mcp_proxy_non_sse_returns_raw_jsonrpc_without_envelope_opt_in() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        use tokio::net::TcpListener;
+
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let mcp_addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            loop {
+                let Ok((mut stream, _)) = listener.accept().await else {
+                    break;
+                };
+                tokio::spawn(async move {
+                    let mut buf = Vec::new();
+                    let mut tmp = [0u8; 4096];
+                    loop {
+                        let n = stream.read(&mut tmp).await.unwrap_or(0);
+                        if n == 0 {
+                            break;
+                        }
+                        buf.extend_from_slice(&tmp[..n]);
+                        let s = String::from_utf8_lossy(&buf);
+                        if let Some((head, body)) = s.split_once("\r\n\r\n") {
+                            let clen: usize = head
+                                .lines()
+                                .find_map(|l| {
+                                    let (k, v) = l.split_once(':')?;
+                                    k.eq_ignore_ascii_case("content-length")
+                                        .then(|| v.trim().parse().ok())?
+                                })
+                                .unwrap_or(0);
+                            if body.len() >= clen {
+                                let req: Value =
+                                    serde_json::from_str(&body[..clen]).unwrap_or_default();
+                                let rid = req.get("id").cloned().unwrap_or(json!(1));
+                                let method =
+                                    req.get("method").and_then(|v| v.as_str()).unwrap_or("");
+                                if method == "notifications/initialized" {
+                                    let _ = stream
+                                        .write_all(b"HTTP/1.1 202 Accepted\r\nContent-Length: 0\r\nConnection: close\r\n\r\n")
+                                        .await;
+                                    return;
+                                }
+                                if method == "tools/list" {
+                                    let sse = format!(
+                                        "data: {}\n\ndata: {}\n\n",
+                                        json!({ "jsonrpc": "2.0", "method": "notifications/progress", "params": { "progress": 1, "total": 1 } }),
+                                        json!({
+                                            "jsonrpc": "2.0",
+                                            "id": rid,
+                                            "result": { "tools": [{ "name": "ping", "inputSchema": { "type": "object", "properties": {} } }] }
+                                        })
+                                    );
+                                    let out = format!(
+                                        "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nMcp-Session-Id: sid-proxy-env\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                                        sse.len(),
+                                        sse
+                                    );
+                                    let _ = stream.write_all(out.as_bytes()).await;
+                                    return;
+                                }
+                                let body_str = json!({
+                                    "jsonrpc": "2.0",
+                                    "id": rid,
+                                    "result": {
+                                        "protocolVersion": "2024-11-05",
+                                        "serverInfo": { "name": "mock-proxy-env", "version": "1.0.0" },
+                                        "capabilities": { "tools": { "listChanged": true } }
+                                    }
+                                })
+                                .to_string();
+                                let out = format!(
+                                    "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nMcp-Session-Id: sid-proxy-env\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                                    body_str.len(),
+                                    body_str
+                                );
+                                let _ = stream.write_all(out.as_bytes()).await;
+                                return;
+                            }
+                        }
+                    }
+                });
+            }
+        });
+
+        let tmp = tempfile::tempdir().unwrap();
+        let runtime = tmp.path().join("rt");
+        let workspace = tmp.path().join("ws");
+        let shadow = tmp.path().join("shadow");
+        let agent_home = tmp.path().join("agent_home");
+        let session_dir = tmp.path().join("session");
+        for d in [&runtime, &workspace, &shadow, &agent_home, &session_dir] {
+            std::fs::create_dir_all(d).unwrap();
+        }
+        let identity = AgentIdentity::new("acme", "coder-proxy-raw", "Engineer");
+        let gw = Arc::new(aos_egress::AegisEgressGateway::new());
+        let broker = SessionBroker::start_with_egress(
+            &runtime,
+            &session_dir,
+            tmp.path().join("ctrl"),
+            BrokerSession {
+                session_id: "ses_proxy_raw".to_string(),
+                mode: "implement".to_string(),
+                enforcement: "enforced".to_string(),
+                workspace: workspace.display().to_string(),
+                shadow: shadow.display().to_string(),
+                agent_home: agent_home.display().to_string(),
+            },
+            identity,
+            Some("127.0.0.1:18080".to_string()),
+            false,
+            Some(gw),
+        )
+        .await
+        .unwrap();
+
+        broker
+            .kernel
+            .mcp_firewall
+            .register_http_server_with_options(
+                "acme",
+                "proxysse",
+                &format!("http://{mcp_addr}/mcp"),
+                std::collections::BTreeMap::new(),
+                aos_mcp_gateway::mcp_firewall::McpServerPolicy::default(),
+                None,
+                None,
+                true,
+            )
+            .await
+            .unwrap();
+
+        let ep = broker.control_endpoint();
+
+        // 1. Default non-SSE `/v1/mcp-proxy/<id>` MUST return standard raw JSON-RPC (no wrapper envelope).
+        let raw_req = json!({ "jsonrpc": "2.0", "id": 21, "method": "tools/list", "params": {} });
+        let raw_resp = control_request_at(
+            &ep,
+            &broker.agent_token,
+            "POST",
+            "/v1/mcp-proxy/proxysse",
+            Some(&raw_req),
+        )
+        .await
+        .unwrap();
+        assert!(
+            raw_resp.get("__aegis_mcp_envelope").is_none(),
+            "non-SSE /v1/mcp-proxy without opt-in header must return raw JSON-RPC: {raw_resp}"
+        );
+        assert_eq!(raw_resp["jsonrpc"], "2.0");
+        assert_eq!(raw_resp["id"], 21);
+        assert_eq!(raw_resp["result"]["tools"][0]["name"], "ping");
+
+        // 2. Opting in via `X-Aegis-Mcp-Envelope: 1` returns `{__aegis_mcp_envelope, notifications, response}`.
+        let env_req = json!({ "jsonrpc": "2.0", "id": 22, "method": "tools/list", "params": {} });
+        let body = serde_json::to_vec(&env_req).unwrap();
+        let path = "/v1/mcp-proxy/proxysse";
+        let env_resp = if ep.starts_with("http://") {
+            let (authority, mapped_path) = map_broker_path_for_http(&ep, path);
+            let req_head = format!(
+                "POST {mapped_path} HTTP/1.1\r\nHost: {authority}\r\nX-Aegis-Token: {}\r\nX-Aegis-Mcp-Envelope: 1\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                broker.agent_token,
+                body.len()
+            );
+            let stream = tokio::net::TcpStream::connect(&authority).await.unwrap();
+            exchange(stream, &req_head, &body).await.unwrap()
+        } else {
+            let req_head = format!(
+                "POST {path} HTTP/1.1\r\nHost: aegis-session-broker\r\nX-Aegis-Token: {}\r\nX-Aegis-Mcp-Envelope: 1\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                broker.agent_token,
+                body.len()
+            );
+            if let Some(addr) = ep.strip_prefix("tcp://") {
+                let stream = tokio::net::TcpStream::connect(addr).await.unwrap();
+                exchange(stream, &req_head, &body).await.unwrap()
+            } else {
+                let stream = tokio::net::UnixStream::connect(&ep).await.unwrap();
+                exchange(stream, &req_head, &body).await.unwrap()
+            }
+        };
+        assert_eq!(env_resp["__aegis_mcp_envelope"], true, "{env_resp}");
+        assert_eq!(env_resp["notifications"][0]["method"], "notifications/progress");
+        assert_eq!(env_resp["response"]["id"], 22);
+        assert_eq!(env_resp["response"]["result"]["tools"][0]["name"], "ping");
     }
 }

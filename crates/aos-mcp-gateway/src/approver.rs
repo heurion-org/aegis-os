@@ -1224,7 +1224,14 @@ pub const APPROVE_PAGE_HTML: &str = r##"<!doctype html>
       await loadMcpInventory(canManageMcp);
       await loadMcpOutbox(canManageMcp);
     } catch (e) {
-      root.innerHTML = '<div class="card"><p class="err">Failed to load escalations: ' + e.message + '</p></div>';
+      root.innerHTML = '';
+      const errCard = document.createElement('div');
+      errCard.className = 'card';
+      const errP = document.createElement('p');
+      errP.className = 'err';
+      errP.textContent = 'Failed to load escalations: ' + (e && e.message ? e.message : String(e));
+      errCard.appendChild(errP);
+      root.appendChild(errCard);
     }
   }
 
@@ -1247,7 +1254,7 @@ pub const APPROVE_PAGE_HTML: &str = r##"<!doctype html>
     }
   }
 
-  async function saveMcpPolicy(orgId, serverId, trustLevel, dlpMode, isolateNet, allowedHostsText) {
+  async function saveMcpPolicy(orgId, serverId, trustLevel, dlpMode, isolateNet, allowedHostsText, allowElicitation) {
     const msg = document.getElementById('mcp-inventory-msg');
     try {
       const payload = {
@@ -1264,6 +1271,9 @@ pub const APPROVE_PAGE_HTML: &str = r##"<!doctype html>
           .split(',')
           .map(x => x.trim())
           .filter(Boolean);
+      }
+      if (typeof allowElicitation === 'boolean') {
+        payload.allow_elicitation = allowElicitation;
       }
       const res = await fetch(apiBase + '/v1/mcp/policy', {
         method: 'POST',
@@ -1457,6 +1467,18 @@ pub const APPROVE_PAGE_HTML: &str = r##"<!doctype html>
         dlpSel.value = ['pseudonymize', 'block', 'off'].includes(s.dlp_mode) ? s.dlp_mode : 'pseudonymize';
         ctrl.appendChild(dlpSel);
 
+        const elicitSel = document.createElement('select');
+        const eOptOff = document.createElement('option');
+        eOptOff.value = 'off';
+        eOptOff.textContent = 'elicit:off';
+        const eOptOn = document.createElement('option');
+        eOptOn.value = 'on';
+        eOptOn.textContent = 'elicit:on';
+        elicitSel.appendChild(eOptOff);
+        elicitSel.appendChild(eOptOn);
+        elicitSel.value = s.allow_elicitation ? 'on' : 'off';
+        ctrl.appendChild(elicitSel);
+
         let netSel = null;
         let hostsInp = null;
         if (s.transport === 'stdio') {
@@ -1489,7 +1511,8 @@ pub const APPROVE_PAGE_HTML: &str = r##"<!doctype html>
           trustSel.value,
           dlpSel.value,
           netSel ? netSel.value === 'isolated' : undefined,
-          hostsInp ? hostsInp.value : undefined
+          hostsInp ? hostsInp.value : undefined,
+          elicitSel.value === 'on'
         );
         ctrl.appendChild(btnSave);
 

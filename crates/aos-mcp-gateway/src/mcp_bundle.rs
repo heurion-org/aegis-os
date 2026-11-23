@@ -147,6 +147,11 @@ pub struct BundleInstallOptions {
     pub proxy_bin_path: Option<PathBuf>,
     pub allow_local_http: bool,
     pub dry_run: bool,
+    pub expected_manifest_sha256: Option<String>,
+    pub clamp_untrusted_policy: bool,
+    pub trust_override: Option<McpTrustLevel>,
+    pub preserve_existing_policies: bool,
+    pub airgap_allowed_origins: Option<Vec<String>>,
 }
 
 impl Default for BundleInstallOptions {
@@ -160,6 +165,11 @@ impl Default for BundleInstallOptions {
             proxy_bin_path: None,
             allow_local_http: false,
             dry_run: false,
+            expected_manifest_sha256: None,
+            clamp_untrusted_policy: false,
+            trust_override: None,
+            preserve_existing_policies: false,
+            airgap_allowed_origins: None,
         }
     }
 }
@@ -431,22 +441,35 @@ impl McpBundleManager {
             .cloned()
     }
 
-    async fn load_manifest(
+    /// Fetches/reads a bundle manifest and returns `(manifest, fetched_url, sha256_hex)`.
+    pub async fn fetch_manifest_with_sha256(
         source: &str,
         allow_local_http: bool,
-    ) -> anyhow::Result<(McpBundleManifest, Option<String>)> {
+        airgap_allowed_origins: Option<&[String]>,
+    ) -> anyhow::Result<(McpBundleManifest, Option<String>, String)> {
+        use sha2::{Digest, Sha256};
+
         let p = Path::new(source);
         if p.is_file() {
-            let raw = tokio::fs::read_to_string(p)
+            let bytes = tokio::fs::read(p)
                 .await
                 .with_context(|| format!("reading local MCP bundle file '{}'", p.display()))?;
-            let manifest: McpBundleManifest = serde_json::from_str(&raw)
+            let sha256 = hex::encode(Sha256::digest(&bytes));
+            let manifest: McpBundleManifest = serde_json::from_slice(&bytes)
                 .with_context(|| format!("parsing MCP bundle JSON '{}'", p.display()))?;
-            return Ok((manifest, None));
+            return Ok((manifest, None, sha256));
         }
 
         let url = resolve_bundle_source_url(source);
         validate_mcp_http_url_syntax(&url, allow_local_http)?;
+        if let Some(origins) = airgap_allowed_origins {
+            if !crate::mcp_registry::url_matches_allowed_origins(&url, origins) {
+                bail!(
+                    "Refusing remote MCP bundle manifest '{}' in air-gapped registry mode",
+                    url
+                );
+            }
+        }
         let (status, _, bytes) = simple_http_request(
             "GET",
             &url,
@@ -463,9 +486,10 @@ impl McpBundleManager {
                 status
             );
         }
+        let sha256 = hex::encode(Sha256::digest(&bytes));
         let manifest: McpBundleManifest = serde_json::from_slice(&bytes)
             .with_context(|| format!("parsing remote MCP bundle manifest from '{}'", url))?;
-        Ok((manifest, Some(url)))
+        Ok((manifest, Some(url), sha256))
     }
 
     /// Installs or upgrades an MCP Bundle for `org_id` from a local JSON file, domain shorthand
@@ -476,7 +500,22 @@ impl McpBundleManager {
         source: &str,
         opts: BundleInstallOptions,
     ) -> anyhow::Result<InstalledMcpBundleRecord> {
-        let (manifest, fetched_url) = Self::load_manifest(source, opts.allow_local_http).await?;
+        let (manifest, fetched_url, actual_sha256) = Self::fetch_manifest_with_sha256(
+            source,
+            opts.allow_local_http,
+            opts.airgap_allowed_origins.as_deref(),
+        )
+        .await?;
+        if let Some(ref exp) = opts.expected_manifest_sha256 {
+            let exp_clean = exp.trim().to_ascii_lowercase();
+            if exp_clean != actual_sha256 {
+                bail!(
+                    "MCP bundle manifest SHA-256 mismatch: expected {}, got {}",
+                    exp_clean,
+                    actual_sha256
+                );
+            }
+        }
         if manifest.schema != "aegis-mcp-bundle/v1" {
             bail!(
                 "Unsupported MCP bundle schema '{}' (expected 'aegis-mcp-bundle/v1')",
@@ -613,14 +652,53 @@ impl McpBundleManager {
         // 2. Register each selected cloud MCP server in McpFirewallRegistry
         let mut server_ids = Vec::new();
         for s in &selected_servers {
-            let policy = McpServerPolicy {
-                trust_level: s.trust_level,
-                dlp_mode: s.dlp_mode,
-                strip_prompt_injection: s.strip_prompt_injection,
-                isolate_upstream_home: true,
-                request_timeout_ms: s.request_timeout_ms,
-                tool_overrides: s.tool_overrides.clone(),
-                ..McpServerPolicy::default()
+            let preserved_policy = if opts.preserve_existing_policies {
+                self.firewall
+                    .get_server(org_id, &s.server_id)
+                    .await
+                    .map(|r| r.policy)
+            } else {
+                None
+            };
+            let policy = if let Some(existing) = preserved_policy {
+                existing
+            } else if opts.clamp_untrusted_policy {
+                let clamped_overrides = s
+                    .tool_overrides
+                    .iter()
+                    .filter(|(_, risk)| {
+                        matches!(
+                            risk,
+                            McpToolRiskClass::StagedWrite | McpToolRiskClass::Forbidden
+                        )
+                    })
+                    .map(|(k, v)| (k.clone(), *v))
+                    .collect();
+                McpServerPolicy {
+                    trust_level: opts
+                        .trust_override
+                        .unwrap_or(McpTrustLevel::UntrustedExternal),
+                    dlp_mode: if matches!(s.dlp_mode, PseudonymMode::Block) {
+                        PseudonymMode::Block
+                    } else {
+                        PseudonymMode::Pseudonymize
+                    },
+                    strip_prompt_injection: true,
+                    isolate_upstream_home: true,
+                    request_timeout_ms: s.request_timeout_ms,
+                    tool_overrides: clamped_overrides,
+                    ..McpServerPolicy::default()
+                }
+            } else {
+                McpServerPolicy {
+                    trust_level: s.trust_level,
+                    dlp_mode: s.dlp_mode,
+                    strip_prompt_injection: s.strip_prompt_injection,
+                    isolate_upstream_home: true,
+                    request_timeout_ms: s.request_timeout_ms,
+                    tool_overrides: s.tool_overrides.clone(),
+                    ..McpServerPolicy::default()
+                }
             };
             let rec = self
                 .firewall
@@ -658,6 +736,16 @@ impl McpBundleManager {
                         } else {
                             rel_or_abs.clone()
                         };
+                        if let Some(ref origins) = opts.airgap_allowed_origins {
+                            if !crate::mcp_registry::url_matches_allowed_origins(&sk_url, origins) {
+                                bail!(
+                                    "Refusing remote skill URL '{}' for skill '{}' in air-gapped registry mode",
+                                    sk_url,
+                                    clean_sk_id
+                                );
+                            }
+                        }
+                        validate_mcp_http_url_syntax(&sk_url, opts.allow_local_http)?;
                         let (st, _, bytes) = simple_http_request(
                             "GET",
                             &sk_url,
@@ -983,7 +1071,7 @@ mod tests {
                     home_dir: Some(home.clone()),
                     proxy_bin_path: Some(PathBuf::from("/usr/local/bin/aegis-os")),
                     allow_local_http: true,
-                    dry_run: false,
+                    ..BundleInstallOptions::default()
                 },
             )
             .await
@@ -1019,7 +1107,7 @@ mod tests {
                     home_dir: Some(home.clone()),
                     proxy_bin_path: Some(PathBuf::from("/usr/local/bin/aegis-os")),
                     allow_local_http: true,
-                    dry_run: false,
+                    ..BundleInstallOptions::default()
                 },
             )
             .await
@@ -1036,5 +1124,207 @@ mod tests {
         let claude_after = std::fs::read_to_string(&claude_path).unwrap();
         assert!(!claude_after.contains("heurion-literature"));
         assert!(claude_after.contains("existing"));
+    }
+
+    #[tokio::test]
+    async fn install_bundle_enforces_sha256_clamps_untrusted_and_preserves_upgrade_policies() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        use tokio::net::TcpListener;
+
+        let manifest_v1 = serde_json::json!({
+            "schema": "aegis-mcp-bundle/v1",
+            "bundle_id": "pin-bundle",
+            "name": "Pinned Bundle",
+            "version": "1.0.0",
+            "servers": [{
+                "server_id": "pin-srv",
+                "url": "https://mcp.pinned.example/mcp",
+                "trust_level": "trusted_internal",
+                "dlp_mode": "off",
+                "strip_prompt_injection": false,
+                "tool_overrides": {
+                    "safe_read": "read_only",
+                    "dangerous_write": "forbidden"
+                }
+            }]
+        })
+        .to_string();
+        let (_, _, sha_v1) = {
+            use sha2::{Digest, Sha256};
+            ((), (), hex::encode(Sha256::digest(manifest_v1.as_bytes())))
+        };
+
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let serve_body = std::sync::Arc::new(tokio::sync::RwLock::new(manifest_v1.clone()));
+        let sb = serve_body.clone();
+        tokio::spawn(async move {
+            while let Ok((mut s, _)) = listener.accept().await {
+                let b = sb.read().await.clone();
+                tokio::spawn(async move {
+                    let mut buf = [0u8; 2048];
+                    let _ = s.read(&mut buf).await;
+                    let resp = format!(
+                        "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{b}",
+                        b.len()
+                    );
+                    let _ = s.write_all(resp.as_bytes()).await;
+                });
+            }
+        });
+
+        let tmp = tempfile::tempdir().unwrap();
+        let rt = tmp.path().join("rt");
+        let policy = Arc::new(aos_policy::AegisPolicyKernel::with_state_file(Some(
+            rt.join("policy.json"),
+        )));
+        let recorder = Arc::new(AegisFlightRecorder::new(Some(
+            rt.join("audit.jsonl"),
+        )));
+        let firewall = Arc::new(McpFirewallRegistry::with_kek_provider(
+            &rt,
+            Arc::new(InMemoryKekProvider::new([0x41u8; 32])),
+            policy,
+            recorder,
+        ));
+        let bundles = McpBundleManager::new(&rt, firewall.clone(), firewall.oauth().clone());
+        let src = format!("http://{addr}/mcp-bundle.json");
+
+        // 1. Tampered digest fails closed.
+        let mismatch = bundles
+            .install_bundle(
+                "acme",
+                &src,
+                BundleInstallOptions {
+                    sync_clients: false,
+                    sync_skills: false,
+                    allow_local_http: true,
+                    expected_manifest_sha256: Some("0".repeat(64)),
+                    clamp_untrusted_policy: true,
+                    ..BundleInstallOptions::default()
+                },
+            )
+            .await
+            .unwrap_err();
+        assert!(mismatch.to_string().contains("SHA-256 mismatch"), "{mismatch}");
+
+        // 2. Matching digest + `clamp_untrusted_policy` forces UntrustedExternal, Pseudonymize, strip_pi=true,
+        // and drops `read_only` downgrade overrides from remote manifest.
+        bundles
+            .install_bundle(
+                "acme",
+                &src,
+                BundleInstallOptions {
+                    sync_clients: false,
+                    sync_skills: false,
+                    allow_local_http: true,
+                    expected_manifest_sha256: Some(sha_v1),
+                    clamp_untrusted_policy: true,
+                    ..BundleInstallOptions::default()
+                },
+            )
+            .await
+            .unwrap();
+        let installed = firewall.get_server("acme", "pin-srv").await.unwrap();
+        assert_eq!(installed.policy.trust_level, McpTrustLevel::UntrustedExternal);
+        assert_eq!(installed.policy.dlp_mode, PseudonymMode::Pseudonymize);
+        assert!(installed.policy.strip_prompt_injection);
+        assert!(!installed.policy.tool_overrides.contains_key("safe_read"));
+        assert_eq!(
+            installed.policy.tool_overrides.get("dangerous_write").copied(),
+            Some(McpToolRiskClass::Forbidden)
+        );
+
+        // 3. Operator upgrades with `preserve_existing_policies: true`: operator customizations survive.
+        firewall
+            .update_server_policy("acme", "pin-srv", |p| {
+                p.allow_elicitation = true;
+                p.tool_overrides
+                    .insert("operator_tool".to_string(), McpToolRiskClass::ReadOnly);
+            })
+            .await
+            .unwrap();
+        *serve_body.write().await = serde_json::json!({
+            "schema": "aegis-mcp-bundle/v1",
+            "bundle_id": "pin-bundle",
+            "version": "1.1.0",
+            "servers": [{
+                "server_id": "pin-srv",
+                "url": "https://mcp.pinned.example/v2/mcp",
+                "trust_level": "trusted_internal",
+                "dlp_mode": "off"
+            }]
+        })
+        .to_string();
+        bundles
+            .install_bundle(
+                "acme",
+                &src,
+                BundleInstallOptions {
+                    sync_clients: false,
+                    sync_skills: false,
+                    allow_local_http: true,
+                    preserve_existing_policies: true,
+                    ..BundleInstallOptions::default()
+                },
+            )
+            .await
+            .unwrap();
+        let after_upgrade = firewall.get_server("acme", "pin-srv").await.unwrap();
+        assert_eq!(after_upgrade.policy.trust_level, McpTrustLevel::UntrustedExternal);
+        assert!(after_upgrade.policy.allow_elicitation);
+        assert_eq!(
+            after_upgrade.policy.tool_overrides.get("operator_tool").copied(),
+            Some(McpToolRiskClass::ReadOnly)
+        );
+    }
+
+    #[tokio::test]
+    async fn install_bundle_airgap_blocks_remote_skill_url_outside_allowed_origins() {
+        let tmp = tempfile::tempdir().unwrap();
+        let rt = tmp.path().join("rt");
+        let ws = tmp.path().join("ws");
+        std::fs::create_dir_all(&ws).unwrap();
+        let manifest_path = tmp.path().join("local-bundle.json");
+        std::fs::write(
+            &manifest_path,
+            serde_json::json!({
+                "schema": "aegis-mcp-bundle/v1",
+                "bundle_id": "airgap-skill-test",
+                "servers": [{ "server_id": "srv", "url": "https://mcp.corp.internal/mcp" }],
+                "skills": [{ "id": "bad-skill", "url": "https://evil.example.com/SKILL.md" }]
+            })
+            .to_string(),
+        )
+        .unwrap();
+
+        let policy = Arc::new(aos_policy::AegisPolicyKernel::with_state_file(Some(
+            rt.join("policy.json"),
+        )));
+        let recorder = Arc::new(AegisFlightRecorder::new(Some(
+            rt.join("audit.jsonl"),
+        )));
+        let firewall = Arc::new(McpFirewallRegistry::with_kek_provider(
+            &rt,
+            Arc::new(InMemoryKekProvider::new([0x42u8; 32])),
+            policy,
+            recorder,
+        ));
+        let bundles = McpBundleManager::new(&rt, firewall.clone(), firewall.oauth().clone());
+        let err = bundles
+            .install_bundle(
+                "acme",
+                manifest_path.to_str().unwrap(),
+                BundleInstallOptions {
+                    sync_clients: false,
+                    sync_skills: true,
+                    workspace_dir: Some(ws),
+                    airgap_allowed_origins: Some(vec!["https://registry.corp.internal".to_string()]),
+                    ..BundleInstallOptions::default()
+                },
+            )
+            .await
+            .unwrap_err();
+        assert!(err.to_string().contains("air-gapped"), "{err}");
     }
 }

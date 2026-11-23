@@ -1082,6 +1082,8 @@ pub(crate) async fn handle_mcp_command(
                                 proxy_bin_path: std::env::current_exe().ok(),
                                 allow_local_http,
                                 dry_run,
+                                airgap_allowed_origins: kernel.mcp_registry.airgap_allowed_origins(),
+                                ..BundleInstallOptions::default()
                             },
                         )
                         .await?;
@@ -1847,6 +1849,8 @@ async fn run_unified_mcp_install(
                         proxy_bin_path: std::env::current_exe().ok(),
                         allow_local_http,
                         dry_run: false,
+                        airgap_allowed_origins: kernel.mcp_registry.airgap_allowed_origins(),
+                        ..BundleInstallOptions::default()
                     },
                 )
                 .await?;
@@ -2455,18 +2459,54 @@ async fn run_mcp_sync_lifecycle(
                                 )?,
                             ..McpServerPolicy::default()
                         };
+                        let (spawn_cmd, spawn_args, spawn_cwd, env_vars) =
+                            if pkg.registry_type == "mcpb" {
+                                let installed = aos_mcp_gateway::mcp_mcpb::install_mcpb_archive(
+                                    &pkg.identifier,
+                                    pkg.file_sha256.as_deref(),
+                                    &cand.server_id,
+                                    kernel.mcp_registry.runtime_data_root(),
+                                    allow_local_http,
+                                )
+                                .await?;
+                                (
+                                    installed.command,
+                                    installed.args,
+                                    Some(installed.cwd.display().to_string()),
+                                    installed.env,
+                                )
+                            } else {
+                                (
+                                    pkg.command.clone(),
+                                    pkg.args.clone(),
+                                    Some(workspace.display().to_string()),
+                                    BTreeMap::new(),
+                                )
+                            };
                         kernel
                             .mcp_firewall
                             .register_stdio_server(
                                 org_id,
                                 &cand.server_id,
-                                &pkg.command,
-                                pkg.args.clone(),
-                                Some(workspace.display().to_string()),
-                                BTreeMap::new(),
+                                &spawn_cmd,
+                                spawn_args,
+                                spawn_cwd,
+                                env_vars,
                                 stdio_policy,
                             )
                             .await?;
+                        let cand_ver = cand
+                            .version
+                            .clone()
+                            .or_else(|| cand.package_spec.as_ref().and_then(|p| p.version.clone()));
+                        let _ = kernel
+                            .mcp_firewall
+                            .update_server_config(org_id, &cand.server_id, |rec| {
+                                rec.registry_name = Some(cand.name.clone());
+                                rec.installed_version = cand_ver;
+                                rec.manifest_sha256 = Some(cand.manifest_sha256.clone());
+                            })
+                            .await;
                     }
                     installed_ids.insert(cand.server_id.clone());
                     installed_count += 1;
@@ -2545,6 +2585,7 @@ async fn run_mcp_upgrade_lifecycle(
     let kernel = AegisRuntimeKernel::new(runtime_dir).await?;
     kernel.mcp_registry.clear_cache().await;
 
+    let airgap_origins = kernel.mcp_registry.airgap_allowed_origins();
     let servers = kernel.mcp_firewall.list_servers(Some(org_id)).await;
     let mut outcomes = Vec::<Value>::new();
     let mut upgraded_bundles = BTreeSet::<String>::new();
@@ -2576,6 +2617,9 @@ async fn run_mcp_upgrade_lifecycle(
                             proxy_bin_path: None,
                             allow_local_http: eff_local,
                             dry_run,
+                            preserve_existing_policies: true,
+                            airgap_allowed_origins: airgap_origins.clone(),
+                            ..BundleInstallOptions::default()
                         },
                     )
                     .await?;

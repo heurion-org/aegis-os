@@ -151,7 +151,7 @@ pub fn parse_query_params(query: &str) -> BTreeMap<String, String> {
     map
 }
 
-fn local_http_env_enabled() -> bool {
+pub(crate) fn local_http_env_enabled() -> bool {
     std::env::var("AOS_ALLOW_LOCAL_HTTP_MCP").as_deref() == Ok("1")
         || std::env::var("AOS_ALLOW_INSECURE_LOCAL_APP_ENDPOINT").as_deref() == Ok("1")
 }
@@ -1052,7 +1052,7 @@ pub async fn open_http_sse_notification_stream(
     idle_timeout: Duration,
     on_event: tokio::sync::mpsc::UnboundedSender<Value>,
 ) -> anyhow::Result<SseStreamExit> {
-    let resolved = resolve_and_validate_mcp_endpoint_strict(url, allow_local_http).await?;
+    let resolved = resolve_and_validate_mcp_endpoint(url, allow_local_http).await?;
     let mut stream =
         connect_endpoint(&resolved, Duration::from_millis(DEFAULT_CONNECT_TIMEOUT_MS)).await?;
 

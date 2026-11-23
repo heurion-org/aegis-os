@@ -2810,12 +2810,18 @@ struct UpstreamStdioProcess {
     cached_init_response: Option<Value>,
     tool_annotations: Arc<std::sync::Mutex<BTreeMap<String, CachedToolAnnotations>>>,
     annotations_loaded: Arc<AtomicBool>,
+    annotations_epoch: Arc<std::sync::atomic::AtomicU64>,
+    reader_task: tokio::task::JoinHandle<()>,
+    _network_guard: Option<StdioNetworkGuard>,
+}
+
+struct StdioBackendHandle {
+    backend_fingerprint: String,
+    stdin: Arc<Mutex<ChildStdin>>,
     allow_elicitation: Arc<AtomicBool>,
     idle_notif_tx: tokio::sync::broadcast::Sender<Value>,
     pending_idle_notifs: Arc<std::sync::Mutex<VecDeque<Value>>>,
-    reader_task: tokio::task::JoinHandle<()>,
-    policy_fingerprint: (bool, bool, Vec<String>),
-    _network_guard: Option<StdioNetworkGuard>,
+    rpc_state: Mutex<UpstreamStdioProcess>,
 }
 
 impl Drop for UpstreamStdioProcess {
@@ -2826,18 +2832,33 @@ impl Drop for UpstreamStdioProcess {
 }
 
 struct UpstreamHttpSession {
+    backend_fingerprint: String,
     init_gate: Mutex<()>,
     mcp_session_id: RwLock<Option<String>>,
     cached_init_request: RwLock<Option<Value>>,
     initialized: AtomicBool,
     tool_annotations: RwLock<BTreeMap<String, CachedToolAnnotations>>,
     annotations_loaded: AtomicBool,
+    annotations_epoch: std::sync::atomic::AtomicU64,
 }
 
 #[derive(Clone)]
 enum UpstreamBackend {
-    Stdio(Arc<Mutex<UpstreamStdioProcess>>),
+    Stdio(Arc<StdioBackendHandle>),
     Http(Arc<UpstreamHttpSession>),
+}
+
+fn compute_backend_fingerprint(server: &AdoptedMcpServerRecord) -> String {
+    let canonical = json!({
+        "transport": server.transport,
+        "auth_realm": server.auth_realm,
+        "allow_local_http": server.allow_local_http,
+        "isolate_upstream_home": server.policy.isolate_upstream_home,
+        "isolate_upstream_network": server.policy.isolate_upstream_network,
+        "allowed_hosts": server.policy.allowed_hosts,
+    });
+    let bytes = serde_json::to_vec(&canonical).unwrap_or_default();
+    hex::encode(Sha256::digest(&bytes))
 }
 
 fn is_server_request_frame(msg: &Value) -> bool {
@@ -2854,10 +2875,17 @@ fn is_notification_frame(msg: &Value) -> bool {
         && msg.get("error").is_none()
 }
 
+fn is_client_response_frame(msg: &Value) -> bool {
+    msg.get("method").is_none()
+        && msg.get("id").is_some_and(|v| !v.is_null())
+        && (msg.get("result").is_some() || msg.get("error").is_some())
+}
+
 pub struct McpProxySessionPool {
     registry: Arc<McpFirewallRegistry>,
     sessions: Mutex<BTreeMap<String, UpstreamBackend>>,
     timeout: std::time::Duration,
+    allow_unisolated_network_fallback: bool,
 }
 
 impl McpProxySessionPool {
@@ -2871,7 +2899,14 @@ impl McpProxySessionPool {
             registry,
             sessions: Mutex::new(BTreeMap::new()),
             timeout: std::time::Duration::from_millis(timeout_ms),
+            allow_unisolated_network_fallback: stdio_unisolated_fallback_env_enabled(),
         }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn with_unisolated_fallback_for_test(mut self) -> Self {
+        self.allow_unisolated_network_fallback = true;
+        self
     }
 
     async fn get_or_spawn_backend(
@@ -2879,22 +2914,15 @@ impl McpProxySessionPool {
         server: &AdoptedMcpServerRecord,
     ) -> anyhow::Result<UpstreamBackend> {
         let key = format!("{}:{}", server.org_id, server.server_id);
-        let want_fp = (
-            server.policy.isolate_upstream_home,
-            server.policy.isolate_upstream_network,
-            server.policy.allowed_hosts.clone(),
-        );
+        let want_fp = compute_backend_fingerprint(server);
         let existing_candidate = {
             let guard = self.sessions.lock().await;
             guard.get(&key).cloned()
         };
         if let Some(existing) = existing_candidate {
             let matches_policy = match &existing {
-                UpstreamBackend::Stdio(proc_arc) => {
-                    let st = proc_arc.lock().await;
-                    st.policy_fingerprint == want_fp
-                }
-                UpstreamBackend::Http(_) => true,
+                UpstreamBackend::Stdio(handle) => handle.backend_fingerprint == want_fp,
+                UpstreamBackend::Http(http_sess) => http_sess.backend_fingerprint == want_fp,
             };
             if matches_policy {
                 return Ok(existing);
@@ -2903,26 +2931,35 @@ impl McpProxySessionPool {
         }
         // Spawn stdio children or initialize HTTP session state outside `self.sessions` mutex.
         let candidate = match &server.transport {
-            UpstreamTransportSpec::Stdio { .. } => UpstreamBackend::Stdio(Arc::new(Mutex::new(
+            UpstreamTransportSpec::Stdio { .. } => UpstreamBackend::Stdio(Arc::new(
                 spawn_upstream_stdio(
                     &self.registry.key_store,
                     &self.registry.runtime_data_root,
                     server,
+                    self.allow_unisolated_network_fallback,
                 )
                 .await?,
-            ))),
+            )),
             UpstreamTransportSpec::Http { .. } => UpstreamBackend::Http(Arc::new(UpstreamHttpSession {
+                backend_fingerprint: want_fp.clone(),
                 init_gate: Mutex::new(()),
                 mcp_session_id: RwLock::new(None),
                 cached_init_request: RwLock::new(None),
                 initialized: AtomicBool::new(false),
                 tool_annotations: RwLock::new(BTreeMap::new()),
                 annotations_loaded: AtomicBool::new(false),
+                annotations_epoch: std::sync::atomic::AtomicU64::new(0),
             })),
         };
         let mut guard = self.sessions.lock().await;
         if let Some(existing) = guard.get(&key) {
-            return Ok(existing.clone());
+            let still_matches = match existing {
+                UpstreamBackend::Stdio(handle) => handle.backend_fingerprint == want_fp,
+                UpstreamBackend::Http(http_sess) => http_sess.backend_fingerprint == want_fp,
+            };
+            if still_matches {
+                return Ok(existing.clone());
+            }
         }
         guard.insert(key, candidate.clone());
         Ok(candidate)
@@ -2959,6 +2996,7 @@ impl McpProxySessionPool {
         if !is_server_req && note_method == "notifications/tools/list_changed" {
             if let UpstreamBackend::Http(http_sess) = backend {
                 http_sess.annotations_loaded.store(false, Ordering::Release);
+                http_sess.annotations_epoch.fetch_add(1, Ordering::AcqRel);
                 http_sess.tool_annotations.write().await.clear();
             }
             cache_invalidated = true;
@@ -3084,9 +3122,8 @@ impl McpProxySessionPool {
             return Vec::new();
         };
         let queued: Vec<Value> = match &backend {
-            UpstreamBackend::Stdio(proc_arc) => {
-                let proc_state = proc_arc.lock().await;
-                let mut q = proc_state.pending_idle_notifs.lock().unwrap();
+            UpstreamBackend::Stdio(handle) => {
+                let mut q = handle.pending_idle_notifs.lock().unwrap();
                 q.drain(..).collect()
             }
             UpstreamBackend::Http(_) => Vec::new(),
@@ -3119,10 +3156,7 @@ impl McpProxySessionPool {
         let key = format!("{org_id}:{server_id}");
         let backend_opt = { self.sessions.lock().await.get(&key).cloned() };
         match backend_opt {
-            Some(UpstreamBackend::Stdio(proc_arc)) => {
-                let st = proc_arc.lock().await;
-                Some(st.idle_notif_tx.subscribe())
-            }
+            Some(UpstreamBackend::Stdio(handle)) => Some(handle.idle_notif_tx.subscribe()),
             _ => None,
         }
     }
@@ -3283,6 +3317,7 @@ impl McpProxySessionPool {
             .and_then(|v| v.as_str())
             .unwrap_or("");
         let req_id = request.get("id").cloned();
+        let is_client_resp = is_client_response_frame(request);
 
         let Some(server) = self
             .registry
@@ -3290,6 +3325,9 @@ impl McpProxySessionPool {
             .await
             .filter(|s| s.org_id == identity.org_id)
         else {
+            if is_client_resp {
+                return Ok(None);
+            }
             return Ok(req_id.map(|id| {
                 json!({
                     "jsonrpc": "2.0",
@@ -3305,6 +3343,9 @@ impl McpProxySessionPool {
         let backend = match self.get_or_spawn_backend(&server).await {
             Ok(b) => b,
             Err(err) => {
+                if is_client_resp {
+                    return Ok(None);
+                }
                 return Ok(req_id.map(|id| {
                     json!({
                         "jsonrpc": "2.0",
@@ -3319,12 +3360,11 @@ impl McpProxySessionPool {
         };
 
         let (inner_tx, mut inner_rx) = tokio::sync::mpsc::unbounded_channel::<Value>();
-        if let UpstreamBackend::Stdio(ref proc_arc) = backend {
-            let proc_state = proc_arc.lock().await;
-            proc_state
+        if let UpstreamBackend::Stdio(ref handle) = backend {
+            handle
                 .allow_elicitation
                 .store(server.policy.allow_elicitation, Ordering::Release);
-            let mut q = proc_state.pending_idle_notifs.lock().unwrap();
+            let mut q = handle.pending_idle_notifs.lock().unwrap();
             while let Some(note) = q.pop_front() {
                 let _ = inner_tx.send(note);
             }
@@ -3387,11 +3427,87 @@ impl McpProxySessionPool {
             turn_id: None,
         };
 
+        // Client JSON-RPC response frames answering upstream `server_request` / elicitation calls.
+        if is_client_response_frame(request) {
+            let now_ms = Utc::now().timestamp_millis();
+            if !server.policy.allow_elicitation {
+                let _ = self
+                    .registry
+                    .recorder
+                    .record(AuditEvent {
+                        event_id: format!("evt-{}", &Uuid::new_v4().simple().to_string()[..8]),
+                        timestamp_ms: now_ms,
+                        org_id: identity.org_id.clone(),
+                        agent_id: identity.agent_id.clone(),
+                        action: "mcp.client_response.blocked".to_string(),
+                        resource: format!("mcp://{}/client_response", server.server_id),
+                        policy_decision: "denied:elicitation_disabled".to_string(),
+                        snapshot_id: None,
+                        details: json!({
+                            "session_id": session_id,
+                            "server_id": server.server_id,
+                            "id": req_id,
+                        }),
+                        task_id: None,
+                        prev_hash: None,
+                        event_hash: None,
+                    })
+                    .await;
+                return Ok(None);
+            }
+            let mut outgoing = request.clone();
+            let pseudonyms_restored = pseudonym_table.restore_json_value(&mut outgoing);
+            match backend {
+                UpstreamBackend::Stdio(handle) => {
+                    // Lock only `handle.stdin` so in-flight RPCs holding `rpc_state` cannot deadlock.
+                    let mut stdin_guard = handle.stdin.lock().await;
+                    let _ = write_jsonrpc_line(&mut stdin_guard, &outgoing).await;
+                }
+                UpstreamBackend::Http(http_sess) => {
+                    let _ = dispatch_http_session_request(
+                        &self.registry.key_store,
+                        &self.registry.oauth,
+                        server,
+                        http_sess,
+                        &outgoing,
+                        false,
+                        on_notification.clone(),
+                        Some(&rpc_ctx),
+                    )
+                    .await;
+                }
+            }
+            let _ = self
+                .registry
+                .recorder
+                .record(AuditEvent {
+                    event_id: format!("evt-{}", &Uuid::new_v4().simple().to_string()[..8]),
+                    timestamp_ms: now_ms,
+                    org_id: identity.org_id.clone(),
+                    agent_id: identity.agent_id.clone(),
+                    action: "mcp.client_response.forwarded".to_string(),
+                    resource: format!("mcp://{}/client_response", server.server_id),
+                    policy_decision: "allowed:elicitation".to_string(),
+                    snapshot_id: None,
+                    details: json!({
+                        "session_id": session_id,
+                        "server_id": server.server_id,
+                        "id": req_id,
+                        "pseudonyms_restored": pseudonyms_restored,
+                    }),
+                    task_id: None,
+                    prev_hash: None,
+                    event_hash: None,
+                })
+                .await;
+            return Ok(None);
+        }
+
         // Notifications (`id` absent) write and flush without awaiting a response.
         if req_id.is_none() || method.starts_with("notifications/") {
             match backend {
-                UpstreamBackend::Stdio(proc_arc) => {
-                    let mut proc_state = proc_arc.lock().await;
+                UpstreamBackend::Stdio(handle) => {
+                    let mut proc_state = handle.rpc_state.lock().await;
                     if method == "notifications/initialized" && proc_state.initialized {
                         if !proc_state.annotations_loaded.load(Ordering::Acquire) {
                             let _ = warm_stdio_tool_annotations(&mut proc_state, self.timeout).await;
@@ -3427,6 +3543,7 @@ impl McpProxySessionPool {
                     if method == "notifications/initialized"
                         && !http_sess.annotations_loaded.load(Ordering::Acquire)
                     {
+                        let start_epoch = http_sess.annotations_epoch.load(Ordering::Acquire);
                         let list_req = json!({
                             "jsonrpc": "2.0",
                             "id": format!("warm-{}", Uuid::new_v4()),
@@ -3444,13 +3561,19 @@ impl McpProxySessionPool {
                         )
                         .await
                         {
-                            if let Some(tools) =
-                                list_resp.pointer("/result/tools").and_then(|v| v.as_array())
-                            {
-                                *http_sess.tool_annotations.write().await =
-                                    extract_annotations_map(tools);
+                            if list_resp.get("error").is_none() {
+                                if let Some(tools) =
+                                    list_resp.pointer("/result/tools").and_then(|v| v.as_array())
+                                {
+                                    if http_sess.annotations_epoch.load(Ordering::Acquire)
+                                        == start_epoch
+                                    {
+                                        *http_sess.tool_annotations.write().await =
+                                            extract_annotations_map(tools);
+                                        http_sess.annotations_loaded.store(true, Ordering::Release);
+                                    }
+                                }
                             }
-                            http_sess.annotations_loaded.store(true, Ordering::Release);
                         }
                     }
                 }
@@ -3462,8 +3585,8 @@ impl McpProxySessionPool {
 
         if method == "initialize" {
             match backend {
-                UpstreamBackend::Stdio(proc_arc) => {
-                    let mut proc_state = proc_arc.lock().await;
+                UpstreamBackend::Stdio(handle) => {
+                    let mut proc_state = handle.rpc_state.lock().await;
                     if proc_state.initialized {
                         if let Some(mut cached) = proc_state.cached_init_response.clone() {
                             if let Some(obj) = cached.as_object_mut() {
@@ -3505,16 +3628,23 @@ impl McpProxySessionPool {
         if method == "tools/list" {
             let started = std::time::Instant::now();
             let mut resp = match backend {
-                UpstreamBackend::Stdio(proc_arc) => {
-                    let mut proc_state = proc_arc.lock().await;
+                UpstreamBackend::Stdio(handle) => {
+                    let mut proc_state = handle.rpc_state.lock().await;
                     ensure_stdio_initialized(&mut proc_state, self.timeout).await?;
+                    let start_epoch = proc_state.annotations_epoch.load(Ordering::Acquire);
                     let resp =
                         send_stdio_rpc(&mut proc_state, request, self.timeout, on_notification)
                             .await?;
-                    if let Some(tools) = resp.pointer("/result/tools").and_then(|v| v.as_array()) {
-                        *proc_state.tool_annotations.lock().unwrap() =
-                            extract_annotations_map(tools);
-                        proc_state.annotations_loaded.store(true, Ordering::Release);
+                    if resp.get("error").is_none() {
+                        if let Some(tools) =
+                            resp.pointer("/result/tools").and_then(|v| v.as_array())
+                        {
+                            if proc_state.annotations_epoch.load(Ordering::Acquire) == start_epoch {
+                                *proc_state.tool_annotations.lock().unwrap() =
+                                    extract_annotations_map(tools);
+                                proc_state.annotations_loaded.store(true, Ordering::Release);
+                            }
+                        }
                     }
                     resp
                 }
@@ -3527,6 +3657,7 @@ impl McpProxySessionPool {
                         Some(&rpc_ctx),
                     )
                     .await?;
+                    let start_epoch = http_sess.annotations_epoch.load(Ordering::Acquire);
                     let resp = dispatch_http_session_request(
                         &self.registry.key_store,
                         &self.registry.oauth,
@@ -3539,9 +3670,16 @@ impl McpProxySessionPool {
                     )
                     .await?
                     .unwrap_or(Value::Null);
-                    if let Some(tools) = resp.pointer("/result/tools").and_then(|v| v.as_array()) {
-                        *http_sess.tool_annotations.write().await = extract_annotations_map(tools);
-                        http_sess.annotations_loaded.store(true, Ordering::Release);
+                    if resp.get("error").is_none() {
+                        if let Some(tools) =
+                            resp.pointer("/result/tools").and_then(|v| v.as_array())
+                        {
+                            if http_sess.annotations_epoch.load(Ordering::Acquire) == start_epoch {
+                                *http_sess.tool_annotations.write().await =
+                                    extract_annotations_map(tools);
+                                http_sess.annotations_loaded.store(true, Ordering::Release);
+                            }
+                        }
                     }
                     resp
                 }
@@ -3553,10 +3691,11 @@ impl McpProxySessionPool {
                 .unwrap_or(0);
             let injection_signals_stripped =
                 sanitize_inbound_mcp_value(&mut resp, server.policy.strip_prompt_injection);
+            let (pii_pseudonymized_count, dlp_blocked) =
+                apply_inbound_dlp(&mut resp, server.policy.dlp_mode, pseudonym_table);
             let now_ms = Utc::now().timestamp_millis();
-            if server.policy.trust_level == McpTrustLevel::UntrustedExternal
-                && injection_signals_stripped > 0
-            {
+            let taint_applied = server.policy.trust_level == McpTrustLevel::UntrustedExternal;
+            if taint_applied && (injection_signals_stripped > 0 || dlp_blocked) {
                 let _ = self
                     .registry
                     .policy
@@ -3567,7 +3706,11 @@ impl McpProxySessionPool {
                         TaintSourceEntry {
                             server_id: server.server_id.clone(),
                             tool_name: "tools/list".to_string(),
-                            summary: "tools-list-injection".to_string(),
+                            summary: if dlp_blocked {
+                                "tools-list-dlp-block".to_string()
+                            } else {
+                                "tools-list-injection".to_string()
+                            },
                             timestamp_ms: now_ms,
                         },
                         DEFAULT_TAINT_TTL_SECS,
@@ -3575,6 +3718,42 @@ impl McpProxySessionPool {
                     .await;
             }
             let response_sha256 = hex::encode(Sha256::digest(canonical_json_bytes(&resp)));
+            if dlp_blocked {
+                let _ = self
+                    .registry
+                    .recorder
+                    .record(AuditEvent {
+                        event_id: format!("evt-{}", &Uuid::new_v4().simple().to_string()[..8]),
+                        timestamp_ms: now_ms,
+                        org_id: identity.org_id.clone(),
+                        agent_id: identity.agent_id.clone(),
+                        action: "mcp.tools.list.dlp_blocked".to_string(),
+                        resource: format!("mcp://{}/tools/list", server.server_id),
+                        policy_decision: "denied:dlp_block".to_string(),
+                        snapshot_id: None,
+                        details: json!({
+                            "session_id": session_id,
+                            "server_id": server.server_id,
+                            "tool_count": tool_count,
+                            "dlp_match_count": pii_pseudonymized_count,
+                            "injection_signals_stripped": injection_signals_stripped,
+                            "response_sha256": response_sha256,
+                            "latency_ms": started.elapsed().as_millis() as u64,
+                        }),
+                        task_id: None,
+                        prev_hash: None,
+                        event_hash: None,
+                    })
+                    .await;
+                return Ok(Some(json!({
+                    "jsonrpc": "2.0",
+                    "id": id,
+                    "error": {
+                        "code": -32004,
+                        "message": "Inbound upstream MCP tools/list response contained unmasked PII under dlp_mode=block policy."
+                    }
+                })));
+            }
             let _ = self
                 .registry
                 .recorder
@@ -3591,6 +3770,7 @@ impl McpProxySessionPool {
                         "session_id": session_id,
                         "server_id": server.server_id,
                         "tool_count": tool_count,
+                        "pii_pseudonymized_count": pii_pseudonymized_count,
                         "injection_signals_stripped": injection_signals_stripped,
                         "response_sha256": response_sha256,
                         "latency_ms": started.elapsed().as_millis() as u64,
@@ -3620,62 +3800,54 @@ impl McpProxySessionPool {
                 .map(Some);
         }
 
-        if matches!(
-            method,
-            "resources/read"
-                | "resources/list"
-                | "resources/templates/list"
-                | "prompts/list"
-                | "prompts/get"
-                | "completion/complete"
-        ) {
-            return self
-                .handle_non_tool_channel_rpc(
-                    identity,
-                    session_id,
-                    server,
-                    backend,
-                    method,
-                    id,
-                    request,
-                    pseudonym_table,
-                    on_notification,
-                )
-                .await
-                .map(Some);
+        // Only trivial liveness/logging methods bypass inbound payload governance; all non-tool
+        // standard and custom JSON-RPC methods go through `handle_non_tool_channel_rpc`.
+        if matches!(method, "ping" | "logging/setLevel") {
+            let resp = match backend {
+                UpstreamBackend::Stdio(handle) => {
+                    let mut proc_state = handle.rpc_state.lock().await;
+                    ensure_stdio_initialized(&mut proc_state, self.timeout).await?;
+                    send_stdio_rpc(&mut proc_state, request, self.timeout, on_notification).await?
+                }
+                UpstreamBackend::Http(http_sess) => {
+                    ensure_http_initialized(
+                        &self.registry.key_store,
+                        &self.registry.oauth,
+                        server,
+                        http_sess,
+                        Some(&rpc_ctx),
+                    )
+                    .await?;
+                    dispatch_http_session_request(
+                        &self.registry.key_store,
+                        &self.registry.oauth,
+                        server,
+                        http_sess,
+                        request,
+                        true,
+                        on_notification,
+                        Some(&rpc_ctx),
+                    )
+                    .await?
+                    .unwrap_or(Value::Null)
+                }
+            };
+            return Ok(Some(with_id(resp, id)));
         }
 
-        // Lightweight control methods (`ping`, `logging/setLevel`, etc.)
-        let resp = match backend {
-            UpstreamBackend::Stdio(proc_arc) => {
-                let mut proc_state = proc_arc.lock().await;
-                ensure_stdio_initialized(&mut proc_state, self.timeout).await?;
-                send_stdio_rpc(&mut proc_state, request, self.timeout, on_notification).await?
-            }
-            UpstreamBackend::Http(http_sess) => {
-                ensure_http_initialized(
-                    &self.registry.key_store,
-                    &self.registry.oauth,
-                    server,
-                    http_sess,
-                    Some(&rpc_ctx),
-                )
-                .await?;
-                dispatch_http_session_request(
-                    &self.registry.key_store,
-                    &self.registry.oauth,
-                    server,
-                    http_sess,
-                    request,
-                    true,
-                    on_notification,
-                    Some(&rpc_ctx),
-                )
-                .await?
-                .unwrap_or(Value::Null)
-            }
-        };
-        Ok(Some(with_id(resp, id)))
+        self.handle_non_tool_channel_rpc(
+            identity,
+            session_id,
+            server,
+            backend,
+            method,
+            id,
+            request,
+            pseudonym_table,
+            on_notification,
+        )
+        .await
+        .map(Some)
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -3717,8 +3889,8 @@ impl McpProxySessionPool {
 
         // 2. Ensure backend initialized & cached annotations warmed before risk classification.
         let cached_ann = match backend {
-            UpstreamBackend::Stdio(proc_arc) => {
-                let mut proc_state = proc_arc.lock().await;
+            UpstreamBackend::Stdio(handle) => {
+                let mut proc_state = handle.rpc_state.lock().await;
                 ensure_stdio_initialized(&mut proc_state, self.timeout).await?;
                 if !proc_state.annotations_loaded.load(Ordering::Acquire) {
                     let _ = warm_stdio_tool_annotations(&mut proc_state, self.timeout).await;
@@ -3741,6 +3913,7 @@ impl McpProxySessionPool {
                 )
                 .await?;
                 if !http_sess.annotations_loaded.load(Ordering::Acquire) {
+                    let start_epoch = http_sess.annotations_epoch.load(Ordering::Acquire);
                     let list_req = json!({"jsonrpc": "2.0", "id": format!("warm-{}", Uuid::new_v4()), "method": "tools/list"});
                     if let Ok(Some(list_resp)) = dispatch_http_session_request(
                         &self.registry.key_store,
@@ -3754,13 +3927,17 @@ impl McpProxySessionPool {
                     )
                     .await
                     {
-                        if let Some(tools) =
-                            list_resp.pointer("/result/tools").and_then(|v| v.as_array())
-                        {
-                            *http_sess.tool_annotations.write().await =
-                                extract_annotations_map(tools);
+                        if list_resp.get("error").is_none() {
+                            if let Some(tools) =
+                                list_resp.pointer("/result/tools").and_then(|v| v.as_array())
+                            {
+                                if http_sess.annotations_epoch.load(Ordering::Acquire) == start_epoch {
+                                    *http_sess.tool_annotations.write().await =
+                                        extract_annotations_map(tools);
+                                    http_sess.annotations_loaded.store(true, Ordering::Release);
+                                }
+                            }
                         }
-                        http_sess.annotations_loaded.store(true, Ordering::Release);
                     }
                 }
                 http_sess
@@ -3944,8 +4121,8 @@ impl McpProxySessionPool {
         });
 
         let upstream_res = match backend {
-            UpstreamBackend::Stdio(proc_arc) => {
-                let mut proc_state = proc_arc.lock().await;
+            UpstreamBackend::Stdio(handle) => {
+                let mut proc_state = handle.rpc_state.lock().await;
                 send_stdio_rpc(&mut proc_state, &upstream_req, self.timeout, on_notification).await
             }
             UpstreamBackend::Http(http_sess) => dispatch_http_session_request(
@@ -4178,7 +4355,7 @@ impl McpProxySessionPool {
                 let res = format!("mcp://{}/prompt:{}", server.server_id, name);
                 ("mcp.prompt.get", name, true, res)
             }
-            _ => {
+            "completion/complete" => {
                 let ref_label = params
                     .pointer("/ref/name")
                     .or_else(|| params.pointer("/ref/uri"))
@@ -4187,6 +4364,11 @@ impl McpProxySessionPool {
                     .to_string();
                 let res = format!("mcp://{}/completion:{}", server.server_id, ref_label);
                 ("mcp.completion.complete", ref_label, true, res)
+            }
+            _ => {
+                let custom_method = if method.is_empty() { "unknown" } else { method };
+                let res = format!("mcp://{}/rpc:{}", server.server_id, custom_method);
+                ("mcp.custom.rpc", custom_method.to_string(), true, res)
             }
         };
 
@@ -4206,8 +4388,8 @@ impl McpProxySessionPool {
             turn_id: None,
         };
         let mut resp = match backend {
-            UpstreamBackend::Stdio(proc_arc) => {
-                let mut proc_state = proc_arc.lock().await;
+            UpstreamBackend::Stdio(handle) => {
+                let mut proc_state = handle.rpc_state.lock().await;
                 ensure_stdio_initialized(&mut proc_state, self.timeout).await?;
                 send_stdio_rpc(&mut proc_state, &req_to_send, self.timeout, on_notification).await?
             }
@@ -4391,18 +4573,43 @@ pub struct StdioSandboxPlan {
     pub isolated_tmp_dir: Option<PathBuf>,
 }
 
-#[cfg(target_os = "linux")]
-fn is_unsafe_home_subpath(host_home: &Path, path: &Path) -> bool {
-    let Ok(rel) = path.strip_prefix(host_home) else {
+pub(crate) fn is_unsafe_home_subpath(host_home: &Path, path: &Path) -> bool {
+    let hh = std::fs::canonicalize(host_home).unwrap_or_else(|_| host_home.to_path_buf());
+    let p = std::fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf());
+    if p == hh || hh.starts_with(&p) {
+        return true;
+    }
+    let Ok(rel) = p.strip_prefix(&hh) else {
         return false;
     };
-    let first = rel
+    let Some(first) = rel
         .components()
         .next()
         .and_then(|c| c.as_os_str().to_str())
-        .unwrap_or("")
-        .to_ascii_lowercase();
-    matches!(first.as_str(), ".ssh" | ".aws" | ".gnupg" | ".kube" | ".aegis" | ".config")
+        .map(|s| s.to_ascii_lowercase())
+    else {
+        return true;
+    };
+    first.starts_with(".env")
+        || matches!(
+            first.as_str(),
+            ".ssh"
+                | ".aws"
+                | ".gnupg"
+                | ".kube"
+                | ".aegis"
+                | ".config"
+                | ".docker"
+                | ".netrc"
+                | ".npmrc"
+                | ".pypirc"
+                | ".git-credentials"
+                | ".cargo"
+                | ".local"
+                | ".mozilla"
+                | ".pki"
+                | "library"
+        )
 }
 
 fn stdio_os_sandbox_available() -> bool {
@@ -4465,6 +4672,16 @@ fn resolve_stdio_egress_shim_exe() -> Option<PathBuf> {
     if let Ok(cur) = std::env::current_exe() {
         if is_aegis_bin(&cur) {
             return Some(cur);
+        }
+        if let Some(sibling) = cur.parent().map(|d| d.join("aegis-os")) {
+            if is_aegis_bin(&sibling) {
+                return Some(sibling);
+            }
+        }
+        if let Some(parent_sibling) = cur.parent().and_then(|d| d.parent()).map(|d| d.join("aegis-os")) {
+            if is_aegis_bin(&parent_sibling) {
+                return Some(parent_sibling);
+            }
         }
     }
     None
@@ -4715,7 +4932,22 @@ pub fn build_stdio_sandbox_plan_full(
         if Path::new("/usr/bin/sandbox-exec").is_file() {
             let mut sb = String::from("(version 1)\n(allow default)\n");
             if let Some(hh) = host_home {
-                for sub in [".ssh", ".aws", ".gnupg", ".kube", ".aegis", ".config"] {
+                for sub in [
+                    ".ssh",
+                    ".aws",
+                    ".gnupg",
+                    ".kube",
+                    ".aegis",
+                    ".config",
+                    ".docker",
+                    ".netrc",
+                    ".npmrc",
+                    ".pypirc",
+                    ".git-credentials",
+                    ".cargo",
+                    ".local",
+                    "Library/Keychains",
+                ] {
                     let p = hh.join(sub).display().to_string().replace('"', "\\\"");
                     sb.push_str(&format!("(deny file-read* file-write* (subpath \"{p}\"))\n"));
                 }
@@ -4790,11 +5022,93 @@ pub fn build_stdio_sandbox_plan(
     )
 }
 
+pub(crate) fn is_forbidden_upstream_env_key(key: &str) -> bool {
+    let trimmed = key.trim();
+    if trimmed.is_empty() || trimmed.contains('\0') || trimmed.contains('=') {
+        return true;
+    }
+    let upper = trimmed.to_ascii_uppercase();
+    if upper.starts_with("LD_")
+        || upper.starts_with("DYLD_")
+        || upper.starts_with("AOS_")
+        || upper.starts_with("PYTHON")
+    {
+        return true;
+    }
+    matches!(
+        upper.as_str(),
+        "NODE_OPTIONS"
+            | "NODE_PATH"
+            | "RUBYOPT"
+            | "RUBYLIB"
+            | "PERL5OPT"
+            | "PERL5LIB"
+            | "BASH_ENV"
+            | "ENV"
+            | "IFS"
+            | "CDPATH"
+            | "GLOBIGNORE"
+            | "PS4"
+            | "SHELLOPTS"
+            | "HOME"
+            | "USERPROFILE"
+            | "TMPDIR"
+            | "TEMP"
+            | "TMP"
+            | "PATH"
+            | "HTTP_PROXY"
+            | "HTTPS_PROXY"
+            | "ALL_PROXY"
+            | "NO_PROXY"
+            | "FTP_PROXY"
+            | "SSL_CERT_FILE"
+            | "SSL_CERT_DIR"
+            | "NODE_EXTRA_CA_CERTS"
+            | "CURL_CA_BUNDLE"
+            | "REQUESTS_CA_BUNDLE"
+            | "AEGIS_EGRESS_BRIDGE_TOKEN"
+    ) || upper == aos_sandbox::bridge::BRIDGE_TOKEN_ENV.to_ascii_uppercase()
+}
+
+fn stdio_unisolated_fallback_env_enabled() -> bool {
+    std::env::var("AOS_MCP_STDIO_ALLOW_UNISOLATED_FALLBACK")
+        .ok()
+        .is_some_and(|v| matches!(v.trim(), "1" | "true" | "yes"))
+}
+
+fn enforce_stdio_network_isolation_requirements(
+    server_id: &str,
+    isolate_network: bool,
+    has_allowed_hosts: bool,
+    sandbox_available: bool,
+    is_linux: bool,
+    has_linux_shim: bool,
+    allow_unisolated_fallback: bool,
+) -> anyhow::Result<()> {
+    if !isolate_network || allow_unisolated_fallback {
+        return Ok(());
+    }
+    if !sandbox_available {
+        bail!(
+            "Refusing to spawn network-isolated stdio MCP server '{}': OS sandbox unavailable (set AOS_MCP_STDIO_ALLOW_UNISOLATED_FALLBACK=1 only for local dev/testing)",
+            server_id
+        );
+    }
+    if is_linux && has_allowed_hosts && !has_linux_shim {
+        bail!(
+            "Refusing to spawn network-isolated stdio MCP server '{}' with allowed_hosts: Linux egress-shim binary not found (install aegis-os or set AOS_EGRESS_SHIM_BIN)",
+            server_id
+        );
+    }
+    Ok(())
+}
+
 async fn spawn_upstream_stdio(
     key_store: &VaultKeyStore,
     runtime_data_root: &Path,
     server: &AdoptedMcpServerRecord,
-) -> anyhow::Result<UpstreamStdioProcess> {
+    allow_unisolated_fallback: bool,
+) -> anyhow::Result<StdioBackendHandle> {
     let UpstreamTransportSpec::Stdio {
         command,
         args,
@@ -4849,12 +5163,23 @@ async fn spawn_upstream_stdio(
     #[cfg(not(target_os = "linux"))]
     let shim_exe: Option<PathBuf> = None;
 
+    let sbx_avail = stdio_os_sandbox_available();
+    enforce_stdio_network_isolation_requirements(
+        &server.server_id,
+        server.policy.isolate_upstream_network,
+        !server.policy.allowed_hosts.is_empty(),
+        sbx_avail,
+        cfg!(target_os = "linux"),
+        shim_exe.is_some(),
+        allow_unisolated_fallback,
+    )?;
+
     let use_sbx = (server.policy.isolate_upstream_home
         || (server.policy.isolate_upstream_network
             && (server.policy.allowed_hosts.is_empty()
                 || cfg!(target_os = "macos")
                 || shim_exe.is_some())))
-        && stdio_os_sandbox_available();
+        && sbx_avail;
 
     let mut network_guard: Option<StdioNetworkGuard> = None;
     let mut bridge_token_env: Option<String> = None;
@@ -4886,7 +5211,12 @@ async fn spawn_upstream_stdio(
                     "/tmp/aos-mcp-net-{}",
                     &Uuid::new_v4().simple().to_string()[..12]
                 ));
-                if std::fs::create_dir_all(&dir).is_ok() {
+                if let Err(e) = std::fs::create_dir_all(&dir) {
+                    if !allow_unisolated_fallback {
+                        proxy_handle.abort();
+                        return Err(e).context("creating Linux stdio egress bridge temp dir");
+                    }
+                } else {
                     #[cfg(unix)]
                     {
                         use std::os::unix::fs::PermissionsExt;
@@ -4913,8 +5243,17 @@ async fn spawn_upstream_stdio(
                         }
                         Err(e) => {
                             let _ = std::fs::remove_dir_all(&dir);
+                            if !allow_unisolated_fallback {
+                                proxy_handle.abort();
+                                return Err(e).with_context(|| {
+                                    format!(
+                                        "spawning Linux stdio egress bridge for '{}'",
+                                        server.server_id
+                                    )
+                                });
+                            }
                             eprintln!(
-                                "[aos-mcp-gateway] stdio egress bridge unavailable for '{}', isolated child stays offline: {}",
+                                "[aos-mcp-gateway] stdio egress bridge unavailable for '{}', test fallback stays offline: {}",
                                 server.server_id, e
                             );
                         }
@@ -4973,6 +5312,24 @@ async fn spawn_upstream_stdio(
         }
     }
 
+    // Apply user/Vault env BEFORE sandbox-enforced variables (skipping forbidden loader/proxy keys).
+    for (k, v) in plain_env {
+        if !is_forbidden_upstream_env_key(k) {
+            cmd.env(k, v);
+        }
+    }
+    for (k, blob) in sealed_env {
+        if is_forbidden_upstream_env_key(k) {
+            continue;
+        }
+        let aad = format!("mcp-env:{}:{}:{}", server.org_id, server.server_id, k);
+        let plain = key_store.open_secret(&aad, blob)?;
+        let val = String::from_utf8(plain.to_vec())
+            .with_context(|| format!("unsealed env '{}' is not valid UTF-8", k))?;
+        cmd.env(k, val);
+    }
+
+    // Enforce isolated HOME / TMPDIR / HTTP(S)_PROXY / NO_PROXY / bridge token LAST so manifest env cannot override them.
     if server.policy.isolate_upstream_home {
         cmd.env("HOME", &iso_home);
         cmd.env("USERPROFILE", &iso_home);
@@ -4999,17 +5356,6 @@ async fn spawn_upstream_stdio(
     }
     if let Some(tok) = bridge_token_env {
         cmd.env(aos_sandbox::bridge::BRIDGE_TOKEN_ENV, tok);
-    }
-
-    for (k, v) in plain_env {
-        cmd.env(k, v);
-    }
-    for (k, blob) in sealed_env {
-        let aad = format!("mcp-env:{}:{}:{}", server.org_id, server.server_id, k);
-        let plain = key_store.open_secret(&aad, blob)?;
-        let val = String::from_utf8(plain.to_vec())
-            .with_context(|| format!("unsealed env '{}' is not valid UTF-8", k))?;
-        cmd.env(k, val);
     }
 
     let mut child = cmd
@@ -5041,6 +5387,7 @@ async fn spawn_upstream_stdio(
         Arc::new(std::sync::Mutex::new(None));
     let tool_annotations = Arc::new(std::sync::Mutex::new(BTreeMap::new()));
     let annotations_loaded = Arc::new(AtomicBool::new(false));
+    let annotations_epoch = Arc::new(std::sync::atomic::AtomicU64::new(0));
     let allow_elicitation = Arc::new(AtomicBool::new(server.policy.allow_elicitation));
     let (idle_notif_tx, _) = tokio::sync::broadcast::channel(64);
     let pending_idle_notifs = Arc::new(std::sync::Mutex::new(VecDeque::new()));
@@ -5050,6 +5397,7 @@ async fn spawn_upstream_stdio(
     let pending_reader = pending_rpc.clone();
     let ann_reader = tool_annotations.clone();
     let ann_loaded_reader = annotations_loaded.clone();
+    let ann_epoch_reader = annotations_epoch.clone();
     let allow_elicit_reader = allow_elicitation.clone();
     let idle_tx_reader = idle_notif_tx.clone();
     let idle_queue_reader = pending_idle_notifs.clone();
@@ -5065,6 +5413,7 @@ async fn spawn_upstream_stdio(
                             && msg.get("method").and_then(|v| v.as_str())
                                 == Some("notifications/tools/list_changed")
                         {
+                            ann_epoch_reader.fetch_add(1, Ordering::AcqRel);
                             ann_loaded_reader.store(false, Ordering::Release);
                             if let Ok(mut g) = ann_reader.lock() {
                                 g.clear();
@@ -5093,8 +5442,7 @@ async fn spawn_upstream_stdio(
                             let guard = pending_reader.lock().unwrap();
                             if let Some(ref pending) = *guard {
                                 if let Some(ref tx) = pending.notif_tx {
-                                    let _ = tx.send(msg.clone());
-                                    true
+                                    tx.send(msg.clone()).is_ok()
                                 } else {
                                     false
                                 }
@@ -5147,24 +5495,26 @@ async fn spawn_upstream_stdio(
         }
     });
 
-    Ok(UpstreamStdioProcess {
+    let backend_fingerprint = compute_backend_fingerprint(server);
+    let proc_state = UpstreamStdioProcess {
         child,
-        stdin: stdin_arc,
+        stdin: stdin_arc.clone(),
         pending_rpc,
         initialized: false,
         cached_init_response: None,
         tool_annotations,
         annotations_loaded,
+        annotations_epoch,
+        reader_task,
+        _network_guard: network_guard,
+    };
+    Ok(StdioBackendHandle {
+        backend_fingerprint,
+        stdin: stdin_arc,
         allow_elicitation,
         idle_notif_tx,
         pending_idle_notifs,
-        reader_task,
-        policy_fingerprint: (
-            server.policy.isolate_upstream_home,
-            server.policy.isolate_upstream_network,
-            server.policy.allowed_hosts.clone(),
-        ),
-        _network_guard: network_guard,
+        rpc_state: Mutex::new(proc_state),
     })
 }
 
@@ -5244,6 +5594,27 @@ async fn read_next_jsonrpc_frame(reader: &mut BufReader<ChildStdout>) -> anyhow:
     }
 }
 
+struct PendingRpcGuard {
+    slot: Arc<std::sync::Mutex<Option<PendingStdioRpc>>>,
+    active: bool,
+}
+
+impl PendingRpcGuard {
+    fn disarm(&mut self) {
+        self.active = false;
+    }
+}
+
+impl Drop for PendingRpcGuard {
+    fn drop(&mut self) {
+        if self.active {
+            if let Ok(mut g) = self.slot.lock() {
+                g.take();
+            }
+        }
+    }
+}
+
 async fn send_stdio_rpc(
     proc_state: &mut UpstreamStdioProcess,
     request: &Value,
@@ -5263,21 +5634,23 @@ async fn send_stdio_rpc(
             notif_tx: on_notification,
         });
     }
+    let mut pending_guard = PendingRpcGuard {
+        slot: proc_state.pending_rpc.clone(),
+        active: true,
+    };
     {
         let mut stdin_guard = proc_state.stdin.lock().await;
-        if let Err(err) = write_jsonrpc_line(&mut stdin_guard, request).await {
-            proc_state.pending_rpc.lock().unwrap().take();
-            return Err(err);
-        }
+        write_jsonrpc_line(&mut stdin_guard, request).await?;
     }
     match tokio::time::timeout(timeout, resp_rx).await {
-        Ok(Ok(res)) => res,
+        Ok(Ok(res)) => {
+            pending_guard.disarm();
+            res
+        }
         Ok(Err(_closed)) => {
-            proc_state.pending_rpc.lock().unwrap().take();
             bail!("upstream MCP server closed stdout before replying")
         }
         Err(_elapsed) => {
-            proc_state.pending_rpc.lock().unwrap().take();
             bail!("timed out waiting for upstream MCP stdio response")
         }
     }
@@ -5321,17 +5694,22 @@ async fn warm_stdio_tool_annotations(
     proc_state: &mut UpstreamStdioProcess,
     timeout: std::time::Duration,
 ) -> anyhow::Result<()> {
+    let start_epoch = proc_state.annotations_epoch.load(Ordering::Acquire);
     let list_req = json!({
         "jsonrpc": "2.0",
         "id": format!("aegis-tools-{}", Uuid::new_v4().simple()),
         "method": "tools/list"
     });
     if let Ok(resp) = send_stdio_rpc(proc_state, &list_req, timeout, None).await {
-        if let Some(tools) = resp.pointer("/result/tools").and_then(|v| v.as_array()) {
-            *proc_state.tool_annotations.lock().unwrap() = extract_annotations_map(tools);
+        if resp.get("error").is_none() {
+            if let Some(tools) = resp.pointer("/result/tools").and_then(|v| v.as_array()) {
+                if proc_state.annotations_epoch.load(Ordering::Acquire) == start_epoch {
+                    *proc_state.tool_annotations.lock().unwrap() = extract_annotations_map(tools);
+                    proc_state.annotations_loaded.store(true, Ordering::Release);
+                }
+            }
         }
     }
-    proc_state.annotations_loaded.store(true, Ordering::Release);
     Ok(())
 }
 
@@ -5714,13 +6092,21 @@ async fn dispatch_single_tool_call(
     });
     match &server.transport {
         UpstreamTransportSpec::Stdio { .. } => {
-            let mut proc_state = spawn_upstream_stdio(key_store, runtime_data_root, server).await?;
+            let handle = spawn_upstream_stdio(
+                key_store,
+                runtime_data_root,
+                server,
+                stdio_unisolated_fallback_env_enabled(),
+            )
+            .await?;
+            let mut proc_state = handle.rpc_state.lock().await;
             let timeout = std::time::Duration::from_millis(DEFAULT_UPSTREAM_TIMEOUT_MS);
             ensure_stdio_initialized(&mut proc_state, timeout).await?;
             send_stdio_rpc(&mut proc_state, &call_req, timeout, None).await
         }
         UpstreamTransportSpec::Http { .. } => {
             let http_sess = UpstreamHttpSession {
+                backend_fingerprint: compute_backend_fingerprint(server),
                 init_gate: Mutex::new(()),
                 mcp_session_id: RwLock::new(None),
                 cached_init_request: RwLock::new(Some(json!({
@@ -5736,6 +6122,7 @@ async fn dispatch_single_tool_call(
                 initialized: std::sync::atomic::AtomicBool::new(false),
                 tool_annotations: RwLock::new(BTreeMap::new()),
                 annotations_loaded: std::sync::atomic::AtomicBool::new(false),
+                annotations_epoch: std::sync::atomic::AtomicU64::new(0),
             };
             let _ = ensure_http_initialized(key_store, oauth, server, &http_sess, ctx).await;
             dispatch_http_session_request(
@@ -7472,7 +7859,7 @@ for line in sys.stdin:
         .await
         .unwrap();
 
-        let pool = McpProxySessionPool::new(reg.clone());
+        let pool = McpProxySessionPool::new(reg.clone()).with_unisolated_fallback_for_test();
         let id = AgentIdentity::new("org-net", "agent-net", "Engineer");
         let ptable = PseudonymSessionTable::new();
         let req = json!({
@@ -8474,5 +8861,736 @@ while True:
             .any(|e| e.action == "mcp.notification.list_changed" && e.details["cache_invalidated"] == true));
         let chain = recorder.verify_chain(None).await.unwrap();
         assert_eq!(chain["verified"], true);
+    }
+
+    #[test]
+    fn unsafe_home_subpath_and_forbidden_env_keys_block_bwrap_and_env_overrides() {
+        let tmp = tempfile::tempdir().unwrap();
+        let hh = tmp.path().join("home");
+        std::fs::create_dir_all(hh.join("work/proj")).unwrap();
+
+        // Exact `$HOME` and parent directories must be rejected to avoid re-exposing sensitive dirs.
+        assert!(is_unsafe_home_subpath(&hh, &hh));
+        assert!(is_unsafe_home_subpath(&hh, tmp.path()));
+
+        for bad in [
+            ".ssh",
+            ".aws",
+            ".gnupg",
+            ".kube",
+            ".aegis",
+            ".config",
+            ".docker",
+            ".netrc",
+            ".npmrc",
+            ".pypirc",
+            ".git-credentials",
+            ".cargo",
+            ".local",
+            ".mozilla",
+            ".pki",
+            "Library",
+            ".env",
+            ".env.local",
+        ] {
+            assert!(is_unsafe_home_subpath(&hh, &hh.join(bad)), "{bad}");
+        }
+        assert!(!is_unsafe_home_subpath(&hh, &hh.join("work/proj")));
+
+        for key in [
+            "LD_PRELOAD",
+            "DYLD_INSERT_LIBRARIES",
+            "HOME",
+            "HTTP_PROXY",
+            "HTTPS_PROXY",
+            "NO_PROXY",
+            "NODE_OPTIONS",
+            "PYTHONPATH",
+            "AOS_EGRESS_BRIDGE_TOKEN",
+            aos_sandbox::bridge::BRIDGE_TOKEN_ENV,
+        ] {
+            assert!(is_forbidden_upstream_env_key(key), "{key}");
+        }
+        assert!(!is_forbidden_upstream_env_key("GITHUB_TOKEN"));
+        assert!(!is_forbidden_upstream_env_key("RUST_LOG"));
+    }
+
+    #[test]
+    fn stdio_network_isolation_fails_closed_when_sandbox_or_shim_unavailable() {
+        assert!(enforce_stdio_network_isolation_requirements(
+            "srv", true, false, false, true, false, false
+        )
+        .is_err());
+        assert!(enforce_stdio_network_isolation_requirements(
+            "srv", true, true, true, true, false, false
+        )
+        .is_err());
+        assert!(enforce_stdio_network_isolation_requirements(
+            "srv", true, false, false, true, false, true
+        )
+        .is_ok());
+        assert!(enforce_stdio_network_isolation_requirements(
+            "srv", false, false, false, true, false, false
+        )
+        .is_ok());
+    }
+
+    #[tokio::test]
+    async fn tools_list_dlp_block_and_unknown_rpc_method_governed() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        use tokio::net::TcpListener;
+
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            loop {
+                let Ok((mut sock, _)) = listener.accept().await else {
+                    break;
+                };
+                tokio::spawn(async move {
+                    let mut buf = Vec::new();
+                    let mut tmp = [0u8; 4096];
+                    loop {
+                        let n = sock.read(&mut tmp).await.unwrap_or(0);
+                        if n == 0 {
+                            break;
+                        }
+                        buf.extend_from_slice(&tmp[..n]);
+                        let raw = String::from_utf8_lossy(&buf);
+                        if let Some((head, body)) = raw.split_once("\r\n\r\n") {
+                            let clen: usize = head
+                                .lines()
+                                .find_map(|l| {
+                                    let (k, v) = l.split_once(':')?;
+                                    k.eq_ignore_ascii_case("content-length")
+                                        .then(|| v.trim().parse().ok())?
+                                })
+                                .unwrap_or(0);
+                            if body.len() >= clen {
+                                let req: Value =
+                                    serde_json::from_str(&body[..clen]).unwrap_or_default();
+                                let rid = req.get("id").cloned().unwrap_or(json!(1));
+                                let method =
+                                    req.get("method").and_then(|v| v.as_str()).unwrap_or("");
+                                if method == "notifications/initialized" {
+                                    let _ = sock
+                                        .write_all(b"HTTP/1.1 202 Accepted\r\nContent-Length: 0\r\nConnection: close\r\n\r\n")
+                                        .await;
+                                    return;
+                                }
+                                let resp_val = match method {
+                                    "initialize" => json!({
+                                        "jsonrpc": "2.0",
+                                        "id": rid,
+                                        "result": { "protocolVersion": "2024-11-05", "capabilities": { "tools": {} } }
+                                    }),
+                                    "tools/list" => json!({
+                                        "jsonrpc": "2.0",
+                                        "id": rid,
+                                        "result": {
+                                            "tools": [{
+                                                "name": "lookup_user",
+                                                "description": "Contact alice@corp.com for details",
+                                                "inputSchema": { "type": "object", "properties": {} },
+                                                "annotations": { "readOnlyHint": true }
+                                            }]
+                                        }
+                                    }),
+                                    _ => json!({
+                                        "jsonrpc": "2.0",
+                                        "id": rid,
+                                        "result": {
+                                            "note": "<!-- hidden prompt injection --> owner bob@corp.com"
+                                        }
+                                    }),
+                                };
+                                let s = resp_val.to_string();
+                                let out = format!(
+                                    "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nMcp-Session-Id: sid-gov\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                                    s.len(),
+                                    s
+                                );
+                                let _ = sock.write_all(out.as_bytes()).await;
+                                return;
+                            }
+                        }
+                    }
+                });
+            }
+        });
+
+        let tmp = tempfile::tempdir().unwrap();
+        let rt = tmp.path().join("rt");
+        let policy = Arc::new(AegisPolicyKernel::with_state_file(Some(rt.join("policy.json"))));
+        let recorder = Arc::new(AegisFlightRecorder::new(Some(rt.join("audit.jsonl"))));
+        let reg = Arc::new(McpFirewallRegistry::with_kek_provider(
+            &rt,
+            Arc::new(InMemoryKekProvider::new([0x31u8; 32])),
+            policy,
+            recorder.clone(),
+        ));
+        let pol = McpServerPolicy {
+            dlp_mode: PseudonymMode::Block,
+            strip_prompt_injection: true,
+            ..McpServerPolicy::default()
+        };
+        reg.register_http_server_with_options(
+            "org-gov",
+            "httpsrv",
+            &format!("http://{addr}/mcp"),
+            BTreeMap::new(),
+            pol,
+            None,
+            None,
+            true,
+        )
+        .await
+        .unwrap();
+
+        let pool = McpProxySessionPool::new(reg.clone());
+        let agent = AgentIdentity::new("org-gov", "agent-gov", "Researcher");
+        let ptable = PseudonymSessionTable::new();
+
+        // 1. `tools/list` containing PII must fail closed with -32004 under `dlp_mode=block`.
+        let list_resp = pool
+            .handle_jsonrpc(
+                &agent,
+                "ses-gov",
+                "httpsrv",
+                &json!({ "jsonrpc": "2.0", "id": 1, "method": "tools/list", "params": {} }),
+                &ptable,
+                false,
+            )
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(list_resp["error"]["code"], -32004, "{list_resp}");
+
+        // 2. Unknown custom RPC method MUST go through sanitization/DLP/audit (`-32004` under Block).
+        let custom_block = pool
+            .handle_jsonrpc(
+                &agent,
+                "ses-gov",
+                "httpsrv",
+                &json!({ "jsonrpc": "2.0", "id": 2, "method": "vendor/secret_query", "params": {} }),
+                &ptable,
+                false,
+            )
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(custom_block["error"]["code"], -32004, "{custom_block}");
+
+        // 3. Under `Pseudonymize`, unknown RPC strips injection & masks PII + logs `mcp.custom.rpc`.
+        reg.update_server_policy("org-gov", "httpsrv", |p| {
+            p.dlp_mode = PseudonymMode::Pseudonymize;
+        })
+        .await
+        .unwrap();
+        let custom_ok = pool
+            .handle_jsonrpc(
+                &agent,
+                "ses-gov",
+                "httpsrv",
+                &json!({ "jsonrpc": "2.0", "id": 3, "method": "vendor/secret_query", "params": {} }),
+                &ptable,
+                false,
+            )
+            .await
+            .unwrap()
+            .unwrap();
+        let raw_custom = custom_ok.to_string();
+        assert!(!raw_custom.contains("hidden prompt injection"), "{custom_ok}");
+        assert!(!raw_custom.contains("bob@corp.com"), "{custom_ok}");
+
+        let events = recorder.query_events("org-gov", None, 50).await.unwrap();
+        assert!(events.iter().any(|e| e.action == "mcp.tools.list.dlp_blocked"));
+        assert!(events.iter().any(|e| e.action == "mcp.channel.dlp_blocked"));
+        assert!(events.iter().any(|e| e.action == "mcp.custom.rpc"));
+    }
+
+    #[tokio::test]
+    async fn annotations_error_does_not_poison_cache_and_epoch_prevents_stale_write() {
+        use std::sync::atomic::{AtomicUsize, Ordering as AtomicOrd};
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        use tokio::net::TcpListener;
+
+        let list_calls = Arc::new(AtomicUsize::new(0));
+        let list_calls_srv = list_calls.clone();
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            loop {
+                let Ok((mut sock, _)) = listener.accept().await else {
+                    break;
+                };
+                let list_calls = list_calls_srv.clone();
+                tokio::spawn(async move {
+                    let mut buf = Vec::new();
+                    let mut tmp = [0u8; 4096];
+                    loop {
+                        let n = sock.read(&mut tmp).await.unwrap_or(0);
+                        if n == 0 {
+                            break;
+                        }
+                        buf.extend_from_slice(&tmp[..n]);
+                        let raw = String::from_utf8_lossy(&buf);
+                        if let Some((head, body)) = raw.split_once("\r\n\r\n") {
+                            let clen: usize = head
+                                .lines()
+                                .find_map(|l| {
+                                    let (k, v) = l.split_once(':')?;
+                                    k.eq_ignore_ascii_case("content-length")
+                                        .then(|| v.trim().parse().ok())?
+                                })
+                                .unwrap_or(0);
+                            if body.len() >= clen {
+                                let req: Value =
+                                    serde_json::from_str(&body[..clen]).unwrap_or_default();
+                                let rid = req.get("id").cloned().unwrap_or(json!(1));
+                                let method =
+                                    req.get("method").and_then(|v| v.as_str()).unwrap_or("");
+                                if method == "notifications/initialized" {
+                                    let _ = sock
+                                        .write_all(b"HTTP/1.1 202 Accepted\r\nContent-Length: 0\r\nConnection: close\r\n\r\n")
+                                        .await;
+                                    return;
+                                }
+                                if method == "tools/call" {
+                                    let sse = format!(
+                                        "data: {}\n\ndata: {}\n\n",
+                                        json!({ "jsonrpc": "2.0", "method": "notifications/tools/list_changed" }),
+                                        json!({
+                                            "jsonrpc": "2.0",
+                                            "id": rid,
+                                            "result": { "content": [{ "type": "text", "text": "ok-read" }] }
+                                        })
+                                    );
+                                    let out = format!(
+                                        "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nMcp-Session-Id: sid-err\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                                        sse.len(),
+                                        sse
+                                    );
+                                    let _ = sock.write_all(out.as_bytes()).await;
+                                    return;
+                                }
+                                let resp_val = match method {
+                                    "initialize" => json!({
+                                        "jsonrpc": "2.0",
+                                        "id": rid,
+                                        "result": { "protocolVersion": "2024-11-05", "capabilities": { "tools": {} } }
+                                    }),
+                                    "tools/list" => {
+                                        let n = list_calls.fetch_add(1, AtomicOrd::SeqCst);
+                                        if n == 0 {
+                                            // First warmup returns JSON-RPC error -> must NOT set `annotations_loaded = true`.
+                                            json!({
+                                                "jsonrpc": "2.0",
+                                                "id": rid,
+                                                "error": { "code": -32000, "message": "transient warmup failure" }
+                                            })
+                                        } else if n == 1 {
+                                            json!({
+                                                "jsonrpc": "2.0",
+                                                "id": rid,
+                                                "result": {
+                                                    "tools": [{
+                                                        "name": "process_item",
+                                                        "annotations": { "readOnlyHint": true }
+                                                    }]
+                                                }
+                                            })
+                                        } else {
+                                            // After `notifications/tools/list_changed`, hint becomes write!
+                                            json!({
+                                                "jsonrpc": "2.0",
+                                                "id": rid,
+                                                "result": {
+                                                    "tools": [{
+                                                        "name": "process_item",
+                                                        "annotations": { "readOnlyHint": false }
+                                                    }]
+                                                }
+                                            })
+                                        }
+                                    }
+                                    _ => json!({ "jsonrpc": "2.0", "id": rid, "result": {} }),
+                                };
+                                let s = resp_val.to_string();
+                                let out = format!(
+                                    "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nMcp-Session-Id: sid-err\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                                    s.len(),
+                                    s
+                                );
+                                let _ = sock.write_all(out.as_bytes()).await;
+                                return;
+                            }
+                        }
+                    }
+                });
+            }
+        });
+
+        let tmp = tempfile::tempdir().unwrap();
+        let rt = tmp.path().join("rt");
+        let policy = Arc::new(AegisPolicyKernel::new());
+        let recorder = Arc::new(AegisFlightRecorder::new(Some(rt.join("audit.jsonl"))));
+        let reg = Arc::new(McpFirewallRegistry::new(&rt, policy, recorder));
+        reg.register_http_server_with_options(
+            "org-ann",
+            "annsrv",
+            &format!("http://{addr}/mcp"),
+            BTreeMap::new(),
+            McpServerPolicy::default(),
+            None,
+            None,
+            true,
+        )
+        .await
+        .unwrap();
+
+        let pool = McpProxySessionPool::new(reg);
+        let agent = AgentIdentity::new("org-ann", "agent-ann", "Researcher");
+        let ptable = PseudonymSessionTable::new();
+
+        // Call 1: warmup `tools/list` errors (`n=0`), so missing annotation stages `process_item` safely.
+        let r1 = pool
+            .handle_jsonrpc(
+                &agent,
+                "ses-ann",
+                "annsrv",
+                &json!({ "jsonrpc": "2.0", "id": 1, "method": "tools/call", "params": { "name": "process_item", "arguments": {} } }),
+                &ptable,
+                false,
+            )
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(r1["result"]["content"][0]["text"]
+            .as_str()
+            .unwrap()
+            .contains("staged_for_human_approval"));
+        assert_eq!(list_calls.load(AtomicOrd::SeqCst), 1);
+
+        // Call 2: because error did NOT set `annotations_loaded=true`, warmup retries (`n=1`) and sees `readOnlyHint=true`!
+        let r2 = pool
+            .handle_jsonrpc(
+                &agent,
+                "ses-ann",
+                "annsrv",
+                &json!({ "jsonrpc": "2.0", "id": 2, "method": "tools/call", "params": { "name": "process_item", "arguments": {} } }),
+                &ptable,
+                false,
+            )
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(r2["result"]["content"][0]["text"], "ok-read");
+        assert_eq!(list_calls.load(AtomicOrd::SeqCst), 2);
+
+        // Call 3: SSE `notifications/tools/list_changed` in Call 2 invalidated cache -> Call 3 re-warms (`n=2`) & stages!
+        let r3 = pool
+            .handle_jsonrpc(
+                &agent,
+                "ses-ann",
+                "annsrv",
+                &json!({ "jsonrpc": "2.0", "id": 3, "method": "tools/call", "params": { "name": "process_item", "arguments": {} } }),
+                &ptable,
+                false,
+            )
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(r3["result"]["content"][0]["text"]
+            .as_str()
+            .unwrap()
+            .contains("staged_for_human_approval"));
+        assert_eq!(list_calls.load(AtomicOrd::SeqCst), 3);
+    }
+
+    #[tokio::test]
+    async fn upgrade_server_transport_evicts_stale_pooled_backend() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        use tokio::net::TcpListener;
+
+        async fn spawn_mock(tool_name: &'static str) -> std::net::SocketAddr {
+            let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let addr = listener.local_addr().unwrap();
+            tokio::spawn(async move {
+                loop {
+                    let Ok((mut sock, _)) = listener.accept().await else {
+                        break;
+                    };
+                    tokio::spawn(async move {
+                        let mut buf = Vec::new();
+                        let mut tmp = [0u8; 4096];
+                        loop {
+                            let n = sock.read(&mut tmp).await.unwrap_or(0);
+                            if n == 0 {
+                                break;
+                            }
+                            buf.extend_from_slice(&tmp[..n]);
+                            let raw = String::from_utf8_lossy(&buf);
+                            if let Some((head, body)) = raw.split_once("\r\n\r\n") {
+                                let clen: usize = head
+                                    .lines()
+                                    .find_map(|l| {
+                                        let (k, v) = l.split_once(':')?;
+                                        k.eq_ignore_ascii_case("content-length")
+                                            .then(|| v.trim().parse().ok())?
+                                    })
+                                    .unwrap_or(0);
+                                if body.len() >= clen {
+                                    let req: Value =
+                                        serde_json::from_str(&body[..clen]).unwrap_or_default();
+                                    let rid = req.get("id").cloned().unwrap_or(json!(1));
+                                    let method =
+                                        req.get("method").and_then(|v| v.as_str()).unwrap_or("");
+                                    if method == "notifications/initialized" {
+                                        let _ = sock
+                                            .write_all(b"HTTP/1.1 202 Accepted\r\nContent-Length: 0\r\nConnection: close\r\n\r\n")
+                                            .await;
+                                        return;
+                                    }
+                                    let resp_val = match method {
+                                        "initialize" => json!({
+                                            "jsonrpc": "2.0",
+                                            "id": rid,
+                                            "result": { "protocolVersion": "2024-11-05", "capabilities": { "tools": {} } }
+                                        }),
+                                        _ => json!({
+                                            "jsonrpc": "2.0",
+                                            "id": rid,
+                                            "result": { "tools": [{ "name": tool_name }] }
+                                        }),
+                                    };
+                                    let s = resp_val.to_string();
+                                    let out = format!(
+                                        "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nMcp-Session-Id: sid-{tool_name}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                                        s.len(),
+                                        s
+                                    );
+                                    let _ = sock.write_all(out.as_bytes()).await;
+                                    return;
+                                }
+                            }
+                        }
+                    });
+                }
+            });
+            addr
+        }
+
+        let addr1 = spawn_mock("tool_v1").await;
+        let addr2 = spawn_mock("tool_v2").await;
+
+        let tmp = tempfile::tempdir().unwrap();
+        let rt = tmp.path().join("rt");
+        let policy = Arc::new(AegisPolicyKernel::new());
+        let recorder = Arc::new(AegisFlightRecorder::new(Some(rt.join("audit.jsonl"))));
+        let reg = Arc::new(McpFirewallRegistry::new(&rt, policy, recorder));
+        reg.register_http_server_with_options(
+            "org-upg",
+            "upgsrv",
+            &format!("http://{addr1}/mcp"),
+            BTreeMap::new(),
+            McpServerPolicy::default(),
+            None,
+            None,
+            true,
+        )
+        .await
+        .unwrap();
+
+        let pool = McpProxySessionPool::new(reg.clone());
+        let agent = AgentIdentity::new("org-upg", "agent-upg", "Engineer");
+        let ptable = PseudonymSessionTable::new();
+
+        let r1 = pool
+            .handle_jsonrpc(
+                &agent,
+                "ses-u",
+                "upgsrv",
+                &json!({ "jsonrpc": "2.0", "id": 1, "method": "tools/list", "params": {} }),
+                &ptable,
+                false,
+            )
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(r1["result"]["tools"][0]["name"], "tool_v1");
+
+        // Upgrade server endpoint without explicitly dropping the pool entry.
+        reg.register_http_server_with_options(
+            "org-upg",
+            "upgsrv",
+            &format!("http://{addr2}/mcp"),
+            BTreeMap::new(),
+            McpServerPolicy::default(),
+            None,
+            None,
+            true,
+        )
+        .await
+        .unwrap();
+
+        let r2 = pool
+            .handle_jsonrpc(
+                &agent,
+                "ses-u",
+                "upgsrv",
+                &json!({ "jsonrpc": "2.0", "id": 2, "method": "tools/list", "params": {} }),
+                &ptable,
+                false,
+            )
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(r2["result"]["tools"][0]["name"], "tool_v2");
+    }
+
+    #[tokio::test]
+    async fn allow_elicitation_forwards_client_jsonrpc_reply_to_stdio_stdin() {
+        let tmp = tempfile::tempdir().unwrap();
+        let rt = tmp.path().join("rt");
+        let script = tmp.path().join("elicit_reply_mcp.py");
+        std::fs::write(
+            &script,
+            r#"import json, sys
+
+replies = []
+for line in sys.stdin:
+    line = line.strip()
+    if not line:
+        continue
+    msg = json.loads(line)
+    method = msg.get("method")
+    rid = msg.get("id")
+    if method is None and rid is not None and ("result" in msg or "error" in msg):
+        replies.append(msg)
+        continue
+    if method == "initialize":
+        resp = {"jsonrpc": "2.0", "id": rid, "result": {"protocolVersion": "2024-11-05", "capabilities": {"tools": {}}}}
+        sys.stdout.write(json.dumps(resp) + "\n")
+        sys.stdout.flush()
+    elif method == "notifications/initialized":
+        continue
+    elif method == "tools/list":
+        resp = {"jsonrpc": "2.0", "id": rid, "result": {"tools": [{"name": "check_replies", "annotations": {"readOnlyHint": True}}]}}
+        sys.stdout.write(json.dumps(resp) + "\n")
+        sys.stdout.flush()
+    elif method == "tools/call":
+        summary = {
+            "count": len(replies),
+            "ids": [m.get("id") for m in replies],
+            "saw_restored_alice": any(
+                m.get("result", {}).get("content", {}).get("email") == "alice@corp.com"
+                for m in replies
+            ),
+        }
+        resp = {"jsonrpc": "2.0", "id": rid, "result": {"content": [{"type": "text", "text": json.dumps(summary)}]}}
+        sys.stdout.write(json.dumps(resp) + "\n")
+        sys.stdout.flush()
+"#,
+        )
+        .unwrap();
+
+        let policy = Arc::new(AegisPolicyKernel::new());
+        let recorder = Arc::new(AegisFlightRecorder::new(Some(rt.join("audit.jsonl"))));
+        let reg = Arc::new(McpFirewallRegistry::new(&rt, policy, recorder.clone()));
+        let srv_policy = McpServerPolicy {
+            isolate_upstream_home: false,
+            isolate_upstream_network: false,
+            allow_elicitation: false,
+            ..McpServerPolicy::default()
+        };
+        reg.register_stdio_server(
+            "org-el",
+            "py-el",
+            "python3",
+            vec![script.display().to_string()],
+            None,
+            BTreeMap::new(),
+            srv_policy,
+        )
+        .await
+        .unwrap();
+
+        let pool = McpProxySessionPool::new(reg.clone());
+        let agent = AgentIdentity::new("org-el", "agent-el", "Engineer");
+        let ptable = PseudonymSessionTable::new();
+
+        // Seed pseudonym for `alice@corp.com`.
+        let mut seed = json!("alice@corp.com");
+        let (cnt, _) = apply_inbound_dlp(&mut seed, PseudonymMode::Pseudonymize, &ptable);
+        assert_eq!(cnt, 1);
+        let masked_email = seed.as_str().unwrap().to_string();
+        assert!(!masked_email.contains("alice@corp.com"));
+
+        // 1. With `allow_elicitation=false`, client JSON-RPC reply is blocked & never written to stdin.
+        let blocked_reply = json!({
+            "jsonrpc": "2.0",
+            "id": 77,
+            "result": { "action": "accept", "content": { "email": masked_email } }
+        });
+        assert!(pool
+            .handle_jsonrpc(&agent, "ses-el", "py-el", &blocked_reply, &ptable, false)
+            .await
+            .unwrap()
+            .is_none());
+        let r1 = pool
+            .handle_jsonrpc(
+                &agent,
+                "ses-el",
+                "py-el",
+                &json!({ "jsonrpc": "2.0", "id": 1, "method": "tools/call", "params": { "name": "check_replies", "arguments": {} } }),
+                &ptable,
+                false,
+            )
+            .await
+            .unwrap()
+            .unwrap();
+        let s1: Value =
+            serde_json::from_str(r1["result"]["content"][0]["text"].as_str().unwrap()).unwrap();
+        assert_eq!(s1["count"], 0);
+        assert_eq!(s1["saw_restored_alice"], false);
+
+        // 2. Enable `allow_elicitation=true` -> client JSON-RPC reply is forwarded with pseudonym restored!
+        reg.update_server_policy("org-el", "py-el", |p| {
+            p.allow_elicitation = true;
+        })
+        .await
+        .unwrap();
+        let fwd_reply = json!({
+            "jsonrpc": "2.0",
+            "id": 78,
+            "result": { "action": "accept", "content": { "email": seed.as_str().unwrap() } }
+        });
+        assert!(pool
+            .handle_jsonrpc(&agent, "ses-el", "py-el", &fwd_reply, &ptable, false)
+            .await
+            .unwrap()
+            .is_none());
+        let r2 = pool
+            .handle_jsonrpc(
+                &agent,
+                "ses-el",
+                "py-el",
+                &json!({ "jsonrpc": "2.0", "id": 2, "method": "tools/call", "params": { "name": "check_replies", "arguments": {} } }),
+                &ptable,
+                false,
+            )
+            .await
+            .unwrap()
+            .unwrap();
+        let s2: Value =
+            serde_json::from_str(r2["result"]["content"][0]["text"].as_str().unwrap()).unwrap();
+        assert_eq!(s2["count"], 1);
+        assert_eq!(s2["ids"], json!([78]));
+        assert_eq!(s2["saw_restored_alice"], true);
+
+        let events = recorder.query_events("org-el", None, 50).await.unwrap();
+        assert!(events.iter().any(|e| e.action == "mcp.client_response.blocked"));
+        assert!(events.iter().any(|e| e.action == "mcp.client_response.forwarded"));
     }
 }

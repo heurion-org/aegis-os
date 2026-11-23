@@ -3350,6 +3350,21 @@ struct InlineMcpApprovalCreds {
     env_secrets: BTreeMap<String, String>,
     trust_override: Option<McpTrustLevel>,
     expires_at_ms: i64,
+    paired_key: Option<String>,
+}
+
+#[derive(Debug, Clone)]
+pub struct ScopedMcpNotification {
+    pub org_id: Option<String>,
+    pub agent_id: Option<String>,
+    pub payload: Value,
+}
+
+impl ScopedMcpNotification {
+    pub fn matches_identity(&self, org_id: &str, agent_id: &str) -> bool {
+        self.org_id.as_deref().is_none_or(|o| o == org_id)
+            && self.agent_id.as_deref().is_none_or(|a| a == agent_id)
+    }
 }
 
 pub type PostInstallHookFn = Arc<
@@ -3407,7 +3422,8 @@ pub struct AegisRuntimeKernel {
     pending_mcp_inline_creds: Arc<RwLock<HashMap<String, InlineMcpApprovalCreds>>>,
     mcp_oauth_sessions: Arc<RwLock<HashMap<String, McpWebOAuthSession>>>,
     mcp_post_install_hook: Arc<RwLock<Option<PostInstallHookFn>>>,
-    mcp_notifications_tx: tokio::sync::broadcast::Sender<Value>,
+    mcp_notifications_tx: tokio::sync::broadcast::Sender<ScopedMcpNotification>,
+    allow_agent_local_http: Arc<std::sync::atomic::AtomicBool>,
     active_host_exec_runs: Arc<std::sync::atomic::AtomicUsize>,
     host_exec_config: RwLock<Option<HostExecBrokerConfig>>,
 }
@@ -3559,16 +3575,32 @@ impl AegisRuntimeKernel {
             mcp_oauth_sessions: Arc::new(RwLock::new(HashMap::new())),
             mcp_post_install_hook: Arc::new(RwLock::new(None)),
             mcp_notifications_tx: tokio::sync::broadcast::channel(64).0,
+            allow_agent_local_http: Arc::new(std::sync::atomic::AtomicBool::new(
+                crate::mcp_http::local_http_env_enabled(),
+            )),
             active_host_exec_runs: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
             host_exec_config: RwLock::new(None),
         })
     }
 
-    pub fn subscribe_mcp_notifications(&self) -> tokio::sync::broadcast::Receiver<Value> {
+    pub fn set_allow_agent_local_http(&self, allow: bool) {
+        self.allow_agent_local_http
+            .store(allow, std::sync::atomic::Ordering::Release);
+    }
+
+    pub fn subscribe_mcp_notifications(
+        &self,
+    ) -> tokio::sync::broadcast::Receiver<ScopedMcpNotification> {
         self.mcp_notifications_tx.subscribe()
     }
 
-    pub fn emit_mcp_notification(&self, method: &str, params: Option<Value>) {
+    pub fn emit_mcp_notification_scoped(
+        &self,
+        org_id: Option<&str>,
+        agent_id: Option<&str>,
+        method: &str,
+        params: Option<Value>,
+    ) {
         let mut msg = json!({
             "jsonrpc": "2.0",
             "method": method,
@@ -3578,7 +3610,15 @@ impl AegisRuntimeKernel {
                 obj.insert("params".to_string(), p);
             }
         }
-        let _ = self.mcp_notifications_tx.send(msg);
+        let _ = self.mcp_notifications_tx.send(ScopedMcpNotification {
+            org_id: org_id.map(str::to_string),
+            agent_id: agent_id.map(str::to_string),
+            payload: msg,
+        });
+    }
+
+    pub fn emit_mcp_notification(&self, method: &str, params: Option<Value>) {
+        self.emit_mcp_notification_scoped(None, None, method, params);
     }
 
     pub async fn get_web_mcp_oauth_session(&self, session_id: &str) -> Option<McpWebOAuthSession> {
@@ -6748,6 +6788,7 @@ impl AegisRuntimeKernel {
 
     pub async fn store_inline_mcp_approval_creds(
         &self,
+        org_id: &str,
         escalation_id: &str,
         evidence_hash: Option<&str>,
         static_token: Option<String>,
@@ -6755,28 +6796,52 @@ impl AegisRuntimeKernel {
         trust_override: Option<McpTrustLevel>,
     ) {
         let now_ms = Utc::now().timestamp_millis();
-        let entry = InlineMcpApprovalCreds {
-            static_token,
-            env_secrets,
+        let esc_key = format!("esc:{org_id}:{escalation_id}");
+        let hash_key = evidence_hash
+            .filter(|s| !s.is_empty())
+            .map(|h| format!("hash:{org_id}:{h}"));
+
+        let mut esc_entry = InlineMcpApprovalCreds {
+            static_token: static_token.clone(),
+            env_secrets: env_secrets.clone(),
             trust_override,
             expires_at_ms: now_ms + 900_000,
+            paired_key: hash_key.clone(),
         };
         let mut guard = self.pending_mcp_inline_creds.write().await;
         guard.retain(|_, v| v.expires_at_ms > now_ms);
-        guard.insert(escalation_id.to_string(), entry.clone());
-        if let Some(h) = evidence_hash.filter(|s| !s.is_empty()) {
-            guard.insert(format!("hash:{h}"), entry);
+        if let Some(ref hk) = hash_key {
+            let hash_entry = InlineMcpApprovalCreds {
+                static_token,
+                env_secrets,
+                trust_override,
+                expires_at_ms: esc_entry.expires_at_ms,
+                paired_key: Some(esc_key.clone()),
+            };
+            guard.insert(hk.clone(), hash_entry);
+        } else {
+            esc_entry.paired_key = None;
         }
+        guard.insert(esc_key, esc_entry);
     }
 
     async fn take_inline_mcp_approval_creds(
         &self,
-        evidence_hash: &str,
+        org_id: &str,
+        key: &str,
     ) -> Option<InlineMcpApprovalCreds> {
         let now_ms = Utc::now().timestamp_millis();
         let mut guard = self.pending_mcp_inline_creds.write().await;
         guard.retain(|_, v| v.expires_at_ms > now_ms);
-        guard.remove(&format!("hash:{evidence_hash}"))
+        let taken = guard
+            .remove(&format!("hash:{org_id}:{key}"))
+            .or_else(|| guard.remove(&format!("esc:{org_id}:{key}")));
+        if let Some(ref entry) = taken {
+            if let Some(ref peer) = entry.paired_key {
+                guard.remove(peer);
+            }
+        }
+        taken
     }
 
     /// Unified zero-secret inventory of external MCP servers, realms, bundles, pending outbox items,
@@ -7051,6 +7116,16 @@ impl AegisRuntimeKernel {
                     .get("allow_local_http")
                     .and_then(|v| v.as_bool())
                     .unwrap_or(false);
+                if allow_local_http
+                    && !self
+                        .allow_agent_local_http
+                        .load(std::sync::atomic::Ordering::Acquire)
+                    && !crate::mcp_http::local_http_env_enabled()
+                {
+                    bail!(
+                        "Refusing agent-requested allow_local_http=true: host has not enabled AOS_ALLOW_LOCAL_HTTP_MCP=1"
+                    );
+                }
 
                 match self
                     .authorize_and_audit(
@@ -7249,10 +7324,20 @@ impl AegisRuntimeKernel {
                     notifications.push(note);
                 }
                 if tools_list_changed {
-                    self.emit_mcp_notification("notifications/tools/list_changed", None);
+                    self.emit_mcp_notification_scoped(
+                        Some(&identity.org_id),
+                        Some(&identity.agent_id),
+                        "notifications/tools/list_changed",
+                        None,
+                    );
                 }
                 if resources_list_changed {
-                    self.emit_mcp_notification("notifications/resources/list_changed", None);
+                    self.emit_mcp_notification_scoped(
+                        Some(&identity.org_id),
+                        Some(&identity.agent_id),
+                        "notifications/resources/list_changed",
+                        None,
+                    );
                 }
                 if let Some(err) = rpc_resp.get("error") {
                     bail!(
@@ -7325,46 +7410,90 @@ impl AegisRuntimeKernel {
             .get("allow_local_http")
             .and_then(|v| v.as_bool())
             .unwrap_or(false);
+        if allow_local_http
+            && !self
+                .allow_agent_local_http
+                .load(std::sync::atomic::Ordering::Acquire)
+        {
+            bail!("Refusing agent-requested allow_local_http=true: host has not enabled AOS_ALLOW_LOCAL_HTTP_MCP=1");
+        }
 
+        let airgap_origins = self.mcp_registry.airgap_allowed_origins();
         let resolved = self
             .mcp_registry
             .resolve_install_target(target, explicit_server_id, allow_local_http)
             .await?;
 
         let (server_id, manifest_sha256, audit_meta, preview_text) = match &resolved {
-            ResolvedInstallTarget::Bundle { source, allow_local_http } => {
-                let mut h = Sha256::new();
-                h.update(
-                    serde_json::to_vec(&json!({
-                        "kind": "bundle",
-                        "source": source,
-                        "allow_local_http": allow_local_http,
-                    }))
-                    .unwrap_or_default(),
-                );
-                let sha = hex::encode(h.finalize());
+            ResolvedInstallTarget::Bundle {
+                source,
+                allow_local_http,
+            } => {
+                let (bundle_manifest, fetched_url, sha) = McpBundleManager::fetch_manifest_with_sha256(
+                    source,
+                    *allow_local_http,
+                    airgap_origins.as_deref(),
+                )
+                .await?;
+                if bundle_manifest.schema != "aegis-mcp-bundle/v1" {
+                    bail!(
+                        "Unsupported MCP bundle schema '{}' (expected 'aegis-mcp-bundle/v1')",
+                        bundle_manifest.schema
+                    );
+                }
+                if bundle_manifest.servers.is_empty() {
+                    bail!("MCP bundle '{}' contains no servers", bundle_manifest.bundle_id);
+                }
                 let sid = explicit_server_id
                     .map(sanitize_server_id)
-                    .unwrap_or_else(|| sanitize_server_id(source));
+                    .unwrap_or_else(|| sanitize_server_id(&bundle_manifest.bundle_id));
+                let server_summaries: Vec<Value> = bundle_manifest
+                    .servers
+                    .iter()
+                    .map(|s| json!({ "server_id": s.server_id, "url": s.url }))
+                    .collect();
+                let urls_line = bundle_manifest
+                    .servers
+                    .iter()
+                    .map(|s| format!("{} -> {}", s.server_id, s.url))
+                    .collect::<Vec<_>>()
+                    .join(", ");
+                let resolved_src = fetched_url.unwrap_or_else(|| source.clone());
                 let meta = json!({
                     "target": target,
                     "server_id": sid,
+                    "bundle_id": bundle_manifest.bundle_id,
+                    "bundle_version": bundle_manifest.version,
+                    "bundle_source": resolved_src,
+                    "bundle_servers": server_summaries,
+                    "skills_count": bundle_manifest.skills.len(),
                     "scope": scope,
                     "reason": reason,
                     "trust_tier": "bundle",
+                    "mcp_trust_tier": "bundle",
                     "domain_verified": false,
+                    "mcp_domain_verified": false,
                     "registry_type": "bundle",
+                    "mcp_registry_type": "bundle",
                     "source": "bundle",
                     "transport_kind": "streamable_http",
                     "evidence_hash": sha,
                     "evidence": {
                         "target": target,
                         "server_id": sid,
+                        "bundle_id": bundle_manifest.bundle_id,
+                        "bundle_version": bundle_manifest.version,
+                        "bundle_source": resolved_src,
+                        "bundle_servers": server_summaries,
+                        "skills_count": bundle_manifest.skills.len(),
                         "scope": scope,
                         "reason": reason,
                         "trust_tier": "bundle",
+                        "mcp_trust_tier": "bundle",
                         "domain_verified": false,
+                        "mcp_domain_verified": false,
                         "registry_type": "bundle",
+                        "mcp_registry_type": "bundle",
                         "source": "bundle",
                         "transport_kind": "streamable_http",
                         "allow_local_http": allow_local_http,
@@ -7372,7 +7501,10 @@ impl AegisRuntimeKernel {
                     }
                 });
                 let preview = format!(
-                    "External MCP Bundle Proposal\nTarget: {target}\nAlias: {sid}\nScope: {scope}\nManifest SHA-256: {sha}\nReason: {reason}"
+                    "External MCP Bundle Proposal\nTarget: {target}\nResolved Source: {resolved_src}\nBundle ID: {} (v{})\nAlias: {sid}\nServers: {urls_line}\nSkills Declared: {}\nScope: {scope}\nDefault Posture: untrusted (clamped) · DLP pseudonymize · staged Outbox writes\nManifest SHA-256: {sha}\nReason: {reason}",
+                    bundle_manifest.bundle_id,
+                    bundle_manifest.version,
+                    bundle_manifest.skills.len()
                 );
                 (sid, sha, meta, preview)
             }
@@ -7392,8 +7524,11 @@ impl AegisRuntimeKernel {
                     "scope": scope,
                     "reason": reason,
                     "trust_tier": cand.trust_tier,
+                    "mcp_trust_tier": cand.trust_tier,
                     "domain_verified": cand.domain_verified,
+                    "mcp_domain_verified": cand.domain_verified,
                     "registry_type": reg_type,
+                    "mcp_registry_type": reg_type,
                     "source": cand.source,
                     "transport_kind": cand.transport_kind,
                     "remote_url": cand.remote_url,
@@ -7410,8 +7545,11 @@ impl AegisRuntimeKernel {
                         "scope": scope,
                         "reason": reason,
                         "trust_tier": cand.trust_tier.label(),
+                        "mcp_trust_tier": cand.trust_tier,
                         "domain_verified": cand.domain_verified,
+                        "mcp_domain_verified": cand.domain_verified,
                         "registry_type": reg_type,
+                        "mcp_registry_type": reg_type,
                         "source": cand.source,
                         "transport_kind": cand.transport_kind,
                         "remote_url": cand.remote_url,
@@ -7490,8 +7628,10 @@ impl AegisRuntimeKernel {
             }
         }
 
-        // Approved! Consume optional host-entered inline credentials (never exposed to agent/LLM).
-        let inline_creds = self.take_inline_mcp_approval_creds(&manifest_sha256).await;
+        // Approved! Consume optional host-entered inline credentials scoped strictly to `identity.org_id`.
+        let inline_creds = self
+            .take_inline_mcp_approval_creds(&identity.org_id, &manifest_sha256)
+            .await;
         let final_trust = inline_creds
             .as_ref()
             .and_then(|c| c.trust_override)
@@ -7524,6 +7664,11 @@ impl AegisRuntimeKernel {
                             proxy_bin_path: std::env::current_exe().ok(),
                             allow_local_http,
                             dry_run: false,
+                            expected_manifest_sha256: Some(manifest_sha256.clone()),
+                            clamp_untrusted_policy: true,
+                            trust_override: inline_creds.as_ref().and_then(|c| c.trust_override),
+                            preserve_existing_policies: false,
+                            airgap_allowed_origins: airgap_origins.clone(),
                         },
                     )
                     .await?;
@@ -7711,8 +7856,18 @@ impl AegisRuntimeKernel {
                 hook(identity.org_id.clone(), id.clone()).await;
             }
         }
-        self.emit_mcp_notification("notifications/tools/list_changed", None);
-        self.emit_mcp_notification("notifications/resources/list_changed", None);
+        self.emit_mcp_notification_scoped(
+            Some(&identity.org_id),
+            Some(&identity.agent_id),
+            "notifications/tools/list_changed",
+            None,
+        );
+        self.emit_mcp_notification_scoped(
+            Some(&identity.org_id),
+            Some(&identity.agent_id),
+            "notifications/resources/list_changed",
+            None,
+        );
 
         let _ = self
             .recorder
@@ -11894,9 +12049,11 @@ impl AegisRuntimeKernel {
                 recv = notif_rx.recv() => {
                     match recv {
                         Ok(note) => {
-                            let out_line = format!("{}\n", serde_json::to_string(&note)?);
-                            stdout.write_all(out_line.as_bytes()).await?;
-                            stdout.flush().await?;
+                            if note.matches_identity(&identity.org_id, &identity.agent_id) {
+                                let out_line = format!("{}\n", serde_json::to_string(&note.payload)?);
+                                stdout.write_all(out_line.as_bytes()).await?;
+                                stdout.flush().await?;
+                            }
                         }
                         Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => {}
                         Err(tokio::sync::broadcast::error::RecvError::Closed) => {}
@@ -12045,8 +12202,10 @@ impl AegisRuntimeKernel {
             let out_line = format!("{}\n", serde_json::to_string(&response)?);
             stdout.write_all(out_line.as_bytes()).await?;
             while let Ok(note) = notif_rx.try_recv() {
-                let note_line = format!("{}\n", serde_json::to_string(&note)?);
-                stdout.write_all(note_line.as_bytes()).await?;
+                if note.matches_identity(&identity.org_id, &identity.agent_id) {
+                    let note_line = format!("{}\n", serde_json::to_string(&note.payload)?);
+                    stdout.write_all(note_line.as_bytes()).await?;
+                }
             }
             stdout.flush().await?;
         }
@@ -13517,6 +13676,7 @@ impl AegisRuntimeKernel {
                                             .as_ref()
                                             .and_then(|e| e.evidence_hash.clone());
                                         k.store_inline_mcp_approval_creds(
+                                            &lease.org_id,
                                             esc_id,
                                             ev_hash.as_deref(),
                                             inline_token,
@@ -13825,6 +13985,13 @@ impl AegisRuntimeKernel {
                         let strip_pi = payload
                             .get("strip_prompt_injection")
                             .and_then(|v| v.as_bool());
+                        let allow_elicitation = payload
+                            .get("allow_elicitation")
+                            .and_then(|v| v.as_bool());
+                        let clear_tool_overrides = payload
+                            .get("clear_tool_overrides")
+                            .and_then(|v| v.as_bool())
+                            .unwrap_or(false);
                         let isolate_home = payload
                             .get("isolate_upstream_home")
                             .and_then(|v| v.as_bool());
@@ -13863,6 +14030,7 @@ impl AegisRuntimeKernel {
                                 })
                                 .unwrap_or_default()
                         };
+                        let remove_tools = collect_names("remove_tools");
                         let allow_tools = collect_names("allow_tools");
                         let stage_tools = collect_names("stage_tools");
                         let forbid_tools = collect_names("forbid_tools");
@@ -13885,6 +14053,9 @@ impl AegisRuntimeKernel {
                                     if let Some(sp) = strip_pi {
                                         policy.strip_prompt_injection = sp;
                                     }
+                                    if let Some(ae) = allow_elicitation {
+                                        policy.allow_elicitation = ae;
+                                    }
                                     if let Some(ih) = isolate_home {
                                         policy.isolate_upstream_home = ih;
                                     }
@@ -13896,6 +14067,12 @@ impl AegisRuntimeKernel {
                                     }
                                     if let Some(inet) = isolate_net {
                                         policy.isolate_upstream_network = inet;
+                                    }
+                                    if clear_tool_overrides {
+                                        policy.tool_overrides.clear();
+                                    }
+                                    for t in &remove_tools {
+                                        policy.tool_overrides.remove(t);
                                     }
                                     for t in &allow_tools {
                                         policy.tool_overrides.insert(t.clone(), McpToolRiskClass::ReadOnly);
@@ -19040,6 +19217,7 @@ time.sleep(60)
         .unwrap();
 
         let kernel = Arc::new(AegisRuntimeKernel::new(&rt_dir).await.unwrap());
+        kernel.set_allow_agent_local_http(true);
         let addr = kernel.clone().start_http_daemon("127.0.0.1:0", repo).await.unwrap();
         let op = kernel.operator_token();
         let agent = AgentIdentity::new("acme", "coder-optb", "Engineer");
@@ -19331,6 +19509,7 @@ time.sleep(60)
         std::fs::create_dir_all(&repo).unwrap();
 
         let kernel = Arc::new(AegisRuntimeKernel::new(&rt_dir).await.unwrap());
+        kernel.set_allow_agent_local_http(true);
         let addr = kernel.clone().start_http_daemon("127.0.0.1:0", repo).await.unwrap();
         let op = kernel.operator_token();
         let (tenant_key, _) = kernel
@@ -19692,6 +19871,7 @@ time.sleep(60)
         std::fs::create_dir_all(&repo).unwrap();
 
         let kernel = Arc::new(AegisRuntimeKernel::new(&rt_dir).await.unwrap());
+        kernel.set_allow_agent_local_http(true);
         let addr = kernel.clone().start_http_daemon("127.0.0.1:0", repo).await.unwrap();
         let op = kernel.operator_token();
         let agent = AgentIdentity::new("acme", "coder-p3", "Engineer");
@@ -19758,7 +19938,7 @@ time.sleep(60)
 
         let mut install_methods = Vec::new();
         while let Ok(ev) = rx.try_recv() {
-            install_methods.push(ev["method"].as_str().unwrap().to_string());
+            install_methods.push(ev.payload["method"].as_str().unwrap().to_string());
         }
         assert!(install_methods.contains(&"notifications/tools/list_changed".to_string()));
         assert!(install_methods.contains(&"notifications/resources/list_changed".to_string()));
@@ -19774,7 +19954,7 @@ time.sleep(60)
             "notifications/tools/list_changed"
         );
         let bus_tools_ev = rx.try_recv().unwrap();
-        assert_eq!(bus_tools_ev["method"], "notifications/tools/list_changed");
+        assert_eq!(bus_tools_ev.payload["method"], "notifications/tools/list_changed");
 
         // 4. Hot-bridge `mcp_hot_call_tool` forwards SSE `resources/list_changed` & re-emits on kernel bus.
         let call_res = kernel
@@ -19787,6 +19967,291 @@ time.sleep(60)
             .unwrap();
         assert_eq!(call_res["resources_list_changed"], true);
         let bus_res_ev = rx.try_recv().unwrap();
-        assert_eq!(bus_res_ev["method"], "notifications/resources/list_changed");
+        assert_eq!(bus_res_ev.payload["method"], "notifications/resources/list_changed");
+    }
+
+    #[tokio::test]
+    async fn inline_mcp_creds_are_org_scoped_and_dual_key_purged() {
+        let tmp = tempfile::tempdir().unwrap();
+        let kernel = AegisRuntimeKernel::new(&tmp.path().join("rt")).await.unwrap();
+
+        kernel
+            .store_inline_mcp_approval_creds(
+                "org-a",
+                "esc-1",
+                Some("hash-1"),
+                Some("tok-a".to_string()),
+                BTreeMap::new(),
+                None,
+            )
+            .await;
+
+        // Cross-org lookup MUST fail for both escalation_id and evidence_hash keys.
+        assert!(kernel
+            .take_inline_mcp_approval_creds("org-b", "esc-1")
+            .await
+            .is_none());
+        assert!(kernel
+            .take_inline_mcp_approval_creds("org-b", "hash-1")
+            .await
+            .is_none());
+
+        // Consuming by escalation_id succeeds AND purges the paired evidence_hash entry.
+        let got = kernel
+            .take_inline_mcp_approval_creds("org-a", "esc-1")
+            .await
+            .unwrap();
+        assert_eq!(got.static_token.as_deref(), Some("tok-a"));
+        assert!(kernel
+            .take_inline_mcp_approval_creds("org-a", "hash-1")
+            .await
+            .is_none());
+        assert!(kernel
+            .take_inline_mcp_approval_creds("org-a", "esc-1")
+            .await
+            .is_none());
+    }
+
+    #[tokio::test]
+    async fn agent_request_install_rejects_local_http_before_probing_loopback() {
+        use std::sync::atomic::{AtomicUsize, Ordering as AtomicOrd};
+        use tokio::net::TcpListener;
+
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let hits = Arc::new(AtomicUsize::new(0));
+        let hits_srv = hits.clone();
+        tokio::spawn(async move {
+            while let Ok((_sock, _)) = listener.accept().await {
+                hits_srv.fetch_add(1, AtomicOrd::SeqCst);
+            }
+        });
+
+        let tmp = tempfile::tempdir().unwrap();
+        let kernel = AegisRuntimeKernel::new(&tmp.path().join("rt")).await.unwrap();
+        let agent = AgentIdentity::new("acme", "coder-no-local", "Engineer");
+
+        let err1 = kernel
+            .call_tool(
+                &agent,
+                "mcp_discover",
+                json!({ "query": "linear", "allow_local_http": true }),
+            )
+            .await
+            .unwrap_err();
+        assert!(err1.to_string().contains("AOS_ALLOW_LOCAL_HTTP_MCP"), "{err1}");
+
+        let err2 = kernel
+            .call_tool(
+                &agent,
+                "mcp_request_install",
+                json!({
+                    "target": format!("http://{addr}/mcp"),
+                    "server_id": "probe",
+                    "allow_local_http": true
+                }),
+            )
+            .await
+            .unwrap_err();
+        assert!(err2.to_string().contains("AOS_ALLOW_LOCAL_HTTP_MCP"), "{err2}");
+        assert_eq!(
+            hits.load(AtomicOrd::SeqCst),
+            0,
+            "loopback socket must not be probed when agent allow_local_http is disallowed"
+        );
+    }
+
+    #[tokio::test]
+    async fn agent_bundle_install_pins_manifest_sha256_and_clamps_untrusted_policy() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        use tokio::net::TcpListener;
+
+        let valid_bundle = json!({
+            "schema": "aegis-mcp-bundle/v1",
+            "bundle_id": "sec-bundle",
+            "version": "1.0.0",
+            "servers": [{
+                "server_id": "sec-srv",
+                "url": "https://mcp.sec.example/mcp",
+                "trust_level": "trusted_internal",
+                "dlp_mode": "off",
+                "strip_prompt_injection": false,
+                "tool_overrides": { "delete_all": "read_only" }
+            }]
+        })
+        .to_string();
+        let tampered_bundle = json!({
+            "schema": "aegis-mcp-bundle/v1",
+            "bundle_id": "sec-bundle",
+            "version": "1.0.1",
+            "servers": [{
+                "server_id": "sec-srv",
+                "url": "https://evil.example/mcp",
+                "trust_level": "trusted_internal",
+                "dlp_mode": "off",
+                "strip_prompt_injection": false,
+                "tool_overrides": { "delete_all": "read_only" }
+            }]
+        })
+        .to_string();
+
+        let default_body = Arc::new(tokio::sync::RwLock::new(valid_bundle.clone()));
+        let queue_bodies = Arc::new(tokio::sync::Mutex::new(std::collections::VecDeque::<String>::new()));
+        let db_srv = default_body.clone();
+        let qb_srv = queue_bodies.clone();
+
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let b_addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            while let Ok((mut s, _)) = listener.accept().await {
+                let db = db_srv.clone();
+                let qb = qb_srv.clone();
+                tokio::spawn(async move {
+                    let mut buf = [0u8; 2048];
+                    let _ = s.read(&mut buf).await;
+                    let body = {
+                        let mut q = qb.lock().await;
+                        if let Some(next) = q.pop_front() {
+                            next
+                        } else {
+                            db.read().await.clone()
+                        }
+                    };
+                    let resp = format!(
+                        "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                        body.len(),
+                        body
+                    );
+                    let _ = s.write_all(resp.as_bytes()).await;
+                });
+            }
+        });
+
+        let tmp = tempfile::tempdir().unwrap();
+        let rt_dir = tmp.path().join("rt");
+        let repo = tmp.path().join("repo");
+        std::fs::create_dir_all(&rt_dir).unwrap();
+        std::fs::create_dir_all(&repo).unwrap();
+
+        let kernel = Arc::new(AegisRuntimeKernel::new(&rt_dir).await.unwrap());
+        kernel.set_allow_agent_local_http(true);
+        let http_addr = kernel.clone().start_http_daemon("127.0.0.1:0", repo).await.unwrap();
+        let op = kernel.operator_token();
+        let agent = AgentIdentity::new("acme", "coder-bundle", "Engineer");
+        let target = format!("bundle:http://{b_addr}/bundle.json");
+
+        // 1. Propose bundle install -> Escalates with real pre-fetched manifest SHA-256.
+        let ask1 = kernel
+            .call_tool(
+                &agent,
+                "mcp_request_install",
+                json!({ "target": target, "allow_local_http": true, "reason": "Bundle test" }),
+            )
+            .await
+            .unwrap();
+        assert_eq!(ask1["status"], "approval_required");
+        let esc1 = ask1["escalation_id"].as_str().unwrap();
+
+        let (ok_head, _) = raw_http(
+            http_addr,
+            "POST",
+            "/v1/approvals/decide",
+            Some(&op),
+            Some(json!({ "escalation_id": esc1, "decision": "approve", "ttl_secs": 0 })),
+        )
+        .await;
+        assert!(ok_head.contains("200 OK"), "{ok_head}");
+
+        // 2. If the manifest mutates before retry, evidence_hash changes and old lease does not authorize it.
+        *default_body.write().await = tampered_bundle.clone();
+        let mutated = kernel
+            .call_tool(
+                &agent,
+                "mcp_request_install",
+                json!({ "target": target, "allow_local_http": true, "reason": "Bundle test" }),
+            )
+            .await
+            .unwrap();
+        assert_eq!(mutated["status"], "approval_required");
+
+        // 3. TOCTOU swap between prefetch and `install_bundle` MUST fail closed on SHA-256 mismatch.
+        *default_body.write().await = valid_bundle.clone();
+        {
+            let mut q = queue_bodies.lock().await;
+            q.push_back(valid_bundle.clone());
+            q.push_back(tampered_bundle.clone());
+        }
+        let toctou_err = kernel
+            .call_tool(
+                &agent,
+                "mcp_request_install",
+                json!({ "target": target, "allow_local_http": true, "reason": "Bundle test" }),
+            )
+            .await
+            .unwrap_err();
+        assert!(toctou_err.to_string().contains("SHA-256 mismatch"), "{toctou_err}");
+
+        // 4. Fresh approval on unmodified manifest installs AND clamps untrusted downgrades/overrides.
+        let ask2 = kernel
+            .call_tool(
+                &agent,
+                "mcp_request_install",
+                json!({ "target": target, "allow_local_http": true, "reason": "Bundle test" }),
+            )
+            .await
+            .unwrap();
+        assert_eq!(ask2["status"], "approval_required");
+        let esc2 = ask2["escalation_id"].as_str().unwrap();
+        let (ok2, _) = raw_http(
+            http_addr,
+            "POST",
+            "/v1/approvals/decide",
+            Some(&op),
+            Some(json!({ "escalation_id": esc2, "decision": "approve", "ttl_secs": 0 })),
+        )
+        .await;
+        assert!(ok2.contains("200 OK"), "{ok2}");
+
+        let installed = kernel
+            .call_tool(
+                &agent,
+                "mcp_request_install",
+                json!({ "target": target, "allow_local_http": true, "reason": "Bundle test" }),
+            )
+            .await
+            .unwrap();
+        assert_eq!(installed["status"], "installed");
+
+        let rec = kernel.mcp_firewall.get_server("acme", "sec-srv").await.unwrap();
+        assert_eq!(rec.policy.trust_level, McpTrustLevel::UntrustedExternal);
+        assert_ne!(rec.policy.dlp_mode, aos_egress::PseudonymMode::Off);
+        assert!(rec.policy.strip_prompt_injection);
+        assert_ne!(
+            rec.policy.tool_overrides.get("delete_all").copied(),
+            Some(McpToolRiskClass::ReadOnly)
+        );
+    }
+
+    #[tokio::test]
+    async fn scoped_mcp_notifications_isolate_orgs_and_agents() {
+        let tmp = tempfile::tempdir().unwrap();
+        let kernel = AegisRuntimeKernel::new(&tmp.path().join("rt")).await.unwrap();
+        let mut rx = kernel.subscribe_mcp_notifications();
+
+        kernel.emit_mcp_notification_scoped(
+            Some("org-a"),
+            Some("agent-1"),
+            "notifications/tools/list_changed",
+            None,
+        );
+        let ev = rx.try_recv().unwrap();
+        assert!(ev.matches_identity("org-a", "agent-1"));
+        assert!(!ev.matches_identity("org-a", "agent-2"));
+        assert!(!ev.matches_identity("org-b", "agent-1"));
+
+        kernel.emit_mcp_notification("notifications/resources/list_changed", None);
+        let global = rx.try_recv().unwrap();
+        assert!(global.matches_identity("org-a", "agent-1"));
+        assert!(global.matches_identity("org-b", "agent-9"));
     }
 }
