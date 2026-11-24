@@ -581,6 +581,115 @@ pub fn bind_workspace_for_key(
     agent_id
 }
 
+/// Default personal tenant/organization identifier used when no explicit `--org`,
+/// project config, or Cloud binding is configured.
+pub const DEFAULT_PERSONAL_ORG_ID: &str = "personal";
+
+/// Compute a collision-resistant, deterministic workspace ID (`ws_<12hex>`) from a
+/// canonicalized host workspace path so distinct directories with the same folder name never share
+/// CoW shadows or IPC channels.
+pub fn workspace_id_for_path(path: &Path) -> String {
+    let canon = std::fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf());
+    let norm = canon.to_string_lossy();
+    // Dual FNV-1a 64-bit hashes seeded differently for 128 bits of stable entropy with zero extra deps.
+    let mut h1: u64 = 0xcbf29ce484222325;
+    let mut h2: u64 = 0x9e3779b97f4a7c15;
+    for &b in norm.as_bytes() {
+        h1 ^= b as u64;
+        h1 = h1.wrapping_mul(0x100000001b3);
+        h2 ^= b as u64;
+        h2 = h2.wrapping_mul(0xbf58476d1ce4e5b9);
+    }
+    format!("ws_{:012x}", (h1 ^ h2) & 0xffff_ffff_ffff)
+}
+
+fn read_toml_org_id(toml_path: &Path) -> Option<String> {
+    let raw = std::fs::read_to_string(toml_path).ok()?;
+    for line in raw.lines() {
+        let no_comment = line.split('#').next().unwrap_or("").trim();
+        let Some((k, v)) = no_comment.split_once('=') else {
+            continue;
+        };
+        if k.trim() != "org_id" {
+            continue;
+        }
+        let val = v.trim().trim_matches('"').trim_matches('\'').trim();
+        if !val.is_empty() && val != "auto" && !val.contains('/') && !val.contains("..") {
+            return Some(val.to_string());
+        }
+    }
+    None
+}
+
+/// Resolve the automatic `org_id` without coupling to the terminal `cwd` directory basename.
+///
+/// Precedence:
+/// 1. `AOS_ORG` env var (when non-empty and not `"auto"`).
+/// 2. `.aegis/project.toml` (`org_id = "..."`) in `workspace` or up to 2 ancestor dirs.
+/// 3. Enabled Cloud binding matching `workspace` in `<runtime_dir>/cloud_bindings.json` (or `auth.org_id`).
+/// 4. Global `<runtime_dir>/config.toml` (`org_id = "..."`).
+/// 5. [`DEFAULT_PERSONAL_ORG_ID`] (`"personal"`).
+pub fn resolve_auto_org_id(runtime_dir: &Path, workspace: &Path) -> String {
+    if let Ok(env_org) = std::env::var("AOS_ORG") {
+        let trimmed = env_org.trim();
+        if !trimmed.is_empty() && trimmed != "auto" {
+            return trimmed.to_string();
+        }
+    }
+
+    let canon_ws = std::fs::canonicalize(workspace).unwrap_or_else(|_| workspace.to_path_buf());
+    let mut probe = Some(canon_ws.as_path());
+    for _ in 0..=2 {
+        let Some(dir) = probe else {
+            break;
+        };
+        if let Some(org) = read_toml_org_id(&dir.join(".aegis/project.toml")) {
+            return org;
+        }
+        probe = dir.parent();
+    }
+
+    if let Ok(bytes) = std::fs::read(runtime_dir.join("cloud_bindings.json")) {
+        if let Ok(val) = serde_json::from_slice::<serde_json::Value>(&bytes) {
+            let ws_str = canon_ws.to_string_lossy();
+            if let Some(bindings) = val.get("bindings").and_then(|v| v.as_array()) {
+                if let Some(matched) = bindings.iter().find(|b| {
+                    b.get("enabled").and_then(|v| v.as_bool()) == Some(true)
+                        && b.get("local_workspace")
+                            .and_then(|v| v.as_str())
+                            .is_some_and(|lw| {
+                                lw == ws_str.as_ref() || ws_str.starts_with(&format!("{lw}/"))
+                            })
+                }) {
+                    if let Some(org) = matched
+                        .get("org_id")
+                        .and_then(|v| v.as_str())
+                        .map(str::trim)
+                        .filter(|s| !s.is_empty())
+                    {
+                        return org.to_string();
+                    }
+                }
+            }
+            if let Some(org) = val
+                .get("auth")
+                .and_then(|a| a.get("org_id"))
+                .and_then(|v| v.as_str())
+                .map(str::trim)
+                .filter(|s| !s.is_empty())
+            {
+                return org.to_string();
+            }
+        }
+    }
+
+    if let Some(org) = read_toml_org_id(&runtime_dir.join("config.toml")) {
+        return org;
+    }
+
+    DEFAULT_PERSONAL_ORG_ID.to_string()
+}
+
 /// Bind the current client process session's active workspace root (and optional umbrella parent).
 pub fn bind_session_workspace(
     runtime_dir: &Path,
@@ -802,5 +911,52 @@ mod tests {
             resolve_workspace_binding_for_key(rt, &key_a_restarted),
             Some((repo_b, Some(ws_root), true))
         );
+    }
+
+    #[test]
+    fn workspace_id_and_auto_org_decouple_from_directory_basename() {
+        let tmp = tempfile::tempdir().unwrap();
+        let rt = tmp.path().join("rt");
+        let dir_a = tmp.path().join("work/api");
+        let dir_b = tmp.path().join("personal/api");
+        std::fs::create_dir_all(&rt).unwrap();
+        std::fs::create_dir_all(&dir_a).unwrap();
+        std::fs::create_dir_all(&dir_b).unwrap();
+
+        // Same basename in different parent folders must get distinct workspace IDs.
+        let ws_a = workspace_id_for_path(&dir_a);
+        let ws_b = workspace_id_for_path(&dir_b);
+        assert!(ws_a.starts_with("ws_"));
+        assert_ne!(ws_a, ws_b);
+        assert_eq!(ws_a, workspace_id_for_path(&dir_a));
+
+        // Without config or cloud binding, auto_org defaults to "personal" (not directory name "api").
+        assert_eq!(resolve_auto_org_id(&rt, &dir_a), DEFAULT_PERSONAL_ORG_ID);
+        assert_eq!(resolve_auto_org_id(&rt, &dir_b), DEFAULT_PERSONAL_ORG_ID);
+
+        // `.aegis/project.toml` overrides org_id for the project and its subdirectories.
+        std::fs::create_dir_all(dir_a.join(".aegis")).unwrap();
+        std::fs::write(dir_a.join(".aegis/project.toml"), "org_id = \"acme-team\"\n").unwrap();
+        let sub_a = dir_a.join("crates/core");
+        std::fs::create_dir_all(&sub_a).unwrap();
+        assert_eq!(resolve_auto_org_id(&rt, &dir_a), "acme-team");
+        assert_eq!(resolve_auto_org_id(&rt, &sub_a), "acme-team");
+
+        // Cloud binding in runtime_dir overrides config when no project.toml exists.
+        let canon_b = std::fs::canonicalize(&dir_b).unwrap();
+        std::fs::write(
+            rt.join("cloud_bindings.json"),
+            serde_json::json!({
+                "auth": { "org_id": "cloud-auth-org" },
+                "bindings": [{
+                    "enabled": true,
+                    "local_workspace": canon_b.to_string_lossy(),
+                    "org_id": "cloud-ws-org"
+                }]
+            })
+            .to_string(),
+        )
+        .unwrap();
+        assert_eq!(resolve_auto_org_id(&rt, &dir_b), "cloud-ws-org");
     }
 }

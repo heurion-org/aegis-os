@@ -969,7 +969,7 @@ pub async fn handle_cloud_command(
                         })),
                     )
                     .await?;
-                    resp.get("api_key")
+                                        resp.get("api_key")
                         .and_then(|v| v.as_str())
                         .context("Cloud endpoint did not return an `api_key`")?
                         .to_string()
@@ -1471,7 +1471,7 @@ pub async fn handle_cloud_command(
                     if resp.get("error").is_none() {
                         eprintln!("Check {email}: open the link in a browser within 30 minutes to add your authenticator app.");
                     }
-                    resp
+                                        resp
                 }
             };
             println!("{}", serde_json::to_string_pretty(&resp)?);
@@ -1578,11 +1578,11 @@ pub async fn handle_cloud_command(
                 match resp["approver_enrollment"]["status"].as_str() {
                     Some("email_sent") => eprintln!(
                         "\nTo approve your agents' escalations, open the link just sent to {} and add your authenticator app.\n",
-                        resp["approver_enrollment"]["email"].as_str().unwrap_or("your billing email")
+                                            resp["approver_enrollment"]["email"].as_str().unwrap_or("your billing email")
                     ),
                     Some(_) => eprintln!(
                         "\nNo approver enrollment email was sent ({}). Run `aegis-os cloud approver enroll --email <billing email>` later.\n",
-                        resp["approver_enrollment"]["reason"].as_str().unwrap_or("unknown reason")
+                                            resp["approver_enrollment"]["reason"].as_str().unwrap_or("unknown reason")
                     ),
                     None => {}
                 }
@@ -2615,16 +2615,12 @@ pub async fn serve_unified_stdio(
     let mut stdout = tokio::io::stdout();
     let mut reader = BufReader::new(stdin).lines();
     let mut base_workspace = initial_workspace;
+    let mut session_switched_ws: Option<PathBuf> = None;
     let mut active_workspace =
         kernel.resolve_workspace_for_session(&base_workspace, ws_session_key.as_ref());
     let mut last_local_sync_ms = Utc::now().timestamp_millis();
     if auto_org {
-        if let Some(name) = active_workspace.file_name() {
-            let name_str = name.to_string_lossy().to_string();
-            if name_str != "config" && !name_str.is_empty() {
-                identity.org_id = name_str;
-            }
-        }
+        identity.org_id = aos_core::session::resolve_auto_org_id(&runtime_dir, &active_workspace);
     }
 
     while let Some(line) = reader.next_line().await? {
@@ -2655,8 +2651,9 @@ pub async fn serve_unified_stdio(
                     }
                 }
             }
-            active_workspace =
-                kernel.resolve_workspace_for_session(&base_workspace, ws_session_key.as_ref());
+            active_workspace = session_switched_ws.clone().unwrap_or_else(|| {
+                kernel.resolve_workspace_for_session(&base_workspace, ws_session_key.as_ref())
+            });
             if let Some(key) = ws_session_key.as_ref() {
                 if aos_core::session::resolve_workspace_binding_for_key(&runtime_dir, key)
                     .is_none()
@@ -2675,12 +2672,8 @@ pub async fn serve_unified_stdio(
                 }
             }
             if auto_org {
-                if let Some(name) = active_workspace.file_name() {
-                    let name_str = name.to_string_lossy().to_string();
-                    if name_str != "config" && !name_str.is_empty() {
-                        identity.org_id = name_str;
-                    }
-                }
+                identity.org_id =
+                    aos_core::session::resolve_auto_org_id(&runtime_dir, &active_workspace);
             }
             let response = json!({
                 "jsonrpc": "2.0",
@@ -2729,15 +2722,12 @@ pub async fn serve_unified_stdio(
             continue;
         }
 
-        active_workspace =
-            kernel.resolve_workspace_for_session(&base_workspace, ws_session_key.as_ref());
-        if auto_org {
-            if let Some(name) = active_workspace.file_name() {
-                let name_str = name.to_string_lossy().to_string();
-                if name_str != "config" && !name_str.is_empty() {
-                    identity.org_id = name_str;
-                }
-            }
+        active_workspace = session_switched_ws.clone().unwrap_or_else(|| {
+            kernel.resolve_workspace_for_session(&base_workspace, ws_session_key.as_ref())
+        });
+        if auto_org && session_switched_ws.is_none() {
+            identity.org_id =
+                aos_core::session::resolve_auto_org_id(&runtime_dir, &active_workspace);
         }
         if let (Some(client), Some(key)) = (auto_agent_client.as_ref(), session_key.as_ref()) {
             identity.agent_id =
@@ -2855,6 +2845,16 @@ pub async fn serve_unified_stdio(
                     Vec::new()
                 };
 
+            let mut forward_req = req.clone();
+            if method == "tools/call" && tool_name == "workspace_commit" {
+                if let Some(params) = forward_req.get_mut("params").and_then(|p| p.as_object_mut()) {
+                    let args_val = params.entry("arguments").or_insert_with(|| json!({}));
+                    if let Some(args_obj) = args_val.as_object_mut() {
+                        args_obj.insert("include_source_files".to_string(), json!(true));
+                    }
+                }
+            }
+
             let response = match cloud_http_json(
                 "POST",
                 &binding.endpoint,
@@ -2866,7 +2866,7 @@ pub async fn serve_unified_stdio(
                     ("X-Aegis-Role", &identity.role),
                     ("X-Aegis-Workspace", &binding.workspace_id),
                 ],
-                Some(&req),
+                Some(&forward_req),
             )
             .await
             {
@@ -2958,7 +2958,7 @@ pub async fn serve_unified_stdio(
                                     ("X-Aegis-Role", &identity.role),
                                     ("X-Aegis-Workspace", &binding.workspace_id),
                                 ],
-                                Some(&req),
+                                Some(&forward_req),
                             )
                             .await
                             {
@@ -2980,7 +2980,7 @@ pub async fn serve_unified_stdio(
                             .and_then(|item| item.get("text"))
                             .and_then(|t| t.as_str())
                             .and_then(|txt| serde_json::from_str::<Value>(txt).ok());
-                        if let Some(ref commit_payload) = parsed_tool_json {
+                        if let Some(mut commit_payload) = parsed_tool_json {
                             if commit_payload.get("status").and_then(|v| v.as_str())
                                 == Some("committed_to_host")
                             {
@@ -3003,6 +3003,21 @@ pub async fn serve_unified_stdio(
                                         }
                                         let _ =
                                             tokio::fs::write(&dest, entry.content.as_bytes()).await;
+                                    }
+                                }
+                            }
+                            if let Some(obj) = commit_payload.as_object_mut() {
+                                if obj.remove("committed_source_files").is_some() {
+                                    if let Some(text_slot) = rpc_resp
+                                        .get_mut("result")
+                                        .and_then(|r| r.get_mut("content"))
+                                        .and_then(|c| c.as_array_mut())
+                                        .and_then(|arr| arr.first_mut())
+                                        .and_then(|item| item.get_mut("text"))
+                                    {
+                                        if let Ok(compact) = serde_json::to_string_pretty(&commit_payload) {
+                                            *text_slot = json!(compact);
+                                        }
                                     }
                                 }
                             }
@@ -3209,12 +3224,62 @@ pub async fn serve_unified_stdio(
                                             )
                                             .await
                                         }
-                                        None => kernel.handle_jsonrpc_message(&identity, req).await,
+                                        None => kernel.handle_jsonrpc_message(&identity, req.clone()).await,
                                     };
                                     if let Ok(retry_resp) = retry {
                                         resp = retry_resp;
                                     }
                                 }
+                            }
+                        }
+                    }
+                }
+                if method == "tools/call" && tool_name == "workspace_switch" {
+                    if let Some(payload) = resp
+                        .get("result")
+                        .filter(|r| r.get("isError").and_then(|v| v.as_bool()) != Some(true))
+                        .and_then(|r| r.get("content"))
+                        .and_then(|c| c.as_array())
+                        .and_then(|arr| arr.first())
+                        .and_then(|item| item.get("text"))
+                        .and_then(|t| t.as_str())
+                        .and_then(|txt| serde_json::from_str::<Value>(txt).ok())
+                    {
+                        if payload.get("status").and_then(|v| v.as_str())
+                            == Some("workspace_switched")
+                        {
+                            if let Some(new_root) =
+                                payload.get("host_source_root").and_then(|v| v.as_str())
+                            {
+                                let new_ws = PathBuf::from(new_root);
+                                if new_ws.is_dir() {
+                                    session_switched_ws = Some(new_ws.clone());
+                                    active_workspace = new_ws;
+                                }
+                            }
+                            if let Some(new_org) =
+                                payload.get("org_id").and_then(|v| v.as_str())
+                            {
+                                if !new_org.trim().is_empty() {
+                                    identity.org_id = new_org.to_string();
+                                }
+                            }
+                            let umb_path = payload
+                                .get("umbrella_root")
+                                .and_then(|v| v.as_str())
+                                .map(PathBuf::from);
+                            if let Some(key) = ws_session_key.as_ref() {
+                                let client_label =
+                                    auto_agent_client.as_deref().unwrap_or("mcp-client");
+                                let _ = aos_core::session::bind_workspace_for_key(
+                                    &runtime_dir,
+                                    client_label,
+                                    key,
+                                    None,
+                                    &active_workspace,
+                                    umb_path.as_deref(),
+                                    true,
+                                );
                             }
                         }
                     }

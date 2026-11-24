@@ -602,6 +602,7 @@ fn expand_home_tilde(raw: &str) -> PathBuf {
 struct HostGitPlan {
     git_bin: PathBuf,
     host_root: PathBuf,
+    repo_rel: Option<String>,
     paths: Vec<String>,
     shadow_paths: Vec<String>,
     auto_commit_shadow: bool,
@@ -832,6 +833,126 @@ fn is_safe_git_ref_name(git_bin: &Path, repo_root: &Path, ref_name: &str) -> boo
     .unwrap_or(false)
 }
 
+fn discover_child_git_repos_sync(dir: &Path) -> Vec<Value> {
+    let mut out = Vec::new();
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return out;
+    };
+    let mut children: Vec<(String, PathBuf)> = entries
+        .flatten()
+        .filter_map(|e| {
+            let p = e.path();
+            if !p.is_dir() {
+                return None;
+            }
+            let name = e.file_name().to_string_lossy().to_string();
+            if name.starts_with('.') {
+                return None;
+            }
+            if p.join(".git").exists() {
+                Some((name, p))
+            } else {
+                None
+            }
+        })
+        .collect();
+    children.sort_by(|a, b| a.0.cmp(&b.0));
+    for (name, p) in children {
+        let head_ref = std::fs::read_to_string(p.join(".git/HEAD"))
+            .ok()
+            .and_then(|s| {
+                let t = s.trim();
+                t.strip_prefix("ref: refs/heads/")
+                    .map(str::to_string)
+                    .or_else(|| (!t.is_empty()).then(|| t.chars().take(12).collect()))
+            });
+        out.push(json!({
+            "name": name,
+            "rel_path": name,
+            "path": p,
+            "branch": head_ref,
+        }));
+    }
+    out
+}
+
+/// Resolve the target Git repository root from an optional `repo` (or `workspace_repo`)
+/// relative path argument inside `workspace_host_root`, enforcing strict path/symlink containment.
+fn resolve_git_repo_target(
+    workspace_host_root: &Path,
+    repo_arg: Option<&str>,
+) -> anyhow::Result<(PathBuf, Option<String>)> {
+    let ws_canon = std::fs::canonicalize(workspace_host_root)
+        .unwrap_or_else(|_| workspace_host_root.to_path_buf());
+    let Some(raw) = repo_arg.map(str::trim).filter(|s| !s.is_empty() && *s != ".") else {
+        if ws_canon.join(".git").exists() {
+            return Ok((ws_canon, None));
+        }
+        let discovered: Vec<String> = discover_child_git_repos_sync(&ws_canon)
+            .into_iter()
+            .filter_map(|v| v.get("name").and_then(|n| n.as_str()).map(str::to_string))
+            .collect();
+        if discovered.is_empty() {
+            bail!("Host workspace '{}' is not a Git repository", ws_canon.display());
+        }
+        bail!(
+            "Host workspace '{}' is a multi-repo directory (not a Git root itself); pass `repo` (e.g. one of {:?}) or use `workspace_switch`",
+            ws_canon.display(),
+            discovered
+        );
+    };
+
+    if raw.contains('\\') || raw.contains('\0') {
+        bail!("Invalid repo subpath '{}'", raw);
+    }
+    let rel_path = Path::new(raw);
+    if rel_path.is_absolute() {
+        bail!("Repo subpath '{}' must be relative to workspace root", raw);
+    }
+    let mut clean_parts = Vec::new();
+    for comp in rel_path.components() {
+        match comp {
+            std::path::Component::Normal(c) => {
+                clean_parts.push(c.to_string_lossy().to_string());
+            }
+            std::path::Component::CurDir => {}
+            _ => bail!("Repo subpath '{}' cannot traverse outside workspace root", raw),
+        }
+    }
+    if clean_parts.is_empty() {
+        if ws_canon.join(".git").exists() {
+            return Ok((ws_canon, None));
+        }
+        bail!("Host workspace '{}' is not a Git repository", ws_canon.display());
+    }
+    let clean_rel = clean_parts.join("/");
+    let joined = ws_canon.join(&clean_rel);
+    if !joined.is_dir() {
+        bail!(
+            "Child repository '{}' does not exist under workspace '{}'",
+            clean_rel,
+            ws_canon.display()
+        );
+    }
+    let repo_canon = std::fs::canonicalize(&joined)
+        .with_context(|| format!("Failed to resolve repository path '{}'", joined.display()))?;
+    if !repo_canon.starts_with(&ws_canon) {
+        bail!(
+            "Repository subpath '{}' escapes workspace root '{}' via symlink",
+            clean_rel,
+            ws_canon.display()
+        );
+    }
+    if !repo_canon.join(".git").exists() {
+        bail!(
+            "Directory '{}' under workspace '{}' is not a Git repository (missing .git)",
+            clean_rel,
+            ws_canon.display()
+        );
+    }
+    Ok((repo_canon, Some(clean_rel)))
+}
+
 async fn execute_workspace_git_plan(
     gateway: &AegisRuntimeKernel,
     env: &AgentEnvironment,
@@ -846,12 +967,16 @@ async fn execute_workspace_git_plan(
         let pre_verify_epoch = env.workspace.read_host_commit_epoch();
         if !plan.skip_verify {
             if let Some(ref cmd) = plan.verify_cmd {
+                let verify_cwd = match plan.repo_rel.as_deref() {
+                    Some(rel) => env.workspace.shadow_root().join(rel),
+                    None => env.workspace.shadow_root().to_path_buf(),
+                };
                 let verify_out = env
                     .sandbox
                     .exec(ExecSpec {
                         command: "sh".to_string(),
                         args: vec!["-c".to_string(), cmd.clone()],
-                        cwd: Some(env.workspace.shadow_root().to_path_buf()),
+                        cwd: Some(verify_cwd),
                         env: HashMap::new(),
                         timeout_ms: plan.verify_timeout_ms.or(Some(30_000)),
                         background: false,
@@ -1139,6 +1264,7 @@ async fn execute_workspace_git_plan(
         Ok(json!({
             "status": "git_completed",
             "host_root": plan.host_root,
+            "repo": plan.repo_rel,
             "head_sha": new_head_sha,
             "shadow_committed_files": shadow_committed,
             "verified_shadow": verified_shadow,
@@ -1187,11 +1313,9 @@ async fn execute_workspace_git_inspect(
     env: &AgentEnvironment,
     args: &Value,
 ) -> anyhow::Result<Value> {
-    let host_root = std::fs::canonicalize(env.workspace.host_source_root())
-        .unwrap_or_else(|_| env.workspace.host_source_root().to_path_buf());
-    if !host_root.join(".git").exists() {
-        bail!("Host workspace '{}' is not a Git repository", host_root.display());
-    }
+    let repo_arg = args.get("repo").and_then(|v| v.as_str());
+    let (host_root, repo_rel) =
+        resolve_git_repo_target(env.workspace.host_source_root(), repo_arg)?;
     let git_bin = resolve_system_git_binary()?;
     let mode = args
         .get("mode")
@@ -1225,11 +1349,21 @@ async fn execute_workspace_git_inspect(
         .unwrap_or_default();
     let paths = validate_repo_relative_paths(paths_raw, "workspace_git_inspect")?;
 
-    let shadow_uncommitted = env
+    let all_shadow = env
         .workspace
         .changed_since_baseline()
         .await
         .unwrap_or_default();
+    let shadow_uncommitted: Vec<String> = match repo_rel.as_deref() {
+        Some(rel) => {
+            let prefix = format!("{rel}/");
+            all_shadow
+                .into_iter()
+                .filter_map(|p| p.strip_prefix(&prefix).map(str::to_string))
+                .collect()
+        }
+        None => all_shadow,
+    };
 
     let mode_clone = mode.clone();
     let host_root_clone = host_root.clone();
@@ -1295,6 +1429,7 @@ async fn execute_workspace_git_inspect(
         "status": "ok",
         "mode": mode,
         "host_root": host_root,
+        "repo": repo_rel,
         "truncated": truncated,
         "output": raw_output,
         "shadow_uncommitted_files": shadow_uncommitted,
@@ -1411,9 +1546,20 @@ fn resolve_github_repo_arg(host_root: &Path, args: &Value) -> anyhow::Result<Str
             }
             Ok(explicit.to_string())
         }
-        None => detect_github_repo_from_git_config(host_root).context(
-            "Could not auto-detect GitHub `owner/repo` from host `.git/config`; pass `repo` explicitly",
-        ),
+        None => {
+            let repo_dir = match args
+                .get("workspace_repo")
+                .and_then(|v| v.as_str())
+                .map(str::trim)
+                .filter(|s| !s.is_empty())
+            {
+                Some(ws_repo) => resolve_git_repo_target(host_root, Some(ws_repo))?.0,
+                None => host_root.to_path_buf(),
+            };
+            detect_github_repo_from_git_config(&repo_dir).context(
+                "Could not auto-detect GitHub `owner/repo` from host `.git/config`; pass `repo` (owner/repo) or `workspace_repo` explicitly",
+            )
+        }
     }
 }
 
@@ -2345,11 +2491,38 @@ async fn execute_pkg_install(
                 )?;
             }
             let mgr_cache = cache_root.join(&plan.manager);
-            tokio::fs::create_dir_all(&mgr_cache).await?;
+            let pnpm_store = cache_root.join("pnpm-store");
+            let pnpm_home = cache_root.join("pnpm-home");
+            let xdg_cache = cache_root.join("xdg-cache");
+            let xdg_data = cache_root.join("xdg-data");
+            let xdg_state = cache_root.join("xdg-state");
+            let yarn_cache = cache_root.join("yarn");
+            let bun_cache = cache_root.join("bun");
+            for dir in [
+                &mgr_cache,
+                &pnpm_store,
+                &pnpm_home,
+                &xdg_cache,
+                &xdg_data,
+                &xdg_state,
+                &yarn_cache,
+                &bun_cache,
+            ] {
+                tokio::fs::create_dir_all(dir).await?;
+            }
             let cache_str = mgr_cache.display().to_string();
+            let pnpm_store_str = pnpm_store.display().to_string();
             env.insert("NPM_CONFIG_USERCONFIG".to_string(), "/dev/null".to_string());
             env.insert("NPM_CONFIG_CACHE".to_string(), cache_str.clone());
             env.insert("npm_config_cache".to_string(), cache_str);
+            env.insert("PNPM_STORE_DIR".to_string(), pnpm_store_str.clone());
+            env.insert("npm_config_store_dir".to_string(), pnpm_store_str);
+            env.insert("PNPM_HOME".to_string(), pnpm_home.display().to_string());
+            env.insert("XDG_CACHE_HOME".to_string(), xdg_cache.display().to_string());
+            env.insert("XDG_DATA_HOME".to_string(), xdg_data.display().to_string());
+            env.insert("XDG_STATE_HOME".to_string(), xdg_state.display().to_string());
+            env.insert("YARN_CACHE_FOLDER".to_string(), yarn_cache.display().to_string());
+            env.insert("BUN_INSTALL_CACHE_DIR".to_string(), bun_cache.display().to_string());
             env.insert(
                 "npm_config_registry".to_string(),
                 "https://registry.npmjs.org/".to_string(),
@@ -4639,16 +4812,18 @@ impl AegisRuntimeKernel {
         subscribed_topics: Vec<String>,
     ) -> anyhow::Result<Arc<AgentEnvironment>> {
         self.ensure_org_vault(&identity.org_id).await?;
+        let canon_host = std::fs::canonicalize(host_project_source.as_ref())
+            .unwrap_or_else(|_| host_project_source.as_ref().to_path_buf());
         let key = Self::agent_key(&identity.org_id, &identity.agent_id);
         if let Some(existing) = self.agents.read().await.get(&key) {
-            if existing.workspace.shadow_root().join(".initialized").exists()
-                || (existing.workspace.shadow_root().exists()
-                    && existing
-                        .workspace
-                        .shadow_root()
-                        .parent()
-                        .is_some_and(|p| p.join(".initialized").exists())
-                    && existing.workspace.host_source_root() == host_project_source.as_ref())
+            if existing.workspace.host_source_root() == canon_host.as_path()
+                && (existing.workspace.shadow_root().join(".initialized").exists()
+                    || (existing.workspace.shadow_root().exists()
+                        && existing
+                            .workspace
+                            .shadow_root()
+                            .parent()
+                            .is_some_and(|p| p.join(".initialized").exists())))
             {
                 return Ok(existing.clone());
             }
@@ -4661,8 +4836,23 @@ impl AegisRuntimeKernel {
             .join("agents")
             .join(&identity.agent_id);
 
-        let cow_base = agent_root.join("cow_workspace");
-        let agent_home = agent_root.join("home");
+        let default_cow_base = agent_root.join("cow_workspace");
+        let marker_host = std::fs::read_to_string(default_cow_base.join(".host_source_root"))
+            .ok()
+            .map(|s| PathBuf::from(s.trim()));
+        let cow_base = if identity.org_id == aos_core::session::DEFAULT_PERSONAL_ORG_ID
+            || marker_host.as_ref().is_some_and(|h| h != &canon_host)
+        {
+            let ws_id = aos_core::session::workspace_id_for_path(&canon_host);
+            agent_root.join("workspaces").join(ws_id).join("cow_workspace")
+        } else {
+            default_cow_base
+        };
+        let agent_home = if cow_base == agent_root.join("cow_workspace") {
+            agent_root.join("home")
+        } else {
+            cow_base.parent().unwrap_or(&agent_root).join("home")
+        };
         let org_shared_ro = self
             .runtime_data_root
             .join("orgs")
@@ -4676,10 +4866,16 @@ impl AegisRuntimeKernel {
             .join(&identity.agent_id);
 
         tokio::fs::create_dir_all(&agent_home).await?;
+        tokio::fs::create_dir_all(&cow_base).await?;
         tokio::fs::create_dir_all(&org_shared_ro).await?;
         tokio::fs::create_dir_all(&org_agent_pub).await?;
 
-        let ws = Arc::new(CoWWorkspace::init(host_project_source.as_ref(), &cow_base).await?);
+        let ws = Arc::new(CoWWorkspace::init(&canon_host, &cow_base).await?);
+        let _ = tokio::fs::write(
+            cow_base.join(".host_source_root"),
+            canon_host.to_string_lossy().as_bytes(),
+        )
+        .await;
 
         let sbx_config = SandboxConfig {
             identity: identity.clone(),
@@ -4870,14 +5066,9 @@ impl AegisRuntimeKernel {
         identity: &AgentIdentity,
         args: &Value,
     ) -> anyhow::Result<(HostGitPlan, String, Vec<aos_core::FileDiffEntry>, Value)> {
-        let host_root = std::fs::canonicalize(env.workspace.host_source_root())
-            .unwrap_or_else(|_| env.workspace.host_source_root().to_path_buf());
-        if !host_root.join(".git").exists() {
-            bail!(
-                "Host workspace '{}' is not a Git repository",
-                host_root.display()
-            );
-        }
+        let repo_arg = args.get("repo").and_then(|v| v.as_str());
+        let (host_root, repo_rel) =
+            resolve_git_repo_target(env.workspace.host_source_root(), repo_arg)?;
         let git_bin = resolve_system_git_binary()?;
 
         let raw_paths: Vec<String> = args
@@ -5013,8 +5204,32 @@ impl AegisRuntimeKernel {
             .changed_since_baseline()
             .await
             .unwrap_or_default();
-        if auto_commit_shadow && paths.is_empty() && commit_message.is_some() && !shadow_changed.is_empty() {
-            paths = shadow_changed.clone();
+        let to_ws_path = |p: &str| -> String {
+            match repo_rel.as_deref() {
+                Some(rel) => format!("{rel}/{p}"),
+                None => p.to_string(),
+            }
+        };
+        let repo_shadow_pairs: Vec<(String, String)> = shadow_changed
+            .iter()
+            .filter_map(|ws_p| match repo_rel.as_deref() {
+                Some(rel) => {
+                    let prefix = format!("{rel}/");
+                    ws_p.strip_prefix(&prefix)
+                        .map(|repo_p| (ws_p.clone(), repo_p.to_string()))
+                }
+                None => Some((ws_p.clone(), ws_p.clone())),
+            })
+            .collect();
+        if auto_commit_shadow
+            && paths.is_empty()
+            && commit_message.is_some()
+            && !repo_shadow_pairs.is_empty()
+        {
+            paths = repo_shadow_pairs
+                .iter()
+                .map(|(_, repo_p)| repo_p.clone())
+                .collect();
         }
 
         if !auto_commit_shadow
@@ -5041,15 +5256,19 @@ impl AegisRuntimeKernel {
             if !paths.is_empty() {
                 paths
                     .iter()
-                    .filter(|p| shadow_changed.iter().any(|s| s == *p))
-                    .cloned()
+                    .map(|p| to_ws_path(p))
+                    .filter(|ws_p| shadow_changed.iter().any(|s| s == ws_p))
                     .collect()
             } else {
-                shadow_changed.clone()
+                repo_shadow_pairs
+                    .iter()
+                    .map(|(ws_p, _)| ws_p.clone())
+                    .collect()
             }
         } else {
             for p in &paths {
-                if shadow_changed.iter().any(|s| s == p) {
+                let ws_p = to_ws_path(p);
+                if shadow_changed.iter().any(|s| s == &ws_p) {
                     bail!(
                         "Path '{}' still has uncommitted changes in your CoW shadow workspace; call 'workspace_commit' first (or pass auto_commit_shadow: true) before 'workspace_git'",
                         p
@@ -5059,7 +5278,7 @@ impl AegisRuntimeKernel {
             Vec::new()
         };
 
-        let mut claim_check_paths = paths.clone();
+        let mut claim_check_paths: Vec<String> = paths.iter().map(|p| to_ws_path(p)).collect();
         for sp in &shadow_paths {
             if !claim_check_paths.contains(sp) {
                 claim_check_paths.push(sp.clone());
@@ -5094,7 +5313,10 @@ impl AegisRuntimeKernel {
 
         let host_only_paths: Vec<String> = paths
             .iter()
-            .filter(|p| !shadow_paths.contains(p))
+            .filter(|p| {
+                let ws_p = to_ws_path(p);
+                !shadow_paths.contains(&ws_p)
+            })
             .cloned()
             .collect();
         if commit_message.is_some() && !host_only_paths.is_empty() {
@@ -5373,6 +5595,7 @@ impl AegisRuntimeKernel {
 
         let canonical_plan = serde_json::to_vec(&json!({
             "host_root": host_root.display().to_string(),
+            "repo": repo_rel,
             "head_sha": head_sha,
             "file_hashes": file_hashes,
             "auto_commit_shadow": auto_commit_shadow,
@@ -5426,6 +5649,7 @@ impl AegisRuntimeKernel {
 
         let meta = json!({
             "host_root": host_root.display().to_string(),
+            "repo": repo_rel,
             "head_sha": head_sha,
             "paths": paths,
             "shadow_paths": shadow_paths,
@@ -5449,6 +5673,7 @@ impl AegisRuntimeKernel {
             "evidence_hash": evidence_hash,
             "evidence": {
                 "host_root": host_root.display().to_string(),
+                "repo": repo_rel,
                 "paths": paths,
                 "shadow_paths": shadow_paths,
                 "auto_commit_shadow": auto_commit_shadow,
@@ -5468,6 +5693,7 @@ impl AegisRuntimeKernel {
         let plan = HostGitPlan {
             git_bin,
             host_root,
+            repo_rel,
             paths,
             shadow_paths,
             auto_commit_shadow,
@@ -8224,12 +8450,19 @@ impl AegisRuntimeKernel {
             let existing_binding =
                 aos_core::session::resolve_session_workspace_binding(&self.runtime_data_root);
             let existing_umbrella = existing_binding.as_ref().and_then(|(_, u, _)| u.clone());
+            let current_root = std::fs::canonicalize(env.workspace.host_source_root())
+                .unwrap_or_else(|_| env.workspace.host_source_root().to_path_buf());
 
             let candidate = if Path::new(raw_path).is_absolute() {
                 PathBuf::from(raw_path)
-            } else if let Some(ref umb) = existing_umbrella {
-                umb.join(raw_path)
-            } else if let Some(parent) = env.workspace.host_source_root().parent() {
+            } else if current_root.join(raw_path).is_dir() {
+                current_root.join(raw_path)
+            } else if existing_umbrella
+                .as_ref()
+                .is_some_and(|u| u.join(raw_path).is_dir())
+            {
+                existing_umbrella.as_ref().unwrap().join(raw_path)
+            } else if let Some(parent) = current_root.parent() {
                 parent.join(raw_path)
             } else {
                 bail!(
@@ -8272,29 +8505,31 @@ impl AegisRuntimeKernel {
                 );
             }
 
-            let within_umbrella = existing_umbrella
+            let next_umbrella = match existing_umbrella {
+                Some(ref u) if canon_target.starts_with(u) => Some(u.clone()),
+                _ if canon_target.starts_with(&current_root) && canon_target != current_root => {
+                    Some(current_root.clone())
+                }
+                other => other,
+            };
+            let within_umbrella = next_umbrella
                 .as_ref()
                 .is_some_and(|u| canon_target.starts_with(u))
-                || canon_target == env.workspace.host_source_root();
+                || canon_target == current_root;
             let new_org_id = args
                 .get("org_id")
                 .and_then(|v| v.as_str())
                 .map(str::trim)
                 .filter(|s| !s.is_empty())
                 .map(str::to_string)
-                .or_else(|| {
-                    canon_target
-                        .file_name()
-                        .map(|n| n.to_string_lossy().to_string())
-                })
-                .unwrap_or_else(|| "default-org".to_string());
+                .unwrap_or_else(|| identity.org_id.clone());
 
             target_resource = canon_target.display().to_string();
             if let Some(obj) = audit_metadata.as_object_mut() {
                 obj.insert("within_umbrella".to_string(), json!(within_umbrella));
                 obj.insert("target_org_id".to_string(), json!(new_org_id.clone()));
             }
-            pre_switch_plan = Some((canon_target, new_org_id, existing_umbrella));
+            pre_switch_plan = Some((canon_target, new_org_id, next_umbrella));
         } else if tool_name == "workspace_git" {
             let (plan, resource, diffs, meta) =
                 self.prepare_workspace_git_plan(&env, identity, &args).await?;
@@ -8692,8 +8927,11 @@ impl AegisRuntimeKernel {
             }
 
             "workspace_switch" => {
-                let (canon_target, new_org_id, existing_umbrella) =
+                let (canon_target, new_org_id, next_umbrella) =
                     pre_switch_plan.context("Missing pre-validated workspace_switch plan")?;
+                let prev_workspace = env.workspace.host_source_root().to_path_buf();
+                let prev_uncommitted_count =
+                    env.workspace.diff(None).await.map(|d| d.len()).unwrap_or(0);
                 let new_identity = AgentIdentity::new(
                     new_org_id,
                     identity.agent_id.clone(),
@@ -8712,15 +8950,19 @@ impl AegisRuntimeKernel {
                     "auto",
                     None,
                     &canon_target,
-                    existing_umbrella.as_deref(),
+                    next_umbrella.as_deref(),
                     true,
                 );
                 Ok(json!({
                     "status": "workspace_switched",
                     "org_id": new_identity.org_id,
                     "agent_id": new_identity.agent_id,
+                    "workspace_id": aos_core::session::workspace_id_for_path(&canon_target),
                     "host_source_root": canon_target,
                     "shadow_root": new_env.workspace.shadow_root(),
+                    "previous_workspace": prev_workspace,
+                    "previous_uncommitted_count": prev_uncommitted_count,
+                    "umbrella_root": next_umbrella,
                 }))
             }
 
@@ -8813,10 +9055,17 @@ impl AegisRuntimeKernel {
                 let orphaned = self
                     .detect_orphaned_shadows(identity, env.workspace.host_source_root())
                     .await;
+                let umbrella_root = aos_core::session::resolve_session_workspace_binding(
+                    &self.runtime_data_root,
+                )
+                .and_then(|(_, u, _)| u);
                 Ok(json!({
                     "identity": identity,
+                    "workspace_id": aos_core::session::workspace_id_for_path(env.workspace.host_source_root()),
                     "shadow_root": env.workspace.shadow_root(),
                     "host_source_root": env.workspace.host_source_root(),
+                    "umbrella_root": umbrella_root,
+                    "child_repos": discover_child_git_repos_sync(env.workspace.host_source_root()),
                     "vault": vault_status,
                     "auto_refresh": refresh,
                     "uncommitted_changes_count": diffs.len(),
@@ -9156,25 +9405,31 @@ impl AegisRuntimeKernel {
                 } else {
                     Vec::new()
                 };
+                let include_source_files = args
+                    .get("include_source_files")
+                    .and_then(|v| v.as_bool())
+                    .unwrap_or(false);
                 let host_root = env.workspace.host_source_root();
                 let mut committed_source_files = Vec::new();
-                for rel in &committed {
-                    let clean = rel.trim_start_matches('/').to_string();
-                    let full = host_root.join(&clean);
-                    if !full.exists() {
-                        committed_source_files.push(paas::SourceFileEntry {
-                            path: clean,
-                            content: String::new(),
-                            deleted: true,
-                        });
-                    } else if let Ok(raw) = tokio::fs::read(&full).await {
-                        if !raw.iter().take(8000).any(|&b| b == 0) {
-                            if let Ok(content) = String::from_utf8(raw) {
-                                committed_source_files.push(paas::SourceFileEntry {
-                                    path: clean,
-                                    content,
-                                    deleted: false,
-                                });
+                if include_source_files {
+                    for rel in &committed {
+                        let clean = rel.trim_start_matches('/').to_string();
+                        let full = host_root.join(&clean);
+                        if !full.exists() {
+                            committed_source_files.push(paas::SourceFileEntry {
+                                path: clean,
+                                content: String::new(),
+                                deleted: true,
+                            });
+                        } else if let Ok(raw) = tokio::fs::read(&full).await {
+                            if !raw.iter().take(8000).any(|&b| b == 0) {
+                                if let Ok(content) = String::from_utf8(raw) {
+                                    committed_source_files.push(paas::SourceFileEntry {
+                                        path: clean,
+                                        content,
+                                        deleted: false,
+                                    });
+                                }
                             }
                         }
                     }
@@ -9201,21 +9456,30 @@ impl AegisRuntimeKernel {
                     committed.len(),
                     short_evidence
                 );
-                Ok(json!({
+                let mut payload = json!({
                     "status": "committed_to_host",
                     "host_root": host_root,
                     "auto_refresh": refresh,
                     "verification_passed": verify_cmd.is_some(),
                     "epoch_reverified": epoch_reverified,
+                    "committed_files_count": committed.len(),
                     "committed_files": committed,
                     "released_claims": released_claims,
-                    "committed_source_files": committed_source_files,
                     "audit_receipt": {
                         "evidence_hash": pre_commit_evidence_hash,
                         "git_trailer": git_trailer,
                         "pr_markdown_badge": pr_markdown_badge,
                     }
-                }))
+                });
+                if include_source_files {
+                    if let Some(obj) = payload.as_object_mut() {
+                        obj.insert(
+                            "committed_source_files".to_string(),
+                            json!(committed_source_files),
+                        );
+                    }
+                }
+                Ok(payload)
             }
 
             "workspace_export_pr" => {
@@ -10603,17 +10867,17 @@ impl AegisRuntimeKernel {
                 },
                 {
                     "name": "workspace_switch",
-                    "description": "[Zero-Prompt in Umbrella / Lease-Gated Outside] Switch this session's active CoW shadow workspace to a sibling or specified project directory.",
+                    "description": "[Zero-Prompt in Umbrella / Lease-Gated Outside] Switch this session's active CoW shadow workspace to a sibling, child, or specified project directory.",
                     "inputSchema": {
                         "type": "object",
                         "properties": {
                             "path": {
                                 "type": "string",
-                                "description": "Target project directory path (absolute, or relative to the session's umbrella container)."
+                                "description": "Target project directory path (absolute, or relative to current workspace / umbrella container / parent)."
                             },
                             "org_id": {
                                 "type": "string",
-                                "description": "Optional organization ID override (defaults to target directory name)."
+                                "description": "Optional organization ID override (defaults to preserving the current org ID, e.g. 'personal')."
                             }
                         },
                         "required": ["path"]
@@ -10642,6 +10906,10 @@ impl AegisRuntimeKernel {
                                 "type": "array",
                                 "items": { "type": "string" },
                                 "description": "Optional repo-relative path filters for 'status', 'log', 'diff', or 'show'."
+                            },
+                            "repo": {
+                                "type": "string",
+                                "description": "Optional child repository subpath relative to workspace root for multi-repo workspaces."
                             }
                         }
                     }
@@ -10655,6 +10923,10 @@ impl AegisRuntimeKernel {
                             "auto_commit_shadow": {
                                 "type": "boolean",
                                 "description": "If true, verify (`verify_cmd`) and land uncommitted CoW shadow changes to host atomically BEFORE `git add/commit` under a single SHA-256-pinned approval."
+                            },
+                            "repo": {
+                                "type": "string",
+                                "description": "Optional child repository subpath relative to workspace root for multi-repo workspaces."
                             },
                             "verify_cmd": {
                                 "type": "string",
@@ -10736,6 +11008,10 @@ impl AegisRuntimeKernel {
                                 "type": "string",
                                 "description": "GitHub repository slug (`owner/name`); auto-detected from host `.git/config` `origin` remote when omitted (cross-repo queries require approval)."
                             },
+                            "workspace_repo": {
+                                "type": "string",
+                                "description": "Optional child repository subpath relative to workspace root used to auto-detect origin owner/name in multi-repo workspaces."
+                            },
                             "run_id": {
                                 "type": "integer",
                                 "description": "Optional GitHub Actions workflow run ID to inspect (returns status + failed log tail)."
@@ -10777,6 +11053,10 @@ impl AegisRuntimeKernel {
                                 "type": "string",
                                 "description": "GitHub repository slug (`owner/name`); defaults to host `origin`."
                             },
+                            "workspace_repo": {
+                                "type": "string",
+                                "description": "Optional child repository subpath relative to workspace root used to auto-detect origin owner/name in multi-repo workspaces."
+                            },
                             "failed_only": {
                                 "type": "boolean",
                                 "description": "Rerun only failed jobs (`--failed`, default true)."
@@ -10814,6 +11094,10 @@ impl AegisRuntimeKernel {
                             "repo": {
                                 "type": "string",
                                 "description": "GitHub repository slug (`owner/name`); defaults to host `origin`."
+                            },
+                            "workspace_repo": {
+                                "type": "string",
+                                "description": "Optional child repository subpath relative to workspace root used to auto-detect origin owner/name in multi-repo workspaces."
                             }
                         }
                     }
@@ -10841,6 +11125,10 @@ impl AegisRuntimeKernel {
                             "repo": {
                                 "type": "string",
                                 "description": "GitHub repository slug (`owner/name`); defaults to host `origin`."
+                            },
+                            "workspace_repo": {
+                                "type": "string",
+                                "description": "Optional child repository subpath relative to workspace root used to auto-detect origin owner/name in multi-repo workspaces."
                             }
                         }
                     }
@@ -10859,6 +11147,10 @@ impl AegisRuntimeKernel {
                             "repo": {
                                 "type": "string",
                                 "description": "GitHub repository slug (`owner/name`); defaults to host `origin`."
+                            },
+                            "workspace_repo": {
+                                "type": "string",
+                                "description": "Optional child repository subpath relative to workspace root used to auto-detect origin owner/name in multi-repo workspaces."
                             }
                         },
                         "required": ["title"]
@@ -10881,6 +11173,10 @@ impl AegisRuntimeKernel {
                             "repo": {
                                 "type": "string",
                                 "description": "GitHub repository slug (`owner/name`); defaults to host `origin`."
+                            },
+                            "workspace_repo": {
+                                "type": "string",
+                                "description": "Optional child repository subpath relative to workspace root used to auto-detect origin owner/name in multi-repo workspaces."
                             }
                         },
                         "required": ["number", "body"]
@@ -10916,6 +11212,10 @@ impl AegisRuntimeKernel {
                             "repo": {
                                 "type": "string",
                                 "description": "GitHub repository slug (`owner/name`); defaults to host `origin`."
+                            },
+                            "workspace_repo": {
+                                "type": "string",
+                                "description": "Optional child repository subpath relative to workspace root used to auto-detect origin owner/name in multi-repo workspaces."
                             }
                         },
                         "required": ["pr_number"]
@@ -11755,6 +12055,10 @@ impl AegisRuntimeKernel {
                     }));
                 }
 
+                let include_source_files = arguments
+                    .get("include_source_files")
+                    .and_then(|v| v.as_bool())
+                    .unwrap_or(false);
                 let result = if HUMAN_ONLY_TOOLS.contains(&name) {
                     Err(anyhow::anyhow!(
                         "`{}` is reserved for the human operator; agents cannot grant leases or approve escalations. Ask the user to approve the pending escalation in the Web Approval Console (/approve or /dashboard) or provide their 6-digit TOTP code in chat.",
@@ -11774,13 +12078,19 @@ impl AegisRuntimeKernel {
                                 obj.insert("_aegis_inbox".to_string(), inbox);
                             }
                         }
+                        let skip_cap = name == "workspace_commit" && include_source_files;
+                        let text = format_capped_mcp_tool_text(
+                            val,
+                            MAX_MCP_TOOL_RESPONSE_BYTES,
+                            skip_cap,
+                        )?;
                         json!({
                             "jsonrpc": "2.0",
                             "id": id,
                             "result": {
                                 "content": [{
                                     "type": "text",
-                                    "text": serde_json::to_string_pretty(&val)?
+                                    "text": text
                                 }]
                             }
                         })
@@ -12031,15 +12341,12 @@ impl AegisRuntimeKernel {
         let mut stdout = tokio::io::stdout();
         let mut reader = BufReader::new(stdin).lines();
         let mut base_workspace = initial_workspace;
+        let mut session_switched_ws: Option<PathBuf> = None;
         let mut active_workspace =
             self.resolve_workspace_for_session(&base_workspace, ws_session_key.as_ref());
         if auto_org {
-            if let Some(name) = active_workspace.file_name() {
-                let name_str = name.to_string_lossy().to_string();
-                if name_str != "config" && !name_str.is_empty() {
-                    identity.org_id = name_str;
-                }
-            }
+            identity.org_id =
+                aos_core::session::resolve_auto_org_id(&self.runtime_data_root, &active_workspace);
         }
 
         let mut notif_rx = self.subscribe_mcp_notifications();
@@ -12120,24 +12427,23 @@ impl AegisRuntimeKernel {
                 }
                 active_workspace =
                     self.resolve_workspace_for_session(&base_workspace, ws_session_key.as_ref());
-                if auto_org {
-                    if let Some(name) = active_workspace.file_name() {
-                        let name_str = name.to_string_lossy().to_string();
-                        if name_str != "config" && !name_str.is_empty() {
-                            identity.org_id = name_str;
-                        }
-                    }
+                if auto_org && session_switched_ws.is_none() {
+                    identity.org_id = aos_core::session::resolve_auto_org_id(
+                        &self.runtime_data_root,
+                        &active_workspace,
+                    );
                 }
             } else if method == "tools/call" || method == "resources/read" {
-                active_workspace =
-                    self.resolve_workspace_for_session(&base_workspace, ws_session_key.as_ref());
-                if auto_org {
-                    if let Some(name) = active_workspace.file_name() {
-                        let name_str = name.to_string_lossy().to_string();
-                        if name_str != "config" && !name_str.is_empty() {
-                            identity.org_id = name_str;
-                        }
-                    }
+                active_workspace = if let Some(ref sw) = session_switched_ws {
+                    sw.clone()
+                } else {
+                    self.resolve_workspace_for_session(&base_workspace, ws_session_key.as_ref())
+                };
+                if auto_org && session_switched_ws.is_none() {
+                    identity.org_id = aos_core::session::resolve_auto_org_id(
+                        &self.runtime_data_root,
+                        &active_workspace,
+                    );
                 }
                 if let (Some(client), Some(key)) = (auto_agent_client.as_ref(), session_key.as_ref()) {
                     identity.agent_id = aos_core::session::resolve_agent_id_for_key(
@@ -12184,6 +12490,12 @@ impl AegisRuntimeKernel {
                     .await;
             }
 
+            let is_workspace_switch_call = method == "tools/call"
+                && req
+                    .get("params")
+                    .and_then(|p| p.get("name"))
+                    .and_then(|v| v.as_str())
+                    == Some("workspace_switch");
             let id = req.get("id").cloned().unwrap_or(Value::Null);
             let response = match self.handle_jsonrpc_message(&identity, req).await {
                 Ok(resp) => resp,
@@ -12199,6 +12511,51 @@ impl AegisRuntimeKernel {
                     }
                 }),
             };
+            if is_workspace_switch_call {
+                if let Some(payload) = response
+                    .get("result")
+                    .filter(|r| r.get("isError").and_then(|v| v.as_bool()) != Some(true))
+                    .and_then(|r| r.get("content"))
+                    .and_then(|c| c.as_array())
+                    .and_then(|arr| arr.first())
+                    .and_then(|item| item.get("text"))
+                    .and_then(|t| t.as_str())
+                    .and_then(|txt| serde_json::from_str::<Value>(txt).ok())
+                {
+                    if payload.get("status").and_then(|v| v.as_str()) == Some("workspace_switched") {
+                        if let Some(new_root) =
+                            payload.get("host_source_root").and_then(|v| v.as_str())
+                        {
+                            let new_ws = PathBuf::from(new_root);
+                            if new_ws.is_dir() {
+                                session_switched_ws = Some(new_ws.clone());
+                                active_workspace = new_ws;
+                            }
+                        }
+                        if let Some(new_org) = payload.get("org_id").and_then(|v| v.as_str()) {
+                            if !new_org.trim().is_empty() {
+                                identity.org_id = new_org.to_string();
+                            }
+                        }
+                        let umb_path = payload
+                            .get("umbrella_root")
+                            .and_then(|v| v.as_str())
+                            .map(PathBuf::from);
+                        if let Some(key) = ws_session_key.as_ref() {
+                            let client_label = auto_agent_client.as_deref().unwrap_or("mcp-client");
+                            let _ = aos_core::session::bind_workspace_for_key(
+                                &self.runtime_data_root,
+                                client_label,
+                                key,
+                                None,
+                                &active_workspace,
+                                umb_path.as_deref(),
+                                true,
+                            );
+                        }
+                    }
+                }
+            }
             let out_line = format!("{}\n", serde_json::to_string(&response)?);
             stdout.write_all(out_line.as_bytes()).await?;
             while let Ok(note) = notif_rx.try_recv() {
@@ -12792,6 +13149,12 @@ impl AegisRuntimeKernel {
                                 ),
                             }
                         }
+                    } else if full_target.starts_with("/v1/desktop/entitlements") {
+                        let status_val = k
+                            .paas
+                            .get_desktop_entitlements_payload(&org_id)
+                            .await;
+                        ("HTTP/1.1 200 OK", status_val.to_string())
                     } else if full_target.starts_with("/v1/billing/status") {
                         let payload: Value = serde_json::from_str(body_str.trim()).unwrap_or_else(|_| json!({}));
                         let mut s_org = payload
@@ -14405,9 +14768,205 @@ impl AegisRuntimeKernel {
     }
 }
 
+const MAX_MCP_TOOL_RESPONSE_BYTES: usize = 512 * 1024;
+
+fn format_capped_mcp_tool_text(
+    mut val: Value,
+    max_bytes: usize,
+    skip_cap: bool,
+) -> anyhow::Result<String> {
+    let pretty = serde_json::to_string_pretty(&val)?;
+    if skip_cap || pretty.len() <= max_bytes {
+        return Ok(pretty);
+    }
+
+    let compact = serde_json::to_string(&val)?;
+    let original_bytes = compact.len();
+    if original_bytes <= max_bytes {
+        return Ok(compact);
+    }
+
+    let status_summary = val
+        .get("status")
+        .and_then(|v| v.as_str())
+        .map(|s| s.to_string());
+
+    if let Some(obj) = val.as_object_mut() {
+        obj.insert("_truncated".to_string(), json!(true));
+        obj.insert("_original_bytes".to_string(), json!(original_bytes));
+        if let Some(changes) = obj
+            .get_mut("uncommitted_changes")
+            .and_then(|v| v.as_array_mut())
+        {
+            for item in changes.iter_mut() {
+                if let Some(m) = item.as_object_mut() {
+                    if let Some(diff) = m.get("preview_diff").and_then(|v| v.as_str()) {
+                        if diff.len() > 256 {
+                            let prefix: String = diff.chars().take(256).collect();
+                            m.insert(
+                                "preview_diff".to_string(),
+                                json!(format!("{prefix}…[truncated]")),
+                            );
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    for cap in [200usize, 50, 10, 0] {
+        if let Some(obj) = val.as_object_mut() {
+            for key in [
+                "uncommitted_changes",
+                "committed_files",
+                "files",
+                "pending_escalations",
+                "entries",
+                "committed_source_files",
+            ] {
+                if let Some(arr) = obj.get_mut(key).and_then(|v| v.as_array_mut()) {
+                    if arr.len() > cap {
+                        arr.truncate(cap);
+                    }
+                }
+            }
+        }
+        let candidate = serde_json::to_string(&val)?;
+        if candidate.len() <= max_bytes {
+            return Ok(candidate);
+        }
+    }
+
+    let fallback = json!({
+        "_truncated": true,
+        "original_bytes": original_bytes,
+        "max_bytes": max_bytes,
+        "status": status_summary,
+        "message": "Tool response exceeded MCP stdio frame cap; inspect specific paths with fs_read or workspace_diff."
+    });
+    Ok(serde_json::to_string(&fallback)?)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn test_format_capped_mcp_tool_text_truncates_oversized_payloads() {
+        let small = json!({ "status": "ok", "count": 2 });
+        let out_small = format_capped_mcp_tool_text(small, 4096, false).unwrap();
+        assert!(out_small.contains('\n'), "small payload should remain pretty");
+
+        let huge_changes: Vec<Value> = (0..1000)
+            .map(|i| {
+                json!({
+                    "relative_path": format!("dir/file_{i}.ts"),
+                    "preview_diff": "x".repeat(400)
+                })
+            })
+            .collect();
+        let huge = json!({
+            "status": "ok",
+            "uncommitted_changes_count": 1000,
+            "uncommitted_changes": huge_changes
+        });
+
+        let uncapped = format_capped_mcp_tool_text(huge.clone(), 4096, true).unwrap();
+        assert!(uncapped.len() > 4096);
+
+        let capped = format_capped_mcp_tool_text(huge, 4096, false).unwrap();
+        assert!(capped.len() <= 4096, "capped length {} > 4096", capped.len());
+        let parsed: Value = serde_json::from_str(&capped).unwrap();
+        assert_eq!(parsed["_truncated"], true);
+    }
+
+    #[tokio::test]
+    async fn test_workspace_commit_omits_source_files_by_default_and_includes_when_requested() {
+        let temp = tempfile::tempdir().unwrap();
+        let host_proj = temp.path().join("proj");
+        std::fs::create_dir_all(&host_proj).unwrap();
+        std::fs::write(host_proj.join("hello.txt"), "v0\n").unwrap();
+
+        let kernel = AegisRuntimeKernel::new(temp.path().join("rt")).await.unwrap();
+        let agent = AgentIdentity::new("aegis-os", "agent-commit", "Coder");
+        let env = kernel
+            .ensure_agent_environment(agent.clone(), &host_proj, IsolationTier::NativeOsSandbox, vec![])
+            .await
+            .unwrap();
+
+        // 1. Default commit omits committed_source_files
+        std::fs::write(env.workspace.shadow_root().join("hello.txt"), "v1\n").unwrap();
+        let ask1 = kernel
+            .call_tool(&agent, "workspace_commit", json!({}))
+            .await
+            .unwrap();
+        let esc1 = ask1["escalation_id"].as_str().unwrap().to_string();
+        kernel.policy.approve_escalation(&esc1, 600, "user").await.unwrap();
+        let res1 = kernel
+            .call_tool(&agent, "workspace_commit", json!({}))
+            .await
+            .unwrap();
+        assert_eq!(res1["status"], "committed_to_host");
+        assert_eq!(res1["committed_files_count"], 1);
+        assert!(
+            res1.get("committed_source_files").is_none(),
+            "committed_source_files must be omitted by default: {res1}"
+        );
+
+        // 2. Explicit include_source_files: true returns synced source files
+        std::fs::write(env.workspace.shadow_root().join("hello2.txt"), "v2\n").unwrap();
+        let res2 = kernel
+            .call_tool(
+                &agent,
+                "workspace_commit",
+                json!({ "include_source_files": true }),
+            )
+            .await
+            .unwrap();
+        assert_eq!(res2["status"], "committed_to_host");
+        let srcs = res2["committed_source_files"].as_array().unwrap();
+        assert!(srcs.iter().any(|s| s["path"] == "hello2.txt" && s["content"] == "v2\n"));
+    }
+
+    #[tokio::test]
+    async fn test_pkg_install_isolates_pnpm_store_outside_workspace() {
+        let temp = tempfile::tempdir().unwrap();
+        let host_proj = temp.path().join("pnpm_proj");
+        std::fs::create_dir_all(host_proj.join("node_modules/.bin")).unwrap();
+        std::fs::write(host_proj.join("package.json"), "{\"name\":\"demo\"}\n").unwrap();
+        let fake_pnpm = host_proj.join("node_modules/.bin/pnpm");
+        std::fs::write(
+            &fake_pnpm,
+            "#!/bin/sh\nset -eu\nprintf 'PNPM_STORE_DIR=%s\\nnpm_config_store_dir=%s\\n' \"$PNPM_STORE_DIR\" \"$npm_config_store_dir\" > .pnpm_env.txt\nmkdir -p node_modules/fake-pkg\n",
+        )
+        .unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mut p = std::fs::metadata(&fake_pnpm).unwrap().permissions();
+            p.set_mode(0o755);
+            std::fs::set_permissions(&fake_pnpm, p).unwrap();
+        }
+
+        let kernel = AegisRuntimeKernel::new(temp.path().join("rt")).await.unwrap();
+        let agent = AgentIdentity::new("aegis-os", "pnpm-agent", "Coder");
+        let env = kernel
+            .ensure_agent_environment(agent.clone(), &host_proj, IsolationTier::NativeOsSandbox, vec![])
+            .await
+            .unwrap();
+        let args = json!({ "manager": "pnpm", "packages": ["fake-pkg"], "offline": true });
+        let ask = kernel.call_tool(&agent, "pkg_install", args.clone()).await.unwrap();
+        let esc = ask["escalation_id"].as_str().unwrap().to_string();
+        kernel.policy.approve_escalation(&esc, 600, "user").await.unwrap();
+        let res = kernel.call_tool(&agent, "pkg_install", args).await.unwrap();
+        assert_eq!(res["status"], "pkg_installed", "{res}");
+
+        let env_txt = std::fs::read_to_string(env.workspace.shadow_root().join(".pnpm_env.txt")).unwrap();
+        let expected_store = env.sandbox.config().agent_home_dir.join("deps/cache/pnpm-store");
+        assert!(env_txt.contains(&format!("PNPM_STORE_DIR={}", expected_store.display())), "{env_txt}");
+        assert!(env_txt.contains(&format!("npm_config_store_dir={}", expected_store.display())), "{env_txt}");
+        assert!(!env.workspace.shadow_root().join(".pnpm-store").exists());
+    }
 
     #[test]
     fn shadow_paths_reject_traversal() {
@@ -17438,11 +17997,260 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(switched["status"], "workspace_switched");
-        assert_eq!(switched["org_id"], "SYLVA");
+        assert_eq!(switched["org_id"], "aegis-os");
         assert_eq!(
             PathBuf::from(switched["host_source_root"].as_str().unwrap()),
             canon_sylva
         );
+    }
+
+    #[tokio::test]
+    async fn test_multi_repo_workspace_git_inspect_and_auto_commit_shadow_with_repo_arg() {
+        std::env::set_var("AEGIS_ALLOW_NESTED_TEST_SANDBOX", "1");
+        let git_bin = resolve_system_git_binary().expect("system git required for test");
+        let temp = tempfile::tempdir().unwrap();
+        let parent_dir = temp.path().join("workspace");
+        let repo_a = parent_dir.join("repo-a");
+        let repo_b = parent_dir.join("repo-b");
+        let rt = temp.path().join("rt");
+
+        std::fs::create_dir_all(&repo_a).unwrap();
+        std::fs::create_dir_all(&repo_b).unwrap();
+        // Top-level README.md ensures parent_dir is treated as a multi-repo project dir, not hijacked as an umbrella.
+        std::fs::write(parent_dir.join("README.md"), "# Workspace\\n").unwrap();
+        assert!(!AegisRuntimeKernel::is_umbrella_parent_dir(&parent_dir));
+
+        for (repo, file_name) in [(&repo_a, "init_a.txt"), (&repo_b, "init_b.txt")] {
+            for args in [
+                vec!["init", "-b", "main"],
+                vec!["config", "user.name", "Tester"],
+                vec!["config", "user.email", "tester@example.com"],
+            ] {
+                let s: Vec<String> = args.into_iter().map(str::to_string).collect();
+                assert!(run_sanitized_host_git(&git_bin, repo, &[], &s)
+                    .unwrap()
+                    .status
+                    .success());
+            }
+            std::fs::write(repo.join(file_name), "initial\\n").unwrap();
+            for args in [
+                vec!["add", file_name],
+                vec!["commit", "-m", "chore: initial"],
+            ] {
+                let s: Vec<String> = args.into_iter().map(str::to_string).collect();
+                assert!(run_sanitized_host_git(&git_bin, repo, &[], &s)
+                    .unwrap()
+                    .status
+                    .success());
+            }
+        }
+
+        let kernel = Arc::new(AegisRuntimeKernel::new(&rt).await.unwrap());
+        let agent = AgentIdentity::new(
+            aos_core::session::DEFAULT_PERSONAL_ORG_ID,
+            "agy-multi",
+            "Developer",
+        );
+        kernel
+            .ensure_agent_environment(
+                agent.clone(),
+                &parent_dir,
+                IsolationTier::NativeOsSandbox,
+                vec!["*".to_string()],
+            )
+            .await
+            .unwrap();
+
+        let status = kernel
+            .call_tool(&agent, "workspace_status", json!({}))
+            .await
+            .unwrap();
+        assert_eq!(
+            status["workspace_id"],
+            aos_core::session::workspace_id_for_path(
+                &std::fs::canonicalize(&parent_dir).unwrap()
+            )
+        );
+        let child_names: Vec<&str> = status["child_repos"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter_map(|v| v["name"].as_str())
+            .collect();
+        assert_eq!(child_names, vec!["repo-a", "repo-b"]);
+
+        let err_no_repo = kernel
+            .call_tool(&agent, "workspace_git_inspect", json!({ "mode": "status" }))
+            .await
+            .unwrap_err()
+            .to_string();
+        assert!(
+            err_no_repo.contains("repo-a") && err_no_repo.contains("repo-b"),
+            "unexpected error: {err_no_repo}"
+        );
+
+        kernel
+            .call_tool(
+                &agent,
+                "fs_write",
+                json!({ "path": "repo-a/hello.txt", "content": "hello from a\\n" }),
+            )
+            .await
+            .unwrap();
+        kernel
+            .call_tool(
+                &agent,
+                "fs_write",
+                json!({ "path": "repo-b/other.txt", "content": "hello from b\\n" }),
+            )
+            .await
+            .unwrap();
+
+        let inspect_a = kernel
+            .call_tool(
+                &agent,
+                "workspace_git_inspect",
+                json!({ "mode": "status", "repo": "repo-a" }),
+            )
+            .await
+            .unwrap();
+        assert_eq!(inspect_a["repo"], "repo-a");
+        assert_eq!(inspect_a["shadow_uncommitted_files"], json!(["hello.txt"]));
+
+        let ask = kernel
+            .call_tool(
+                &agent,
+                "workspace_git",
+                json!({
+                    "repo": "repo-a",
+                    "auto_commit_shadow": true,
+                    "skip_verify": true,
+                    "commit_message": "feat: child repo commit"
+                }),
+            )
+            .await
+            .unwrap();
+        assert_eq!(ask["status"], "approval_required");
+        let esc_id = ask["escalation_id"].as_str().unwrap();
+        kernel
+            .policy
+            .approve_escalation(esc_id, 600, "user")
+            .await
+            .unwrap();
+
+        let git_res = kernel
+            .call_tool(
+                &agent,
+                "workspace_git",
+                json!({
+                    "repo": "repo-a",
+                    "auto_commit_shadow": true,
+                    "skip_verify": true,
+                    "commit_message": "feat: child repo commit"
+                }),
+            )
+            .await
+            .unwrap();
+        assert_eq!(git_res["repo"], "repo-a");
+        assert_eq!(
+            std::fs::read_to_string(repo_a.join("hello.txt")).unwrap(),
+            "hello from a\\n"
+        );
+        assert!(
+            !repo_b.join("other.txt").exists(),
+            "repo-b host files must stay untouched when committing repo-a"
+        );
+        let log_out = run_sanitized_host_git(
+            &git_bin,
+            &repo_a,
+            &[],
+            &["log".into(), "-1".into(), "--pretty=%s".into()],
+        )
+        .unwrap();
+        assert_eq!(
+            String::from_utf8_lossy(&log_out.stdout).trim(),
+            "feat: child repo commit"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_workspace_switch_relative_child_preserves_personal_org_and_isolates_shadows() {
+        std::env::set_var("AEGIS_ALLOW_NESTED_TEST_SANDBOX", "1");
+        let temp = tempfile::tempdir().unwrap();
+        let parent_dir = temp.path().join("monorepo");
+        let repo_a = parent_dir.join("repo-a");
+        let repo_b = parent_dir.join("repo-b");
+        let rt = temp.path().join("rt");
+
+        std::fs::create_dir_all(&repo_a).unwrap();
+        std::fs::create_dir_all(&repo_b).unwrap();
+        std::fs::write(parent_dir.join("README.md"), "# Monorepo\\n").unwrap();
+
+        let kernel = Arc::new(AegisRuntimeKernel::new(&rt).await.unwrap());
+        let agent = AgentIdentity::new(
+            aos_core::session::DEFAULT_PERSONAL_ORG_ID,
+            "agy-rel",
+            "Developer",
+        );
+        let env_parent = kernel
+            .ensure_agent_environment(
+                agent.clone(),
+                &parent_dir,
+                IsolationTier::NativeOsSandbox,
+                vec!["*".to_string()],
+            )
+            .await
+            .unwrap();
+
+        kernel
+            .call_tool(
+                &agent,
+                "fs_write",
+                json!({ "path": "notes.txt", "content": "uncommitted parent edit\\n" }),
+            )
+            .await
+            .unwrap();
+
+        let sw_a = kernel
+            .call_tool(&agent, "workspace_switch", json!({ "path": "repo-a" }))
+            .await
+            .unwrap();
+        assert_eq!(sw_a["status"], "workspace_switched");
+        assert_eq!(sw_a["org_id"], aos_core::session::DEFAULT_PERSONAL_ORG_ID);
+        assert_eq!(sw_a["previous_uncommitted_count"], 1);
+        let canon_parent = std::fs::canonicalize(&parent_dir).unwrap();
+        let canon_a = std::fs::canonicalize(&repo_a).unwrap();
+        let canon_b = std::fs::canonicalize(&repo_b).unwrap();
+        assert_eq!(
+            sw_a["workspace_id"],
+            aos_core::session::workspace_id_for_path(&canon_a)
+        );
+        assert_eq!(
+            PathBuf::from(sw_a["umbrella_root"].as_str().unwrap()),
+            canon_parent
+        );
+
+        let sw_b = kernel
+            .call_tool(&agent, "workspace_switch", json!({ "path": "repo-b" }))
+            .await
+            .unwrap();
+        assert_eq!(sw_b["status"], "workspace_switched");
+        assert_eq!(sw_b["org_id"], aos_core::session::DEFAULT_PERSONAL_ORG_ID);
+        assert_eq!(
+            sw_b["workspace_id"],
+            aos_core::session::workspace_id_for_path(&canon_b)
+        );
+        assert_eq!(
+            PathBuf::from(sw_b["umbrella_root"].as_str().unwrap()),
+            canon_parent
+        );
+
+        let shadow_parent = env_parent.workspace.shadow_root().to_path_buf();
+        let shadow_a = PathBuf::from(sw_a["shadow_root"].as_str().unwrap());
+        let shadow_b = PathBuf::from(sw_b["shadow_root"].as_str().unwrap());
+        assert_ne!(shadow_parent, shadow_a);
+        assert_ne!(shadow_a, shadow_b);
+        assert_ne!(shadow_parent, shadow_b);
     }
 
     #[tokio::test]

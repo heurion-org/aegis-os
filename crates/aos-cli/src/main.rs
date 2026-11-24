@@ -15,6 +15,7 @@ mod adapter_manifest;
 mod bench;
 mod cloud;
 mod coord;
+mod desktop_daemon;
 mod explore;
 mod hooks;
 mod installer;
@@ -765,6 +766,13 @@ enum Commands {
         insecure_no_auth: bool,
     },
 
+    /// Start the authenticated local Control Daemon for Aegis Desktop (`human_token` Bearer auth)
+    #[command(name = "desktop-daemon", hide = true)]
+    DesktopDaemon {
+        #[arg(long, default_value = "127.0.0.1:0")]
+        listen: String,
+    },
+
     /// Display the Mission Control dashboard for all Agents, CoW Workspaces, IPC & Escalations
     Top,
 
@@ -1171,10 +1179,7 @@ pub(crate) fn resolve_identity(
     runtime_dir: &Path,
 ) -> AgentIdentity {
     let org_id = if raw_org == "auto" || raw_org.is_empty() {
-        canonical_workspace
-            .file_name()
-            .map(|n| n.to_string_lossy().to_string())
-            .unwrap_or_else(|| "default-org".to_string())
+        aos_core::session::resolve_auto_org_id(runtime_dir, canonical_workspace)
     } else {
         raw_org.to_string()
     };
@@ -3579,6 +3584,14 @@ async fn main() -> anyhow::Result<()> {
             tokio::signal::ctrl_c().await?;
         }
 
+        Commands::DesktopDaemon { listen } => {
+            let home_dir = std::env::var("HOME")
+                .map(PathBuf::from)
+                .unwrap_or_else(|_| PathBuf::from("."));
+            desktop_daemon::run_desktop_daemon(&listen, &cli.runtime_dir, &home_dir, &workspace)
+                .await?;
+        }
+
         Commands::Top => {
             let kernel = AegisRuntimeKernel::new(&cli.runtime_dir).await?;
             render_mission_control_top(&kernel, &identity.org_id, &workspace, &cli.runtime_dir).await?;
@@ -4129,7 +4142,7 @@ async fn run_end_to_end_multi_client_demo() -> anyhow::Result<()> {
         .await?;
 
     println!();
-    render_mission_control_top(&kernel, "payment-gateway", &project_repo, &runtime_dir).await?;
+    render_mission_control_top(&kernel, &agy_id.org_id, &project_repo, &runtime_dir).await?;
     println!("==================================================================================");
     Ok(())
 }
