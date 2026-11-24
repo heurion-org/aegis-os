@@ -1,27 +1,27 @@
 class AegisOs < Formula
   desc "Kernel-enforced sandbox, CoW shadow workspace, and MCP firewall for Claude Code, Codex, OpenCode, Hermes, and AGY"
   homepage "https://github.com/heurion-org/aegis-os"
-  version "0.10.0"
+  version "0.11.1"
   license "Apache-2.0"
   head "https://github.com/heurion-org/aegis-os.git", branch: "main"
 
   on_macos do
     if Hardware::CPU.arm?
-      url "https://github.com/heurion-org/aegis-os/releases/download/v0.10.0/aegis-os-v0.10.0-aarch64-apple-darwin.tar.gz"
-      sha256 "ff96f6caaf2100f4561fa82514493cbcd131a4d4cc2e2470c2b7173fc9a5bc4b"
+      url "https://github.com/heurion-org/aegis-os/releases/download/v0.11.1/aegis-os-v0.11.1-aarch64-apple-darwin.tar.gz"
+      sha256 "0dbfb708c798f4392c3c05e6b4b6a31927ca50c909c408a5bba9813564b89394"
     else
-      url "https://github.com/heurion-org/aegis-os/releases/download/v0.10.0/aegis-os-v0.10.0-x86_64-apple-darwin.tar.gz"
-      sha256 "dc5e4f1a58ee379a0ef92bd6f86108294c99123fb8933cc303927eeef83f97e8"
+      url "https://github.com/heurion-org/aegis-os/releases/download/v0.11.1/aegis-os-v0.11.1-x86_64-apple-darwin.tar.gz"
+      sha256 "0997af5d7e3df9dbf1d17e8ed7c746fa050863369f8805285fc74abf78834af5"
     end
   end
 
   on_linux do
     if Hardware::CPU.arm?
-      url "https://github.com/heurion-org/aegis-os/releases/download/v0.10.0/aegis-os-v0.10.0-aarch64-unknown-linux-gnu.tar.gz"
-      sha256 "65b02ef6195607fe51fa223e58418f6873c75d8d9dec7091d7b58c89e4c1313e"
+      url "https://github.com/heurion-org/aegis-os/releases/download/v0.11.1/aegis-os-v0.11.1-aarch64-unknown-linux-gnu.tar.gz"
+      sha256 "3aaa0a9fdaac8cf986b3e8b7179e91b180adf72eb8f98bc2e3bf58ccc74884b3"
     else
-      url "https://github.com/heurion-org/aegis-os/releases/download/v0.10.0/aegis-os-v0.10.0-x86_64-unknown-linux-gnu.tar.gz"
-      sha256 "7c7de79733cf8b7a6d0837d6cb45608a2d0fa2ecdf6f27ff49214ca5eb92b39f"
+      url "https://github.com/heurion-org/aegis-os/releases/download/v0.11.1/aegis-os-v0.11.1-x86_64-unknown-linux-gnu.tar.gz"
+      sha256 "1de7489946572a76e4f481f9ae1c0691c8ea8e6fff2d6a7563f3b968abc23841"
     end
   end
 
