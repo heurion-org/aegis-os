@@ -1058,6 +1058,10 @@ impl CoWWorkspace {
                 | ".git"
                 | "target"
                 | "node_modules"
+                | ".pnpm-store"
+                | ".yarn"
+                | ".npm"
+                | ".bun"
                 | ".gemini"
                 | ".next"
                 | "dist"
@@ -3662,5 +3666,30 @@ mod frozen_stage_tests {
         let byte_cap = CoWWorkspace::preflight_cow_footprint(&host, &rt, 100, 15).unwrap();
         assert!(byte_cap.limit_exceeded);
         assert!(byte_cap.total_bytes > 15);
+    }
+
+    #[tokio::test]
+    async fn test_cow_ignores_pnpm_store_and_js_package_caches() {
+        let tmp = tempfile::tempdir().unwrap();
+        let host = tmp.path().join("host");
+        let shadow_rt = tmp.path().join("rt");
+        std::fs::create_dir_all(host.join("src")).unwrap();
+        std::fs::write(host.join("src/index.ts"), "export const ok = true;\n").unwrap();
+
+        let ws = CoWWorkspace::init(&host, &shadow_rt).await.unwrap();
+        for ignored in [".pnpm-store/v11/files", ".yarn/cache", ".npm/_cacache", ".bun/install"] {
+            let p = ws.shadow_root().join(ignored).join("cached.bin");
+            std::fs::create_dir_all(p.parent().unwrap()).unwrap();
+            std::fs::write(&p, b"cache-data").unwrap();
+        }
+        std::fs::write(ws.shadow_root().join("src/index.ts"), "export const ok = 2;\n").unwrap();
+
+        let files = CoWWorkspace::collect_files(ws.shadow_root()).await.unwrap();
+        let rels: Vec<String> = files.into_iter().map(|(r, _)| r).collect();
+        assert_eq!(rels, vec!["src/index.ts"]);
+
+        let diffs = ws.diff(None).await.unwrap();
+        assert_eq!(diffs.len(), 1);
+        assert_eq!(diffs[0].relative_path, "src/index.ts");
     }
 }

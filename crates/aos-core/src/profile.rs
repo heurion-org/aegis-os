@@ -158,6 +158,20 @@ impl DomainProfile {
         WorkspaceDomain::from_name(name).map(Self::for_domain)
     }
 
+    /// Dual-Surface CRDT profile used by Heurion Doc / Aegis Desktop for section-level
+    /// collaborative editing (`docx` / `pptx` / structured `md`) with rendered track-changes.
+    pub fn for_documents_crdt() -> Self {
+        Self {
+            domain: WorkspaceDomain::Documents,
+            merge: MergeStrategy::Lcs3CrdtBlock,
+            claims: ClaimGranularity::SectionParagraph,
+            verify: Vec::new(),
+            evidence: EvidenceFormat::RenderedDiff,
+            overwrite: OverwritePolicy::Never,
+            cas: None,
+        }
+    }
+
     fn contains_secret_signature(text: &str) -> Option<&'static str> {
         if text.contains("-----BEGIN ") && text.contains("PRIVATE KEY-----") {
             return Some("PEM_PRIVATE_KEY");
@@ -374,7 +388,7 @@ impl DomainProfile {
                 WorkspaceDomain::Data => {
                     const DATA_EXTS: &[&str] = &[
                         "csv", "tsv", "json", "jsonl", "parquet", "arrow", "sql", "yaml", "yml",
-                        "ipynb",
+                        "ipynb", "xlsx",
                     ];
                     if !DATA_EXTS.contains(&ext.as_str()) {
                         return Err(format!(
@@ -515,6 +529,12 @@ mod tests {
         let data = DomainProfile::for_name("data").unwrap();
         assert_eq!(data.merge, MergeStrategy::SchemaAware);
         assert_eq!(data.evidence, EvidenceFormat::SchemaDiff);
+
+        let docs_crdt = DomainProfile::for_documents_crdt();
+        assert_eq!(docs_crdt.domain, WorkspaceDomain::Documents);
+        assert_eq!(docs_crdt.merge, MergeStrategy::Lcs3CrdtBlock);
+        assert_eq!(docs_crdt.claims, ClaimGranularity::SectionParagraph);
+        assert_eq!(docs_crdt.evidence, EvidenceFormat::RenderedDiff);
     }
 
     #[test]
@@ -538,12 +558,16 @@ mod tests {
         .unwrap();
         assert!(code.verify_workspace_changes(root, &["leak.rs".to_string()]).is_err());
 
-        // 2. Docs blocks .sh script, allows .md
+        // 2. Docs blocks .sh script, allows .md; Data allows .xlsx
         let docs = DomainProfile::for_name("docs").unwrap();
         std::fs::write(root.join("README.md"), "# Documentation\n").unwrap();
         assert!(docs.verify_workspace_changes(root, &["README.md".to_string()]).is_ok());
         std::fs::write(root.join("exploit.sh"), "#!/bin/sh\nid\n").unwrap();
         assert!(docs.verify_workspace_changes(root, &["exploit.sh".to_string()]).is_err());
+
+        let data = DomainProfile::for_name("data").unwrap();
+        std::fs::write(root.join("report.xlsx"), b"PK\x03\x04dummy").unwrap();
+        assert!(data.verify_workspace_changes(root, &["report.xlsx".to_string()]).is_ok());
 
         // 3. Binary blocks ELF disguised as .png, allows valid PNG header
         let binary = DomainProfile::for_name("binary").unwrap();

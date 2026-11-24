@@ -221,6 +221,242 @@ pub async fn test_agent(runtime_dir: &Path, home: &Path, id: &str) -> Result<()>
     Ok(())
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct AdapterInstallRecipe {
+    pub macos: Vec<String>,
+    pub linux: Vec<String>,
+    pub docs_url: String,
+    pub notes: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct DesktopAgentSpec {
+    pub id: String,
+    pub display_name: String,
+    pub description: String,
+    pub roles: Vec<String>,
+    pub bin: Vec<String>,
+    pub version_cmd: Vec<String>,
+    pub auth_files: Vec<String>,
+    pub auth_login_cmd: Vec<String>,
+    pub headless_flag: Vec<String>,
+    pub install_recipe: AdapterInstallRecipe,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct DesktopAgentStatus {
+    pub id: String,
+    pub display_name: String,
+    pub description: String,
+    pub roles: Vec<String>,
+    pub installed: bool,
+    pub binary_path: Option<String>,
+    pub version: Option<String>,
+    pub authenticated: bool,
+    pub auth_hint: String,
+    pub install_command_for_os: Vec<String>,
+    pub install_recipe: AdapterInstallRecipe,
+}
+
+/// Built-in first-class local coding & writing agents supported by Aegis Desktop:
+/// `opencode`, `claude`, and `agy`.
+pub fn builtin_desktop_agents() -> Vec<DesktopAgentSpec> {
+    vec![
+        DesktopAgentSpec {
+            id: "claude".to_string(),
+            display_name: "Claude Code".to_string(),
+            description: "深度长文写作、结构化修改与复杂代码重构引擎".to_string(),
+            roles: vec![
+                "writer".to_string(),
+                "editor".to_string(),
+                "coder".to_string(),
+                "slides".to_string(),
+            ],
+            bin: vec!["claude".to_string()],
+            version_cmd: vec!["claude".to_string(), "--version".to_string()],
+            auth_files: vec![
+                "~/.claude/.credentials.json".to_string(),
+                "~/.claude.json".to_string(),
+            ],
+            auth_login_cmd: vec!["claude".to_string(), "login".to_string()],
+            headless_flag: vec![
+                "-p".to_string(),
+                "--output-format".to_string(),
+                "stream-json".to_string(),
+            ],
+            install_recipe: AdapterInstallRecipe {
+                macos: vec![
+                    "npm".to_string(),
+                    "install".to_string(),
+                    "-g".to_string(),
+                    "@anthropic-ai/claude-code".to_string(),
+                ],
+                linux: vec![
+                    "npm".to_string(),
+                    "install".to_string(),
+                    "-g".to_string(),
+                    "@anthropic-ai/claude-code".to_string(),
+                ],
+                docs_url: "https://docs.anthropic.com/en/docs/claude-code".to_string(),
+                notes: "安装后将自动引导浏览器登录 Anthropic 账号".to_string(),
+            },
+        },
+        DesktopAgentSpec {
+            id: "opencode".to_string(),
+            display_name: "OpenCode".to_string(),
+            description: "开源多模型终端与文档分析 Agent，支持自备任意模型 API Key".to_string(),
+            roles: vec![
+                "researcher".to_string(),
+                "coder".to_string(),
+                "writer".to_string(),
+                "editor".to_string(),
+            ],
+            bin: vec!["opencode".to_string()],
+            version_cmd: vec!["opencode".to_string(), "--version".to_string()],
+            auth_files: vec![
+                "~/.local/share/opencode/auth.json".to_string(),
+                "~/.config/opencode/opencode.json".to_string(),
+                "~/.config/opencode/opencode.jsonc".to_string(),
+            ],
+            auth_login_cmd: vec!["opencode".to_string(), "auth".to_string(), "login".to_string()],
+            headless_flag: vec!["run".to_string(), "--format".to_string(), "json".to_string()],
+            install_recipe: AdapterInstallRecipe {
+                macos: vec!["brew".to_string(), "install".to_string(), "opencode".to_string()],
+                linux: vec![
+                    "npm".to_string(),
+                    "install".to_string(),
+                    "-g".to_string(),
+                    "opencode-ai".to_string(),
+                ],
+                docs_url: "https://opencode.ai/docs".to_string(),
+                notes: "支持 OpenAI / Anthropic / DeepSeek / 本地 Ollama".to_string(),
+            },
+        },
+        DesktopAgentSpec {
+            id: "agy".to_string(),
+            display_name: "Antigravity (AGY)".to_string(),
+            description: "Google Gemini 原生多模态协作 Agent，擅长长上下文资料整理与幻灯片大纲".to_string(),
+            roles: vec![
+                "researcher".to_string(),
+                "slides".to_string(),
+                "writer".to_string(),
+                "coder".to_string(),
+            ],
+            bin: vec!["agy".to_string()],
+            version_cmd: vec!["agy".to_string(), "--version".to_string()],
+            auth_files: vec![
+                "~/.gemini/antigravity-cli/antigravity-oauth-token".to_string(),
+                "~/.gemini/oauth_creds.json".to_string(),
+            ],
+            auth_login_cmd: vec!["agy".to_string(), "auth".to_string(), "login".to_string()],
+            headless_flag: vec!["--headless".to_string()],
+            install_recipe: AdapterInstallRecipe {
+                macos: vec![
+                    "npm".to_string(),
+                    "install".to_string(),
+                    "-g".to_string(),
+                    "@google/antigravity-cli".to_string(),
+                ],
+                linux: vec![
+                    "npm".to_string(),
+                    "install".to_string(),
+                    "-g".to_string(),
+                    "@google/antigravity-cli".to_string(),
+                ],
+                docs_url: "https://antigravity.google".to_string(),
+                notes: "内置 Google OAuth 浏览器自动授权".to_string(),
+            },
+        },
+    ]
+}
+
+fn expand_tilde(home: &Path, raw: &str) -> PathBuf {
+    if let Some(rest) = raw.strip_prefix("~/") {
+        home.join(rest)
+    } else {
+        PathBuf::from(raw)
+    }
+}
+
+pub fn probe_desktop_agents_with(home: &Path, probe_versions: bool) -> Vec<DesktopAgentStatus> {
+    builtin_desktop_agents()
+        .into_iter()
+        .map(|spec| {
+            let found = spec.bin.iter().find_map(|b| find_in_path(b));
+            let installed = found.is_some();
+            let version = if installed && probe_versions {
+                command_version(&spec.version_cmd)
+            } else {
+                None
+            };
+            let authenticated = installed
+                && spec
+                    .auth_files
+                    .iter()
+                    .any(|p| expand_tilde(home, p).is_file());
+            let auth_hint = if !installed {
+                spec.install_recipe.notes.clone()
+            } else if authenticated {
+                "已就绪".to_string()
+            } else {
+                format!("点击授权登录 ({})", spec.display_name)
+            };
+            let install_command_for_os = if cfg!(target_os = "macos") {
+                spec.install_recipe.macos.clone()
+            } else {
+                spec.install_recipe.linux.clone()
+            };
+            DesktopAgentStatus {
+                id: spec.id,
+                display_name: spec.display_name,
+                description: spec.description,
+                roles: spec.roles,
+                installed,
+                binary_path: found.map(|p| p.display().to_string()),
+                version,
+                authenticated,
+                auth_hint,
+                install_command_for_os,
+                install_recipe: spec.install_recipe,
+            }
+        })
+        .collect()
+}
+
+pub fn resolve_agent_for_role(
+    role: &str,
+    preferred_agent: Option<&str>,
+    statuses: &[DesktopAgentStatus],
+) -> Option<String> {
+    if let Some(pref) = preferred_agent.map(str::trim).filter(|s| !s.is_empty() && *s != "auto") {
+        if let Some(st) = statuses.iter().find(|s| s.id == pref && s.installed) {
+            return Some(st.id.clone());
+        }
+    }
+    let norm = role.trim().to_ascii_lowercase();
+    let role_priority: &[&str] = match norm.as_str() {
+        "writer" | "editor" => &["claude", "opencode", "agy"],
+        "researcher" => &["opencode", "agy", "claude"],
+        "slides" => &["agy", "claude", "opencode"],
+        "coder" => &["claude", "opencode", "agy"],
+        _ => &["claude", "opencode", "agy"],
+    };
+    for candidate in role_priority {
+        if statuses
+            .iter()
+            .any(|s| s.id == *candidate && s.installed && s.authenticated)
+        {
+            return Some((*candidate).to_string());
+        }
+    }
+    for candidate in role_priority {
+        if statuses.iter().any(|s| s.id == *candidate && s.installed) {
+            return Some((*candidate).to_string());
+        }
+    }
+    None
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -272,5 +508,69 @@ mod tests {
             notes: String::new(),
         };
         assert!(manifest.validate().is_err());
+    }
+
+    #[test]
+    fn builtin_desktop_agents_include_opencode_claude_and_agy_and_route_roles() {
+        let specs = builtin_desktop_agents();
+        let ids: Vec<&str> = specs.iter().map(|s| s.id.as_str()).collect();
+        assert_eq!(ids, vec!["claude", "opencode", "agy"]);
+
+        let tmp = tempfile::tempdir().unwrap();
+        let statuses = probe_desktop_agents_with(tmp.path(), false);
+        assert_eq!(statuses.len(), 3);
+
+        // Simulate only opencode + agy installed, with opencode authenticated.
+        let mock_statuses = vec![
+            DesktopAgentStatus {
+                id: "claude".into(),
+                display_name: "Claude Code".into(),
+                description: String::new(),
+                roles: vec!["writer".into()],
+                installed: false,
+                binary_path: None,
+                version: None,
+                authenticated: false,
+                auth_hint: String::new(),
+                install_command_for_os: vec![],
+                install_recipe: specs[0].install_recipe.clone(),
+            },
+            DesktopAgentStatus {
+                id: "opencode".into(),
+                display_name: "OpenCode".into(),
+                description: String::new(),
+                roles: vec!["researcher".into(), "writer".into()],
+                installed: true,
+                binary_path: Some("/usr/local/bin/opencode".into()),
+                version: Some("1.0.0".into()),
+                authenticated: true,
+                auth_hint: "已就绪".into(),
+                install_command_for_os: vec![],
+                install_recipe: specs[1].install_recipe.clone(),
+            },
+            DesktopAgentStatus {
+                id: "agy".into(),
+                display_name: "AGY".into(),
+                description: String::new(),
+                roles: vec!["slides".into()],
+                installed: true,
+                binary_path: Some("/usr/local/bin/agy".into()),
+                version: Some("1.0.0".into()),
+                authenticated: false,
+                auth_hint: "点击授权登录".into(),
+                install_command_for_os: vec![],
+                install_recipe: specs[2].install_recipe.clone(),
+            },
+        ];
+
+        assert_eq!(
+            resolve_agent_for_role("writer", None, &mock_statuses).as_deref(),
+            Some("opencode")
+        );
+        // Authenticated opencode is preferred over unauthenticated agy unless explicitly overridden.
+        assert_eq!(
+            resolve_agent_for_role("slides", Some("agy"), &mock_statuses).as_deref(),
+            Some("agy")
+        );
     }
 }

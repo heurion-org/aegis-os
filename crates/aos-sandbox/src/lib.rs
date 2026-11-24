@@ -1502,6 +1502,14 @@ impl SandboxInstance for NativeOsSandboxInstance {
                 "CARGO_TARGET_DIR",
                 self.config.agent_home_dir.join("cargo_target"),
             )
+            .env(
+                "PNPM_STORE_DIR",
+                self.config.agent_home_dir.join("deps/cache/pnpm-store"),
+            )
+            .env(
+                "npm_config_store_dir",
+                self.config.agent_home_dir.join("deps/cache/pnpm-store"),
+            )
             .env("AOS_SANDBOX_ID", &self.instance_id)
             .env("AOS_ORG_ID", &self.config.identity.org_id)
             .env("AOS_AGENT_ID", &self.config.identity.agent_id)
@@ -1685,6 +1693,14 @@ impl SandboxInstance for NativeOsSandboxInstance {
                 .env(
                     "CARGO_TARGET_DIR",
                     self.config.agent_home_dir.join("cargo_target"),
+                )
+                .env(
+                    "PNPM_STORE_DIR",
+                    self.config.agent_home_dir.join("deps/cache/pnpm-store"),
+                )
+                .env(
+                    "npm_config_store_dir",
+                    self.config.agent_home_dir.join("deps/cache/pnpm-store"),
                 )
                 .env("AOS_SANDBOX_ID", &self.instance_id)
                 .env("AOS_ORG_ID", &self.config.identity.org_id)

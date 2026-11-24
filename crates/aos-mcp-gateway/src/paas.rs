@@ -124,6 +124,129 @@ impl PlanTier {
             Self::Enterprise => "enterprise",
         }
     }
+
+    pub fn desktop_entitlements(&self) -> DesktopEntitlements {
+        match self {
+            Self::Community => DesktopEntitlements {
+                plan_tier: *self,
+                dual_surface_crdt: false,
+                office_formats: false,
+                multiplayer_crdt_rooms: false,
+                selective_sync: false,
+                team_mcp_bundles: false,
+                cross_user_approvals: false,
+                max_workspaces: self.max_workspaces(),
+                max_concurrent_agents: self.max_concurrent_agents(),
+            },
+            Self::Pro => DesktopEntitlements {
+                plan_tier: *self,
+                dual_surface_crdt: true,
+                office_formats: true,
+                multiplayer_crdt_rooms: true,
+                selective_sync: true,
+                team_mcp_bundles: false,
+                cross_user_approvals: false,
+                max_workspaces: self.max_workspaces(),
+                max_concurrent_agents: self.max_concurrent_agents(),
+            },
+            Self::Team | Self::Enterprise => DesktopEntitlements {
+                plan_tier: *self,
+                dual_surface_crdt: true,
+                office_formats: true,
+                multiplayer_crdt_rooms: true,
+                selective_sync: true,
+                team_mcp_bundles: true,
+                cross_user_approvals: true,
+                max_workspaces: self.max_workspaces(),
+                max_concurrent_agents: self.max_concurrent_agents(),
+            },
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct DesktopEntitlements {
+    pub plan_tier: PlanTier,
+    pub dual_surface_crdt: bool,
+    pub office_formats: bool,
+    pub multiplayer_crdt_rooms: bool,
+    pub selective_sync: bool,
+    pub team_mcp_bundles: bool,
+    pub cross_user_approvals: bool,
+    pub max_workspaces: usize,
+    pub max_concurrent_agents: usize,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct DesktopEntitlementClaims {
+    pub org_id: String,
+    pub issued_at_ms: i64,
+    pub expires_at_ms: i64,
+    pub entitlements: DesktopEntitlements,
+}
+
+fn derive_entitlement_signing_key(seed_secret: &str) -> ed25519_dalek::SigningKey {
+    let mut hasher = Sha256::new();
+    hasher.update(b"aegis-desktop-entitlement-ed25519-v1:");
+    hasher.update(seed_secret.as_bytes());
+    let digest: [u8; 32] = hasher.finalize().into();
+    ed25519_dalek::SigningKey::from_bytes(&digest)
+}
+
+pub fn issue_desktop_entitlement_token(
+    seed_secret: &str,
+    claims: &DesktopEntitlementClaims,
+) -> anyhow::Result<(String, String)> {
+    use ed25519_dalek::Signer as _;
+    let signing_key = derive_entitlement_signing_key(seed_secret);
+    let header_b64 = URL_SAFE_NO_PAD.encode(r#"{"alg":"EdDSA","typ":"AOS-ENT+jwt"}"#.as_bytes());
+    let payload_b64 = URL_SAFE_NO_PAD.encode(serde_json::to_vec(claims)?);
+    let signing_input = format!("{header_b64}.{payload_b64}");
+    let sig = signing_key.sign(signing_input.as_bytes());
+    let sig_b64 = URL_SAFE_NO_PAD.encode(sig.to_bytes());
+    let pubkey_b64 = URL_SAFE_NO_PAD.encode(signing_key.verifying_key().to_bytes());
+    Ok((format!("{signing_input}.{sig_b64}"), pubkey_b64))
+}
+
+pub fn verify_desktop_entitlement_token(
+    token: &str,
+    pubkey_b64: &str,
+    now_ms: i64,
+) -> anyhow::Result<DesktopEntitlementClaims> {
+    use ed25519_dalek::{Signature, Verifier as _, VerifyingKey};
+    let mut parts = token.split('.');
+    let header_b64 = parts
+        .next()
+        .ok_or_else(|| anyhow::anyhow!("malformed entitlement token: missing header"))?;
+    let payload_b64 = parts
+        .next()
+        .ok_or_else(|| anyhow::anyhow!("malformed entitlement token: missing payload"))?;
+    let sig_b64 = parts
+        .next()
+        .ok_or_else(|| anyhow::anyhow!("malformed entitlement token: missing signature"))?;
+    if parts.next().is_some() {
+        bail!("malformed entitlement token: unexpected extra segments");
+    }
+    let pk_bytes: [u8; 32] = URL_SAFE_NO_PAD
+        .decode(pubkey_b64)?
+        .as_slice()
+        .try_into()
+        .map_err(|_| anyhow::anyhow!("Ed25519 verifying key must be 32 bytes"))?;
+    let verifying_key = VerifyingKey::from_bytes(&pk_bytes)?;
+    let sig_bytes: [u8; 64] = URL_SAFE_NO_PAD
+        .decode(sig_b64)?
+        .as_slice()
+        .try_into()
+        .map_err(|_| anyhow::anyhow!("Ed25519 signature must be 64 bytes"))?;
+    let signature = Signature::from_bytes(&sig_bytes);
+    let signing_input = format!("{header_b64}.{payload_b64}");
+    verifying_key.verify(signing_input.as_bytes(), &signature)?;
+    let claims: DesktopEntitlementClaims =
+        serde_json::from_slice(&URL_SAFE_NO_PAD.decode(payload_b64)?)?;
+    if claims.expires_at_ms <= now_ms {
+        bail!("desktop entitlement token expired");
+    }
+    Ok(claims)
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -1066,6 +1189,7 @@ impl PaasControlPlane {
             "customer_email": matched_sub.as_ref().and_then(|s| s.customer_email.clone()).or(email_norm),
             "plan_tier": tier.as_str(),
             "monthly_price_usd": tier.monthly_price_usd(),
+            "desktop_entitlements": tier.desktop_entitlements(),
             "key_claim_ready": matched_sub.as_ref().is_some_and(|s| s.status == "active" && s.claimable_api_key.is_some()),
             "quotas": {
                 "daily_syscalls_used": daily_sys,
@@ -1105,6 +1229,39 @@ impl PaasControlPlane {
             .find(|t| t.org_id == org_id)
             .map(|t| t.plan_tier)
             .unwrap_or(PlanTier::Community)
+    }
+
+    pub async fn get_desktop_entitlements_payload(&self, org_id: &str) -> Value {
+        let clean_org = if org_id.trim().is_empty() || org_id == "*" || org_id == "default-org" {
+            "aegis-os"
+        } else {
+            org_id.trim()
+        };
+        let tier = self.get_tenant_plan(clean_org).await;
+        let entitlements = tier.desktop_entitlements();
+        let now_ms = Utc::now().timestamp_millis();
+        let expires_at_ms = now_ms + 24 * 60 * 60 * 1000;
+        let signing_secret = self.state.read().await.ticket_signing_secret.clone();
+        let claims = DesktopEntitlementClaims {
+            org_id: clean_org.to_string(),
+            issued_at_ms: now_ms,
+            expires_at_ms,
+            entitlements: entitlements.clone(),
+        };
+        match issue_desktop_entitlement_token(&signing_secret, &claims) {
+            Ok((token, pubkey_b64)) => json!({
+                "org_id": clean_org,
+                "entitlements": entitlements,
+                "token": token,
+                "pubkey_b64": pubkey_b64,
+                "expires_at_ms": expires_at_ms,
+            }),
+            Err(err) => json!({
+                "org_id": clean_org,
+                "entitlements": entitlements,
+                "error": err.to_string(),
+            }),
+        }
     }
 
     /// Official Polar.sh hosted checkout link for Aegis Cloud Pro ($29/mo).
@@ -3519,5 +3676,40 @@ mod tests {
             .unwrap();
         assert_eq!(wrong_cancel["status"], "ignored");
         assert_eq!(kernel.paas.get_tenant_plan("paid-org").await, PlanTier::Pro);
+    }
+
+    #[tokio::test]
+    async fn desktop_entitlements_gate_community_vs_pro_and_sign_ed25519_jwt() {
+        let tmp = tempfile::tempdir().unwrap();
+        let paas = PaasControlPlane::new(&tmp.path().join("rt"));
+        let free = paas.get_desktop_entitlements_payload("free-org").await;
+        assert_eq!(free["entitlements"]["plan_tier"], "community");
+        assert_eq!(free["entitlements"]["dual_surface_crdt"], false);
+        assert_eq!(free["entitlements"]["office_formats"], false);
+
+        assert!(PlanTier::Pro.desktop_entitlements().dual_surface_crdt);
+        assert!(PlanTier::Pro.desktop_entitlements().office_formats);
+        assert!(!PlanTier::Pro.desktop_entitlements().team_mcp_bundles);
+        assert!(PlanTier::Team.desktop_entitlements().team_mcp_bundles);
+        assert!(PlanTier::Team.desktop_entitlements().cross_user_approvals);
+
+        let token = free["token"].as_str().unwrap();
+        let pubkey = free["pubkey_b64"].as_str().unwrap();
+        let verified = verify_desktop_entitlement_token(
+            token,
+            pubkey,
+            Utc::now().timestamp_millis(),
+        )
+        .unwrap();
+        assert_eq!(verified.org_id, "free-org");
+        assert_eq!(verified.entitlements.plan_tier, PlanTier::Community);
+
+        let tampered = format!("{token}x");
+        assert!(verify_desktop_entitlement_token(
+            &tampered,
+            pubkey,
+            Utc::now().timestamp_millis(),
+        )
+        .is_err());
     }
 }
