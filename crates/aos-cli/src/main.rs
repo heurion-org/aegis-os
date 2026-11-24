@@ -374,6 +374,9 @@ enum Commands {
         /// Create ~/.aegis/bin shims so `claude` / `opencode` / ... launch through `aos run`
         #[arg(long, default_value_t = false)]
         enforce: bool,
+        /// Suppress detailed per-client installation output
+        #[arg(long, short = 'q', default_value_t = false)]
+        quiet: bool,
     },
 
     /// Remove Aegis PATH shims, client MCP/Hook/rule integrations, and optionally runtime/vault data
@@ -573,6 +576,9 @@ enum Commands {
         /// Print detected install method and upgrade plan without modifying files or binary
         #[arg(long, default_value_t = false)]
         dry_run: bool,
+        /// Show detailed download URLs, internal paths, and client refresh logs
+        #[arg(long, short = 'v', default_value_t = false)]
+        verbose: bool,
         /// Optional custom home directory for post-upgrade client refresh (defaults to `$HOME`)
         #[arg(long)]
         home_dir: Option<PathBuf>,
@@ -2771,15 +2777,26 @@ async fn main() -> anyhow::Result<()> {
             std::process::exit(code);
         }
 
-        Commands::Install { home_dir, dry_run, enforce } => {
+        Commands::Install {
+            home_dir,
+            dry_run,
+            enforce,
+            quiet,
+        } => {
             let target_home = home_dir.unwrap_or_else(|| {
                 std::env::var("HOME")
                     .map(PathBuf::from)
                     .unwrap_or_else(|_| PathBuf::from("."))
             });
-            installer::install_global_clients(&target_home, &cli.runtime_dir, dry_run).await?;
+            installer::install_global_clients_with_options(
+                &target_home,
+                &cli.runtime_dir,
+                dry_run,
+                quiet,
+            )
+            .await?;
             if enforce {
-                installer::install_enforced_shims(&target_home, dry_run)?;
+                installer::install_enforced_shims_with_options(&target_home, dry_run, None, quiet)?;
             }
             if !dry_run {
                 telemetry::emit_telemetry_ping(&cli.runtime_dir, "install", "installer", "local_cow")
@@ -2829,6 +2846,7 @@ async fn main() -> anyhow::Result<()> {
             refresh_only,
             no_refresh,
             dry_run,
+            verbose,
             home_dir,
         } => {
             let (_custom_home, target_home, effective_runtime_dir) =
@@ -2845,6 +2863,7 @@ async fn main() -> anyhow::Result<()> {
                 refresh_only,
                 no_refresh,
                 dry_run,
+                verbose,
             })
             .await?;
         }

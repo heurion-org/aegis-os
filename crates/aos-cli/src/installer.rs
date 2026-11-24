@@ -111,15 +111,26 @@ pub async fn install_global_clients(
     runtime_dir: &Path,
     dry_run: bool,
 ) -> anyhow::Result<()> {
+    install_global_clients_with_options(home_dir, runtime_dir, dry_run, false).await
+}
+
+pub async fn install_global_clients_with_options(
+    home_dir: &Path,
+    runtime_dir: &Path,
+    dry_run: bool,
+    quiet: bool,
+) -> anyhow::Result<()> {
     let bin_path = std::env::current_exe().unwrap_or_else(|_| PathBuf::from("aegis-os"));
     let bin_str = bin_path.to_string_lossy().to_string();
     let rt_str = runtime_dir.to_string_lossy().to_string();
 
-    println!("=========================================================================");
-    println!("  Aegis OS Global Zero-Config Installer (`aegis-os install`)");
-    println!("  Binary:      {}", bin_str);
-    println!("  Runtime Dir: {}", rt_str);
-    println!("=========================================================================\n");
+    if !quiet {
+        println!("=========================================================================");
+        println!("  Aegis OS Global Zero-Config Installer (`aegis-os install`)");
+        println!("  Binary:      {}", bin_str);
+        println!("  Runtime Dir: {}", rt_str);
+        println!("=========================================================================\n");
+    }
 
     // ------------------------------------------------------------------------
     // 1. Configure AGY (Antigravity CLI / IDE) Globally (`~/.gemini/config/`)
@@ -388,24 +399,26 @@ You are running inside the **Aegis OS Runtime (`aegis-os`)** with an isolated Co
         let updated_md = replace_or_append_aegis_block(&existing_md, shared_agent_prompt);
         tokio::fs::write(&agy_rules_path, updated_md).await?;
     }
-    println!("[1/4] AGY (Antigravity) configured:");
-    println!("      - MCP Server:  {}", agy_mcp_path.display());
-    println!("      - Auto-Hooks:  {}", agy_hooks_path.display());
-    println!(
-        "      - Auto-Allow:  {} ({} `mcp(aegis-os/*)` rules)",
-        agy_cli_settings_path.display(),
-        AGY_MCP_ALLOW_RULES.len()
-    );
-    println!("      - Global Rule: {}", agy_rules_path.display());
-    if !dry_run
-        && crate::launcher::backfill_host_agy_credentials_from_sessions(runtime_dir, home_dir)
-    {
+    let rescued_oauth = !dry_run
+        && crate::launcher::backfill_host_agy_credentials_from_sessions(runtime_dir, home_dir);
+    if !quiet {
+        println!("[1/4] AGY (Antigravity) configured:");
+        println!("      - MCP Server:  {}", agy_mcp_path.display());
+        println!("      - Auto-Hooks:  {}", agy_hooks_path.display());
         println!(
-            "      - OAuth Token: rescued active AGY session token -> {}",
-            home_dir
-                .join(".gemini/antigravity-cli/antigravity-oauth-token")
-                .display()
+            "      - Auto-Allow:  {} ({} `mcp(aegis-os/*)` rules)",
+            agy_cli_settings_path.display(),
+            AGY_MCP_ALLOW_RULES.len()
         );
+        println!("      - Global Rule: {}", agy_rules_path.display());
+        if rescued_oauth {
+            println!(
+                "      - OAuth Token: rescued active AGY session token -> {}",
+                home_dir
+                    .join(".gemini/antigravity-cli/antigravity-oauth-token")
+                    .display()
+            );
+        }
     }
 
     // ------------------------------------------------------------------------
@@ -556,14 +569,16 @@ You are running inside the **Aegis OS Runtime (`aegis-os`)** with an isolated Co
         let updated_md = replace_or_append_aegis_block(&existing_md, shared_agent_prompt);
         tokio::fs::write(&claude_md_path, updated_md).await?;
     }
-    println!("\n[2/4] Claude Code (`claude`) configured:");
-    println!("      - MCP Server:  {}", claude_mcp_path.display());
-    println!(
-        "      - Auto-Allow:  {} ({} `mcp__aegis-os__*` rules)",
-        claude_settings_path.display(),
-        AEGIS_TOOL_NAMES.len()
-    );
-    println!("      - Global Rule: {}", claude_md_path.display());
+    if !quiet {
+        println!("\n[2/4] Claude Code (`claude`) configured:");
+        println!("      - MCP Server:  {}", claude_mcp_path.display());
+        println!(
+            "      - Auto-Allow:  {} ({} `mcp__aegis-os__*` rules)",
+            claude_settings_path.display(),
+            AEGIS_TOOL_NAMES.len()
+        );
+        println!("      - Global Rule: {}", claude_md_path.display());
+    }
 
     // ------------------------------------------------------------------------
     // 3. Configure OpenAI Codex CLI Globally (`~/.codex/config.toml` & `~/.codex/AGENTS.md`)
@@ -598,9 +613,11 @@ startup_timeout_sec = 30
         let updated_agents = replace_or_append_aegis_block(&existing_agents, shared_agent_prompt);
         tokio::fs::write(&codex_agents_md, updated_agents).await?;
     }
-    println!("\n[3/4] OpenAI Codex (`codex`) configured:");
-    println!("      - MCP Server:  {}", codex_toml_path.display());
-    println!("      - Global Rule: {}", codex_agents_md.display());
+    if !quiet {
+        println!("\n[3/4] OpenAI Codex (`codex`) configured:");
+        println!("      - MCP Server:  {}", codex_toml_path.display());
+        println!("      - Global Rule: {}", codex_agents_md.display());
+    }
 
     // ------------------------------------------------------------------------
     // 4. Configure OpenCode (`~/.config/opencode/opencode.json`)
@@ -611,17 +628,21 @@ startup_timeout_sec = 30
     let opencode_agents = opencode_dir.join("AGENTS.md");
     let opencode_plugin = opencode_dir.join("plugins").join("aegis-os.js");
     if dry_run {
-        println!("\n  - would install OpenCode plugin {}", opencode_plugin.display());
+        if !quiet {
+            println!("\n  - would install OpenCode plugin {}", opencode_plugin.display());
+        }
     } else {
         tokio::fs::create_dir_all(opencode_dir.join("plugins")).await?;
         tokio::fs::write(&opencode_plugin, OPENCODE_AEGIS_PLUGIN).await?;
     }
     if opencode_jsonc.exists() && !opencode_json.exists() {
-        println!(
-            "\n[4/4] OpenCode uses {}; Aegis left it untouched. Add the `aegis-os` MCP server \
+        if !quiet {
+            println!(
+                "\n[4/4] OpenCode uses {}; Aegis left it untouched. Add the `aegis-os` MCP server \
              manually or rename it to opencode.json.",
-            opencode_jsonc.display()
-        );
+                opencode_jsonc.display()
+            );
+        }
     } else {
         merge_json_file(
             &opencode_json,
@@ -676,28 +697,42 @@ startup_timeout_sec = 30
             )
             .await?;
         }
-        println!("\n[4/4] OpenCode (`opencode`) configured:");
-        println!("      - MCP Server:  {}", opencode_json.display());
-        println!("      - Global Rule: {}", opencode_agents.display());
-        println!("      - Aegis Plugin: {}", opencode_plugin.display());
+        if !quiet {
+            println!("\n[4/4] OpenCode (`opencode`) configured:");
+            println!("      - MCP Server:  {}", opencode_json.display());
+            println!("      - Global Rule: {}", opencode_agents.display());
+            println!("      - Aegis Plugin: {}", opencode_plugin.display());
+        }
     }
 
-    println!(
-        "\nDone! You can now directly run `agy`, `claude`, `codex`, or `opencode` in any project directory."
-    );
-    println!(
-        "Tip: Run `aegis-os audit-me` (or `aegis-os audit-me --share`) to inspect your local Security & Prompt Fatigue Score!"
-    );
+    if !quiet {
+        println!(
+            "\nDone! You can now directly run `agy`, `claude`, `codex`, or `opencode` in any project directory."
+        );
+        println!(
+            "Tip: Run `aegis-os audit-me` (or `aegis-os audit-me --share`) to inspect your local Security & Prompt Fatigue Score!"
+        );
+    }
     Ok(())
 }
 
 const PATH_BLOCK_START: &str = "# >>> aegis-os PATH >>>";
 const PATH_BLOCK_END: &str = "# <<< aegis-os PATH <<<";
 
+#[allow(dead_code)]
 fn install_shell_path_block(
     home_dir: &Path,
     shim_dir: &Path,
     dry_run: bool,
+) -> anyhow::Result<bool> {
+    install_shell_path_block_with_options(home_dir, shim_dir, dry_run, false)
+}
+
+fn install_shell_path_block_with_options(
+    home_dir: &Path,
+    shim_dir: &Path,
+    dry_run: bool,
+    quiet: bool,
 ) -> anyhow::Result<bool> {
     use std::fmt::Write as _;
 
@@ -736,7 +771,9 @@ fn install_shell_path_block(
             continue;
         }
         if dry_run {
-            println!("  - would append PATH block to {}", path.display());
+            if !quiet {
+                println!("  - would append PATH block to {}", path.display());
+            }
             updated_any = true;
             continue;
         }
@@ -746,7 +783,9 @@ fn install_shell_path_block(
         }
         let _ = writeln!(updated, "{block}");
         std::fs::write(&path, updated)?;
-        println!("  - appended PATH block to {}", path.display());
+        if !quiet {
+            println!("  - appended PATH block to {}", path.display());
+        }
         updated_any = true;
     }
     Ok(updated_any)
@@ -1628,13 +1667,23 @@ fn stable_aegis_exe_for_shim() -> PathBuf {
 }
 
 pub(crate) fn install_enforced_shims(home_dir: &Path, dry_run: bool) -> anyhow::Result<()> {
-    install_enforced_shims_with_path(home_dir, dry_run, None)
+    install_enforced_shims_with_options(home_dir, dry_run, None, false)
 }
 
+#[allow(dead_code)]
 pub(crate) fn install_enforced_shims_with_path(
     home_dir: &Path,
     dry_run: bool,
     path_override: Option<&std::ffi::OsStr>,
+) -> anyhow::Result<()> {
+    install_enforced_shims_with_options(home_dir, dry_run, path_override, false)
+}
+
+pub(crate) fn install_enforced_shims_with_options(
+    home_dir: &Path,
+    dry_run: bool,
+    path_override: Option<&std::ffi::OsStr>,
+    quiet: bool,
 ) -> anyhow::Result<()> {
     let shim_dir = home_dir.join(".aegis").join("bin");
     let aegis = stable_aegis_exe_for_shim();
@@ -1671,7 +1720,9 @@ pub(crate) fn install_enforced_shims_with_path(
         );
         let path = shim_dir.join(agent);
         if dry_run {
-            println!("  - would write {} -> {}", path.display(), real.display());
+            if !quiet {
+                println!("  - would write {} -> {}", path.display(), real.display());
+            }
         } else {
             std::fs::create_dir_all(&shim_dir)?;
             std::fs::write(&path, script)?;
@@ -1683,25 +1734,32 @@ pub(crate) fn install_enforced_shims_with_path(
         }
         agents.push(agent);
     }
-    println!("\n[enforce] Aegis launcher shims:");
     if agents.is_empty() {
-        println!("  - no supported agents found on PATH");
-    } else {
-        for agent in &agents {
-            println!("  - {}", shim_dir.join(agent).display());
+        if !quiet {
+            println!("\n[enforce] Aegis launcher shims:");
+            println!("  - no supported agents found on PATH");
         }
-        if install_shell_path_block(home_dir, &shim_dir, dry_run)? {
-            if !dry_run {
+    } else {
+        let path_block_present =
+            install_shell_path_block_with_options(home_dir, &shim_dir, dry_run, quiet)?;
+        if !quiet {
+            println!("\n[enforce] Aegis launcher shims:");
+            for agent in &agents {
+                println!("  - {}", shim_dir.join(agent).display());
+            }
+            if path_block_present {
+                if !dry_run {
+                    println!(
+                        "  PATH block present; new shells will prefer {}",
+                        shim_dir.display()
+                    );
+                }
+            } else {
                 println!(
-                    "  PATH block present; new shells will prefer {}",
+                    "  Add this to your shell profile: export PATH=\"{}:$PATH\"",
                     shim_dir.display()
                 );
             }
-        } else {
-            println!(
-                "  Add this to your shell profile: export PATH=\"{}:$PATH\"",
-                shim_dir.display()
-            );
         }
     }
     Ok(())
@@ -1886,6 +1944,7 @@ pub(crate) struct UpgradeOptions<'a> {
     pub refresh_only: bool,
     pub no_refresh: bool,
     pub dry_run: bool,
+    pub verbose: bool,
 }
 
 fn find_aegis_repo_root(start: &Path) -> Option<PathBuf> {
@@ -2258,7 +2317,7 @@ pub(crate) fn probe_binary_version(bin: &Path) -> Option<String> {
     None
 }
 
-pub(crate) fn binary_supports_install_enforce(bin: &Path) -> bool {
+fn binary_install_help_contains(bin: &Path, flag: &str) -> bool {
     let Ok(out) = std::process::Command::new(bin)
         .args(["install", "--help"])
         .output()
@@ -2267,7 +2326,15 @@ pub(crate) fn binary_supports_install_enforce(bin: &Path) -> bool {
     };
     let stdout = String::from_utf8_lossy(&out.stdout);
     let stderr = String::from_utf8_lossy(&out.stderr);
-    stdout.contains("--enforce") || stderr.contains("--enforce")
+    stdout.contains(flag) || stderr.contains(flag)
+}
+
+pub(crate) fn binary_supports_install_enforce(bin: &Path) -> bool {
+    binary_install_help_contains(bin, "--enforce")
+}
+
+pub(crate) fn binary_supports_install_quiet(bin: &Path) -> bool {
+    binary_install_help_contains(bin, "--quiet")
 }
 
 pub(crate) fn is_candidate_binary_regression(
@@ -2334,11 +2401,23 @@ fn sync_secondary_path_binaries(source_bin: &Path, primary_target: &Path) {
     }
 }
 
+enum SignedDownloadOutcome {
+    Installed {
+        bin_tmp: PathBuf,
+        downloaded_from: String,
+        version: Option<String>,
+    },
+    KeptNewerLocal {
+        mirror_version: Option<String>,
+    },
+}
+
 async fn perform_signed_release_upgrade(
     exe: &Path,
     tag: Option<&str>,
     dry_run: bool,
-) -> anyhow::Result<PathBuf> {
+    verbose: bool,
+) -> anyhow::Result<(PathBuf, Option<String>, bool)> {
     let asset = release_asset_name()?;
     let target_exe = resolve_signed_target_exe(exe);
     let bases = signed_release_base_candidates(tag);
@@ -2356,7 +2435,8 @@ async fn perform_signed_release_upgrade(
             RELEASE_PRINCIPAL, RELEASE_NAMESPACE
         );
         println!("==> [dry-run] Would atomically replace {}", target_exe.display());
-        return Ok(target_exe);
+        let planned_ver = tag.map(|t| t.strip_prefix('v').unwrap_or(t).to_string());
+        return Ok((target_exe, planned_ver, false));
     }
 
     match std::process::Command::new("ssh-keygen").arg("-V").output() {
@@ -2375,8 +2455,12 @@ async fn perform_signed_release_upgrade(
     let asset_owned = asset.to_string();
     let enforce_expected = tag.is_none();
 
-    let downloaded = tokio::task::spawn_blocking(
-        move || -> anyhow::Result<Option<(PathBuf, String)>> {
+    if !verbose {
+        println!("==> Downloading Aegis OS release ...");
+    }
+
+    let outcome = tokio::task::spawn_blocking(
+        move || -> anyhow::Result<SignedDownloadOutcome> {
             let agent = ureq::AgentBuilder::new()
                 .timeout(std::time::Duration::from_secs(45))
                 .build();
@@ -2384,10 +2468,15 @@ async fn perform_signed_release_upgrade(
             let sig_tmp = work_path.join(format!("{}.sig", asset_owned));
             let mut last_err = None;
             let mut skipped_regression: Option<String> = None;
+            let mut skipped_mirror_version: Option<String> = None;
+            let mut printed_verifying = false;
+
             for base in &bases_owned {
                 let bin_url = format!("{}/{}", base, asset_owned);
                 let sig_url = format!("{}/{}.sig", base, asset_owned);
-                println!("==> Downloading `{}` from {} ...", asset_owned, base);
+                if verbose {
+                    println!("==> Downloading `{}` from {} ...", asset_owned, base);
+                }
                 if let Err(err) = download_to_file(&agent, &bin_url, &bin_tmp)
                     .and_then(|_| download_to_file(&agent, &sig_url, &sig_tmp))
                 {
@@ -2396,7 +2485,10 @@ async fn perform_signed_release_upgrade(
                     last_err = Some(err);
                     continue;
                 }
-                println!("==> Verifying Ed25519 release signature ...");
+                if verbose || !printed_verifying {
+                    println!("==> Verifying Ed25519 release signature ...");
+                    printed_verifying = true;
+                }
                 verify_openssh_signature(&bin_tmp, &sig_tmp, &work_path)?;
                 #[cfg(unix)]
                 {
@@ -2404,21 +2496,39 @@ async fn perform_signed_release_upgrade(
                     let _ =
                         std::fs::set_permissions(&bin_tmp, std::fs::Permissions::from_mode(0o755));
                 }
+                let cand_ver = probe_binary_version(&bin_tmp);
                 if enforce_expected {
                     if let Some(reason) =
                         is_candidate_binary_regression(&bin_tmp, CURRENT_VERSION, true)
                     {
-                        println!("  ! skipping {}: {} (trying next mirror)", base, reason);
+                        if verbose {
+                            println!("  ! skipping {}: {} (trying next mirror)", base, reason);
+                        }
                         let _ = std::fs::remove_file(&bin_tmp);
                         let _ = std::fs::remove_file(&sig_tmp);
                         skipped_regression = Some(reason);
+                        if let Some(ver) = cand_ver {
+                            let is_newer = skipped_mirror_version
+                                .as_deref()
+                                .map(|prev| parse_semver_key(&ver) > parse_semver_key(prev))
+                                .unwrap_or(true);
+                            if is_newer {
+                                skipped_mirror_version = Some(ver);
+                            }
+                        }
                         continue;
                     }
                 }
-                return Ok(Some((bin_tmp, base.clone())));
+                return Ok(SignedDownloadOutcome::Installed {
+                    bin_tmp,
+                    downloaded_from: base.clone(),
+                    version: cand_ver,
+                });
             }
             if skipped_regression.is_some() && last_err.is_none() {
-                return Ok(None);
+                return Ok(SignedDownloadOutcome::KeptNewerLocal {
+                    mirror_version: skipped_mirror_version,
+                });
             }
             Err(last_err.unwrap_or_else(|| {
                 anyhow::anyhow!(
@@ -2431,25 +2541,39 @@ async fn perform_signed_release_upgrade(
     )
     .await??;
 
-    let Some((verified_bin, downloaded_from)) = downloaded else {
-        println!(
-            "==> Installed binary (v{}) is already newer than published release mirrors; keeping {} intact.",
-            CURRENT_VERSION,
-            target_exe.display()
-        );
-        return Ok(target_exe);
+    let (verified_bin, downloaded_from, probed_version) = match outcome {
+        SignedDownloadOutcome::KeptNewerLocal { mirror_version } => {
+            if verbose {
+                println!(
+                    "==> Installed binary (v{}) is already newer than published release mirrors; keeping {} intact.",
+                    CURRENT_VERSION,
+                    target_exe.display()
+                );
+            }
+            return Ok((target_exe, mirror_version, true));
+        }
+        SignedDownloadOutcome::Installed {
+            bin_tmp,
+            downloaded_from,
+            version,
+        } => (bin_tmp, downloaded_from, version),
     };
 
     atomic_install_binary(&verified_bin, &target_exe)?;
-    println!(
-        "==> Installed verified binary from {} -> {}",
-        downloaded_from,
-        target_exe.display()
-    );
+    if verbose {
+        println!(
+            "==> Installed verified binary from {} -> {}",
+            downloaded_from,
+            target_exe.display()
+        );
+    }
 
     sync_secondary_path_binaries(&verified_bin, &target_exe);
+    let resolved_ver = probed_version
+        .or_else(|| probe_binary_version(&target_exe))
+        .or_else(|| tag.map(|t| t.strip_prefix('v').unwrap_or(t).to_string()));
 
-    Ok(target_exe)
+    Ok((target_exe, resolved_ver, false))
 }
 
 fn cargo_bin_aegis_path() -> Option<PathBuf> {
@@ -2488,17 +2612,27 @@ fn which_aegis_os_after_upgrade(method: &InstallMethod) -> PathBuf {
     }
 }
 
-fn perform_homebrew_upgrade(exe: &Path, tag: Option<&str>, dry_run: bool) -> anyhow::Result<PathBuf> {
+fn perform_homebrew_upgrade(
+    exe: &Path,
+    tag: Option<&str>,
+    dry_run: bool,
+    verbose: bool,
+) -> anyhow::Result<(PathBuf, Option<String>)> {
     if tag.is_some() {
         println!("  ! note: Homebrew upgrades track the tap formula version; ignoring `--tag`");
     }
     if dry_run {
         println!("==> [dry-run] Would run: brew update && brew upgrade aegis-os");
-        return Ok(exe.to_path_buf());
+        return Ok((exe.to_path_buf(), None));
     }
-    println!("==> Updating Homebrew tap ...");
-    let _ = std::process::Command::new("brew").arg("update").status();
-    println!("==> Upgrading `aegis-os` via Homebrew ...");
+    if verbose {
+        println!("==> Updating Homebrew tap ...");
+        let _ = std::process::Command::new("brew").arg("update").status();
+        println!("==> Upgrading `aegis-os` via Homebrew ...");
+    } else {
+        println!("==> Upgrading Aegis OS via Homebrew ...");
+        let _ = std::process::Command::new("brew").arg("update").output();
+    }
     let status = std::process::Command::new("brew")
         .args(["upgrade", "aegis-os"])
         .status()
@@ -2511,9 +2645,11 @@ fn perform_homebrew_upgrade(exe: &Path, tag: Option<&str>, dry_run: bool) -> any
             anyhow::bail!("`brew upgrade aegis-os` exited with status {}", status);
         }
     }
-    Ok(which_aegis_os_after_upgrade(&InstallMethod::Homebrew {
+    let new_exe = which_aegis_os_after_upgrade(&InstallMethod::Homebrew {
         exe: exe.to_path_buf(),
-    }))
+    });
+    let new_ver = probe_binary_version(&new_exe);
+    Ok((new_exe, new_ver))
 }
 
 fn perform_source_upgrade(
@@ -2521,7 +2657,8 @@ fn perform_source_upgrade(
     exe: &Path,
     offline: bool,
     dry_run: bool,
-) -> anyhow::Result<PathBuf> {
+    verbose: bool,
+) -> anyhow::Result<(PathBuf, Option<String>)> {
     let crate_dir = repo_dir.join("crates").join("aos-cli");
     if dry_run {
         println!(
@@ -2529,12 +2666,19 @@ fn perform_source_upgrade(
             crate_dir.display(),
             if offline { " --offline" } else { "" }
         );
-        return Ok(cargo_bin_aegis_path().unwrap_or_else(|| exe.to_path_buf()));
+        return Ok((
+            cargo_bin_aegis_path().unwrap_or_else(|| exe.to_path_buf()),
+            read_local_repo_version(repo_dir),
+        ));
     }
-    println!(
-        "==> Building & installing `aos-cli` from source ({}) ...",
-        repo_dir.display()
-    );
+    if verbose {
+        println!(
+            "==> Building & installing `aos-cli` from source ({}) ...",
+            repo_dir.display()
+        );
+    } else {
+        println!("==> Building & installing Aegis OS from local source ...");
+    }
     let mut cmd = std::process::Command::new("cargo");
     cmd.arg("install")
         .arg("--path")
@@ -2561,19 +2705,33 @@ fn perform_source_upgrade(
         }
         sync_secondary_path_binaries(&cargo_bin, &cargo_bin);
     }
-    Ok(cargo_bin)
+    let new_ver =
+        probe_binary_version(&cargo_bin).or_else(|| read_local_repo_version(repo_dir));
+    Ok((cargo_bin, new_ver))
 }
 
-fn perform_cargo_git_upgrade(exe: &Path, tag: Option<&str>, dry_run: bool) -> anyhow::Result<PathBuf> {
+fn perform_cargo_git_upgrade(
+    exe: &Path,
+    tag: Option<&str>,
+    dry_run: bool,
+    verbose: bool,
+) -> anyhow::Result<(PathBuf, Option<String>)> {
     if dry_run {
         let tag_arg = tag.map(|t| format!(" --tag {}", t)).unwrap_or_default();
         println!(
             "==> [dry-run] Would run: cargo install --git https://github.com/heurion-org/aegis-os{} aos-cli --locked --force",
             tag_arg
         );
-        return Ok(cargo_bin_aegis_path().unwrap_or_else(|| exe.to_path_buf()));
+        return Ok((
+            cargo_bin_aegis_path().unwrap_or_else(|| exe.to_path_buf()),
+            tag.map(|t| t.strip_prefix('v').unwrap_or(t).to_string()),
+        ));
     }
-    println!("==> Installing `aos-cli` via `cargo install --git` ...");
+    if verbose {
+        println!("==> Installing `aos-cli` via `cargo install --git` ...");
+    } else {
+        println!("==> Building & installing Aegis OS via Cargo ...");
+    }
     let mut cmd = std::process::Command::new("cargo");
     cmd.args(["install", "--git", "https://github.com/heurion-org/aegis-os"]);
     if let Some(t) = tag {
@@ -2584,7 +2742,10 @@ fn perform_cargo_git_upgrade(exe: &Path, tag: Option<&str>, dry_run: bool) -> an
     if !status.success() {
         anyhow::bail!("`cargo install --git` failed with status {}", status);
     }
-    Ok(cargo_bin_aegis_path().unwrap_or_else(|| exe.to_path_buf()))
+    let cargo_bin = cargo_bin_aegis_path().unwrap_or_else(|| exe.to_path_buf());
+    let new_ver = probe_binary_version(&cargo_bin)
+        .or_else(|| tag.map(|t| t.strip_prefix('v').unwrap_or(t).to_string()));
+    Ok((cargo_bin, new_ver))
 }
 
 async fn run_upgrade_check(method: &InstallMethod, opts: &UpgradeOptions<'_>) -> anyhow::Result<()> {
@@ -2645,13 +2806,67 @@ async fn run_upgrade_check(method: &InstallMethod, opts: &UpgradeOptions<'_>) ->
     Ok(())
 }
 
+pub(crate) fn format_upgrade_outcome(
+    old_version: &str,
+    new_version: Option<&str>,
+    kept_newer_local: bool,
+) -> String {
+    let old_norm = old_version.strip_prefix('v').unwrap_or(old_version);
+    if kept_newer_local {
+        return match new_version {
+            Some(latest) => {
+                let latest_norm = latest.strip_prefix('v').unwrap_or(latest);
+                format!(
+                    "Aegis OS is already up to date (local v{} is newer than latest release v{}).",
+                    old_norm, latest_norm
+                )
+            }
+            None => format!(
+                "Aegis OS is already up to date (local v{} is newer than published releases).",
+                old_norm
+            ),
+        };
+    }
+
+    let Some(new_ver) = new_version else {
+        return format!(
+            "Aegis OS upgrade complete (previous: v{}; installed version unavailable).",
+            old_norm
+        );
+    };
+    let new_norm = new_ver.strip_prefix('v').unwrap_or(new_ver);
+    match (parse_semver_key(old_norm), parse_semver_key(new_norm)) {
+        (Some(old_k), Some(new_k)) if new_k > old_k => {
+            format!("Upgraded Aegis OS: v{} -> v{}", old_norm, new_norm)
+        }
+        (Some(old_k), Some(new_k)) if new_k == old_k => {
+            format!("Aegis OS is already up to date (latest: v{}).", new_norm)
+        }
+        (Some(old_k), Some(new_k)) if new_k < old_k => {
+            format!("Installed Aegis OS v{} (was v{}).", new_norm, old_norm)
+        }
+        _ if old_norm == new_norm => {
+            format!("Aegis OS is already up to date (latest: v{}).", new_norm)
+        }
+        _ => format!("Upgraded Aegis OS: v{} -> v{}", old_norm, new_norm),
+    }
+}
+
+#[allow(dead_code)]
 pub(crate) fn refresh_via_upgraded_binary(
     new_exe: &Path,
     runtime_dir: &Path,
     home_dir: &Path,
     had_shims: bool,
 ) -> anyhow::Result<()> {
-    refresh_via_upgraded_binary_with_path(new_exe, runtime_dir, home_dir, had_shims, None)
+    refresh_via_upgraded_binary_with_options(
+        new_exe,
+        runtime_dir,
+        home_dir,
+        had_shims,
+        None,
+        false,
+    )
 }
 
 pub(crate) fn refresh_via_upgraded_binary_with_path(
@@ -2661,7 +2876,26 @@ pub(crate) fn refresh_via_upgraded_binary_with_path(
     had_shims: bool,
     path_override: Option<&std::ffi::OsStr>,
 ) -> anyhow::Result<()> {
+    refresh_via_upgraded_binary_with_options(
+        new_exe,
+        runtime_dir,
+        home_dir,
+        had_shims,
+        path_override,
+        false,
+    )
+}
+
+pub(crate) fn refresh_via_upgraded_binary_with_options(
+    new_exe: &Path,
+    runtime_dir: &Path,
+    home_dir: &Path,
+    had_shims: bool,
+    path_override: Option<&std::ffi::OsStr>,
+    quiet: bool,
+) -> anyhow::Result<()> {
     let pass_enforce = had_shims && binary_supports_install_enforce(new_exe);
+    let pass_quiet = quiet && binary_supports_install_quiet(new_exe);
     let mut cmd = std::process::Command::new(new_exe);
     cmd.arg("--runtime-dir")
         .arg(runtime_dir)
@@ -2671,12 +2905,44 @@ pub(crate) fn refresh_via_upgraded_binary_with_path(
     if pass_enforce {
         cmd.arg("--enforce");
     }
-    let status = cmd.status().with_context(|| {
-        format!(
-            "invoking upgraded binary `{}` to refresh client integrations",
-            new_exe.display()
-        )
-    })?;
+    if pass_quiet {
+        cmd.arg("--quiet");
+    }
+    let status = if quiet {
+        let out = cmd.output().with_context(|| {
+            format!(
+                "invoking upgraded binary `{}` to refresh client integrations",
+                new_exe.display()
+            )
+        })?;
+        if !out.status.success() {
+            let stderr = String::from_utf8_lossy(&out.stderr);
+            let stdout = String::from_utf8_lossy(&out.stdout);
+            let detail = if !stderr.trim().is_empty() {
+                stderr.trim().to_string()
+            } else {
+                stdout.trim().to_string()
+            };
+            anyhow::bail!(
+                "`{} install` exited with status {} after upgrade{}",
+                new_exe.display(),
+                out.status,
+                if detail.is_empty() {
+                    String::new()
+                } else {
+                    format!(": {}", detail)
+                }
+            );
+        }
+        out.status
+    } else {
+        cmd.status().with_context(|| {
+            format!(
+                "invoking upgraded binary `{}` to refresh client integrations",
+                new_exe.display()
+            )
+        })?
+    };
     if !status.success() {
         anyhow::bail!(
             "`{} install` exited with status {} after upgrade",
@@ -2685,7 +2951,7 @@ pub(crate) fn refresh_via_upgraded_binary_with_path(
         );
     }
     if had_shims && !pass_enforce {
-        install_enforced_shims_with_path(home_dir, false, path_override)?;
+        install_enforced_shims_with_options(home_dir, false, path_override, quiet)?;
     }
     Ok(())
 }
@@ -2715,59 +2981,117 @@ pub(crate) async fn run_upgrade(opts: UpgradeOptions<'_>) -> anyhow::Result<()> 
         return run_upgrade_check(&method, &opts).await;
     }
 
-    println!("=========================================================================");
-    println!(
-        "  Aegis OS Upgrader{}",
-        if opts.dry_run { " (dry-run)" } else { "" }
-    );
-    println!("  Current Version: v{}", CURRENT_VERSION);
-    println!("  Install Method:  {}", method.label());
-    println!("  Runtime Dir:     {}", opts.runtime_dir.display());
-    println!("=========================================================================\n");
+    let verbose = opts.verbose;
+
+    if verbose || opts.dry_run {
+        println!("=========================================================================");
+        println!(
+            "  Aegis OS Upgrader{}",
+            if opts.dry_run { " (dry-run)" } else { "" }
+        );
+        println!("  Current Version: v{}", CURRENT_VERSION);
+        println!("  Install Method:  {}", method.label());
+        println!("  Runtime Dir:     {}", opts.runtime_dir.display());
+        println!("=========================================================================\n");
+    } else {
+        println!(
+            "==> Checking Aegis OS updates (current: v{}) ...",
+            CURRENT_VERSION
+        );
+    }
 
     let had_shims = has_enforced_shims(opts.home_dir);
 
-    let upgraded_exe: Option<PathBuf> = if opts.refresh_only {
-        println!("==> Skipping binary download/build (--refresh-only)");
+    let upgraded: Option<(PathBuf, Option<String>, bool)> = if opts.refresh_only {
+        if verbose || opts.dry_run {
+            println!("==> Skipping binary download/build (--refresh-only)");
+        }
         None
     } else {
-        let exe = match &method {
+        let res = match &method {
             InstallMethod::Homebrew { exe } => {
-                perform_homebrew_upgrade(exe, opts.tag, opts.dry_run)?
+                let (p, v) = perform_homebrew_upgrade(exe, opts.tag, opts.dry_run, verbose)?;
+                (p, v, false)
             }
             InstallMethod::Source { repo_dir, exe } => {
-                perform_source_upgrade(repo_dir, exe, opts.offline, opts.dry_run)?
+                let (p, v) =
+                    perform_source_upgrade(repo_dir, exe, opts.offline, opts.dry_run, verbose)?;
+                (p, v, false)
             }
             InstallMethod::CargoGit { exe } => {
-                perform_cargo_git_upgrade(exe, opts.tag, opts.dry_run)?
+                let (p, v) = perform_cargo_git_upgrade(exe, opts.tag, opts.dry_run, verbose)?;
+                (p, v, false)
             }
             InstallMethod::SignedRelease { exe } => {
-                perform_signed_release_upgrade(exe, opts.tag, opts.dry_run).await?
+                perform_signed_release_upgrade(exe, opts.tag, opts.dry_run, verbose).await?
             }
         };
-        Some(exe)
+        Some(res)
     };
 
-    if opts.no_refresh {
-        println!("\n==> Skipping client integration refresh (--no-refresh)");
-        return Ok(());
-    }
-
-    if opts.refresh_only || opts.dry_run {
-        println!("\n==> Refreshing global client integrations ...");
-        install_global_clients(opts.home_dir, opts.runtime_dir, opts.dry_run).await?;
-        if had_shims {
-            install_enforced_shims(opts.home_dir, opts.dry_run)?;
+    if !opts.no_refresh {
+        if opts.refresh_only || opts.dry_run {
+            let quiet_refresh = !verbose && !opts.dry_run;
+            if verbose || opts.dry_run {
+                println!("\n==> Refreshing global client integrations ...");
+            } else {
+                println!("==> Refreshing client integrations ...");
+            }
+            install_global_clients_with_options(
+                opts.home_dir,
+                opts.runtime_dir,
+                opts.dry_run,
+                quiet_refresh,
+            )
+            .await?;
+            if had_shims {
+                install_enforced_shims_with_options(
+                    opts.home_dir,
+                    opts.dry_run,
+                    None,
+                    quiet_refresh,
+                )?;
+            }
+        } else if let Some((new_exe, _, _)) = &upgraded {
+            if verbose {
+                println!(
+                    "\n==> Refreshing client integrations via upgraded binary ({}) ...",
+                    new_exe.display()
+                );
+            } else {
+                println!("==> Refreshing client integrations ...");
+            }
+            refresh_via_upgraded_binary_with_options(
+                new_exe,
+                opts.runtime_dir,
+                opts.home_dir,
+                had_shims,
+                None,
+                !verbose,
+            )?;
         }
-        return Ok(());
+    } else if verbose || opts.dry_run {
+        println!("\n==> Skipping client integration refresh (--no-refresh)");
     }
 
-    if let Some(new_exe) = upgraded_exe {
+    if opts.dry_run {
+        if let Some((_, Some(planned_ver), _)) = &upgraded {
+            println!(
+                "==> [dry-run] Target version: v{} (current: v{})",
+                planned_ver.strip_prefix('v').unwrap_or(planned_ver),
+                CURRENT_VERSION
+            );
+        }
+    } else if let Some((_, installed_ver, kept_newer_local)) = upgraded {
         println!(
-            "\n==> Refreshing client integrations via upgraded binary ({}) ...",
-            new_exe.display()
+            "==> {}",
+            format_upgrade_outcome(CURRENT_VERSION, installed_ver.as_deref(), kept_newer_local)
         );
-        refresh_via_upgraded_binary(&new_exe, opts.runtime_dir, opts.home_dir, had_shims)?;
+    } else if opts.refresh_only {
+        println!(
+            "==> Refreshed client integrations (Aegis OS v{}).",
+            CURRENT_VERSION
+        );
     }
 
     Ok(())
@@ -3478,6 +3802,7 @@ mod install_tests {
             refresh_only: true,
             no_refresh: false,
             dry_run: false,
+            verbose: false,
         })
         .await
         .unwrap();
@@ -3564,6 +3889,120 @@ mod install_tests {
             home.join(".aegis/bin/claude").is_file(),
             "enforced shim must still be installed in-process when legacy binary lacks --enforce"
         );
+    }
+
+    #[test]
+    fn format_upgrade_outcome_reports_upgrade_up_to_date_downgrade_and_newer_local() {
+        assert_eq!(
+            super::format_upgrade_outcome("0.9.2", Some("0.11.0"), false),
+            "Upgraded Aegis OS: v0.9.2 -> v0.11.0"
+        );
+        assert_eq!(
+            super::format_upgrade_outcome("v0.9.2", Some("v0.11.0"), false),
+            "Upgraded Aegis OS: v0.9.2 -> v0.11.0"
+        );
+        assert_eq!(
+            super::format_upgrade_outcome("0.11.0", Some("0.11.0"), false),
+            "Aegis OS is already up to date (latest: v0.11.0)."
+        );
+        assert_eq!(
+            super::format_upgrade_outcome("0.11.0", Some("0.9.2"), false),
+            "Installed Aegis OS v0.9.2 (was v0.11.0)."
+        );
+        assert_eq!(
+            super::format_upgrade_outcome("0.11.0", Some("0.10.0"), true),
+            "Aegis OS is already up to date (local v0.11.0 is newer than latest release v0.10.0)."
+        );
+        assert_eq!(
+            super::format_upgrade_outcome("0.11.0", None, true),
+            "Aegis OS is already up to date (local v0.11.0 is newer than published releases)."
+        );
+        assert_eq!(
+            super::format_upgrade_outcome("0.9.2", None, false),
+            "Aegis OS upgrade complete (previous: v0.9.2; installed version unavailable)."
+        );
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn refresh_via_upgraded_binary_quiet_suppresses_output_and_keeps_shims() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let tmp = tempfile::tempdir().unwrap();
+        let make_mock_bin = |name: &str, script: &str| -> PathBuf {
+            let p = tmp.path().join(name);
+            std::fs::write(&p, script).unwrap();
+            std::fs::set_permissions(&p, std::fs::Permissions::from_mode(0o755)).unwrap();
+            p
+        };
+
+        let quiet_args_log = tmp.path().join("quiet_args.txt");
+        let quiet_bin = make_mock_bin(
+            "aegis-quiet",
+            &format!(
+                "#!/bin/sh\nif [ \"$2\" = \"--help\" ]; then\n  echo \"Usage: aegis-os install --enforce --quiet\"\n  exit 0\nfi\nprintf '%s\\n' \"$*\" > \"{}\"\necho \"noisy stdout that should be captured\"\nexit 0\n",
+                quiet_args_log.display()
+            ),
+        );
+
+        let legacy_args_log = tmp.path().join("legacy_args.txt");
+        let legacy_bin = make_mock_bin(
+            "aegis-legacy",
+            &format!(
+                "#!/bin/sh\nif [ \"$2\" = \"--help\" ]; then\n  echo \"Usage: aegis-os install --home-dir <HOME_DIR> --enforce\"\n  exit 0\nfi\nfor a in \"$@\"; do\n  if [ \"$a\" = \"--quiet\" ]; then\n    echo \"unexpected --quiet\" >&2\n    exit 2\n  fi\ndone\nprintf '%s\\n' \"$*\" > \"{}\"\necho \"legacy stdout\"\nexit 0\n",
+                legacy_args_log.display()
+            ),
+        );
+
+        assert!(super::binary_supports_install_quiet(&quiet_bin));
+        assert!(!super::binary_supports_install_quiet(&legacy_bin));
+
+        let fake_bin = tmp.path().join("fake_bin");
+        std::fs::create_dir_all(&fake_bin).unwrap();
+        let fake_claude = fake_bin.join("claude");
+        std::fs::write(&fake_claude, "#!/bin/sh\nexit 0\n").unwrap();
+        std::fs::set_permissions(&fake_claude, std::fs::Permissions::from_mode(0o755)).unwrap();
+
+        let home = tmp.path().join("home");
+        let rt = home.join(".aegis");
+        std::fs::create_dir_all(&home).unwrap();
+        std::fs::write(home.join(".zshrc"), "# existing\n").unwrap();
+
+        super::refresh_via_upgraded_binary_with_options(
+            &quiet_bin,
+            &rt,
+            &home,
+            true,
+            Some(fake_bin.as_os_str()),
+            true,
+        )
+        .unwrap();
+        let recorded_quiet = std::fs::read_to_string(&quiet_args_log).unwrap();
+        assert!(recorded_quiet.contains("--enforce"));
+        assert!(recorded_quiet.contains("--quiet"));
+
+        super::refresh_via_upgraded_binary_with_options(
+            &legacy_bin,
+            &rt,
+            &home,
+            false,
+            Some(fake_bin.as_os_str()),
+            true,
+        )
+        .unwrap();
+        let recorded_legacy = std::fs::read_to_string(&legacy_args_log).unwrap();
+        assert!(!recorded_legacy.contains("--quiet"));
+
+        super::install_global_clients_with_options(&home, &rt, false, true)
+            .await
+            .unwrap();
+        super::install_enforced_shims_with_options(&home, false, Some(fake_bin.as_os_str()), true)
+            .unwrap();
+        assert!(home.join(".gemini/config/mcp_config.json").is_file());
+        assert!(home.join(".aegis/bin/claude").is_file());
+        assert!(std::fs::read_to_string(home.join(".zshrc"))
+            .unwrap()
+            .contains(PATH_BLOCK_START));
     }
 
     #[tokio::test]
