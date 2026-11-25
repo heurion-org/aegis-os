@@ -19,7 +19,7 @@ use axum::extract::{Path as AxumPath, Query, Request, State};
 use axum::http::{header, StatusCode};
 use axum::middleware::{self, Next};
 use axum::response::{IntoResponse, Response};
-use axum::routing::{get, post};
+use axum::routing::{delete, get, post};
 use axum::{Json, Router};
 use chrono::Utc;
 use serde::{Deserialize, Serialize};
@@ -157,6 +157,15 @@ pub struct DesktopDaemonState {
     pub tasks: Arc<RwLock<HashMap<String, DesktopTaskRecord>>>,
     pub task_notify: Arc<Notify>,
     pub kernel: Arc<AegisRuntimeKernel>,
+}
+
+fn is_unsafe_workspace_root(path: &Path, home_dir: &Path) -> bool {
+    let canon_path = std::fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf());
+    if canon_path.parent().is_none() {
+        return true;
+    }
+    let canon_home = std::fs::canonicalize(home_dir).unwrap_or_else(|_| home_dir.to_path_buf());
+    canon_path == canon_home
 }
 
 fn is_ignored_dir_name(name: &str) -> bool {
@@ -298,19 +307,26 @@ impl DesktopDaemonState {
             return Ok(());
         };
         let entries: Vec<PersistedWorkspaceEntry> = serde_json::from_slice(&bytes)?;
-        let mut guard = self.workspaces.write().await;
-        for entry in entries {
-            if !entry.path.is_dir() {
-                continue;
+        let mut pruned = false;
+        {
+            let mut guard = self.workspaces.write().await;
+            for entry in entries {
+                if !entry.path.is_dir() || is_unsafe_workspace_root(&entry.path, &self.home_dir) {
+                    pruned = true;
+                    continue;
+                }
+                let ws = self.build_workspace(
+                    &entry.path,
+                    Some(entry.name),
+                    Some(entry.org_id),
+                    entry.mode,
+                    Some(entry.created_at),
+                );
+                guard.insert(ws.id.clone(), ws);
             }
-            let ws = self.build_workspace(
-                &entry.path,
-                Some(entry.name),
-                Some(entry.org_id),
-                entry.mode,
-                Some(entry.created_at),
-            );
-            guard.insert(ws.id.clone(), ws);
+        }
+        if pruned {
+            let _ = self.save_workspace_registry().await;
         }
         Ok(())
     }
@@ -485,10 +501,33 @@ async fn create_workspace_handler(
             Json(json!({ "error": format!("workspace path does not exist: {}", req.path.display()) })),
         );
     }
+    if is_unsafe_workspace_root(&req.path, &state.home_dir) {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(json!({
+                "error": "please select a specific project folder rather than your home directory or filesystem root"
+            })),
+        );
+    }
     let ws = state.build_workspace(&req.path, req.name, req.org_id, req.mode, None);
     state.workspaces.write().await.insert(ws.id.clone(), ws.clone());
     let _ = state.save_workspace_registry().await;
     (StatusCode::CREATED, Json(json!({ "workspace": ws })))
+}
+
+async fn delete_workspace_handler(
+    State(state): State<DesktopDaemonState>,
+    AxumPath(id): AxumPath<String>,
+) -> impl IntoResponse {
+    let removed = state.workspaces.write().await.remove(&id);
+    if removed.is_none() {
+        return (
+            StatusCode::NOT_FOUND,
+            Json(json!({ "error": "workspace not found" })),
+        );
+    }
+    let _ = state.save_workspace_registry().await;
+    (StatusCode::OK, Json(json!({ "ok": true, "removed_id": id })))
 }
 
 fn classify_tier_for_ext(ext: &str) -> &'static str {
@@ -2206,6 +2245,7 @@ pub fn build_desktop_router(state: DesktopDaemonState) -> Router {
             "/v1/workspaces",
             get(list_workspaces_handler).post(create_workspace_handler),
         )
+        .route("/v1/workspaces/:id", delete(delete_workspace_handler))
         .route("/v1/workspaces/:id/tree", get(workspace_tree_handler))
         .route(
             "/v1/workspaces/:id/file",
@@ -2238,7 +2278,7 @@ pub async fn run_desktop_daemon(
     listen: &str,
     runtime_dir: &Path,
     home_dir: &Path,
-    default_workspace: &Path,
+    default_workspace: Option<&Path>,
 ) -> Result<()> {
     let kernel = Arc::new(AegisRuntimeKernel::new(runtime_dir).await?);
     let human_token = format!("aht_{}{}", Uuid::new_v4().simple(), Uuid::new_v4().simple());
@@ -2259,12 +2299,14 @@ pub async fn run_desktop_daemon(
 
     let _ = state.load_workspace_registry().await;
 
-    if default_workspace.is_dir() {
-        let ws = state.build_workspace(default_workspace, None, None, "local".to_string(), None);
-        let mut guard = state.workspaces.write().await;
-        guard.entry(ws.id.clone()).or_insert(ws);
-        drop(guard);
-        let _ = state.save_workspace_registry().await;
+    if let Some(ws_dir) = default_workspace {
+        if ws_dir.is_dir() && !is_unsafe_workspace_root(ws_dir, home_dir) {
+            let ws = state.build_workspace(ws_dir, None, None, "local".to_string(), None);
+            let mut guard = state.workspaces.write().await;
+            guard.entry(ws.id.clone()).or_insert(ws);
+            drop(guard);
+            let _ = state.save_workspace_registry().await;
+        }
     }
 
     let listener = tokio::net::TcpListener::bind(listen)
@@ -2927,6 +2969,27 @@ echo "Second streamed chunk"
                 "Initial host line\nUpdated by CoW shadow\n"
             );
 
+            // 6. Unsafe home/root rejection & workspace delete
+            let bad_home = agent
+                .post(&format!("{base}/v1/workspaces"))
+                .set("Authorization", auth)
+                .send_json(json!({ "path": tmp.path().join("home") }));
+            assert!(matches!(bad_home, Err(ureq::Error::Status(400, _))));
+
+            let del_resp: Value = agent
+                .delete(&format!("{base}/v1/workspaces/{ws_id}"))
+                .set("Authorization", auth)
+                .call()?
+                .into_json()?;
+            assert_eq!(del_resp["ok"], true);
+            assert_eq!(del_resp["removed_id"], ws_id);
+
+            let del_again = agent
+                .delete(&format!("{base}/v1/workspaces/{ws_id}"))
+                .set("Authorization", auth)
+                .call();
+            assert!(matches!(del_again, Err(ureq::Error::Status(404, _))));
+
             Ok(())
         })
         .await
@@ -2934,5 +2997,68 @@ echo "Second streamed chunk"
 
         srv.abort();
         outcome.unwrap();
+    }
+
+    #[tokio::test]
+    async fn workspace_registry_prunes_home_and_root_entries() {
+        let tmp = tempfile::tempdir().unwrap();
+        let rt = tmp.path().join("rt");
+        let home = tmp.path().join("home");
+        let proj = home.join("my-project");
+        std::fs::create_dir_all(&proj).unwrap();
+
+        assert!(is_unsafe_workspace_root(&home, &home));
+        assert!(is_unsafe_workspace_root(Path::new("/"), &home));
+        assert!(!is_unsafe_workspace_root(&proj, &home));
+
+        let kernel = Arc::new(AegisRuntimeKernel::new(&rt).await.unwrap());
+        let state = DesktopDaemonState {
+            runtime_dir: rt.clone(),
+            home_dir: home.clone(),
+            human_token: "aht_prune".to_string(),
+            simulate_tasks: true,
+            aegis_bin: None,
+            workspaces: Arc::new(RwLock::new(BTreeMap::new())),
+            workspace_sessions: Arc::new(RwLock::new(HashMap::new())),
+            tasks: Arc::new(RwLock::new(HashMap::new())),
+            task_notify: Arc::new(Notify::new()),
+            kernel,
+        };
+
+        let reg_path = state.registry_path();
+        std::fs::create_dir_all(reg_path.parent().unwrap()).unwrap();
+        std::fs::write(
+            &reg_path,
+            serde_json::to_vec_pretty(&json!([
+                {
+                    "id": workspace_id_for_path(&home),
+                    "name": "home",
+                    "org_id": "personal",
+                    "path": home,
+                    "mode": "local",
+                    "created_at": "2026-11-25T00:00:00Z"
+                },
+                {
+                    "id": workspace_id_for_path(&proj),
+                    "name": "my-project",
+                    "org_id": "personal",
+                    "path": proj,
+                    "mode": "local",
+                    "created_at": "2026-11-25T00:00:00Z"
+                }
+            ]))
+            .unwrap(),
+        )
+        .unwrap();
+
+        state.load_workspace_registry().await.unwrap();
+        let ws_map = state.workspaces.read().await;
+        assert_eq!(ws_map.len(), 1);
+        assert!(ws_map.values().all(|w| w.name == "my-project"));
+
+        let rewritten: Vec<Value> =
+            serde_json::from_slice(&std::fs::read(&reg_path).unwrap()).unwrap();
+        assert_eq!(rewritten.len(), 1);
+        assert_eq!(rewritten[0]["name"], "my-project");
     }
 }

@@ -3588,8 +3588,15 @@ async fn main() -> anyhow::Result<()> {
             let home_dir = std::env::var("HOME")
                 .map(PathBuf::from)
                 .unwrap_or_else(|_| PathBuf::from("."));
-            desktop_daemon::run_desktop_daemon(&listen, &cli.runtime_dir, &home_dir, &workspace)
-                .await?;
+            let initial_workspace =
+                (cli.workspace != Path::new(".")).then_some(workspace.as_path());
+            desktop_daemon::run_desktop_daemon(
+                &listen,
+                &cli.runtime_dir,
+                &home_dir,
+                initial_workspace,
+            )
+            .await?;
         }
 
         Commands::Top => {
