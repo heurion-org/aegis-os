@@ -4278,6 +4278,58 @@ fn find_session(runtime_dir: &Path, session_id: Option<&str>) -> anyhow::Result<
     Ok(found)
 }
 
+pub(crate) fn load_session_by_id(
+    runtime_dir: &Path,
+    session_id: &str,
+) -> anyhow::Result<Option<(PathBuf, Value)>> {
+    let clean = session_id.trim();
+    if clean.is_empty() || clean.contains('/') || clean.contains('\\') || clean.contains("..") {
+        anyhow::bail!("invalid session_id '{session_id}'");
+    }
+    let session_file = runtime_dir.join("sessions").join(clean).join("session.json");
+    if !session_file.is_file() {
+        return Ok(None);
+    }
+    find_session(runtime_dir, Some(clean))
+}
+
+pub(crate) fn list_sessions_for_workspace(
+    runtime_dir: &Path,
+    workspace: &Path,
+) -> Vec<(PathBuf, Value)> {
+    let target = std::fs::canonicalize(workspace).unwrap_or_else(|_| workspace.to_path_buf());
+    let sessions_dir = runtime_dir.join("sessions");
+    let Ok(entries) = std::fs::read_dir(&sessions_dir) else {
+        return Vec::new();
+    };
+    let mut out: Vec<(i64, PathBuf, Value)> = Vec::new();
+    for entry in entries.flatten() {
+        let dir = entry.path();
+        let Ok(raw) = std::fs::read_to_string(dir.join("session.json")) else {
+            continue;
+        };
+        let Ok(value) = serde_json::from_str::<Value>(&raw) else {
+            continue;
+        };
+        let Some(ws_str) = value.get("workspace").and_then(|v| v.as_str()) else {
+            continue;
+        };
+        let ws_path = Path::new(ws_str);
+        let ws_canon = std::fs::canonicalize(ws_path).unwrap_or_else(|_| ws_path.to_path_buf());
+        if ws_canon != target {
+            continue;
+        }
+        let _ = unlock_session_vault_if_needed(runtime_dir, &dir, &value);
+        let created = value
+            .get("created_at_ms")
+            .and_then(|v| v.as_i64())
+            .unwrap_or(0);
+        out.push((created, dir, value));
+    }
+    out.sort_by(|a, b| b.0.cmp(&a.0));
+    out.into_iter().map(|(_, dir, value)| (dir, value)).collect()
+}
+
 pub(crate) async fn diff(
     runtime_dir: &Path,
     session_id: Option<&str>,

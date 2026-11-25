@@ -6,6 +6,7 @@
 
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::path::{Path, PathBuf};
+use std::process::Stdio;
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -13,6 +14,7 @@ use anyhow::{Context, Result};
 use aos_core::session::{resolve_auto_org_id, workspace_id_for_path, DEFAULT_PERSONAL_ORG_ID};
 use aos_core::{DomainProfile, PendingEscalation};
 use aos_mcp_gateway::AegisRuntimeKernel;
+use aos_vfs::CoWWorkspace;
 use axum::extract::{Path as AxumPath, Query, Request, State};
 use axum::http::{header, StatusCode};
 use axum::middleware::{self, Next};
@@ -22,6 +24,7 @@ use axum::{Json, Router};
 use chrono::Utc;
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
+use tokio::io::{AsyncBufReadExt, BufReader};
 use tokio::sync::{Notify, RwLock};
 use uuid::Uuid;
 
@@ -135,6 +138,9 @@ pub struct DesktopTaskRecord {
     pub resolved_agent: String,
     pub prompt: String,
     pub status: String, // "queued" | "running" | "completed" | "failed"
+    pub enforcement: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub session_id: Option<String>,
     pub steps: Vec<DesktopTaskStep>,
     pub created_at: String,
 }
@@ -145,7 +151,9 @@ pub struct DesktopDaemonState {
     pub home_dir: PathBuf,
     pub human_token: String,
     pub simulate_tasks: bool,
+    pub aegis_bin: Option<PathBuf>,
     pub workspaces: Arc<RwLock<BTreeMap<String, DesktopWorkspace>>>,
+    pub workspace_sessions: Arc<RwLock<HashMap<PathBuf, String>>>,
     pub tasks: Arc<RwLock<HashMap<String, DesktopTaskRecord>>>,
     pub task_notify: Arc<Notify>,
     pub kernel: Arc<AegisRuntimeKernel>,
@@ -648,6 +656,8 @@ struct CreateTaskRequest {
     prompt: String,
     #[serde(default)]
     doc_refs: Vec<String>,
+    #[serde(default)]
+    enforcement: Option<String>,
 }
 
 fn default_role() -> String {
@@ -665,6 +675,62 @@ fn truncate_log(raw: &str, max_bytes: usize) -> String {
     format!("{}…\n[truncated {} bytes]", &raw[..end], raw.len() - end)
 }
 
+fn normalize_task_enforcement(raw: Option<&str>) -> String {
+    match raw.map(str::trim).map(str::to_ascii_lowercase).as_deref() {
+        Some("advisory") => "advisory".to_string(),
+        Some("isolated") => "isolated".to_string(),
+        Some("direct") => "direct".to_string(),
+        _ => "enforced".to_string(),
+    }
+}
+
+fn resolve_aegis_binary(override_bin: Option<&Path>) -> Option<PathBuf> {
+    if let Some(p) = override_bin.filter(|p| p.is_file()) {
+        return Some(p.to_path_buf());
+    }
+    if let Ok(exe) = std::env::current_exe() {
+        let is_cli = exe
+            .file_name()
+            .and_then(|s| s.to_str())
+            .is_some_and(|name| {
+                matches!(name, "aegis-os" | "aos" | "aegis-os.exe") || name.starts_with("aegis-os-")
+            });
+        if is_cli && exe.is_file() {
+            return Some(exe);
+        }
+    }
+    if let Some(env_bin) = std::env::var_os("AOS_BIN") {
+        let p = PathBuf::from(env_bin);
+        if p.is_file() {
+            return Some(p);
+        }
+    }
+    crate::launcher::find_in_path("aegis-os")
+}
+
+fn format_prompt_with_doc_refs(prompt: &str, doc_refs: &[String]) -> String {
+    let trimmed = prompt.trim();
+    if trimmed.is_empty()
+        || doc_refs.is_empty()
+        || trimmed.starts_with("[Workspace context files:")
+    {
+        return prompt.to_string();
+    }
+    let refs = doc_refs
+        .iter()
+        .map(|r| {
+            let t = r.trim();
+            if t.starts_with('@') {
+                t.to_string()
+            } else {
+                format!("@{t}")
+            }
+        })
+        .collect::<Vec<_>>()
+        .join(", ");
+    format!("[Workspace context files: {refs}]\n\n{trimmed}")
+}
+
 fn build_headless_agent_args(agent_id: &str, prompt: &str) -> Vec<String> {
     match agent_id {
         "claude" => vec!["-p".into(), prompt.into()],
@@ -673,6 +739,86 @@ fn build_headless_agent_args(agent_id: &str, prompt: &str) -> Vec<String> {
         "gemini" => vec!["-p".into(), prompt.into()],
         _ => vec!["--headless".into(), prompt.into()],
     }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn build_desktop_task_command(
+    aegis_bin: Option<&Path>,
+    enforcement: &str,
+    runtime_dir: &Path,
+    org_id: &str,
+    role: &str,
+    target_dir: &Path,
+    resolved_agent: &str,
+    agent_binary: &str,
+    prompt: &str,
+) -> std::result::Result<(String, Vec<String>), String> {
+    let agent_args = build_headless_agent_args(resolved_agent, prompt);
+    if enforcement == "direct" {
+        return Ok((agent_binary.to_string(), agent_args));
+    }
+    let Some(aegis_exe) = resolve_aegis_binary(aegis_bin) else {
+        return Err(
+            "未能定位 `aegis-os` 可执行文件，无法以 CoW + OS 沙盒启动任务".to_string(),
+        );
+    };
+    let mut args = vec![
+        "--org".to_string(),
+        org_id.to_string(),
+        "--agent".to_string(),
+        resolved_agent.to_string(),
+        "--client".to_string(),
+        resolved_agent.to_string(),
+        "--role".to_string(),
+        role.to_string(),
+        "--workspace".to_string(),
+        target_dir.display().to_string(),
+        "--runtime-dir".to_string(),
+        runtime_dir.display().to_string(),
+        "run".to_string(),
+        "--mode".to_string(),
+        "implement".to_string(),
+    ];
+    if enforcement == "isolated" {
+        args.push("--isolated".to_string());
+    } else {
+        args.push("--enforcement".to_string());
+        args.push(enforcement.to_string());
+    }
+    args.push("--".to_string());
+    args.push(agent_binary.to_string());
+    args.extend(agent_args);
+    Ok((aegis_exe.display().to_string(), args))
+}
+
+fn extract_session_id_from_stderr_line(line: &str) -> Option<String> {
+    let trimmed = line.trim();
+    let rest = trimmed.strip_prefix("session:")?.trim();
+    let token = rest.split_whitespace().next()?;
+    if token.starts_with("ses_") && token.len() > 4 {
+        Some(token.to_string())
+    } else {
+        None
+    }
+}
+
+fn is_aegis_launcher_banner_line(line: &str) -> bool {
+    let trimmed = line.trim_start();
+    line.starts_with("Aegis · ")
+        || [
+            "session:",
+            "project:",
+            "shadow:",
+            "git:",
+            "network:",
+            "profile:",
+            "mode:",
+            "broker:",
+            "mcp:",
+            "approvals:",
+        ]
+        .iter()
+        .any(|prefix| trimmed.starts_with(prefix))
 }
 
 async fn append_task_step(
@@ -703,15 +849,63 @@ async fn append_task_step(
     state.task_notify.notify_waiters();
 }
 
+async fn attach_session_to_task(
+    state: &DesktopDaemonState,
+    task_id: &str,
+    target_dir: &Path,
+    session_id: &str,
+) {
+    let canon = std::fs::canonicalize(target_dir).unwrap_or_else(|_| target_dir.to_path_buf());
+    state
+        .workspace_sessions
+        .write()
+        .await
+        .insert(canon, session_id.to_string());
+    let mut guard = state.tasks.write().await;
+    if let Some(task) = guard.get_mut(task_id) {
+        task.session_id = Some(session_id.to_string());
+    }
+    drop(guard);
+    state.task_notify.notify_waiters();
+}
+
+fn first_line_preview(raw: &str, max_bytes: usize) -> String {
+    raw.lines()
+        .find(|l| !l.trim().is_empty())
+        .map(|l| truncate_log(l.trim(), max_bytes))
+        .unwrap_or_else(|| "收到流式输出".to_string())
+}
+
+fn append_capped(buf: &mut String, line: &str, cap_bytes: usize) {
+    if !buf.is_empty() {
+        buf.push('\n');
+    }
+    if buf.len() + line.len() <= cap_bytes {
+        buf.push_str(line);
+    } else {
+        let remaining = cap_bytes.saturating_sub(buf.len());
+        let mut end = remaining;
+        while end > 0 && !line.is_char_boundary(end) {
+            end -= 1;
+        }
+        buf.push_str(&line[..end]);
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
 async fn execute_desktop_task(
     state: DesktopDaemonState,
     task_id: String,
     target_dir: PathBuf,
+    org_id: String,
+    role: String,
+    enforcement: String,
     repo_label: Option<String>,
     resolved_agent: String,
     prompt: String,
     doc_refs: Vec<String>,
 ) {
+    let task_started_ms = Utc::now().timestamp_millis();
     let scope_desc = repo_label
         .as_deref()
         .map(|r| format!("子仓库 `{r}`"))
@@ -726,7 +920,7 @@ async fn execute_desktop_task(
         &task_id,
         Some("running"),
         "file_read",
-        format!("正在 {refs_desc} 中准备隔离执行上下文"),
+        format!("正在 {refs_desc} 中准备 {enforcement} CoW 沙盒上下文"),
         Some(target_dir.display().to_string()),
         None,
     )
@@ -747,54 +941,308 @@ async fn execute_desktop_task(
     }
 
     let statuses = probe_desktop_agents_with(&state.home_dir, false);
-    let agent_status = statuses.into_iter().find(|s| s.id == resolved_agent);
-    let Some(agent_status) = agent_status.filter(|s| s.installed) else {
-        let install_hint = builtin_desktop_agents()
-            .into_iter()
-            .find(|s| s.id == resolved_agent)
-            .map(|s| {
-                let cmd = if cfg!(target_os = "macos") {
-                    s.install_recipe.macos.join(" ")
-                } else {
-                    s.install_recipe.linux.join(" ")
-                };
-                format!("请先安装 `{resolved_agent}`：`{cmd}`")
-            })
-            .unwrap_or_else(|| format!("未检测到本地 `{resolved_agent}` 可执行文件"));
-        append_task_step(
-            &state,
-            &task_id,
-            Some("failed"),
-            "failed",
-            format!("无法启动 `{resolved_agent}`：Agent 未安装"),
-            Some(install_hint),
-            None,
-        )
-        .await;
-        return;
+    let agent_status = statuses
+        .into_iter()
+        .find(|s| s.id == resolved_agent)
+        .filter(|s| s.installed);
+
+    let agent_binary = match agent_status {
+        Some(st) => st.binary_path.unwrap_or_else(|| resolved_agent.clone()),
+        None if state.aegis_bin.is_some() => resolved_agent.clone(),
+        None => {
+            let install_hint = builtin_desktop_agents()
+                .into_iter()
+                .find(|s| s.id == resolved_agent)
+                .map(|s| {
+                    let cmd = if cfg!(target_os = "macos") {
+                        s.install_recipe.macos.join(" ")
+                    } else {
+                        s.install_recipe.linux.join(" ")
+                    };
+                    format!("请先安装 `{resolved_agent}`：`{cmd}`")
+                })
+                .unwrap_or_else(|| format!("未检测到本地 `{resolved_agent}` 可执行文件"));
+            append_task_step(
+                &state,
+                &task_id,
+                Some("failed"),
+                "failed",
+                format!("无法启动 `{resolved_agent}`：Agent 未安装"),
+                Some(install_hint),
+                None,
+            )
+            .await;
+            return;
+        }
     };
 
-    let binary = agent_status
-        .binary_path
-        .unwrap_or_else(|| resolved_agent.clone());
-    let args = build_headless_agent_args(&resolved_agent, &prompt);
-    let mut cmd = tokio::process::Command::new(&binary);
-    cmd.args(&args).current_dir(&target_dir);
+    let effective_prompt = format_prompt_with_doc_refs(&prompt, &doc_refs);
+    let (program, args) = match build_desktop_task_command(
+        state.aegis_bin.as_deref(),
+        &enforcement,
+        &state.runtime_dir,
+        &org_id,
+        &role,
+        &target_dir,
+        &resolved_agent,
+        &agent_binary,
+        &effective_prompt,
+    ) {
+        Ok(pair) => pair,
+        Err(msg) => {
+            append_task_step(
+                &state,
+                &task_id,
+                Some("failed"),
+                "failed",
+                format!("无法构造 `{resolved_agent}` 启动命令"),
+                Some(msg),
+                None,
+            )
+            .await;
+            return;
+        }
+    };
 
-    match tokio::time::timeout(Duration::from_secs(120), cmd.output()).await {
-        Ok(Ok(out)) => {
-            let stdout = String::from_utf8_lossy(&out.stdout).to_string();
-            let stderr = String::from_utf8_lossy(&out.stderr).to_string();
-            let combined = if stderr.trim().is_empty() {
-                stdout.clone()
-            } else if stdout.trim().is_empty() {
-                stderr.clone()
+    let mut cmd = tokio::process::Command::new(&program);
+    cmd.args(&args)
+        .current_dir(&target_dir)
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .kill_on_drop(true);
+
+    let mut child = match cmd.spawn() {
+        Ok(c) => c,
+        Err(err) => {
+            append_task_step(
+                &state,
+                &task_id,
+                Some("failed"),
+                "failed",
+                format!("启动 `{resolved_agent}` 失败"),
+                Some(err.to_string()),
+                None,
+            )
+            .await;
+            return;
+        }
+    };
+
+    let stdout_pipe = child.stdout.take();
+    let stderr_pipe = child.stderr.take();
+    let (tx, mut rx) = tokio::sync::mpsc::channel::<(bool, String)>(256);
+
+    if let Some(out) = stdout_pipe {
+        let tx_out = tx.clone();
+        tokio::spawn(async move {
+            let mut lines = BufReader::new(out).lines();
+            while let Ok(Some(line)) = lines.next_line().await {
+                if tx_out.send((false, line)).await.is_err() {
+                    break;
+                }
+            }
+        });
+    }
+    if let Some(err) = stderr_pipe {
+        let tx_err = tx.clone();
+        tokio::spawn(async move {
+            let mut lines = BufReader::new(err).lines();
+            while let Ok(Some(line)) = lines.next_line().await {
+                if tx_err.send((true, line)).await.is_err() {
+                    break;
+                }
+            }
+        });
+    }
+    drop(tx);
+
+    let timeout_secs: u64 = std::env::var("AOS_DESKTOP_TASK_TIMEOUT_SECS")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .filter(|&s| s > 0)
+        .unwrap_or(300);
+
+    let mut captured_session_id: Option<String> = None;
+    let mut full_stdout = String::new();
+    let mut full_stderr = String::new();
+    let mut pending_stdout = String::new();
+    let mut pending_stderr = String::new();
+    let mut streamed_chunks = false;
+
+    let flush_stdout = |pending: &mut String, streamed: &mut bool| -> Option<String> {
+        if pending.trim().is_empty() {
+            pending.clear();
+            return None;
+        }
+        *streamed = true;
+        Some(std::mem::take(pending))
+    };
+
+    let flush_stderr = |pending: &mut String| -> Option<String> {
+        if pending.trim().is_empty() {
+            pending.clear();
+            return None;
+        }
+        Some(std::mem::take(pending))
+    };
+
+    let stream_res = tokio::time::timeout(Duration::from_secs(timeout_secs), async {
+        let mut tick = tokio::time::interval(Duration::from_millis(350));
+        tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+        loop {
+            tokio::select! {
+                msg = rx.recv() => {
+                    match msg {
+                        Some((is_stderr, line)) => {
+                            if is_stderr {
+                                if captured_session_id.is_none() {
+                                    if let Some(sid) = extract_session_id_from_stderr_line(&line) {
+                                        captured_session_id = Some(sid.clone());
+                                        attach_session_to_task(&state, &task_id, &target_dir, &sid).await;
+                                        append_task_step(
+                                            &state,
+                                            &task_id,
+                                            None,
+                                            "session_started",
+                                            format!("CoW 沙盒会话已启动 ({sid})"),
+                                            Some(format!("enforcement={enforcement}")),
+                                            None,
+                                        )
+                                        .await;
+                                        continue;
+                                    }
+                                }
+                                if !is_aegis_launcher_banner_line(&line) {
+                                    append_capped(&mut full_stderr, &line, 16 * 1024);
+                                    append_capped(&mut pending_stderr, &line, 4096);
+                                }
+                            } else {
+                                append_capped(&mut full_stdout, &line, 64 * 1024);
+                                append_capped(&mut pending_stdout, &line, 4096);
+                                if pending_stdout.len() >= 1024 {
+                                    if let Some(chunk) = flush_stdout(&mut pending_stdout, &mut streamed_chunks) {
+                                        append_task_step(
+                                            &state,
+                                            &task_id,
+                                            None,
+                                            "output",
+                                            first_line_preview(&chunk, 120),
+                                            None,
+                                            Some(chunk),
+                                        )
+                                        .await;
+                                    }
+                                }
+                            }
+                        }
+                        None => break,
+                    }
+                }
+                _ = tick.tick() => {
+                    if let Some(chunk) = flush_stdout(&mut pending_stdout, &mut streamed_chunks) {
+                        append_task_step(
+                            &state,
+                            &task_id,
+                            None,
+                            "output",
+                            first_line_preview(&chunk, 120),
+                            None,
+                            Some(chunk),
+                        )
+                        .await;
+                    }
+                    if let Some(err_chunk) = flush_stderr(&mut pending_stderr) {
+                        append_task_step(
+                            &state,
+                            &task_id,
+                            None,
+                            "stderr",
+                            first_line_preview(&err_chunk, 120),
+                            None,
+                            Some(err_chunk),
+                        )
+                        .await;
+                    }
+                }
+            }
+        }
+
+        if let Some(chunk) = flush_stdout(&mut pending_stdout, &mut streamed_chunks) {
+            append_task_step(
+                &state,
+                &task_id,
+                None,
+                "output",
+                first_line_preview(&chunk, 120),
+                None,
+                Some(chunk),
+            )
+            .await;
+        }
+        if let Some(err_chunk) = flush_stderr(&mut pending_stderr) {
+            append_task_step(
+                &state,
+                &task_id,
+                None,
+                "stderr",
+                first_line_preview(&err_chunk, 120),
+                None,
+                Some(err_chunk),
+            )
+            .await;
+        }
+
+        child.wait().await
+    })
+    .await;
+
+    if captured_session_id.is_none() && enforcement != "direct" {
+        let sessions = crate::launcher::list_sessions_for_workspace(&state.runtime_dir, &target_dir);
+        for (_dir, val) in sessions {
+            let created_ms = val
+                .get("created_at_ms")
+                .and_then(|v| v.as_i64())
+                .unwrap_or(0);
+            if created_ms >= task_started_ms - 1000 {
+                if let Some(sid) = val.get("session_id").and_then(|v| v.as_str()) {
+                    captured_session_id = Some(sid.to_string());
+                    attach_session_to_task(&state, &task_id, &target_dir, sid).await;
+                    break;
+                }
+            }
+        }
+    }
+
+    match stream_res {
+        Ok(Ok(exit_status)) => {
+            let combined = if full_stderr.trim().is_empty() {
+                full_stdout.clone()
+            } else if full_stdout.trim().is_empty() {
+                full_stderr.clone()
+            } else if streamed_chunks {
+                full_stdout.clone()
             } else {
-                format!("{stdout}\n--- stderr ---\n{stderr}")
+                format!("{full_stdout}\n--- stderr ---\n{full_stderr}")
             };
-            let raw_log = (!combined.trim().is_empty()).then(|| truncate_log(&combined, 16 * 1024));
-            if out.status.success() {
-                let preview = stdout
+            let raw_log = (!combined.trim().is_empty()).then(|| truncate_log(&combined, 32 * 1024));
+            if exit_status.success() {
+                let mut shadow_count = 0usize;
+                if let Some(ref sid) = captured_session_id {
+                    if let Some((_, _, diffs, _)) =
+                        find_pending_cow_session(&state, &target_dir, Some(sid)).await
+                    {
+                        shadow_count = diffs.len();
+                    }
+                }
+                let summary = match (captured_session_id.as_deref(), shadow_count) {
+                    (Some(sid), n) if n > 0 => {
+                        format!("`{resolved_agent}` 任务完成 · CoW 沙盒产生 {n} 个待审查变更 ({sid})")
+                    }
+                    (Some(sid), _) => format!("`{resolved_agent}` 任务完成 ({sid})"),
+                    _ => format!("`{resolved_agent}` 任务执行完成"),
+                };
+                let preview = full_stdout
                     .lines()
                     .find(|l| !l.trim().is_empty())
                     .map(|l| truncate_log(l.trim(), 200));
@@ -803,7 +1251,7 @@ async fn execute_desktop_task(
                     &task_id,
                     Some("completed"),
                     "completed",
-                    format!("`{resolved_agent}` 任务执行完成"),
+                    summary,
                     preview,
                     raw_log,
                 )
@@ -814,8 +1262,8 @@ async fn execute_desktop_task(
                     &task_id,
                     Some("failed"),
                     "failed",
-                    format!("`{resolved_agent}` 返回非零状态（{:?}）", out.status.code()),
-                    stderr
+                    format!("`{resolved_agent}` 返回非零状态（{:?}）", exit_status.code()),
+                    full_stderr
                         .lines()
                         .find(|l| !l.trim().is_empty())
                         .map(|l| truncate_log(l.trim(), 200)),
@@ -830,21 +1278,22 @@ async fn execute_desktop_task(
                 &task_id,
                 Some("failed"),
                 "failed",
-                format!("启动 `{resolved_agent}` 失败"),
+                format!("等待 `{resolved_agent}` 退出失败"),
                 Some(err.to_string()),
                 None,
             )
             .await;
         }
         Err(_) => {
+            let _ = child.kill().await;
             append_task_step(
                 &state,
                 &task_id,
                 Some("failed"),
                 "failed",
-                format!("`{resolved_agent}` 执行超时（120s）"),
-                Some("任务已在 120 秒超时阈值中止".to_string()),
-                None,
+                format!("`{resolved_agent}` 执行超时（{timeout_secs}s）"),
+                Some(format!("任务已在 {timeout_secs} 秒超时阈值中止")),
+                (!full_stdout.trim().is_empty()).then(|| truncate_log(&full_stdout, 16 * 1024)),
             )
             .await;
         }
@@ -871,6 +1320,11 @@ async fn create_task_handler(
         Err(resp) => return resp,
     };
 
+    let enforcement = if state.simulate_tasks {
+        "dry_run".to_string()
+    } else {
+        normalize_task_enforcement(req.enforcement.as_deref())
+    };
     let statuses = probe_desktop_agents_with(&state.home_dir, false);
     let resolved_agent =
         resolve_agent_for_role(&req.role, req.agent_override.as_deref(), &statuses)
@@ -889,8 +1343,8 @@ async fn create_task_handler(
         seq: 1,
         kind: "started".to_string(),
         summary: format!(
-            "已指派给 `{}` 执行（角色：{}，关联：{}）",
-            resolved_agent, req.role, scope_desc
+            "已指派给 `{}` 执行（角色：{}，模式：{}，关联：{}）",
+            resolved_agent, req.role, enforcement, scope_desc
         ),
         detail: Some(req.prompt.clone()),
         raw_log: None,
@@ -899,10 +1353,12 @@ async fn create_task_handler(
     let task = DesktopTaskRecord {
         task_id: task_id.clone(),
         workspace_id: ws_id,
-        role: req.role,
+        role: req.role.clone(),
         resolved_agent: resolved_agent.clone(),
         prompt: req.prompt.clone(),
         status: "queued".to_string(),
+        enforcement: enforcement.clone(),
+        session_id: None,
         steps: vec![step],
         created_at: now,
     };
@@ -913,6 +1369,9 @@ async fn create_task_handler(
         state,
         task_id,
         target_dir,
+        ws.org_id,
+        req.role,
+        enforcement,
         repo_label,
         resolved_agent,
         req.prompt,
@@ -1108,6 +1567,115 @@ async fn write_workspace_file_handler(
     }
 }
 
+async fn find_pending_cow_session(
+    state: &DesktopDaemonState,
+    target_dir: &Path,
+    explicit_session_id: Option<&str>,
+) -> Option<(String, PathBuf, Vec<aos_core::FileDiffEntry>, String)> {
+    let canon_target = std::fs::canonicalize(target_dir).unwrap_or_else(|_| target_dir.to_path_buf());
+    let mut candidates: Vec<(String, Value)> = Vec::new();
+    let mut seen = BTreeSet::new();
+
+    if let Some(sid) = explicit_session_id.map(str::trim).filter(|s| !s.is_empty()) {
+        if let Ok(Some((_dir, val))) = crate::launcher::load_session_by_id(&state.runtime_dir, sid) {
+            seen.insert(sid.to_string());
+            candidates.push((sid.to_string(), val));
+        }
+    } else {
+        if let Some(tracked_sid) = state
+            .workspace_sessions
+            .read()
+            .await
+            .get(&canon_target)
+            .cloned()
+        {
+            if let Ok(Some((_dir, val))) =
+                crate::launcher::load_session_by_id(&state.runtime_dir, &tracked_sid)
+            {
+                if seen.insert(tracked_sid.clone()) {
+                    candidates.push((tracked_sid, val));
+                }
+            }
+        }
+        for (_dir, val) in crate::launcher::list_sessions_for_workspace(&state.runtime_dir, &canon_target)
+        {
+            let Some(sid) = val.get("session_id").and_then(|v| v.as_str()) else {
+                continue;
+            };
+            if seen.insert(sid.to_string()) {
+                candidates.push((sid.to_string(), val));
+            }
+        }
+    }
+
+    for (sid, val) in candidates {
+        let status = val.get("status").and_then(|v| v.as_str()).unwrap_or("");
+        if status == "committed" || status == "discarded" {
+            continue;
+        }
+        let Some(shadow_str) = val.get("shadow").and_then(|v| v.as_str()) else {
+            continue;
+        };
+        let shadow_path = PathBuf::from(shadow_str);
+        if !shadow_path.is_dir() {
+            continue;
+        }
+        let Ok(diffs) = CoWWorkspace::diff_dirs(&canon_target, &shadow_path, None).await else {
+            continue;
+        };
+        if diffs.is_empty() && explicit_session_id.is_none() {
+            continue;
+        }
+        let Ok((_ev, evidence_hash)) = crate::launcher::approval_evidence(&diffs) else {
+            continue;
+        };
+        return Some((sid, shadow_path, diffs, evidence_hash));
+    }
+    None
+}
+
+async fn workspace_sessions_handler(
+    State(state): State<DesktopDaemonState>,
+    AxumPath(id): AxumPath<String>,
+    Query(q): Query<RepoQuery>,
+) -> Response {
+    let ws = {
+        let guard = state.workspaces.read().await;
+        guard.get(&id).cloned()
+    };
+    let Some(ws) = ws else {
+        return (
+            StatusCode::NOT_FOUND,
+            Json(json!({ "error": "workspace not found" })),
+        )
+            .into_response();
+    };
+    let (target_dir, active_repo) = match resolve_repo_root(&ws, q.repo.as_deref()) {
+        Ok(res) => res,
+        Err(resp) => return resp.into_response(),
+    };
+    let items: Vec<Value> = crate::launcher::list_sessions_for_workspace(&state.runtime_dir, &target_dir)
+        .into_iter()
+        .take(20)
+        .map(|(_dir, val)| {
+            json!({
+                "session_id": val.get("session_id").cloned().unwrap_or(Value::Null),
+                "status": val.get("status").cloned().unwrap_or(Value::Null),
+                "enforcement": val.get("enforcement").cloned().unwrap_or(Value::Null),
+                "agent_id": val.get("agent_id").cloned().unwrap_or(Value::Null),
+                "created_at_ms": val.get("created_at_ms").cloned().unwrap_or(Value::Null),
+                "shadow": val.get("shadow").cloned().unwrap_or(Value::Null),
+            })
+        })
+        .collect();
+    Json(json!({
+        "workspace_id": id,
+        "repo": active_repo,
+        "sessions": items,
+    }))
+    .into_response()
+}
+
 async fn workspace_diff_handler(
     State(state): State<DesktopDaemonState>,
     AxumPath(id): AxumPath<String>,
@@ -1129,9 +1697,37 @@ async fn workspace_diff_handler(
         Err(resp) => return resp.into_response(),
     };
     let is_git_repo = target_dir.join(".git").exists();
+
+    if let Some((sid, _shadow, diffs, evidence_hash)) =
+        find_pending_cow_session(&state, &target_dir, None).await
+    {
+        let changed_files: Vec<String> = diffs
+            .iter()
+            .map(|d| format!("{} {}", d.change_type.short_label(), d.relative_path))
+            .collect();
+        let diff_text = diffs
+            .iter()
+            .filter_map(|d| d.preview_diff.as_deref())
+            .collect::<Vec<_>>()
+            .join("\n");
+        return Json(json!({
+            "repo": active_repo,
+            "source": "cow_shadow",
+            "session_id": sid,
+            "evidence_hash": format!("sha256:{evidence_hash}"),
+            "is_git_repo": is_git_repo,
+            "changed_files": changed_files,
+            "diff_text": diff_text,
+        }))
+        .into_response();
+    }
+
     if !is_git_repo {
         return Json(json!({
             "repo": active_repo,
+            "source": "git",
+            "session_id": null,
+            "evidence_hash": null,
             "is_git_repo": false,
             "changed_files": Vec::<String>::new(),
             "diff_text": "",
@@ -1164,6 +1760,9 @@ async fn workspace_diff_handler(
         .unwrap_or_default();
     Json(json!({
         "repo": active_repo,
+        "source": "git",
+        "session_id": null,
+        "evidence_hash": null,
         "is_git_repo": true,
         "changed_files": changed_files,
         "diff_text": diff_text,
@@ -1177,6 +1776,12 @@ struct CommitWorkspaceRequest {
     message: Option<String>,
     #[serde(default)]
     paths: Vec<String>,
+    #[serde(default)]
+    session_id: Option<String>,
+    #[serde(default)]
+    expected_diff_hash: Option<String>,
+    #[serde(default)]
+    allow_sensitive: bool,
 }
 
 #[derive(Debug, Deserialize, Default)]
@@ -1184,6 +1789,8 @@ struct RollbackWorkspaceRequest {
     repo: Option<String>,
     #[serde(default)]
     paths: Vec<String>,
+    #[serde(default)]
+    session_id: Option<String>,
 }
 
 fn sanitize_repo_rel_paths(
@@ -1226,18 +1833,71 @@ async fn workspace_commit_handler(
         Ok(res) => res,
         Err(resp) => return resp.into_response(),
     };
-    if !target_dir.join(".git").exists() {
-        return (
-            StatusCode::BAD_REQUEST,
-            Json(json!({ "error": "target directory is not a git repository (select a child repo first)" })),
-        )
-            .into_response();
-    }
     let clean_paths = match sanitize_repo_rel_paths(&target_dir, active_repo.as_deref(), &req.paths)
     {
         Ok(p) => p,
         Err(resp) => return resp.into_response(),
     };
+
+    if let Some((sid, _shadow, diffs, _hash)) =
+        find_pending_cow_session(&state, &target_dir, req.session_id.as_deref()).await
+    {
+        if diffs.is_empty() {
+            return Json(json!({
+                "ok": true,
+                "committed": false,
+                "source": "cow_shadow",
+                "session_id": sid,
+                "repo": active_repo,
+                "summary": "No CoW shadow changes to land",
+            }))
+            .into_response();
+        }
+        let filter = (!clean_paths.is_empty()).then_some(clean_paths);
+        match crate::launcher::commit_with_expected_hash(
+            &state.runtime_dir,
+            Some(&sid),
+            filter,
+            req.allow_sensitive,
+            true,
+            req.expected_diff_hash.as_deref(),
+        )
+        .await
+        {
+            Ok(()) => {
+                let canon_target =
+                    std::fs::canonicalize(&target_dir).unwrap_or_else(|_| target_dir.clone());
+                let mut sessions_guard = state.workspace_sessions.write().await;
+                if sessions_guard.get(&canon_target).map(String::as_str) == Some(sid.as_str()) {
+                    sessions_guard.remove(&canon_target);
+                }
+                return Json(json!({
+                    "ok": true,
+                    "committed": true,
+                    "source": "cow_shadow",
+                    "session_id": sid,
+                    "repo": active_repo,
+                    "summary": format!("Landed {} CoW shadow change(s) to host ({sid})", diffs.len()),
+                }))
+                .into_response();
+            }
+            Err(e) => {
+                return (
+                    StatusCode::BAD_REQUEST,
+                    Json(json!({ "error": e.to_string() })),
+                )
+                    .into_response();
+            }
+        }
+    }
+
+    if !target_dir.join(".git").exists() {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(json!({ "error": "no pending CoW shadow session and target directory is not a git repository" })),
+        )
+            .into_response();
+    }
 
     let mut add_cmd = tokio::process::Command::new("git");
     if clean_paths.is_empty() {
@@ -1276,6 +1936,7 @@ async fn workspace_commit_handler(
         return Json(json!({
             "ok": true,
             "committed": false,
+            "source": "git",
             "repo": active_repo,
             "summary": "No changes to commit",
         }))
@@ -1307,6 +1968,7 @@ async fn workspace_commit_handler(
             Json(json!({
                 "ok": true,
                 "committed": true,
+                "source": "git",
                 "repo": active_repo,
                 "commit_hash": commit_hash,
                 "summary": String::from_utf8_lossy(&out.stdout).trim().to_string(),
@@ -1351,10 +2013,41 @@ async fn workspace_rollback_handler(
         Ok(res) => res,
         Err(resp) => return resp.into_response(),
     };
+
+    if let Some((sid, _shadow, diffs, _hash)) =
+        find_pending_cow_session(&state, &target_dir, req.session_id.as_deref()).await
+    {
+        match crate::launcher::discard(&state.runtime_dir, Some(&sid)) {
+            Ok(()) => {
+                let canon_target =
+                    std::fs::canonicalize(&target_dir).unwrap_or_else(|_| target_dir.clone());
+                let mut sessions_guard = state.workspace_sessions.write().await;
+                if sessions_guard.get(&canon_target).map(String::as_str) == Some(sid.as_str()) {
+                    sessions_guard.remove(&canon_target);
+                }
+                return Json(json!({
+                    "ok": true,
+                    "source": "cow_shadow",
+                    "session_id": sid,
+                    "repo": active_repo,
+                    "restored_paths": diffs.into_iter().map(|d| d.relative_path).collect::<Vec<_>>(),
+                }))
+                .into_response();
+            }
+            Err(e) => {
+                return (
+                    StatusCode::BAD_REQUEST,
+                    Json(json!({ "error": format!("discard CoW shadow failed: {e}") })),
+                )
+                    .into_response();
+            }
+        }
+    }
+
     if !target_dir.join(".git").exists() {
         return (
             StatusCode::BAD_REQUEST,
-            Json(json!({ "error": "target directory is not a git repository (select a child repo first)" })),
+            Json(json!({ "error": "no pending CoW shadow session and target directory is not a git repository" })),
         )
             .into_response();
     }
@@ -1374,6 +2067,7 @@ async fn workspace_rollback_handler(
     match checkout_cmd.current_dir(&target_dir).output().await {
         Ok(out) if out.status.success() => Json(json!({
             "ok": true,
+            "source": "git",
             "repo": active_repo,
             "restored_paths": if clean_paths.is_empty() { vec![".".to_string()] } else { clean_paths },
         }))
@@ -1527,6 +2221,7 @@ pub fn build_desktop_router(state: DesktopDaemonState) -> Router {
             "/v1/workspaces/:id/sync-policy",
             get(get_sync_policy_handler).patch(patch_sync_policy_handler),
         )
+        .route("/v1/workspaces/:id/sessions", get(workspace_sessions_handler))
         .route("/v1/workspaces/:id/tasks", post(create_task_handler))
         .route("/v1/tasks/:task_id/events", get(task_events_handler))
         .route("/v1/approvals", get(approvals_handler))
@@ -1554,7 +2249,9 @@ pub async fn run_desktop_daemon(
         home_dir: home_dir.to_path_buf(),
         human_token: human_token.clone(),
         simulate_tasks,
+        aegis_bin: None,
         workspaces: Arc::new(RwLock::new(BTreeMap::new())),
+        workspace_sessions: Arc::new(RwLock::new(HashMap::new())),
         tasks: Arc::new(RwLock::new(HashMap::new())),
         task_notify: Arc::new(Notify::new()),
         kernel,
@@ -1592,7 +2289,7 @@ pub async fn run_desktop_daemon(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use aos_core::{AgentIdentity, EscalationStatus, PolicyContext, PolicyDecision};
+    use aos_core::{AgentIdentity, EscalationStatus, PolicyContext, PolicyDecision, TransactionalWorkspace};
 
     fn run_git(dir: &Path, args: &[&str]) {
         let out = std::process::Command::new("git")
@@ -1696,7 +2393,9 @@ mod tests {
             home_dir: home.clone(),
             human_token: "aht_test_token_123".to_string(),
             simulate_tasks: true,
+            aegis_bin: None,
             workspaces: Arc::new(RwLock::new(BTreeMap::new())),
+            workspace_sessions: Arc::new(RwLock::new(HashMap::new())),
             tasks: Arc::new(RwLock::new(HashMap::new())),
             task_notify: Arc::new(Notify::new()),
             kernel: Arc::clone(&kernel),
@@ -1917,7 +2616,9 @@ mod tests {
             home_dir: home,
             human_token: "aht_test_token_123".to_string(),
             simulate_tasks: true,
+            aegis_bin: None,
             workspaces: Arc::new(RwLock::new(BTreeMap::new())),
+            workspace_sessions: Arc::new(RwLock::new(HashMap::new())),
             tasks: Arc::new(RwLock::new(HashMap::new())),
             task_notify: Arc::new(Notify::new()),
             kernel,
@@ -1926,5 +2627,312 @@ mod tests {
         let reloaded = state_reloaded.workspaces.read().await;
         assert!(reloaded.contains_key(&expected_ws_id));
         assert_eq!(reloaded[&expected_ws_id].org_id, "personal");
+    }
+
+    #[test]
+    fn desktop_task_command_wraps_aegis_run_and_parses_banner_and_session() {
+        let tmp = tempfile::tempdir().unwrap();
+        let fake_bin = tmp.path().join("aegis-os");
+        std::fs::write(&fake_bin, "#!/bin/sh\n").unwrap();
+        let ws_dir = tmp.path().join("ws");
+        let rt_dir = tmp.path().join("rt");
+
+        let (prog, args) = build_desktop_task_command(
+            Some(&fake_bin),
+            "enforced",
+            &rt_dir,
+            "my-org",
+            "coder",
+            &ws_dir,
+            "codex",
+            "/usr/local/bin/codex",
+            "Fix bug",
+        )
+        .unwrap();
+        assert_eq!(prog, fake_bin.display().to_string());
+        assert_eq!(
+            args,
+            vec![
+                "--org",
+                "my-org",
+                "--agent",
+                "codex",
+                "--client",
+                "codex",
+                "--role",
+                "coder",
+                "--workspace",
+                &ws_dir.display().to_string(),
+                "--runtime-dir",
+                &rt_dir.display().to_string(),
+                "run",
+                "--mode",
+                "implement",
+                "--enforcement",
+                "enforced",
+                "--",
+                "/usr/local/bin/codex",
+                "exec",
+                "Fix bug",
+            ]
+        );
+
+        let (iso_prog, iso_args) = build_desktop_task_command(
+            Some(&fake_bin),
+            "isolated",
+            &rt_dir,
+            "my-org",
+            "writer",
+            &ws_dir,
+            "claude",
+            "claude",
+            "Write draft",
+        )
+        .unwrap();
+        assert_eq!(iso_prog, fake_bin.display().to_string());
+        assert!(iso_args.contains(&"--isolated".to_string()));
+        assert!(iso_args.ends_with(&["--".into(), "claude".into(), "-p".into(), "Write draft".into()]));
+
+        let (direct_prog, direct_args) = build_desktop_task_command(
+            Some(&fake_bin),
+            "direct",
+            &rt_dir,
+            "my-org",
+            "analyst",
+            &ws_dir,
+            "opencode",
+            "/usr/bin/opencode",
+            "Summarize CSV",
+        )
+        .unwrap();
+        assert_eq!(direct_prog, "/usr/bin/opencode");
+        assert_eq!(direct_args, vec!["run", "Summarize CSV"]);
+
+        assert_eq!(
+            extract_session_id_from_stderr_line("  session: ses_abc123def456"),
+            Some("ses_abc123def456".to_string())
+        );
+        assert_eq!(extract_session_id_from_stderr_line("other stderr line"), None);
+        assert!(is_aegis_launcher_banner_line("Aegis · enforced (filesystem) · org/claude"));
+        assert!(is_aegis_launcher_banner_line("  shadow: /tmp/shadow"));
+        assert!(!is_aegis_launcher_banner_line("Error: rate limited"));
+    }
+
+    #[tokio::test]
+    async fn desktop_daemon_streams_aegis_run_output_and_handles_cow_diff_commit_and_rollback() {
+        let tmp = tempfile::tempdir().unwrap();
+        let rt = tmp.path().join("rt");
+        let home = tmp.path().join("home");
+        let ws_dir = tmp.path().join("non-git-ws");
+        std::fs::create_dir_all(&ws_dir).unwrap();
+        std::fs::write(ws_dir.join("note.md"), "Initial host line\n").unwrap();
+
+        // Create mock executable aegis-os script that streams stdout chunks and prints a CoW session id.
+        let mock_aegis = tmp.path().join("mock-aegis-os");
+        let script = r#"#!/usr/bin/env bash
+echo "Aegis · enforced (filesystem) · personal/claude" >&2
+echo "  session: ses_streamtest01" >&2
+echo "First streamed chunk"
+sleep 0.45
+echo "Second streamed chunk"
+"#;
+        std::fs::write(&mock_aegis, script).unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&mock_aegis, std::fs::Permissions::from_mode(0o755)).unwrap();
+        }
+
+        // Seed a realistic CoW session under runtime_dir/sessions/ses_streamtest01 with shadow edits.
+        let ses_id = "ses_streamtest01";
+        let ses_dir = rt.join("sessions").join(ses_id);
+        let cow_base = ses_dir.join("cow_workspace");
+        let canon_ws = std::fs::canonicalize(&ws_dir).unwrap();
+        let cow = CoWWorkspace::init(&canon_ws, &cow_base).await.unwrap();
+        let shadow_dir = cow.shadow_root().to_path_buf();
+        std::fs::write(shadow_dir.join("note.md"), "Initial host line\nUpdated by CoW shadow\n").unwrap();
+        std::fs::write(
+            ses_dir.join("session.json"),
+            serde_json::to_vec_pretty(&json!({
+                "session_id": ses_id,
+                "workspace": canon_ws.display().to_string(),
+                "shadow": shadow_dir.display().to_string(),
+                "agent_home": ses_dir.join("agent_home").display().to_string(),
+                "org_id": "personal",
+                "agent_id": "claude",
+                "mode": "implement",
+                "enforcement": "enforced",
+                "profile": "docs",
+                "status": "exited",
+                "created_at_ms": chrono::Utc::now().timestamp_millis(),
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+
+        let kernel = Arc::new(AegisRuntimeKernel::new(&rt).await.unwrap());
+        let state = DesktopDaemonState {
+            runtime_dir: rt.clone(),
+            home_dir: home,
+            human_token: "aht_stream_token".to_string(),
+            simulate_tasks: false,
+            aegis_bin: Some(mock_aegis),
+            workspaces: Arc::new(RwLock::new(BTreeMap::new())),
+            workspace_sessions: Arc::new(RwLock::new(HashMap::new())),
+            tasks: Arc::new(RwLock::new(HashMap::new())),
+            task_notify: Arc::new(Notify::new()),
+            kernel,
+        };
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let srv = tokio::spawn(async move {
+            let _ = axum::serve(listener, build_desktop_router(state)).await;
+        });
+
+        let ws_dir_clone = ws_dir.clone();
+        let rt_clone = rt.clone();
+        let outcome = tokio::task::spawn_blocking(move || -> anyhow::Result<()> {
+            let base = format!("http://127.0.0.1:{port}");
+            let agent = ureq::AgentBuilder::new().timeout(Duration::from_secs(10)).build();
+            let auth = "Bearer aht_stream_token";
+
+            let created: Value = agent
+                .post(&format!("{base}/v1/workspaces"))
+                .set("Authorization", auth)
+                .send_json(json!({ "name": "NonGit", "path": ws_dir_clone }))?
+                .into_json()?;
+            let ws_id = created["workspace"]["id"].as_str().unwrap().to_string();
+
+            // 1. Task runs via mock aegis-os wrapper, streams chunks incrementally, and extracts ses_streamtest01.
+            let t_resp: Value = agent
+                .post(&format!("{base}/v1/workspaces/{ws_id}/tasks"))
+                .set("Authorization", auth)
+                .send_json(json!({
+                    "role": "writer",
+                    "prompt": "Update note.md",
+                    "doc_refs": ["note.md"]
+                }))?
+                .into_json()?;
+            assert_eq!(t_resp["task"]["enforcement"], "enforced");
+            let task_id = t_resp["task"]["task_id"].as_str().unwrap().to_string();
+
+            let mut steps = Vec::new();
+            let mut after = 0usize;
+            let mut final_status = String::new();
+            for _ in 0..20 {
+                let ev: Value = agent
+                    .get(&format!("{base}/v1/tasks/{task_id}/events?after={after}&wait_ms=800"))
+                    .set("Authorization", auth)
+                    .call()?
+                    .into_json()?;
+                final_status = ev["status"].as_str().unwrap().to_string();
+                if let Some(arr) = ev["events"].as_array() {
+                    steps.extend(arr.iter().cloned());
+                }
+                after = ev["next_after"].as_u64().unwrap_or(0) as usize;
+                if final_status == "completed" || final_status == "failed" {
+                    break;
+                }
+            }
+            assert_eq!(final_status, "completed");
+            assert!(steps.iter().any(|s| s["kind"] == "session_started"));
+            let output_steps: Vec<_> = steps.iter().filter(|s| s["kind"] == "output").collect();
+            assert!(output_steps.len() >= 2, "expected incremental streaming steps, got {steps:?}");
+
+            // 2. Sessions list route surfaces ses_streamtest01.
+            let sessions_resp: Value = agent
+                .get(&format!("{base}/v1/workspaces/{ws_id}/sessions"))
+                .set("Authorization", auth)
+                .call()?
+                .into_json()?;
+            assert_eq!(sessions_resp["sessions"][0]["session_id"], ses_id);
+
+            // 3. Diff reads CoW shadow directly even though workspace has no .git directory.
+            let diff: Value = agent
+                .get(&format!("{base}/v1/workspaces/{ws_id}/diff"))
+                .set("Authorization", auth)
+                .call()?
+                .into_json()?;
+            assert_eq!(diff["source"], "cow_shadow");
+            assert_eq!(diff["session_id"], ses_id);
+            let ev_hash = diff["evidence_hash"].as_str().unwrap().to_string();
+            assert!(diff["diff_text"].as_str().unwrap().contains("Updated by CoW shadow"));
+
+            // 4. Stale expected_diff_hash fails TOCTOU check; valid hash lands CoW shadow to host.
+            let bad_commit = agent
+                .post(&format!("{base}/v1/workspaces/{ws_id}/commit"))
+                .set("Authorization", auth)
+                .send_json(json!({
+                    "session_id": ses_id,
+                    "expected_diff_hash": "sha256:0000000000000000"
+                }));
+            assert!(matches!(bad_commit, Err(ureq::Error::Status(400, _))));
+
+            let ok_commit: Value = match agent
+                .post(&format!("{base}/v1/workspaces/{ws_id}/commit"))
+                .set("Authorization", auth)
+                .send_json(json!({
+                    "session_id": ses_id,
+                    "expected_diff_hash": ev_hash
+                }))
+            {
+                Ok(resp) => resp.into_json()?,
+                Err(ureq::Error::Status(code, resp)) => {
+                    anyhow::bail!("commit failed with status {code}: {}", resp.into_string().unwrap_or_default());
+                }
+                Err(e) => return Err(e.into()),
+            };
+            assert_eq!(ok_commit["committed"], true);
+            assert_eq!(ok_commit["source"], "cow_shadow");
+            assert_eq!(
+                std::fs::read_to_string(ws_dir_clone.join("note.md")).unwrap(),
+                "Initial host line\nUpdated by CoW shadow\n"
+            );
+
+            // 5. Rollback on another CoW session discards its shadow without touching host.
+            let ses2_id = "ses_discardtest02";
+            let ses2_dir = rt_clone.join("sessions").join(ses2_id);
+            let cow2 = ses2_dir.join("cow_workspace");
+            let shadow2 = cow2.join("upper_workspace");
+            std::fs::create_dir_all(&shadow2).unwrap();
+            std::fs::write(shadow2.join("note.md"), "SHOULD BE DISCARDED\n").unwrap();
+            std::fs::write(
+                ses2_dir.join("session.json"),
+                serde_json::to_vec_pretty(&json!({
+                    "session_id": ses2_id,
+                    "workspace": std::fs::canonicalize(&ws_dir_clone).unwrap().display().to_string(),
+                    "shadow": shadow2.display().to_string(),
+                    "agent_home": ses2_dir.join("agent_home").display().to_string(),
+                    "org_id": "personal",
+                    "agent_id": "claude",
+                    "mode": "implement",
+                    "status": "exited",
+                    "created_at_ms": chrono::Utc::now().timestamp_millis() + 1000,
+                }))
+                .unwrap(),
+            )
+            .unwrap();
+
+            let rb: Value = agent
+                .post(&format!("{base}/v1/workspaces/{ws_id}/rollback"))
+                .set("Authorization", auth)
+                .send_json(json!({ "session_id": ses2_id }))?
+                .into_json()?;
+            assert_eq!(rb["ok"], true);
+            assert_eq!(rb["source"], "cow_shadow");
+            assert_eq!(rb["session_id"], ses2_id);
+            assert!(!ses2_dir.exists());
+            assert_eq!(
+                std::fs::read_to_string(ws_dir_clone.join("note.md")).unwrap(),
+                "Initial host line\nUpdated by CoW shadow\n"
+            );
+
+            Ok(())
+        })
+        .await
+        .unwrap();
+
+        srv.abort();
+        outcome.unwrap();
     }
 }

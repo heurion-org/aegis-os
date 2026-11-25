@@ -259,7 +259,7 @@ pub struct DesktopAgentStatus {
 }
 
 /// Built-in first-class local coding & writing agents supported by Aegis Desktop:
-/// `opencode`, `claude`, and `agy`.
+/// `claude`, `opencode`, `codex`, and `agy`.
 pub fn builtin_desktop_agents() -> Vec<DesktopAgentSpec> {
     vec![
         DesktopAgentSpec {
@@ -330,6 +330,41 @@ pub fn builtin_desktop_agents() -> Vec<DesktopAgentSpec> {
                 ],
                 docs_url: "https://opencode.ai/docs".to_string(),
                 notes: "支持 OpenAI / Anthropic / DeepSeek / 本地 Ollama".to_string(),
+            },
+        },
+        DesktopAgentSpec {
+            id: "codex".to_string(),
+            display_name: "Codex CLI".to_string(),
+            description: "OpenAI 终端代码与任务执行 Agent，支持代码重构、测试验证与结构化分析".to_string(),
+            roles: vec![
+                "coder".to_string(),
+                "analyst".to_string(),
+                "reviewer".to_string(),
+                "writer".to_string(),
+            ],
+            bin: vec!["codex".to_string()],
+            version_cmd: vec!["codex".to_string(), "--version".to_string()],
+            auth_files: vec![
+                "~/.codex/auth.json".to_string(),
+                "~/.codex/config.toml".to_string(),
+            ],
+            auth_login_cmd: vec!["codex".to_string(), "login".to_string()],
+            headless_flag: vec!["exec".to_string()],
+            install_recipe: AdapterInstallRecipe {
+                macos: vec![
+                    "npm".to_string(),
+                    "install".to_string(),
+                    "-g".to_string(),
+                    "@openai/codex".to_string(),
+                ],
+                linux: vec![
+                    "npm".to_string(),
+                    "install".to_string(),
+                    "-g".to_string(),
+                    "@openai/codex".to_string(),
+                ],
+                docs_url: "https://github.com/openai/codex".to_string(),
+                notes: "支持 OpenAI 账号 OAuth 登录或 OPENAI_API_KEY".to_string(),
             },
         },
         DesktopAgentSpec {
@@ -435,11 +470,12 @@ pub fn resolve_agent_for_role(
     }
     let norm = role.trim().to_ascii_lowercase();
     let role_priority: &[&str] = match norm.as_str() {
-        "writer" | "editor" => &["claude", "opencode", "agy"],
-        "researcher" => &["opencode", "agy", "claude"],
-        "slides" => &["agy", "claude", "opencode"],
-        "coder" => &["claude", "opencode", "agy"],
-        _ => &["claude", "opencode", "agy"],
+        "writer" | "editor" => &["claude", "opencode", "codex", "agy"],
+        "researcher" | "analyst" => &["opencode", "claude", "codex", "agy"],
+        "slides" => &["agy", "claude", "opencode", "codex"],
+        "reviewer" => &["claude", "codex", "opencode", "agy"],
+        "coder" => &["claude", "opencode", "codex", "agy"],
+        _ => &["claude", "opencode", "codex", "agy"],
     };
     for candidate in role_priority {
         if statuses
@@ -514,13 +550,13 @@ mod tests {
     fn builtin_desktop_agents_include_opencode_claude_and_agy_and_route_roles() {
         let specs = builtin_desktop_agents();
         let ids: Vec<&str> = specs.iter().map(|s| s.id.as_str()).collect();
-        assert_eq!(ids, vec!["claude", "opencode", "agy"]);
+        assert_eq!(ids, vec!["claude", "opencode", "codex", "agy"]);
 
         let tmp = tempfile::tempdir().unwrap();
         let statuses = probe_desktop_agents_with(tmp.path(), false);
-        assert_eq!(statuses.len(), 3);
+        assert_eq!(statuses.len(), 4);
 
-        // Simulate only opencode + agy installed, with opencode authenticated.
+        // Simulate opencode (authenticated) + codex + agy installed.
         let mock_statuses = vec![
             DesktopAgentStatus {
                 id: "claude".into(),
@@ -549,6 +585,19 @@ mod tests {
                 install_recipe: specs[1].install_recipe.clone(),
             },
             DesktopAgentStatus {
+                id: "codex".into(),
+                display_name: "Codex CLI".into(),
+                description: String::new(),
+                roles: vec!["coder".into(), "reviewer".into()],
+                installed: true,
+                binary_path: Some("/usr/local/bin/codex".into()),
+                version: Some("1.0.0".into()),
+                authenticated: true,
+                auth_hint: "已就绪".into(),
+                install_command_for_os: vec![],
+                install_recipe: specs[2].install_recipe.clone(),
+            },
+            DesktopAgentStatus {
                 id: "agy".into(),
                 display_name: "AGY".into(),
                 description: String::new(),
@@ -559,7 +608,7 @@ mod tests {
                 authenticated: false,
                 auth_hint: "点击授权登录".into(),
                 install_command_for_os: vec![],
-                install_recipe: specs[2].install_recipe.clone(),
+                install_recipe: specs[3].install_recipe.clone(),
             },
         ];
 
@@ -567,10 +616,18 @@ mod tests {
             resolve_agent_for_role("writer", None, &mock_statuses).as_deref(),
             Some("opencode")
         );
+        assert_eq!(
+            resolve_agent_for_role("reviewer", None, &mock_statuses).as_deref(),
+            Some("codex")
+        );
         // Authenticated opencode is preferred over unauthenticated agy unless explicitly overridden.
         assert_eq!(
             resolve_agent_for_role("slides", Some("agy"), &mock_statuses).as_deref(),
             Some("agy")
+        );
+        assert_eq!(
+            resolve_agent_for_role("coder", Some("codex"), &mock_statuses).as_deref(),
+            Some("codex")
         );
     }
 }
