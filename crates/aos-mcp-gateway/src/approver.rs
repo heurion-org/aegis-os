@@ -939,7 +939,7 @@ pub const APPROVE_PAGE_HTML: &str = r##"<!doctype html>
       'pkg_install_scripts',
       'host_exec',
       'github_pr_merge'
-    ].includes(esc.action) || !!ev.allow_scripts || !!ev.force_push || !!ev.force_tag;
+    ].includes(esc.action) || !!ev.allow_scripts || !!ev.force_push || !!ev.force_tag || !!ev.bootstrap_repo;
 
     const h = document.createElement('h1');
     if (isHighRisk) h.className = 'err';
@@ -961,6 +961,9 @@ pub const APPROVE_PAGE_HTML: &str = r##"<!doctype html>
       }
       if (ev.force_push) reasons.push('Includes destructive git force push');
       if (ev.force_tag) reasons.push('Includes force tag overwrite');
+      if (ev.bootstrap_repo) {
+        reasons.push('Initializes a new Git repo and binds origin -> ' + (ev.bootstrap_remote_url || 'local-only'));
+      }
       if (esc.action === 'github_pr_merge') reasons.push('Destructive PR merge on remote repository');
       warn.textContent = (esc.action === 'host_exec' ? 'HIGH RISK · HASH-LOCKED HOST EXEC: ' : 'HIGH RISK · ONE-SHOT APPROVAL ONLY: ') +
         (reasons.length ? reasons.join('; ') : 'Elevated security boundary review required') +
@@ -1017,6 +1020,8 @@ pub const APPROVE_PAGE_HTML: &str = r##"<!doctype html>
       fields.push(['Shadow Files', ev.shadow_paths.join(', ')]);
     }
     if (ev.branch) fields.push(['Target Branch', ev.branch]);
+    if (ev.bootstrap_repo) fields.push(['Bootstrap Repo', 'git init -b ' + (ev.bootstrap_branch || 'main')]);
+    if (ev.bootstrap_remote_url) fields.push(['Bootstrap Remote (origin)', ev.bootstrap_remote_url]);
     if (ev.commit_message) fields.push(['Commit Message', ev.commit_message]);
     if (ev.tag) fields.push(['Git Tag', ev.tag + (ev.force_tag ? ' (FORCE TAG)' : '')]);
     if (ev.push !== undefined) fields.push(['Git Push', String(!!ev.push) + (ev.force_push ? ' (FORCE PUSH)' : '')]);

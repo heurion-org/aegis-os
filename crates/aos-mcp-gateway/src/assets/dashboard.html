@@ -1257,7 +1257,7 @@
           'pkg_install_scripts',
           'host_exec',
           'github_pr_merge'
-        ].includes(esc.action) || !!ev.allow_scripts || !!ev.force_push || !!ev.force_tag;
+        ].includes(esc.action) || !!ev.allow_scripts || !!ev.force_push || !!ev.force_tag || !!ev.bootstrap_repo;
 
         const box = document.createElement('div');
         box.className = 'esc-card';
@@ -1317,6 +1317,11 @@
             warnBanner.textContent = currentLang === 'zh'
               ? '高危操作 · 哈希锁定宿主执行 (SHA-256 Pinned)：将在宿主机无沙箱平级运行，15m/1h 租约同样严格绑定冻结包 SHA-256，改动 1 字节即重审。'
               : 'HIGH RISK · HASH-LOCKED HOST EXEC: Runs unsandboxed on host as sibling process. 15m/1h leases stay pinned to identical bundle & args.';
+          } else if (ev.bootstrap_repo) {
+            const targetUrl = ev.bootstrap_remote_url || 'local-only';
+            warnBanner.textContent = currentLang === 'zh'
+              ? '高危操作 · 仅限单次锁定审批（One-Shot）：初始化宿主机 Git 仓库并绑定 origin -> ' + targetUrl + '，已禁用 15m/1h 租约快捷放行。'
+              : 'HIGH RISK · ONE-SHOT APPROVAL ONLY: Initializes host Git repo and binds origin -> ' + targetUrl + '. 15m/1h window leases are disabled.';
           } else {
             warnBanner.textContent = currentLang === 'zh'
               ? '高危操作 · 仅限单次锁定审批（SHA-256 Pinned）：涉及生命周期脚本、敏感路径、强制推送或 PR 合并，已禁用 15m/1h 租约快捷放行。'
@@ -1368,6 +1373,8 @@
           rows.push(['Shadow Files', ev.shadow_paths.join(', ')]);
         }
         if (ev.branch) rows.push(['Branch', ev.branch]);
+        if (ev.bootstrap_repo) rows.push([currentLang === 'zh' ? '初始化仓库' : 'Bootstrap Repo', 'git init -b ' + (ev.bootstrap_branch || 'main')]);
+        if (ev.bootstrap_remote_url) rows.push([currentLang === 'zh' ? '绑定 Remote (origin)' : 'Bootstrap Remote', ev.bootstrap_remote_url]);
         if (ev.commit_message) rows.push(['Commit Msg', ev.commit_message]);
         if (ev.tag) rows.push(['Tag', ev.tag + (ev.force_tag ? ' (FORCE)' : '')]);
         if (ev.push !== undefined) rows.push(['Push', String(!!ev.push) + (ev.force_push ? ' (FORCE)' : '')]);

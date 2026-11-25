@@ -2073,6 +2073,24 @@ impl PolicyEngine for AegisPolicyKernel {
                     sensitive_candidates.push(flag_res.to_string());
                 }
             }
+            if ctx
+                .metadata
+                .get("bootstrap_repo")
+                .and_then(|v| v.as_bool())
+                == Some(true)
+            {
+                let slug = ctx
+                    .metadata
+                    .get("bootstrap_remote_slug")
+                    .and_then(|v| v.as_str())
+                    .map(str::trim)
+                    .filter(|s| !s.is_empty())
+                    .unwrap_or("local-only");
+                let target_tag = format!("bootstrap_repo:{slug}");
+                if seen_sensitive_paths.insert(target_tag.clone()) {
+                    sensitive_candidates.push(target_tag);
+                }
+            }
             if ctx.metadata.get("skip_verify").and_then(|v| v.as_bool()) == Some(true)
                 && ctx
                     .metadata
@@ -2960,7 +2978,16 @@ impl PolicyEngine for AegisPolicyKernel {
             item.clone()
         };
 
-        let is_oneshot = ttl_secs <= 0 || target.action == "mcp_request_install";
+        let is_bootstrap_repo = target.action == "workspace_git_sensitive"
+            && (target.target_resource.contains("bootstrap_repo:")
+                || target
+                    .evidence
+                    .as_ref()
+                    .and_then(|ev| ev.get("bootstrap_repo"))
+                    .and_then(|v| v.as_bool())
+                    == Some(true));
+        let is_oneshot =
+            ttl_secs <= 0 || target.action == "mcp_request_install" || is_bootstrap_repo;
         let active_taint_ms = self
             .taints
             .read()
@@ -4192,6 +4219,71 @@ mod tests {
         assert!(
             matches!(kernel.evaluate(&sensitive_git).await.unwrap(), PolicyDecision::Allow { .. }),
             "Single approval of workspace_git_sensitive must also authorize companion workspace_git"
+        );
+    }
+
+    #[tokio::test]
+    async fn workspace_git_bootstrap_repo_bypasses_general_lease_and_forces_oneshot() {
+        let kernel = AegisPolicyKernel::with_state_file(None);
+        let agent = AgentIdentity::new("aegis-os", "agy-agent", "Lead");
+        let target_res = "git:/ws/heurion-doc#bootstrap:remote=heurion-org/heurion-doc,branch=main,push=true";
+
+        kernel
+            .grant_lease(LeaseGrant {
+                lease_id: "lease-general-bootstrap".to_string(),
+                org_id: "aegis-os".to_string(),
+                agent_id: "agy-agent".to_string(),
+                action_pattern: "workspace_git".to_string(),
+                resource_pattern: target_res.to_string(),
+                created_at_ms: 0,
+                expires_at_ms: Utc::now().timestamp_millis() + 600_000,
+                granted_by: "user".to_string(),
+                kind: LeaseKind::Ttl,
+                task_id: None,
+            })
+            .await
+            .unwrap();
+
+        let bootstrap_ctx = PolicyContext {
+            principal: agent,
+            action: "workspace_git".to_string(),
+            target_org_id: "aegis-os".to_string(),
+            target_resource: target_res.to_string(),
+            metadata: json!({
+                "host_root": "/ws/heurion-doc",
+                "bootstrap_repo": true,
+                "bootstrap_remote_slug": "heurion-org/heurion-doc",
+                "bootstrap_remote_url": "https://github.com/heurion-org/heurion-doc.git",
+                "evidence_hash": "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef",
+                "evidence": {
+                    "bootstrap_repo": true
+                }
+            }),
+        };
+
+        let esc_id = match kernel.evaluate(&bootstrap_ctx).await.unwrap() {
+            PolicyDecision::Ask { escalation_id, reason, .. } => {
+                assert!(
+                    reason.contains("HIGH RISK") && reason.contains("bootstrap_repo:heurion-org/heurion-doc"),
+                    "{reason}"
+                );
+                escalation_id
+            }
+            other => panic!("Expected workspace_git_sensitive Ask, got {other:?}"),
+        };
+
+        // Even when requesting a 1h TTL, bootstrap_repo forces LeaseKind::OneShot.
+        let lease = kernel.approve_escalation(&esc_id, 3600, "user").await.unwrap();
+        assert_eq!(lease.kind, LeaseKind::OneShot);
+        assert!(lease.resource_pattern.contains("#sha256:"));
+
+        assert!(
+            matches!(kernel.evaluate(&bootstrap_ctx).await.unwrap(), PolicyDecision::Allow { .. }),
+            "First evaluation after one-shot approval must be allowed"
+        );
+        assert!(
+            matches!(kernel.evaluate(&bootstrap_ctx).await.unwrap(), PolicyDecision::Ask { .. }),
+            "Second evaluation must require fresh approval (forced One-Shot)"
         );
     }
 

@@ -611,6 +611,12 @@ struct HostGitPlan {
     overwrite_binaries: bool,
     skip_verify: bool,
     shadow_evidence_hash: Option<String>,
+    bootstrap_repo: bool,
+    bootstrap_branch: Option<String>,
+    bootstrap_remote_url: Option<String>,
+    bootstrap_remote_slug: Option<String>,
+    bootstrap_stage_all: bool,
+    bootstrap_snapshot_hash: Option<String>,
     checkout_branch: Option<String>,
     create_branch: bool,
     sync_mode: Option<String>,
@@ -876,11 +882,145 @@ fn discover_child_git_repos_sync(dir: &Path) -> Vec<Value> {
     out
 }
 
+/// Validate a raw remote URL exclusively for explicit one-shot `bootstrap_repo: true`.
+/// Only canonical `https://github.com/<owner>/<repo>[.git]` or `git@github.com:<owner>/<repo>[.git]`
+/// endpoints are permitted; raw `ext::`, `file://`, `ssh://`, embedded credentials, and non-GitHub
+/// hosts are strictly rejected.
+fn validate_bootstrap_remote_url(raw: &str) -> anyhow::Result<(String, String)> {
+    let trimmed = raw.trim();
+    if trimmed.is_empty()
+        || trimmed.len() > 256
+        || trimmed.starts_with('-')
+        || trimmed.contains('\\')
+        || trimmed.contains('\0')
+        || trimmed.contains('?')
+        || trimmed.contains('#')
+        || trimmed.contains('%')
+        || trimmed.contains("..")
+        || trimmed.chars().any(|c| c.is_whitespace() || c.is_control())
+    {
+        bail!(
+            "Invalid bootstrap_remote_url '{}': rejected unsafe URL characters",
+            trimmed
+        );
+    }
+
+    let slug = if let Some(rest) = trimmed.strip_prefix("https://github.com/") {
+        if rest.contains('@') || rest.contains(':') || rest.contains("//") {
+            bail!(
+                "Invalid bootstrap_remote_url '{}': embedded credentials/ports forbidden",
+                trimmed
+            );
+        }
+        rest.strip_suffix(".git").unwrap_or(rest)
+    } else if let Some(rest) = trimmed.strip_prefix("git@github.com:") {
+        if rest.contains('@') || rest.contains(':') || rest.contains("//") {
+            bail!(
+                "Invalid bootstrap_remote_url '{}': malformed SSH GitHub path",
+                trimmed
+            );
+        }
+        rest.strip_suffix(".git").unwrap_or(rest)
+    } else {
+        bail!(
+            "Invalid bootstrap_remote_url '{}': only https://github.com/<owner>/<repo>[.git] or git@github.com:<owner>/<repo>[.git] are allowed",
+            trimmed
+        );
+    };
+
+    if !is_valid_github_repo_slug(slug) {
+        bail!(
+            "Invalid GitHub repository slug '{}' in bootstrap_remote_url '{}'",
+            slug,
+            trimmed
+        );
+    }
+
+    Ok((trimmed.to_string(), slug.to_string()))
+}
+
+fn is_bootstrap_ignored_entry(name: &str) -> bool {
+    matches!(
+        name,
+        ".git" | "node_modules" | "target" | "dist" | "build" | ".DS_Store"
+    ) || name.ends_with(".sqlite")
+        || name.ends_with(".db")
+}
+
+fn compute_bootstrap_tree_snapshot(host_root: &Path) -> anyhow::Result<(usize, String)> {
+    let mut entries: Vec<(String, PathBuf)> = Vec::new();
+    let mut stack: Vec<PathBuf> = vec![host_root.to_path_buf()];
+    const MAX_FILES: usize = 5000;
+
+    while let Some(dir) = stack.pop() {
+        let Ok(rd) = std::fs::read_dir(&dir) else {
+            continue;
+        };
+        let mut children: Vec<_> = rd.flatten().collect();
+        children.sort_by_key(|e| e.file_name());
+        for ent in children {
+            let name = ent.file_name().to_string_lossy().to_string();
+            if is_bootstrap_ignored_entry(&name) {
+                continue;
+            }
+            let path = ent.path();
+            let Ok(meta) = std::fs::symlink_metadata(&path) else {
+                continue;
+            };
+            if meta.file_type().is_dir() {
+                stack.push(path);
+            } else if meta.file_type().is_file() || meta.file_type().is_symlink() {
+                if entries.len() >= MAX_FILES {
+                    bail!(
+                        "Directory '{}' exceeds {MAX_FILES} files for workspace_git bootstrap snapshot",
+                        host_root.display()
+                    );
+                }
+                let rel = path
+                    .strip_prefix(host_root)
+                    .unwrap_or(&path)
+                    .to_string_lossy()
+                    .replace('\\', "/");
+                entries.push((rel, path));
+            }
+        }
+    }
+
+    entries.sort_by(|a, b| a.0.cmp(&b.0));
+    let mut hasher = Sha256::new();
+    hasher.update((entries.len() as u64).to_le_bytes());
+    for (rel, full) in &entries {
+        hasher.update(rel.as_bytes());
+        hasher.update([0u8]);
+        let meta = std::fs::symlink_metadata(full)?;
+        if meta.file_type().is_symlink() {
+            let target = std::fs::read_link(full)?;
+            hasher.update(b"L");
+            hasher.update(target.to_string_lossy().as_bytes());
+        } else {
+            let bytes = std::fs::read(full)?;
+            let fh = Sha256::digest(&bytes);
+            hasher.update(b"F");
+            hasher.update((bytes.len() as u64).to_le_bytes());
+            hasher.update(fh);
+        }
+    }
+    Ok((entries.len(), hex::encode(hasher.finalize())))
+}
+
 /// Resolve the target Git repository root from an optional `repo` (or `workspace_repo`)
 /// relative path argument inside `workspace_host_root`, enforcing strict path/symlink containment.
 fn resolve_git_repo_target(
     workspace_host_root: &Path,
     repo_arg: Option<&str>,
+) -> anyhow::Result<(PathBuf, Option<String>)> {
+    resolve_git_repo_target_with_options(workspace_host_root, repo_arg, false)
+}
+
+fn resolve_git_repo_target_with_options(
+    workspace_host_root: &Path,
+    repo_arg: Option<&str>,
+    allow_uninitialized: bool,
 ) -> anyhow::Result<(PathBuf, Option<String>)> {
     let ws_canon = std::fs::canonicalize(workspace_host_root)
         .unwrap_or_else(|_| workspace_host_root.to_path_buf());
@@ -893,6 +1033,9 @@ fn resolve_git_repo_target(
             .filter_map(|v| v.get("name").and_then(|n| n.as_str()).map(str::to_string))
             .collect();
         if discovered.is_empty() {
+            if allow_uninitialized {
+                return Ok((ws_canon, None));
+            }
             bail!("Host workspace '{}' is not a Git repository", ws_canon.display());
         }
         bail!(
@@ -920,7 +1063,7 @@ fn resolve_git_repo_target(
         }
     }
     if clean_parts.is_empty() {
-        if ws_canon.join(".git").exists() {
+        if ws_canon.join(".git").exists() || allow_uninitialized {
             return Ok((ws_canon, None));
         }
         bail!("Host workspace '{}' is not a Git repository", ws_canon.display());
@@ -943,7 +1086,7 @@ fn resolve_git_repo_target(
             ws_canon.display()
         );
     }
-    if !repo_canon.join(".git").exists() {
+    if !allow_uninitialized && !repo_canon.join(".git").exists() {
         bail!(
             "Directory '{}' under workspace '{}' is not a Git repository (missing .git)",
             clean_rel,
@@ -1065,10 +1208,70 @@ async fn execute_workspace_git_plan(
         }
     }
 
-    let need_shadow_refresh = plan.sync_mode.is_some() || plan.checkout_branch.is_some();
+    let need_shadow_refresh =
+        plan.bootstrap_repo || plan.sync_mode.is_some() || plan.checkout_branch.is_some();
     let identity_org = identity.org_id.clone();
     let identity_agent = identity.agent_id.clone();
     let git_result = tokio::task::spawn_blocking(move || {
+        if plan.bootstrap_repo {
+            if !plan.host_root.join(".git").exists() {
+                let branch = plan.bootstrap_branch.as_deref().unwrap_or("main");
+                let init_out = run_sanitized_host_git(
+                    &plan.git_bin,
+                    &plan.host_root,
+                    &[],
+                    &["init".to_string(), "-b".to_string(), branch.to_string()],
+                )?;
+                if !init_out.status.success() {
+                    bail!(
+                        "git init failed: {}",
+                        String::from_utf8_lossy(&init_out.stderr).trim()
+                    );
+                }
+            }
+            if let Some(ref remote_url) = plan.bootstrap_remote_url {
+                let existing = run_sanitized_host_git(
+                    &plan.git_bin,
+                    &plan.host_root,
+                    &[],
+                    &[
+                        "remote".to_string(),
+                        "get-url".to_string(),
+                        "--".to_string(),
+                        "origin".to_string(),
+                    ],
+                )?;
+                if existing.status.success() {
+                    let cur = String::from_utf8_lossy(&existing.stdout).trim().to_string();
+                    if cur != *remote_url {
+                        bail!(
+                            "TOCTOU error: host repo '{}' now has origin '{}' (refusing overwrite)",
+                            plan.host_root.display(),
+                            cur
+                        );
+                    }
+                } else {
+                    let add_out = run_sanitized_host_git(
+                        &plan.git_bin,
+                        &plan.host_root,
+                        &[],
+                        &[
+                            "remote".to_string(),
+                            "add".to_string(),
+                            "origin".to_string(),
+                            remote_url.clone(),
+                        ],
+                    )?;
+                    if !add_out.status.success() {
+                        bail!(
+                            "git remote add origin failed: {}",
+                            String::from_utf8_lossy(&add_out.stderr).trim()
+                        );
+                    }
+                }
+            }
+        }
+
         let mut checked_out_branch = None;
         if let Some(ref branch_name) = plan.checkout_branch {
             let co_args = if plan.create_branch {
@@ -1160,33 +1363,70 @@ async fn execute_workspace_git_plan(
             .collect();
 
         if let Some(ref msg) = plan.commit_message {
-            let mut add_args = vec!["add".to_string(), "--".to_string()];
-            add_args.extend(plan.paths.iter().cloned());
-            let add_out = run_sanitized_host_git(&plan.git_bin, &plan.host_root, &[], &add_args)?;
-            if !add_out.status.success() {
-                bail!(
-                    "git add failed: {}",
-                    String::from_utf8_lossy(&add_out.stderr).trim()
-                );
-            }
+            if plan.bootstrap_stage_all {
+                let (_, current_snap) = compute_bootstrap_tree_snapshot(&plan.host_root)?;
+                if plan.bootstrap_snapshot_hash.as_deref() != Some(current_snap.as_str()) {
+                    bail!(
+                        "TOCTOU integrity error: host directory files changed after bootstrap_repo approval; re-request workspace_git approval"
+                    );
+                }
+                let add_out = run_sanitized_host_git(
+                    &plan.git_bin,
+                    &plan.host_root,
+                    &[],
+                    &["add".to_string(), "-A".to_string()],
+                )?;
+                if !add_out.status.success() {
+                    bail!(
+                        "git add -A failed: {}",
+                        String::from_utf8_lossy(&add_out.stderr).trim()
+                    );
+                }
+                let mut commit_args = vec!["commit".to_string(), "-m".to_string(), msg.clone()];
+                for trailer in &plan.trailers {
+                    commit_args.push("-m".to_string());
+                    commit_args.push(trailer.clone());
+                }
+                let commit_out = run_sanitized_host_git(
+                    &plan.git_bin,
+                    &plan.host_root,
+                    &author_cfg_refs,
+                    &commit_args,
+                )?;
+                if !commit_out.status.success() {
+                    let err = String::from_utf8_lossy(&commit_out.stderr).trim().to_string();
+                    let out = String::from_utf8_lossy(&commit_out.stdout).trim().to_string();
+                    bail!("git commit failed: {}", if err.is_empty() { out } else { err });
+                }
+            } else {
+                let mut add_args = vec!["add".to_string(), "--".to_string()];
+                add_args.extend(plan.paths.iter().cloned());
+                let add_out = run_sanitized_host_git(&plan.git_bin, &plan.host_root, &[], &add_args)?;
+                if !add_out.status.success() {
+                    bail!(
+                        "git add failed: {}",
+                        String::from_utf8_lossy(&add_out.stderr).trim()
+                    );
+                }
 
-            let mut commit_args = vec!["commit".to_string(), "-m".to_string(), msg.clone()];
-            for trailer in &plan.trailers {
-                commit_args.push("-m".to_string());
-                commit_args.push(trailer.clone());
-            }
-            commit_args.push("--".to_string());
-            commit_args.extend(plan.paths.iter().cloned());
-            let commit_out = run_sanitized_host_git(
-                &plan.git_bin,
-                &plan.host_root,
-                &author_cfg_refs,
-                &commit_args,
-            )?;
-            if !commit_out.status.success() {
-                let err = String::from_utf8_lossy(&commit_out.stderr).trim().to_string();
-                let out = String::from_utf8_lossy(&commit_out.stdout).trim().to_string();
-                bail!("git commit failed: {}", if err.is_empty() { out } else { err });
+                let mut commit_args = vec!["commit".to_string(), "-m".to_string(), msg.clone()];
+                for trailer in &plan.trailers {
+                    commit_args.push("-m".to_string());
+                    commit_args.push(trailer.clone());
+                }
+                commit_args.push("--".to_string());
+                commit_args.extend(plan.paths.iter().cloned());
+                let commit_out = run_sanitized_host_git(
+                    &plan.git_bin,
+                    &plan.host_root,
+                    &author_cfg_refs,
+                    &commit_args,
+                )?;
+                if !commit_out.status.success() {
+                    let err = String::from_utf8_lossy(&commit_out.stderr).trim().to_string();
+                    let out = String::from_utf8_lossy(&commit_out.stdout).trim().to_string();
+                    bail!("git commit failed: {}", if err.is_empty() { out } else { err });
+                }
             }
         }
 
@@ -1225,6 +1465,9 @@ async fn execute_workspace_git_plan(
             if let Some(ref branch) = plan.push_branch {
                 let refspec = format!("refs/heads/{branch}:refs/heads/{branch}");
                 let mut push_args = vec!["push".to_string()];
+                if plan.bootstrap_repo {
+                    push_args.push("-u".to_string());
+                }
                 if plan.force_push {
                     push_args.push("--force-with-lease".to_string());
                 }
@@ -1266,6 +1509,10 @@ async fn execute_workspace_git_plan(
             "host_root": plan.host_root,
             "repo": plan.repo_rel,
             "head_sha": new_head_sha,
+            "bootstrapped": plan.bootstrap_repo,
+            "bootstrap_branch": plan.bootstrap_branch,
+            "bootstrap_remote_url": plan.bootstrap_remote_url,
+            "bootstrap_remote_slug": plan.bootstrap_remote_slug,
             "shadow_committed_files": shadow_committed,
             "verified_shadow": verified_shadow,
             "checked_out_branch": checked_out_branch,
@@ -1276,7 +1523,7 @@ async fn execute_workspace_git_plan(
             "force_tag": plan.force_tag,
             "force_push": plan.force_push,
             "pushed": plan.push,
-            "remote": (plan.push || plan.sync_mode.is_some()).then_some(plan.remote),
+            "remote": (plan.push || plan.sync_mode.is_some() || plan.bootstrap_remote_url.is_some()).then_some(plan.remote),
             "remote_url": plan.remote_url,
             "pushed_refs": pushed_refs,
             "evidence_hash": plan.evidence_hash,
@@ -5066,10 +5313,50 @@ impl AegisRuntimeKernel {
         identity: &AgentIdentity,
         args: &Value,
     ) -> anyhow::Result<(HostGitPlan, String, Vec<aos_core::FileDiffEntry>, Value)> {
+        let bootstrap_repo = args
+            .get("bootstrap_repo")
+            .and_then(|v| v.as_bool())
+            .unwrap_or(false);
+        let raw_bootstrap_url = args
+            .get("bootstrap_remote_url")
+            .and_then(|v| v.as_str())
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .map(str::to_string);
+        let raw_bootstrap_branch = args
+            .get("bootstrap_branch")
+            .and_then(|v| v.as_str())
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .map(str::to_string);
+        if !bootstrap_repo && (raw_bootstrap_url.is_some() || raw_bootstrap_branch.is_some()) {
+            bail!("'bootstrap_remote_url' and 'bootstrap_branch' require 'bootstrap_repo: true'");
+        }
+
         let repo_arg = args.get("repo").and_then(|v| v.as_str());
-        let (host_root, repo_rel) =
-            resolve_git_repo_target(env.workspace.host_source_root(), repo_arg)?;
+        let (host_root, repo_rel) = resolve_git_repo_target_with_options(
+            env.workspace.host_source_root(),
+            repo_arg,
+            bootstrap_repo,
+        )?;
         let git_bin = resolve_system_git_binary()?;
+
+        let (bootstrap_remote_url, bootstrap_remote_slug) = match raw_bootstrap_url {
+            Some(ref raw) => {
+                let (u, s) = validate_bootstrap_remote_url(raw)?;
+                (Some(u), Some(s))
+            }
+            None => (None, None),
+        };
+        let bootstrap_branch = if bootstrap_repo {
+            let b = raw_bootstrap_branch.unwrap_or_else(|| "main".to_string());
+            if !is_safe_git_ref_name(&git_bin, &host_root, &b) {
+                bail!("Invalid Git bootstrap branch name '{}'", b);
+            }
+            Some(b)
+        } else {
+            None
+        };
 
         let raw_paths: Vec<String> = args
             .get("paths")
@@ -5196,6 +5483,49 @@ impl AegisRuntimeKernel {
             .to_string();
         let branch_arg = args.get("branch").and_then(|v| v.as_str());
 
+        if bootstrap_repo {
+            if remote != "origin" {
+                bail!("bootstrap_repo requires remote 'origin' (got '{}')", remote);
+            }
+            if sync_mode.is_some() {
+                bail!("Cannot pass 'sync' together with 'bootstrap_repo: true'");
+            }
+            if host_root.join(".git").exists() {
+                let existing = run_sanitized_host_git(
+                    &git_bin,
+                    &host_root,
+                    &[],
+                    &[
+                        "remote".to_string(),
+                        "get-url".to_string(),
+                        "--".to_string(),
+                        "origin".to_string(),
+                    ],
+                )?;
+                if existing.status.success() {
+                    let existing_url = String::from_utf8_lossy(&existing.stdout).trim().to_string();
+                    if bootstrap_remote_url.as_deref() == Some(existing_url.as_str()) {
+                        bail!(
+                            "Host repository '{}' already has 'origin' set to '{}'; omit 'bootstrap_repo' and use normal workspace_git",
+                            host_root.display(),
+                            existing_url
+                        );
+                    }
+                    bail!(
+                        "Refusing to overwrite existing 'origin' remote ('{}') on '{}' via bootstrap_repo",
+                        existing_url,
+                        host_root.display()
+                    );
+                }
+                if bootstrap_remote_url.is_none() {
+                    bail!(
+                        "Host repository '{}' already has .git initialized; pass 'bootstrap_remote_url' to bind origin or omit 'bootstrap_repo'",
+                        host_root.display()
+                    );
+                }
+            }
+        }
+
         if auto_commit_shadow {
             let _ = env.workspace.refresh_from_host().await;
         }
@@ -5232,19 +5562,36 @@ impl AegisRuntimeKernel {
                 .collect();
         }
 
-        if !auto_commit_shadow
+        if !bootstrap_repo
+            && !auto_commit_shadow
             && checkout_branch.is_none()
             && sync_mode.is_none()
             && commit_message.is_none()
             && tag.is_none()
             && !push
         {
-            bail!("workspace_git requires at least one of 'commit_message', 'tag', 'push: true', 'checkout_branch', 'sync', or 'auto_commit_shadow: true'");
+            bail!("workspace_git requires at least one of 'bootstrap_repo', 'commit_message', 'tag', 'push: true', 'checkout_branch', 'sync', or 'auto_commit_shadow: true'");
         }
+        let mut bootstrap_stage_all = false;
+        let mut bootstrap_file_count = 0usize;
+        let mut bootstrap_snapshot_hash: Option<String> = None;
         if commit_message.is_some() && paths.is_empty() {
-            bail!(
-                "workspace_git requires explicit repo-relative 'paths' (or uncommitted CoW edits with auto_commit_shadow: true) when 'commit_message' is set"
-            );
+            if bootstrap_repo {
+                bootstrap_stage_all = true;
+                let (cnt, snap) = compute_bootstrap_tree_snapshot(&host_root)?;
+                if cnt == 0 {
+                    bail!(
+                        "Cannot commit during bootstrap_repo: directory '{}' has no non-ignored files",
+                        host_root.display()
+                    );
+                }
+                bootstrap_file_count = cnt;
+                bootstrap_snapshot_hash = Some(snap);
+            } else {
+                bail!(
+                    "workspace_git requires explicit repo-relative 'paths' (or uncommitted CoW edits with auto_commit_shadow: true) when 'commit_message' is set"
+                );
+            }
         }
         if commit_message.is_none() && !paths.is_empty() && !auto_commit_shadow {
             bail!(
@@ -5319,7 +5666,7 @@ impl AegisRuntimeKernel {
             })
             .cloned()
             .collect();
-        if commit_message.is_some() && !host_only_paths.is_empty() {
+        if commit_message.is_some() && !host_only_paths.is_empty() && host_root.join(".git").exists() {
             let mut status_args = vec![
                 "status".to_string(),
                 "--porcelain".to_string(),
@@ -5343,14 +5690,18 @@ impl AegisRuntimeKernel {
             }
         }
 
-        let head_out = run_sanitized_host_git(
-            &git_bin,
-            &host_root,
-            &[],
-            &["rev-parse".to_string(), "--verify".to_string(), "HEAD".to_string()],
-        )?;
-        let head_sha = if head_out.status.success() {
-            String::from_utf8_lossy(&head_out.stdout).trim().to_string()
+        let head_sha = if host_root.join(".git").exists() {
+            let head_out = run_sanitized_host_git(
+                &git_bin,
+                &host_root,
+                &[],
+                &["rev-parse".to_string(), "--verify".to_string(), "HEAD".to_string()],
+            )?;
+            if head_out.status.success() {
+                String::from_utf8_lossy(&head_out.stdout).trim().to_string()
+            } else {
+                "UNBORN".to_string()
+            }
         } else {
             "UNBORN".to_string()
         };
@@ -5382,7 +5733,7 @@ impl AegisRuntimeKernel {
             }
         }
 
-        let mut remote_url = None;
+        let mut remote_url = bootstrap_remote_url.clone();
         let mut push_branch = None;
         if push || sync_mode.is_some() {
             if !is_safe_remote_name(&remote) {
@@ -5391,25 +5742,47 @@ impl AegisRuntimeKernel {
                     remote
                 );
             }
-            let url_out = run_sanitized_host_git(
-                &git_bin,
-                &host_root,
-                &[],
-                &[
-                    "remote".to_string(),
-                    "get-url".to_string(),
-                    "--".to_string(),
-                    remote.clone(),
-                ],
-            )?;
-            if !url_out.status.success() {
-                bail!(
-                    "Git remote '{}' is not configured in host repository '{}'",
-                    remote,
-                    host_root.display()
-                );
+            if bootstrap_repo {
+                if remote_url.is_none() && host_root.join(".git").exists() {
+                    let url_out = run_sanitized_host_git(
+                        &git_bin,
+                        &host_root,
+                        &[],
+                        &[
+                            "remote".to_string(),
+                            "get-url".to_string(),
+                            "--".to_string(),
+                            remote.clone(),
+                        ],
+                    )?;
+                    if url_out.status.success() {
+                        remote_url = Some(String::from_utf8_lossy(&url_out.stdout).trim().to_string());
+                    }
+                }
+                if remote_url.is_none() {
+                    bail!("bootstrap_repo with push: true requires 'bootstrap_remote_url'");
+                }
+            } else {
+                let url_out = run_sanitized_host_git(
+                    &git_bin,
+                    &host_root,
+                    &[],
+                    &[
+                        "remote".to_string(),
+                        "get-url".to_string(),
+                        "--".to_string(),
+                        remote.clone(),
+                    ],
+                )?;
+                if !url_out.status.success() {
+                    bail!(
+                        "Git remote '{}' is not configured in host repository '{}'",
+                        remote,
+                        host_root.display()
+                    );
+                }
+                remote_url = Some(String::from_utf8_lossy(&url_out.stdout).trim().to_string());
             }
-            remote_url = Some(String::from_utf8_lossy(&url_out.stdout).trim().to_string());
 
             push_branch = match branch_arg {
                 Some(s) if s.trim().is_empty() => {
@@ -5429,6 +5802,8 @@ impl AegisRuntimeKernel {
                 None => {
                     if let Some(ref cb) = checkout_branch {
                         Some(cb.clone())
+                    } else if let Some(ref bb) = bootstrap_branch {
+                        Some(bb.clone())
                     } else {
                         let sym = run_sanitized_host_git(
                             &git_bin,
@@ -5465,6 +5840,23 @@ impl AegisRuntimeKernel {
             format!("+Repository: {}", host_root.display()),
             format!("+Base HEAD:  {}", head_sha),
         ];
+        if bootstrap_repo {
+            plan_lines.push(format!(
+                "+BOOTSTRAP: git init -b {}",
+                bootstrap_branch.as_deref().unwrap_or("main")
+            ));
+            plan_lines.push(format!(
+                "+REMOTE:    origin -> {}",
+                bootstrap_remote_url.as_deref().unwrap_or("<local-only>")
+            ));
+            if bootstrap_stage_all {
+                plan_lines.push(format!(
+                    "+FILES:     {} non-ignored file(s) staged via git add -A (snapshot=sha256:{})",
+                    bootstrap_file_count,
+                    bootstrap_snapshot_hash.as_deref().unwrap_or("?")
+                ));
+            }
+        }
         if auto_commit_shadow {
             plan_lines.push(format!(
                 "+AutoShadow: true ({} file(s), skip_verify={}, verify_cmd={})",
@@ -5601,6 +5993,12 @@ impl AegisRuntimeKernel {
             "auto_commit_shadow": auto_commit_shadow,
             "shadow_paths": shadow_paths,
             "shadow_evidence_hash": shadow_evidence_hash,
+            "bootstrap_repo": bootstrap_repo,
+            "bootstrap_branch": bootstrap_branch,
+            "bootstrap_remote_url": bootstrap_remote_url,
+            "bootstrap_remote_slug": bootstrap_remote_slug,
+            "bootstrap_stage_all": bootstrap_stage_all,
+            "bootstrap_snapshot_hash": bootstrap_snapshot_hash,
             "overwrite_binaries": overwrite_binaries,
             "skip_verify": skip_verify,
             "verify_cmd": verify_cmd,
@@ -5619,7 +6017,15 @@ impl AegisRuntimeKernel {
         }))?;
         let evidence_hash = hex::encode(Sha256::digest(&canonical_plan));
 
-        let mut target_resource = if push {
+        let mut target_resource = if bootstrap_repo {
+            format!(
+                "git:{}#bootstrap:remote={},branch={},push={}",
+                host_root.display(),
+                bootstrap_remote_slug.as_deref().unwrap_or("local-only"),
+                bootstrap_branch.as_deref().unwrap_or("main"),
+                push
+            )
+        } else if push {
             let base = format!(
                 "git:{}#push:{}:branch={},tag={},force_tag={}",
                 host_root.display(),
@@ -5642,7 +6048,14 @@ impl AegisRuntimeKernel {
         } else {
             format!("git:{}#local", host_root.display())
         };
-        if !push && auto_commit_shadow && !shadow_paths.is_empty() && sync_mode.is_none() && checkout_branch.is_none() && tag.is_none() {
+        if !bootstrap_repo
+            && !push
+            && auto_commit_shadow
+            && !shadow_paths.is_empty()
+            && sync_mode.is_none()
+            && checkout_branch.is_none()
+            && tag.is_none()
+        {
             // Keep clean `#local` prefix with explicit shadow indicator only when needed.
             target_resource = format!("git:{}#local:auto_shadow", host_root.display());
         }
@@ -5654,6 +6067,12 @@ impl AegisRuntimeKernel {
             "paths": paths,
             "shadow_paths": shadow_paths,
             "auto_commit_shadow": auto_commit_shadow,
+            "bootstrap_repo": bootstrap_repo,
+            "bootstrap_branch": bootstrap_branch,
+            "bootstrap_remote_url": bootstrap_remote_url,
+            "bootstrap_remote_slug": bootstrap_remote_slug,
+            "bootstrap_stage_all": bootstrap_stage_all,
+            "bootstrap_snapshot_hash": bootstrap_snapshot_hash,
             "verify_cmd": verify_cmd,
             "has_configured_verify_cmd": configured_verify_cmd.is_some(),
             "overwrite_binaries": overwrite_binaries,
@@ -5667,7 +6086,7 @@ impl AegisRuntimeKernel {
             "force_tag": force_tag,
             "push": push,
             "force_push": force_push,
-            "remote": (push || sync_mode.is_some()).then_some(&remote),
+            "remote": (push || sync_mode.is_some() || bootstrap_remote_url.is_some()).then_some(&remote),
             "remote_url": remote_url,
             "branch": push_branch,
             "evidence_hash": evidence_hash,
@@ -5677,6 +6096,12 @@ impl AegisRuntimeKernel {
                 "paths": paths,
                 "shadow_paths": shadow_paths,
                 "auto_commit_shadow": auto_commit_shadow,
+                "bootstrap_repo": bootstrap_repo,
+                "bootstrap_branch": bootstrap_branch,
+                "bootstrap_remote_url": bootstrap_remote_url,
+                "bootstrap_remote_slug": bootstrap_remote_slug,
+                "bootstrap_stage_all": bootstrap_stage_all,
+                "bootstrap_snapshot_hash": bootstrap_snapshot_hash,
                 "checkout_branch": checkout_branch,
                 "create_branch": create_branch,
                 "sync": sync_mode,
@@ -5702,6 +6127,12 @@ impl AegisRuntimeKernel {
             overwrite_binaries,
             skip_verify,
             shadow_evidence_hash,
+            bootstrap_repo,
+            bootstrap_branch,
+            bootstrap_remote_url,
+            bootstrap_remote_slug,
+            bootstrap_stage_all,
+            bootstrap_snapshot_hash,
             checkout_branch,
             create_branch,
             sync_mode,
@@ -10989,7 +11420,19 @@ impl AegisRuntimeKernel {
                             },
                             "remote": {
                                 "type": "string",
-                                "description": "Configured remote name (default: `origin`; raw URLs are forbidden)."
+                                "description": "Configured remote name (default: `origin`; raw URLs are forbidden on normal operations)."
+                            },
+                            "bootstrap_repo": {
+                                "type": "boolean",
+                                "description": "[HIGH RISK · One-Shot Only] Initialize `.git` (if absent) and bind `origin` to an allowlisted GitHub URL (`bootstrap_remote_url`). Never overwrites an existing remote."
+                            },
+                            "bootstrap_remote_url": {
+                                "type": "string",
+                                "description": "Allowlisted GitHub URL (`https://github.com/<owner>/<repo>[.git]` or `git@github.com:<owner>/<repo>[.git]`) used only when `bootstrap_repo: true`."
+                            },
+                            "bootstrap_branch": {
+                                "type": "string",
+                                "description": "Initial branch name for `git init -b` when `bootstrap_repo: true` (default: `main`)."
                             },
                             "branch": {
                                 "type": "string",
@@ -18571,6 +19014,147 @@ mod tests {
         assert!(
             status_after.contains("M dirty_unrelated.txt"),
             "unrelated host file must not be staged: {status_after}"
+        );
+    }
+
+    #[test]
+    fn bootstrap_remote_url_validator_enforces_strict_github_allowlist() {
+        assert_eq!(
+            validate_bootstrap_remote_url("https://github.com/heurion-org/heurion-doc.git").unwrap(),
+            (
+                "https://github.com/heurion-org/heurion-doc.git".to_string(),
+                "heurion-org/heurion-doc".to_string()
+            )
+        );
+        assert_eq!(
+            validate_bootstrap_remote_url("git@github.com:heurion-org/aegis-desktop.git").unwrap(),
+            (
+                "git@github.com:heurion-org/aegis-desktop.git".to_string(),
+                "heurion-org/aegis-desktop".to_string()
+            )
+        );
+        for bad in [
+            "http://github.com/heurion-org/heurion-doc.git",
+            "file:///tmp/evil",
+            "ext::sh -c id",
+            "https://user:token@github.com/heurion-org/heurion-doc.git",
+            "https://127.0.0.1/heurion-org/heurion-doc.git",
+            "https://evil.example/heurion-org/heurion-doc.git",
+            "https://github.com/../escape/repo.git",
+            "-oProxyCommand=id",
+            "",
+        ] {
+            assert!(
+                validate_bootstrap_remote_url(bad).is_err(),
+                "must reject unsafe remote url: {bad}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn workspace_git_bootstrap_repo_requires_oneshot_approval_and_initializes_child_repo() {
+        let tmp = tempfile::tempdir().unwrap();
+        let ws = tmp.path().join("umbrella");
+        let child = ws.join("new-repo");
+        std::fs::create_dir_all(&child).unwrap();
+        std::fs::write(child.join(".gitignore"), "ignored.log\n").unwrap();
+        std::fs::write(child.join("README.md"), "# New Repo\n").unwrap();
+        std::fs::write(child.join("ignored.log"), "secret temp log\n").unwrap();
+
+        let rt = tmp.path().join("rt");
+        let vault = Arc::new(
+            OrgVaultManager::new(&rt).with_mode(aos_vfs::vault::VaultMode::Off),
+        );
+        let kernel = AegisRuntimeKernel::new_with_vault(&rt, vault).await.unwrap();
+        let agent = AgentIdentity::new("personal", "agy-agent", "Lead");
+        kernel
+            .ensure_agent_environment(
+                agent.clone(),
+                &ws,
+                IsolationTier::NativeOsSandbox,
+                vec!["*".to_string()],
+            )
+            .await
+            .unwrap();
+
+        let req = json!({
+            "repo": "new-repo",
+            "bootstrap_repo": true,
+            "bootstrap_remote_url": "https://github.com/heurion-org/demo-doc.git",
+            "bootstrap_branch": "main",
+            "commit_message": "chore: initial commit"
+        });
+        let ask = kernel
+            .call_tool(&agent, "workspace_git", req.clone())
+            .await
+            .unwrap();
+        assert_eq!(ask["status"], "approval_required");
+        assert!(
+            ask["reason"]
+                .as_str()
+                .unwrap()
+                .contains("bootstrap_repo:heurion-org/demo-doc"),
+            "{ask}"
+        );
+
+        let esc_id = ask["escalation_id"].as_str().unwrap();
+        // Approve with non-zero TTL; policy must force LeaseKind::OneShot.
+        let lease = kernel
+            .policy
+            .approve_escalation(esc_id, 3600, "user")
+            .await
+            .unwrap();
+        assert_eq!(lease.kind, LeaseKind::OneShot);
+
+        let done = kernel
+            .call_tool(&agent, "workspace_git", req)
+            .await
+            .unwrap();
+        assert_eq!(done["status"], "git_completed", "{done}");
+        assert_eq!(done["bootstrapped"], true);
+        assert!(child.join(".git").exists());
+
+        let git_bin = resolve_system_git_binary().unwrap();
+        let origin = run_sanitized_host_git(
+            &git_bin,
+            &child,
+            &[],
+            &["remote".into(), "get-url".into(), "--".into(), "origin".into()],
+        )
+        .unwrap();
+        assert_eq!(
+            String::from_utf8_lossy(&origin.stdout).trim(),
+            "https://github.com/heurion-org/demo-doc.git"
+        );
+        let files = run_sanitized_host_git(
+            &git_bin,
+            &child,
+            &[],
+            &["ls-files".into()],
+        )
+        .unwrap();
+        let tracked = String::from_utf8_lossy(&files.stdout);
+        assert!(tracked.contains("README.md"), "{tracked}");
+        assert!(!tracked.contains("ignored.log"), "{tracked}");
+
+        // Never overwrite an already-configured origin via bootstrap_repo.
+        let overwrite_err = kernel
+            .call_tool(
+                &agent,
+                "workspace_git",
+                json!({
+                    "repo": "new-repo",
+                    "bootstrap_repo": true,
+                    "bootstrap_remote_url": "https://github.com/heurion-org/other.git"
+                }),
+            )
+            .await
+            .unwrap_err();
+        assert!(
+            overwrite_err
+                .to_string()
+                .contains("Refusing to overwrite existing 'origin'"),
+            "{overwrite_err:#}"
         );
     }
 
