@@ -2210,6 +2210,12 @@ fn allow_large_workspace_override() -> bool {
         .is_some_and(|v| matches!(v.trim().to_ascii_lowercase().as_str(), "1" | "true" | "yes"))
 }
 
+fn allow_umbrella_workspace_override() -> bool {
+    std::env::var("AOS_ALLOW_UMBRELLA_WORKSPACE")
+        .ok()
+        .is_some_and(|v| matches!(v.trim().to_ascii_lowercase().as_str(), "1" | "true" | "yes"))
+}
+
 fn env_usize(key: &str, default: usize) -> usize {
     std::env::var(key)
         .ok()
@@ -2226,7 +2232,7 @@ fn env_u64(key: &str, default: u64) -> u64 {
         .unwrap_or(default)
 }
 
-fn detect_umbrella_workspace(project: &Path) -> Option<Vec<String>> {
+pub(crate) fn detect_umbrella_workspace(project: &Path) -> Option<Vec<String>> {
     if !project.is_dir() {
         return None;
     }
@@ -2315,7 +2321,7 @@ pub(crate) fn validate_workspace_roots(
         project,
         host_home,
         runtime_dir,
-        allow_large_workspace_override(),
+        allow_large_workspace_override() || allow_umbrella_workspace_override(),
     )
 }
 
@@ -12259,6 +12265,14 @@ env = { SECRET_KEY = "tok_inline_secret" }
         std::fs::create_dir_all(&plain).unwrap();
         std::fs::write(plain.join("main.py"), "print('hi')\n").unwrap();
         assert!(validate_workspace_roots_inner(&plain, &home, &rt, false).is_ok());
+
+        // 5. detect_umbrella_workspace returns child repo names for umbrella dirs and None for git roots.
+        assert_eq!(
+            detect_umbrella_workspace(&multi),
+            Some(vec!["repo-a".to_string(), "repo-b".to_string()])
+        );
+        assert_eq!(detect_umbrella_workspace(&git_root), None);
+        assert_eq!(detect_umbrella_workspace(&plain), None);
     }
 
     #[test]

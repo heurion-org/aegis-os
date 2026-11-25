@@ -12,7 +12,7 @@ use std::time::Duration;
 
 use anyhow::{Context, Result};
 use aos_core::session::{resolve_auto_org_id, workspace_id_for_path, DEFAULT_PERSONAL_ORG_ID};
-use aos_core::{DomainProfile, PendingEscalation};
+use aos_core::{DomainProfile, EscalationStatus, PendingEscalation};
 use aos_mcp_gateway::AegisRuntimeKernel;
 use aos_vfs::CoWWorkspace;
 use axum::extract::{Path as AxumPath, Query, Request, State};
@@ -1050,6 +1050,13 @@ async fn execute_desktop_task(
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .kill_on_drop(true);
+    if state.aegis_bin.is_some()
+        && enforcement != "direct"
+        && repo_label.is_none()
+        && crate::launcher::detect_umbrella_workspace(&target_dir).is_some()
+    {
+        cmd.env("AOS_ALLOW_UMBRELLA_WORKSPACE", "1");
+    }
 
     let mut child = match cmd.spawn() {
         Ok(c) => c,
@@ -1339,6 +1346,71 @@ async fn execute_desktop_task(
     }
 }
 
+fn infer_single_child_repo_for_refs(
+    ws: &DesktopWorkspace,
+    doc_refs: &[String],
+) -> Option<(String, Vec<String>)> {
+    if ws.is_git_repo || ws.child_repos.is_empty() {
+        return None;
+    }
+    let mut normalized_repos: Vec<String> = ws
+        .child_repos
+        .iter()
+        .map(|r| {
+            r.rel_path
+                .trim()
+                .trim_start_matches("./")
+                .trim_matches('/')
+                .to_string()
+        })
+        .filter(|s| !s.is_empty())
+        .collect();
+    normalized_repos.sort_by(|a, b| b.len().cmp(&a.len()));
+    normalized_repos.dedup();
+    if normalized_repos.is_empty() {
+        return None;
+    }
+
+    let cleaned_refs: Vec<String> = doc_refs
+        .iter()
+        .map(|r| {
+            r.trim()
+                .trim_start_matches('@')
+                .trim_start_matches("./")
+                .trim_start_matches('/')
+                .to_string()
+        })
+        .filter(|s| !s.is_empty())
+        .collect();
+
+    if cleaned_refs.is_empty() {
+        if normalized_repos.len() == 1 {
+            return Some((normalized_repos.remove(0), Vec::new()));
+        }
+        return None;
+    }
+
+    let mut matched_repo: Option<String> = None;
+    let mut stripped_refs = Vec::with_capacity(cleaned_refs.len());
+    for raw_ref in &cleaned_refs {
+        let found = normalized_repos.iter().find(|rel| {
+            raw_ref == *rel || raw_ref.starts_with(&format!("{rel}/"))
+        })?;
+        match &matched_repo {
+            Some(prev) if prev != found => return None,
+            None => matched_repo = Some(found.clone()),
+            Some(_) => {}
+        }
+        let stripped = raw_ref
+            .strip_prefix(&format!("{found}/"))
+            .map(str::to_string)
+            .unwrap_or_else(|| ".".to_string());
+        stripped_refs.push(stripped);
+    }
+
+    matched_repo.map(|repo| (repo, stripped_refs))
+}
+
 async fn create_task_handler(
     State(state): State<DesktopDaemonState>,
     AxumPath(ws_id): AxumPath<String>,
@@ -1354,7 +1426,16 @@ async fn create_task_handler(
             Json(json!({ "error": "workspace not found" })),
         );
     };
-    let (target_dir, repo_label) = match resolve_repo_root(&ws, req.repo.as_deref()) {
+    let explicit_repo = req.repo.as_deref().map(str::trim).filter(|s| !s.is_empty());
+    let (resolved_req_repo, effective_doc_refs) = if let Some(explicit) = explicit_repo {
+        (Some(explicit.to_string()), req.doc_refs.clone())
+    } else if let Some((inferred, stripped)) = infer_single_child_repo_for_refs(&ws, &req.doc_refs)
+    {
+        (Some(inferred), stripped)
+    } else {
+        (None, req.doc_refs.clone())
+    };
+    let (target_dir, repo_label) = match resolve_repo_root(&ws, resolved_req_repo.as_deref()) {
         Ok(res) => res,
         Err(resp) => return resp,
     };
@@ -1371,8 +1452,12 @@ async fn create_task_handler(
             .unwrap_or_else(|| "claude".to_string());
     let task_id = format!("tsk_{}", &Uuid::new_v4().simple().to_string()[..12]);
     let now = Utc::now().to_rfc3339();
-    let scope_desc = if !req.doc_refs.is_empty() {
-        req.doc_refs.join(", ")
+    let scope_desc = if !effective_doc_refs.is_empty() {
+        if let Some(ref repo) = repo_label {
+            format!("子仓库 {repo} · {}", effective_doc_refs.join(", "))
+        } else {
+            effective_doc_refs.join(", ")
+        }
     } else if let Some(ref repo) = repo_label {
         format!("子仓库 {repo}")
     } else {
@@ -1414,7 +1499,7 @@ async fn create_task_handler(
         repo_label,
         resolved_agent,
         req.prompt,
-        req.doc_refs,
+        effective_doc_refs,
     ));
 
     (StatusCode::CREATED, Json(json!({ "task": task })))
@@ -2142,6 +2227,7 @@ async fn approvals_handler(State(state): State<DesktopDaemonState>) -> Json<Valu
         }
     }
     let mut seen: BTreeSet<String> = BTreeSet::new();
+    let mut seen_history: BTreeSet<String> = BTreeSet::new();
     let mut combined: Vec<PendingEscalation> = Vec::new();
     for org in org_ids {
         let list = state
@@ -2151,12 +2237,23 @@ async fn approvals_handler(State(state): State<DesktopDaemonState>) -> Json<Valu
             .await
             .unwrap_or_default();
         for item in list {
+            if item.status != EscalationStatus::Pending {
+                seen_history.insert(item.escalation_id);
+                continue;
+            }
             if seen.insert(item.escalation_id.clone()) {
                 combined.push(item);
             }
         }
     }
-    Json(json!({ "escalations": combined }))
+    combined.sort_by(|a, b| b.created_at_ms.cmp(&a.created_at_ms));
+    let pending_count = combined.len();
+    let history_count = seen_history.len();
+    Json(json!({
+        "escalations": combined,
+        "pending_count": pending_count,
+        "history_count": history_count,
+    }))
 }
 
 #[derive(Debug, Deserialize)]
@@ -2331,7 +2428,7 @@ pub async fn run_desktop_daemon(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use aos_core::{AgentIdentity, EscalationStatus, PolicyContext, PolicyDecision, TransactionalWorkspace};
+    use aos_core::{AgentIdentity, PolicyContext, PolicyDecision, TransactionalWorkspace};
 
     fn run_git(dir: &Path, args: &[&str]) {
         let out = std::process::Command::new("git")
@@ -2638,6 +2735,15 @@ mod tests {
                 .into_json()?;
             assert_eq!(approve_resp["ok"], true);
             assert_eq!(approve_resp["decision"], "approved");
+
+            let app_after: Value = agent
+                .get(&format!("{base}/v1/approvals"))
+                .set("Authorization", auth_hdr)
+                .call()?
+                .into_json()?;
+            let pending_after = app_after["escalations"].as_array().unwrap();
+            assert!(pending_after.iter().all(|e| e["escalation_id"] != esc_id));
+            assert!(app_after["history_count"].as_u64().unwrap_or(0) >= 1);
 
             Ok(())
         })
@@ -3060,5 +3166,57 @@ echo "Second streamed chunk"
             serde_json::from_slice(&std::fs::read(&reg_path).unwrap()).unwrap();
         assert_eq!(rewritten.len(), 1);
         assert_eq!(rewritten[0]["name"], "my-project");
+    }
+
+    #[test]
+    fn infer_single_child_repo_scopes_umbrella_refs_cleanly() {
+        let make_ws = |is_git_repo: bool, repos: &[&str]| DesktopWorkspace {
+            id: "ws_test".to_string(),
+            name: "aegisdesktop".to_string(),
+            org_id: "personal".to_string(),
+            path: PathBuf::from("/tmp/aegisdesktop"),
+            mode: "local".to_string(),
+            is_git_repo,
+            child_repos: repos
+                .iter()
+                .map(|r| ChildRepoSummary {
+                    name: (*r).to_string(),
+                    rel_path: (*r).to_string(),
+                    path: PathBuf::from(format!("/tmp/aegisdesktop/{r}")),
+                    branch: Some("main".to_string()),
+                })
+                .collect(),
+            sync_policy: SyncPolicy::default(),
+            created_at: "2026-11-25T00:00:00Z".to_string(),
+        };
+
+        let multi = make_ws(false, &["aegis-desktop", "aegis-os"]);
+        assert_eq!(
+            infer_single_child_repo_for_refs(&multi, &["@aegis-desktop/README.md".to_string()]),
+            Some(("aegis-desktop".to_string(), vec!["README.md".to_string()]))
+        );
+        assert_eq!(
+            infer_single_child_repo_for_refs(
+                &multi,
+                &[
+                    "aegis-desktop/README.md".to_string(),
+                    "aegis-os/Cargo.toml".to_string(),
+                ],
+            ),
+            None
+        );
+        assert_eq!(infer_single_child_repo_for_refs(&multi, &[]), None);
+
+        let single = make_ws(false, &["sole-repo"]);
+        assert_eq!(
+            infer_single_child_repo_for_refs(&single, &[]),
+            Some(("sole-repo".to_string(), vec![]))
+        );
+
+        let git_root = make_ws(true, &["submodule-a"]);
+        assert_eq!(
+            infer_single_child_repo_for_refs(&git_root, &["submodule-a/README.md".to_string()]),
+            None
+        );
     }
 }
