@@ -15,6 +15,7 @@ use std::path::{Path, PathBuf};
 
 pub mod claims;
 pub mod effect;
+pub mod friction;
 pub mod profile;
 pub mod session;
 

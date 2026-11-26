@@ -360,6 +360,36 @@ pub async fn handle_stop_gate(
         || stop_reason.eq_ignore_ascii_case("MAX_TOKEN_BUDGET_EXCEEDED")
         || stop_reason.eq_ignore_ascii_case("TERMINAL_CUSTOM_HOOK")
     {
+        if stop_reason.eq_ignore_ascii_case("MAX_INVOCATIONS")
+            || stop_reason.eq_ignore_ascii_case("MAX_FORCED_INVOCATIONS")
+            || stop_reason.eq_ignore_ascii_case("MAX_TOKEN_BUDGET_EXCEEDED")
+        {
+            let ev = aos_core::friction::new_friction_event(
+                aos_core::friction::FrictionCategory::LoopThrash,
+                aos_core::friction::CmdBucket::Other,
+                Some(&identity.agent_id),
+                None,
+                1,
+                false,
+            );
+            let _ = aos_core::friction::append_friction_event(
+                &aos_core::friction::default_friction_log_path(runtime_dir),
+                &ev,
+            );
+        } else if stop_reason.eq_ignore_ascii_case("ERROR") {
+            let ev = aos_core::friction::new_friction_event(
+                aos_core::friction::FrictionCategory::SandboxExecError,
+                aos_core::friction::CmdBucket::Other,
+                Some(&identity.agent_id),
+                None,
+                1,
+                false,
+            );
+            let _ = aos_core::friction::append_friction_event(
+                &aos_core::friction::default_friction_log_path(runtime_dir),
+                &ev,
+            );
+        }
         return json!({});
     }
     let continuation_active = payload
@@ -444,6 +474,35 @@ pub fn log_routing_decision(
         {
             let _ = f.write_all(line.as_bytes());
         }
+    }
+
+    let category = if decision.contains("redirect_proc_exec") {
+        Some(aos_core::friction::FrictionCategory::RoutingRedirect)
+    } else if decision.contains("host_boundary_ask") {
+        Some(aos_core::friction::FrictionCategory::HostFallback)
+    } else if decision.contains("deny") {
+        Some(aos_core::friction::FrictionCategory::PolicyDenied)
+    } else {
+        None
+    };
+    if let Some(cat) = category {
+        let bucket = if tool_name == "run_command" || tool_name == "Bash" {
+            aos_core::friction::classify_cmd_bucket(detail, &[])
+        } else {
+            aos_core::friction::CmdBucket::Other
+        };
+        let ev = aos_core::friction::new_friction_event(
+            cat,
+            bucket,
+            Some(agent_id),
+            None,
+            1,
+            false,
+        );
+        let _ = aos_core::friction::append_friction_event(
+            &aos_core::friction::default_friction_log_path(runtime_dir),
+            &ev,
+        );
     }
 }
 

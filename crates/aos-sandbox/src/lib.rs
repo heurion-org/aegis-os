@@ -217,6 +217,56 @@ fn tail_lossy(buf: &Mutex<Vec<u8>>) -> String {
     String::from_utf8_lossy(&buf[start..]).trim_end().to_string()
 }
 
+/// Ensure the per-agent `<agent_home>/tmp` scratch directory exists and return its path.
+/// Keeping `$TMPDIR` inside `agent_home_dir` prevents host `/tmp` leakage and gives agents a
+/// Seatbelt-writable temp directory without prompting.
+fn ensure_agent_tmp_dir(agent_home: &Path) -> PathBuf {
+    let tmp_dir = agent_home.join("tmp");
+    let _ = std::fs::create_dir_all(&tmp_dir);
+    tmp_dir
+}
+
+fn contains_tmp_permission_error(text: &str) -> bool {
+    let lower = text.to_ascii_lowercase();
+    (lower.contains("/tmp") || lower.contains("/private/tmp"))
+        && (lower.contains("operation not permitted")
+            || lower.contains("permission denied")
+            || lower.contains("read-only file system")
+            || lower.contains("cannot create"))
+}
+
+fn build_proc_timeout_hint(command: &str, args: &[String]) -> String {
+    let base = " For long-running tasks (>2m, such as online LLM benchmarks), pass `\"background\": true` to `proc_exec` and poll with `\"poll_pid\": <pid>`.";
+    let joined = format!("{command} {}", args.join(" ")).to_ascii_lowercase();
+    if joined.contains("find /") || joined.contains("mdfind ") || joined.contains("locate ") {
+        return format!(
+            " Avoid broad filesystem scans like `find /` inside the sandbox; use `which <tool>` or search inside the workspace only.{base}"
+        );
+    }
+    if joined
+        .split(|c: char| !(c.is_ascii_alphanumeric() || c == '_' || c == '-'))
+        .any(|w| w == "du")
+    {
+        let sort_note = if joined.contains("| sort") || joined.contains("|sort") {
+            " Piping into `sort` buffers all stdout until completion, hiding progress."
+        } else {
+            ""
+        };
+        return format!(
+            " `du` over large `target/` or `node_modules/` directories often exceeds foreground timeouts.{sort_note} Scope with `du -d 1` / omit build artifacts, pass `\"background\": true` + `poll_pid`, or use `host_exec` for host-wide disk inspection.{base}"
+        );
+    }
+    if joined
+        .split(|c: char| !(c.is_ascii_alphanumeric() || c == '_' || c == '-'))
+        .any(|w| matches!(w, "curl" | "wget"))
+    {
+        return format!(
+            " Outbound internet is disabled inside `proc_exec`; use `mcp_aegis-os_egress_http_request` instead of `{command}`.{base}"
+        );
+    }
+    base.to_string()
+}
+
 /// Runs `cmd` in its own process group and waits for the process itself rather than pipe EOF.
 /// On timeout, or when descendants still hold the pipes after the grace window, the whole group
 /// is killed so no orphaned worker can wedge the caller.
@@ -244,20 +294,41 @@ async fn run_foreground_tracked(
     let mut child = cmd.spawn()?;
     let pid = child.id().unwrap_or(0);
     let _pgid_guard = ActivePgidGuard::register(pid, active_pgids);
-    let (out_buf, mut out_task) = spawn_pipe_reader(child.stdout.take());
-    let (err_buf, mut err_task) = spawn_pipe_reader(child.stderr.take());
+    let (out_buf, out_task) = spawn_pipe_reader(child.stdout.take());
+    let (err_buf, err_task) = spawn_pipe_reader(child.stderr.take());
+    let mut out_task = Some(out_task);
+    let mut err_task = Some(err_task);
 
-    async fn drain(out: &mut tokio::task::JoinHandle<()>, err: &mut tokio::task::JoinHandle<()>) {
-        let _ = out.await;
-        let _ = err.await;
+    async fn drain(
+        out: &mut Option<tokio::task::JoinHandle<()>>,
+        err: &mut Option<tokio::task::JoinHandle<()>>,
+    ) {
+        if let Some(h) = out.as_mut() {
+            let _ = h.await;
+            *out = None;
+        }
+        if let Some(h) = err.as_mut() {
+            let _ = h.await;
+            *err = None;
+        }
+    }
+    fn abort_tasks(
+        out: &mut Option<tokio::task::JoinHandle<()>>,
+        err: &mut Option<tokio::task::JoinHandle<()>>,
+    ) {
+        if let Some(h) = out.take() {
+            h.abort();
+        }
+        if let Some(h) = err.take() {
+            h.abort();
+        }
     }
     let waited = tokio::time::timeout(timeout, child.wait()).await;
     let status = match waited {
         Ok(Ok(status)) => status,
         Ok(Err(err)) => {
             kill_process_group(pid);
-            out_task.abort();
-            err_task.abort();
+            abort_tasks(&mut out_task, &mut err_task);
             return Err(err.into());
         }
         Err(_) => {
@@ -269,16 +340,21 @@ async fn run_foreground_tracked(
                 drain(&mut out_task, &mut err_task),
             )
             .await;
-            out_task.abort();
-            err_task.abort();
+            abort_tasks(&mut out_task, &mut err_task);
             let mut msg = format!(
                 "Command timed out after {}ms (process group {} killed).{}",
                 timeout.as_millis(),
                 pid,
                 timeout_hint
             );
-            for (label, buf) in [("stdout", &out_buf), ("stderr", &err_buf)] {
-                let tail = tail_lossy(buf);
+            let out_tail = tail_lossy(&out_buf);
+            let err_tail = tail_lossy(&err_buf);
+            if contains_tmp_permission_error(&err_tail) {
+                msg.push_str(
+                    "\n[aegis-os hint] Host /tmp and /private/tmp are denied by Seatbelt. Use $TMPDIR (pre-created at <agent_home>/tmp) instead.",
+                );
+            }
+            for (label, tail) in [("stdout", out_tail), ("stderr", err_tail)] {
                 if !tail.is_empty() {
                     msg.push_str(&format!("\n--- last {label} before timeout ---\n{tail}"));
                 }
@@ -300,8 +376,7 @@ async fn run_foreground_tracked(
             drain(&mut out_task, &mut err_task),
         )
         .await;
-        out_task.abort();
-        err_task.abort();
+        abort_tasks(&mut out_task, &mut err_task);
     }
 
     let stdout = std::mem::take(&mut *out_buf.lock().unwrap());
@@ -319,6 +394,14 @@ async fn run_foreground_tracked(
             )
             .as_bytes(),
         );
+    }
+    if !status.success() {
+        let err_text = String::from_utf8_lossy(&stderr);
+        if contains_tmp_permission_error(&err_text) && !err_text.contains("[aegis-os hint]") {
+            stderr.extend_from_slice(
+                b"\n[aegis-os hint] Host /tmp and /private/tmp are denied by Seatbelt. Use $TMPDIR (pre-created at <agent_home>/tmp) instead.\n",
+            );
+        }
     }
     Ok(ForegroundOutput {
         pid,
@@ -383,6 +466,71 @@ impl NativeOsSandboxInstance {
         }
     }
 
+    /// Pure helper for [`Self::resolve_org_shared_cache_dir`]: resolves `<org>/shared_cache`
+    /// when `config.org_shared_ro_dir` ends with `shared_ro` and `shared_cache_env` does not
+    /// disable sharing (`"0"` or `"false"`, case-insensitive).
+    fn shared_cache_dir_from_config(
+        config: &SandboxConfig,
+        shared_cache_env: Option<&str>,
+    ) -> Option<PathBuf> {
+        if let Some(val) = shared_cache_env {
+            let trimmed = val.trim();
+            if trimmed == "0" || trimmed.eq_ignore_ascii_case("false") {
+                return None;
+            }
+        }
+        if config.org_shared_ro_dir.file_name() == Some(std::ffi::OsStr::new("shared_ro")) {
+            return config
+                .org_shared_ro_dir
+                .parent()
+                .filter(|org_dir| !org_dir.as_os_str().is_empty())
+                .map(|org_dir| org_dir.join("shared_cache"));
+        }
+        None
+    }
+
+    /// Resolves the org-level shared cache directory (`<org>/shared_cache`) when enabled and
+    /// `org_shared_ro_dir` ends with `shared_ro`. Set `AOS_SHARED_ORG_CACHE=0` or `false` to
+    /// fall back to per-agent isolation under `agent_home_dir`.
+    pub fn resolve_org_shared_cache_dir(&self) -> Option<PathBuf> {
+        let opt_out = std::env::var("AOS_SHARED_ORG_CACHE").ok();
+        Self::shared_cache_dir_from_config(&self.config, opt_out.as_deref())
+    }
+
+    fn effective_cargo_target_dir_for(
+        config: &SandboxConfig,
+        shared_cache_env: Option<&str>,
+    ) -> PathBuf {
+        match Self::shared_cache_dir_from_config(config, shared_cache_env) {
+            Some(shared) => shared.join("cargo_target"),
+            None => config.agent_home_dir.join("cargo_target"),
+        }
+    }
+
+    fn effective_pnpm_store_dir_for(
+        config: &SandboxConfig,
+        shared_cache_env: Option<&str>,
+    ) -> PathBuf {
+        match Self::shared_cache_dir_from_config(config, shared_cache_env) {
+            Some(shared) => shared.join("deps/cache/pnpm-store"),
+            None => config.agent_home_dir.join("deps/cache/pnpm-store"),
+        }
+    }
+
+    /// Returns the `CARGO_TARGET_DIR` path for sandboxed commands (org-shared when available,
+    /// otherwise per-agent `<agent_home>/cargo_target`).
+    pub fn effective_cargo_target_dir(&self) -> PathBuf {
+        let opt_out = std::env::var("AOS_SHARED_ORG_CACHE").ok();
+        Self::effective_cargo_target_dir_for(&self.config, opt_out.as_deref())
+    }
+
+    /// Returns the `PNPM_STORE_DIR` / `npm_config_store_dir` path for sandboxed commands
+    /// (org-shared when available, otherwise per-agent `<agent_home>/deps/cache/pnpm-store`).
+    pub fn effective_pnpm_store_dir(&self) -> PathBuf {
+        let opt_out = std::env::var("AOS_SHARED_ORG_CACHE").ok();
+        Self::effective_pnpm_store_dir_for(&self.config, opt_out.as_deref())
+    }
+
     fn effective_loopback_ports(&self, extra: &[u16]) -> Vec<u16> {
         let mut set = std::collections::BTreeSet::new();
         for &p in &self.config.allowed_loopback_ports {
@@ -438,6 +586,9 @@ impl NativeOsSandboxInstance {
         let home = Self::sbpl_path(&self.config.agent_home_dir);
         let shared_ro_sbpl = Self::sbpl_path(&self.config.org_shared_ro_dir);
         let pub_dir = Self::sbpl_path(&self.config.org_agent_pub_dir);
+        let shared_cache_sbpl = self
+            .resolve_org_shared_cache_dir()
+            .map(|p| Self::sbpl_path(&p));
 
         let loopback_ports = self.effective_loopback_ports(extra_loopback_ports);
         let net_enforced = !aos_core::ablated("net_isolation")
@@ -482,6 +633,9 @@ impl NativeOsSandboxInstance {
                 rules.push_str(&format!(
                     "\n    (subpath \"{ws}\")\n    (subpath \"{home}\")\n    (subpath \"{shared_ro_sbpl}\")\n    (subpath \"{pub_dir}\")"
                 ));
+                if let Some(ref sc) = shared_cache_sbpl {
+                    rules.push_str(&format!("\n    (subpath \"{sc}\")"));
+                }
                 if let Some(ref host_src) = self.config.host_source_dir {
                     rules.push_str(&format!("\n    (subpath \"{}\")", Self::sbpl_path(host_src)));
                 }
@@ -584,6 +738,10 @@ impl NativeOsSandboxInstance {
                             .join(&self.config.identity.org_id),
                     );
                     let org_vault_paas = Self::sbpl_path(&org_dir.join("paas_workspaces"));
+                    let shared_cache_rule = shared_cache_sbpl
+                        .as_ref()
+                        .map(|sc| format!("\n    (subpath \"{sc}\")"))
+                        .unwrap_or_default();
                     // Only the current workspace/home are readable under runtime. Do NOT allow
                     // the whole session directory: it contains human.token, approval tickets and
                     // other control-plane material that the agent must never read.
@@ -596,7 +754,7 @@ impl NativeOsSandboxInstance {
     (subpath "{shared_ro}")
     (subpath "{org_pub}")
     (subpath "{org_paas}")
-    (subpath "{org_vault_paas}")
+    (subpath "{org_vault_paas}"){shared_cache_rule}
 )"#
                     )
                 }
@@ -636,6 +794,11 @@ impl NativeOsSandboxInstance {
 (deny mach-lookup (global-name-regex #"^com\.apple\.(coreservices\.|lsd\.)")){ipc_proc_isolation}"##
         );
 
+        let shared_cache_rw = shared_cache_sbpl
+            .as_ref()
+            .map(|sc| format!("\n(allow file-read* file-write* (subpath \"{sc}\"))"))
+            .unwrap_or_default();
+
         format!(
             r#"(version 1)
 (allow default)
@@ -650,7 +813,7 @@ impl NativeOsSandboxInstance {
     (literal "/dev/random")
     (literal "/dev/urandom")
     (literal "/dev/tty")
-){launch_rules}{home_rules}{tenant_rules}{cred_rules}{net_rules}
+){shared_cache_rw}{launch_rules}{home_rules}{tenant_rules}{cred_rules}{net_rules}
 "#
         )
     }
@@ -1055,6 +1218,10 @@ impl NativeOsSandboxInstance {
             self.config.org_agent_pub_dir.to_string_lossy().to_string(),
             self.config.org_agent_pub_dir.to_string_lossy().to_string(),
         ]);
+        if let Some(shared_cache) = self.resolve_org_shared_cache_dir() {
+            let shared_str = shared_cache.to_string_lossy().into_owned();
+            args.extend(["--bind".to_string(), shared_str.clone(), shared_str]);
+        }
         if !aos_core::ablated("cred_mask") {
             for (path, is_file) in Self::credential_mask_targets() {
                 let p_ref = Path::new(&path);
@@ -1351,6 +1518,10 @@ impl SandboxInstance for NativeOsSandboxInstance {
         tokio::fs::create_dir_all(&self.config.agent_home_dir).await?;
         tokio::fs::create_dir_all(&self.config.org_shared_ro_dir).await?;
         tokio::fs::create_dir_all(&self.config.org_agent_pub_dir).await?;
+        let cargo_target_dir = self.effective_cargo_target_dir();
+        let pnpm_store_dir = self.effective_pnpm_store_dir();
+        std::fs::create_dir_all(&cargo_target_dir)?;
+        std::fs::create_dir_all(&pnpm_store_dir)?;
 
         let requested_ports = spec
             .env
@@ -1497,19 +1668,10 @@ impl SandboxInstance for NativeOsSandboxInstance {
                 "/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin",
             )
             .env("HOME", &self.config.agent_home_dir)
-            .env("TMPDIR", &self.config.agent_home_dir)
-            .env(
-                "CARGO_TARGET_DIR",
-                self.config.agent_home_dir.join("cargo_target"),
-            )
-            .env(
-                "PNPM_STORE_DIR",
-                self.config.agent_home_dir.join("deps/cache/pnpm-store"),
-            )
-            .env(
-                "npm_config_store_dir",
-                self.config.agent_home_dir.join("deps/cache/pnpm-store"),
-            )
+            .env("TMPDIR", ensure_agent_tmp_dir(&self.config.agent_home_dir))
+            .env("CARGO_TARGET_DIR", &cargo_target_dir)
+            .env("PNPM_STORE_DIR", &pnpm_store_dir)
+            .env("npm_config_store_dir", &pnpm_store_dir)
             .env("AOS_SANDBOX_ID", &self.instance_id)
             .env("AOS_ORG_ID", &self.config.identity.org_id)
             .env("AOS_AGENT_ID", &self.config.identity.agent_id)
@@ -1663,10 +1825,11 @@ impl SandboxInstance for NativeOsSandboxInstance {
         }
 
         let timeout_dur = Duration::from_millis(spec.timeout_ms.unwrap_or(30_000));
+        let timeout_hint = build_proc_timeout_hint(&spec.command, &spec.args);
         let output = run_foreground_tracked(
             cmd,
             timeout_dur,
-            " For long-running tasks (>2m, such as online LLM benchmarks), pass `\"background\": true` to `proc_exec` and poll with `\"poll_pid\": <pid>`.",
+            &timeout_hint,
             Some(&self.active_pgids),
         )
         .await?;
@@ -1689,19 +1852,10 @@ impl SandboxInstance for NativeOsSandboxInstance {
                 .env_clear()
                 .env("PATH", &path_val)
                 .env("HOME", &self.config.agent_home_dir)
-                .env("TMPDIR", &self.config.agent_home_dir)
-                .env(
-                    "CARGO_TARGET_DIR",
-                    self.config.agent_home_dir.join("cargo_target"),
-                )
-                .env(
-                    "PNPM_STORE_DIR",
-                    self.config.agent_home_dir.join("deps/cache/pnpm-store"),
-                )
-                .env(
-                    "npm_config_store_dir",
-                    self.config.agent_home_dir.join("deps/cache/pnpm-store"),
-                )
+                .env("TMPDIR", ensure_agent_tmp_dir(&self.config.agent_home_dir))
+                .env("CARGO_TARGET_DIR", &cargo_target_dir)
+                .env("PNPM_STORE_DIR", &pnpm_store_dir)
+                .env("npm_config_store_dir", &pnpm_store_dir)
                 .env("AOS_SANDBOX_ID", &self.instance_id)
                 .env("AOS_ORG_ID", &self.config.identity.org_id)
                 .env("AOS_AGENT_ID", &self.config.identity.agent_id)
@@ -2869,6 +3023,205 @@ t.join(timeout=2)
         assert_eq!(
             super::resolve_live_exe_from(gone_deleted, Some(joined_path.as_os_str())),
             Some(real_bin)
+        );
+    }
+
+    #[test]
+    fn ensure_agent_tmp_dir_creates_isolated_subdir_and_hints_detect_tmp_and_scans() {
+        let tmp = tempfile::tempdir().unwrap();
+        let home = tmp.path().join("agent_home");
+        let agent_tmp = super::ensure_agent_tmp_dir(&home);
+        assert_eq!(agent_tmp, home.join("tmp"));
+        assert!(agent_tmp.is_dir());
+
+        assert!(super::contains_tmp_permission_error(
+            "mkdir: /tmp/t: Operation not permitted"
+        ));
+        assert!(super::contains_tmp_permission_error(
+            "mkdir: /private/tmp/x: Read-only file system"
+        ));
+        assert!(!super::contains_tmp_permission_error(
+            "cargo error[E0308]: mismatched types"
+        ));
+
+        let find_hint = super::build_proc_timeout_hint(
+            "sh",
+            &["-c".to_string(), "find / -name keccak.cairo".to_string()],
+        );
+        assert!(find_hint.contains("find /"), "{find_hint}");
+        assert!(find_hint.contains("\"background\": true"), "{find_hint}");
+
+        let curl_hint = super::build_proc_timeout_hint(
+            "sh",
+            &["-c".to_string(), "curl -s https://example.com".to_string()],
+        );
+        assert!(curl_hint.contains("egress_http_request"), "{curl_hint}");
+
+        let du_hint = super::build_proc_timeout_hint(
+            "sh",
+            &["-c".to_string(), "du -sh * | sort -hr".to_string()],
+        );
+        assert!(du_hint.contains("du"), "{du_hint}");
+        assert!(du_hint.contains("sort"), "{du_hint}");
+        assert!(du_hint.contains("\"background\": true"), "{du_hint}");
+    }
+
+    #[test]
+    fn shared_org_cache_resolves_sibling_and_respects_opt_out() {
+        let tmp = tempfile::tempdir().unwrap();
+        let org = tmp.path().join("orgs/acme");
+        let agent_home = org.join("agents/coder-1/home");
+        let cfg = SandboxConfig {
+            identity: AgentIdentity::new("acme", "coder-1", "Engineer"),
+            tier: IsolationTier::NativeOsSandbox,
+            limits: ResourceLimits::default(),
+            workspace_dir: org.join("agents/coder-1/cow_workspace/ws"),
+            agent_home_dir: agent_home.clone(),
+            org_shared_ro_dir: org.join("shared_ro"),
+            org_agent_pub_dir: org.join("pub/coder-1"),
+            egress_proxy_addr: None,
+            host_source_dir: None,
+            tighten_home_read: true,
+            allowed_loopback_ports: Vec::new(),
+            isolate_loopback_only: false,
+        };
+
+        let expected_shared = org.join("shared_cache");
+        for enabled in [None, Some("1"), Some("true")] {
+            assert_eq!(
+                NativeOsSandboxInstance::shared_cache_dir_from_config(&cfg, enabled),
+                Some(expected_shared.clone())
+            );
+            assert_eq!(
+                NativeOsSandboxInstance::effective_cargo_target_dir_for(&cfg, enabled),
+                expected_shared.join("cargo_target")
+            );
+            assert_eq!(
+                NativeOsSandboxInstance::effective_pnpm_store_dir_for(&cfg, enabled),
+                expected_shared.join("deps/cache/pnpm-store")
+            );
+        }
+
+        for disabled in [Some("0"), Some("false"), Some("FALSE"), Some(" 0 ")] {
+            assert_eq!(
+                NativeOsSandboxInstance::shared_cache_dir_from_config(&cfg, disabled),
+                None
+            );
+            assert_eq!(
+                NativeOsSandboxInstance::effective_cargo_target_dir_for(&cfg, disabled),
+                agent_home.join("cargo_target")
+            );
+            assert_eq!(
+                NativeOsSandboxInstance::effective_pnpm_store_dir_for(&cfg, disabled),
+                agent_home.join("deps/cache/pnpm-store")
+            );
+        }
+
+        let non_shared_ro = SandboxConfig {
+            org_shared_ro_dir: tmp.path().join("ro"),
+            ..cfg.clone()
+        };
+        assert_eq!(
+            NativeOsSandboxInstance::shared_cache_dir_from_config(&non_shared_ro, None),
+            None
+        );
+        assert_eq!(
+            NativeOsSandboxInstance::effective_cargo_target_dir_for(&non_shared_ro, None),
+            agent_home.join("cargo_target")
+        );
+
+        let bare_shared_ro = SandboxConfig {
+            org_shared_ro_dir: PathBuf::from("shared_ro"),
+            ..cfg
+        };
+        assert_eq!(
+            NativeOsSandboxInstance::shared_cache_dir_from_config(&bare_shared_ro, None),
+            None
+        );
+    }
+
+    #[test]
+    fn seatbelt_and_bwrap_profiles_allow_shared_org_cache_without_exposing_vaults_or_keys() {
+        let tmp = tempfile::tempdir().unwrap();
+        let rt = tmp.path().join("runtime");
+        let org = rt.join("orgs/acme");
+        let me = org.join("agents/coder-1");
+        let shared_cache = org.join("shared_cache");
+        for dir in [
+            me.join("cow_workspace/ws"),
+            me.join("home"),
+            org.join("shared_ro"),
+            org.join("pub/coder-1"),
+            shared_cache.clone(),
+            rt.join("vaults"),
+            rt.join("keys"),
+        ] {
+            std::fs::create_dir_all(&dir).unwrap();
+        }
+
+        let cfg = SandboxConfig {
+            identity: AgentIdentity::new("acme", "coder-1", "Engineer"),
+            tier: IsolationTier::NativeOsSandbox,
+            limits: ResourceLimits::default(),
+            workspace_dir: me.join("cow_workspace/ws"),
+            agent_home_dir: me.join("home"),
+            org_shared_ro_dir: org.join("shared_ro"),
+            org_agent_pub_dir: org.join("pub/coder-1"),
+            egress_proxy_addr: None,
+            host_source_dir: None,
+            tighten_home_read: true,
+            allowed_loopback_ports: Vec::new(),
+            isolate_loopback_only: false,
+        };
+        let sbx = NativeOsSandboxInstance::new(cfg);
+        if sbx.resolve_org_shared_cache_dir().is_none() {
+            // Respect outer AOS_SHARED_ORG_CACHE=0/false if set in caller environment.
+            return;
+        }
+
+        let profile = sbx.generate_macos_seatbelt_profile();
+        let shared_sbpl = NativeOsSandboxInstance::sbpl_path(&shared_cache);
+        let vaults_sbpl = NativeOsSandboxInstance::sbpl_path(&rt.join("vaults"));
+        let keys_sbpl = NativeOsSandboxInstance::sbpl_path(&rt.join("keys"));
+        let org_sbpl = NativeOsSandboxInstance::sbpl_path(&org);
+
+        assert!(
+            profile.contains(&format!(
+                "(allow file-read* file-write* (subpath \"{shared_sbpl}\"))"
+            )),
+            "expected shared_cache allow rule in seatbelt profile: {profile}"
+        );
+        assert!(
+            profile.contains(&format!("(subpath \"{shared_sbpl}\")")),
+            "expected shared_cache subpath in seatbelt profile: {profile}"
+        );
+        assert!(!profile.contains(".aegis/vaults"), "{profile}");
+        assert!(
+            !profile.contains(&format!("(subpath \"{vaults_sbpl}\")")),
+            "vaults must never be exposed: {profile}"
+        );
+        assert!(
+            !profile.contains(&format!("(subpath \"{keys_sbpl}\")")),
+            "keys must never be exposed: {profile}"
+        );
+        assert!(
+            !profile.contains(&format!("(subpath \"{org_sbpl}\")")),
+            "org parent dir must never be exposed: {profile}"
+        );
+
+        let args = sbx.generate_linux_bwrap_args();
+        let shared_str = shared_cache.to_string_lossy().into_owned();
+        let bind_pos = args
+            .windows(3)
+            .position(|w| w == ["--bind", shared_str.as_str(), shared_str.as_str()])
+            .expect("expected --bind for shared_cache in bwrap args");
+        let tmpfs_pos = args
+            .windows(2)
+            .position(|w| w == ["--tmpfs", "/tmp"])
+            .expect("expected --tmpfs /tmp");
+        assert!(
+            tmpfs_pos < bind_pos,
+            "--bind shared_cache must appear after --tmpfs masks: {args:?}"
         );
     }
 }

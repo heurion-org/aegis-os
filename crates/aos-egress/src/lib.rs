@@ -884,6 +884,11 @@ impl AegisEgressGateway {
             .insert(domain.to_string(), (addr.to_string(), use_tls));
     }
 
+    /// Read a host-configured upstream override `(addr, use_tls)` for local integration tests.
+    pub async fn upstream_override(&self, domain: &str) -> Option<(String, bool)> {
+        self.upstream_overrides.read().await.get(domain).cloned()
+    }
+
     pub async fn allow_domains(&self, org_id: &str, domains: Vec<String>) {
         let mut map = self.org_allowed_domains.write().await;
         let set = map.entry(org_id.to_string()).or_default();

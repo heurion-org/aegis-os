@@ -91,6 +91,17 @@ pub struct VaultStatus {
     pub key_source: String,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct VaultCompactResult {
+    pub org_id: String,
+    pub backend: VaultBackendKind,
+    pub backing_path: PathBuf,
+    pub encrypted: bool,
+    pub bytes_before: u64,
+    pub bytes_after: u64,
+    pub bytes_reclaimed: u64,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct EncryptedDekEnvelope {
     pub version: u32,
@@ -685,65 +696,90 @@ impl VaultKeyStore {
         }
     }
 
+    /// Unseals an existing per-org encrypted DEK envelope without ever creating a new key.
+    pub fn unseal_existing_dek(
+        &self,
+        org_id: &str,
+        dek_path: &Path,
+    ) -> anyhow::Result<(Zeroizing<String>, String)> {
+        let meta = std::fs::symlink_metadata(dek_path).with_context(|| {
+            format!(
+                "missing encrypted DEK envelope '{}' for org '{}'",
+                dek_path.display(),
+                org_id
+            )
+        })?;
+        if meta.file_type().is_symlink() || !meta.is_file() {
+            bail!(
+                "encrypted DEK envelope '{}' for org '{}' is not a regular file",
+                dek_path.display(),
+                org_id
+            );
+        }
+        let bytes = std::fs::read(dek_path).with_context(|| {
+            format!("reading encrypted DEK envelope '{}'", dek_path.display())
+        })?;
+        let env: EncryptedDekEnvelope = serde_json::from_slice(&bytes).with_context(|| {
+            format!("parsing encrypted DEK envelope '{}'", dek_path.display())
+        })?;
+        if env.version != 1 {
+            bail!("unsupported DEK envelope version {}", env.version);
+        }
+        if env.org_id != org_id {
+            bail!(
+                "DEK envelope org_id mismatch: envelope '{}' vs requested '{}'",
+                env.org_id,
+                org_id
+            );
+        }
+        let kek = match self
+            .kek_provider
+            .load_existing_kek_for_source(&env.key_source)?
+        {
+            Some((k, _)) => k,
+            None => self.kek_provider.load_or_create_kek()?.0,
+        };
+        let nonce_bytes = hex::decode(env.nonce_hex.trim())
+            .context("decoding DEK envelope nonce_hex")?;
+        if nonce_bytes.len() != 12 {
+            bail!("invalid DEK nonce length {}", nonce_bytes.len());
+        }
+        let mut nonce_arr = [0u8; 12];
+        nonce_arr.copy_from_slice(&nonce_bytes);
+        let mut in_out = Zeroizing::new(
+            base64::engine::general_purpose::STANDARD
+                .decode(env.ciphertext_b64.trim())
+                .context("decoding DEK ciphertext_b64")?,
+        );
+        let unbound = UnboundKey::new(&AES_256_GCM, &*kek)
+            .map_err(|_| anyhow::anyhow!("failed initializing AES-256-GCM key"))?;
+        let key = LessSafeKey::new(unbound);
+        let plain = key
+            .open_in_place(
+                Nonce::assume_unique_for_key(nonce_arr),
+                Aad::from(org_id.as_bytes()),
+                &mut *in_out,
+            )
+            .map_err(|_| {
+                anyhow::anyhow!(
+                    "AEAD authentication failed unwrapping DEK for org '{}' (wrong KEK or tampered envelope)",
+                    org_id
+                )
+            })?;
+        let dek_str = Zeroizing::new(
+            String::from_utf8(plain.to_vec())
+                .context("unwrapped DEK is not valid UTF-8")?,
+        );
+        Ok((dek_str, env.key_source))
+    }
+
     pub fn load_or_create_dek(
         &self,
         org_id: &str,
         dek_path: &Path,
     ) -> anyhow::Result<(Zeroizing<String>, String)> {
-        if dek_path.exists() {
-            let bytes = std::fs::read(dek_path).with_context(|| {
-                format!("reading encrypted DEK envelope '{}'", dek_path.display())
-            })?;
-            let env: EncryptedDekEnvelope = serde_json::from_slice(&bytes).with_context(|| {
-                format!("parsing encrypted DEK envelope '{}'", dek_path.display())
-            })?;
-            if env.version != 1 {
-                bail!("unsupported DEK envelope version {}", env.version);
-            }
-            if env.org_id != org_id {
-                bail!(
-                    "DEK envelope org_id mismatch: envelope '{}' vs requested '{}'",
-                    env.org_id,
-                    org_id
-                );
-            }
-            let kek = match self
-                .kek_provider
-                .load_existing_kek_for_source(&env.key_source)?
-            {
-                Some((k, _)) => k,
-                None => self.kek_provider.load_or_create_kek()?.0,
-            };
-            let nonce_bytes = hex::decode(env.nonce_hex.trim())
-                .context("decoding DEK envelope nonce_hex")?;
-            if nonce_bytes.len() != 12 {
-                bail!("invalid DEK nonce length {}", nonce_bytes.len());
-            }
-            let mut nonce_arr = [0u8; 12];
-            nonce_arr.copy_from_slice(&nonce_bytes);
-            let mut in_out = base64::engine::general_purpose::STANDARD
-                .decode(env.ciphertext_b64.trim())
-                .context("decoding DEK ciphertext_b64")?;
-            let unbound = UnboundKey::new(&AES_256_GCM, &*kek)
-                .map_err(|_| anyhow::anyhow!("failed initializing AES-256-GCM key"))?;
-            let key = LessSafeKey::new(unbound);
-            let plain = key
-                .open_in_place(
-                    Nonce::assume_unique_for_key(nonce_arr),
-                    Aad::from(org_id.as_bytes()),
-                    &mut in_out,
-                )
-                .map_err(|_| {
-                    anyhow::anyhow!(
-                        "AEAD authentication failed unwrapping DEK for org '{}' (wrong KEK or tampered envelope)",
-                        org_id
-                    )
-                })?;
-            let dek_str = Zeroizing::new(
-                String::from_utf8(plain.to_vec())
-                    .context("unwrapped DEK is not valid UTF-8")?,
-            );
-            return Ok((dek_str, env.key_source));
+        if std::fs::symlink_metadata(dek_path).is_ok() {
+            return self.unseal_existing_dek(org_id, dek_path);
         }
 
         let (kek, key_source) = self.kek_provider.load_or_create_kek()?;
@@ -900,6 +936,52 @@ pub trait VolumeMounter: Send + Sync {
         let _ = force;
         self.unmount(backend, org_id, mount_dir)
     }
+
+    fn compact(
+        &self,
+        _backend: VaultBackendKind,
+        _backing_path: &Path,
+        _dek: Option<&str>,
+    ) -> anyhow::Result<()> {
+        anyhow::bail!("vault compaction not supported on this backend/platform")
+    }
+}
+
+fn recursive_size_no_symlinks(path: &Path) -> u64 {
+    let Ok(meta) = std::fs::symlink_metadata(path) else {
+        return 0;
+    };
+    if meta.file_type().is_symlink() {
+        return 0;
+    }
+    if meta.is_file() {
+        return meta.len();
+    }
+    if !meta.is_dir() {
+        return 0;
+    }
+    let mut total: u64 = 0;
+    let mut stack = vec![path.to_path_buf()];
+    while let Some(dir) = stack.pop() {
+        let Ok(entries) = std::fs::read_dir(&dir) else {
+            continue;
+        };
+        for entry in entries.flatten() {
+            let child = entry.path();
+            let Ok(child_meta) = std::fs::symlink_metadata(&child) else {
+                continue;
+            };
+            if child_meta.file_type().is_symlink() {
+                continue;
+            }
+            if child_meta.is_file() {
+                total = total.saturating_add(child_meta.len());
+            } else if child_meta.is_dir() {
+                stack.push(child);
+            }
+        }
+    }
+    total
 }
 
 pub fn is_mountpoint(mount_dir: &Path) -> bool {
@@ -1499,6 +1581,58 @@ impl VolumeMounter for OsVolumeMounter {
             VaultBackendKind::PlainDir0700 => Ok(()),
         }
     }
+
+    fn compact(
+        &self,
+        backend: VaultBackendKind,
+        backing_path: &Path,
+        dek: Option<&str>,
+    ) -> anyhow::Result<()> {
+        match backend {
+            VaultBackendKind::ApfsSparseBundle => {
+                #[cfg(target_os = "macos")]
+                {
+                    let backing_str = backing_path.to_string_lossy();
+                    let out = match dek {
+                        Some(pass) => run_cmd_with_stdin(
+                            "/usr/bin/hdiutil",
+                            &["compact", "-stdinpass", backing_str.as_ref()],
+                            pass.as_bytes(),
+                        )?,
+                        None => Command::new("/usr/bin/hdiutil")
+                            .args(["compact", backing_str.as_ref()])
+                            .stdin(Stdio::null())
+                            .output()
+                            .context("spawning /usr/bin/hdiutil compact")?,
+                    };
+                    if !out.status.success() {
+                        let stderr = String::from_utf8_lossy(&out.stderr).trim().to_string();
+                        let detail = if stderr.is_empty() {
+                            String::from_utf8_lossy(&out.stdout).trim().to_string()
+                        } else {
+                            stderr
+                        };
+                        bail!("hdiutil compact failed ({}): {}", out.status, detail);
+                    }
+                    Ok(())
+                }
+                #[cfg(not(target_os = "macos"))]
+                {
+                    let _ = (backing_path, dek);
+                    bail!("ApfsSparseBundle compaction is only supported on macOS");
+                }
+            }
+            VaultBackendKind::LuksBtrfs
+            | VaultBackendKind::GocryptfsFuse
+            | VaultBackendKind::PlainDir0700 => {
+                let _ = (backing_path, dek);
+                bail!(
+                    "offline compaction not supported for vault backend '{}'",
+                    backend.as_str()
+                );
+            }
+        }
+    }
 }
 
 /// Manages per-organization encrypted volumes mounted at `<runtime_root>/orgs/<org_id>`.
@@ -2048,6 +2182,78 @@ impl OrgVaultManager {
         }
         Ok(locked)
     }
+
+    /// Reclaims free sparse-bundle bands on an unmounted APFS encrypted `.sparsebundle` vault.
+    pub fn compact_org(&self, org_id: &str) -> anyhow::Result<VaultCompactResult> {
+        let safe_org = sanitize_and_validate_org_id(org_id)?;
+        let vaults_dir = self.vaults_dir();
+        std::fs::create_dir_all(&vaults_dir)?;
+        let _ = set_dir_0700(&vaults_dir);
+        let lock_target = vaults_dir.join(format!("{}.vault.json", safe_org));
+        let _lock = aos_core::session::acquire_file_lock_sync(&lock_target)?;
+
+        let mount_dir = self.mount_dir(org_id);
+        if self.mounter.is_mounted(&mount_dir) {
+            bail!(
+                "OrgVault '{}' is currently mounted and cannot be compacted live; run `aegis-os --org {} vault lock` first",
+                org_id,
+                org_id
+            );
+        }
+
+        let (backend, backing_path) = match self.detect_existing_backing(&safe_org) {
+            Some((VaultBackendKind::ApfsSparseBundle, path)) => {
+                (VaultBackendKind::ApfsSparseBundle, path)
+            }
+            Some((other, _)) => {
+                bail!(
+                    "offline compaction not supported for org '{}' vault backend '{}'",
+                    org_id,
+                    other.as_str()
+                );
+            }
+            None => {
+                bail!("no vault backing volume found for org '{}'", org_id);
+            }
+        };
+
+        let backing_meta = std::fs::symlink_metadata(&backing_path).with_context(|| {
+            format!(
+                "inspecting vault backing path '{}'",
+                backing_path.display()
+            )
+        })?;
+        if backing_meta.file_type().is_symlink() {
+            bail!(
+                "refusing symlink vault backing path '{}'",
+                backing_path.display()
+            );
+        }
+
+        let encrypted = backend.is_encrypted();
+        let dek_path = self.dek_path(&safe_org);
+        let dek: Option<Zeroizing<String>> = if encrypted {
+            Some(self.key_store.unseal_existing_dek(org_id, &dek_path)?.0)
+        } else {
+            None
+        };
+
+        let bytes_before = recursive_size_no_symlinks(&backing_path);
+        self.mounter
+            .compact(backend, &backing_path, dek.as_ref().map(|d| d.as_str()))?;
+        let bytes_after = recursive_size_no_symlinks(&backing_path);
+        let bytes_reclaimed = bytes_before.saturating_sub(bytes_after);
+
+        Ok(VaultCompactResult {
+            org_id: org_id.to_string(),
+            backend,
+            backing_path,
+            encrypted,
+            bytes_before,
+            bytes_after,
+            bytes_reclaimed,
+        })
+    }
 }
 
 #[cfg(test)]
@@ -2063,9 +2269,17 @@ pub mod tests {
         mounted: bool,
     }
 
+    #[derive(Debug, Clone, PartialEq, Eq)]
+    pub struct MockCompactCall {
+        pub backend: VaultBackendKind,
+        pub backing_path: PathBuf,
+        pub dek: Option<String>,
+    }
+
     pub struct MockVolumeMounter {
         preferred: VaultBackendKind,
         records: Mutex<HashMap<PathBuf, MockMountRecord>>,
+        compact_calls: Mutex<Vec<MockCompactCall>>,
         shadow_store_dir: PathBuf,
     }
 
@@ -2074,8 +2288,13 @@ pub mod tests {
             Self {
                 preferred,
                 records: Mutex::new(HashMap::new()),
+                compact_calls: Mutex::new(Vec::new()),
                 shadow_store_dir,
             }
+        }
+
+        pub fn compact_calls(&self) -> Vec<MockCompactCall> {
+            self.compact_calls.lock().unwrap().clone()
         }
 
         fn backing_payload_dir(&self, org_id: &str) -> PathBuf {
@@ -2178,6 +2397,49 @@ pub mod tests {
             }
             if let Some(rec) = self.records.lock().unwrap().get_mut(mount_dir) {
                 rec.mounted = false;
+            }
+            Ok(())
+        }
+
+        fn compact(
+            &self,
+            backend: VaultBackendKind,
+            backing_path: &Path,
+            dek: Option<&str>,
+        ) -> anyhow::Result<()> {
+            if backend != VaultBackendKind::ApfsSparseBundle {
+                bail!(
+                    "offline compaction not supported for vault backend '{}'",
+                    backend.as_str()
+                );
+            }
+            if !backing_path.exists() {
+                bail!("missing backing path {}", backing_path.display());
+            }
+            self.compact_calls.lock().unwrap().push(MockCompactCall {
+                backend,
+                backing_path: backing_path.to_path_buf(),
+                dek: dek.map(str::to_string),
+            });
+            let bands_dir = backing_path.join("bands");
+            if std::fs::symlink_metadata(&bands_dir)
+                .is_ok_and(|m| !m.file_type().is_symlink() && m.is_dir())
+            {
+                for entry in std::fs::read_dir(&bands_dir)? {
+                    let p = entry?.path();
+                    let Ok(meta) = std::fs::symlink_metadata(&p) else {
+                        continue;
+                    };
+                    if meta.file_type().is_symlink() || !meta.is_file() {
+                        continue;
+                    }
+                    let cur_len = meta.len();
+                    if cur_len > 0 {
+                        let new_len = if cur_len == 1 { 0 } else { cur_len / 2 };
+                        let f = std::fs::OpenOptions::new().write(true).open(&p)?;
+                        f.set_len(new_len)?;
+                    }
+                }
             }
             Ok(())
         }
@@ -2460,5 +2722,141 @@ pub mod tests {
                 .is_err(),
             "wrong KEK must fail AEAD authentication"
         );
+    }
+
+    #[test]
+    fn compact_org_rejects_mounted_vault_with_lock_hint() {
+        let tmp = tempfile::tempdir().unwrap();
+        let runtime_root = tmp.path().join("runtime");
+        let mock_store = tmp.path().join("mock_cipher_store");
+        let kek = Arc::new(InMemoryKekProvider::new([0x33u8; 32]));
+        let mounter = Arc::new(MockVolumeMounter::new(
+            VaultBackendKind::ApfsSparseBundle,
+            mock_store,
+        ));
+        let mgr = OrgVaultManager::with_components(
+            &runtime_root,
+            VaultMode::Enforced,
+            4,
+            kek,
+            mounter.clone(),
+        );
+        let _guard = VaultUnmountGuard(&mgr);
+
+        mgr.ensure_org_unlocked("acme").unwrap();
+        let err = mgr.compact_org("acme").unwrap_err();
+        let msg = err.to_string();
+        assert!(
+            msg.contains("aegis-os --org acme vault lock"),
+            "expected vault lock hint in error, got: {msg}"
+        );
+        assert!(mounter.compact_calls().is_empty());
+    }
+
+    #[test]
+    fn compact_org_unseals_dek_passes_to_mounter_and_computes_bytes_reclaimed() {
+        let tmp = tempfile::tempdir().unwrap();
+        let runtime_root = tmp.path().join("runtime");
+        let mock_store = tmp.path().join("mock_cipher_store");
+        let kek = Arc::new(InMemoryKekProvider::new([0x55u8; 32]));
+        let mounter = Arc::new(MockVolumeMounter::new(
+            VaultBackendKind::ApfsSparseBundle,
+            mock_store,
+        ));
+        let mgr = OrgVaultManager::with_components(
+            &runtime_root,
+            VaultMode::Enforced,
+            4,
+            kek.clone(),
+            mounter.clone(),
+        );
+        let _guard = VaultUnmountGuard(&mgr);
+
+        let unlocked = mgr.ensure_org_unlocked("acme").unwrap();
+        let backing = unlocked.backing_path.clone().unwrap();
+        mgr.lock_org("acme").unwrap();
+
+        let bands_dir = backing.join("bands");
+        std::fs::create_dir_all(&bands_dir).unwrap();
+        std::fs::write(bands_dir.join("0"), vec![0xABu8; 4096]).unwrap();
+
+        let ext_file = tmp.path().join("external.bin");
+        std::fs::write(&ext_file, vec![0xCDu8; 16384]).unwrap();
+        #[cfg(unix)]
+        std::os::unix::fs::symlink(&ext_file, backing.join("ext_link")).unwrap();
+
+        let dek_path = runtime_root.join("vaults/acme.dek.enc.json");
+        let (expected_dek, _) = VaultKeyStore::new(kek)
+            .unseal_existing_dek("acme", &dek_path)
+            .unwrap();
+
+        let res = mgr.compact_org("acme").unwrap();
+        assert_eq!(res.org_id, "acme");
+        assert_eq!(res.backend, VaultBackendKind::ApfsSparseBundle);
+        assert_eq!(res.backing_path, backing);
+        assert!(res.encrypted);
+        assert!(res.bytes_before >= 4096);
+        assert!(res.bytes_before < 16384, "symlinked external file must not be counted");
+        assert!(res.bytes_after < res.bytes_before);
+        assert_eq!(res.bytes_reclaimed, res.bytes_before - res.bytes_after);
+        assert!(res.bytes_reclaimed > 0);
+
+        let calls = mounter.compact_calls();
+        assert_eq!(calls.len(), 1);
+        assert_eq!(calls[0].backend, VaultBackendKind::ApfsSparseBundle);
+        assert_eq!(calls[0].backing_path, res.backing_path);
+        assert_eq!(calls[0].dek.as_deref(), Some(expected_dek.as_str()));
+    }
+
+    #[test]
+    fn compact_org_rejects_missing_or_mismatched_dek_without_creating_new_dek() {
+        let tmp = tempfile::tempdir().unwrap();
+        let runtime_root = tmp.path().join("runtime");
+        let mock_store = tmp.path().join("mock_cipher_store");
+        let kek = Arc::new(InMemoryKekProvider::new([0x66u8; 32]));
+        let mounter = Arc::new(MockVolumeMounter::new(
+            VaultBackendKind::ApfsSparseBundle,
+            mock_store,
+        ));
+        let mgr = OrgVaultManager::with_components(
+            &runtime_root,
+            VaultMode::Enforced,
+            4,
+            kek,
+            mounter.clone(),
+        );
+        let _guard = VaultUnmountGuard(&mgr);
+
+        mgr.ensure_org_unlocked("acme").unwrap();
+        mgr.lock_org("acme").unwrap();
+        let acme_dek_path = runtime_root.join("vaults/acme.dek.enc.json");
+        assert!(acme_dek_path.exists());
+
+        // 1. Missing DEK must fail cleanly and NEVER create a fresh DEK.
+        std::fs::remove_file(&acme_dek_path).unwrap();
+        let missing_err = mgr.compact_org("acme").unwrap_err();
+        assert!(
+            missing_err.to_string().contains("missing encrypted DEK envelope"),
+            "unexpected missing-DEK error: {missing_err}"
+        );
+        assert!(
+            !acme_dek_path.exists(),
+            "compact_org must never synthesize a new DEK when missing"
+        );
+        assert!(mounter.compact_calls().is_empty());
+
+        // 2. Mismatched env.org_id must fail cleanly without overwriting envelope or calling compact.
+        mgr.ensure_org_unlocked("beta").unwrap();
+        mgr.lock_org("beta").unwrap();
+        let beta_dek_bytes = std::fs::read(runtime_root.join("vaults/beta.dek.enc.json")).unwrap();
+        std::fs::write(&acme_dek_path, &beta_dek_bytes).unwrap();
+
+        let mismatch_err = mgr.compact_org("acme").unwrap_err();
+        assert!(
+            mismatch_err.to_string().contains("org_id mismatch"),
+            "unexpected mismatch error: {mismatch_err}"
+        );
+        assert_eq!(std::fs::read(&acme_dek_path).unwrap(), beta_dek_bytes);
+        assert!(mounter.compact_calls().is_empty());
     }
 }

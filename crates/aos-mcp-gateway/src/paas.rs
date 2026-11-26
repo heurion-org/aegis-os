@@ -413,8 +413,66 @@ struct PersistedPaasState {
     approver_enrollments: Vec<ApproverEnrollmentRecord>,
     #[serde(default)]
     telemetry_devices: std::collections::BTreeMap<String, TelemetryDeviceRecord>,
+    #[serde(default)]
+    friction_aggregates: FrictionAggregateState,
     #[serde(default = "default_ticket_signing_secret")]
     ticket_signing_secret: String,
+}
+
+/// Zero-PII friction summary payload accepted at `POST /v1/telemetry/friction`.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct FrictionReportPayload {
+    #[serde(default)]
+    pub schema_version: u32,
+    #[serde(default)]
+    pub device_token: String,
+    #[serde(default)]
+    pub version: String,
+    #[serde(default)]
+    pub os: String,
+    #[serde(default)]
+    pub arch: String,
+    #[serde(default)]
+    pub client: String,
+    #[serde(default)]
+    pub window_days: u32,
+    #[serde(default)]
+    pub total_events: u64,
+    #[serde(default)]
+    pub recovered_events: u64,
+    #[serde(default)]
+    pub max_streak_seen: u32,
+    #[serde(default)]
+    pub by_category: std::collections::BTreeMap<String, u64>,
+    #[serde(default)]
+    pub by_cmd_bucket: std::collections::BTreeMap<String, u64>,
+}
+
+/// Persisted zero-PII aggregate friction counters (strictly bounded key sets).
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct FrictionAggregateState {
+    #[serde(default)]
+    pub total_reports: u64,
+    #[serde(default)]
+    pub total_events: u64,
+    #[serde(default)]
+    pub recovered_events: u64,
+    #[serde(default)]
+    pub max_streak_seen: u32,
+    #[serde(default)]
+    pub unique_reporters: std::collections::BTreeMap<String, i64>,
+    #[serde(default)]
+    pub by_category: std::collections::BTreeMap<String, u64>,
+    #[serde(default)]
+    pub by_cmd_bucket: std::collections::BTreeMap<String, u64>,
+    #[serde(default)]
+    pub by_client: std::collections::BTreeMap<String, u64>,
+    #[serde(default)]
+    pub by_os: std::collections::BTreeMap<String, u64>,
+    #[serde(default)]
+    pub by_version: std::collections::BTreeMap<String, u64>,
+    #[serde(default)]
+    pub last_report_ms: Option<i64>,
 }
 
 #[derive(Debug, Clone)]
@@ -3445,8 +3503,148 @@ impl PaasControlPlane {
             "by_os_arch": by_os_arch,
             "by_version": by_version,
             "by_mode": by_mode,
-            "daily_trend_14d": daily_trend_14d
+            "daily_trend_14d": daily_trend_14d,
+            "friction": Self::friction_summary_from_state(&state)
         })
+    }
+
+    fn friction_summary_from_state(state: &PersistedPaasState) -> Value {
+        let agg = &state.friction_aggregates;
+        let mut top_categories: Vec<Value> = agg
+            .by_category
+            .iter()
+            .map(|(k, v)| json!({ "key": k, "count": v }))
+            .collect();
+        top_categories.sort_by(|a, b| {
+            let ca = a["count"].as_u64().unwrap_or(0);
+            let cb = b["count"].as_u64().unwrap_or(0);
+            cb.cmp(&ca)
+                .then_with(|| a["key"].as_str().cmp(&b["key"].as_str()))
+        });
+        let recovery_rate_pct = if agg.total_events > 0 {
+            ((agg.recovered_events as f64) * 1000.0 / (agg.total_events as f64)).round() / 10.0
+        } else {
+            0.0
+        };
+        json!({
+            "total_reports": agg.total_reports,
+            "unique_reporters": agg.unique_reporters.len(),
+            "total_events": agg.total_events,
+            "recovered_events": agg.recovered_events,
+            "recovery_rate_pct": recovery_rate_pct,
+            "max_streak_seen": agg.max_streak_seen,
+            "last_report_ms": agg.last_report_ms,
+            "by_category": agg.by_category,
+            "by_cmd_bucket": agg.by_cmd_bucket,
+            "by_client": agg.by_client,
+            "by_os": agg.by_os,
+            "by_version": agg.by_version,
+            "top_categories": top_categories,
+        })
+    }
+
+    /// Record a zero-PII aggregate friction report submitted via `POST /v1/telemetry/friction`.
+    /// Rejects unknown category/bucket keys so arbitrary strings can never enter telemetry state.
+    pub async fn record_friction_report(
+        &self,
+        payload: &FrictionReportPayload,
+    ) -> anyhow::Result<Value> {
+        const MAX_EVENT_BATCH: u64 = 1_000_000;
+        const MAX_UNIQUE_REPORTERS: usize = 10_000;
+        const MAX_VERSION_KEYS: usize = 64;
+
+        let version =
+            Self::sanitize_telemetry_token(&payload.version, env!("CARGO_PKG_VERSION"), 24);
+        let os = Self::sanitize_telemetry_token(&payload.os, std::env::consts::OS, 24);
+        let arch = Self::sanitize_telemetry_token(&payload.arch, std::env::consts::ARCH, 24);
+        let os_arch = format!("{os}-{arch}");
+        let client = aos_core::friction::normalize_client_tag(&payload.client).to_string();
+        let reporter_key = if payload.device_token.trim().len() >= 6 {
+            Self::anonymous_device_token(payload.device_token.trim())
+        } else {
+            "anon".to_string()
+        };
+
+        let mut sanitized_categories = std::collections::BTreeMap::new();
+        for (raw_k, count) in &payload.by_category {
+            if let Some(cat) = aos_core::friction::FrictionCategory::parse(raw_k) {
+                if *count > 0 {
+                    let entry = sanitized_categories
+                        .entry(cat.as_str().to_string())
+                        .or_insert(0u64);
+                    *entry = entry.saturating_add(*count).min(MAX_EVENT_BATCH);
+                }
+            }
+        }
+        let mut sanitized_buckets = std::collections::BTreeMap::new();
+        for (raw_k, count) in &payload.by_cmd_bucket {
+            if let Some(bucket) = aos_core::friction::CmdBucket::parse(raw_k) {
+                if *count > 0 {
+                    let entry = sanitized_buckets
+                        .entry(bucket.as_str().to_string())
+                        .or_insert(0u64);
+                    *entry = entry.saturating_add(*count).min(MAX_EVENT_BATCH);
+                }
+            }
+        }
+
+        let category_sum: u64 = sanitized_categories.values().copied().sum();
+        let added_events = payload
+            .total_events
+            .max(category_sum)
+            .min(MAX_EVENT_BATCH);
+        let added_recovered = payload.recovered_events.min(added_events);
+        let max_streak = payload.max_streak_seen.min(1000);
+        let now_ms = Utc::now().timestamp_millis();
+
+        self.with_state_mut(move |state| {
+            let agg = &mut state.friction_aggregates;
+            agg.total_reports = agg.total_reports.saturating_add(1);
+            agg.total_events = agg.total_events.saturating_add(added_events);
+            agg.recovered_events = agg.recovered_events.saturating_add(added_recovered);
+            agg.max_streak_seen = agg.max_streak_seen.max(max_streak);
+            agg.last_report_ms = Some(now_ms);
+
+            if agg.unique_reporters.contains_key(&reporter_key)
+                || agg.unique_reporters.len() < MAX_UNIQUE_REPORTERS
+            {
+                agg.unique_reporters.insert(reporter_key, now_ms);
+            }
+            for (k, v) in sanitized_categories {
+                let entry = agg.by_category.entry(k).or_insert(0);
+                *entry = entry.saturating_add(v);
+            }
+            for (k, v) in sanitized_buckets {
+                let entry = agg.by_cmd_bucket.entry(k).or_insert(0);
+                *entry = entry.saturating_add(v);
+            }
+            let c_entry = agg.by_client.entry(client).or_insert(0);
+            *c_entry = c_entry.saturating_add(added_events.max(1));
+            let os_entry = agg.by_os.entry(os_arch).or_insert(0);
+            *os_entry = os_entry.saturating_add(added_events.max(1));
+            if agg.by_version.contains_key(&version) || agg.by_version.len() < MAX_VERSION_KEYS {
+                let v_entry = agg.by_version.entry(version).or_insert(0);
+                *v_entry = v_entry.saturating_add(added_events.max(1));
+            }
+            Ok(())
+        })
+        .await?;
+
+        Ok(json!({
+            "accepted": true,
+            "events_recorded": added_events
+        }))
+    }
+
+    /// Return aggregated zero-PII friction telemetry for operators (`GET /v1/telemetry/friction/stats`).
+    pub async fn get_friction_stats(&self) -> Value {
+        self.reload().await;
+        let state = self.state.read().await;
+        let mut summary = Self::friction_summary_from_state(&state);
+        if let Some(obj) = summary.as_object_mut() {
+            obj.insert("generated_at".to_string(), json!(Utc::now().to_rfc3339()));
+        }
+        summary
     }
 }
 
@@ -3711,5 +3909,119 @@ mod tests {
             Utc::now().timestamp_millis(),
         )
         .is_err());
+    }
+
+    #[tokio::test]
+    async fn friction_report_sanitizes_keys_caps_counts_and_rolls_up_stats() {
+        let tmp = tempfile::tempdir().unwrap();
+        let paas = PaasControlPlane::new(tmp.path());
+
+        let mut by_category = std::collections::BTreeMap::new();
+        by_category.insert("network_blocked".to_string(), 4);
+        by_category.insert("tmp_denied".to_string(), 2);
+        by_category.insert("/Users/alice/secret/path.rs".to_string(), 99);
+
+        let mut by_cmd_bucket = std::collections::BTreeMap::new();
+        by_cmd_bucket.insert("http_client".to_string(), 4);
+        by_cmd_bucket.insert("curl https://secret.example.com".to_string(), 50);
+
+        let res = paas
+            .record_friction_report(&FrictionReportPayload {
+                schema_version: 1,
+                device_token: "anon-seed-123456".to_string(),
+                version: env!("CARGO_PKG_VERSION").to_string(),
+                os: "macos".to_string(),
+                arch: "aarch64".to_string(),
+                client: "Claude Code CLI".to_string(),
+                window_days: 30,
+                total_events: 6,
+                recovered_events: 5,
+                max_streak_seen: 3,
+                by_category,
+                by_cmd_bucket,
+            })
+            .await
+            .unwrap();
+        assert_eq!(res["accepted"], true);
+        assert_eq!(res["events_recorded"], 6);
+
+        let stats = paas.get_friction_stats().await;
+        assert_eq!(stats["total_reports"], 1);
+        assert_eq!(stats["unique_reporters"], 1);
+        assert_eq!(stats["total_events"], 6);
+        assert_eq!(stats["recovered_events"], 5);
+        assert_eq!(stats["max_streak_seen"], 3);
+        assert_eq!(stats["by_category"]["network_blocked"], 4);
+        assert_eq!(stats["by_category"]["tmp_denied"], 2);
+        assert!(stats["by_category"].get("/Users/alice/secret/path.rs").is_none());
+        assert_eq!(stats["by_cmd_bucket"]["http_client"], 4);
+        assert!(stats["by_cmd_bucket"].get("curl https://secret.example.com").is_none());
+        assert_eq!(stats["by_client"]["claude_code"], 6);
+
+        let telemetry = paas.get_telemetry_stats().await;
+        assert_eq!(telemetry["friction"]["total_events"], 6);
+    }
+
+    #[tokio::test]
+    async fn friction_report_accepts_all_canonical_categories_and_buckets() {
+        let tmp = tempfile::tempdir().unwrap();
+        let paas = PaasControlPlane::new(tmp.path());
+
+        let mut by_category = std::collections::BTreeMap::new();
+        for &cat in aos_core::friction::FrictionCategory::ALL {
+            by_category.insert(cat.as_str().to_string(), 1);
+        }
+        by_category.insert("  EDIT_MISMATCH ".to_string(), 2);
+        by_category.insert("rogue_pii_key".to_string(), 99);
+
+        let mut by_cmd_bucket = std::collections::BTreeMap::new();
+        for &bucket in aos_core::friction::CmdBucket::ALL {
+            by_cmd_bucket.insert(bucket.as_str().to_string(), 1);
+        }
+        by_cmd_bucket.insert("/tmp/secret".to_string(), 99);
+
+        let res = paas
+            .record_friction_report(&FrictionReportPayload {
+                schema_version: 1,
+                device_token: "anon-seed-all-cats".to_string(),
+                version: env!("CARGO_PKG_VERSION").to_string(),
+                os: "macos".to_string(),
+                arch: "aarch64".to_string(),
+                client: "AGY".to_string(),
+                window_days: 30,
+                total_events: 14,
+                recovered_events: 4,
+                max_streak_seen: 3,
+                by_category,
+                by_cmd_bucket,
+            })
+            .await
+            .unwrap();
+        assert_eq!(res["accepted"], true);
+
+        let stats = paas.get_friction_stats().await;
+        for &cat in aos_core::friction::FrictionCategory::ALL {
+            let expected = if cat == aos_core::friction::FrictionCategory::EditMismatch {
+                3
+            } else {
+                1
+            };
+            assert_eq!(
+                stats["by_category"][cat.as_str()],
+                expected,
+                "missing or mismatched category {}",
+                cat.as_str()
+            );
+        }
+        for &bucket in aos_core::friction::CmdBucket::ALL {
+            assert_eq!(
+                stats["by_cmd_bucket"][bucket.as_str()],
+                1,
+                "missing bucket {}",
+                bucket.as_str()
+            );
+        }
+        assert!(stats["by_category"].get("rogue_pii_key").is_none());
+        assert!(stats["by_cmd_bucket"].get("/tmp/secret").is_none());
     }
 }

@@ -399,7 +399,249 @@ pub async fn render_growth_analytics(
             println!("  {d} | DAU: {:<4} (+{:<3} new) {}", dau_n, new_n, bar);
         }
     }
+
+    let local_events = aos_core::friction::load_friction_events(
+        &aos_core::friction::default_friction_log_path(runtime_dir),
+        Some(30),
+    )
+    .unwrap_or_default();
+    let local_summary = aos_core::friction::aggregate_friction_events(&local_events, 30);
+    let remote_friction = telemetry_stats.get("friction").filter(|v| !v.is_null());
+    println!("\n[5] Agent Friction & Runtime Health (Zero-PII, Last 30d)");
+    println!(
+        "  - Local Friction: {} event(s), {} recovered, max streak {}",
+        local_summary.total_events, local_summary.recovered_events, local_summary.max_streak_seen
+    );
+    if !local_summary.top_categories.is_empty() {
+        let top = local_summary
+            .top_categories
+            .iter()
+            .take(4)
+            .map(|b| format!("{}: {}", b.key, b.count))
+            .collect::<Vec<_>>()
+            .join(" | ");
+        println!("  - Top Local Frictions: {top}");
+    }
+    if let Some(rf) = remote_friction {
+        let r_events = rf["total_events"].as_u64().unwrap_or(0);
+        let r_reports = rf["total_reports"].as_u64().unwrap_or(0);
+        let r_rate = rf["recovery_rate_pct"].as_f64().unwrap_or(0.0);
+        println!(
+            "  - Cloud Aggregated: {r_reports} report(s), {r_events} event(s), {r_rate:.1}% recovered"
+        );
+    }
     println!("========================================================================");
+    Ok(())
+}
+
+/// Actionable diagnosis strings shown locally in `aegis-os insights`.
+fn recommendation_for_category(category: &str) -> &'static str {
+    match category {
+        "network_blocked" => {
+            "Use `mcp_aegis-os_egress_http_request {\"url\":\"...\"}` instead of `curl`/`wget` inside `proc_exec`."
+        }
+        "tmp_denied" => {
+            "Use `$TMPDIR` (auto-created inside writable agent home) instead of hardcoded `/tmp` or `/private/tmp`."
+        }
+        "timeout_scan" => {
+            "Avoid `find /` or whole-disk searches inside Seatbelt; search scoped workspace paths or pass `background: true`."
+        }
+        "routing_redirect" => {
+            "Agents called native shell/file tools before reading runtime rules; verify global skill `aegis-os-runtime/SKILL.md` is installed via `aegis-os doctor`."
+        }
+        "loop_thrash" => {
+            "Agents retried failing commands repeatedly; review stderr `aegis_hint` guidance before re-running."
+        }
+        "host_fallback" => {
+            "Consider granting scoped `host_exec` or `egress` leases if specific host workflows keep falling back."
+        }
+        "policy_denied" => {
+            "Review policy denials and secret masks; keep work within shadow workspace and `$TMPDIR`."
+        }
+        _ => "Inspect recent sandbox exits with `aegis-os audit` and ensure `aegis-os install` rules are fresh.",
+    }
+}
+
+/// Build the local `aegis-os insights` JSON payload (100% offline, zero PII).
+pub fn build_insights_report(runtime_dir: &Path, days: u32) -> anyhow::Result<Value> {
+    let log_path = aos_core::friction::default_friction_log_path(runtime_dir);
+    let events = aos_core::friction::load_friction_events(&log_path, Some(days))?;
+    let summary = aos_core::friction::aggregate_friction_events(&events, days);
+    let recommendations: Vec<Value> = summary
+        .top_categories
+        .iter()
+        .take(5)
+        .map(|entry| {
+            json!({
+                "category": entry.key,
+                "count": entry.count,
+                "recommendation": recommendation_for_category(&entry.key),
+            })
+        })
+        .collect();
+    Ok(json!({
+        "log_path": log_path.display().to_string(),
+        "telemetry_opted_out": is_telemetry_disabled() || aos_core::friction::is_telemetry_opted_out(),
+        "summary": summary,
+        "recommendations": recommendations,
+    }))
+}
+
+/// Render `aegis-os insights` showing where coding agents stalled inside the local runtime.
+pub fn render_insights(runtime_dir: &Path, days: u32, json_out: bool) -> anyhow::Result<()> {
+    let report = build_insights_report(runtime_dir, days)?;
+    if json_out {
+        println!("{}", serde_json::to_string_pretty(&report)?);
+        return Ok(());
+    }
+
+    let total = report["summary"]["total_events"].as_u64().unwrap_or(0);
+    let recovered = report["summary"]["recovered_events"].as_u64().unwrap_or(0);
+    let max_streak = report["summary"]["max_streak_seen"].as_u64().unwrap_or(0);
+    println!("========================================================================");
+    println!(" Aegis OS Agent Friction Insights (Last {} Days, Zero-PII Local Log)", days);
+    println!("========================================================================");
+    println!("  Log file:          {}", report["log_path"].as_str().unwrap_or("-"));
+    println!(
+        "  Telemetry opt-out: {}",
+        if report["telemetry_opted_out"].as_bool().unwrap_or(false) {
+            "enabled (recording paused)"
+        } else {
+            "active (local zero-PII counters)"
+        }
+    );
+    println!("  Total events:      {total} (recovered: {recovered}, max streak: {max_streak})");
+
+    if total == 0 {
+        println!("\n  No agent friction events recorded in the last {days} days.");
+        println!("========================================================================");
+        return Ok(());
+    }
+
+    println!("\n[1] Friction Breakdown by Category");
+    if let Some(cats) = report["summary"]["top_categories"].as_array() {
+        for item in cats {
+            let k = item["key"].as_str().unwrap_or("unknown");
+            let c = item["count"].as_u64().unwrap_or(0);
+            println!("  - {:<20} {}", k, c);
+        }
+    }
+
+    if let Some(buckets) = report["summary"]["by_cmd_bucket"].as_object() {
+        if !buckets.is_empty() {
+            println!("\n[2] Command Families");
+            let line = buckets
+                .iter()
+                .map(|(k, v)| format!("{k}: {}", v.as_u64().unwrap_or(0)))
+                .collect::<Vec<_>>()
+                .join(" | ");
+            println!("  {line}");
+        }
+    }
+
+    if let Some(recs) = report["recommendations"].as_array() {
+        println!("\n[3] Actionable Product & Skill Recommendations");
+        for rec in recs {
+            let cat = rec["category"].as_str().unwrap_or("other");
+            let cnt = rec["count"].as_u64().unwrap_or(0);
+            let msg = rec["recommendation"].as_str().unwrap_or("");
+            println!("  * [{cat} x{cnt}] {msg}");
+        }
+    }
+    println!(
+        "\nPreview zero-PII summary: `aegis-os feedback --dry-run` (or upload with `--send`)."
+    );
+    println!("========================================================================");
+    Ok(())
+}
+
+/// Build an anonymized, strictly aggregate feedback payload from local `friction_events.jsonl`.
+pub fn build_feedback_payload(runtime_dir: &Path, days: u32) -> anyhow::Result<Value> {
+    let log_path = aos_core::friction::default_friction_log_path(runtime_dir);
+    let events = aos_core::friction::load_friction_events(&log_path, Some(days))?;
+    let summary = aos_core::friction::aggregate_friction_events(&events, days);
+    let top_client = summary
+        .by_client
+        .iter()
+        .max_by_key(|(_, v)| *v)
+        .map(|(k, _)| k.clone())
+        .unwrap_or_else(|| "unknown".to_string());
+
+    Ok(json!({
+        "schema_version": 1,
+        "device_token": anonymous_device_id(runtime_dir),
+        "version": env!("CARGO_PKG_VERSION"),
+        "os": std::env::consts::OS,
+        "arch": std::env::consts::ARCH,
+        "client": top_client,
+        "window_days": days,
+        "total_events": summary.total_events,
+        "recovered_events": summary.recovered_events,
+        "max_streak_seen": summary.max_streak_seen,
+        "by_category": summary.by_category,
+        "by_cmd_bucket": summary.by_cmd_bucket,
+    }))
+}
+
+/// `aegis-os feedback`: inspect or explicitly send zero-PII aggregate friction metrics.
+/// Defaults to `--dry-run`; network upload occurs ONLY when `--send` is explicitly passed.
+pub async fn run_feedback_command(
+    runtime_dir: &Path,
+    days: u32,
+    send: bool,
+    endpoint: Option<&str>,
+) -> anyhow::Result<()> {
+    let payload = build_feedback_payload(runtime_dir, days)?;
+    if !send {
+        println!("# Zero-PII Aggregate Friction Payload (Dry-Run — nothing transmitted)");
+        println!("# Contains ZERO commands, paths, domains, URLs, stderr, or source code.");
+        println!("{}", serde_json::to_string_pretty(&payload)?);
+        println!("\nRun `aegis-os feedback --send` to submit this summary to Aegis telemetry.");
+        return Ok(());
+    }
+
+    if is_telemetry_disabled() || aos_core::friction::is_telemetry_opted_out() {
+        anyhow::bail!(
+            "Telemetry opt-out is active (`DO_NOT_TRACK` / `AOS_TELEMETRY_DISABLED` / opt-out file). Refusing to send feedback."
+        );
+    }
+
+    let base = endpoint
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .map(str::to_string)
+        .or_else(|| {
+            std::env::var("AOS_TELEMETRY_URL")
+                .ok()
+                .or_else(|| std::env::var("AOS_CLOUD_ENDPOINT").ok())
+                .map(|s| s.trim().to_string())
+                .filter(|s| !s.is_empty())
+        })
+        .unwrap_or_else(|| "https://heurion.org/aegis-cloud".to_string());
+
+    let url = if base.trim_end_matches('/').ends_with("/v1/telemetry/friction") {
+        base.trim_end_matches('/').to_string()
+    } else {
+        format!("{}/v1/telemetry/friction", base.trim_end_matches('/'))
+    };
+
+    let url_clone = url.clone();
+    let payload_clone = payload.clone();
+    let resp_json: Value = tokio::task::spawn_blocking(move || -> anyhow::Result<Value> {
+        let agent = ureq::AgentBuilder::new()
+            .timeout(Duration::from_secs(6))
+            .build();
+        let resp = agent.post(&url_clone).send_json(payload_clone)?;
+        Ok(resp.into_json()?)
+    })
+    .await??;
+
+    println!(
+        "Submitted zero-PII friction summary ({} events) to {}: {}",
+        payload["total_events"].as_u64().unwrap_or(0),
+        url,
+        resp_json
+    );
     Ok(())
 }
 
@@ -1078,6 +1320,48 @@ mod audit_me_tests {
 
         let line_plain = format_audit_box_line(plain, plain, 40);
         assert_eq!(line_plain.chars().count(), 42);
+    }
+
+    #[test]
+    fn insights_and_feedback_payload_stay_strictly_zero_pii() {
+        let tmp = tempfile::tempdir().unwrap();
+        let rt = tmp.path();
+        let log_path = aos_core::friction::default_friction_log_path(rt);
+
+        let ev1 = aos_core::friction::new_friction_event(
+            aos_core::friction::FrictionCategory::NetworkBlocked,
+            aos_core::friction::CmdBucket::HttpClient,
+            Some("claude-deadbeef"),
+            Some(6),
+            1,
+            false,
+        );
+        let ev2 = aos_core::friction::new_friction_event(
+            aos_core::friction::FrictionCategory::TmpDenied,
+            aos_core::friction::CmdBucket::FsTemp,
+            Some("agy-123456"),
+            Some(1),
+            2,
+            true,
+        );
+        aos_core::friction::append_friction_event_to(&log_path, &ev1, 100_000).unwrap();
+        aos_core::friction::append_friction_event_to(&log_path, &ev2, 100_000).unwrap();
+
+        let report = super::build_insights_report(rt, 30).unwrap();
+        assert_eq!(report["summary"]["total_events"], 2);
+        assert_eq!(report["summary"]["recovered_events"], 1);
+        assert_eq!(report["summary"]["max_streak_seen"], 2);
+        assert!(report["recommendations"].as_array().unwrap().len() >= 2);
+
+        let payload = super::build_feedback_payload(rt, 30).unwrap();
+        assert_eq!(payload["schema_version"], 1);
+        assert_eq!(payload["total_events"], 2);
+        assert_eq!(payload["recovered_events"], 1);
+        assert_eq!(payload["by_category"]["network_blocked"], 1);
+        assert_eq!(payload["by_category"]["tmp_denied"], 1);
+        let serialized = serde_json::to_string(&payload).unwrap();
+        assert!(!serialized.contains(&rt.display().to_string()));
+        assert!(!serialized.contains("claude-deadbeef"));
     }
 }
 

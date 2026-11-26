@@ -376,6 +376,49 @@ const GIT_HOST_SUBCOMMANDS: &[&str] = &[
     "remote", "config", "restore", "init", "clone", "submodule", "gc", "prune", "update-ref",
 ];
 
+fn is_host_outside_workspace_du_target(arg: &str, host_root: &Path) -> bool {
+    let raw = arg.trim().trim_matches(|c| c == '\'' || c == '"');
+    if raw.is_empty() || raw.starts_with('-') {
+        return false;
+    }
+    if raw == "~" || raw.starts_with("~/") {
+        let trimmed = raw
+            .trim_start_matches("~/")
+            .trim_end_matches("/*")
+            .trim_end_matches("/.[!.]*");
+        if raw == "~" || raw == "~/*" || raw.starts_with("~/Library") {
+            return true;
+        }
+        if let Some(home) = std::env::var_os("HOME") {
+            let resolved = normalize(&PathBuf::from(home).join(trimmed));
+            let root_norm = normalize(host_root);
+            return !resolved.starts_with(&root_norm);
+        }
+        return true;
+    }
+    if raw.starts_with("/System/Volumes")
+        || raw == "/Library"
+        || raw.starts_with("/Library/")
+        || raw == "/Applications"
+        || raw.starts_with("/Applications/")
+    {
+        return true;
+    }
+    if raw.starts_with("/Users/") || raw.starts_with("/home/") {
+        if raw.contains("/.aegis/") || raw.contains("/.gemini/") {
+            return false;
+        }
+        let cleaned = raw
+            .trim_end_matches("/*")
+            .trim_end_matches("/.[!.]*")
+            .trim_end_matches('/');
+        let norm = normalize(Path::new(cleaned));
+        let root_norm = normalize(host_root);
+        return !norm.starts_with(&root_norm);
+    }
+    false
+}
+
 fn host_boundary_reason(words: &[String], full_cmd: &str, host_root: &Path) -> Option<String> {
     let cmd = basename(words.first()?.as_str());
     let sub = words.get(1).map(|s| s.as_str()).unwrap_or("");
@@ -398,9 +441,17 @@ fn host_boundary_reason(words: &[String], full_cmd: &str, host_root: &Path) -> O
         }
         "pip" | "pip3" | "uv" => matches!(sub, "install" | "uninstall") && !words.iter().any(|w| w == "--target"),
         "brew" | "gh" | "open" | "launchctl" | "osascript" | "defaults" | "kill" | "pkill"
-        | "killall" | "shutdown" | "reboot" | "diskutil" | "security" | "scp" | "ssh" | "rsync"
-        | "docker" | "kubectl" | "gcloud" | "aws" | "az" | "terraform" | "wrangler" => true,
-        "aegis-os" => matches!(sub, "install" | "setup-agy" | "policy" | "daemon"),
+        | "killall" | "shutdown" | "reboot" | "diskutil" | "tmutil" | "mdutil"
+        | "softwareupdate" | "security" | "scp" | "ssh" | "rsync" | "docker" | "kubectl"
+        | "gcloud" | "aws" | "az" | "terraform" | "wrangler" => true,
+        "du" => words
+            .iter()
+            .skip(1)
+            .any(|w| is_host_outside_workspace_du_target(w, host_root)),
+        "aegis-os" => matches!(
+            sub,
+            "install" | "setup-agy" | "policy" | "daemon" | "disk" | "du" | "gc" | "prune"
+        ),
         _ => false,
     };
     hit.then(|| {
@@ -416,6 +467,10 @@ fn host_boundary_reason(words: &[String], full_cmd: &str, host_root: &Path) -> O
                 ("issue", _) => "\n  • Tip: Use MCP tool `mcp_aegis-os_github_issue_inspect` ({\"issue_number\":<id>}) to list or inspect Issues safely.",
                 _ => "",
             }
+        } else if matches!(cmd, "du" | "tmutil" | "diskutil" | "mdutil")
+            || (cmd == "aegis-os" && matches!(sub, "disk" | "du" | "gc" | "prune"))
+        {
+            "\n  • Note: Seatbelt (`tighten_home_read`) hides host `$HOME` directories outside the active workspace (e.g. `~/Library`, `~/.aegis`), so running host-wide disk scans inside `proc_exec` will silently omit them. Approve host execution, use `mcp_aegis-os_host_exec`, or inspect/reclaim runtime storage on host with `aegis-os disk` / `aegis-os gc`."
         } else {
             ""
         };
@@ -501,8 +556,86 @@ pub fn is_binary_artifact_path(path: &Path) -> bool {
     )
 }
 
+fn extract_first_http_url(cmd: &str) -> Option<String> {
+    cmd.split(|c: char| c.is_whitespace() || matches!(c, '"' | '\'' | ';' | ')' | '(' | ',' | '<' | '>'))
+        .find_map(|tok| {
+            let trimmed = tok.trim_start_matches("R=");
+            let stripped = trimmed
+                .split('=')
+                .rfind(|p| p.starts_with("http://") || p.starts_with("https://"))
+                .unwrap_or(trimmed);
+            if stripped.starts_with("https://") || stripped.starts_with("http://") {
+                Some(stripped.to_string())
+            } else {
+                None
+            }
+        })
+}
+
+fn contains_cmd_word(cmd_lower: &str, word: &str) -> bool {
+    cmd_lower
+        .split(|c: char| !(c.is_ascii_alphanumeric() || c == '_' || c == '-' || c == '.'))
+        .any(|tok| tok == word)
+}
+
 pub fn sandbox_redirect_reason(cmd: &str, shadow_root: &Path, host_root: &Path) -> String {
     let segments = split_segments(cmd);
+    let cmd_lower = cmd.to_ascii_lowercase();
+    let mentions_http_cli = segments.iter().any(|s| {
+        leading_words(s)
+            .1
+            .first()
+            .is_some_and(|w| matches!(basename(w), "curl" | "wget"))
+    }) || contains_cmd_word(&cmd_lower, "curl")
+        || contains_cmd_word(&cmd_lower, "wget");
+    let mentions_tmp_path = cmd_lower.contains("/tmp/")
+        || cmd_lower.ends_with("/tmp")
+        || cmd_lower.contains("/tmp\"")
+        || cmd_lower.contains("/tmp'")
+        || cmd_lower.contains("/private/tmp");
+    let mentions_root_scan = cmd_lower.contains("find / ")
+        || cmd_lower.contains("find /\"")
+        || cmd_lower.ends_with("find /")
+        || cmd_lower.contains("mdfind ")
+        || cmd_lower.contains("locate ");
+
+    let has_local_project_work = segments.iter().any(|s| {
+        let (_, words) = leading_words(s);
+        let first = words.first().map(|w| basename(w));
+        matches!(
+            first,
+            Some(
+                "cargo"
+                    | "rustc"
+                    | "scarb"
+                    | "npm"
+                    | "pnpm"
+                    | "yarn"
+                    | "bun"
+                    | "pytest"
+                    | "python"
+                    | "python3"
+                    | "node"
+                    | "go"
+                    | "make"
+                    | "cmake"
+                    | "git"
+                    | "gh"
+                    | "forge"
+            )
+        )
+    });
+
+    let sample_url = extract_first_http_url(cmd).unwrap_or_else(|| "https://<domain>/<path>".to_string());
+    let sample_method = if cmd_lower.contains("--data")
+        || cmd_lower.contains(" -d ")
+        || cmd_lower.contains("post")
+    {
+        "POST"
+    } else {
+        "GET"
+    };
+
     let git_hint = if segments
         .iter()
         .any(|s| leading_words(s).1.first().map(|w| basename(w) == "git").unwrap_or(false))
@@ -534,7 +667,7 @@ pub fn sandbox_redirect_reason(cmd: &str, shadow_root: &Path, host_root: &Path) 
                 )
             })
             .unwrap_or(false)
-    }) || cmd.to_ascii_lowercase().contains(".pdf")
+    }) || cmd_lower.contains(".pdf")
     {
         "\nTip: to export a compiled binary/PDF from the shadow workspace to an external host path in zero tokens, call mcp_aegis-os_fs_export_file {\"src_path\":\"<rel_in_shadow>\",\"dst_host_path\":\"/abs/host/path\"} (or import external files via mcp_aegis-os_fs_import_file {\"src_host_path\":\"/abs/host/file\"}, or switch active workspace via mcp_aegis-os_workspace_switch {\"path\":\"/abs/project/dir\"})."
     } else {
@@ -578,14 +711,60 @@ pub fn sandbox_redirect_reason(cmd: &str, shadow_root: &Path, host_root: &Path) 
     } else {
         ""
     };
+    let tmp_hint = if mentions_tmp_path {
+        "\nNote: host `/tmp` and `/private/tmp` are read-only under macOS Seatbelt inside `proc_exec`. Use `$TMPDIR` (pre-created inside your writable agent home) instead of `/tmp` or `/private/tmp`."
+    } else {
+        ""
+    };
+    let scan_hint = if mentions_root_scan {
+        "\nTip: broad filesystem scans like `find /` or `locate` will time out inside `proc_exec`; use `which <tool>` or search targeted directories inside the workspace only."
+    } else {
+        ""
+    };
+
+    if mentions_http_cli && !has_local_project_work {
+        return format!(
+            "[Aegis OS routing] Native shell is disabled and external internet is blocked inside `proc_exec`. Issue outbound HTTP/HTTPS requests directly via the host-brokered egress MCP tool instead of `{}`:\n  mcp_aegis-os_egress_http_request {{\"url\":{},\"method\":{}}}\n(If you also need a local non-network command inside your CoW shadow workspace {}, use `mcp_aegis-os_proc_exec`.) {}{}{}{}{}",
+            if contains_cmd_word(&cmd_lower, "wget") { "wget" } else { "curl" },
+            json_str(&sample_url),
+            json_str(sample_method),
+            shadow_root.display(),
+            tmp_hint,
+            scan_hint,
+            git_hint,
+            export_hint,
+            pkg_hint,
+        );
+    }
+
+    let http_hint = if mentions_http_cli {
+        format!(
+            "\nTip: outbound HTTP/HTTPS (`curl`/`wget`) is blocked inside `proc_exec`; use `mcp_aegis-os_egress_http_request {{\"url\":{},\"method\":{}}}` for approved external requests.",
+            json_str(&sample_url),
+            json_str(sample_method),
+        )
+    } else {
+        String::new()
+    };
+    let du_hint = if contains_cmd_word(&cmd_lower, "du") {
+        "\nTip: `du` over large `target/` or `node_modules/` trees often times out in foreground `proc_exec` (and piping into `sort` buffers all output). Scope with `du -d 1` / targeted subdirs or pass `\"background\": true` + `poll_pid`."
+    } else {
+        ""
+    };
+
     format!(
-        "[Aegis OS routing] Native shell is disabled for in-repo work in this workspace. Re-issue it via MCP (zero prompts, kernel-sandboxed):\n  mcp_aegis-os_proc_exec {{\"command\":\"sh\",\"args\":[\"-c\",{}]}}\ncwd = your CoW shadow workspace ({}); host files stay readable by absolute path; writes land in the shadow and reach the host only via workspace_commit.{}{}{}{}",
+        "[Aegis OS routing] Native shell is disabled for in-repo work in this workspace. Re-issue it via MCP (zero prompts, kernel-sandboxed):\n  mcp_aegis-os_proc_exec {{\"command\":\"sh\",\"args\":[\"-c\",{}]}}\ncwd = your CoW shadow workspace ({}); only the active workspace ({}) and toolchains are readable inside proc_exec (host $HOME outside the workspace such as ~/Library or ~/.aegis is denied by Seatbelt); writes land in the shadow and reach the host only via workspace_commit.{}{}{}{}{}{}{}{}",
         json_str(cmd),
         shadow_root.display(),
+        host_root.display(),
         git_hint,
         export_hint,
         ci_hint,
-        pkg_hint
+        pkg_hint,
+        http_hint,
+        tmp_hint,
+        scan_hint,
+        du_hint
     )
 }
 
@@ -819,10 +998,38 @@ fn strip_nested_test_tmpdir(s: &str) -> &str {
     {
         return s;
     }
-    let Some(idx) = s.find("/agent_home/.tmp") else {
+    let after_prefix = [
+        "/agent_home/tmp/.tmp",
+        "/agent_home/.tmp",
+        "/home/tmp/.tmp",
+        "/home/.tmp",
+    ]
+    .into_iter()
+    .find_map(|needle| {
+        let idx = s.find(needle)?;
+        if needle.starts_with("/home/") {
+            let prefix = &s[..idx];
+            if !(prefix.contains("/.aegis/orgs/") && prefix.contains("/agents/")) {
+                return None;
+            }
+            let dir_end = if needle.starts_with("/home/tmp/") {
+                idx + "/home/tmp/".len()
+            } else {
+                idx + "/home/".len()
+            };
+            return Some(&s[dir_end..]);
+        }
+        let dir_end = if needle.starts_with("/agent_home/tmp/") {
+            idx + "/agent_home/tmp/".len()
+        } else {
+            idx + "/agent_home/".len()
+        };
+        Some(&s[dir_end..])
+    });
+
+    let Some(rest) = after_prefix else {
         return s;
     };
-    let rest = &s[idx + "/agent_home/".len()..];
     match rest.find('/') {
         Some(slash) => &rest[slash..],
         None => "",
@@ -841,7 +1048,10 @@ fn is_protected_runtime_state_path(raw: &str, canonical: &str) -> bool {
             || s_checked.contains("/.gemini/antigravity-cli/builtin/")
             || s_checked.contains("/.gemini/config/plugins/")
             || s_checked.contains("/agent_home/imports/")
-            || s_checked.contains("/agent_home/tmp/");
+            || s_checked.contains("/agent_home/tmp/")
+            || (s_checked.contains("/.aegis/orgs/")
+                && s_checked.contains("/agents/")
+                && (s_checked.contains("/home/tmp/") || s_checked.contains("/home/imports/")));
         if s_checked.contains("/.aegis/")
             && !in_agent_home_safe_subpath
             && !(s_checked.contains("/orgs/") && s_checked.contains("/cas/"))
@@ -932,6 +1142,7 @@ pub fn classify_native_write(path: &Path, repo_root: &Path) -> Route {
         || t.contains("/upper_workspace/")
         || t.contains("/.gemini/antigravity-cli/brain/")
         || t.contains("/agent_home/tmp/")
+        || (t.contains("/.aegis/orgs/") && t.contains("/agents/") && t.contains("/home/tmp/"))
         || (!in_repo
             && (t.starts_with("/tmp/") || t.starts_with("/private/tmp/"))
             && !t.contains("/orgs/")
@@ -1406,5 +1617,104 @@ mod tests {
             ),
             Route::Deny { .. }
         ));
+
+        // Gateway-layout `<agent>/home/tmp/` scratch passes while credentials/arbitrary files under `/home/` stay denied.
+        assert!(matches!(
+            classify_native_read(
+                Path::new("/Users/alice/.aegis/orgs/aegis-os/agents/agy-1/home/tmp/scratch.txt"),
+                "aegis-os"
+            ),
+            Route::Pass
+        ));
+        assert!(matches!(
+            classify_native_write(
+                Path::new("/Users/alice/.aegis/orgs/aegis-os/agents/agy-1/home/tmp/scratch.txt"),
+                Path::new("/repo")
+            ),
+            Route::Pass
+        ));
+        assert!(matches!(
+            classify_native_read(
+                Path::new("/Users/alice/.aegis/orgs/aegis-os/agents/agy-1/home/.gemini/oauth_creds.json"),
+                "aegis-os"
+            ),
+            Route::Deny { .. }
+        ));
+        assert!(matches!(
+            classify_native_write(
+                Path::new("/Users/alice/.aegis/orgs/aegis-os/agents/agy-1/home/.gemini/oauth_creds.json"),
+                Path::new("/repo")
+            ),
+            Route::Deny { .. }
+        ));
+        assert!(matches!(
+            classify_native_write(
+                Path::new("/Users/alice/.aegis/orgs/aegis-os/agents/agy-1/home/secret.txt"),
+                Path::new("/repo")
+            ),
+            Route::Deny { .. }
+        ));
+    }
+
+    #[test]
+    fn redirect_reason_routes_external_http_to_egress_and_hints_tmpdir_and_find_root() {
+        let reason_curl = sandbox_redirect_reason(
+            "cd /private/tmp/claude-501/scratchpad && R=https://rpc.mantle.xyz; curl -s -X POST --data '{}' $R",
+            &shadow(),
+            Path::new("/repo"),
+        );
+        assert!(
+            reason_curl.contains("mcp_aegis-os_egress_http_request"),
+            "{reason_curl}"
+        );
+        assert!(
+            reason_curl.contains("https://rpc.mantle.xyz"),
+            "{reason_curl}"
+        );
+        assert!(reason_curl.contains("$TMPDIR"), "{reason_curl}");
+
+        let reason_find = sandbox_redirect_reason(
+            "mkdir -p /tmp/t && find / -path '*corelib/src/keccak.cairo'",
+            &shadow(),
+            Path::new("/repo"),
+        );
+        assert!(reason_find.contains("$TMPDIR"), "{reason_find}");
+        assert!(reason_find.contains("find /"), "{reason_find}");
+        assert!(
+            reason_find.contains("mcp_aegis-os_proc_exec"),
+            "{reason_find}"
+        );
+    }
+
+    #[test]
+    fn host_wide_disk_and_tmutil_commands_route_to_host_boundary_and_redirect_warns_accurately() {
+        let ws = Path::new("/Users/huizhao/Downloads/workspace");
+        for host_cmd in [
+            "tmutil listlocalsnapshots /",
+            "echo \"=== DF ===\" && df -h && du -sh ~/* ~/Library/*",
+            "du -sh /Users/huizhao/* /Users/huizhao/Library/*",
+            "aegis-os disk",
+            "aegis-os du --json",
+            "aegis-os gc --dry-run",
+            "aegis-os prune --yes",
+        ] {
+            let Route::HostBoundary { reason } = classify_run_command(host_cmd, &shadow(), ws) else {
+                panic!("expected HostBoundary for `{host_cmd}`");
+            };
+            assert!(reason.contains("tighten_home_read"), "{reason}");
+            assert!(reason.contains("host_exec"), "{reason}");
+            assert!(reason.contains("aegis-os disk"), "{reason}");
+        }
+
+        let Route::RedirectToSandbox { reason: local_du } =
+            classify_run_command("du -sh crates/", &shadow(), ws)
+        else {
+            panic!("expected RedirectToSandbox for workspace `du`");
+        };
+        assert!(local_du.contains("background"), "{local_du}");
+        assert!(
+            !local_du.contains("host files stay readable by absolute path"),
+            "{local_du}"
+        );
     }
 }

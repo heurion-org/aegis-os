@@ -106,6 +106,60 @@ async fn merge_json_file(path: &Path, patch_fn: impl FnOnce(&mut Value), dry_run
     Ok(())
 }
 
+/// Built-in runtime playbook synced to global skill folders across supported coding agents.
+pub const AEGIS_RUNTIME_SKILL_MD: &str = r#"---
+name: aegis-os-runtime
+description: Mandatory runtime playbook for working inside Aegis OS sandboxes (proc_exec offline rules, egress_http_request, $TMPDIR on macOS Seatbelt, avoiding find / timeouts, and zero-PII friction diagnostics).
+---
+
+# Aegis OS Sandbox Playbook (`aegis-os-runtime`)
+
+Follow these rules whenever operating inside an Aegis OS managed workspace so commands succeed on the first try without sandbox trial-and-error.
+
+## 1. Tool Selection Matrix
+
+| Task | Use This MCP Tool (`aegis-os`) | Never Use Inside Repo / Sandbox |
+|---|---|---|
+| Build, test, lint, scripts, workspace search | `proc_exec` (`background: true` + `poll_pid` if >30s) | Native `run_command` / `Bash` |
+| External HTTP / HTTPS / JSON-RPC requests | `egress_http_request` (`{"url":"https://...","method":"GET\|POST","body":"..."}`) | `curl` / `wget` / Python `urllib` in `proc_exec` |
+| Install npm / PyPI / crates / Go packages | `pkg_install` | `npm install` / `pip install` / `cargo fetch` in `proc_exec` |
+| Read, write, edit, glob repository files | `fs_read`, `fs_write`, `fs_edit`, `fs_delete`, `fs_glob` | Native `write_file` / `edit_file` |
+| Read/write host git or GitHub CI/PRs | `workspace_git_inspect`, `workspace_git`, `github_*` | Native `gh` or `git commit`/`push` |
+| Host-native simulators / unsandboxed tools | `host_exec` (broker-approved) | Nested `sandbox-exec` / `bwrap` |
+
+## 2. Hard Sandbox Rules (Avoid Common Failures)
+
+1. **`proc_exec` has NO outbound internet.** Calling `curl`, `wget`, or `pip` inside `proc_exec` fails (`Could not resolve host`, `Operation not permitted`, or timeout). Immediately use `mcp_aegis-os_egress_http_request` with `"url"` (sets `execute: true` automatically) for HTTPS requests or `mcp_aegis-os_pkg_install` for packages.
+2. **Host `/tmp` and `/private/tmp` are read-only on macOS Seatbelt.** Never write scratch files to `/tmp/...` or `/private/tmp/...`. Always use `$TMPDIR` (auto-created at `<agent_home>/tmp` and writable inside Seatbelt).
+3. **Never scan `/` or run unbounded commands.** Commands like `find /` or `locate` hit the 30s timeout. Use `which <tool>`, toolchain env queries, or search inside workspace directories only. For tests/builds >30s, pass `"background": true` and poll with `"poll_pid"`.
+4. **Host `$HOME` outside workspace & heavy `du` scans.** Seatbelt (`tighten_home_read`) blocks reading `~/Library`, `~/.aegis`, and sibling repos inside `proc_exec`; use `host_exec` (or ask the user) for host-wide disk checks (`tmutil`, `diskutil`, `du ~/Library`), and `aegis-os disk` / `aegis-os gc` on host to inspect or reclaim `~/.aegis` runtime storage. Inside the workspace, avoid synchronous `du` across large `target/`/`node_modules/` dirs (especially `du ... | sort`, which buffers all stdout); use `du -d 1` or `"background": true` + `poll_pid`.
+5. **Read `aegis_hint` on non-zero exits.** Do not blindly retry failing commands (`LoopThrash`); inspect `aegis_hint` / `friction_category` or run `aegis-os insights` locally (`aegis-os feedback --dry-run` to preview zero-PII counters).
+"#;
+
+async fn install_runtime_skill(skills_root: &Path, dry_run: bool) -> anyhow::Result<PathBuf> {
+    let skill_dir = skills_root.join("aegis-os-runtime");
+    let skill_path = skill_dir.join("SKILL.md");
+    if !dry_run {
+        tokio::fs::create_dir_all(&skill_dir).await?;
+        tokio::fs::write(&skill_path, AEGIS_RUNTIME_SKILL_MD).await?;
+    }
+    Ok(skill_path)
+}
+
+fn clean_runtime_skill(skills_root: &Path, dry_run: bool) -> anyhow::Result<Option<PathBuf>> {
+    let skill_dir = skills_root.join("aegis-os-runtime");
+    let skill_path = skill_dir.join("SKILL.md");
+    if !skill_path.exists() || !file_mentions_aegis(&skill_path) {
+        return Ok(None);
+    }
+    if !dry_run {
+        std::fs::remove_file(&skill_path)?;
+    }
+    remove_dir_if_empty(&skill_dir, dry_run);
+    remove_dir_if_empty(skills_root, dry_run);
+    Ok(Some(skill_path))
+}
+
 pub async fn install_global_clients(
     home_dir: &Path,
     runtime_dir: &Path,
@@ -151,6 +205,7 @@ pub async fn install_global_clients_with_options(
         "fs_delete",
         "fs_glob",
         "proc_exec",
+        "egress_http_request",
         "pkg_install",
         "host_exec",
         "workspace_status",
@@ -281,6 +336,7 @@ pub async fn install_global_clients_with_options(
         "mcp(aegis-os/workspace_rollback)",
         "mcp(aegis-os/workspace_commit)",
         "mcp(aegis-os/proc_exec)",
+        "mcp(aegis-os/egress_http_request)",
         "mcp(aegis-os/pkg_install)",
         "mcp(aegis-os/host_exec)",
         "mcp(aegis-os/coord_claim)",
@@ -377,6 +433,7 @@ You are running inside the **Aegis OS Runtime (`aegis-os`)** with an isolated Co
 | Intent | REQUIRED Tool (`aegis-os` MCP) | Forbidden / Gated Native Tool |
 |---|---|---|
 | Build / test / lint / git status / scripts | `proc_exec` (`mcp_aegis-os_proc_exec`; `loopback_ports` / `$AOS_DEV_PORT` / `$AOS_LOOPBACK_PORTS` for `127.0.0.1` servers) | `run_command` (denied for in-repo work) |
+| External HTTP/HTTPS requests | `egress_http_request` (host-brokered, DLP-redacted; `url` defaults `execute: true`) | `curl` / `wget` inside `proc_exec` (no outbound internet) |
 | Install npm / Python / Rust / Go packages | `pkg_install` (registry-restricted proxy; `allow_scripts` gated) | `npm install` / `pip install` without registry egress approval |
 | Run unsandboxed host sibling commands (e.g. nested sandbox/container benchmarks, simulators) | `host_exec` (enforced SessionBroker only; SHA-256 frozen bundle, human approval, scrubbed env, control-plane lock) | Nested `sandbox-exec`/`bwrap` or inline `python3 -c` inside `proc_exec` |
 | Read / write / edit / delete repo files | `fs_read`, `fs_write`, `fs_edit`, `fs_delete`, `fs_glob` | `write_file` / `edit_file` (denied for repo files) |
@@ -390,15 +447,23 @@ You are running inside the **Aegis OS Runtime (`aegis-os`)** with an isolated Co
 | Land shadow / commit / tag / branch / push | `workspace_git` (supports one-click `auto_commit_shadow: true`) | Native `git commit` / `git push` in `run_command` |
 | Inspect & rerun CI, PRs, Issues | `github_ci_inspect`, `github_ci_rerun`, `github_pr_inspect`, `github_pr_create`, `github_comment_create`, `github_pr_merge`, `github_issue_inspect` | Native `gh run/pr/issue` / unauthenticated curl |
 | Switch Cloud vs. Local execution mode | `runtime_configure_mode` (`mode: "cloud" \| "local"`) | Manual CLI configuration |
+
+## Sandbox Scratch & Search Rules
+- **No external internet in `proc_exec`**: Use `egress_http_request` for HTTP/HTTPS and `pkg_install` for registries.
+- **Scratch files (`$TMPDIR`)**: On macOS Seatbelt, host `/tmp` and `/private/tmp` are denied — always use `$TMPDIR` (pre-created in writable agent home).
+- **Scoped searches**: Never run `find /` (it times out at 30s); use `which <tool>` or search workspace paths only, and pass `background: true` for commands >30s.
 <!-- AEGIS-OS-RUNTIME-END -->
 "#;
 
+    let agy_skills_root = agy_config_dir.join("skills");
     if !dry_run {
         tokio::fs::create_dir_all(&agy_config_dir).await?;
         let existing_md = tokio::fs::read_to_string(&agy_rules_path).await.unwrap_or_default();
         let updated_md = replace_or_append_aegis_block(&existing_md, shared_agent_prompt);
         tokio::fs::write(&agy_rules_path, updated_md).await?;
     }
+    let agy_skill_path = install_runtime_skill(&agy_skills_root, dry_run).await?;
+    let _ = &agy_skill_path;
     let rescued_oauth = !dry_run
         && crate::launcher::backfill_host_agy_credentials_from_sessions(runtime_dir, home_dir);
     if !quiet {
@@ -470,6 +535,7 @@ You are running inside the **Aegis OS Runtime (`aegis-os`)** with an isolated Co
         "workspace_rollback",
         "workspace_commit",
         "proc_exec",
+        "egress_http_request",
         "pkg_install",
         "host_exec",
         "coord_claim",
@@ -563,12 +629,14 @@ You are running inside the **Aegis OS Runtime (`aegis-os`)** with an isolated Co
     )
     .await?;
 
+    let claude_skills_root = claude_dir.join("skills");
     if !dry_run {
         tokio::fs::create_dir_all(&claude_dir).await?;
         let existing_md = tokio::fs::read_to_string(&claude_md_path).await.unwrap_or_default();
         let updated_md = replace_or_append_aegis_block(&existing_md, shared_agent_prompt);
         tokio::fs::write(&claude_md_path, updated_md).await?;
     }
+    let claude_skill_path = install_runtime_skill(&claude_skills_root, dry_run).await?;
     if !quiet {
         println!("\n[2/4] Claude Code (`claude`) configured:");
         println!("      - MCP Server:  {}", claude_mcp_path.display());
@@ -578,6 +646,7 @@ You are running inside the **Aegis OS Runtime (`aegis-os`)** with an isolated Co
             AEGIS_TOOL_NAMES.len()
         );
         println!("      - Global Rule: {}", claude_md_path.display());
+        println!("      - Runtime Skill: {}", claude_skill_path.display());
     }
 
     // ------------------------------------------------------------------------
@@ -586,6 +655,7 @@ You are running inside the **Aegis OS Runtime (`aegis-os`)** with an isolated Co
     let codex_dir = home_dir.join(".codex");
     let codex_toml_path = codex_dir.join("config.toml");
     let codex_agents_md = codex_dir.join("AGENTS.md");
+    let codex_skills_root = codex_dir.join("skills");
 
     let codex_toml_block = format!(
         r#"
@@ -613,10 +683,12 @@ startup_timeout_sec = 30
         let updated_agents = replace_or_append_aegis_block(&existing_agents, shared_agent_prompt);
         tokio::fs::write(&codex_agents_md, updated_agents).await?;
     }
+    let codex_skill_path = install_runtime_skill(&codex_skills_root, dry_run).await?;
     if !quiet {
         println!("\n[3/4] OpenAI Codex (`codex`) configured:");
         println!("      - MCP Server:  {}", codex_toml_path.display());
         println!("      - Global Rule: {}", codex_agents_md.display());
+        println!("      - Runtime Skill: {}", codex_skill_path.display());
     }
 
     // ------------------------------------------------------------------------
@@ -627,6 +699,7 @@ startup_timeout_sec = 30
     let opencode_jsonc = opencode_dir.join("opencode.jsonc");
     let opencode_agents = opencode_dir.join("AGENTS.md");
     let opencode_plugin = opencode_dir.join("plugins").join("aegis-os.js");
+    let opencode_skills_root = opencode_dir.join("skills");
     if dry_run {
         if !quiet {
             println!("\n  - would install OpenCode plugin {}", opencode_plugin.display());
@@ -635,6 +708,7 @@ startup_timeout_sec = 30
         tokio::fs::create_dir_all(opencode_dir.join("plugins")).await?;
         tokio::fs::write(&opencode_plugin, OPENCODE_AEGIS_PLUGIN).await?;
     }
+    let opencode_skill_path = install_runtime_skill(&opencode_skills_root, dry_run).await?;
     if opencode_jsonc.exists() && !opencode_json.exists() {
         if !quiet {
             println!(
@@ -702,6 +776,7 @@ startup_timeout_sec = 30
             println!("      - MCP Server:  {}", opencode_json.display());
             println!("      - Global Rule: {}", opencode_agents.display());
             println!("      - Aegis Plugin: {}", opencode_plugin.display());
+            println!("      - Runtime Skill: {}", opencode_skill_path.display());
         }
     }
 
@@ -1060,6 +1135,9 @@ fn clean_agy_configs(home_dir: &Path, dry_run: bool) -> anyhow::Result<Vec<PathB
     )? {
         touched.push(gemini_md);
     }
+    if let Some(p) = clean_runtime_skill(&agy_dir.join("skills"), dry_run)? {
+        touched.push(p);
+    }
     Ok(touched)
 }
 
@@ -1124,6 +1202,9 @@ fn clean_claude_configs(home_dir: &Path, dry_run: bool) -> anyhow::Result<Vec<Pa
     )? {
         touched.push(claude_md);
     }
+    if let Some(p) = clean_runtime_skill(&claude_dir.join("skills"), dry_run)? {
+        touched.push(p);
+    }
     Ok(touched)
 }
 
@@ -1149,6 +1230,9 @@ fn clean_codex_configs(home_dir: &Path, dry_run: bool) -> anyhow::Result<Vec<Pat
         dry_run,
     )? {
         touched.push(codex_md);
+    }
+    if let Some(p) = clean_runtime_skill(&codex_dir.join("skills"), dry_run)? {
+        touched.push(p);
     }
     Ok(touched)
 }
@@ -1223,6 +1307,9 @@ fn clean_opencode_configs(home_dir: &Path, dry_run: bool) -> anyhow::Result<Vec<
         dry_run,
     )? {
         touched.push(opencode_md);
+    }
+    if let Some(p) = clean_runtime_skill(&opencode_dir.join("skills"), dry_run)? {
+        touched.push(p);
     }
     Ok(touched)
 }
@@ -1666,10 +1753,6 @@ fn stable_aegis_exe_for_shim() -> PathBuf {
     exe
 }
 
-pub(crate) fn install_enforced_shims(home_dir: &Path, dry_run: bool) -> anyhow::Result<()> {
-    install_enforced_shims_with_options(home_dir, dry_run, None, false)
-}
-
 #[allow(dead_code)]
 pub(crate) fn install_enforced_shims_with_path(
     home_dir: &Path,
@@ -1771,6 +1854,73 @@ fn file_mentions_aegis(path: &Path) -> bool {
         .unwrap_or(false)
 }
 
+fn format_doctor_disk_status(avail_bytes: u64, total_bytes: u64) -> String {
+    let avail_gb = avail_bytes as f64 / (1024.0 * 1024.0 * 1024.0);
+    let pct = if total_bytes > 0 {
+        (avail_bytes as f64 / total_bytes as f64) * 100.0
+    } else {
+        0.0
+    };
+    if crate::hooks::is_low_disk(avail_bytes, total_bytes) {
+        format!(
+            "WARN ({:.2} GB free, {:.1}% — run `aegis-os disk` or `aegis-os gc --dry-run`)",
+            avail_gb, pct
+        )
+    } else {
+        format!("OK ({:.2} GB free, {:.1}%)", avail_gb, pct)
+    }
+}
+
+fn find_executable_on_path(bin: &str, path_env: Option<&std::ffi::OsStr>) -> Option<PathBuf> {
+    let path_env = path_env?;
+    for dir in std::env::split_paths(path_env) {
+        let cand = dir.join(bin);
+        if cand.is_file() {
+            return Some(cand);
+        }
+    }
+    None
+}
+
+fn probe_rust_toolchain_status(path_env: Option<&std::ffi::OsStr>) -> String {
+    if find_executable_on_path("cargo", path_env).is_none() {
+        return "not on PATH (skipped)".to_string();
+    }
+    let Some(rustc_bin) = find_executable_on_path("rustc", path_env) else {
+        return "WARN (`rustc` not found on PATH; run `rustup toolchain install stable --force`)"
+            .to_string();
+    };
+    match std::process::Command::new(&rustc_bin).arg("-vV").output() {
+        Ok(out) if out.status.success() => {
+            let stdout = String::from_utf8_lossy(&out.stdout);
+            let release = stdout
+                .lines()
+                .find_map(|line| line.strip_prefix("release:").map(str::trim))
+                .filter(|s| !s.is_empty());
+            match release {
+                Some(ver) => format!("ok (rustc {ver})"),
+                None => "ok".to_string(),
+            }
+        }
+        Ok(out) => {
+            let stderr = String::from_utf8_lossy(&out.stderr);
+            let detail = stderr
+                .lines()
+                .map(str::trim)
+                .find(|l| !l.is_empty())
+                .unwrap_or("non-zero exit");
+            format!(
+                "WARN (`rustc -vV` failed: {detail}; run `rustup toolchain install stable --force`)"
+            )
+        }
+        Err(err) => {
+            format!(
+                "WARN (`rustc -vV` failed: {err}; run `rustup toolchain install stable --force`)"
+            )
+        }
+    }
+}
+
 pub(crate) async fn run_doctor(home_dir: &Path) -> anyhow::Result<()> {
     let checks = vec![
         ("AGY MCP Config", home_dir.join(".gemini/config/mcp_config.json")),
@@ -1785,6 +1935,22 @@ pub(crate) async fn run_doctor(home_dir: &Path) -> anyhow::Result<()> {
         (
             "OpenCode Aegis Plugin",
             home_dir.join(".config/opencode/plugins/aegis-os.js"),
+        ),
+        (
+            "AGY Runtime Skill",
+            home_dir.join(".gemini/config/skills/aegis-os-runtime/SKILL.md"),
+        ),
+        (
+            "Claude Runtime Skill",
+            home_dir.join(".claude/skills/aegis-os-runtime/SKILL.md"),
+        ),
+        (
+            "Codex Runtime Skill",
+            home_dir.join(".codex/skills/aegis-os-runtime/SKILL.md"),
+        ),
+        (
+            "OpenCode Runtime Skill",
+            home_dir.join(".config/opencode/skills/aegis-os-runtime/SKILL.md"),
         ),
     ];
 
@@ -1846,6 +2012,24 @@ pub(crate) async fn run_doctor(home_dir: &Path) -> anyhow::Result<()> {
             }
         }
     }
+
+    println!("\nHost Environment:");
+    match crate::hooks::fs_disk_space_bytes(home_dir) {
+        Some((avail, total)) => {
+            println!(
+                "  - disk ({}): {}",
+                home_dir.display(),
+                format_doctor_disk_status(avail, total)
+            );
+        }
+        None => {
+            println!("  - disk ({}): unavailable", home_dir.display());
+        }
+    }
+    println!(
+        "  - rust toolchain: {}",
+        probe_rust_toolchain_status(std::env::var_os("PATH").as_deref())
+    );
 
     println!("\nEnforced Runtime (Phase 1):");
     #[cfg(target_os = "linux")]
@@ -3176,6 +3360,7 @@ You are operating inside **Aegis OS Runtime** (`{role}`) within Organization **`
 | Intent | REQUIRED Tool (`aegis-os` MCP) | Forbidden / Gated Native Tool |
 |---|---|---|
 | Build / test / lint / git status / scripts | `proc_exec` (`mcp_aegis-os_proc_exec`; `loopback_ports` / `$AOS_DEV_PORT` / `$AOS_LOOPBACK_PORTS` for `127.0.0.1` servers) | `run_command` (denied for in-repo work) |
+| External HTTP/HTTPS requests | `egress_http_request` (host-brokered, DLP-redacted; `url` defaults `execute: true`) | `curl` / `wget` inside `proc_exec` (no outbound internet) |
 | Install npm / Python / Rust / Go packages | `pkg_install` (registry-restricted proxy; `allow_scripts` gated) | `npm install` / `pip install` without registry egress approval |
 | Run unsandboxed host sibling commands (e.g. nested sandbox/container benchmarks, simulators) | `host_exec` (enforced SessionBroker only; SHA-256 frozen bundle, human approval, scrubbed env, control-plane lock) | Nested `sandbox-exec`/`bwrap` or inline `python3 -c` inside `proc_exec` |
 | Read / write / edit / delete repo files | `fs_read`, `fs_write`, `fs_edit`, `fs_delete`, `fs_glob` | `write_file` / `edit_file` (denied for repo files) |
@@ -3188,6 +3373,11 @@ You are operating inside **Aegis OS Runtime** (`{role}`) within Organization **`
 | Inspect host Git status / branches / logs | `workspace_git_inspect` (zero-prompt, DLP-redacted) | Native `.git` guessing |
 | Land shadow / commit / tag / branch / push | `workspace_git` (supports one-click `auto_commit_shadow: true`) | Native `git commit` / `git push` in `run_command` |
 | Inspect & rerun CI, PRs, Issues | `github_ci_inspect`, `github_ci_rerun`, `github_pr_inspect`, `github_pr_create`, `github_comment_create`, `github_pr_merge`, `github_issue_inspect` | Native `gh run/pr/issue` / unauthenticated curl |
+
+## Sandbox Scratch & Search Rules
+- **No external internet in `proc_exec`**: Use `egress_http_request` for HTTP/HTTPS and `pkg_install` for registries.
+- **Scratch files (`$TMPDIR`)**: On macOS Seatbelt, host `/tmp` and `/private/tmp` are denied — always use `$TMPDIR` (pre-created in writable agent home).
+- **Scoped searches**: Never run `find /` (it times out at 30s); use `which <tool>` or search workspace paths only, and pass `background: true` for commands >30s.
 
 ## Commit & Pull Request Audit Attribution
 When creating a Git commit or Pull Request after `workspace_commit` (or `aegis-os commit`), attach the returned `audit_receipt.git_trailer` (`Aegis-OS-Verified: ...`) in the commit trailer and `audit_receipt.pr_markdown_badge` in the PR description so reviewers can verify the CoW merge and evidence hash.
@@ -4038,6 +4228,123 @@ mod install_tests {
             } else {
                 assert_eq!(parsed, json!({}));
             }
+        }
+    }
+
+    #[tokio::test]
+    async fn install_and_uninstall_sync_runtime_skills_across_all_four_clients() {
+        let tmp = tempfile::tempdir().unwrap();
+        let home = tmp.path().join("home");
+        let rt = tmp.path().join("rt");
+        let ws = tmp.path().join("ws");
+        std::fs::create_dir_all(&home).unwrap();
+        std::fs::create_dir_all(&rt).unwrap();
+        std::fs::create_dir_all(&ws).unwrap();
+
+        super::install_global_clients_with_options(&home, &rt, false, true)
+            .await
+            .unwrap();
+
+        let skill_paths = [
+            home.join(".gemini/config/skills/aegis-os-runtime/SKILL.md"),
+            home.join(".claude/skills/aegis-os-runtime/SKILL.md"),
+            home.join(".codex/skills/aegis-os-runtime/SKILL.md"),
+            home.join(".config/opencode/skills/aegis-os-runtime/SKILL.md"),
+        ];
+        for skill in &skill_paths {
+            let content = std::fs::read_to_string(skill)
+                .unwrap_or_else(|e| panic!("missing runtime skill {}: {e}", skill.display()));
+            assert!(content.contains("egress_http_request"), "{}", skill.display());
+            assert!(content.contains("$TMPDIR"), "{}", skill.display());
+            assert!(content.contains("find /"), "{}", skill.display());
+        }
+
+        let gemini_md = std::fs::read_to_string(home.join(".gemini/config/GEMINI.md")).unwrap();
+        let mode_pos = gemini_md
+            .find("Switch Cloud vs. Local execution mode")
+            .expect("mode row present");
+        let rules_pos = gemini_md
+            .find("## Sandbox Scratch & Search Rules")
+            .expect("sandbox rules header present");
+        assert!(
+            mode_pos < rules_pos,
+            "Markdown table row must precede `## Sandbox Scratch & Search Rules`"
+        );
+
+        run_uninstall(UninstallOptions {
+            home_dir: &home,
+            runtime_dir: &rt,
+            workspace: &ws,
+            shim_only: false,
+            purge: false,
+            workspace_clean: false,
+            dry_run: false,
+            yes: false,
+            purge_host_credentials: false,
+        })
+        .await
+        .unwrap();
+
+        for skill in &skill_paths {
+            assert!(!skill.exists(), "skill should be removed: {}", skill.display());
+            assert!(!skill.parent().unwrap().exists());
+            assert!(!skill.parent().unwrap().parent().unwrap().exists());
+        }
+    }
+
+    #[test]
+    fn doctor_disk_and_rust_toolchain_probes() {
+        const GIB: u64 = 1024 * 1024 * 1024;
+        let healthy = super::format_doctor_disk_status(50 * GIB, 200 * GIB);
+        assert!(healthy.starts_with("OK (50.00 GB free, 25.0%"), "{healthy}");
+
+        let low = super::format_doctor_disk_status(5 * GIB, 200 * GIB);
+        assert!(low.starts_with("WARN (5.00 GB free"), "{low}");
+        assert!(low.contains("aegis-os disk"), "{low}");
+        assert!(low.contains("aegis-os gc"), "{low}");
+
+        let empty = tempfile::tempdir().unwrap();
+        let skipped = super::probe_rust_toolchain_status(Some(empty.path().as_os_str()));
+        assert!(skipped.contains("skipped"), "{skipped}");
+
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+
+            let bin_dir = tempfile::tempdir().unwrap();
+            let cargo_bin = bin_dir.path().join("cargo");
+            std::fs::write(&cargo_bin, "#!/bin/sh\nexit 0\n").unwrap();
+            std::fs::set_permissions(&cargo_bin, std::fs::Permissions::from_mode(0o755)).unwrap();
+
+            let missing_rustc =
+                super::probe_rust_toolchain_status(Some(bin_dir.path().as_os_str()));
+            assert!(
+                missing_rustc.contains("WARN")
+                    && missing_rustc.contains("rustup toolchain install stable --force"),
+                "{missing_rustc}"
+            );
+
+            let rustc_bin = bin_dir.path().join("rustc");
+            std::fs::write(
+                &rustc_bin,
+                "#!/bin/sh\necho 'rustc 1.85.0'\necho 'release: 1.85.0'\n",
+            )
+            .unwrap();
+            std::fs::set_permissions(&rustc_bin, std::fs::Permissions::from_mode(0o755)).unwrap();
+            let ok_status = super::probe_rust_toolchain_status(Some(bin_dir.path().as_os_str()));
+            assert_eq!(ok_status, "ok (rustc 1.85.0)");
+
+            std::fs::write(
+                &rustc_bin,
+                "#!/bin/sh\necho 'error: no default toolchain' >&2\nexit 1\n",
+            )
+            .unwrap();
+            let warn_status = super::probe_rust_toolchain_status(Some(bin_dir.path().as_os_str()));
+            assert!(
+                warn_status.contains("WARN")
+                    && warn_status.contains("rustup toolchain install stable --force"),
+                "{warn_status}"
+            );
         }
     }
 

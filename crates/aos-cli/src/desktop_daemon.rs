@@ -15,6 +15,7 @@ use aos_core::session::{resolve_auto_org_id, workspace_id_for_path, DEFAULT_PERS
 use aos_core::{DomainProfile, EscalationStatus, PendingEscalation};
 use aos_mcp_gateway::AegisRuntimeKernel;
 use aos_vfs::CoWWorkspace;
+use axum::body::Bytes;
 use axum::extract::{Path as AxumPath, Query, Request, State};
 use axum::http::{header, StatusCode};
 use axum::middleware::{self, Next};
@@ -2332,6 +2333,67 @@ async fn mcp_inventory_handler(State(state): State<DesktopDaemonState>) -> Json<
     Json(json!({ "entries": entries }))
 }
 
+#[derive(Debug, Default, Deserialize)]
+struct DiskGcRequest {
+    older_than_days: Option<u64>,
+    include_shadows: Option<bool>,
+    force_dirty: Option<bool>,
+    compact_vaults: Option<bool>,
+    apply: Option<bool>,
+}
+
+async fn disk_report_handler(State(state): State<DesktopDaemonState>) -> Response {
+    match crate::disk::analyze_runtime_disk(&state.runtime_dir).await {
+        Ok(report) => (StatusCode::OK, Json(report)).into_response(),
+        Err(err) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(json!({ "error": err.to_string() })),
+        )
+            .into_response(),
+    }
+}
+
+async fn disk_gc_handler(State(state): State<DesktopDaemonState>, body: Bytes) -> Response {
+    // Allow empty body (with or without Content-Type) or `{}`/`null` as safe dry-run defaults,
+    // while still rejecting malformed JSON instead of silently ignoring caller input.
+    let req: DiskGcRequest = if body.iter().all(|b| b.is_ascii_whitespace()) {
+        DiskGcRequest::default()
+    } else {
+        match serde_json::from_slice::<Option<DiskGcRequest>>(&body) {
+            Ok(Some(req)) => req,
+            Ok(None) => DiskGcRequest::default(),
+            Err(err) => {
+                return (
+                    StatusCode::BAD_REQUEST,
+                    Json(json!({ "error": format!("invalid request body: {err}") })),
+                )
+                    .into_response();
+            }
+        }
+    };
+
+    let opts = crate::disk::GcOptions {
+        runtime_dir: state.runtime_dir.clone(),
+        older_than_days: req
+            .older_than_days
+            .unwrap_or(crate::disk::DEFAULT_GC_OLDER_THAN_DAYS),
+        include_shadows: req.include_shadows.unwrap_or(false),
+        force_dirty: req.force_dirty.unwrap_or(false),
+        compact_vaults: req.compact_vaults.unwrap_or(false),
+        apply: req.apply.unwrap_or(false),
+        json: true,
+    };
+
+    match crate::disk::run_gc_plan(&opts).await {
+        Ok(report) => (StatusCode::OK, Json(report)).into_response(),
+        Err(err) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(json!({ "error": err.to_string() })),
+        )
+            .into_response(),
+    }
+}
+
 pub fn build_desktop_router(state: DesktopDaemonState) -> Router {
     Router::new()
         .route("/v1/health", get(health_handler))
@@ -2364,6 +2426,8 @@ pub fn build_desktop_router(state: DesktopDaemonState) -> Router {
         .route("/v1/approvals", get(approvals_handler))
         .route("/v1/approvals/:id/decide", post(decide_approval_handler))
         .route("/v1/mcp/inventory", get(mcp_inventory_handler))
+        .route("/v1/disk", get(disk_report_handler))
+        .route("/v1/disk/gc", post(disk_gc_handler))
         .layer(middleware::from_fn_with_state(
             state.clone(),
             require_human_token,
@@ -2429,6 +2493,38 @@ pub async fn run_desktop_daemon(
 mod tests {
     use super::*;
     use aos_core::{AgentIdentity, PolicyContext, PolicyDecision, TransactionalWorkspace};
+
+    fn next_test_loopback_bind_candidates() -> Vec<String> {
+        static NEXT_IDX: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+        let mut candidates = Vec::new();
+        if let Ok(raw) = std::env::var("AOS_LOOPBACK_PORTS") {
+            let ports: Vec<u16> = raw
+                .split(',')
+                .filter_map(|p| p.trim().parse::<u16>().ok())
+                .filter(|p| *p > 0)
+                .collect();
+            if !ports.is_empty() {
+                let start = NEXT_IDX.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                for offset in 0..ports.len() {
+                    let port = ports[(start + offset) % ports.len()];
+                    candidates.push(format!("127.0.0.1:{port}"));
+                }
+            }
+        }
+        candidates.push("127.0.0.1:0".to_string());
+        candidates
+    }
+
+    async fn bind_test_loopback_listener() -> tokio::net::TcpListener {
+        let mut last_err = None;
+        for cand in next_test_loopback_bind_candidates() {
+            match tokio::net::TcpListener::bind(&cand).await {
+                Ok(listener) => return listener,
+                Err(e) => last_err = Some(e),
+            }
+        }
+        panic!("failed to bind test loopback listener: {:?}", last_err);
+    }
 
     fn run_git(dir: &Path, args: &[&str]) {
         let out = std::process::Command::new("git")
@@ -2539,7 +2635,7 @@ mod tests {
             task_notify: Arc::new(Notify::new()),
             kernel: Arc::clone(&kernel),
         };
-        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let listener = bind_test_loopback_listener().await;
         let port = listener.local_addr().unwrap().port();
         let srv = tokio::spawn(async move {
             let _ = axum::serve(listener, build_desktop_router(state)).await;
@@ -2931,7 +3027,7 @@ echo "Second streamed chunk"
             task_notify: Arc::new(Notify::new()),
             kernel,
         };
-        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let listener = bind_test_loopback_listener().await;
         let port = listener.local_addr().unwrap().port();
         let srv = tokio::spawn(async move {
             let _ = axum::serve(listener, build_desktop_router(state)).await;
@@ -3218,5 +3314,222 @@ echo "Second streamed chunk"
             infer_single_child_repo_for_refs(&git_root, &["submodule-a/README.md".to_string()]),
             None
         );
+    }
+
+    fn write_test_bytes(path: &Path, len: usize, fill: u8) {
+        if let Some(parent) = path.parent() {
+            std::fs::create_dir_all(parent).unwrap();
+        }
+        std::fs::write(path, vec![fill; len]).unwrap();
+    }
+
+    #[tokio::test]
+    async fn desktop_daemon_disk_endpoints_require_auth_and_enforce_safe_gc_defaults() {
+        let tmp = tempfile::tempdir().unwrap();
+        let raw_rt = tmp.path().join("rt");
+        let home = tmp.path().join("home");
+        std::fs::create_dir_all(&raw_rt).unwrap();
+        let rt = std::fs::canonicalize(&raw_rt).unwrap();
+
+        let kernel = Arc::new(AegisRuntimeKernel::new(&rt).await.unwrap());
+
+        // Seed protected runtime state that `gc` must preserve.
+        let master_key = rt.join("keys/master.key");
+        let policy_state = rt.join("policy_state.json");
+        write_test_bytes(&master_key, 64, b'K');
+        write_test_bytes(&policy_state, 32, b'P');
+
+        // Register a live agent peer pointing at our active test PID.
+        let live_id = AgentIdentity::new("personal", "agy-live", "worker");
+        kernel.ipc.register_peer(&live_id, vec![]).await.unwrap();
+        kernel
+            .ipc
+            .update_peer_metadata(
+                &live_id,
+                Some("agy".to_string()),
+                Some(std::process::id()),
+                None,
+                None,
+            )
+            .await
+            .unwrap();
+
+        let live_cache = rt.join("orgs/personal/agents/agy-live/home/cargo_target/live.rlib");
+        let live_tmp = rt.join("orgs/personal/agents/agy-live/home/tmp/scratch.txt");
+        write_test_bytes(&live_cache, 1024, b'L');
+        write_test_bytes(&live_tmp, 256, b'S');
+
+        // Seed an offline agent's cache, tmp, and bg_jobs directories.
+        let offline_agent_dir = rt.join("orgs/personal/agents/agy-offline");
+        let offline_cargo = offline_agent_dir.join("home/cargo_target/old.rlib");
+        let offline_deps = offline_agent_dir.join("home/deps/cache/pkg.tgz");
+        let offline_tmp = offline_agent_dir.join("home/tmp/tmp.bin");
+        let offline_bg = offline_agent_dir.join("home/bg_jobs/job1.log");
+        write_test_bytes(&offline_cargo, 2048, b'C');
+        write_test_bytes(&offline_deps, 512, b'D');
+        write_test_bytes(&offline_tmp, 300, b'T');
+        write_test_bytes(&offline_bg, 200, b'B');
+
+        let state = DesktopDaemonState {
+            runtime_dir: rt.clone(),
+            home_dir: home,
+            human_token: "aht_disk_token_123".to_string(),
+            simulate_tasks: true,
+            aegis_bin: None,
+            workspaces: Arc::new(RwLock::new(BTreeMap::new())),
+            workspace_sessions: Arc::new(RwLock::new(HashMap::new())),
+            tasks: Arc::new(RwLock::new(HashMap::new())),
+            task_notify: Arc::new(Notify::new()),
+            kernel,
+        };
+        let listener = bind_test_loopback_listener().await;
+        let port = listener.local_addr().unwrap().port();
+        let srv = tokio::spawn(async move {
+            let _ = axum::serve(listener, build_desktop_router(state)).await;
+        });
+
+        let rt_clone = rt.clone();
+        let outcome = tokio::task::spawn_blocking(move || -> anyhow::Result<()> {
+            let base = format!("http://127.0.0.1:{port}");
+            let agent = ureq::AgentBuilder::new()
+                .timeout(Duration::from_secs(5))
+                .build();
+            let auth_hdr = "Bearer aht_disk_token_123";
+
+            // 1. Missing or invalid bearer token returns 401 Unauthorized.
+            let unauth_disk = agent.get(&format!("{base}/v1/disk")).call();
+            assert!(matches!(unauth_disk, Err(ureq::Error::Status(401, _))));
+
+            let bad_auth_disk = agent
+                .get(&format!("{base}/v1/disk"))
+                .set("Authorization", "Bearer wrong_token")
+                .call();
+            assert!(matches!(bad_auth_disk, Err(ureq::Error::Status(401, _))));
+
+            let unauth_gc = agent.post(&format!("{base}/v1/disk/gc")).call();
+            assert!(matches!(unauth_gc, Err(ureq::Error::Status(401, _))));
+
+            let unauth_gc_json = agent
+                .post(&format!("{base}/v1/disk/gc"))
+                .send_json(json!({ "older_than_days": 0, "apply": true }));
+            assert!(matches!(unauth_gc_json, Err(ureq::Error::Status(401, _))));
+
+            // 2. Authenticated GET /v1/disk returns 200 OK with expected byte counts.
+            let disk_resp = agent
+                .get(&format!("{base}/v1/disk"))
+                .set("Authorization", auth_hdr)
+                .call()?;
+            assert_eq!(disk_resp.status(), 200);
+            let disk: crate::disk::DiskReport = disk_resp.into_json()?;
+            assert!(disk.live_agents.contains(&"personal/agy-live".to_string()));
+            assert_eq!(disk.agent_cache_bytes, 1024 + 2048 + 512);
+            assert_eq!(disk.agent_tmp_bytes, 256 + 300);
+            assert_eq!(disk.agent_bg_jobs_bytes, 200);
+            assert!(disk.protected_bytes >= 64 + 32);
+            assert!(disk.host_ssd_bytes >= 1024 + 2048 + 512 + 256 + 300 + 200 + 64 + 32);
+
+            // 3. POST /v1/disk/gc with empty body defaults to safe non-destructive dry-run.
+            let gc_empty_resp = agent
+                .post(&format!("{base}/v1/disk/gc"))
+                .set("Authorization", auth_hdr)
+                .call()?;
+            assert_eq!(gc_empty_resp.status(), 200);
+            let gc_empty: crate::disk::GcReport = gc_empty_resp.into_json()?;
+            assert!(gc_empty.dry_run);
+            assert_eq!(
+                gc_empty.older_than_days,
+                crate::disk::DEFAULT_GC_OLDER_THAN_DAYS
+            );
+            assert!(!gc_empty.include_shadows);
+            assert!(!gc_empty.force_dirty);
+            assert!(!gc_empty.compact_vaults);
+            assert_eq!(gc_empty.reclaimed_bytes, 0);
+            assert!(offline_cargo.exists());
+
+            // 4. POST /v1/disk/gc with `{}` also defaults to safe dry-run.
+            let gc_obj_resp = agent
+                .post(&format!("{base}/v1/disk/gc"))
+                .set("Authorization", auth_hdr)
+                .send_json(json!({}))?;
+            assert_eq!(gc_obj_resp.status(), 200);
+            let gc_obj: crate::disk::GcReport = gc_obj_resp.into_json()?;
+            assert!(gc_obj.dry_run);
+            assert_eq!(
+                gc_obj.older_than_days,
+                crate::disk::DEFAULT_GC_OLDER_THAN_DAYS
+            );
+            assert_eq!(gc_obj.reclaimed_bytes, 0);
+            assert!(offline_cargo.exists());
+
+            // 5. POST /v1/disk/gc with `{ "older_than_days": 0 }` (omitted `apply`) stays dry-run.
+            let expected_offline_bytes = 2048 + 512 + 300 + 200;
+            let gc_preview_resp = agent
+                .post(&format!("{base}/v1/disk/gc"))
+                .set("Authorization", auth_hdr)
+                .send_json(json!({ "older_than_days": 0 }))?;
+            assert_eq!(gc_preview_resp.status(), 200);
+            let gc_preview: crate::disk::GcReport = gc_preview_resp.into_json()?;
+            assert!(gc_preview.dry_run);
+            assert_eq!(gc_preview.older_than_days, 0);
+            assert_eq!(gc_preview.reclaimable_bytes, expected_offline_bytes);
+            assert_eq!(gc_preview.reclaimed_bytes, 0);
+            assert!(offline_cargo.exists());
+
+            // 6. Malformed JSON or invalid field types return 400 Bad Request without mutating disk.
+            let bad_json = agent
+                .post(&format!("{base}/v1/disk/gc"))
+                .set("Authorization", auth_hdr)
+                .set("Content-Type", "application/json")
+                .send_string("{not-valid-json");
+            assert!(matches!(bad_json, Err(ureq::Error::Status(400, _))));
+
+            let bad_type = agent
+                .post(&format!("{base}/v1/disk/gc"))
+                .set("Authorization", auth_hdr)
+                .send_json(json!({ "apply": "yes" }));
+            assert!(matches!(bad_type, Err(ureq::Error::Status(400, _))));
+            assert!(offline_cargo.exists());
+
+            // 7. POST /v1/disk/gc with `{ "older_than_days": 0, "apply": true }` reclaims offline
+            //    caches while preserving live agent caches and protected files.
+            let gc_apply_resp = agent
+                .post(&format!("{base}/v1/disk/gc"))
+                .set("Authorization", auth_hdr)
+                .send_json(json!({ "older_than_days": 0, "apply": true }))?;
+            assert_eq!(gc_apply_resp.status(), 200);
+            let gc_apply: crate::disk::GcReport = gc_apply_resp.into_json()?;
+            assert!(!gc_apply.dry_run);
+            assert_eq!(gc_apply.older_than_days, 0);
+            assert_eq!(gc_apply.reclaimable_bytes, expected_offline_bytes);
+            assert_eq!(gc_apply.reclaimed_bytes, expected_offline_bytes);
+
+            assert!(!offline_cargo.exists());
+            assert!(!offline_deps.exists());
+            assert!(!offline_tmp.exists());
+            assert!(!offline_bg.exists());
+
+            assert!(live_cache.exists());
+            assert!(live_tmp.exists());
+            assert!(master_key.exists());
+            assert!(policy_state.exists());
+            assert!(rt_clone.join("ipc_state.json").exists());
+
+            // 8. Subsequent GET /v1/disk reflects the reclaimed offline cache bytes.
+            let disk_after: crate::disk::DiskReport = agent
+                .get(&format!("{base}/v1/disk"))
+                .set("Authorization", auth_hdr)
+                .call()?
+                .into_json()?;
+            assert_eq!(disk_after.agent_cache_bytes, 1024);
+            assert_eq!(disk_after.agent_tmp_bytes, 256);
+            assert_eq!(disk_after.agent_bg_jobs_bytes, 0);
+
+            Ok(())
+        })
+        .await
+        .unwrap();
+
+        srv.abort();
+        outcome.unwrap();
     }
 }

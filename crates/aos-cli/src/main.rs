@@ -16,6 +16,7 @@ mod bench;
 mod cloud;
 mod coord;
 mod desktop_daemon;
+mod disk;
 mod explore;
 mod hooks;
 mod installer;
@@ -583,6 +584,69 @@ enum Commands {
         /// Optional custom home directory for post-upgrade client refresh (defaults to `$HOME`)
         #[arg(long)]
         home_dir: Option<PathBuf>,
+    },
+
+    /// Diagnose local agent sandbox stalls & retries from zero-PII friction telemetry (`~/.aegis/friction_events.jsonl`)
+    Insights {
+        /// Trailing window in days (default: 30)
+        #[arg(long, default_value_t = 30)]
+        days: u32,
+        /// Output machine-readable JSON
+        #[arg(long, default_value_t = false)]
+        json: bool,
+    },
+
+    /// Preview or submit anonymized aggregate friction metrics (defaults to `--dry-run`; passes NO code, paths, domains, or commands)
+    Feedback {
+        /// Trailing window in days (default: 30)
+        #[arg(long, default_value_t = 30)]
+        days: u32,
+        /// Print preview JSON locally without sending (default behavior unless `--send` is passed)
+        #[arg(long, default_value_t = false)]
+        dry_run: bool,
+        /// Explicitly upload the zero-PII aggregate summary to telemetry endpoint
+        #[arg(long, default_value_t = false, conflicts_with = "dry_run")]
+        send: bool,
+        /// Override telemetry endpoint URL (defaults to `AOS_TELEMETRY_URL` / `AOS_CLOUD_ENDPOINT` / https://heurion.org/aegis-cloud)
+        #[arg(long)]
+        endpoint: Option<String>,
+    },
+
+    /// Inspect Aegis OS runtime disk usage across vaults, CoW shadows, build caches, and sessions
+    #[command(visible_alias = "du")]
+    Disk {
+        /// Maximum number of largest entries to show in the top consumers list
+        #[arg(long, default_value_t = 20)]
+        top: usize,
+        /// Output raw JSON report
+        #[arg(long, default_value_t = false)]
+        json: bool,
+    },
+
+    /// Reclaim offline agent caches, scratch dirs, old exited sessions, and clean shadows under `--runtime-dir` (default `~/.aegis`)
+    #[command(visible_alias = "prune")]
+    Gc {
+        /// Only prune items older than N days (`0` skips age filtering for eligible offline items)
+        #[arg(long, default_value_t = 7)]
+        older_than_days: u64,
+        /// Also include clean offline CoW shadow workspaces (`cow_workspace`)
+        #[arg(long, default_value_t = false)]
+        include_shadows: bool,
+        /// Allow deleting dirty offline CoW shadows (requires `--include-shadows`; discards unrecovered edits)
+        #[arg(long, default_value_t = false)]
+        force_dirty: bool,
+        /// Preview reclaimable space without deleting anything (default behavior unless `--yes` is passed)
+        #[arg(long, default_value_t = false)]
+        dry_run: bool,
+        /// Apply planned deletions and vault compactions (required to actually free disk space)
+        #[arg(long, short = 'y', default_value_t = false, conflicts_with = "dry_run")]
+        yes: bool,
+        /// Compact unmounted APFS `.sparsebundle` vaults via `hdiutil compact` on macOS (skips mounted vaults with lock hint)
+        #[arg(long, default_value_t = false)]
+        compact_vaults: bool,
+        /// Output raw JSON plan/result
+        #[arg(long, default_value_t = false)]
+        json: bool,
     },
 
     /// View Product Growth & User Analytics (GitHub Release downloads, DAU / WAU / MAU, Retention & Client breakdown)
@@ -2892,6 +2956,46 @@ async fn main() -> anyhow::Result<()> {
                 &workspace,
                 &cli.runtime_dir,
             )
+            .await?;
+        }
+
+        Commands::Insights { days, json } => {
+            telemetry::render_insights(&cli.runtime_dir, days, json)?;
+        }
+
+        Commands::Feedback {
+            days,
+            dry_run: _,
+            send,
+            endpoint,
+        } => {
+            telemetry::run_feedback_command(&cli.runtime_dir, days, send, endpoint.as_deref())
+                .await?;
+        }
+
+        Commands::Disk { top, json } => {
+            disk::render_disk_report(&cli.runtime_dir, top, json).await?;
+        }
+
+        Commands::Gc {
+            older_than_days,
+            include_shadows,
+            force_dirty,
+            dry_run,
+            yes,
+            compact_vaults,
+            json,
+        } => {
+            let apply = yes && !dry_run;
+            disk::render_gc_command(disk::GcOptions {
+                runtime_dir: cli.runtime_dir.clone(),
+                older_than_days,
+                include_shadows,
+                force_dirty,
+                compact_vaults,
+                apply,
+                json,
+            })
             .await?;
         }
 

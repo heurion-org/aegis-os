@@ -766,6 +766,54 @@
             </div>
           </article>
         </div>
+
+        <!-- Operator-only Zero-PII Agent Friction Telemetry -->
+        <article class="card" id="friction-panel" style="display:none; margin-top:1.25rem;">
+          <div style="display:flex; align-items:flex-start; justify-content:space-between; gap:0.75rem; flex-wrap:wrap; margin-bottom:0.85rem;">
+            <div>
+              <span class="label-caps">OPERATOR TELEMETRY · ZERO-PII AGGREGATES</span>
+              <h3 class="card-title" style="margin-bottom:0.15rem;">
+                <span data-zh>Agent 摩擦探针（仅运维 · 零 PII）</span>
+                <span data-en>Agent Friction Telemetry (Operator · Zero-PII)</span>
+              </h3>
+              <p style="font-size:0.78rem; color:var(--ink-muted); margin:0;">
+                <span data-zh>仅汇总来自 <code>POST /v1/telemetry/friction</code> 的枚举桶计数与自动恢复率，不含任何源码、路径或命令明文。</span>
+                <span data-en>Aggregated enum bucket counts &amp; recovery rate from <code>POST /v1/telemetry/friction</code> — zero paths, domains, or raw commands.</span>
+              </p>
+            </div>
+            <span class="badge" id="friction-summary-badge">-</span>
+          </div>
+
+          <div style="display:grid; grid-template-columns:repeat(auto-fit, minmax(140px, 1fr)); gap:0.75rem; margin-bottom:1rem;">
+            <div class="kpi-cell">
+              <div class="label-caps"><span data-zh>上报批次</span><span data-en>REPORTS</span></div>
+              <div class="kpi-num" id="friction-total-reports">0</div>
+              <div class="kpi-sub" id="friction-unique-reporters"><span data-zh>独立节点：0</span><span data-en>Nodes: 0</span></div>
+            </div>
+            <div class="kpi-cell">
+              <div class="label-caps"><span data-zh>摩擦事件总数</span><span data-en>TOTAL EVENTS</span></div>
+              <div class="kpi-num" id="friction-total-events">0</div>
+              <div class="kpi-sub" id="friction-recovered-sub"><span data-zh>已自愈：0</span><span data-en>Recovered: 0</span></div>
+            </div>
+            <div class="kpi-cell">
+              <div class="label-caps"><span data-zh>自动恢复率</span><span data-en>RECOVERY RATE</span></div>
+              <div class="kpi-num" id="friction-recovery-rate">0.0%</div>
+              <div class="kpi-sub"><span data-zh>跨工具纠偏后恢复</span><span data-en>Post-hint recovery</span></div>
+            </div>
+            <div class="kpi-cell">
+              <div class="label-caps"><span data-zh>最高连续重试</span><span data-en>MAX STREAK</span></div>
+              <div class="kpi-num" id="friction-max-streak">0</div>
+              <div class="kpi-sub"><span data-zh>LoopThrash 阈值 &ge;3</span><span data-en>LoopThrash &ge;3</span></div>
+            </div>
+          </div>
+
+          <div class="label-caps" style="margin-bottom:0.4rem;">
+            <span data-zh>高频摩擦类别排行 (TOP FRICTION CATEGORIES)</span>
+            <span data-en>TOP FRICTION CATEGORIES</span>
+          </div>
+          <div id="friction-categories-list"></div>
+          <div id="friction-meta-row" style="margin-top:0.85rem; padding-top:0.75rem; border-top:1px solid var(--hairline); font-family:var(--font-mono); font-size:0.74rem; color:var(--ink-muted);"></div>
+        </article>
       </div>
     </section>
   </main>
@@ -1595,6 +1643,115 @@
       }
     }
 
+    function renderFrictionStats(stats) {
+      const s = stats || {};
+      const totalReports = Number(s.total_reports || 0);
+      const uniqueNodes = Number(s.unique_reporters || 0);
+      const totalEvents = Number(s.total_events || 0);
+      const recovered = Number(s.recovered_events || 0);
+      const rate = Number(s.recovery_rate_pct || 0);
+      const maxStreak = Number(s.max_streak_seen || 0);
+
+      const badge = document.getElementById('friction-summary-badge');
+      if (badge) {
+        badge.className = totalEvents > 0 ? 'badge badge-ok' : 'badge';
+        badge.textContent = currentLang === 'zh'
+          ? (totalEvents + ' 条事件 · 恢复 ' + rate.toFixed(1) + '%')
+          : (totalEvents + ' events · ' + rate.toFixed(1) + '% recovered');
+      }
+
+      const setTxt = (id, txt) => {
+        const el = document.getElementById(id);
+        if (el) el.textContent = txt;
+      };
+      setTxt('friction-total-reports', String(totalReports));
+      setTxt('friction-unique-reporters', (currentLang === 'zh' ? '独立节点：' : 'Nodes: ') + uniqueNodes);
+      setTxt('friction-total-events', String(totalEvents));
+      setTxt('friction-recovered-sub', (currentLang === 'zh' ? '已自愈：' : 'Recovered: ') + recovered);
+      setTxt('friction-recovery-rate', rate.toFixed(1) + '%');
+      setTxt('friction-max-streak', String(maxStreak));
+
+      const listEl = document.getElementById('friction-categories-list');
+      if (listEl) {
+        listEl.replaceChildren();
+        const cats = Array.isArray(s.top_categories) ? s.top_categories : [];
+        if (!cats.length) {
+          const p = document.createElement('p');
+          p.style.cssText = 'font-size:0.82rem; color:var(--ink-muted); margin:0;';
+          p.textContent = currentLang === 'zh'
+            ? '暂无上报的摩擦事件（用户仅通过 `aegis-os feedback --send` 显式上传零 PII 计数）。'
+            : 'No friction events reported yet (sent only explicitly via `aegis-os feedback --send`).';
+          listEl.appendChild(p);
+        } else {
+          const maxCnt = Math.max(1, Number(cats[0].count || 1));
+          for (const item of cats.slice(0, 8)) {
+            const key = String(item.key || 'unknown');
+            const cnt = Number(item.count || 0);
+            const meter = document.createElement('div');
+            meter.className = 'quota-meter';
+
+            const head = document.createElement('div');
+            head.className = 'quota-meter-head';
+            const left = document.createElement('strong');
+            left.style.cssText = 'font-family:var(--font-mono); font-size:0.78rem;';
+            left.textContent = key;
+            const right = document.createElement('span');
+            right.style.cssText = 'font-family:var(--font-mono); font-size:0.78rem;';
+            right.textContent = String(cnt);
+            head.appendChild(left);
+            head.appendChild(right);
+
+            const track = document.createElement('div');
+            track.className = 'quota-track';
+            const fill = document.createElement('div');
+            fill.className = 'quota-fill';
+            fill.style.width = Math.max(4, Math.round((cnt / maxCnt) * 100)) + '%';
+            track.appendChild(fill);
+
+            meter.appendChild(head);
+            meter.appendChild(track);
+            listEl.appendChild(meter);
+          }
+        }
+      }
+
+      const metaEl = document.getElementById('friction-meta-row');
+      if (metaEl) {
+        metaEl.replaceChildren();
+        const fmtMap = (obj) => {
+          if (!obj || typeof obj !== 'object') return '-';
+          const entries = Object.entries(obj);
+          if (!entries.length) return '-';
+          return entries.map(([k, v]) => k + ': ' + v).join(' | ');
+        };
+        const line1 = document.createElement('div');
+        line1.textContent = (currentLang === 'zh' ? '命令桶: ' : 'Buckets: ') + fmtMap(s.by_cmd_bucket);
+        const line2 = document.createElement('div');
+        line2.style.marginTop = '0.25rem';
+        line2.textContent = (currentLang === 'zh' ? '客户端与系统: ' : 'Clients / OS: ')
+          + fmtMap(s.by_client) + ' · ' + fmtMap(s.by_os);
+        metaEl.appendChild(line1);
+        metaEl.appendChild(line2);
+      }
+    }
+
+    async function refreshFrictionPanel() {
+      const panel = document.getElementById('friction-panel');
+      if (!panel) return;
+      try {
+        const res = await fetch(apiBase + '/v1/telemetry/friction/stats', { headers: authHeaders() });
+        if (!res.ok) {
+          panel.style.display = 'none';
+          return;
+        }
+        const stats = await res.json();
+        panel.style.display = '';
+        renderFrictionStats(stats);
+      } catch (_) {
+        panel.style.display = 'none';
+      }
+    }
+
     async function refreshAll() {
       const connBadge = document.getElementById('conn-badge');
       const totpBadge = document.getElementById('totp-status-badge');
@@ -1616,6 +1773,8 @@
             connBadge.className = 'badge';
             connBadge.textContent = currentLang === 'zh' ? '未连接账户' : 'Not Connected';
           }
+          const fp = document.getElementById('friction-panel');
+          if (fp) fp.style.display = 'none';
           return;
         }
         const data = await res.json();
@@ -1664,6 +1823,7 @@
 
         renderEscalations(Array.isArray(data.pending_escalations) ? data.pending_escalations : []);
         renderLeasesAndWorkspaces(data);
+        await refreshFrictionPanel();
       } catch (_) {}
     }
 

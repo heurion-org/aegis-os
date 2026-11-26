@@ -1152,6 +1152,68 @@ pub(crate) async fn evaluate_broker_hook(
     .await
 }
 
+const LOW_DISK_MIN_BYTES: u64 = 10 * 1024 * 1024 * 1024; // 10 GiB
+
+pub(crate) fn is_low_disk(avail_bytes: u64, total_bytes: u64) -> bool {
+    total_bytes > 0
+        && ((avail_bytes as u128) * 10 < (total_bytes as u128)
+            || avail_bytes < LOW_DISK_MIN_BYTES)
+}
+
+#[cfg(unix)]
+pub(crate) fn fs_disk_space_bytes(path: &Path) -> Option<(u64, u64)> {
+    let mut probe = Some(path);
+    while let Some(p) = probe {
+        if p.exists() {
+            use std::os::unix::ffi::OsStrExt;
+            let c_path = std::ffi::CString::new(p.as_os_str().as_bytes()).ok()?;
+            let mut st: libc::statvfs = unsafe { std::mem::zeroed() };
+            if unsafe { libc::statvfs(c_path.as_ptr(), &mut st) } == 0 {
+                let frsize = u64::try_from(st.f_frsize).unwrap_or(0);
+                let bsize = u64::try_from(st.f_bsize).unwrap_or(0);
+                let block_size = if frsize > 0 { frsize } else { bsize };
+                if block_size > 0 {
+                    let avail_blocks = u64::try_from(st.f_bavail).unwrap_or(0);
+                    let total_blocks = u64::try_from(st.f_blocks).unwrap_or(0);
+                    return Some((
+                        avail_blocks.saturating_mul(block_size),
+                        total_blocks.saturating_mul(block_size),
+                    ));
+                }
+            }
+            return None;
+        }
+        probe = p.parent();
+    }
+    None
+}
+
+#[cfg(not(unix))]
+pub(crate) fn fs_disk_space_bytes(_path: &Path) -> Option<(u64, u64)> {
+    None
+}
+
+pub(crate) fn format_low_disk_warning(avail_bytes: u64, total_bytes: u64) -> Option<String> {
+    if !is_low_disk(avail_bytes, total_bytes) {
+        return None;
+    }
+    let pct = (avail_bytes as f64 / total_bytes as f64) * 100.0;
+    Some(format!(
+        "[Aegis OS Warning] Low disk space: {} free ({:.1}%). Inspect with `aegis-os disk` or preview cleanup with `aegis-os gc --dry-run`.",
+        crate::disk::format_bytes(avail_bytes),
+        pct
+    ))
+}
+
+fn low_disk_warning_for_runtime(runtime_dir: &Path) -> Option<String> {
+    let (avail, total) = fs_disk_space_bytes(runtime_dir).or_else(|| {
+        std::env::var_os("HOME")
+            .map(PathBuf::from)
+            .and_then(|home| fs_disk_space_bytes(&home))
+    })?;
+    format_low_disk_warning(avail, total)
+}
+
 async fn evaluate_hook_core(ctx: HookEvalContext<'_>) -> anyhow::Result<Value> {
     let conversation_id = ctx
         .payload
@@ -1205,7 +1267,7 @@ async fn evaluate_hook_core(ctx: HookEvalContext<'_>) -> anyhow::Result<Value> {
                 .map(|p| p.address())
                 .collect();
             let mut msg = format!(
-                "[Aegis OS Runtime Active] Principal: `{}/{}` | CoW Shadow: `{}` | Same-Org Peers: {:?} | Global Peers: {:?} | Unread IPC: {} | Shadow Rebase Updates: {} (Conflicts: {}).",
+                "[Aegis OS Runtime Active] Principal: `{}/{}` | CoW Shadow: `{}` | Same-Org Peers: {:?} | Global Peers: {:?} | Unread IPC: {} | Shadow Rebase Updates: {} (Conflicts: {}). Runtime guardrails: use $TMPDIR (host /tmp is read-only), use `mcp_aegis-os_egress_http_request` for HTTP/HTTPS (proc_exec has no internet), and avoid broad scans like `find /`.",
                 ctx.identity.org_id,
                 ctx.identity.agent_id,
                 ctx.shadow_root.display(),
@@ -1215,6 +1277,10 @@ async fn evaluate_hook_core(ctx: HookEvalContext<'_>) -> anyhow::Result<Value> {
                 refresh.total_updates(),
                 refresh.conflicts.len()
             );
+            if let Some(warning) = low_disk_warning_for_runtime(ctx.runtime_dir) {
+                msg.push('\n');
+                msg.push_str(&warning);
+            }
             if cloud::should_prompt_mode_onboarding(ctx.runtime_dir, ctx.effective_workspace) {
                 if let Some(onboarding) = cloud::build_onboarding_prompt_if_needed(
                     ctx.runtime_dir,
@@ -1986,6 +2052,37 @@ mod tests {
         )
         .unwrap();
         assert!(client_has_aegis_mcp_configured(true, &ws, Some(&home)));
+    }
+
+    #[test]
+    fn low_disk_warning_triggers_below_threshold_and_is_none_when_healthy() {
+        const GIB: u64 = 1024 * 1024 * 1024;
+
+        assert_eq!(format_low_disk_warning(0, 0), None);
+        assert_eq!(format_low_disk_warning(50 * GIB, 200 * GIB), None);
+        assert_eq!(format_low_disk_warning(10 * GIB, 100 * GIB), None);
+
+        let low_abs =
+            format_low_disk_warning(9 * GIB, 50 * GIB).expect("expected warning below 10 GiB");
+        assert!(low_abs.contains("aegis-os disk"), "{low_abs}");
+        assert!(low_abs.contains("aegis-os gc --dry-run"), "{low_abs}");
+
+        let low_pct =
+            format_low_disk_warning(15 * GIB, 200 * GIB).expect("expected warning below 10%");
+        assert!(low_pct.contains("aegis-os disk"), "{low_pct}");
+        assert!(low_pct.contains("aegis-os gc --dry-run"), "{low_pct}");
+
+        assert_eq!(format_low_disk_warning(u64::MAX / 2, u64::MAX), None);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn fs_disk_space_bytes_succeeds_for_existing_and_uncreated_nested_paths() {
+        let tmp = tempfile::tempdir().unwrap();
+        let nested = tmp.path().join("does/not/exist/yet");
+        let (avail, total) = fs_disk_space_bytes(&nested).expect("statvfs should succeed");
+        assert!(total > 0);
+        assert!(avail <= total);
     }
 }
 

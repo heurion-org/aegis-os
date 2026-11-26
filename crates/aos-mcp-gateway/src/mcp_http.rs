@@ -163,7 +163,7 @@ pub fn validate_mcp_http_url_syntax(raw_url: &str, allow_local_http: bool) -> an
     Ok(())
 }
 
-fn parse_validated_url_parts(
+pub(crate) fn parse_validated_url_parts(
     raw_url: &str,
     allow_local_http: bool,
 ) -> anyhow::Result<(bool, String, u16, String)> {

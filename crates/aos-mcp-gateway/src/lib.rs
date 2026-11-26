@@ -3631,7 +3631,7 @@ pub const TOOL_ANNOTATIONS: &[(&str, bool, bool, bool, bool)] = &[
     ("ipc_ack", false, false, true, false),
     ("ipc_wait", false, false, true, false),
     // Inspects and rewrites the request at the boundary; it does not forward it (yet).
-    ("egress_http_request", true, false, true, false),
+    ("egress_http_request", false, false, false, true),
     ("coord_claim", false, false, true, false),
     ("coord_release", false, false, true, false),
     ("policy_list_escalations", true, false, true, false),
@@ -3693,9 +3693,11 @@ fn is_public_route(method: &str, target: &str) -> bool {
     ]
     .iter()
     .any(|p| path.starts_with(p));
+    // Exact path check for zero-PII friction submissions so `/v1/telemetry/friction/stats` stays operator-only.
+    let friction_post = method == "POST" && path == "/v1/telemetry/friction";
     // Key signup: the route itself only lets anonymous callers mint an org's *first* key.
     let signup = method == "POST" && path.starts_with("/v1/tenants/keys");
-    (method == "GET" && get_public) || any_public || signup
+    (method == "GET" && get_public) || any_public || friction_post || signup
 }
 
 /// Routes no tenant key may use: simulating approvals, resetting approvers, fleet-wide GC, and
@@ -3710,6 +3712,7 @@ fn is_operator_only_route(method: &str, target: &str) -> bool {
         || path.starts_with("/v1/orgs")
         || path.starts_with("/v1/workspaces/gc-idle")
         || path.starts_with("/v1/telemetry/stats")
+        || path.starts_with("/v1/telemetry/friction/stats")
         || path.starts_with("/v1/mcp/")
         || ((path.starts_with("/api/status") || path.starts_with("/v1/status"))
             && requested_orgs(target, "").iter().any(|o| o == "*"))
@@ -3846,6 +3849,8 @@ pub struct AegisRuntimeKernel {
     allow_agent_local_http: Arc<std::sync::atomic::AtomicBool>,
     active_host_exec_runs: Arc<std::sync::atomic::AtomicUsize>,
     host_exec_config: RwLock<Option<HostExecBrokerConfig>>,
+    /// Per-(agent_id, cmd_bucket) failure streak counter for LoopThrash friction detection.
+    friction_streaks: RwLock<HashMap<(String, String), u32>>,
 }
 
 /// Controls how many built-in Aegis runtime MCP tools are advertised via `tools/list`.
@@ -4000,12 +4005,520 @@ impl AegisRuntimeKernel {
             )),
             active_host_exec_runs: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
             host_exec_config: RwLock::new(None),
+            friction_streaks: RwLock::new(HashMap::new()),
         })
     }
 
     pub fn set_allow_agent_local_http(&self, allow: bool) {
         self.allow_agent_local_http
             .store(allow, std::sync::atomic::Ordering::Release);
+    }
+
+    /// Location of the local zero-PII friction log for this gateway runtime root.
+    pub fn friction_log_path(&self) -> PathBuf {
+        aos_core::friction::default_friction_log_path(&self.runtime_data_root)
+    }
+
+    /// Persist a single zero-PII [`aos_core::friction::FrictionEvent`] under `runtime_data_root`.
+    pub fn record_kernel_friction(
+        &self,
+        category: aos_core::friction::FrictionCategory,
+        cmd_bucket: aos_core::friction::CmdBucket,
+        client: Option<&str>,
+        exit_code: Option<i32>,
+        streak_len: u32,
+        recovered: bool,
+    ) {
+        let ev = aos_core::friction::new_friction_event(
+            category,
+            cmd_bucket,
+            client,
+            exit_code,
+            streak_len,
+            recovered,
+        );
+        let _ = aos_core::friction::append_friction_event(&self.friction_log_path(), &ev);
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    async fn update_proc_exec_friction(
+        &self,
+        agent_id: &str,
+        command: &str,
+        cmd_args: &[String],
+        exit_code: Option<i32>,
+        timed_out: bool,
+        stdout: &str,
+        stderr: &str,
+    ) -> Option<(aos_core::friction::FrictionCategory, String, u32)> {
+        let bucket = aos_core::friction::classify_cmd_bucket(command, cmd_args);
+        let streak_key = (agent_id.to_string(), bucket.as_str().to_string());
+
+        if !timed_out && exit_code == Some(0) {
+            let prev = self.friction_streaks.write().await.remove(&streak_key);
+            if let Some(prev_streak) = prev {
+                if prev_streak >= 2 {
+                    self.record_kernel_friction(
+                        aos_core::friction::FrictionCategory::LoopThrash,
+                        bucket,
+                        Some("mcp_gateway"),
+                        Some(0),
+                        prev_streak,
+                        true,
+                    );
+                }
+            }
+            return None;
+        }
+
+        let streak = {
+            let mut streaks = self.friction_streaks.write().await;
+            let entry = streaks.entry(streak_key).or_insert(0);
+            *entry = entry.saturating_add(1);
+            *entry
+        };
+
+        if let Some(mut diag) = aos_core::friction::diagnose_proc_exec_friction(
+            command, cmd_args, exit_code, timed_out, stdout, stderr,
+        ) {
+            self.record_kernel_friction(
+                diag.category,
+                diag.cmd_bucket,
+                Some("mcp_gateway"),
+                exit_code,
+                streak,
+                false,
+            );
+            if streak >= 3 {
+                diag.hint.push_str(
+                    " [Loop guard: repeated consecutive failures in this category — switch approach or use Aegis MCP tools.]",
+                );
+            }
+            return Some((diag.category, diag.hint, streak));
+        }
+
+        if streak >= 3 {
+            self.record_kernel_friction(
+                aos_core::friction::FrictionCategory::LoopThrash,
+                bucket,
+                Some("mcp_gateway"),
+                exit_code,
+                streak,
+                false,
+            );
+            return Some((
+                aos_core::friction::FrictionCategory::LoopThrash,
+                format!(
+                    "Detected {streak} consecutive failing `{}` commands in proc_exec. Pause and fix the root cause (or switch to `egress_http_request`, `pkg_install`, or `$TMPDIR`) rather than retrying blindly.",
+                    bucket.as_str()
+                ),
+                streak,
+            ));
+        }
+
+        None
+    }
+
+    async fn record_tool_streak_failure(
+        &self,
+        agent_id: &str,
+        streak_name: &str,
+        category: aos_core::friction::FrictionCategory,
+        bucket: aos_core::friction::CmdBucket,
+    ) -> u32 {
+        let streak_key = (agent_id.to_string(), streak_name.to_string());
+        let streak = {
+            let mut streaks = self.friction_streaks.write().await;
+            let entry = streaks.entry(streak_key).or_insert(0);
+            *entry = entry.saturating_add(1);
+            *entry
+        };
+        self.record_kernel_friction(category, bucket, Some("mcp_gateway"), None, streak, false);
+        if streak >= 3 {
+            self.record_kernel_friction(
+                aos_core::friction::FrictionCategory::LoopThrash,
+                bucket,
+                Some("mcp_gateway"),
+                None,
+                streak,
+                false,
+            );
+        }
+        streak
+    }
+
+    async fn reset_tool_streak_on_success(
+        &self,
+        agent_id: &str,
+        streak_name: &str,
+        bucket: aos_core::friction::CmdBucket,
+    ) {
+        let streak_key = (agent_id.to_string(), streak_name.to_string());
+        let prev = self.friction_streaks.write().await.remove(&streak_key);
+        if let Some(prev_streak) = prev {
+            if prev_streak >= 2 {
+                self.record_kernel_friction(
+                    aos_core::friction::FrictionCategory::LoopThrash,
+                    bucket,
+                    Some("mcp_gateway"),
+                    Some(0),
+                    prev_streak,
+                    true,
+                );
+            }
+        }
+    }
+
+    fn slice_poll_log_bytes(
+        bytes: &[u8],
+        offset: Option<usize>,
+        tail_bytes: usize,
+    ) -> (String, usize, bool, usize) {
+        let total = bytes.len();
+        let (start, end, truncated) = match offset {
+            Some(req_off) => {
+                let start = req_off.min(total);
+                let end = start.saturating_add(tail_bytes).min(total);
+                (start, end, end < total)
+            }
+            None => {
+                let start = total.saturating_sub(tail_bytes);
+                (start, total, start > 0)
+            }
+        };
+        let text = String::from_utf8_lossy(&bytes[start..end]).into_owned();
+        (text, total, truncated, start)
+    }
+
+    async fn execute_fs_edit(env: &AgentEnvironment, args: &Value) -> anyhow::Result<Value> {
+        let rel_path = args
+            .get("path")
+            .and_then(|v| v.as_str())
+            .context("Missing 'path'")?;
+        let target = args
+            .get("target")
+            .and_then(|v| v.as_str())
+            .context("Missing 'target'")?;
+        let replacement = args
+            .get("replacement")
+            .and_then(|v| v.as_str())
+            .context("Missing 'replacement'")?;
+        let (clean, full_path) = shadow_path_for_write(env.workspace.shadow_root(), rel_path)?;
+        let original = tokio::fs::read_to_string(&full_path)
+            .await
+            .with_context(|| format!("File '{}' not found in CoW workspace", clean))?;
+        if !original.contains(target) {
+            bail!(
+                "Target snippet not found in '{}' inside CoW shadow workspace",
+                clean
+            );
+        }
+        let updated = original.replace(target, replacement);
+        aos_core::session::write_bytes_atomic_synced_async(&full_path, updated.into_bytes()).await?;
+        Ok(json!({
+            "status": "edited_in_cow_shadow",
+            "path": clean,
+            "host_modified": false
+        }))
+    }
+
+    async fn execute_egress_http_request(
+        &self,
+        identity: &AgentIdentity,
+        args: &Value,
+    ) -> anyhow::Result<Value> {
+        const MAX_EGRESS_RESPONSE_BYTES: usize = 256 * 1024;
+        let raw_url = args
+            .get("url")
+            .and_then(|v| v.as_str())
+            .map(str::trim)
+            .filter(|s| !s.is_empty());
+        let method = args
+            .get("method")
+            .and_then(|v| v.as_str())
+            .unwrap_or("GET")
+            .trim()
+            .to_ascii_uppercase();
+        if !matches!(
+            method.as_str(),
+            "GET" | "POST" | "PUT" | "PATCH" | "DELETE" | "HEAD" | "OPTIONS"
+        ) {
+            bail!("Unsupported HTTP method '{}' in egress_http_request", method);
+        }
+        let allow_local_http = self
+            .allow_agent_local_http
+            .load(std::sync::atomic::Ordering::Relaxed);
+
+        let (target_domain, path, parsed_port, parsed_is_https, execute_default) =
+            if let Some(u) = raw_url {
+                let (is_https, host, port, pq) =
+                    crate::mcp_http::parse_validated_url_parts(u, allow_local_http)?;
+                (host, pq, Some(port), is_https, true)
+            } else {
+                let dom = args
+                    .get("target_domain")
+                    .and_then(|v| v.as_str())
+                    .map(str::trim)
+                    .filter(|s| !s.is_empty())
+                    .context("Missing 'url' or 'target_domain'")?
+                    .to_string();
+                let raw_path = args
+                    .get("path")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("/");
+                let normalized_path = if raw_path.starts_with('/') {
+                    raw_path.to_string()
+                } else {
+                    format!("/{raw_path}")
+                };
+                (dom, normalized_path, None, true, false)
+            };
+        let execute = args
+            .get("execute")
+            .and_then(|v| v.as_bool())
+            .unwrap_or(execute_default);
+        let timeout_ms = args
+            .get("timeout_ms")
+            .and_then(|v| v.as_u64())
+            .unwrap_or(15_000)
+            .clamp(1_000, 60_000);
+        let headers: HashMap<String, String> = args
+            .get("headers")
+            .and_then(|v| serde_json::from_value(v.clone()).ok())
+            .unwrap_or_default();
+        let body = args.get("body").and_then(|v| v.as_str());
+
+        let spec = aos_egress::OutboundRequestSpec {
+            target_domain: target_domain.clone(),
+            method: method.clone(),
+            path: path.clone(),
+            headers: headers.clone(),
+        };
+        let verdict = self
+            .egress
+            .inspect_and_inject_with_body(identity, &spec, body)
+            .await?;
+        let (injected_headers, injected_path, secrets_injected) = match &verdict {
+            aos_egress::EgressVerdict::RequiresEscalation { domain, reason } => {
+                let esc_decision = self
+                    .authorize_and_audit(
+                        identity,
+                        "egress_unlisted_domain",
+                        &identity.org_id,
+                        domain,
+                        json!({
+                            "target_domain": domain,
+                            "method": method,
+                            "path": path,
+                            "reason": reason,
+                            "evidence": {
+                                "domain": domain,
+                                "method": method,
+                                "path": path,
+                            }
+                        }),
+                    )
+                    .await?;
+                match esc_decision {
+                    PolicyDecision::Allow { .. } => (headers, path, Vec::new()),
+                    PolicyDecision::Ask {
+                        escalation_id,
+                        reason: esc_reason,
+                        suggested_lease_scope,
+                    } => {
+                        let mut out = serde_json::to_value(&verdict)?;
+                        if let Some(obj) = out.as_object_mut() {
+                            obj.insert("status".to_string(), json!("approval_required"));
+                            obj.insert("escalation_id".to_string(), json!(escalation_id));
+                            obj.insert("reason".to_string(), json!(esc_reason));
+                            obj.insert(
+                                "suggested_lease_scope".to_string(),
+                                json!(suggested_lease_scope),
+                            );
+                        }
+                        return Ok(out);
+                    }
+                    PolicyDecision::Deny { reason: deny_reason } => {
+                        bail!("Policy Denied egress to '{}': {}", domain, deny_reason);
+                    }
+                }
+            }
+            aos_egress::EgressVerdict::BlockedSecretExfiltration {
+                placeholder,
+                unauthorized_domain,
+            } => {
+                let _ = self
+                    .recorder
+                    .record(AuditEvent {
+                        event_id: format!("evt-{}", &Uuid::new_v4().to_string()[..8]),
+                        timestamp_ms: Utc::now().timestamp_millis(),
+                        org_id: identity.org_id.clone(),
+                        agent_id: identity.agent_id.clone(),
+                        action: "egress_dlp_block".to_string(),
+                        resource: target_domain.clone(),
+                        policy_decision: format!("deny:dlp:{placeholder}"),
+                        snapshot_id: None,
+                        details: json!({
+                            "target_domain": target_domain,
+                            "method": method,
+                            "path": path,
+                            "placeholder": placeholder,
+                            "unauthorized_domain": unauthorized_domain,
+                        }),
+                        task_id: self.active_task_id(identity).await,
+                        prev_hash: None,
+                        event_hash: None,
+                    })
+                    .await;
+                if execute {
+                    bail!(
+                        "Blocked potential secret exfiltration ({placeholder}) to unauthorized domain '{unauthorized_domain}'"
+                    );
+                }
+                self.record_kernel_friction(
+                    aos_core::friction::FrictionCategory::EgressDenied,
+                    aos_core::friction::CmdBucket::Egress,
+                    Some("mcp_gateway"),
+                    None,
+                    1,
+                    false,
+                );
+                return Ok(serde_json::to_value(verdict)?);
+            }
+            aos_egress::EgressVerdict::AllowedAndSanitized {
+                injected_headers,
+                injected_path,
+                secrets_injected,
+            } => (
+                injected_headers.clone(),
+                injected_path.clone(),
+                secrets_injected.clone(),
+            ),
+        };
+
+        if !execute {
+            return Ok(serde_json::to_value(
+                aos_egress::EgressVerdict::AllowedAndSanitized {
+                    injected_headers,
+                    injected_path,
+                    secrets_injected,
+                },
+            )?);
+        }
+
+        let mut explicit_content_type: Option<String> = None;
+        let mut outbound_headers: Vec<(String, String)> = Vec::new();
+        for (k, v) in injected_headers {
+            if k.contains(['\r', '\n']) || v.contains(['\r', '\n']) || k.trim().is_empty() {
+                bail!("Invalid CR/LF or empty HTTP header name in egress_http_request");
+            }
+            let kl = k.trim().to_ascii_lowercase();
+            if matches!(
+                kl.as_str(),
+                "host" | "content-length" | "transfer-encoding" | "connection"
+            ) {
+                continue;
+            }
+            if kl == "content-type" && body.is_some() {
+                explicit_content_type = Some(v);
+                continue;
+            }
+            outbound_headers.push((k, v));
+        }
+
+        let inferred_ct = explicit_content_type.unwrap_or_else(|| {
+            let b_trimmed = body.unwrap_or("").trim_start();
+            if b_trimmed.starts_with('{') || b_trimmed.starts_with('[') {
+                "application/json".to_string()
+            } else {
+                "text/plain; charset=utf-8".to_string()
+            }
+        });
+
+        let (forward_url, forward_allow_local) = if let Some((override_addr, override_tls)) =
+            self.egress.upstream_override(&target_domain).await
+        {
+            let scheme = if override_tls { "https" } else { "http" };
+            (
+                format!("{scheme}://{override_addr}{injected_path}"),
+                allow_local_http || !override_tls,
+            )
+        } else {
+            let scheme = if parsed_is_https { "https" } else { "http" };
+            let port_suffix = match (parsed_is_https, parsed_port) {
+                (true, Some(p)) if p != 443 => format!(":{p}"),
+                (false, Some(p)) if p != 80 => format!(":{p}"),
+                _ => String::new(),
+            };
+            (
+                format!("{scheme}://{target_domain}{port_suffix}{injected_path}"),
+                allow_local_http,
+            )
+        };
+
+        let body_param = body.map(|b| (inferred_ct.as_str(), b.as_bytes()));
+        let (status_code, resp_headers, resp_bytes) = crate::mcp_http::simple_http_request(
+            &method,
+            &forward_url,
+            &outbound_headers,
+            body_param,
+            forward_allow_local,
+            timeout_ms,
+        )
+        .await?;
+
+        let truncated = resp_bytes.len() > MAX_EGRESS_RESPONSE_BYTES;
+        let capped = &resp_bytes[..resp_bytes.len().min(MAX_EGRESS_RESPONSE_BYTES)];
+        let raw_body = String::from_utf8_lossy(capped);
+        let (redacted_body, body_dlp) = aos_egress::redact_dlp_secrets(&raw_body);
+
+        let mut sanitized_headers = serde_json::Map::new();
+        for (hk, hv) in resp_headers {
+            if matches!(
+                hk.to_ascii_lowercase().as_str(),
+                "set-cookie" | "authorization" | "proxy-authorization"
+            ) {
+                continue;
+            }
+            let (hv_clean, _) = aos_egress::redact_dlp_secrets(&hv);
+            sanitized_headers.insert(hk, json!(hv_clean));
+        }
+
+        let _ = self
+            .recorder
+            .record(AuditEvent {
+                event_id: format!("evt-{}", &Uuid::new_v4().to_string()[..8]),
+                timestamp_ms: Utc::now().timestamp_millis(),
+                org_id: identity.org_id.clone(),
+                agent_id: identity.agent_id.clone(),
+                action: "egress_http_forward".to_string(),
+                resource: target_domain.clone(),
+                policy_decision: format!("allow:{status_code}"),
+                snapshot_id: None,
+                details: json!({
+                    "target_domain": target_domain,
+                    "method": method,
+                    "status_code": status_code,
+                    "truncated": truncated,
+                    "secrets_injected_count": secrets_injected.len(),
+                }),
+                task_id: self.active_task_id(identity).await,
+                prev_hash: None,
+                event_hash: None,
+            })
+            .await;
+
+        Ok(json!({
+            "executed": true,
+            "status_code": status_code,
+            "target_domain": target_domain,
+            "path": injected_path,
+            "headers": sanitized_headers,
+            "body": redacted_body,
+            "truncated": truncated,
+            "dlp_redacted_types": body_dlp,
+            "secrets_injected": secrets_injected
+        }))
     }
 
     pub fn subscribe_mcp_notifications(
@@ -4462,11 +4975,17 @@ impl AegisRuntimeKernel {
                 .and_then(|b| serde_json::from_slice::<Vec<SnapshotMeta>>(&b).ok())
                 .map(|s| s.len())
                 .unwrap_or(0);
-            let changed_paths: Vec<String> = diffs.iter().map(|d| d.relative_path.clone()).collect();
+            let changed_paths_total = diffs.len();
+            let changed_paths: Vec<String> = diffs
+                .iter()
+                .take(20)
+                .map(|d| d.relative_path.clone())
+                .collect();
             orphaned.push(json!({
                 "agent_id": other_id,
-                "uncommitted_changes_count": diffs.len(),
+                "uncommitted_changes_count": changed_paths_total,
                 "changed_paths": changed_paths,
+                "changed_paths_total": changed_paths_total,
                 "snapshots_count": snapshots_count,
             }));
         }
@@ -9062,7 +9581,20 @@ impl AegisRuntimeKernel {
             pre_commit_evidence_hash = Some(plan.evidence_hash.clone());
             pre_pr_merge_plan = Some(plan);
         } else if tool_name == "pkg_install" {
-            let (plan, resource, diffs, meta) = Self::prepare_pkg_install_plan(&env, &args)?;
+            let (plan, resource, diffs, meta) = match Self::prepare_pkg_install_plan(&env, &args) {
+                Ok(planned) => planned,
+                Err(err) => {
+                    self.record_kernel_friction(
+                        aos_core::friction::FrictionCategory::PkgInstallFailed,
+                        aos_core::friction::CmdBucket::PkgInstall,
+                        Some("mcp_gateway"),
+                        None,
+                        1,
+                        false,
+                    );
+                    return Err(err);
+                }
+            };
             target_resource = resource;
             if let (Some(obj), Some(meta_obj)) =
                 (audit_metadata.as_object_mut(), meta.as_object())
@@ -9075,7 +9607,20 @@ impl AegisRuntimeKernel {
             pre_commit_evidence_hash = Some(plan.evidence_hash.clone());
             pre_pkg_install_plan = Some(plan);
         } else if tool_name == "host_exec" {
-            let (plan, resource, diffs, meta) = self.prepare_host_exec_plan(&env, &args).await?;
+            let (plan, resource, diffs, meta) = match self.prepare_host_exec_plan(&env, &args).await {
+                Ok(planned) => planned,
+                Err(err) => {
+                    self.record_kernel_friction(
+                        aos_core::friction::FrictionCategory::HostExecDenied,
+                        aos_core::friction::CmdBucket::HostExec,
+                        Some("mcp_gateway"),
+                        None,
+                        1,
+                        false,
+                    );
+                    return Err(err);
+                }
+            };
             target_resource = resource;
             if let (Some(obj), Some(meta_obj)) =
                 (audit_metadata.as_object_mut(), meta.as_object())
@@ -9214,6 +9759,33 @@ impl AegisRuntimeKernel {
                     return Ok(ask_payload);
                 }
                 PolicyDecision::Deny { reason } => {
+                    match tool_name {
+                        "egress_http_request" => self.record_kernel_friction(
+                            aos_core::friction::FrictionCategory::EgressDenied,
+                            aos_core::friction::CmdBucket::Egress,
+                            Some("mcp_gateway"),
+                            None,
+                            1,
+                            false,
+                        ),
+                        "pkg_install" => self.record_kernel_friction(
+                            aos_core::friction::FrictionCategory::PkgInstallFailed,
+                            aos_core::friction::CmdBucket::PkgInstall,
+                            Some("mcp_gateway"),
+                            None,
+                            1,
+                            false,
+                        ),
+                        "host_exec" => self.record_kernel_friction(
+                            aos_core::friction::FrictionCategory::HostExecDenied,
+                            aos_core::friction::CmdBucket::HostExec,
+                            Some("mcp_gateway"),
+                            None,
+                            1,
+                            false,
+                        ),
+                        _ => {}
+                    }
                     bail!("Policy Denied syscall '{}': {}", tool_name, reason);
                 }
             }
@@ -9397,42 +9969,33 @@ impl AegisRuntimeKernel {
                 }))
             }
 
-            "fs_edit" => {
-                let rel_path = args
-                    .get("path")
-                    .and_then(|v| v.as_str())
-                    .context("Missing 'path'")?;
-                let target = args
-                    .get("target")
-                    .and_then(|v| v.as_str())
-                    .context("Missing 'target'")?;
-                let replacement = args
-                    .get("replacement")
-                    .and_then(|v| v.as_str())
-                    .context("Missing 'replacement'")?;
-                let (clean, full_path) =
-                    shadow_path_for_write(env.workspace.shadow_root(), rel_path)?;
-                let original = tokio::fs::read_to_string(&full_path)
-                    .await
-                    .with_context(|| format!("File '{}' not found in CoW workspace", clean))?;
-                if !original.contains(target) {
-                    bail!(
-                        "Target snippet not found in '{}' inside CoW shadow workspace",
-                        clean
-                    );
+            "fs_edit" => match Self::execute_fs_edit(&env, &args).await {
+                Ok(res) => {
+                    self.reset_tool_streak_on_success(
+                        &identity.agent_id,
+                        "fs_edit",
+                        aos_core::friction::CmdBucket::FsEdit,
+                    )
+                    .await;
+                    Ok(res)
                 }
-                let updated = original.replace(target, replacement);
-                aos_core::session::write_bytes_atomic_synced_async(
-                    &full_path,
-                    updated.into_bytes(),
-                )
-                .await?;
-                Ok(json!({
-                    "status": "edited_in_cow_shadow",
-                    "path": clean,
-                    "host_modified": false
-                }))
-            }
+                Err(err) => {
+                    let streak = self
+                        .record_tool_streak_failure(
+                            &identity.agent_id,
+                            "fs_edit",
+                            aos_core::friction::FrictionCategory::EditMismatch,
+                            aos_core::friction::CmdBucket::FsEdit,
+                        )
+                        .await;
+                    if streak >= 3 {
+                        bail!(
+                            "{err}\n[aegis_hint (loop_thrash)]: Detected {streak} consecutive failing `fs_edit` attempts. Re-read the target file with `fs_read` before retrying `fs_edit`."
+                        );
+                    }
+                    Err(err)
+                }
+            },
 
             "fs_delete" => {
                 let rel_path = args
@@ -9470,6 +10033,22 @@ impl AegisRuntimeKernel {
             }
 
             "workspace_status" => {
+                #[derive(Serialize)]
+                struct SlimFileDiffEntry<'a> {
+                    relative_path: &'a str,
+                    change_type: &'a DiffChangeType,
+                    old_size: Option<u64>,
+                    new_size: Option<u64>,
+                    #[serde(skip_serializing_if = "Option::is_none")]
+                    old_sha256: Option<&'a str>,
+                    #[serde(skip_serializing_if = "Option::is_none")]
+                    new_sha256: Option<&'a str>,
+                }
+
+                let include_diffs = args
+                    .get("include_diffs")
+                    .and_then(|v| v.as_bool())
+                    .unwrap_or(false);
                 if !env.workspace.shadow_root().exists() {
                     let _ = self.ensure_org_vault(&identity.org_id).await;
                 }
@@ -9480,7 +10059,12 @@ impl AegisRuntimeKernel {
                     .ipc
                     .recv_inbox(&identity.org_id, &identity.agent_id, true, 50)
                     .await?;
-                let escalations = self.policy.list_escalations(&identity.org_id).await?;
+                let all_escalations = self.policy.list_escalations(&identity.org_id).await?;
+                let total_escalations_count = all_escalations.len();
+                let pending_escalations: Vec<_> = all_escalations
+                    .into_iter()
+                    .filter(|e| e.status == aos_core::EscalationStatus::Pending)
+                    .collect();
                 let (claims, _) = self.load_claims(&identity.org_id).await.unwrap_or_default();
                 let vault_status = self.vault.status_org(&identity.org_id).ok();
                 let orphaned = self
@@ -9490,6 +10074,22 @@ impl AegisRuntimeKernel {
                     &self.runtime_data_root,
                 )
                 .and_then(|(_, u, _)| u);
+                let uncommitted_changes = if include_diffs {
+                    serde_json::to_value(&diffs)?
+                } else {
+                    let slim: Vec<SlimFileDiffEntry<'_>> = diffs
+                        .iter()
+                        .map(|d| SlimFileDiffEntry {
+                            relative_path: &d.relative_path,
+                            change_type: &d.change_type,
+                            old_size: d.old_size,
+                            new_size: d.new_size,
+                            old_sha256: d.old_sha256.as_deref(),
+                            new_sha256: d.new_sha256.as_deref(),
+                        })
+                        .collect();
+                    serde_json::to_value(slim)?
+                };
                 Ok(json!({
                     "identity": identity,
                     "workspace_id": aos_core::session::workspace_id_for_path(env.workspace.host_source_root()),
@@ -9500,12 +10100,13 @@ impl AegisRuntimeKernel {
                     "vault": vault_status,
                     "auto_refresh": refresh,
                     "uncommitted_changes_count": diffs.len(),
-                    "uncommitted_changes": diffs,
+                    "uncommitted_changes": uncommitted_changes,
                     "recoverable_orphaned_shadows": orphaned,
                     "active_claims": claims,
                     "snapshots": snapshots,
                     "unread_ipc_messages_count": unread_ipc.len(),
-                    "pending_escalations": escalations
+                    "pending_escalations": pending_escalations,
+                    "total_escalations_count": total_escalations_count
                 }))
             }
 
@@ -9982,12 +10583,54 @@ impl AegisRuntimeKernel {
 
             "pkg_install" => {
                 let plan = pre_pkg_install_plan.context("Missing pre-validated pkg_install plan")?;
-                execute_pkg_install(identity, plan).await
+                match execute_pkg_install(identity, plan).await {
+                    Ok(val) => {
+                        if val.get("status").and_then(|v| v.as_str()) == Some("pkg_install_failed") {
+                            let exit_code = val
+                                .get("exit_code")
+                                .and_then(|v| v.as_i64())
+                                .map(|c| c as i32);
+                            self.record_kernel_friction(
+                                aos_core::friction::FrictionCategory::PkgInstallFailed,
+                                aos_core::friction::CmdBucket::PkgInstall,
+                                Some("mcp_gateway"),
+                                exit_code,
+                                1,
+                                false,
+                            );
+                        }
+                        Ok(val)
+                    }
+                    Err(err) => {
+                        self.record_kernel_friction(
+                            aos_core::friction::FrictionCategory::PkgInstallFailed,
+                            aos_core::friction::CmdBucket::PkgInstall,
+                            Some("mcp_gateway"),
+                            None,
+                            1,
+                            false,
+                        );
+                        Err(err)
+                    }
+                }
             }
 
             "host_exec" => {
                 let plan = pre_host_exec_plan.context("Missing pre-validated host_exec plan")?;
-                self.execute_host_exec(&env, plan).await
+                match self.execute_host_exec(&env, plan).await {
+                    Ok(val) => Ok(val),
+                    Err(err) => {
+                        self.record_kernel_friction(
+                            aos_core::friction::FrictionCategory::HostExecDenied,
+                            aos_core::friction::CmdBucket::HostExec,
+                            Some("mcp_gateway"),
+                            None,
+                            1,
+                            false,
+                        );
+                        Err(err)
+                    }
+                }
             }
 
             // ----------------------------------------------------------------
@@ -10000,8 +10643,25 @@ impl AegisRuntimeKernel {
                     let out_path = bg_dir.join(format!("{}.stdout.log", pid));
                     let err_path = bg_dir.join(format!("{}.stderr.log", pid));
                     let exit_path = bg_dir.join(format!("{}.exit", pid));
-                    let stdout = tokio::fs::read_to_string(&out_path).await.unwrap_or_default();
-                    let stderr = tokio::fs::read_to_string(&err_path).await.unwrap_or_default();
+                    let out_bytes = tokio::fs::read(&out_path).await.unwrap_or_default();
+                    let err_bytes = tokio::fs::read(&err_path).await.unwrap_or_default();
+                    let tail_bytes = args
+                        .get("tail_bytes")
+                        .and_then(|v| v.as_u64())
+                        .map(|n| usize::try_from(n).unwrap_or(usize::MAX).min(262_144))
+                        .unwrap_or(32_768);
+                    let stdout_offset = args
+                        .get("stdout_offset")
+                        .and_then(|v| v.as_u64())
+                        .map(|n| usize::try_from(n).unwrap_or(usize::MAX));
+                    let stderr_offset = args
+                        .get("stderr_offset")
+                        .and_then(|v| v.as_u64())
+                        .map(|n| usize::try_from(n).unwrap_or(usize::MAX));
+                    let (stdout, stdout_total_bytes, stdout_truncated, stdout_offset_returned) =
+                        Self::slice_poll_log_bytes(&out_bytes, stdout_offset, tail_bytes);
+                    let (stderr, stderr_total_bytes, stderr_truncated, stderr_offset_returned) =
+                        Self::slice_poll_log_bytes(&err_bytes, stderr_offset, tail_bytes);
                     let recorded_exit = tokio::fs::read_to_string(&exit_path)
                         .await
                         .ok()
@@ -10029,6 +10689,12 @@ impl AegisRuntimeKernel {
                         "exit_status": exit_status,
                         "stdout": stdout,
                         "stderr": stderr,
+                        "stdout_total_bytes": stdout_total_bytes,
+                        "stderr_total_bytes": stderr_total_bytes,
+                        "stdout_truncated": stdout_truncated,
+                        "stderr_truncated": stderr_truncated,
+                        "stdout_offset_returned": stdout_offset_returned,
+                        "stderr_offset_returned": stderr_offset_returned,
                         "sandbox_profile_used": "background-job-poll"
                     }));
                 }
@@ -10065,18 +10731,65 @@ impl AegisRuntimeKernel {
                     );
                 }
 
-                let out = env
+                let exec_res = env
                     .sandbox
                     .exec(ExecSpec {
-                        command,
-                        args: cmd_args,
+                        command: command.clone(),
+                        args: cmd_args.clone(),
                         cwd,
                         env: exec_env,
                         timeout_ms: args.get("timeout_ms").and_then(|v| v.as_u64()),
                         background,
                     })
-                    .await?;
+                    .await;
+                let out = match exec_res {
+                    Ok(out) => out,
+                    Err(e) => {
+                        let err_str = e.to_string();
+                        let timed_out = err_str.to_ascii_lowercase().contains("timed out");
+                        if !background {
+                            if let Some((cat, hint, _streak)) = self
+                                .update_proc_exec_friction(
+                                    &identity.agent_id,
+                                    &command,
+                                    &cmd_args,
+                                    None,
+                                    timed_out,
+                                    "",
+                                    &err_str,
+                                )
+                                .await
+                            {
+                                bail!("{err_str}\n[aegis_hint ({})]: {hint}", cat.as_str());
+                            }
+                        }
+                        return Err(e);
+                    }
+                };
+                let diag = if !background {
+                    self.update_proc_exec_friction(
+                        &identity.agent_id,
+                        &command,
+                        &cmd_args,
+                        out.exit_code,
+                        false,
+                        &out.stdout,
+                        &out.stderr,
+                    )
+                    .await
+                } else {
+                    None
+                };
                 let mut out_val = serde_json::to_value(out)?;
+                if let Some((cat, hint, streak)) = diag {
+                    if let Some(obj) = out_val.as_object_mut() {
+                        obj.insert("friction_category".to_string(), json!(cat.as_str()));
+                        obj.insert("aegis_hint".to_string(), json!(hint));
+                        if streak >= 2 {
+                            obj.insert("friction_streak".to_string(), json!(streak));
+                        }
+                    }
+                }
                 let active_ports = env.sandbox.allocated_loopback_ports();
                 if !active_ports.is_empty() {
                     if let Some(obj) = out_val.as_object_mut() {
@@ -10799,124 +11512,20 @@ impl AegisRuntimeKernel {
             }
 
             "egress_http_request" => {
-                let target_domain = args
-                    .get("target_domain")
-                    .and_then(|v| v.as_str())
-                    .context("Missing 'target_domain'")?
-                    .to_string();
-                let method = args
-                    .get("method")
-                    .and_then(|v| v.as_str())
-                    .unwrap_or("GET")
-                    .to_string();
-                let path = args
-                    .get("path")
-                    .and_then(|v| v.as_str())
-                    .unwrap_or("/")
-                    .to_string();
-                let headers: HashMap<String, String> = args
-                    .get("headers")
-                    .and_then(|v| serde_json::from_value(v.clone()).ok())
-                    .unwrap_or_default();
-                let body = args.get("body").and_then(|v| v.as_str());
-
-                let spec = aos_egress::OutboundRequestSpec {
-                    target_domain: target_domain.clone(),
-                    method: method.clone(),
-                    path: path.clone(),
-                    headers: headers.clone(),
-                };
-                let verdict = self
-                    .egress
-                    .inspect_and_inject_with_body(identity, &spec, body)
-                    .await?;
-                match &verdict {
-                    aos_egress::EgressVerdict::RequiresEscalation { domain, reason } => {
-                        let esc_decision = self
-                            .authorize_and_audit(
-                                identity,
-                                "egress_unlisted_domain",
-                                &identity.org_id,
-                                domain,
-                                json!({
-                                    "target_domain": domain,
-                                    "method": method,
-                                    "path": path,
-                                    "reason": reason,
-                                    "evidence": {
-                                        "domain": domain,
-                                        "method": method,
-                                        "path": path,
-                                    }
-                                }),
-                            )
-                            .await?;
-                        match esc_decision {
-                            PolicyDecision::Allow { .. } => {
-                                return Ok(serde_json::to_value(
-                                    aos_egress::EgressVerdict::AllowedAndSanitized {
-                                        injected_headers: headers,
-                                        injected_path: path,
-                                        secrets_injected: Vec::new(),
-                                    },
-                                )?);
-                            }
-                            PolicyDecision::Ask {
-                                escalation_id,
-                                reason: esc_reason,
-                                suggested_lease_scope,
-                            } => {
-                                let mut out = serde_json::to_value(&verdict)?;
-                                if let Some(obj) = out.as_object_mut() {
-                                    obj.insert(
-                                        "status".to_string(),
-                                        json!("approval_required"),
-                                    );
-                                    obj.insert("escalation_id".to_string(), json!(escalation_id));
-                                    obj.insert("reason".to_string(), json!(esc_reason));
-                                    obj.insert(
-                                        "suggested_lease_scope".to_string(),
-                                        json!(suggested_lease_scope),
-                                    );
-                                }
-                                return Ok(out);
-                            }
-                            PolicyDecision::Deny { reason: deny_reason } => {
-                                bail!("Policy Denied egress to '{}': {}", domain, deny_reason);
-                            }
-                        }
+                match self.execute_egress_http_request(identity, &args).await {
+                    Ok(val) => Ok(val),
+                    Err(err) => {
+                        self.record_kernel_friction(
+                            aos_core::friction::FrictionCategory::EgressDenied,
+                            aos_core::friction::CmdBucket::Egress,
+                            Some("mcp_gateway"),
+                            None,
+                            1,
+                            false,
+                        );
+                        Err(err)
                     }
-                    aos_egress::EgressVerdict::BlockedSecretExfiltration {
-                        placeholder,
-                        unauthorized_domain,
-                    } => {
-                        let _ = self
-                            .recorder
-                            .record(AuditEvent {
-                                event_id: format!("evt-{}", &Uuid::new_v4().to_string()[..8]),
-                                timestamp_ms: Utc::now().timestamp_millis(),
-                                org_id: identity.org_id.clone(),
-                                agent_id: identity.agent_id.clone(),
-                                action: "egress_dlp_block".to_string(),
-                                resource: target_domain.clone(),
-                                policy_decision: format!("deny:dlp:{}", placeholder),
-                                snapshot_id: None,
-                                details: json!({
-                                    "target_domain": target_domain,
-                                    "method": method,
-                                    "path": path,
-                                    "placeholder": placeholder,
-                                    "unauthorized_domain": unauthorized_domain,
-                                }),
-                                task_id: self.active_task_id(identity).await,
-                                prev_hash: None,
-                                event_hash: None,
-                            })
-                            .await;
-                    }
-                    aos_egress::EgressVerdict::AllowedAndSanitized { .. } => {}
                 }
-                Ok(serde_json::to_value(verdict)?)
             }
 
             // ----------------------------------------------------------------
@@ -11209,7 +11818,15 @@ impl AegisRuntimeKernel {
                 {
                     "name": "workspace_status",
                     "description": "[Zero-Prompt] Get full status of the CoW shadow workspace, snapshots, unread IPC messages, and pending escalations.",
-                    "inputSchema": { "type": "object", "properties": {} }
+                    "inputSchema": {
+                        "type": "object",
+                        "properties": {
+                            "include_diffs": {
+                                "type": "boolean",
+                                "description": "Include full `preview_diff` patch text in `uncommitted_changes` (default false to keep responses compact; paths, change types, sizes, and SHA-256 digests are always included)."
+                            }
+                        }
+                    }
                 },
                 {
                     "name": "workspace_sync",
@@ -11666,7 +12283,7 @@ impl AegisRuntimeKernel {
                 },
                 {
                     "name": "proc_exec",
-                    "description": "[Zero-Prompt] PREFERRED over native shell tools (run_command/Bash): execute a command (e.g. `sh -c \"grep -rn foo crates | head\"`, `cargo test`) kernel-confined inside the Agent's OS sandbox. cwd = your CoW shadow workspace (with host `node_modules`/`.venv` auto-linked read-only); writes stay in the shadow until workspace_commit. Isolated 127.0.0.1 dev ports are exposed via `$AOS_DEV_PORT` and `$AOS_LOOPBACK_PORTS` (pass `loopback_ports` to reserve extra ports). For long-running tasks (>2m, e.g. online LLM benchmarks), pass `background: true` and poll status/output with `poll_pid`.",
+                    "description": "[Zero-Prompt] PREFERRED over native shell tools (run_command/Bash): execute a command (e.g. `sh -c \"grep -rn foo crates | head\"`, `cargo test`) kernel-confined inside the Agent's OS sandbox. Sandbox facts: (1) NO outbound internet (`curl`/`wget` fail — use `egress_http_request` for HTTP/HTTPS and `pkg_install` for packages); (2) on macOS Seatbelt host `/tmp` and `/private/tmp` are denied — always use `$TMPDIR` (writable, pre-created inside agent home); (3) avoid broad root scans like `find /` (use `which` or workspace paths); (4) pass `background: true` and poll `poll_pid` for tasks >30s. cwd = your CoW shadow workspace (host `node_modules`/`.venv` auto-linked read-only); writes stay in shadow until `workspace_commit`. Isolated 127.0.0.1 ports are exposed via `$AOS_DEV_PORT` and `$AOS_LOOPBACK_PORTS` (`loopback_ports`).",
                     "inputSchema": {
                         "type": "object",
                         "properties": {
@@ -11676,6 +12293,22 @@ impl AegisRuntimeKernel {
                             "timeout_ms": { "type": "integer" },
                             "background": { "type": "boolean" },
                             "poll_pid": { "type": "integer" },
+                            "stdout_offset": {
+                                "type": "integer",
+                                "minimum": 0,
+                                "description": "Optional byte offset into stdout when polling a background job with `poll_pid`."
+                            },
+                            "stderr_offset": {
+                                "type": "integer",
+                                "minimum": 0,
+                                "description": "Optional byte offset into stderr when polling a background job with `poll_pid`."
+                            },
+                            "tail_bytes": {
+                                "type": "integer",
+                                "minimum": 0,
+                                "maximum": 262144,
+                                "description": "Maximum bytes of stdout/stderr to return when polling `poll_pid` (default 32768, max 262144; returns trailing bytes unless offset is set)."
+                            },
                             "loopback_ports": {
                                 "type": "integer",
                                 "description": "Optional count of isolated 127.0.0.1 loopback ports (0..=8) to allocate for local dev/mock servers (exposed via $AOS_DEV_PORT and $AOS_LOOPBACK_PORTS)."
@@ -12044,16 +12677,19 @@ impl AegisRuntimeKernel {
                 },
                 {
                     "name": "egress_http_request",
-                    "description": "[Boundary-Sanitized] Inspect an outbound HTTP request against the Organization domain allowlist and inject secret vault placeholders at the boundary.",
+                    "description": "[Boundary-Sanitized Host Proxy] Execute an approved outbound HTTP/HTTPS request from the host broker (since `proc_exec` has no internet). Supports full `url` (defaults `execute: true`) or legacy `target_domain`/`path` inspection (`execute: false`). Applies Org domain allowlists, Vault secret injection, and response DLP redaction.",
                     "inputSchema": {
                         "type": "object",
                         "properties": {
-                            "target_domain": { "type": "string" },
-                            "method": { "type": "string" },
-                            "path": { "type": "string" },
-                            "headers": { "type": "object" }
-                        },
-                        "required": ["target_domain"]
+                            "url": { "type": "string", "description": "Full https:// (or allowed loopback http://) URL to fetch. Setting `url` defaults `execute` to true." },
+                            "target_domain": { "type": "string", "description": "Legacy/inspection domain if `url` is omitted." },
+                            "method": { "type": "string", "description": "HTTP method (GET, POST, PUT, PATCH, DELETE, HEAD). Defaults to GET." },
+                            "path": { "type": "string", "description": "Path + query when using `target_domain` without `url`." },
+                            "headers": { "type": "object" },
+                            "body": { "type": "string", "description": "Optional request body string (e.g., JSON-RPC payload)." },
+                            "execute": { "type": "boolean", "description": "Forward upstream over HTTP/HTTPS (default true when `url` is passed, false for legacy `target_domain`-only checks)." },
+                            "timeout_ms": { "type": "integer", "description": "Request timeout in ms (1000..=60000, default 15000)." }
+                        }
                     }
                 },
                 {
@@ -12202,6 +12838,17 @@ impl AegisRuntimeKernel {
         .await
     }
 
+/// Concise operational instructions returned in the MCP `initialize` result so every client
+/// knows Aegis OS sandbox boundaries from handshake before attempting failing shell commands.
+pub const MCP_SERVER_INSTRUCTIONS: &str = concat!(
+    "Aegis OS Runtime (MCP-First, Kernel-Sandboxed):\n",
+    "- Repo edits & builds: use `fs_read`/`fs_write`/`fs_edit`/`fs_glob` + `proc_exec` (writes stay in CoW shadow until `workspace_commit` or `workspace_git`).\n",
+    "- Outbound network: `proc_exec` has NO internet (`curl`/`wget`/network fail); use `egress_http_request` (`url` defaults `execute: true`) for HTTP/HTTPS and `pkg_install` for packages.\n",
+    "- Temp files on macOS: host `/tmp` and `/private/tmp` are read-only in Seatbelt; always use `$TMPDIR` (`<agent_home>/tmp`).\n",
+    "- Host visibility: Seatbelt (`tighten_home_read`) hides host `$HOME` paths outside the active workspace (e.g. `~/Library`, `~/.aegis`, sibling repos); use `host_exec` or ask the user for host-wide diagnostics (`tmutil`, `diskutil`, `du ~/Library`).\n",
+    "- Long tasks & scans: never run `find /` or synchronous `du` across large `target/`/`node_modules/` dirs (especially `du ... | sort`, which buffers stdout); scope searches to workspace subdirs and pass `\"background\": true` + `\"poll_pid\"` for tasks >30s. Read `aegis_hint` on errors."
+);
+
     pub async fn handle_jsonrpc_message_with_profile(
         &self,
         identity: &AgentIdentity,
@@ -12224,7 +12871,8 @@ impl AegisRuntimeKernel {
                     "capabilities": {
                         "tools": { "listChanged": true },
                         "resources": { "subscribe": true, "listChanged": true }
-                    }
+                    },
+                    "instructions": Self::MCP_SERVER_INSTRUCTIONS
                 }
             }),
             "tools/list" => {
@@ -13515,6 +14163,38 @@ impl AegisRuntimeKernel {
                                 .to_string(),
                             )
                         }
+                    } else if method == "POST" && route_path(full_target) == "/v1/telemetry/friction" {
+                        if body_str.len() > 16 * 1024 {
+                            (
+                                "HTTP/1.1 413 Payload Too Large",
+                                json!({ "error": "Friction payload exceeds 16 KiB limit" }).to_string(),
+                            )
+                        } else {
+                            let Ok(payload) =
+                                serde_json::from_str::<paas::FrictionReportPayload>(body_str.trim())
+                            else {
+                                let body =
+                                    json!({ "error": "Invalid friction telemetry JSON payload" })
+                                        .to_string();
+                                let resp = format!(
+                                    "HTTP/1.1 400 Bad Request\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                                    body.len(),
+                                    body
+                                );
+                                let _ = stream.write_all(resp.as_bytes()).await;
+                                return;
+                            };
+                            match k.paas.record_friction_report(&payload).await {
+                                Ok(val) => ("HTTP/1.1 200 OK", val.to_string()),
+                                Err(e) => (
+                                    "HTTP/1.1 400 Bad Request",
+                                    json!({ "error": e.to_string() }).to_string(),
+                                ),
+                            }
+                        }
+                    } else if method == "GET" && route_path(full_target) == "/v1/telemetry/friction/stats" {
+                        let stats = k.paas.get_friction_stats().await;
+                        ("HTTP/1.1 200 OK", stats.to_string())
                     } else if method == "POST" && full_target.starts_with("/v1/telemetry/ping") {
                         let Ok(payload) =
                             serde_json::from_str::<paas::TelemetryPingPayload>(body_str.trim())
@@ -21148,9 +21828,8 @@ time.sleep(60)
     #[tokio::test]
     async fn option_b_install_and_hot_bridge_emit_list_changed_notifications() {
         use tokio::io::{AsyncReadExt, AsyncWriteExt};
-        use tokio::net::TcpListener;
 
-        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let mcp_addr = listener.local_addr().unwrap();
         tokio::spawn(async move {
             loop {
@@ -21407,9 +22086,8 @@ time.sleep(60)
     #[tokio::test]
     async fn agent_request_install_rejects_local_http_before_probing_loopback() {
         use std::sync::atomic::{AtomicUsize, Ordering as AtomicOrd};
-        use tokio::net::TcpListener;
 
-        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
         let hits = Arc::new(AtomicUsize::new(0));
         let hits_srv = hits.clone();
@@ -21456,7 +22134,6 @@ time.sleep(60)
     #[tokio::test]
     async fn agent_bundle_install_pins_manifest_sha256_and_clamps_untrusted_policy() {
         use tokio::io::{AsyncReadExt, AsyncWriteExt};
-        use tokio::net::TcpListener;
 
         let valid_bundle = json!({
             "schema": "aegis-mcp-bundle/v1",
@@ -21492,7 +22169,7 @@ time.sleep(60)
         let db_srv = default_body.clone();
         let qb_srv = queue_bodies.clone();
 
-        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let b_addr = listener.local_addr().unwrap();
         tokio::spawn(async move {
             while let Ok((mut s, _)) = listener.accept().await {
@@ -21645,5 +22322,879 @@ time.sleep(60)
         let global = rx.try_recv().unwrap();
         assert!(global.matches_identity("org-a", "agent-1"));
         assert!(global.matches_identity("org-b", "agent-9"));
+    }
+
+    fn next_test_loopback_bind_candidates() -> Vec<String> {
+        static NEXT_IDX: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+        let mut candidates = Vec::new();
+        if let Ok(raw) = std::env::var("AOS_LOOPBACK_PORTS") {
+            let ports: Vec<u16> = raw
+                .split(',')
+                .filter_map(|p| p.trim().parse::<u16>().ok())
+                .filter(|p| *p > 0)
+                .collect();
+            if !ports.is_empty() {
+                let start = NEXT_IDX.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                for offset in 0..ports.len() {
+                    let port = ports[(start + offset) % ports.len()];
+                    candidates.push(format!("127.0.0.1:{port}"));
+                }
+            }
+        }
+        candidates.push("127.0.0.1:0".to_string());
+        candidates
+    }
+
+    async fn bind_test_loopback_listener() -> tokio::net::TcpListener {
+        let mut last_err = None;
+        for cand in next_test_loopback_bind_candidates() {
+            match tokio::net::TcpListener::bind(&cand).await {
+                Ok(listener) => return listener,
+                Err(e) => last_err = Some(e),
+            }
+        }
+        panic!(
+            "failed to bind test loopback listener: {:?}",
+            last_err
+        );
+    }
+
+    async fn start_test_http_daemon(
+        kernel: Arc<AegisRuntimeKernel>,
+        repo: PathBuf,
+    ) -> std::net::SocketAddr {
+        let mut last_err = None;
+        for cand in next_test_loopback_bind_candidates() {
+            match kernel.clone().start_http_daemon(&cand, repo.clone()).await {
+                Ok(addr) => return addr,
+                Err(e) => last_err = Some(e),
+            }
+        }
+        panic!(
+            "failed to start test http daemon: {:?}",
+            last_err
+        );
+    }
+
+    #[tokio::test]
+    async fn egress_http_request_forwards_real_http_redacts_dlp_and_preserves_legacy_inspect() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let seen_requests = Arc::new(tokio::sync::Mutex::new(Vec::<String>::new()));
+        let seen_srv = seen_requests.clone();
+        let listener = bind_test_loopback_listener().await;
+        let upstream_addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            while let Ok((mut s, _)) = listener.accept().await {
+                let seen = seen_srv.clone();
+                tokio::spawn(async move {
+                    let mut buf = [0u8; 4096];
+                    let n = s.read(&mut buf).await.unwrap_or(0);
+                    seen.lock()
+                        .await
+                        .push(String::from_utf8_lossy(&buf[..n]).to_string());
+                    let body =
+                        r#"{"echo_ok":true,"leaked_token":"ghp_abcdefghijklmnopqrstuvwxyz1234567890"}"#;
+                    let resp = format!(
+                        "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nSet-Cookie: session=secret\r\nConnection: close\r\n\r\n{}",
+                        body.len(),
+                        body
+                    );
+                    let _ = s.write_all(resp.as_bytes()).await;
+                });
+            }
+        });
+
+        let tmp = tempfile::tempdir().unwrap();
+        let repo = tmp.path().join("repo");
+        std::fs::create_dir_all(&repo).unwrap();
+        let kernel = AegisRuntimeKernel::new(&tmp.path().join("rt")).await.unwrap();
+        let agent = AgentIdentity::new("acme", "coder-egress", "Engineer");
+        kernel
+            .ensure_agent_environment(
+                agent.clone(),
+                &repo,
+                aos_core::IsolationTier::NativeOsSandbox,
+                vec!["*".to_string()],
+            )
+            .await
+            .unwrap();
+        kernel
+            .egress
+            .allow_domains("acme", vec!["api.example.com".to_string()])
+            .await;
+        let real_secret = "ghp_1234567890abcdef1234567890abcdef1234";
+        kernel
+            .egress
+            .register_secret(aos_egress::SecretVaultEntry {
+                org_id: "acme".to_string(),
+                placeholder: "$AOS_SECRET_TEST".to_string(),
+                real_secret_value: real_secret.to_string(),
+                allowed_domains: vec!["api.example.com".to_string()],
+            })
+            .await;
+        kernel
+            .egress
+            .set_upstream_override("api.example.com", &upstream_addr.to_string(), false)
+            .await;
+
+        // 1. Passing `url` defaults `execute = true`, injects secret upstream, redacts DLP & Set-Cookie on response, and never leaks `injected_headers`.
+        let exec_res = kernel
+            .call_tool(
+                &agent,
+                "egress_http_request",
+                json!({
+                    "url": "https://api.example.com/v1/test?mode=rpc",
+                    "method": "POST",
+                    "headers": {
+                        "Authorization": "Bearer $AOS_SECRET_TEST",
+                        "X-Custom": "alpha"
+                    },
+                    "body": "{\"ok\":true}"
+                }),
+            )
+            .await
+            .unwrap();
+        assert_eq!(exec_res["executed"], true);
+        assert_eq!(exec_res["status_code"], 200);
+        assert!(exec_res.get("injected_headers").is_none());
+        let exec_dump = exec_res.to_string();
+        assert!(!exec_dump.contains(real_secret), "raw vault secret must never return to agent");
+        assert!(
+            !exec_dump.contains("ghp_abcdefghijklmnopqrstuvwxyz1234567890"),
+            "response secret token must be DLP-redacted: {exec_dump}"
+        );
+        assert!(
+            exec_res["headers"].get("set-cookie").is_none()
+                && exec_res["headers"].get("Set-Cookie").is_none(),
+            "Set-Cookie must be stripped from response headers"
+        );
+        {
+            let recorded = seen_requests.lock().await;
+            assert_eq!(recorded.len(), 1);
+            assert!(recorded[0].contains("POST /v1/test?mode=rpc HTTP/1.1"));
+            assert!(recorded[0].contains(real_secret));
+        }
+
+        // 2. Legacy `target_domain`-only invocation stays non-executing (`AllowedAndSanitized`).
+        let inspect_res = kernel
+            .call_tool(
+                &agent,
+                "egress_http_request",
+                json!({
+                    "target_domain": "api.example.com",
+                    "method": "GET",
+                    "path": "/v1/check"
+                }),
+            )
+            .await
+            .unwrap();
+        assert!(inspect_res.get("AllowedAndSanitized").is_some(), "{inspect_res}");
+        assert_eq!(seen_requests.lock().await.len(), 1);
+
+        // 3. Invalid HTTP method (CRLF / smuggling) is rejected before network I/O.
+        let bad_method = kernel
+            .call_tool(
+                &agent,
+                "egress_http_request",
+                json!({
+                    "url": "https://api.example.com/v1/test",
+                    "method": "GET\r\nEvil: 1"
+                }),
+            )
+            .await;
+        assert!(bad_method.is_err());
+
+        // 4. Unlisted domain with `url` escalates (`approval_required`) without hitting network.
+        let unlisted = kernel
+            .call_tool(
+                &agent,
+                "egress_http_request",
+                json!({
+                    "url": "https://unlisted.example.org/foo",
+                    "method": "GET"
+                }),
+            )
+            .await
+            .unwrap();
+        assert_eq!(unlisted["status"], "approval_required");
+        assert_eq!(seen_requests.lock().await.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn proc_exec_emits_aegis_hint_and_loop_thrash_friction_events() {
+        let tmp = tempfile::tempdir().unwrap();
+        let rt_dir = tmp.path().join("rt");
+        let repo = tmp.path().join("repo");
+        std::fs::create_dir_all(&rt_dir).unwrap();
+        std::fs::create_dir_all(&repo).unwrap();
+
+        let kernel = AegisRuntimeKernel::new(&rt_dir).await.unwrap();
+        let agent = AgentIdentity::new("acme", "coder-friction", "Engineer");
+        kernel
+            .ensure_agent_environment(
+                agent.clone(),
+                &repo,
+                aos_core::IsolationTier::NativeOsSandbox,
+                vec!["*".to_string()],
+            )
+            .await
+            .unwrap();
+
+        // 1. Simulated `/tmp` permission denial triggers `tmp_denied` + `$TMPDIR` hint.
+        let tmp_err = kernel
+            .call_tool(
+                &agent,
+                "proc_exec",
+                json!({
+                    "command": "sh",
+                    "args": ["-c", "echo 'mkdir: /tmp/probe-secret: Operation not permitted' >&2; exit 1"]
+                }),
+            )
+            .await
+            .unwrap();
+        assert_eq!(tmp_err["friction_category"], "tmp_denied");
+        assert!(tmp_err["aegis_hint"].as_str().unwrap().contains("$TMPDIR"));
+
+        // 2. Simulated curl network block triggers `network_blocked` + `egress_http_request` hint.
+        let net_err = kernel
+            .call_tool(
+                &agent,
+                "proc_exec",
+                json!({
+                    "command": "sh",
+                    "args": ["-c", "echo 'curl: (6) Could not resolve host: secret.example.com' >&2; exit 6"]
+                }),
+            )
+            .await
+            .unwrap();
+        assert_eq!(net_err["friction_category"], "network_blocked");
+        assert!(net_err["aegis_hint"]
+            .as_str()
+            .unwrap()
+            .contains("egress_http_request"));
+
+        // 3. Three consecutive failures in `shell_script` trigger `loop_thrash`, then `exit 0` recovers.
+        for i in 1..=3 {
+            let res = kernel
+                .call_tool(
+                    &agent,
+                    "proc_exec",
+                    json!({ "command": "sh", "args": ["-c", "exit 1"] }),
+                )
+                .await
+                .unwrap();
+            if i < 3 {
+                assert!(
+                    res.get("friction_category").is_none(),
+                    "attempt {i} unexpectedly emitted friction_category: {res}"
+                );
+            } else {
+                assert_eq!(res["friction_category"], "loop_thrash");
+                assert_eq!(res["friction_streak"], 3);
+                assert!(!res["aegis_hint"].as_str().unwrap().is_empty());
+            }
+        }
+        let recovered = kernel
+            .call_tool(
+                &agent,
+                "proc_exec",
+                json!({ "command": "sh", "args": ["-c", "exit 0"] }),
+            )
+            .await
+            .unwrap();
+        assert_eq!(recovered["exit_code"], 0);
+
+        if !aos_core::friction::is_telemetry_opted_out() {
+            let log_txt = std::fs::read_to_string(kernel.friction_log_path()).unwrap();
+            assert!(log_txt.contains("tmp_denied"));
+            assert!(log_txt.contains("network_blocked"));
+            assert!(log_txt.contains("loop_thrash"));
+            assert!(!log_txt.contains("secret.example.com"));
+            assert!(!log_txt.contains("probe-secret"));
+        }
+    }
+
+    #[tokio::test]
+    async fn friction_telemetry_routes_enforce_operator_auth_size_cap_and_dashboard_panel() {
+        let tmp = tempfile::tempdir().unwrap();
+        let rt_dir = tmp.path().join("rt");
+        let repo = tmp.path().join("repo");
+        std::fs::create_dir_all(&rt_dir).unwrap();
+        std::fs::create_dir_all(&repo).unwrap();
+
+        let kernel = Arc::new(AegisRuntimeKernel::new(&rt_dir).await.unwrap());
+        let addr = start_test_http_daemon(kernel.clone(), repo).await;
+        let op = kernel.operator_token();
+        let (tenant_key, _) = kernel
+            .paas
+            .issue_api_key("acme", "coder-web", "Engineer", None, "test-web")
+            .await
+            .unwrap();
+
+        // 1. Dashboard serves the bilingual operator-only Friction panel HTML & JS endpoint.
+        let (dash_head, dash_body) = raw_http(addr, "GET", "/dashboard", None, None).await;
+        assert!(dash_head.contains("200 OK"), "{dash_head}");
+        let html = dash_body["html"].as_str().unwrap_or("");
+        assert!(html.contains("id=\"friction-panel\""), "missing #friction-panel");
+        assert!(
+            html.contains("/v1/telemetry/friction/stats"),
+            "missing stats endpoint fetch"
+        );
+
+        // 2. Public POST /v1/telemetry/friction accepts zero-PII aggregate payloads & drops rogue PII keys.
+        let (post_head, post_body) = raw_http(
+            addr,
+            "POST",
+            "/v1/telemetry/friction",
+            None,
+            Some(json!({
+                "schema_version": 1,
+                "device_token": "dev-abcdef-123456",
+                "version": env!("CARGO_PKG_VERSION"),
+                "os": "macos",
+                "arch": "aarch64",
+                "client": "claude_code",
+                "window_days": 30,
+                "total_events": 3,
+                "recovered_events": 2,
+                "max_streak_seen": 2,
+                "by_category": {
+                    "network_blocked": 3,
+                    "/Users/alice/secret.rs": 99
+                },
+                "by_cmd_bucket": {
+                    "http_client": 3
+                }
+            })),
+        )
+        .await;
+        assert!(post_head.contains("200 OK"), "{post_head} {post_body}");
+        assert_eq!(post_body["accepted"], true);
+
+        // 3. Oversized (>16 KiB) POST /v1/telemetry/friction is rejected with 413 Payload Too Large.
+        let (big_head, _) = raw_http(
+            addr,
+            "POST",
+            "/v1/telemetry/friction",
+            None,
+            Some(json!({
+                "version": "0.12.3",
+                "device_token": "x".repeat(17 * 1024)
+            })),
+        )
+        .await;
+        assert!(big_head.contains("413"), "{big_head}");
+
+        // 4. GET /v1/telemetry/friction/stats is strictly operator-only (401 anon, 403 tenant, 200 operator).
+        let (anon_head, _) = raw_http(addr, "GET", "/v1/telemetry/friction/stats", None, None).await;
+        assert!(anon_head.contains("401"), "{anon_head}");
+
+        let (tenant_head, _) = raw_http(
+            addr,
+            "GET",
+            "/v1/telemetry/friction/stats",
+            Some(&tenant_key),
+            None,
+        )
+        .await;
+        assert!(tenant_head.contains("403"), "{tenant_head}");
+
+        let (op_head, op_body) =
+            raw_http(addr, "GET", "/v1/telemetry/friction/stats", Some(&op), None).await;
+        assert!(op_head.contains("200 OK"), "{op_head} {op_body}");
+        assert_eq!(op_body["total_reports"], 1);
+        assert_eq!(op_body["total_events"], 3);
+        assert_eq!(op_body["by_category"]["network_blocked"], 3);
+        assert!(op_body["by_category"].get("/Users/alice/secret.rs").is_none());
+    }
+
+    #[tokio::test]
+    async fn mcp_initialize_advertises_runtime_instructions() {
+        let tmp = tempfile::tempdir().unwrap();
+        let kernel = AegisRuntimeKernel::new(&tmp.path().join("rt")).await.unwrap();
+        let agent = AgentIdentity::new("acme", "coder-init", "Engineer");
+
+        let resp = kernel
+            .handle_jsonrpc_message(
+                &agent,
+                json!({
+                    "jsonrpc": "2.0",
+                    "id": 1,
+                    "method": "initialize",
+                    "params": {}
+                }),
+            )
+            .await
+            .unwrap();
+        let instr = resp["result"]["instructions"]
+            .as_str()
+            .expect("MCP initialize result must include instructions");
+        assert!(instr.contains("egress_http_request"), "{instr}");
+        assert!(instr.contains("$TMPDIR"), "{instr}");
+        assert!(instr.contains("host_exec"), "{instr}");
+        assert!(instr.contains("background"), "{instr}");
+    }
+
+    #[tokio::test]
+    async fn workspace_status_filters_approved_escalations_omits_diffs_by_default_and_caps_orphans() {
+        let tmp = tempfile::tempdir().unwrap();
+        let rt_dir = tmp.path().join("rt");
+        let host_proj = tmp.path().join("host_proj");
+        tokio::fs::create_dir_all(&host_proj).await.unwrap();
+        tokio::fs::write(host_proj.join("README.md"), "# Seed\n")
+            .await
+            .unwrap();
+
+        let kernel = AegisRuntimeKernel::new(&rt_dir).await.unwrap();
+        let agent = AgentIdentity::new("org-ws", "coder-ws", "Engineer");
+        kernel
+            .ensure_agent_environment(
+                agent.clone(),
+                &host_proj,
+                IsolationTier::NativeOsSandbox,
+                vec!["*".to_string()],
+            )
+            .await
+            .unwrap();
+
+        // Create two escalations: approve the first, leave the second pending.
+        let ask1 = kernel
+            .call_tool(
+                &agent,
+                "egress_http_request",
+                json!({
+                    "target_domain": "api.approved-ws.example",
+                    "method": "GET",
+                    "path": "/v1/ping"
+                }),
+            )
+            .await
+            .unwrap();
+        assert_eq!(ask1["status"], "approval_required");
+        let esc1 = ask1["escalation_id"].as_str().unwrap().to_string();
+        kernel
+            .policy
+            .approve_escalation(&esc1, 60, "human")
+            .await
+            .unwrap();
+
+        let ask2 = kernel
+            .call_tool(
+                &agent,
+                "egress_http_request",
+                json!({
+                    "target_domain": "api.pending-ws.example",
+                    "method": "GET",
+                    "path": "/v1/ping"
+                }),
+            )
+            .await
+            .unwrap();
+        assert_eq!(ask2["status"], "approval_required");
+        let esc2 = ask2["escalation_id"].as_str().unwrap().to_string();
+
+        // Create an uncommitted file edit in the shadow workspace.
+        kernel
+            .call_tool(
+                &agent,
+                "fs_write",
+                json!({ "path": "note.txt", "content": "hello slim status\n" }),
+            )
+            .await
+            .unwrap();
+
+        // Seed an orphaned dead-agent shadow with 25 modified files to verify cap=20 + total=25.
+        let orphan_upper = rt_dir
+            .join("orgs/org-ws/agents/dead-orphan/cow_workspace/upper_workspace");
+        tokio::fs::create_dir_all(&orphan_upper).await.unwrap();
+        tokio::fs::write(orphan_upper.join("README.md"), "# Seed\n")
+            .await
+            .unwrap();
+        for i in 0..25usize {
+            tokio::fs::write(
+                orphan_upper.join(format!("orphan_{i:02}.txt")),
+                format!("orphan line {i}\n"),
+            )
+            .await
+            .unwrap();
+        }
+
+        // Default workspace_status omits `preview_diff`, keeps only pending escalations, and caps orphan paths.
+        let status = kernel
+            .call_tool(&agent, "workspace_status", json!({}))
+            .await
+            .unwrap();
+        assert_eq!(status["total_escalations_count"], 2);
+        let pending = status["pending_escalations"].as_array().unwrap();
+        assert_eq!(pending.len(), 1, "expected only 1 pending escalation: {status}");
+        assert_eq!(pending[0]["escalation_id"], esc2);
+        assert_eq!(pending[0]["status"], "pending");
+
+        assert_eq!(status["uncommitted_changes_count"], 1);
+        let changes = status["uncommitted_changes"].as_array().unwrap();
+        assert_eq!(changes.len(), 1);
+        assert_eq!(changes[0]["relative_path"], "note.txt");
+        assert!(
+            changes[0].get("preview_diff").is_none(),
+            "preview_diff must be omitted by default: {}",
+            changes[0]
+        );
+        assert!(changes[0].get("new_size").is_some());
+        assert!(changes[0].get("new_sha256").is_some());
+
+        let orphaned = status["recoverable_orphaned_shadows"].as_array().unwrap();
+        assert_eq!(orphaned.len(), 1);
+        assert_eq!(orphaned[0]["agent_id"], "dead-orphan");
+        assert_eq!(orphaned[0]["uncommitted_changes_count"], 25);
+        assert_eq!(orphaned[0]["changed_paths_total"], 25);
+        assert_eq!(orphaned[0]["changed_paths"].as_array().unwrap().len(), 20);
+
+        // Passing `include_diffs: true` restores `preview_diff`.
+        let status_full = kernel
+            .call_tool(&agent, "workspace_status", json!({ "include_diffs": true }))
+            .await
+            .unwrap();
+        let full_changes = status_full["uncommitted_changes"].as_array().unwrap();
+        assert_eq!(full_changes.len(), 1);
+        assert!(
+            full_changes[0]["preview_diff"]
+                .as_str()
+                .unwrap_or("")
+                .contains("hello slim status"),
+            "include_diffs=true must include preview_diff: {}",
+            full_changes[0]
+        );
+    }
+
+    #[tokio::test]
+    async fn proc_exec_poll_pid_supports_tail_bytes_and_byte_offsets() {
+        let tmp = tempfile::tempdir().unwrap();
+        let rt_dir = tmp.path().join("rt");
+        let host_proj = tmp.path().join("host_proj");
+        tokio::fs::create_dir_all(&host_proj).await.unwrap();
+        tokio::fs::write(host_proj.join("README.md"), "# Test\n")
+            .await
+            .unwrap();
+
+        let kernel = AegisRuntimeKernel::new(&rt_dir).await.unwrap();
+        let agent = AgentIdentity::new("org-poll", "agent-poll", "Runner");
+        kernel
+            .ensure_agent_environment(
+                agent.clone(),
+                &host_proj,
+                IsolationTier::NativeOsSandbox,
+                vec!["*".to_string()],
+            )
+            .await
+            .unwrap();
+
+        let start_out = kernel
+            .call_tool(
+                &agent,
+                "proc_exec",
+                json!({
+                    "command": "sh",
+                    "args": [
+                        "-c",
+                        "printf '%0100d%0100d' 1 2; printf '%080d' 7 >&2"
+                    ],
+                    "background": true
+                }),
+            )
+            .await
+            .unwrap();
+        let pid = start_out["pid"].as_u64().expect("expected background pid");
+
+        let mut finished = None;
+        for _ in 0..40 {
+            let poll = kernel
+                .call_tool(&agent, "proc_exec", json!({ "poll_pid": pid }))
+                .await
+                .unwrap();
+            if poll["exit_status"] == "exited"
+                && poll["stdout_total_bytes"] == 200
+                && poll["stderr_total_bytes"] == 80
+            {
+                finished = Some(poll);
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        }
+        let full_poll = finished.expect("background job did not finish with expected byte totals");
+        assert_eq!(full_poll["exit_code"], 0);
+        assert_eq!(full_poll["stdout"].as_str().unwrap().len(), 200);
+        assert_eq!(full_poll["stderr"].as_str().unwrap().len(), 80);
+        assert_eq!(full_poll["stdout_truncated"], false);
+        assert_eq!(full_poll["stderr_truncated"], false);
+        assert_eq!(full_poll["stdout_offset_returned"], 0);
+        assert_eq!(full_poll["stderr_offset_returned"], 0);
+
+        // Tail mode slices the trailing `tail_bytes`.
+        let tail_poll = kernel
+            .call_tool(
+                &agent,
+                "proc_exec",
+                json!({ "poll_pid": pid, "tail_bytes": 50 }),
+            )
+            .await
+            .unwrap();
+        let tail_out = tail_poll["stdout"].as_str().unwrap();
+        let tail_err = tail_poll["stderr"].as_str().unwrap();
+        assert_eq!(tail_out.len(), 50);
+        assert!(tail_out.ends_with('2'));
+        assert_eq!(tail_poll["stdout_total_bytes"], 200);
+        assert_eq!(tail_poll["stdout_truncated"], true);
+        assert_eq!(tail_poll["stdout_offset_returned"], 150);
+        assert_eq!(tail_err.len(), 50);
+        assert!(tail_err.ends_with('7'));
+        assert_eq!(tail_poll["stderr_total_bytes"], 80);
+        assert_eq!(tail_poll["stderr_truncated"], true);
+        assert_eq!(tail_poll["stderr_offset_returned"], 30);
+
+        // Offset mode slices `[offset .. min(len, offset + tail_bytes)]`.
+        let mid_poll = kernel
+            .call_tool(
+                &agent,
+                "proc_exec",
+                json!({
+                    "poll_pid": pid,
+                    "stdout_offset": 90,
+                    "stderr_offset": 20,
+                    "tail_bytes": 40
+                }),
+            )
+            .await
+            .unwrap();
+        let mid_out = mid_poll["stdout"].as_str().unwrap();
+        assert_eq!(mid_out.len(), 40);
+        assert_eq!(mid_out.as_bytes()[9], b'1');
+        assert_eq!(mid_poll["stdout_total_bytes"], 200);
+        assert_eq!(mid_poll["stdout_truncated"], true);
+        assert_eq!(mid_poll["stdout_offset_returned"], 90);
+        assert_eq!(mid_poll["stderr"].as_str().unwrap().len(), 40);
+        assert_eq!(mid_poll["stderr_total_bytes"], 80);
+        assert_eq!(mid_poll["stderr_truncated"], true);
+        assert_eq!(mid_poll["stderr_offset_returned"], 20);
+
+        // Final offset chunk reaching EOF sets `*_truncated` to false.
+        let end_poll = kernel
+            .call_tool(
+                &agent,
+                "proc_exec",
+                json!({
+                    "poll_pid": pid,
+                    "stdout_offset": 170,
+                    "stderr_offset": 50,
+                    "tail_bytes": 40
+                }),
+            )
+            .await
+            .unwrap();
+        assert_eq!(end_poll["stdout"].as_str().unwrap().len(), 30);
+        assert!(end_poll["stdout"].as_str().unwrap().ends_with('2'));
+        assert_eq!(end_poll["stdout_truncated"], false);
+        assert_eq!(end_poll["stdout_offset_returned"], 170);
+        assert_eq!(end_poll["stderr"].as_str().unwrap().len(), 30);
+        assert!(end_poll["stderr"].as_str().unwrap().ends_with('7'));
+        assert_eq!(end_poll["stderr_truncated"], false);
+        assert_eq!(end_poll["stderr_offset_returned"], 50);
+    }
+
+    #[tokio::test]
+    async fn fs_edit_and_boundary_denials_emit_zero_pii_friction_events_and_reset_streaks() {
+        let tmp = tempfile::tempdir().unwrap();
+        let rt_dir = tmp.path().join("rt");
+        let host_proj = tmp.path().join("host_proj");
+        tokio::fs::create_dir_all(&host_proj).await.unwrap();
+        tokio::fs::write(
+            host_proj.join("secret_file.rs"),
+            "pub fn target_ok() -> u32 { 1 }\n",
+        )
+        .await
+        .unwrap();
+
+        let kernel = AegisRuntimeKernel::new(&rt_dir).await.unwrap();
+        let agent = AgentIdentity::new("acme", "coder-probes", "Engineer");
+        kernel
+            .ensure_agent_environment(
+                agent.clone(),
+                &host_proj,
+                IsolationTier::NativeOsSandbox,
+                vec!["*".to_string()],
+            )
+            .await
+            .unwrap();
+
+        let streak_key = (agent.agent_id.clone(), "fs_edit".to_string());
+
+        // 1. Three consecutive fs_edit failures increment streak and trigger LoopThrash at >= 3.
+        for expected_streak in 1..=3u32 {
+            let err = kernel
+                .call_tool(
+                    &agent,
+                    "fs_edit",
+                    json!({
+                        "path": "secret_file.rs",
+                        "target": "NEVER_MATCH_SECRET_SNIPPET",
+                        "replacement": "pub fn x() {}"
+                    }),
+                )
+                .await
+                .unwrap_err()
+                .to_string();
+            assert_eq!(
+                kernel.friction_streaks.read().await.get(&streak_key).copied(),
+                Some(expected_streak)
+            );
+            if expected_streak < 3 {
+                assert!(!err.contains("[aegis_hint (loop_thrash)]"), "{err}");
+            } else {
+                assert!(err.contains("[aegis_hint (loop_thrash)]"), "{err}");
+            }
+        }
+
+        // 2. Successful fs_edit resets the streak cleanly.
+        let edit_ok = kernel
+            .call_tool(
+                &agent,
+                "fs_edit",
+                json!({
+                    "path": "secret_file.rs",
+                    "target": "pub fn target_ok() -> u32 { 1 }",
+                    "replacement": "pub fn target_ok() -> u32 { 2 }"
+                }),
+            )
+            .await
+            .unwrap();
+        assert_eq!(edit_ok["status"], "edited_in_cow_shadow");
+        assert!(
+            kernel.friction_streaks.read().await.get(&streak_key).is_none(),
+            "fs_edit success must reset streak"
+        );
+
+        // 3. Failure after success restarts streak at 1 without immediate LoopThrash.
+        let post_reset_err = kernel
+            .call_tool(
+                &agent,
+                "fs_edit",
+                json!({
+                    "path": "secret_file.rs",
+                    "target": "MISSING_AFTER_RESET",
+                    "replacement": "noop"
+                }),
+            )
+            .await
+            .unwrap_err()
+            .to_string();
+        assert_eq!(
+            kernel.friction_streaks.read().await.get(&streak_key).copied(),
+            Some(1)
+        );
+        assert!(
+            !post_reset_err.contains("[aegis_hint (loop_thrash)]"),
+            "{post_reset_err}"
+        );
+
+        // 4. Egress policy denial (loopback/link-local unlisted target) and SSRF URL rejection emit EgressDenied.
+        assert!(kernel
+            .call_tool(
+                &agent,
+                "egress_http_request",
+                json!({
+                    "target_domain": "127.0.0.1",
+                    "method": "GET",
+                    "path": "/private-token-leak"
+                }),
+            )
+            .await
+            .is_err());
+        assert!(kernel
+            .call_tool(
+                &agent,
+                "egress_http_request",
+                json!({
+                    "url": "http://169.254.169.254/latest/meta-data",
+                    "method": "GET"
+                }),
+            )
+            .await
+            .is_err());
+
+        // 5. pkg_install validation failure & host_exec broker rejection emit their respective categories.
+        assert!(kernel
+            .call_tool(
+                &agent,
+                "pkg_install",
+                json!({ "manager": "npm", "packages": ["https://evil.org/pkg.tgz"], "offline": true }),
+            )
+            .await
+            .is_err());
+        assert!(kernel
+            .call_tool(
+                &agent,
+                "host_exec",
+                json!({ "program": "python3", "script": "scripts/probe.py" }),
+            )
+            .await
+            .is_err());
+
+        if !aos_core::friction::is_telemetry_opted_out() {
+            let log_txt = std::fs::read_to_string(kernel.friction_log_path()).unwrap();
+            assert!(!log_txt.contains("secret_file.rs"));
+            assert!(!log_txt.contains("NEVER_MATCH_SECRET_SNIPPET"));
+            assert!(!log_txt.contains("MISSING_AFTER_RESET"));
+            assert!(!log_txt.contains("169.254.169.254"));
+            assert!(!log_txt.contains("private-token-leak"));
+            assert!(!log_txt.contains("evil.org"));
+
+            let events =
+                aos_core::friction::load_friction_events(&kernel.friction_log_path(), None)
+                    .unwrap();
+            let edit_mismatches: Vec<_> = events
+                .iter()
+                .filter(|e| {
+                    e.category == aos_core::friction::FrictionCategory::EditMismatch
+                        && e.cmd_bucket == aos_core::friction::CmdBucket::FsEdit
+                })
+                .collect();
+            assert_eq!(edit_mismatches.len(), 4);
+            assert_eq!(
+                edit_mismatches
+                    .iter()
+                    .map(|e| e.streak_len)
+                    .collect::<Vec<_>>(),
+                vec![1, 2, 3, 1]
+            );
+            assert!(events.iter().any(|e| {
+                e.category == aos_core::friction::FrictionCategory::LoopThrash
+                    && e.cmd_bucket == aos_core::friction::CmdBucket::FsEdit
+                    && e.streak_len == 3
+                    && !e.recovered
+            }));
+            assert!(events.iter().any(|e| {
+                e.category == aos_core::friction::FrictionCategory::LoopThrash
+                    && e.cmd_bucket == aos_core::friction::CmdBucket::FsEdit
+                    && e.streak_len == 3
+                    && e.recovered
+            }));
+            assert_eq!(
+                events
+                    .iter()
+                    .filter(|e| {
+                        e.category == aos_core::friction::FrictionCategory::EgressDenied
+                            && e.cmd_bucket == aos_core::friction::CmdBucket::Egress
+                    })
+                    .count(),
+                2
+            );
+            assert!(events.iter().any(|e| {
+                e.category == aos_core::friction::FrictionCategory::PkgInstallFailed
+                    && e.cmd_bucket == aos_core::friction::CmdBucket::PkgInstall
+            }));
+            assert!(events.iter().any(|e| {
+                e.category == aos_core::friction::FrictionCategory::HostExecDenied
+                    && e.cmd_bucket == aos_core::friction::CmdBucket::HostExec
+            }));
+        }
     }
 }
