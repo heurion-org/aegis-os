@@ -1141,12 +1141,14 @@ pub fn classify_native_write(path: &Path, repo_root: &Path) -> Route {
     if t.contains("/cow_workspace/")
         || t.contains("/upper_workspace/")
         || t.contains("/.gemini/antigravity-cli/brain/")
-        || t.contains("/agent_home/tmp/")
-        || (t.contains("/.aegis/orgs/") && t.contains("/agents/") && t.contains("/home/tmp/"))
         || (!in_repo
-            && (t.starts_with("/tmp/") || t.starts_with("/private/tmp/"))
-            && !t.contains("/orgs/")
-            && !t.contains("/aegis-os-runtime/"))
+            && (t.contains("/agent_home/tmp/")
+                || (t.contains("/.aegis/orgs/")
+                    && t.contains("/agents/")
+                    && t.contains("/home/tmp/"))
+                || ((t.starts_with("/tmp/") || t.starts_with("/private/tmp/"))
+                    && !t.contains("/orgs/")
+                    && !t.contains("/aegis-os-runtime/"))))
     {
         return Route::Pass;
     }
@@ -1198,6 +1200,273 @@ pub fn classify_native_write(path: &Path, repo_root: &Path) -> Route {
         reason: format!(
             "[Aegis OS routing] Native file writes inside the repository are disabled (they bypass the CoW transaction and are unattributed). Use MCP instead (zero prompts):\n  mcp_aegis-os_fs_write {{\"path\":{rel},\"content\":...}}  or  mcp_aegis-os_fs_edit {{\"path\":{rel},\"target\":...,\"replacement\":...}}\nRead the current version with mcp_aegis-os_fs_read {{\"path\":{rel}}}. Land changes on the host with mcp_aegis-os_workspace_commit when the task is done.",
             rel = json_str(&rel_s)
+        ),
+    }
+}
+
+fn contains_call_ident(text: &str, ident: &str) -> bool {
+    for raw_line in text.lines() {
+        let line = raw_line.trim_start();
+        if line.starts_with('#') {
+            continue;
+        }
+        let mut search_from = 0;
+        while let Some(rel_idx) = line[search_from..].find(ident) {
+            let idx = search_from + rel_idx;
+            let after = idx + ident.len();
+            let prev_ok = idx == 0
+                || !line[..idx]
+                    .chars()
+                    .next_back()
+                    .is_some_and(|c| c.is_ascii_alphanumeric() || c == '_');
+            let next_is_paren = line[after..].trim_start().starts_with('(');
+            if prev_ok && next_is_paren {
+                return true;
+            }
+            search_from = after;
+        }
+    }
+    false
+}
+
+fn has_workflow_orchestration(script: &str) -> bool {
+    ["agent", "parallel", "pipeline", "phase"]
+        .iter()
+        .any(|ident| contains_call_ident(script, ident))
+}
+
+fn read_workflow_script_preview(path: &Path) -> Option<String> {
+    let content = std::fs::read_to_string(path).ok()?;
+    let preview: String = content.chars().take(65_536).collect();
+    Some(preview)
+}
+
+fn resolve_workflow_script_text(
+    script: &str,
+    script_path: &str,
+    shadow_root: &Path,
+    host_root: &Path,
+) -> Option<String> {
+    if !script.trim().is_empty() {
+        return Some(script.to_string());
+    }
+    let trimmed_path = script_path.trim();
+    if trimmed_path.is_empty() {
+        return None;
+    }
+    let candidate = Path::new(trimmed_path);
+    if candidate.is_absolute() {
+        let canon_cand = canonicalize_lossy(candidate);
+        let canon_host = canonicalize_lossy(host_root);
+        if let Ok(rel) = canon_cand.strip_prefix(&canon_host) {
+            if let Some(text) = read_workflow_script_preview(&shadow_root.join(rel)) {
+                return Some(text);
+            }
+        }
+        return read_workflow_script_preview(candidate);
+    }
+    read_workflow_script_preview(&shadow_root.join(candidate))
+        .or_else(|| read_workflow_script_preview(&host_root.join(candidate)))
+}
+
+/// Classify a native `run_workflow` call (`Script` inline or `ScriptPath` file).
+///
+/// Ad-hoc Python scripts and HTTP fetch helpers executed via `run_workflow` bypass `proc_exec`
+/// and `egress_http_request` and trigger raw native permission prompts; only genuine multi-agent
+/// workflow orchestrations (`agent`/`parallel`/`pipeline`/`phase`) cross the host boundary.
+pub fn classify_workflow_script(
+    script: &str,
+    script_path: &str,
+    shadow_root: &Path,
+    host_root: &Path,
+) -> Route {
+    let trimmed_path = script_path.trim();
+    if !trimmed_path.is_empty() {
+        if CREDENTIAL_MARKERS.iter().any(|m| trimmed_path.contains(m)) {
+            return Route::Deny {
+                reason: "Blocked by Aegis OS Ring-0 policy: workflow script path references protected host credential stores.".to_string(),
+            };
+        }
+        if RUNTIME_STATE_MARKERS
+            .iter()
+            .any(|m| trimmed_path.contains(m))
+        {
+            return Route::Deny {
+                reason: "Blocked by Aegis OS Ring-0 policy: workflow script path references protected Aegis OS runtime state files.".to_string(),
+            };
+        }
+    }
+
+    let resolved = resolve_workflow_script_text(script, trimmed_path, shadow_root, host_root);
+    if let Some(ref text) = resolved {
+        if invokes_approval_cli(text) {
+            return Route::Deny {
+                reason: "Blocked by Aegis OS: approving escalations, granting leases, committing workspaces via CLI, and enrolling approvers is done by a human in their own terminal, not inside a workflow script.".to_string(),
+            };
+        }
+        if CREDENTIAL_MARKERS.iter().any(|m| text.contains(m)) {
+            return Route::Deny {
+                reason: "Blocked by Aegis OS Ring-0 policy: workflow script references host credential stores (~/.ssh, ~/.aws, ~/.gnupg, ~/.kube, Keychains, ...).".to_string(),
+            };
+        }
+        if RUNTIME_STATE_MARKERS.iter().any(|m| text.contains(m)) {
+            return Route::Deny {
+                reason: "Blocked by Aegis OS Ring-0 policy: workflow script references protected Aegis OS runtime state files.".to_string(),
+            };
+        }
+
+        if !has_workflow_orchestration(text) {
+            let lower = text.to_ascii_lowercase();
+            let mentions_http = [
+                "http://",
+                "https://",
+                "urllib",
+                "requests.",
+                "httpx",
+                "aiohttp",
+                "urlopen",
+                "fetch_json",
+            ]
+            .iter()
+            .any(|needle| lower.contains(needle));
+            let sample_url = extract_first_http_url(text)
+                .unwrap_or_else(|| "https://<domain>/<path>".to_string());
+            let http_hint = if mentions_http {
+                format!(
+                    "\nFor outbound HTTP/HTTPS requests, use the host-brokered egress MCP tool instead:\n  mcp_aegis-os_egress_http_request {{\"url\":{},\"method\":\"GET\"}}",
+                    json_str(&sample_url)
+                )
+            } else {
+                String::new()
+            };
+            return Route::RedirectToSandbox {
+                reason: format!(
+                    "[Aegis OS routing] `run_workflow` is reserved for multi-agent workflow orchestration (`agent`/`parallel`/`pipeline`/`phase`), not ad-hoc Python scripts or HTTP fetches. Run local scripts inside your sandboxed CoW shadow workspace via:\n  mcp_aegis-os_proc_exec {{\"command\":\"python3\",\"args\":[\"-c\",\"...\"]}}\ncwd = {} (host repo = {}).{}",
+                    shadow_root.display(),
+                    host_root.display(),
+                    http_hint
+                ),
+            };
+        }
+    }
+
+    let summary = if !trimmed_path.is_empty() {
+        trimmed_path.to_string()
+    } else {
+        let line_count = script.lines().count().max(1);
+        format!("inline Python workflow ({line_count} lines)")
+    };
+    Route::HostBoundary {
+        reason: format!(
+            "[Aegis OS Host Workflow Approval]\n  • What this does: Execute multi-agent `run_workflow` orchestration (`{summary}`) outside the per-command `proc_exec` sandbox for repository `{}`.\n  • Why confirmation is required: Workflow orchestration spawns coordinated subagents on the host runner.",
+            host_root.display()
+        ),
+    }
+}
+
+fn is_restricted_ipv4(ip: std::net::Ipv4Addr) -> bool {
+    let octets = ip.octets();
+    ip.is_loopback()
+        || ip.is_private()
+        || ip.is_link_local()
+        || ip.is_unspecified()
+        || ip.is_broadcast()
+        || ip.is_multicast()
+        || (octets[0] == 100 && (octets[1] & 0b1100_0000) == 64)
+}
+
+fn is_restricted_ip(ip: std::net::IpAddr) -> bool {
+    match ip {
+        std::net::IpAddr::V4(v4) => is_restricted_ipv4(v4),
+        std::net::IpAddr::V6(v6) => {
+            v6.is_loopback()
+                || v6.is_unspecified()
+                || v6.is_multicast()
+                || (v6.segments()[0] & 0xfe00) == 0xfc00
+                || (v6.segments()[0] & 0xffc0) == 0xfe80
+                || v6.to_ipv4_mapped().is_some_and(is_restricted_ipv4)
+        }
+    }
+}
+
+fn extract_url_host(url: &str) -> Option<String> {
+    let trimmed = url.trim();
+    let after_scheme = trimmed
+        .strip_prefix("https://")
+        .or_else(|| trimmed.strip_prefix("HTTPS://"))
+        .or_else(|| trimmed.strip_prefix("http://"))
+        .or_else(|| trimmed.strip_prefix("HTTP://"))
+        .unwrap_or_else(|| {
+            if let Some(idx) = trimmed.find("://") {
+                &trimmed[idx + 3..]
+            } else {
+                trimmed
+            }
+        });
+    let authority = after_scheme
+        .split(&['/', '?', '#'][..])
+        .next()
+        .unwrap_or("")
+        .trim();
+    if authority.is_empty() {
+        return None;
+    }
+    let host_port = authority.rsplit('@').next().unwrap_or(authority);
+    let host = if let Some(rest) = host_port.strip_prefix('[') {
+        rest.split(']').next().unwrap_or("")
+    } else if let Some((h, _port)) = host_port.rsplit_once(':') {
+        h
+    } else {
+        host_port
+    };
+    let clean = host.trim().trim_end_matches('.').to_ascii_lowercase();
+    if clean.is_empty() {
+        None
+    } else {
+        Some(clean)
+    }
+}
+
+/// Classify a native `WebFetch` / `web_fetch` tool call so external fetches go through
+/// `mcp_aegis-os_egress_http_request` and loopback/private/metadata targets are denied immediately.
+pub fn classify_native_web_fetch(url: &str) -> Route {
+    let trimmed = url.trim();
+    let lower = trimmed.to_ascii_lowercase();
+    if lower.starts_with("file://") || lower.starts_with("gopher://") {
+        return Route::Deny {
+            reason: format!(
+                "Blocked by Aegis OS Ring-0 policy: native web fetch scheme in `{trimmed}` is forbidden."
+            ),
+        };
+    }
+    if let Some(host) = extract_url_host(trimmed) {
+        let is_restricted_name = host == "localhost"
+            || host.ends_with(".localhost")
+            || host.ends_with(".local")
+            || host.ends_with(".internal")
+            || host == "metadata";
+        let is_restricted_addr = host
+            .parse::<std::net::IpAddr>()
+            .ok()
+            .is_some_and(is_restricted_ip);
+        if is_restricted_name || is_restricted_addr {
+            return Route::Deny {
+                reason: format!(
+                    "Blocked by Aegis OS Ring-0/SSRF policy: native web fetch to loopback, private network, or metadata endpoint `{trimmed}` is forbidden. Use `mcp_aegis-os_egress_http_request` for host-brokered HTTP policy enforcement."
+                ),
+            };
+        }
+    }
+
+    let sample_url = if trimmed.is_empty() {
+        "https://<domain>/<path>"
+    } else {
+        trimmed
+    };
+    Route::RedirectToSandbox {
+        reason: format!(
+            "[Aegis OS routing] Native web fetch is disabled because it bypasses host-brokered egress policy and DLP redaction. Use MCP instead:\n  mcp_aegis-os_egress_http_request {{\"url\":{},\"method\":\"GET\"}}",
+            json_str(sample_url)
         ),
     }
 }
@@ -1715,6 +1984,93 @@ mod tests {
         assert!(
             !local_du.contains("host files stay readable by absolute path"),
             "{local_du}"
+        );
+    }
+
+    #[test]
+    fn workflow_script_and_webfetch_routing() {
+        let ws = Path::new("/Users/alice/repo");
+        let sh = Path::new("/Users/alice/.aegis/shadow");
+
+        // Ad-hoc Python HTTP fetch inside `run_workflow` -> RedirectToSandbox.
+        let ad_hoc = "import json\nfrom collections import defaultdict\n\nasync def fetch_json(url):\n    return await call_tool('https://api.example.com/v1/data')\n";
+        let Route::RedirectToSandbox { reason } = classify_workflow_script(ad_hoc, "", sh, ws)
+        else {
+            panic!("expected RedirectToSandbox for ad-hoc workflow script");
+        };
+        assert!(reason.contains("mcp_aegis-os_proc_exec"), "{reason}");
+        assert!(
+            reason.contains("mcp_aegis-os_egress_http_request"),
+            "{reason}"
+        );
+        assert!(reason.contains("https://api.example.com/v1/data"), "{reason}");
+
+        // Plain ad-hoc Python without orchestration primitives -> RedirectToSandbox.
+        let plain_py = "print(sum(range(10)))\n";
+        assert!(matches!(
+            classify_workflow_script(plain_py, "", sh, ws),
+            Route::RedirectToSandbox { .. }
+        ));
+
+        // Credential or approval CLI inside `run_workflow` -> Deny (even with `agent(`).
+        let cred_wf = "parallel([agent('read ~/.ssh/id_rsa')])\n";
+        assert!(matches!(
+            classify_workflow_script(cred_wf, "", sh, ws),
+            Route::Deny { .. }
+        ));
+        let approve_wf = "agent('aegis-os policy approve esc-1')\n";
+        assert!(matches!(
+            classify_workflow_script(approve_wf, "", sh, ws),
+            Route::Deny { .. }
+        ));
+        assert!(matches!(
+            classify_workflow_script("", "/Users/alice/.ssh/wf.py", sh, ws),
+            Route::Deny { .. }
+        ));
+
+        // Genuine multi-agent workflow -> HostBoundary (`ask`).
+        let real_wf = "results = parallel([agent('review auth'), agent('review tests')])\n";
+        let Route::HostBoundary { reason: wf_ask } =
+            classify_workflow_script(real_wf, "", sh, ws)
+        else {
+            panic!("expected HostBoundary for genuine multi-agent workflow");
+        };
+        assert!(wf_ask.contains("Host Workflow Approval"), "{wf_ask}");
+
+        // Synthetic/unreadable ScriptPath without inline script -> HostBoundary (`ask`).
+        assert!(matches!(
+            classify_workflow_script("", "/Users/alice/repo/workflows/fanout.py", sh, ws),
+            Route::HostBoundary { .. }
+        ));
+
+        // WebFetch SSRF/loopback/metadata targets -> Deny.
+        for bad_url in [
+            "http://127.0.0.1:7080/v1/approvals/decide",
+            "http://169.254.169.254/latest/meta-data/iam/security-credentials/",
+            "http://localhost:8080/health",
+            "http://[::1]:9000/status",
+            "http://10.0.0.12/internal",
+            "file:///etc/passwd",
+        ] {
+            assert!(
+                matches!(classify_native_web_fetch(bad_url), Route::Deny { .. }),
+                "expected Deny for {bad_url}"
+            );
+        }
+
+        // Public external URL -> RedirectToSandbox (`egress_http_request`).
+        let Route::RedirectToSandbox { reason: fetch_redir } =
+            classify_native_web_fetch("https://api.github.com/repos/foo/bar")
+        else {
+            panic!("expected RedirectToSandbox for public WebFetch URL");
+        };
+        assert!(
+            fetch_redir.contains("mcp_aegis-os_egress_http_request"),
+            "{fetch_redir}"
+        );
+        assert!(
+            fetch_redir.contains("https://api.github.com/repos/foo/bar"),
+            "{fetch_redir}"
         );
     }
 }

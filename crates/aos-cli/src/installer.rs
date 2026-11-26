@@ -134,6 +134,7 @@ Follow these rules whenever operating inside an Aegis OS managed workspace so co
 3. **Never scan `/` or run unbounded commands.** Commands like `find /` or `locate` hit the 30s timeout. Use `which <tool>`, toolchain env queries, or search inside workspace directories only. For tests/builds >30s, pass `"background": true` and poll with `"poll_pid"`.
 4. **Host `$HOME` outside workspace & heavy `du` scans.** Seatbelt (`tighten_home_read`) blocks reading `~/Library`, `~/.aegis`, and sibling repos inside `proc_exec`; use `host_exec` (or ask the user) for host-wide disk checks (`tmutil`, `diskutil`, `du ~/Library`), and `aegis-os disk` / `aegis-os gc` on host to inspect or reclaim `~/.aegis` runtime storage. Inside the workspace, avoid synchronous `du` across large `target/`/`node_modules/` dirs (especially `du ... | sort`, which buffers all stdout); use `du -d 1` or `"background": true` + `poll_pid`.
 5. **Read `aegis_hint` on non-zero exits.** Do not blindly retry failing commands (`LoopThrash`); inspect `aegis_hint` / `friction_category` or run `aegis-os insights` locally (`aegis-os feedback --dry-run` to preview zero-PII counters).
+6. **Never route around `proc_exec` or `egress_http_request` with `run_workflow` or `WebFetch`.** `run_workflow` is reserved strictly for multi-agent workflow orchestration (`agent`/`parallel`/`pipeline`/`phase`), never ad-hoc Python or HTTP scripts, and native `WebFetch`/`web_fetch` must be replaced with `mcp_aegis-os_egress_http_request`.
 "#;
 
 async fn install_runtime_skill(skills_root: &Path, dry_run: bool) -> anyhow::Result<PathBuf> {
@@ -299,7 +300,7 @@ pub async fn install_global_clients_with_options(
                     ],
                     "PreToolUse": [
                         {
-                            "matcher": "call_mcp_tool|mcp_aegis-os_.*|mcp__aegis-os__.*|write_file|edit_file|read_file|view_file|run_command|Write|Edit|MultiEdit|Read|Bash",
+                            "matcher": "call_mcp_tool|mcp_aegis-os_.*|mcp__aegis-os__.*|write_file|write_to_file|edit_file|replace_file_content|multi_replace_file_content|create_file|delete_file|apply_patch|read_file|view_file|run_command|run_workflow|WebFetch|web_fetch|Write|Edit|MultiEdit|NotebookEdit|Read|Bash|bash|shell",
                             "hooks": [
                                 {
                                     "type": "command",
@@ -614,7 +615,7 @@ You are running inside the **Aegis OS Runtime (`aegis-os`)** with an isolated Co
                 if let Some(arr) = pre_tool_use.as_array_mut() {
                     strip_aegis_from_hook_array(arr);
                     arr.push(json!({
-                        "matcher": "call_mcp_tool|mcp__aegis-os__.*|Write|Edit|MultiEdit|Read|Bash|write_file|edit_file|read_file|run_command",
+                        "matcher": "call_mcp_tool|mcp__aegis-os__.*|Write|Edit|MultiEdit|NotebookEdit|Read|Bash|bash|shell|WebFetch|web_fetch|write_file|write_to_file|edit_file|replace_file_content|multi_replace_file_content|create_file|delete_file|apply_patch|read_file|view_file|run_command|run_workflow",
                         "hooks": [
                             {
                                 "type": "command",
@@ -3053,6 +3054,7 @@ pub(crate) fn refresh_via_upgraded_binary(
     )
 }
 
+#[cfg(test)]
 pub(crate) fn refresh_via_upgraded_binary_with_path(
     new_exe: &Path,
     runtime_dir: &Path,
@@ -3327,7 +3329,7 @@ pub(crate) async fn setup_agy_workspace(
             ],
             "PreToolUse": [
                 {
-                    "matcher": "call_mcp_tool|mcp_aegis-os_.*|mcp__aegis-os__.*|write_file|edit_file|read_file|view_file|run_command|Write|Edit|MultiEdit|Read|Bash",
+                    "matcher": "call_mcp_tool|mcp_aegis-os_.*|mcp__aegis-os__.*|write_file|write_to_file|edit_file|replace_file_content|multi_replace_file_content|create_file|delete_file|apply_patch|read_file|view_file|run_command|run_workflow|WebFetch|web_fetch|Write|Edit|MultiEdit|NotebookEdit|Read|Bash|bash|shell",
                     "hooks": [
                         {
                             "type": "command",
@@ -3721,6 +3723,21 @@ mod install_tests {
         assert!(home.join(".gemini/config/mcp_config.json").exists());
         assert!(ws.join(".agents/hooks.json").exists());
         assert!(ws.join(".agents/README.md").exists());
+
+        for hook_path in [
+            home.join(".gemini/config/hooks.json"),
+            home.join(".claude/settings.json"),
+            ws.join(".agents/hooks.json"),
+        ] {
+            let text = std::fs::read_to_string(&hook_path).unwrap();
+            for tool in ["run_workflow", "WebFetch", "write_to_file", "bash"] {
+                assert!(
+                    text.contains(tool),
+                    "expected `{tool}` in PreToolUse matcher of {}",
+                    hook_path.display()
+                );
+            }
+        }
 
         run_uninstall(UninstallOptions {
             home_dir: &home,

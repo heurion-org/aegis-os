@@ -1021,6 +1021,7 @@ fn build_fail_safe_hook_response(
             }
         }
         "write_file"
+        | "write_to_file"
         | "edit_file"
         | "write"
         | "edit"
@@ -1029,16 +1030,51 @@ fn build_fail_safe_hook_response(
         | "create_file"
         | "replace_file_content"
         | "multi_replace_file_content"
-        | "delete_file" => {
+        | "delete_file"
+        | "apply_patch" => {
             let target_path = pending_args
                 .get("Path")
                 .or_else(|| pending_args.get("file_path"))
                 .or_else(|| pending_args.get("TargetFile"))
+                .or_else(|| pending_args.get("FilePath"))
                 .and_then(|v| v.as_str())
                 .unwrap_or("");
             if let routing::Route::Deny { reason } =
                 routing::classify_native_write(Path::new(target_path), workspace)
             {
+                return format_hook_output_json(
+                    hook_decision("deny", &reason),
+                    is_claude_payload,
+                );
+            }
+        }
+        "run_workflow" => {
+            let script = pending_args
+                .get("Script")
+                .or_else(|| pending_args.get("script"))
+                .and_then(|v| v.as_str())
+                .unwrap_or("");
+            let script_path = pending_args
+                .get("ScriptPath")
+                .or_else(|| pending_args.get("script_path"))
+                .and_then(|v| v.as_str())
+                .unwrap_or("");
+            if let routing::Route::Deny { reason } =
+                routing::classify_workflow_script(script, script_path, workspace, workspace)
+            {
+                return format_hook_output_json(
+                    hook_decision("deny", &reason),
+                    is_claude_payload,
+                );
+            }
+        }
+        "webfetch" | "web_fetch" => {
+            let url = pending_args
+                .get("url")
+                .or_else(|| pending_args.get("Url"))
+                .and_then(|v| v.as_str())
+                .unwrap_or("");
+            if let routing::Route::Deny { reason } = routing::classify_native_web_fetch(url) {
                 return format_hook_output_json(
                     hook_decision("deny", &reason),
                     is_claude_payload,
@@ -1521,6 +1557,7 @@ async fn evaluate_hook_core(ctx: HookEvalContext<'_>) -> anyhow::Result<Value> {
                     | "list"
                     | "write"
                     | "write_file"
+                    | "write_to_file"
                     | "create_file"
                     | "edit"
                     | "edit_file"
@@ -1534,6 +1571,7 @@ async fn evaluate_hook_core(ctx: HookEvalContext<'_>) -> anyhow::Result<Value> {
                     | "bash"
                     | "shell"
                     | "run_command"
+                    | "run_workflow"
                     | "webfetch"
                     | "web_fetch"
                     | "websearch"
@@ -1602,22 +1640,25 @@ async fn evaluate_hook_core(ctx: HookEvalContext<'_>) -> anyhow::Result<Value> {
             }
 
             if matches!(
-                tool_name,
+                tool_name.to_ascii_lowercase().as_str(),
                 "write_file"
+                    | "write_to_file"
                     | "edit_file"
-                    | "Write"
-                    | "Edit"
-                    | "MultiEdit"
-                    | "NotebookEdit"
+                    | "write"
+                    | "edit"
+                    | "multiedit"
+                    | "notebookedit"
                     | "create_file"
                     | "replace_file_content"
                     | "multi_replace_file_content"
                     | "delete_file"
+                    | "apply_patch"
             ) {
                 let target_path = tool_args
                     .get("Path")
                     .or_else(|| tool_args.get("file_path"))
                     .or_else(|| tool_args.get("TargetFile"))
+                    .or_else(|| tool_args.get("FilePath"))
                     .and_then(|v| v.as_str())
                     .unwrap_or("");
 
@@ -1683,7 +1724,10 @@ async fn evaluate_hook_core(ctx: HookEvalContext<'_>) -> anyhow::Result<Value> {
                 return Ok(format_hook_output_json(out, ctx.is_claude_payload));
             }
 
-            if matches!(tool_name, "run_command" | "Bash") {
+            if matches!(
+                tool_name.to_ascii_lowercase().as_str(),
+                "run_command" | "bash" | "shell"
+            ) {
                 let cmd_line = tool_args
                     .get("CommandLine")
                     .or_else(|| tool_args.get("command"))
@@ -1763,6 +1807,68 @@ async fn evaluate_hook_core(ctx: HookEvalContext<'_>) -> anyhow::Result<Value> {
                 return Ok(format_hook_output_json(out, ctx.is_claude_payload));
             }
 
+            if tool_name.eq_ignore_ascii_case("run_workflow") {
+                let script = tool_args
+                    .get("Script")
+                    .or_else(|| tool_args.get("script"))
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("");
+                let script_path = tool_args
+                    .get("ScriptPath")
+                    .or_else(|| tool_args.get("script_path"))
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("");
+                let route = routing::classify_workflow_script(
+                    script,
+                    script_path,
+                    ctx.shadow_root,
+                    ctx.effective_workspace,
+                );
+                if !matches!(route, routing::Route::Pass) {
+                    let logged_target = if !script_path.trim().is_empty() {
+                        script_path
+                    } else {
+                        script
+                    };
+                    coord::log_routing_decision(
+                        ctx.runtime_dir,
+                        &ctx.identity.agent_id,
+                        "run_workflow",
+                        &format!("{}:{}", ctx.routing_mode.as_str(), route.kind()),
+                        logged_target,
+                    );
+                }
+                let out = route.to_hook_decision(ctx.routing_mode);
+                return Ok(format_hook_output_json(out, ctx.is_claude_payload));
+            }
+
+            if matches!(
+                tool_name.to_ascii_lowercase().as_str(),
+                "webfetch" | "web_fetch"
+            ) {
+                let url = tool_args
+                    .get("url")
+                    .or_else(|| tool_args.get("Url"))
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("");
+                let route = routing::classify_native_web_fetch(url);
+                if !matches!(route, routing::Route::Pass) {
+                    coord::log_routing_decision(
+                        ctx.runtime_dir,
+                        &ctx.identity.agent_id,
+                        tool_name,
+                        &format!("{}:{}", ctx.routing_mode.as_str(), route.kind()),
+                        url,
+                    );
+                }
+                let out = route.to_hook_decision(ctx.routing_mode);
+                return Ok(format_hook_output_json(out, ctx.is_claude_payload));
+            }
+
+            // Invariant (Option A): Keep `"decision": "allow"` without `permissionOverrides`
+            // for remaining unmatched tools (notably third-party `call_mcp_tool` where
+            // ServerName != "aegis-os"): Claude's `format_hook_output_json` strips unflagged
+            // allow to `{}`, while Antigravity rejects `{}` with an empty reason.
             Ok(format_hook_output_json(
                 json!({ "decision": "allow" }),
                 ctx.is_claude_payload,
@@ -2084,6 +2190,195 @@ mod tests {
         assert!(total > 0);
         assert!(avail <= total);
     }
+
+    #[tokio::test]
+    async fn evaluate_hook_core_blocks_workflow_webfetch_write_to_file_bash_and_allows_third_party_mcp() {
+        let tmp = tempfile::tempdir().unwrap();
+        let ws = tmp.path().join("ws");
+        let rt = tmp.path().join("rt");
+        let shadow = tmp.path().join("shadow");
+        std::fs::create_dir_all(&ws).unwrap();
+        std::fs::create_dir_all(&rt).unwrap();
+        std::fs::write(ws.join("Cargo.toml"), "[package]\nname = \"demo\"\n").unwrap();
+
+        let cow = aos_vfs::CoWWorkspace::init(&ws, shadow.clone())
+            .await
+            .unwrap();
+        let kernel = AegisRuntimeKernel::new(&rt).await.unwrap();
+        let identity = AgentIdentity::new("aegis-os", "agy-agent", "Lead");
+
+        let eval = |payload: Value, is_claude: bool| {
+            let ws_ref = &ws;
+            let rt_ref = &rt;
+            let sh_ref = &shadow;
+            let cow_ref = &cow;
+            let kernel_ref = &kernel;
+            let id_ref = &identity;
+            async move {
+                evaluate_hook_core(HookEvalContext {
+                    event: "PreToolUse",
+                    payload: &payload,
+                    runtime_dir: rt_ref,
+                    effective_workspace: ws_ref,
+                    shadow_root: sh_ref,
+                    workspace_tx: cow_ref,
+                    kernel: kernel_ref,
+                    identity: id_ref,
+                    is_claude_payload: is_claude,
+                    routing_mode: routing::RoutingMode::Enforce,
+                    is_enforced_session: true,
+                    inline_approve: true,
+                    force_wrap_cmd: false,
+                    broker_state: None,
+                })
+                .await
+                .unwrap()
+            }
+        };
+
+        // 1a. Ad-hoc Python HTTP fetch via `run_workflow` -> denied & redirected to proc_exec + egress.
+        let wf_adhoc = eval(
+            json!({
+                "toolCall": {
+                    "name": "run_workflow",
+                    "args": {
+                        "Script": "import json\nasync def fetch_json(url):\n    return 'https://api.example.com/v1'\n"
+                    }
+                }
+            }),
+            false,
+        )
+        .await;
+        assert_eq!(wf_adhoc["decision"], "deny", "{wf_adhoc}");
+        let wf_reason = wf_adhoc["reason"].as_str().unwrap();
+        assert!(wf_reason.contains("mcp_aegis-os_proc_exec"), "{wf_reason}");
+        assert!(
+            wf_reason.contains("mcp_aegis-os_egress_http_request"),
+            "{wf_reason}"
+        );
+
+        // 1b. Genuine multi-agent workflow -> Aegis HostBoundary ("ask"), never raw bypass.
+        let wf_real = eval(
+            json!({
+                "toolCall": {
+                    "name": "run_workflow",
+                    "args": {
+                        "Script": "results = parallel([agent('audit auth'), agent('audit tests')])\n"
+                    }
+                }
+            }),
+            false,
+        )
+        .await;
+        assert_eq!(wf_real["decision"], "ask", "{wf_real}");
+        assert!(
+            wf_real["reason"]
+                .as_str()
+                .unwrap()
+                .contains("Host Workflow Approval"),
+            "{wf_real}"
+        );
+
+        // 2. Native WebFetch -> public redirected to egress_http_request; SSRF denied.
+        let webfetch_pub = eval(
+            json!({
+                "tool_name": "WebFetch",
+                "tool_input": { "url": "https://api.github.com/repos/foo/bar" }
+            }),
+            true,
+        )
+        .await;
+        assert_eq!(
+            webfetch_pub["hookSpecificOutput"]["permissionDecision"], "deny",
+            "{webfetch_pub}"
+        );
+        assert!(
+            webfetch_pub["hookSpecificOutput"]["permissionDecisionReason"]
+                .as_str()
+                .unwrap()
+                .contains("mcp_aegis-os_egress_http_request"),
+            "{webfetch_pub}"
+        );
+
+        let webfetch_ssrf = eval(
+            json!({
+                "toolCall": {
+                    "name": "web_fetch",
+                    "args": { "url": "http://169.254.169.254/latest/meta-data/" }
+                }
+            }),
+            false,
+        )
+        .await;
+        assert_eq!(webfetch_ssrf["decision"], "deny", "{webfetch_ssrf}");
+
+        // 3. `write_to_file` & lowercase `bash` -> both redirected instead of falling through.
+        let write_to = eval(
+            json!({
+                "toolCall": {
+                    "name": "write_to_file",
+                    "args": { "TargetFile": ws.join("src/main.rs").display().to_string() }
+                }
+            }),
+            false,
+        )
+        .await;
+        assert_eq!(write_to["decision"], "deny", "{write_to}");
+        assert!(
+            write_to["reason"]
+                .as_str()
+                .unwrap()
+                .contains("mcp_aegis-os_fs_write"),
+            "{write_to}"
+        );
+
+        let bash_lower = eval(
+            json!({
+                "toolCall": {
+                    "name": "bash",
+                    "args": { "command": "cargo test" }
+                }
+            }),
+            false,
+        )
+        .await;
+        assert_eq!(bash_lower["decision"], "deny", "{bash_lower}");
+        assert!(
+            bash_lower["reason"]
+                .as_str()
+                .unwrap()
+                .contains("mcp_aegis-os_proc_exec"),
+            "{bash_lower}"
+        );
+
+        // 4. Option A invariant: third-party `call_mcp_tool` preserves AGY allow without
+        // `permissionOverrides` and Claude `{}` pass-through.
+        let third_party_agy = eval(
+            json!({
+                "toolCall": {
+                    "name": "call_mcp_tool",
+                    "args": { "ServerName": "chrome-devtools", "ToolName": "list_pages", "Arguments": {} }
+                }
+            }),
+            false,
+        )
+        .await;
+        assert_eq!(third_party_agy["decision"], "allow", "{third_party_agy}");
+        assert!(
+            third_party_agy.get("permissionOverrides").is_none(),
+            "{third_party_agy}"
+        );
+
+        let third_party_claude = eval(
+            json!({
+                "tool_name": "call_mcp_tool",
+                "tool_input": { "ServerName": "chrome-devtools", "ToolName": "list_pages", "Arguments": {} }
+            }),
+            true,
+        )
+        .await;
+        assert_eq!(third_party_claude, json!({}), "{third_party_claude}");
+    }
 }
 
 
@@ -2185,6 +2480,49 @@ mod fail_safe_hook_tests {
             true,
         );
         assert_eq!(token_deny["decision"], "deny");
+
+        let wf_cred_deny = build_fail_safe_hook_response(
+            "PreToolUse",
+            &json!({
+                "toolCall": { "name": "run_workflow", "args": { "Script": "open('/Users/alice/.ssh/id_rsa')" } }
+            }),
+            ws,
+            "aegis-os",
+            false,
+            None,
+            true,
+        );
+        assert_eq!(wf_cred_deny["decision"], "deny");
+
+        let webfetch_ssrf_deny = build_fail_safe_hook_response(
+            "PreToolUse",
+            &json!({
+                "tool_name": "WebFetch",
+                "tool_input": { "url": "http://169.254.169.254/latest/meta-data/" }
+            }),
+            ws,
+            "aegis-os",
+            true,
+            None,
+            true,
+        );
+        assert_eq!(
+            webfetch_ssrf_deny["hookSpecificOutput"]["permissionDecision"],
+            "deny"
+        );
+
+        let wtf_cred_deny = build_fail_safe_hook_response(
+            "PreToolUse",
+            &json!({
+                "toolCall": { "name": "write_to_file", "args": { "TargetFile": "/Users/alice/.ssh/authorized_keys" } }
+            }),
+            ws,
+            "aegis-os",
+            false,
+            None,
+            true,
+        );
+        assert_eq!(wtf_cred_deny["decision"], "deny");
 
         // Enforced fallback for unknown/untrusted native tools emits valid "ask" (never `{}`) for AGY,
         // while Claude Code receives valid `{}` pass-through.

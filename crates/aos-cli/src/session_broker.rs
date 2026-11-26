@@ -1777,6 +1777,15 @@ async fn evaluate_with_hard_guards(
 }
 
 fn effect_for_tool(tool: &str, input: &Value, state: &BrokerState) -> Option<Effect> {
+    effect_for_tool_with_session(tool, input, &state.session, &state.session_dir)
+}
+
+fn effect_for_tool_with_session(
+    tool: &str,
+    input: &Value,
+    session: &BrokerSession,
+    session_dir: &Path,
+) -> Option<Effect> {
     let tool_l = tool.to_ascii_lowercase();
     let path = input
         .get("path")
@@ -1785,6 +1794,7 @@ fn effect_for_tool(tool: &str, input: &Value, state: &BrokerState) -> Option<Eff
         .or_else(|| input.get("Path"))
         .or_else(|| input.get("AbsolutePath"))
         .or_else(|| input.get("TargetFile"))
+        .or_else(|| input.get("FilePath"))
         .and_then(|v| v.as_str())
         .unwrap_or("");
     let scope_path = if path.is_empty() || path.starts_with('/') || path.starts_with("~/") {
@@ -1792,16 +1802,17 @@ fn effect_for_tool(tool: &str, input: &Value, state: &BrokerState) -> Option<Eff
     } else {
         format!(
             "{}/{}",
-            state.session.workspace.trim_end_matches('/'),
+            session.workspace.trim_end_matches('/'),
             path.trim_start_matches("./")
         )
     };
-    let scope = scope_for_path(&scope_path, state);
+    let scope = scope_for_path_with_session(&scope_path, session, session_dir);
     let kind = match tool_l.as_str() {
         "read" | "read_file" | "fs_read" | "view" | "view_file" | "glob" | "grep" | "ls"
         | "list" => EffectKind::FsRead,
         "write"
         | "write_file"
+        | "write_to_file"
         | "fs_write"
         | "create_file"
         | "edit"
@@ -1819,7 +1830,7 @@ fn effect_for_tool(tool: &str, input: &Value, state: &BrokerState) -> Option<Eff
             }
         }
         "delete" | "delete_file" | "fs_delete" => EffectKind::FsDelete,
-        "bash" | "shell" | "run_command" | "proc_exec" => EffectKind::ProcExec,
+        "bash" | "shell" | "run_command" | "run_workflow" | "proc_exec" => EffectKind::ProcExec,
         "webfetch" | "web_fetch" | "websearch" | "web_search" | "fetch" | "http" => {
             EffectKind::NetRequest
         }
@@ -1835,11 +1846,16 @@ fn effect_for_tool(tool: &str, input: &Value, state: &BrokerState) -> Option<Eff
         EffectKind::ProcExec => input
             .get("command")
             .or_else(|| input.get("CommandLine"))
+            .or_else(|| input.get("ScriptPath"))
+            .or_else(|| input.get("script_path"))
+            .or_else(|| input.get("Script"))
+            .or_else(|| input.get("script"))
             .and_then(|v| v.as_str())
             .unwrap_or(tool)
             .to_string(),
         EffectKind::NetRequest => input
             .get("url")
+            .or_else(|| input.get("Url"))
             .or_else(|| input.get("query"))
             .and_then(|v| v.as_str())
             .unwrap_or(tool)
@@ -1910,7 +1926,11 @@ fn is_credential_or_ring0_path(raw: &str, norm_s: &str) -> bool {
     false
 }
 
-fn scope_for_path(path: &str, state: &BrokerState) -> ResourceScope {
+fn scope_for_path_with_session(
+    path: &str,
+    session: &BrokerSession,
+    session_dir: &Path,
+) -> ResourceScope {
     if path.is_empty() {
         return ResourceScope::Shadow;
     }
@@ -1924,11 +1944,11 @@ fn scope_for_path(path: &str, state: &BrokerState) -> ResourceScope {
         return ResourceScope::Credential;
     }
 
-    let shadow_norm = crate::routing::canonicalize_lossy(Path::new(&state.session.shadow));
+    let shadow_norm = crate::routing::canonicalize_lossy(Path::new(&session.shadow));
     let session_upper_norm =
-        crate::routing::canonicalize_lossy(&state.session_dir.join("cow_workspace/upper_workspace"));
-    let agent_home_norm = crate::routing::canonicalize_lossy(Path::new(&state.session.agent_home));
-    let workspace_norm = crate::routing::canonicalize_lossy(Path::new(&state.session.workspace));
+        crate::routing::canonicalize_lossy(&session_dir.join("cow_workspace/upper_workspace"));
+    let agent_home_norm = crate::routing::canonicalize_lossy(Path::new(&session.agent_home));
+    let workspace_norm = crate::routing::canonicalize_lossy(Path::new(&session.workspace));
 
     let in_tmp_scratch = (norm_s.starts_with("/tmp/") || norm_s.starts_with("/private/tmp/"))
         && !norm_s.contains("/aegis-os-runtime/")
@@ -3403,5 +3423,68 @@ print("BROKER_PROBE_DONE")
         assert_eq!(env_resp["notifications"][0]["method"], "notifications/progress");
         assert_eq!(env_resp["response"]["id"], 22);
         assert_eq!(env_resp["response"]["result"]["tools"][0]["name"], "ping");
+    }
+
+    #[test]
+    fn effect_for_tool_covers_run_workflow_and_write_to_file() {
+        let session = BrokerSession {
+            session_id: "ses_wf_test".to_string(),
+            mode: "implement".to_string(),
+            enforcement: "enforced".to_string(),
+            workspace: "/ws".to_string(),
+            shadow: "/tmp/ses/cow_workspace/upper_workspace".to_string(),
+            agent_home: "/tmp/ses/agent_home".to_string(),
+        };
+        let session_dir = Path::new("/tmp/ses");
+
+        let wf_script = effect_for_tool_with_session(
+            "run_workflow",
+            &json!({ "Script": "print('hi')" }),
+            &session,
+            session_dir,
+        )
+        .expect("run_workflow Script must map to Effect");
+        assert_eq!(wf_script.kind, EffectKind::ProcExec);
+        assert_eq!(wf_script.resource, "print('hi')");
+
+        let wf_path = effect_for_tool_with_session(
+            "run_workflow",
+            &json!({ "ScriptPath": "scripts/wf.py" }),
+            &session,
+            session_dir,
+        )
+        .expect("run_workflow ScriptPath must map to Effect");
+        assert_eq!(wf_path.kind, EffectKind::ProcExec);
+        assert_eq!(wf_path.resource, "scripts/wf.py");
+
+        let wtf_ws = effect_for_tool_with_session(
+            "write_to_file",
+            &json!({ "TargetFile": "/ws/src/lib.rs" }),
+            &session,
+            session_dir,
+        )
+        .expect("write_to_file must map to Effect");
+        assert_eq!(wtf_ws.kind, EffectKind::FsWrite);
+        assert_eq!(wtf_ws.resource, "/ws/src/lib.rs");
+
+        let wtf_cred = effect_for_tool_with_session(
+            "write_to_file",
+            &json!({ "TargetFile": "/Users/alice/.ssh/authorized_keys" }),
+            &session,
+            session_dir,
+        )
+        .expect("write_to_file credential path must map to Effect");
+        assert_eq!(wtf_cred.kind, EffectKind::FsWrite);
+        assert_eq!(wtf_cred.scope, ResourceScope::Credential);
+
+        let wf_net = effect_for_tool_with_session(
+            "WebFetch",
+            &json!({ "Url": "https://api.example.com/v1" }),
+            &session,
+            session_dir,
+        )
+        .expect("WebFetch must map to Effect");
+        assert_eq!(wf_net.kind, EffectKind::NetRequest);
+        assert_eq!(wf_net.resource, "https://api.example.com/v1");
     }
 }
