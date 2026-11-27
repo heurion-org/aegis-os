@@ -68,42 +68,140 @@ impl PaasControlPlane {
         Ok(())
     }
 
-    pub(super) fn is_ssrf_or_internal_git_url(url: &str) -> bool {
-        let lower = url.trim().to_ascii_lowercase();
-        let Some(rest) = lower
-            .strip_prefix("http://")
-            .or_else(|| lower.strip_prefix("https://"))
-        else {
-            return false;
-        };
-        let authority = rest.split('/').next().unwrap_or("");
-        let host_port = authority.rsplit('@').next().unwrap_or(authority);
-        let host = if let Some(h) = host_port.strip_prefix('[') {
-            h.split(']').next().unwrap_or(h)
+    fn extract_git_host_and_port(url: &str) -> Option<(String, u16)> {
+        let trimmed = url.trim();
+        let lower = trimmed.to_ascii_lowercase();
+        let (default_port, authority_rest) = if let Some(r) = lower.strip_prefix("https://") {
+            (443u16, r.split(['/', '?']).next().unwrap_or(""))
+        } else if let Some(r) = lower.strip_prefix("http://") {
+            (80u16, r.split(['/', '?']).next().unwrap_or(""))
+        } else if let Some(r) = lower.strip_prefix("ssh://") {
+            (22u16, r.split(['/', '?']).next().unwrap_or(""))
+        } else if let Some(r) = lower.strip_prefix("git://") {
+            (9418u16, r.split(['/', '?']).next().unwrap_or(""))
+        } else if !lower.contains("://") && lower.contains('@') && lower.contains(':') {
+            let after_at = lower.rsplit('@').next().unwrap_or("");
+            let host_only = after_at.split(':').next().unwrap_or("");
+            return (!host_only.is_empty()).then(|| (host_only.trim_end_matches('.').to_string(), 22));
         } else {
-            host_port.split(':').next().unwrap_or(host_port)
+            return None;
+        };
+
+        let host_port = authority_rest.rsplit('@').next().unwrap_or(authority_rest);
+        let (host, port) = if let Some(after_open) = host_port.strip_prefix('[') {
+            let (h, after_close) = after_open.split_once(']')?;
+            let p = if let Some(ps) = after_close.strip_prefix(':') {
+                ps.parse::<u16>().ok()?
+            } else {
+                default_port
+            };
+            (h, p)
+        } else if let Some((h, ps)) = host_port.rsplit_once(':') {
+            if h.contains(':') {
+                return None;
+            }
+            (h, ps.parse::<u16>().ok()?)
+        } else {
+            (host_port, default_port)
+        };
+        let clean = host.trim_end_matches('.');
+        if clean.is_empty() || port == 0 {
+            None
+        } else {
+            Some((clean.to_string(), port))
+        }
+    }
+
+    fn is_obfuscated_ip_host(host: &str) -> bool {
+        if host.parse::<u32>().is_ok()
+            || host.starts_with("0x")
+            || host.starts_with("0X")
+        {
+            return true;
+        }
+        let segs: Vec<&str> = host.split('.').collect();
+        segs.len() == 4
+            && segs
+                .iter()
+                .all(|s| !s.is_empty() && s.bytes().all(|b| b.is_ascii_hexdigit() || b == b'x' || b == b'X'))
+            && segs.iter().any(|s| {
+                (s.len() > 1 && s.starts_with('0')) || s.starts_with("0x") || s.starts_with("0X")
+            })
+    }
+
+    pub(crate) fn is_ssrf_or_internal_git_url(url: &str) -> bool {
+        let lower = url.trim().to_ascii_lowercase();
+        if lower.starts_with("file://")
+            || lower.starts_with("ext::")
+            || lower.starts_with("fd::")
+        {
+            return true;
+        }
+        let Some((host, _port)) = Self::extract_git_host_and_port(&lower) else {
+            return lower.contains("://") || lower.contains('@');
         };
         if host.is_empty()
             || host == "localhost"
             || host.ends_with(".localhost")
-            || host == "0.0.0.0"
-            || host == "::1"
             || host == "metadata.google.internal"
-            || host.starts_with("127.")
-            || host.starts_with("10.")
-            || host.starts_with("192.168.")
-            || host.starts_with("169.254.")
+            || host == "metadata.goog"
+            || host.ends_with(".internal")
+            || Self::is_obfuscated_ip_host(&host)
         {
             return true;
         }
-        if let Some(second) = host.strip_prefix("172.").and_then(|r| r.split('.').next()) {
-            if let Ok(octet) = second.parse::<u8>() {
-                if (16..=31).contains(&octet) {
-                    return true;
+        if let Ok(ip) = host.parse::<std::net::IpAddr>() {
+            return aos_core::security::is_forbidden_outbound_ip(ip);
+        }
+        false
+    }
+
+    pub(super) async fn validate_remote_git_url(url: &str) -> anyhow::Result<()> {
+        let trimmed = url.trim();
+        let lower = trimmed.to_ascii_lowercase();
+        if trimmed.is_empty()
+            || trimmed.starts_with('-')
+            || trimmed.chars().any(|c| c.is_control() || c.is_whitespace())
+        {
+            bail!("Unsupported or unsafe workspace source_url '{}'", url);
+        }
+        if !lower.starts_with("https://")
+            && !lower.starts_with("http://")
+            && !lower.starts_with("git@")
+        {
+            bail!(
+                "Unsupported remote git scheme in source_url '{}' (expected https:// or git@)",
+                url
+            );
+        }
+        if Self::is_ssrf_or_internal_git_url(trimmed) {
+            bail!(
+                "Refusing to clone internal or loopback git URL '{}'",
+                url
+            );
+        }
+        let (host, port) = Self::extract_git_host_and_port(trimmed)
+            .with_context(|| format!("Invalid git URL '{}'", url))?;
+        if host.parse::<std::net::IpAddr>().is_err() {
+            let addrs: Vec<std::net::SocketAddr> =
+                tokio::net::lookup_host((host.as_str(), port))
+                    .await
+                    .with_context(|| format!("DNS lookup failed for git host '{}'", host))?
+                    .collect();
+            if addrs.is_empty() {
+                bail!("No DNS records resolved for git host '{}'", host);
+            }
+            for addr in addrs {
+                if aos_core::security::is_forbidden_outbound_ip(addr.ip()) {
+                    bail!(
+                        "Refusing to clone git URL '{}': host resolved to forbidden IP '{}'",
+                        url,
+                        addr.ip()
+                    );
                 }
             }
         }
-        false
+        Ok(())
     }
 
     pub(super) fn validate_local_source_dir(&self, src_path: &Path) -> anyhow::Result<PathBuf> {
@@ -126,29 +224,44 @@ impl PaasControlPlane {
                 );
             }
         }
+        if let Some(home) = std::env::var_os("HOME")
+            .map(PathBuf::from)
+            .and_then(|h| std::fs::canonicalize(&h).ok())
+        {
+            if canon == home || home.starts_with(&canon) {
+                bail!(
+                    "Refusing to provision workspace from user home or ancestor '{}'",
+                    canon.display()
+                );
+            }
+        }
         let s = canon.to_string_lossy();
         const FORBIDDEN_PREFIXES: &[&str] = &[
             "/etc",
+            "/private/etc",
             "/root",
             "/proc",
             "/sys",
             "/dev",
             "/boot",
             "/var/run",
+            "/private/var/run",
+            "/private/tmp",
             "/run",
             "/usr",
             "/bin",
             "/sbin",
             "/lib",
+            "/system",
+            "/library",
         ];
+        let lower_s = s.to_ascii_lowercase();
         if s == "/"
             || FORBIDDEN_PREFIXES
                 .iter()
-                .any(|p| s == *p || s.starts_with(&format!("{p}/")))
-            || s.contains("/.ssh")
-            || s.contains("/.aws")
-            || s.contains("/.gnupg")
-            || s.contains("/.aegis-os")
+                .any(|p| lower_s == *p || lower_s.starts_with(&format!("{p}/")))
+            || aos_policy::AegisPolicyKernel::is_forbidden_import_source(&s)
+            || crate::fs_transfer::is_forbidden_export_dest(&s, &s)
         {
             bail!(
                 "Refusing to provision workspace from restricted host path '{}'",
@@ -205,6 +318,29 @@ impl PaasControlPlane {
         branch: &str,
         agents: Vec<String>,
     ) -> anyhow::Result<CloudWorkspaceRecord> {
+        self.provision_workspace_with_policy(
+            kernel,
+            org_id,
+            workspace_id,
+            source_url_or_path,
+            branch,
+            agents,
+            true,
+        )
+        .await
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub async fn provision_workspace_with_policy(
+        &self,
+        kernel: &AegisRuntimeKernel,
+        org_id: &str,
+        workspace_id: &str,
+        source_url_or_path: &str,
+        branch: &str,
+        agents: Vec<String>,
+        allow_local_source: bool,
+    ) -> anyhow::Result<CloudWorkspaceRecord> {
         self.reload().await;
         let org_id = org_id.trim();
         Self::validate_identifier("org_id", org_id)?;
@@ -221,9 +357,12 @@ impl PaasControlPlane {
         };
         Self::validate_branch_name(branch)?;
         let source_url_or_path = source_url_or_path.trim();
-        if source_url_or_path.starts_with('-')
-            || source_url_or_path.to_ascii_lowercase().starts_with("file://")
-        {
+        let lower_source = source_url_or_path.to_ascii_lowercase();
+        let is_cloud_sync = source_url_or_path == "." || source_url_or_path == "cloud-sync";
+        let is_remote_git = lower_source.starts_with("http://")
+            || lower_source.starts_with("https://")
+            || lower_source.starts_with("git@");
+        if source_url_or_path.starts_with('-') || lower_source.starts_with("file://") {
             bail!(
                 "Unsupported or unsafe workspace source_url '{}'",
                 source_url_or_path
@@ -232,6 +371,14 @@ impl PaasControlPlane {
         if Self::is_ssrf_or_internal_git_url(source_url_or_path) {
             bail!(
                 "Refusing to clone internal or loopback git URL '{}'",
+                source_url_or_path
+            );
+        }
+        if is_remote_git {
+            Self::validate_remote_git_url(source_url_or_path).await?;
+        } else if !is_cloud_sync && !allow_local_source {
+            bail!(
+                "LOCAL_SOURCE_FORBIDDEN: Provisioning a cloud workspace from a local host directory ('{}') is restricted to the server operator; use source_url='cloud-sync' with /v1/workspaces/sync-up or an https:// Git URL",
                 source_url_or_path
             );
         }
@@ -305,17 +452,7 @@ impl PaasControlPlane {
         }
 
         let src_path = Path::new(source_url_or_path);
-        if source_url_or_path != "."
-            && source_url_or_path != "cloud-sync"
-            && src_path.exists()
-            && src_path.is_dir()
-        {
-            let safe_src = self.validate_local_source_dir(src_path)?;
-            CoWWorkspace::cow_sync_dir(&safe_src, &host_repo).await?;
-        } else if source_url_or_path.starts_with("http://")
-            || source_url_or_path.starts_with("https://")
-            || source_url_or_path.starts_with("git@")
-        {
+        if is_remote_git {
             let parent_dir = host_repo
                 .parent()
                 .map(|p| p.to_path_buf())
@@ -338,7 +475,11 @@ impl PaasControlPlane {
                 crate::run_sanitized_host_git(
                     &git_bin,
                     &parent_dir,
-                    &[("protocol.file.allow", "never")],
+                    &[
+                        ("protocol.file.allow", "never"),
+                        ("protocol.ext.allow", "never"),
+                        ("http.followRedirects", "false"),
+                    ],
                     &args,
                 )
             })
@@ -352,6 +493,9 @@ impl PaasControlPlane {
                     String::from_utf8_lossy(&output.stderr).trim()
                 );
             }
+        } else if allow_local_source && !is_cloud_sync && src_path.exists() && src_path.is_dir() {
+            let safe_src = self.validate_local_source_dir(src_path)?;
+            CoWWorkspace::cow_sync_dir(&safe_src, &host_repo).await?;
         } else {
             tokio::fs::create_dir_all(&host_repo).await?;
             tokio::fs::write(

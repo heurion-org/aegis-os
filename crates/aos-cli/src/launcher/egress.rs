@@ -792,9 +792,7 @@ pub(super) async fn start_egress(
         // skipping the Linux netns Unix-socket bridge avoids macOS `SUN_LEN` (104-byte) failures
         // when `--runtime-dir` lives under deep `$TMPDIR` (`/var/folders/...`) paths.
         let egress_dir = session_dir.join("egress");
-        std::fs::create_dir_all(&egress_dir)?;
-        use std::os::unix::fs::PermissionsExt;
-        let _ = std::fs::set_permissions(&egress_dir, std::fs::Permissions::from_mode(0o700));
+        aos_core::security::create_private_dir_0700(&egress_dir)?;
         Ok((
             EgressGuard {
                 gateway,
@@ -820,9 +818,7 @@ pub(super) async fn start_egress(
             temp_dir = Some(short.clone());
             egress_dir = short;
         }
-        std::fs::create_dir_all(&egress_dir)?;
-        use std::os::unix::fs::PermissionsExt;
-        let _ = std::fs::set_permissions(&egress_dir, std::fs::Permissions::from_mode(0o700));
+        aos_core::security::create_private_dir_0700(&egress_dir)?;
         let sock = egress_dir.join("bridge.sock");
         let token = aos_sandbox::bridge::new_token();
         let handle = aos_sandbox::bridge::spawn_host_bridge(&sock, proxy.clone(), token.clone())?;

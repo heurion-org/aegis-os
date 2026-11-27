@@ -36,6 +36,9 @@ base64.workspace = true
 sha2.workspace = true
 hex.workspace = true
 
+[dev-dependencies]
+aos-core = { workspace = true, features = ["nested-test-sandbox"] }
+
 [features]
 # Test-only benchmark ablations (see `aos-core`). Never enable in release builds.
 ablation = ["aos-core/ablation"]

@@ -913,7 +913,7 @@ impl PaasControlPlane {
                 let pending = state
                     .pending_claims
                     .iter()
-                    .find(|c| Self::secrets_match(&c.token_sha256, &hash))
+                    .find(|c| Self::hex_digests_match(&c.token_sha256, &hash))
                     .cloned()
                     .context("Unknown or already used claim token")?;
                 let sub = state

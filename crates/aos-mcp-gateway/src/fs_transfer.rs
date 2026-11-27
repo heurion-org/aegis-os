@@ -18,11 +18,29 @@ pub(crate) fn shadow_relative(rel: &str) -> anyhow::Result<PathBuf> {
     Ok(out)
 }
 
+pub(crate) fn reject_secret_or_git_workspace_path(path_display: &str) -> anyhow::Result<()> {
+    if aos_core::security::is_dotenv_secret_path(path_display) {
+        bail!(
+            "Blocked by Aegis OS policy: accessing dotenv secret file '{}' is forbidden (only .env.example/.sample/.template/.dist/.schema are permitted)",
+            path_display
+        );
+    }
+    if aos_core::security::is_git_internal_path(path_display) {
+        bail!(
+            "Blocked by Aegis OS policy: direct access to Git internal path '{}' is forbidden (use workspace_git_inspect / workspace_git)",
+            path_display
+        );
+    }
+    Ok(())
+}
+
 /// Resolves a path for `fs_write` / `fs_edit` / `fs_delete`. The gateway runs unsandboxed, so a
 /// symlink planted from `proc_exec` (or a host-linked `node_modules`) would redirect the write to
 /// the host; any symlink on the path is therefore refused.
 pub(crate) fn shadow_path_for_write(root: &Path, rel: &str) -> anyhow::Result<(String, PathBuf)> {
     let rel_path = shadow_relative(rel)?;
+    let rel_str = rel_path.to_string_lossy().into_owned();
+    reject_secret_or_git_workspace_path(&rel_str)?;
     let mut cur = root.to_path_buf();
     for comp in rel_path.components() {
         cur.push(comp);
@@ -36,27 +54,53 @@ pub(crate) fn shadow_path_for_write(root: &Path, rel: &str) -> anyhow::Result<(S
         }
     }
     let full = root.join(&rel_path);
-    Ok((rel_path.to_string_lossy().into_owned(), full))
+    Ok((rel_str, full))
 }
 
-/// Resolves a path for `fs_read`. Symlinks may be followed (host-linked `node_modules`/`.venv` are
-/// expected), but the real target must stay inside the shadow workspace or the host repo.
+/// Resolves a path for `fs_read`. Symlinks may be followed only into the shadow workspace or into
+/// auto-linked host dependency directories (`node_modules`, `.venv`, `venv`), and never to
+/// `.env*` secret files or `.git/` internals.
 pub(crate) fn shadow_path_for_read(root: &Path, host_root: &Path, rel: &str) -> anyhow::Result<(String, PathBuf)> {
     let rel_path = shadow_relative(rel)?;
+    let rel_str = rel_path.to_string_lossy().into_owned();
+    reject_secret_or_git_workspace_path(&rel_str)?;
     let full = root.join(&rel_path);
     let real = std::fs::canonicalize(&full)
         .with_context(|| format!("File '{}' not found in CoW workspace", rel_path.display()))?;
-    let allowed = [root, host_root]
-        .iter()
-        .filter_map(|r| std::fs::canonicalize(r).ok())
-        .any(|r| real.starts_with(&r));
-    if !allowed {
-        bail!(
-            "Refusing to read '{}': it resolves outside the shadow workspace and host repo",
-            rel_path.display()
-        );
+    let canon_shadow = std::fs::canonicalize(root).ok();
+    let canon_host = std::fs::canonicalize(host_root).ok();
+
+    if let Some(ref cs) = canon_shadow {
+        if let Ok(inner_rel) = real.strip_prefix(cs) {
+            reject_secret_or_git_workspace_path(&inner_rel.to_string_lossy())?;
+            return Ok((rel_str, real));
+        }
     }
-    Ok((rel_path.to_string_lossy().into_owned(), real))
+
+    if let Some(ref ch) = canon_host {
+        if let Ok(host_rel) = real.strip_prefix(ch) {
+            let through_dep_dir = rel_path.components().any(|c| {
+                matches!(
+                    c,
+                    std::path::Component::Normal(seg)
+                        if matches!(seg.to_str(), Some("node_modules" | ".venv" | "venv"))
+                )
+            });
+            if !through_dep_dir {
+                bail!(
+                    "Refusing to read '{}': host symlink targets outside dependency directories (node_modules/.venv/venv) are forbidden",
+                    rel_path.display()
+                );
+            }
+            reject_secret_or_git_workspace_path(&host_rel.to_string_lossy())?;
+            return Ok((rel_str, real));
+        }
+    }
+
+    bail!(
+        "Refusing to read '{}': it resolves outside the shadow workspace and host repo",
+        rel_path.display()
+    );
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -228,6 +272,7 @@ pub(crate) fn strip_root_matching_macos_private(path: &Path, root: &Path) -> Opt
 
 pub(crate) fn open_and_read_no_symlink(root: &Path, rel: &Path) -> anyhow::Result<(PathBuf, Vec<u8>)> {
     use std::io::Read;
+    reject_secret_or_git_workspace_path(&rel.to_string_lossy())?;
     let canon_root = std::fs::canonicalize(root)
         .with_context(|| format!("Sandbox root '{}' is unavailable", root.display()))?;
     let mut cur = canon_root.clone();
@@ -259,12 +304,13 @@ pub(crate) fn open_and_read_no_symlink(root: &Path, rel: &Path) -> anyhow::Resul
         );
     }
     let canon_file = std::fs::canonicalize(&cur)?;
-    if !canon_file.starts_with(&canon_root) {
+    let Ok(canon_rel) = canon_file.strip_prefix(&canon_root) else {
         bail!(
             "Refusing to read '{}': resolves outside allowed sandbox root",
             cur.display()
         );
-    }
+    };
+    reject_secret_or_git_workspace_path(&canon_rel.to_string_lossy())?;
 
     let mut opts = std::fs::OpenOptions::new();
     opts.read(true);
@@ -390,20 +436,6 @@ pub(crate) fn canonicalize_export_dest_no_trailing_symlink(
     Ok(resolved_parent.join(file_name))
 }
 
-pub(crate) fn strip_nested_test_tmpdir(s: &str) -> &str {
-    if std::env::var("AEGIS_ALLOW_NESTED_TEST_SANDBOX").as_deref() != Ok("1") {
-        return s;
-    }
-    let Some(idx) = s.find("/agent_home/.tmp") else {
-        return s;
-    };
-    let rest = &s[idx + "/agent_home/".len()..];
-    match rest.find('/') {
-        Some(slash) => &rest[slash..],
-        None => "",
-    }
-}
-
 pub(crate) fn is_forbidden_export_dest(raw: &str, canonical: &str) -> bool {
     const RING0_MARKERS: &[&str] = &[
         "/.ssh",
@@ -454,7 +486,8 @@ pub(crate) fn is_forbidden_export_dest(raw: &str, canonical: &str) -> bool {
         "/Library/LaunchDaemons/",
     ];
     for candidate in [raw, canonical] {
-        let candidate_folded = strip_nested_test_tmpdir(candidate).to_ascii_lowercase();
+        let candidate_folded =
+            aos_core::security::strip_nested_test_tmpdir(candidate).to_ascii_lowercase();
         if RING0_MARKERS
             .iter()
             .any(|m| candidate_folded.contains(&m.to_ascii_lowercase()))

@@ -169,17 +169,14 @@ impl PaasControlPlane {
         hex::encode(outer.finalize())
     }
 
-    /// Constant-time comparison for secrets and hex digests (ASCII case-insensitive, so hex
-    /// signatures match regardless of case). Length is not secret.
+    /// Constant-time exact comparison for bearer/admin secrets. Case-sensitive; rejects empty.
     pub fn secrets_match(provided: &str, expected: &str) -> bool {
-        let (a, b) = (provided.as_bytes(), expected.as_bytes());
-        if a.is_empty() || a.len() != b.len() {
-            return false;
-        }
-        a.iter()
-            .zip(b)
-            .fold(0u8, |acc, (x, y)| acc | (x.to_ascii_lowercase() ^ y.to_ascii_lowercase()))
-            == 0
+        aos_core::security::ct_eq_str(provided, expected)
+    }
+
+    /// Constant-time ASCII case-insensitive comparison for hexadecimal HMAC/SHA-256 digests.
+    pub fn hex_digests_match(provided: &str, expected: &str) -> bool {
+        aos_core::security::ct_eq_hex(provided, expected)
     }
 
     /// Verify webhook HMAC-SHA256 signature from Polar.sh, Lemon Squeezy, or Stripe. Fails closed:
@@ -189,6 +186,18 @@ impl PaasControlPlane {
         headers: &std::collections::HashMap<String, String>,
         raw_body: &str,
     ) -> bool {
+        Self::verify_webhook_signature_at(secret, headers, raw_body, Utc::now().timestamp())
+    }
+
+    /// Same as [`Self::verify_webhook_signature`], parameterized by current Unix timestamp (seconds)
+    /// for deterministic Stripe replay-window enforcement (`±300s`).
+    pub fn verify_webhook_signature_at(
+        secret: &str,
+        headers: &std::collections::HashMap<String, String>,
+        raw_body: &str,
+        now_unix_secs: i64,
+    ) -> bool {
+        const STRIPE_TOLERANCE_SECS: i64 = 300;
         let secret = secret.trim();
         if secret.is_empty() {
             return false;
@@ -208,13 +217,13 @@ impl PaasControlPlane {
                     .strip_prefix("sha256=")
                     .or_else(|| sig_val.trim().strip_prefix("v1="))
                     .unwrap_or(sig_val.trim());
-                if Self::secrets_match(cleaned, &expected_hex) {
+                if Self::hex_digests_match(cleaned, &expected_hex) {
                     return true;
                 }
             }
         }
 
-        // 2. Stripe (`stripe-signature: t=1700000,v1=<hex>`)
+        // 2. Stripe (`stripe-signature: t=1700000,v1=<hex>`) with ±300s replay tolerance
         if let Some(stripe_sig) = headers.get("stripe-signature") {
             let mut ts = "";
             let mut v1 = "";
@@ -226,14 +235,19 @@ impl PaasControlPlane {
                 }
             }
             if !ts.is_empty() && !v1.is_empty() {
-                let signed_payload = format!("{}.{}", ts, raw_body);
-                let stripe_expected =
-                    Self::hmac_sha256_hex(secret.as_bytes(), signed_payload.as_bytes());
-                if Self::secrets_match(v1, &stripe_expected) {
-                    return true;
+                if let Ok(ts_val) = ts.parse::<i64>() {
+                    if (now_unix_secs - ts_val).abs() <= STRIPE_TOLERANCE_SECS {
+                        let signed_payload = format!("{}.{}", ts, raw_body);
+                        let stripe_expected =
+                            Self::hmac_sha256_hex(secret.as_bytes(), signed_payload.as_bytes());
+                        if Self::hex_digests_match(v1, &stripe_expected) {
+                            return true;
+                        }
+                    }
                 }
+                return false;
             }
-            if Self::secrets_match(stripe_sig.trim(), &expected_hex) {
+            if !stripe_sig.contains("t=") && Self::hex_digests_match(stripe_sig.trim(), &expected_hex) {
                 return true;
             }
         }
@@ -372,7 +386,7 @@ impl PaasControlPlane {
             return None;
         }
         let expected_mac = Self::hmac_sha256_hex(key.as_bytes(), payload.as_bytes());
-        if !Self::secrets_match(mac, &expected_mac) {
+        if !Self::hex_digests_match(mac, &expected_mac) {
             return None;
         }
         let org_bytes = URL_SAFE_NO_PAD.decode(org_b64).ok()?;
@@ -553,7 +567,7 @@ impl PaasControlPlane {
             let rec = state
                 .approver_enrollments
                 .iter()
-                .find(|e| Self::secrets_match(&e.token_sha256, &hash) && e.expires_at_ms > now)
+                .find(|e| Self::hex_digests_match(&e.token_sha256, &hash) && e.expires_at_ms > now)
                 .cloned()
                 .context("This enrollment link is invalid, expired or already used")?;
             // One approver device per org: every outstanding link for it dies with this one.
@@ -613,6 +627,26 @@ impl PaasControlPlane {
             state.approvers.retain(|a| a.org_id != org_owned);
             state.approver_enrollments.retain(|e| e.org_id != org_owned);
             Ok(before != state.approvers.len())
+        })
+        .await
+    }
+
+    #[cfg(test)]
+    pub(crate) async fn enroll_approver_for_test(&self, org_id: &str) -> anyhow::Result<String> {
+        let org_owned = org_id.to_string();
+        self.with_state_mut(move |state| {
+            let _ = Self::new_approver(
+                state,
+                &org_owned,
+                Some("ops@example.com".to_string()),
+                "test",
+            );
+            state
+                .approvers
+                .iter()
+                .find(|a| a.org_id == org_owned)
+                .map(|a| a.secret_hex.clone())
+                .context("enrolled approver missing")
         })
         .await
     }
@@ -1081,7 +1115,8 @@ mod tests {
     #[test]
     fn secrets_match_is_exact_and_rejects_empty() {
         assert!(PaasControlPlane::secrets_match("s3cret", "s3cret"));
-        assert!(PaasControlPlane::secrets_match("ABCDEF", "abcdef"));
+        assert!(!PaasControlPlane::secrets_match("ABCDEF", "abcdef"));
+        assert!(PaasControlPlane::hex_digests_match("ABCDEF", "abcdef"));
         assert!(!PaasControlPlane::secrets_match("s3cret", "s3cre"));
         assert!(!PaasControlPlane::secrets_match("s3cret", "s3creT!"));
         assert!(!PaasControlPlane::secrets_match("", ""));
@@ -1112,7 +1147,18 @@ mod tests {
         let v1 = PaasControlPlane::hmac_sha256_hex(b"whsec", stripe_payload.as_bytes());
         let mut stripe = HashMap::new();
         stripe.insert("stripe-signature".to_string(), format!("t=1700000000,v1={v1}"));
-        assert!(PaasControlPlane::verify_webhook_signature("whsec", &stripe, body));
+        assert!(PaasControlPlane::verify_webhook_signature_at(
+            "whsec",
+            &stripe,
+            body,
+            1_700_000_050
+        ));
+        assert!(!PaasControlPlane::verify_webhook_signature_at(
+            "whsec",
+            &stripe,
+            body,
+            1_700_000_500
+        ));
     }
 
     #[tokio::test]

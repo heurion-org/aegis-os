@@ -1742,7 +1742,7 @@ impl McpRegistryClient {
         }
         let servers = root
             .as_object_mut()
-            .expect("object")
+            .context("registry JSON root is not an object")?
             .entry("mcpServers")
             .or_insert_with(|| json!({}));
         if !servers.is_object() {
@@ -1771,7 +1771,7 @@ impl McpRegistryClient {
         };
         servers
             .as_object_mut()
-            .expect("mcpServers object")
+            .context("normalized mcpServers is not an object")?
             .insert(candidate.server_id.clone(), entry);
 
         let pretty = format!("{}\n", serde_json::to_string_pretty(&root)?);

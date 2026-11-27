@@ -13,3 +13,6 @@ async-trait.workspace = true
 tokio.workspace = true
 uuid.workspace = true
 chrono.workspace = true
+
+[dev-dependencies]
+aos-core = { workspace = true, features = ["nested-test-sandbox"] }

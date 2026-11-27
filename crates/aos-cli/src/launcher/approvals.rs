@@ -1,4 +1,8 @@
 use super::*;
+use axum::extract::Request;
+use axum::http::{header, HeaderName, HeaderValue, StatusCode};
+use axum::middleware::{self, Next};
+use axum::response::{IntoResponse, Response};
 
 #[derive(Clone)]
 pub(super) struct ApprovalState {
@@ -22,13 +26,54 @@ pub(super) fn html_escape(value: &str) -> String {
         .replace('<', "&lt;")
         .replace('>', "&gt;")
         .replace('"', "&quot;")
+        .replace('\'', "&#39;")
+}
+
+fn is_loopback_host(host: &str) -> bool {
+    let hostname = host
+        .rsplit_once(':')
+        .map(|(hostname, _)| hostname)
+        .unwrap_or(host);
+    matches!(hostname, "127.0.0.1" | "localhost" | "[::1]")
+}
+
+async fn loopback_and_security_headers(request: Request, next: Next) -> Response {
+    let host = request
+        .headers()
+        .get(header::HOST)
+        .and_then(|value| value.to_str().ok())
+        .unwrap_or_default();
+    if !is_loopback_host(host) {
+        return (
+            StatusCode::FORBIDDEN,
+            Html("<h1>403 Forbidden: loopback host required</h1>".to_string()),
+        )
+            .into_response();
+    }
+    let mut resp = next.run(request).await;
+    let headers = resp.headers_mut();
+    headers.insert(header::CACHE_CONTROL, HeaderValue::from_static("no-store"));
+    headers.insert(header::REFERRER_POLICY, HeaderValue::from_static("no-referrer"));
+    headers.insert(
+        header::X_CONTENT_TYPE_OPTIONS,
+        HeaderValue::from_static("nosniff"),
+    );
+    headers.insert(header::X_FRAME_OPTIONS, HeaderValue::from_static("DENY"));
+    headers.insert(
+        HeaderName::from_static("content-security-policy"),
+        HeaderValue::from_static(
+            "default-src 'none'; style-src 'unsafe-inline'; base-uri 'none'; form-action 'self'; frame-ancestors 'none'",
+        ),
+    );
+    resp
 }
 
 pub(super) async fn approvals_index(
     State(state): State<ApprovalState>,
     Query(query): Query<TokenQuery>,
 ) -> Html<String> {
-    if query.token.as_deref() != Some(state.token.as_str()) {
+    let provided = query.token.as_deref().unwrap_or("");
+    if !aos_core::security::ct_eq_str(provided, &state.token) {
         return Html("<h1>401 Unauthorized</h1>".to_string());
     }
     let mut rows = String::new();
@@ -47,12 +92,12 @@ pub(super) async fn approvals_index(
                     .join("<br>")
             })
             .unwrap_or_default();
+        let safe_id_attr = html_escape(id);
+        let safe_token = html_escape(&state.token);
         let actions = if status == "pending" {
             format!(
-                "<form method=post action='/approve/{id}'><input type=hidden name=token value='{}'><button>Approve</button></form>\
-                 <form method=post action='/deny/{id}'><input type=hidden name=token value='{}'><button>Deny</button></form>",
-                html_escape(&state.token),
-                html_escape(&state.token)
+                "<form method=post action='/approve/{safe_id_attr}'><input type=hidden name=token value='{safe_token}'><button>Approve</button></form>\
+                 <form method=post action='/deny/{safe_id_attr}'><input type=hidden name=token value='{safe_token}'><button>Deny</button></form>"
             )
         } else {
             String::new()
@@ -82,7 +127,7 @@ pub(super) async fn approvals_web_approve(
     AxumPath(id): AxumPath<String>,
     Form(form): Form<DecisionForm>,
 ) -> Html<String> {
-    if form.token != state.token {
+    if !aos_core::security::ct_eq_str(&form.token, &state.token) {
         return Html("<h1>401 Unauthorized</h1>".to_string());
     }
     let message = match approval_decide(&state.runtime_dir, &id, true).await {
@@ -101,7 +146,7 @@ pub(super) async fn approvals_web_deny(
     AxumPath(id): AxumPath<String>,
     Form(form): Form<DecisionForm>,
 ) -> Html<String> {
-    if form.token != state.token {
+    if !aos_core::security::ct_eq_str(&form.token, &state.token) {
         return Html("<h1>401 Unauthorized</h1>".to_string());
     }
     let message = match approval_decide(&state.runtime_dir, &id, false).await {
@@ -129,6 +174,7 @@ pub(crate) async fn approvals_serve(
         .route("/", get(approvals_index))
         .route("/approve/:id", post(approvals_web_approve))
         .route("/deny/:id", post(approvals_web_deny))
+        .layer(middleware::from_fn(loopback_and_security_headers))
         .with_state(state);
     let listener = tokio::net::TcpListener::bind(("127.0.0.1", port)).await?;
     let addr = listener.local_addr()?;
@@ -387,4 +433,76 @@ pub(crate) async fn approval_decide(runtime_dir: &Path, id: &str, approve: bool)
         id
     );
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    #[test]
+    fn html_escape_neutralizes_quotes_and_tags() {
+        let evil = "esc' onclick='alert(1)'><script>";
+        let escaped = html_escape(evil);
+        assert!(!escaped.contains('\''));
+        assert!(!escaped.contains('<'));
+        assert!(!escaped.contains('>'));
+        assert!(escaped.contains("&#39;"));
+    }
+
+    #[tokio::test]
+    async fn approvals_router_blocks_non_loopback_host_and_sets_security_headers() {
+        let tmp = tempfile::tempdir().unwrap();
+        let state = ApprovalState {
+            runtime_dir: tmp.path().to_path_buf(),
+            token: "tok-secret-123".to_string(),
+        };
+        let app = Router::new()
+            .route("/", get(approvals_index))
+            .layer(middleware::from_fn(loopback_and_security_headers))
+            .with_state(state);
+        let bind_target = std::env::var("AOS_LOOPBACK_PORTS")
+            .ok()
+            .and_then(|ports| {
+                ports
+                    .split(',')
+                    .filter_map(|s| s.trim().parse::<u16>().ok())
+                    .nth(2)
+            })
+            .map(|p| format!("127.0.0.1:{p}"))
+            .unwrap_or_else(|| "127.0.0.1:0".to_string());
+        let listener = tokio::net::TcpListener::bind(&bind_target).await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let srv = tokio::spawn(async move {
+            let _ = axum::serve(listener, app).await;
+        });
+
+        // Non-loopback Host header (DNS rebinding) must fail with 403
+        let mut s_bad = tokio::net::TcpStream::connect(addr).await.unwrap();
+        s_bad
+            .write_all(b"GET /?token=tok-secret-123 HTTP/1.1\r\nHost: evil.example:8080\r\nConnection: close\r\n\r\n")
+            .await
+            .unwrap();
+        let mut bad_raw = String::new();
+        s_bad.read_to_string(&mut bad_raw).await.unwrap();
+        assert!(bad_raw.contains("403 Forbidden"), "{bad_raw}");
+
+        // Loopback Host header succeeds with CSP & X-Frame-Options
+        let mut s_ok = tokio::net::TcpStream::connect(addr).await.unwrap();
+        s_ok.write_all(
+            format!("GET /?token=tok-secret-123 HTTP/1.1\r\nHost: {addr}\r\nConnection: close\r\n\r\n")
+                .as_bytes(),
+        )
+        .await
+        .unwrap();
+        let mut ok_raw = String::new();
+        s_ok.read_to_string(&mut ok_raw).await.unwrap();
+        let lower_ok = ok_raw.to_ascii_lowercase();
+        assert!(ok_raw.contains("200 OK"), "{ok_raw}");
+        assert!(lower_ok.contains("x-frame-options: deny"), "{ok_raw}");
+        assert!(lower_ok.contains("content-security-policy:"), "{ok_raw}");
+        assert!(ok_raw.contains("Aegis Approval Console"), "{ok_raw}");
+
+        srv.abort();
+    }
 }

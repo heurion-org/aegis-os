@@ -904,54 +904,10 @@ pub fn canonicalize_lossy(p: &Path) -> PathBuf {
 /// host build artifacts or executables outside the CoW shadow transaction.
 const NATIVE_WRITE_ALLOWED_DIRS: &[&str] = &[".gemini", ".antigravity", "brain"];
 
-fn strip_nested_test_tmpdir(s: &str) -> &str {
-    if !cfg!(test)
-        && std::env::var_os("AOS_SANDBOX_ID").is_none()
-        && std::env::var("AEGIS_ALLOW_NESTED_TEST_SANDBOX").as_deref() != Ok("1")
-    {
-        return s;
-    }
-    let after_prefix = [
-        "/agent_home/tmp/.tmp",
-        "/agent_home/.tmp",
-        "/home/tmp/.tmp",
-        "/home/.tmp",
-    ]
-    .into_iter()
-    .find_map(|needle| {
-        let idx = s.find(needle)?;
-        if needle.starts_with("/home/") {
-            let prefix = &s[..idx];
-            if !(prefix.contains("/.aegis/orgs/") && prefix.contains("/agents/")) {
-                return None;
-            }
-            let dir_end = if needle.starts_with("/home/tmp/") {
-                idx + "/home/tmp/".len()
-            } else {
-                idx + "/home/".len()
-            };
-            return Some(&s[dir_end..]);
-        }
-        let dir_end = if needle.starts_with("/agent_home/tmp/") {
-            idx + "/agent_home/tmp/".len()
-        } else {
-            idx + "/agent_home/".len()
-        };
-        Some(&s[dir_end..])
-    });
-
-    let Some(rest) = after_prefix else {
-        return s;
-    };
-    match rest.find('/') {
-        Some(slash) => &rest[slash..],
-        None => "",
-    }
-}
-
 fn is_protected_runtime_state_path(raw: &str, canonical: &str) -> bool {
     for s in [raw, canonical] {
-        let s_checked = aos_policy::ring0::normalize_for_match(strip_nested_test_tmpdir(s));
+        let s_checked =
+            aos_policy::ring0::normalize_for_match(aos_core::security::strip_nested_test_tmpdir(s));
         if aos_policy::ring0::contains_runtime_state_marker(&s_checked) {
             return true;
         }

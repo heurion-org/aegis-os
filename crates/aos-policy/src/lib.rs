@@ -281,38 +281,11 @@ impl AegisPolicyKernel {
         changed
     }
 
-    fn strip_nested_test_tmpdir(s: &str) -> &str {
-        if std::env::var("AEGIS_ALLOW_NESTED_TEST_SANDBOX").as_deref() != Ok("1") {
-            return s;
-        }
-        let temp_dir_str = std::env::temp_dir().to_string_lossy().into_owned();
-        let temp_norm = temp_dir_str.trim_end_matches('/');
-        let has_real_tmp_prefix = s.starts_with("/tmp/")
-            || s.starts_with("/private/tmp/")
-            || s.starts_with("/var/folders/")
-            || s.starts_with("/private/var/folders/")
-            || (!temp_norm.is_empty() && s.starts_with(&format!("{temp_norm}/")));
-        if !has_real_tmp_prefix {
-            return s;
-        }
-        let Some(idx) = s.find("/agent_home/.tmp") else {
-            return s;
-        };
-        if s[..idx].contains("/../") || s[..idx].ends_with("/..") {
-            return s;
-        }
-        let rest = &s[idx + "/agent_home/".len()..];
-        match rest.find('/') {
-            Some(slash) => &rest[slash..],
-            None => "",
-        }
-    }
-
     /// Returns true if a relative workspace path can trigger automatic code execution on the host
     /// during git operations, directory entry (`direnv`), CI runs, or build-system invocation
     /// (`build.rs`, `Makefile`, `package.json`, `.cargo/config.toml`, `.vscode/tasks.json`).
     pub fn is_commit_poisoning_path(p: &str) -> bool {
-        let p = Self::strip_nested_test_tmpdir(p);
+        let p = aos_core::security::strip_nested_test_tmpdir(p);
         // Case-fold before matching: on case-insensitive filesystems (APFS/HFS+ default, NTFS)
         // `.GIT/hooks/x` or `.GitHub/Workflows/x.yml` lands on the real `.git/hooks/x` /
         // `.github/workflows/x.yml`. All literals below are therefore lowercase.
@@ -394,16 +367,11 @@ impl AegisPolicyKernel {
     /// Returns true when a host path points to credentials, runtime internals, or dotenv secrets
     /// that must never be imported via `fs_import_file`.
     pub fn is_forbidden_import_source(p: &str) -> bool {
-        let res = Self::strip_nested_test_tmpdir(p);
+        let res = aos_core::security::strip_nested_test_tmpdir(p);
         // Case-fold: `~/.SSH/id_rsa` names the same file as `~/.ssh/id_rsa` on APFS/NTFS.
         let norm = res.replace('\\', "/").to_lowercase();
         let file_name = norm.rsplit('/').next().unwrap_or(&norm);
-        if (file_name == ".env" || file_name.starts_with(".env."))
-            && !matches!(
-                file_name,
-                ".env.example" | ".env.sample" | ".env.template" | ".env.dist" | ".env.schema"
-            )
-        {
+        if aos_core::security::is_dotenv_secret_filename(file_name) {
             return true;
         }
         [
@@ -707,6 +675,11 @@ impl AegisPolicyKernel {
             trimmed.as_str()
         };
         let host = host.trim_end_matches('.');
+        if let Ok(ip) = host.parse::<std::net::IpAddr>() {
+            if aos_core::security::is_forbidden_outbound_ip(ip) {
+                return true;
+            }
+        }
         host == "localhost"
             || host == "127.0.0.1"
             || host == "::1"
@@ -717,6 +690,7 @@ impl AegisPolicyKernel {
             || host.starts_with("169.254.")
             || host.contains("::ffff:127.")
             || host.ends_with(".localhost")
+            || host == "metadata.google.internal"
     }
 
     pub async fn record_untrusted_taint(
@@ -1016,7 +990,8 @@ impl PolicyEngine for AegisPolicyKernel {
             });
         }
 
-        let redline_target = Self::strip_nested_test_tmpdir(&ctx.target_resource).to_lowercase();
+        let redline_target =
+            aos_core::security::strip_nested_test_tmpdir(&ctx.target_resource).to_lowercase();
         for forbidden in &self.forbidden_host_prefixes {
             let forbidden_folded = forbidden.to_lowercase();
             if redline_target.starts_with(&forbidden_folded)
@@ -1077,7 +1052,7 @@ impl PolicyEngine for AegisPolicyKernel {
         // lease matching so even a wildcard lease can never export over git hooks/client configs or
         // import credentials / dotenv secrets).
         if ctx.action == "fs_export_file" {
-            let res = Self::strip_nested_test_tmpdir(ctx.target_resource.as_str());
+            let res = aos_core::security::strip_nested_test_tmpdir(ctx.target_resource.as_str());
             let res_folded = res.to_lowercase();
             let poisoned = Self::is_commit_poisoning_path(res)
                 || Self::PROTECTED_CLIENT_CONFIG_MARKERS

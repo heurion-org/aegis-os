@@ -265,12 +265,7 @@ impl SessionBroker {
             temp_control_dir = Some(short.clone());
             control_dir = short;
         }
-        std::fs::create_dir_all(&control_dir)?;
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::PermissionsExt;
-            let _ = std::fs::set_permissions(&control_dir, std::fs::Permissions::from_mode(0o700));
-        }
+        aos_core::security::create_private_dir_0700(&control_dir)?;
         let socket_path = control_dir.join("control.sock");
         let _ = std::fs::remove_file(&socket_path);
 
@@ -2038,12 +2033,7 @@ fn append_effect(path: &Path, event: &Value) {
 }
 
 fn token_eq(a: &str, b: &str) -> bool {
-    let a = a.as_bytes();
-    let b = b.as_bytes();
-    if a.len() != b.len() {
-        return false;
-    }
-    a.iter().zip(b).fold(0u8, |acc, (x, y)| acc | (x ^ y)) == 0
+    aos_core::security::ct_eq_str(a, b)
 }
 
 async fn write_empty_status<S>(stream: &mut S, status: &str) -> Result<()>

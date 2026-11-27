@@ -4790,7 +4790,7 @@ mod tests {
             Some(json!({
                 "org_id": "polar-org",
                 "workspace_id": "ws-polar-1",
-                "source_url": source_repo.to_string_lossy(),
+                "source_url": "cloud-sync",
                 "agents": ["agy-agent", "claude-code", "codex-cli"]
             })),
         )
@@ -10403,5 +10403,375 @@ time.sleep(60)
                 .is_err());
             assert_eq!(std::fs::read_to_string(&outside_file).unwrap(), "SECRET");
         }
+    }
+
+    #[tokio::test]
+    async fn phase1_fs_read_write_export_enforce_dotenv_git_and_host_symlink_isolation() {
+        let tmp = tempfile::tempdir().unwrap();
+        let host_repo = tmp.path().join("host_repo");
+        let rt_dir = tmp.path().join("rt");
+        std::fs::create_dir_all(host_repo.join(".git")).unwrap();
+        std::fs::create_dir_all(host_repo.join("node_modules/pkg")).unwrap();
+        std::fs::create_dir_all(&rt_dir).unwrap();
+        std::fs::write(host_repo.join(".env.example"), "PORT=8080\n").unwrap();
+        std::fs::write(host_repo.join(".git/config"), "[remote \"origin\"]\nurl=https://tok@github.com/a/b\n").unwrap();
+        std::fs::write(host_repo.join("README.md"), "# ok\n").unwrap();
+        std::fs::write(host_repo.join("node_modules/pkg/index.js"), "module.exports = 1;\n").unwrap();
+
+        let kernel = Arc::new(AegisRuntimeKernel::new(&rt_dir).await.unwrap());
+        let agent = AgentIdentity::new("sec-org", "agent-1", "Coder");
+        let env = kernel
+            .ensure_agent_environment(
+                agent.clone(),
+                &host_repo,
+                IsolationTier::NativeOsSandbox,
+                vec!["*".to_string()],
+            )
+            .await
+            .unwrap();
+
+        // Plant .env inside shadow AFTER CoWWorkspace::init (host .env cannot be read inside an outer Seatbelt test runner).
+        let _ = std::fs::write(env.workspace.shadow_root().join(".env"), "AWS_SECRET_ACCESS_KEY=secret123\n");
+
+        // Direct .env / .git access via MCP fs_read / fs_write / fs_edit / fs_export_file is blocked
+        for secret_rel in [".env", ".ENV", ".git/config", ".GIT/config"] {
+            let err_read = kernel
+                .call_tool(&agent, "fs_read", json!({ "path": secret_rel }))
+                .await
+                .unwrap_err()
+                .to_string();
+            assert!(
+                err_read.contains("Blocked by Aegis OS policy"),
+                "fs_read({secret_rel}) unexpected err: {err_read}"
+            );
+            let err_write = kernel
+                .call_tool(&agent, "fs_write", json!({ "path": secret_rel, "content": "x" }))
+                .await
+                .unwrap_err()
+                .to_string();
+            assert!(
+                err_write.contains("Blocked by Aegis OS policy"),
+                "fs_write({secret_rel}) unexpected err: {err_write}"
+            );
+        }
+        assert!(
+            kernel
+                .call_tool(
+                    &agent,
+                    "fs_edit",
+                    json!({ "path": ".env", "target": "secret123", "replacement": "x" })
+                )
+                .await
+                .is_err()
+        );
+        let export_dst = tmp.path().join("out_env.txt");
+        assert!(
+            kernel
+                .call_tool(
+                    &agent,
+                    "fs_export_file",
+                    json!({ "src_path": ".env", "dst_host_path": export_dst })
+                )
+                .await
+                .is_err()
+        );
+
+        // Non-secret template .env.example and host-linked node_modules remain readable
+        let ex = kernel
+            .call_tool(&agent, "fs_read", json!({ "path": ".env.example" }))
+            .await
+            .unwrap();
+        assert_eq!(ex["content"], "PORT=8080\n");
+        let dep = kernel
+            .call_tool(&agent, "fs_read", json!({ "path": "node_modules/pkg/index.js" }))
+            .await
+            .unwrap();
+        assert_eq!(dep["content"], "module.exports = 1;\n");
+
+        #[cfg(unix)]
+        {
+            // Planted symlink inside shadow pointing directly to host_repo/.git/config or host_repo/README.md is rejected
+            std::os::unix::fs::symlink(
+                host_repo.join(".git/config"),
+                env.workspace.shadow_root().join("leak_git"),
+            )
+            .unwrap();
+            std::os::unix::fs::symlink(
+                host_repo.join("README.md"),
+                env.workspace.shadow_root().join("leak_host_file"),
+            )
+            .unwrap();
+            assert!(kernel
+                .call_tool(&agent, "fs_read", json!({ "path": "leak_git" }))
+                .await
+                .is_err());
+            let err_host_link = kernel
+                .call_tool(&agent, "fs_read", json!({ "path": "leak_host_file" }))
+                .await
+                .unwrap_err()
+                .to_string();
+            assert!(
+                err_host_link.contains("outside dependency directories"),
+                "unexpected err for host symlink: {err_host_link}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn phase1_workspaces_ssrf_and_tenant_local_source_blocked() {
+        assert!(PaasControlPlane::is_ssrf_or_internal_git_url("git@127.0.0.1:org/repo.git"));
+        assert!(PaasControlPlane::is_ssrf_or_internal_git_url("https://[::ffff:127.0.0.1]/repo"));
+        assert!(PaasControlPlane::is_ssrf_or_internal_git_url("https://[fd00:ec2::254]/latest"));
+        assert!(PaasControlPlane::is_ssrf_or_internal_git_url("https://100.64.0.1/repo"));
+        assert!(PaasControlPlane::is_ssrf_or_internal_git_url("http://2130706433/repo"));
+        assert!(PaasControlPlane::is_ssrf_or_internal_git_url("http://0177.0.0.1/repo"));
+        assert!(PaasControlPlane::is_ssrf_or_internal_git_url("file:///etc/passwd"));
+        assert!(!PaasControlPlane::is_ssrf_or_internal_git_url("https://github.com/heurion-org/aegis-os.git"));
+
+        fn pick_loopback_bind(slot: usize) -> String {
+            if let Ok(ports) = std::env::var("AOS_LOOPBACK_PORTS") {
+                if let Some(p) = ports.split(',').filter_map(|s| s.trim().parse::<u16>().ok()).nth(slot) {
+                    return format!("127.0.0.1:{p}");
+                }
+            }
+            "127.0.0.1:0".to_string()
+        }
+
+        async fn http_call(
+            addr: std::net::SocketAddr,
+            method: &str,
+            path: &str,
+            auth: Option<&str>,
+            body: Option<Value>,
+        ) -> (String, Value) {
+            use tokio::io::{AsyncReadExt, AsyncWriteExt};
+            let mut stream = tokio::net::TcpStream::connect(addr).await.unwrap();
+            let body_str = body.map(|b| b.to_string()).unwrap_or_default();
+            let auth_hdr = auth
+                .map(|a| format!("Authorization: Bearer {}\r\n", a))
+                .unwrap_or_default();
+            let req = format!(
+                "{} {} HTTP/1.1\r\nHost: {}\r\n{}Content-Length: {}\r\n\r\n{}",
+                method,
+                path,
+                addr,
+                auth_hdr,
+                body_str.len(),
+                body_str
+            );
+            stream.write_all(req.as_bytes()).await.unwrap();
+            let mut buf = Vec::new();
+            stream.read_to_end(&mut buf).await.unwrap();
+            let raw = String::from_utf8_lossy(&buf).to_string();
+            let (head, b) = raw.split_once("\r\n\r\n").unwrap_or((&raw, "{}"));
+            let parsed = serde_json::from_str::<Value>(b).unwrap_or_else(|_| json!({ "raw": b }));
+            (head.to_string(), parsed)
+        }
+
+        let tmp = tempfile::tempdir().unwrap();
+        let default_ws = tmp.path().join("server_secret_ws");
+        let victim_dir = tmp.path().join("victim_host_dir");
+        std::fs::create_dir_all(&default_ws).unwrap();
+        std::fs::create_dir_all(&victim_dir).unwrap();
+        std::fs::write(default_ws.join("TOP_SECRET.txt"), "do_not_leak").unwrap();
+        std::fs::write(victim_dir.join("private.txt"), "victim_data").unwrap();
+
+        let kernel = Arc::new(AegisRuntimeKernel::new(&tmp.path().join("rt")).await.unwrap());
+        let addr = kernel
+            .clone()
+            .start_http_daemon_with_auth(&pick_loopback_bind(0), default_ws.clone(), DaemonAuth::Required)
+            .await
+            .unwrap();
+
+        let (k_head, k_resp) = http_call(
+            addr,
+            "POST",
+            "/v1/tenants/keys",
+            None,
+            Some(json!({ "org_id": "tenant-ssrf-test" })),
+        )
+        .await;
+        assert!(k_head.contains("200 OK"), "{k_head}");
+        let api_key = k_resp["api_key"].as_str().unwrap().to_string();
+
+        // Tenant passing local path must receive 403 Forbidden
+        let (bad_head, _) = http_call(
+            addr,
+            "POST",
+            "/v1/workspaces",
+            Some(&api_key),
+            Some(json!({
+                "org_id": "tenant-ssrf-test",
+                "workspace_id": "ws-evil",
+                "source_url": victim_dir.to_string_lossy()
+            })),
+        )
+        .await;
+        assert!(bad_head.contains("403 Forbidden"), "expected 403, got {bad_head}");
+
+        // Tenant omitting source_url creates an empty cloud-sync repo and does NOT clone server default_ws
+        let (ok_head, ok_resp) = http_call(
+            addr,
+            "POST",
+            "/v1/workspaces",
+            Some(&api_key),
+            Some(json!({
+                "org_id": "tenant-ssrf-test",
+                "workspace_id": "ws-safe"
+            })),
+        )
+        .await;
+        assert!(ok_head.contains("200 OK"), "expected 200, got {ok_head} {ok_resp}");
+        let host_repo = PathBuf::from(ok_resp["workspace"]["host_repo_path"].as_str().unwrap());
+        assert!(!host_repo.join("TOP_SECRET.txt").exists());
+    }
+
+    #[tokio::test]
+    async fn phase1_http_daemon_hardening_and_host_exec_totp_single_consume() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        fn pick_loopback_bind(slot: usize) -> String {
+            if let Ok(ports) = std::env::var("AOS_LOOPBACK_PORTS") {
+                if let Some(p) = ports.split(',').filter_map(|s| s.trim().parse::<u16>().ok()).nth(slot) {
+                    return format!("127.0.0.1:{p}");
+                }
+            }
+            "127.0.0.1:0".to_string()
+        }
+        async fn http_call(
+            addr: std::net::SocketAddr,
+            method: &str,
+            path: &str,
+            auth: Option<&str>,
+            body: Option<Value>,
+        ) -> (String, Value) {
+            let mut stream = tokio::net::TcpStream::connect(addr).await.unwrap();
+            let body_str = body.map(|b| b.to_string()).unwrap_or_default();
+            let auth_hdr = auth
+                .map(|a| format!("Authorization: Bearer {}\r\n", a))
+                .unwrap_or_default();
+            let req = format!(
+                "{} {} HTTP/1.1\r\nHost: {}\r\n{}Content-Length: {}\r\n\r\n{}",
+                method,
+                path,
+                addr,
+                auth_hdr,
+                body_str.len(),
+                body_str
+            );
+            stream.write_all(req.as_bytes()).await.unwrap();
+            let mut buf = Vec::new();
+            stream.read_to_end(&mut buf).await.unwrap();
+            let raw = String::from_utf8_lossy(&buf).to_string();
+            let (head, b) = raw.split_once("\r\n\r\n").unwrap_or((&raw, "{}"));
+            let parsed = serde_json::from_str::<Value>(b).unwrap_or_else(|_| json!({ "raw": b }));
+            (head.to_string(), parsed)
+        }
+
+        let tmp = tempfile::tempdir().unwrap();
+        let ws = tmp.path().join("ws");
+        std::fs::create_dir_all(&ws).unwrap();
+        let kernel = Arc::new(AegisRuntimeKernel::new(&tmp.path().join("rt")).await.unwrap());
+        let addr = kernel
+            .clone()
+            .start_http_daemon_with_auth(&pick_loopback_bind(1), ws, DaemonAuth::Required)
+            .await
+            .unwrap();
+        let op = kernel.operator_token();
+
+        // 1. HTML security headers + operator secrets_match case sensitivity
+        let (html_head, _) = http_call(addr, "GET", "/approve", None, None).await;
+        assert!(html_head.contains("X-Frame-Options: DENY"), "{html_head}");
+        assert!(html_head.contains("X-Content-Type-Options: nosniff"), "{html_head}");
+        assert!(html_head.contains("Content-Security-Policy:"), "{html_head}");
+
+        let wrong_case = op.to_ascii_uppercase();
+        if wrong_case != op {
+            let (auth_head, _) = http_call(addr, "GET", "/v1/status?org_id=*", Some(&wrong_case), None).await;
+            assert!(auth_head.contains("401 Unauthorized"), "operator secret must be case-sensitive: {auth_head}");
+        }
+
+        // 2. Reject Transfer-Encoding: chunked, conflicting Content-Length, and truncated body
+        let mut s1 = tokio::net::TcpStream::connect(addr).await.unwrap();
+        s1.write_all(b"POST /health HTTP/1.1\r\nHost: 127.0.0.1\r\nTransfer-Encoding: chunked\r\n\r\n0\r\n\r\n").await.unwrap();
+        let mut r1 = String::new();
+        s1.read_to_string(&mut r1).await.unwrap();
+        assert!(r1.contains("400 Bad Request"), "chunked must fail: {r1}");
+
+        let mut s2 = tokio::net::TcpStream::connect(addr).await.unwrap();
+        s2.write_all(b"POST /health HTTP/1.1\r\nHost: 127.0.0.1\r\nContent-Length: 2\r\nContent-Length: 5\r\n\r\nhi").await.unwrap();
+        let mut r2 = String::new();
+        s2.read_to_string(&mut r2).await.unwrap();
+        assert!(r2.contains("400 Bad Request"), "conflicting CL must fail: {r2}");
+
+        let mut s3 = tokio::net::TcpStream::connect(addr).await.unwrap();
+        s3.write_all(b"POST /v1/approvals/decide HTTP/1.1\r\nHost: 127.0.0.1\r\nContent-Length: 100\r\n\r\n{}").await.unwrap();
+        s3.shutdown().await.unwrap();
+        let mut r3 = String::new();
+        s3.read_to_string(&mut r3).await.unwrap();
+        assert!(r3.contains("408 Request Timeout"), "truncated body must fail: {r3}");
+
+        // 3. Single-consume TOTP during active_host_exec_runs() > 0 (tenant caller)
+        let (_, k_resp) = http_call(
+            addr,
+            "POST",
+            "/v1/tenants/keys",
+            None,
+            Some(json!({ "org_id": "totp-lock-org" })),
+        )
+        .await;
+        let tenant_key = k_resp["api_key"].as_str().unwrap().to_string();
+        let (_, sim_resp) = http_call(
+            addr,
+            "POST",
+            "/v1/approvals/simulate",
+            Some(&op),
+            Some(json!({ "org_id": "totp-lock-org", "agent_id": "agent-a" })),
+        )
+        .await;
+        let esc_id = sim_resp["escalation_id"].as_str().unwrap().to_string();
+
+        // Enroll approver for test org
+        let secret_hex = kernel
+            .paas
+            .enroll_approver_for_test("totp-lock-org")
+            .await
+            .unwrap();
+        let secret_bytes = hex::decode(secret_hex).unwrap();
+        let step = crate::approver::totp_step(chrono::Utc::now().timestamp()) as u64;
+        let code = format!("{:06}", crate::approver::hotp(&secret_bytes, step));
+
+        kernel.active_host_exec_runs.store(1, std::sync::atomic::Ordering::Release);
+        let (dec_head, dec_resp) = http_call(
+            addr,
+            "POST",
+            "/v1/approvals/decide",
+            Some(&tenant_key),
+            Some(json!({ "escalation_id": esc_id, "decision": "approve", "totp": code })),
+        )
+        .await;
+        kernel.active_host_exec_runs.store(0, std::sync::atomic::Ordering::Release);
+        assert!(
+            dec_head.contains("200 OK"),
+            "single TOTP during host_exec must succeed once: {dec_head} {dec_resp}"
+        );
+        // Replaying same TOTP code must fail
+        let (_, sim_resp2) = http_call(
+            addr,
+            "POST",
+            "/v1/approvals/simulate",
+            Some(&op),
+            Some(json!({ "org_id": "totp-lock-org", "agent_id": "agent-a" })),
+        )
+        .await;
+        let esc_id2 = sim_resp2["escalation_id"].as_str().unwrap().to_string();
+        let (replay_head, _) = http_call(
+            addr,
+            "POST",
+            "/v1/approvals/decide",
+            Some(&tenant_key),
+            Some(json!({ "escalation_id": esc_id2, "decision": "approve", "totp": code })),
+        )
+        .await;
+        assert!(replay_head.contains("403 Forbidden"), "replayed TOTP must fail: {replay_head}");
     }
 }

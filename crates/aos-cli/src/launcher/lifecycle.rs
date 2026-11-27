@@ -538,13 +538,11 @@ pub(super) struct ShortTempDir(pub(super) PathBuf);
 #[cfg(target_os = "macos")]
 impl ShortTempDir {
     pub(super) fn create(prefix: &str) -> anyhow::Result<Self> {
-        use std::os::unix::fs::PermissionsExt;
         let p = PathBuf::from(format!(
             "/tmp/{prefix}-{}",
             &uuid::Uuid::new_v4().simple().to_string()[..12]
         ));
-        std::fs::create_dir_all(&p)?;
-        std::fs::set_permissions(&p, std::fs::Permissions::from_mode(0o700))?;
+        aos_core::security::create_private_dir_0700(&p)?;
         Ok(Self(p))
     }
 }

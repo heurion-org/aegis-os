@@ -23,3 +23,5 @@ tempfile.workspace = true
 # to measure what each one contributes. Release builds must NOT enable it: without the feature
 # `ablated()` is a constant `false` and every ablation branch is compiled out.
 ablation = []
+# TEST-ONLY. Enables `strip_nested_test_tmpdir` when running `cargo test` inside an Aegis sandbox.
+nested-test-sandbox = []

@@ -453,12 +453,7 @@ impl MicroVmSandboxInstance {
 
         let short_id = &Uuid::new_v4().simple().to_string()[..12];
         let sock_dir = PathBuf::from(format!("/tmp/aos-vm-{short_id}"));
-        std::fs::create_dir_all(&sock_dir)?;
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::PermissionsExt;
-            let _ = std::fs::set_permissions(&sock_dir, std::fs::Permissions::from_mode(0o700));
-        }
+        aos_core::security::create_private_dir_0700(&sock_dir)?;
 
         let guest_ws_path = config
             .host_source_dir

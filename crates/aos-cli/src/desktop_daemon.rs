@@ -344,7 +344,7 @@ async fn require_human_token(
         .and_then(|v| v.to_str().ok())
         .unwrap_or("");
     let expected = format!("Bearer {}", state.human_token);
-    if auth != expected {
+    if !aos_core::security::ct_eq_str(auth, &expected) {
         return (
             StatusCode::UNAUTHORIZED,
             Json(json!({ "error": "unauthorized: valid human_token Bearer header required" })),

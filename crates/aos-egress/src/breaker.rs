@@ -403,7 +403,7 @@ impl SessionBreakerState {
         shared_pool: Option<Arc<SharedBudgetPool>>,
         soft_cap_bps: Option<u16>,
     ) {
-        let mut g = self.inner.lock().expect("breaker lock poisoned");
+        let mut g = self.inner.lock().unwrap_or_else(|e| e.into_inner());
         g.policy = policy;
         g.shared_pool = shared_pool;
         g.soft_cap_bps = soft_cap_bps;
@@ -414,7 +414,7 @@ impl SessionBreakerState {
     }
 
     pub fn snapshot(&self, pseudonyms_active: usize, pseudonym_replacements: u64) -> UsageSnapshot {
-        let g = self.inner.lock().expect("breaker lock poisoned");
+        let g = self.inner.lock().unwrap_or_else(|e| e.into_inner());
         UsageSnapshot {
             input_tokens: g.input_tokens,
             output_tokens: g.output_tokens,
@@ -435,7 +435,7 @@ impl SessionBreakerState {
         add_tokens: u64,
         add_requests: u32,
     ) -> EgressGuardEvent {
-        let mut g = self.inner.lock().expect("breaker lock poisoned");
+        let mut g = self.inner.lock().unwrap_or_else(|e| e.into_inner());
         if add_micro_usd > 0 {
             g.policy.max_cost_micro_usd = Some(
                 g.policy
@@ -502,7 +502,7 @@ impl SessionBreakerState {
         let est_in = ((req_body.len() / 4) as u64).max(1);
         let est_cost = pricing.estimate_preflight_cost_micro_usd(&model, est_in);
 
-        let mut g = self.inner.lock().expect("breaker lock poisoned");
+        let mut g = self.inner.lock().unwrap_or_else(|e| e.into_inner());
         if let Some(ref existing) = g.tripped {
             return Err(Box::new((existing.clone(), None)));
         }
@@ -628,7 +628,7 @@ impl SessionBreakerState {
             0
         };
 
-        let mut g = self.inner.lock().expect("breaker lock poisoned");
+        let mut g = self.inner.lock().unwrap_or_else(|e| e.into_inner());
         let pool = g.shared_pool.clone();
         g.inflight_tokens = g.inflight_tokens.saturating_sub(res.reserved_tokens);
         g.inflight_cost_micro_usd = g
@@ -694,7 +694,7 @@ impl SessionBreakerState {
     }
 
     pub fn cancel_reservation(&self, res: PreFlightReservation) {
-        let mut g = self.inner.lock().expect("breaker lock poisoned");
+        let mut g = self.inner.lock().unwrap_or_else(|e| e.into_inner());
         let pool = g.shared_pool.clone();
         g.requests = g.requests.saturating_sub(1);
         g.inflight_tokens = g.inflight_tokens.saturating_sub(res.reserved_tokens);

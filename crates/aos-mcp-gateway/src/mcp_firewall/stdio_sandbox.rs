@@ -814,20 +814,12 @@ pub(super) async fn spawn_upstream_stdio(
                     "/tmp/aos-mcp-net-{}",
                     &Uuid::new_v4().simple().to_string()[..12]
                 ));
-                if let Err(e) = std::fs::create_dir_all(&dir) {
+                if let Err(e) = aos_core::security::create_private_dir_0700(&dir) {
                     if !allow_unisolated_fallback {
                         proxy_handle.abort();
                         return Err(e).context("creating Linux stdio egress bridge temp dir");
                     }
                 } else {
-                    #[cfg(unix)]
-                    {
-                        use std::os::unix::fs::PermissionsExt;
-                        let _ = std::fs::set_permissions(
-                            &dir,
-                            std::fs::Permissions::from_mode(0o700),
-                        );
-                    }
                     let sock = dir.join("b.s");
                     let tok = aos_sandbox::bridge::new_token();
                     match aos_sandbox::bridge::spawn_host_bridge(
@@ -1042,7 +1034,7 @@ pub(super) async fn spawn_upstream_stdio(
                             let _ = write_jsonrpc_line(&mut sw, &reply).await;
                         }
                         let sent_to_active = {
-                            let guard = pending_reader.lock().unwrap();
+                            let guard = pending_reader.lock().unwrap_or_else(|e| e.into_inner());
                             if let Some(ref pending) = *guard {
                                 if let Some(ref tx) = pending.notif_tx {
                                     tx.send(msg.clone()).is_ok()
@@ -1057,7 +1049,7 @@ pub(super) async fn spawn_upstream_stdio(
                             if idle_tx_reader.receiver_count() > 0 {
                                 let _ = idle_tx_reader.send(msg);
                             } else {
-                                let mut q = idle_queue_reader.lock().unwrap();
+                                let mut q = idle_queue_reader.lock().unwrap_or_else(|e| e.into_inner());
                                 if q.len() >= 32 {
                                     q.pop_front();
                                 }
@@ -1068,7 +1060,7 @@ pub(super) async fn spawn_upstream_stdio(
                     }
 
                     let matched_sender = {
-                        let mut guard = pending_reader.lock().unwrap();
+                        let mut guard = pending_reader.lock().unwrap_or_else(|e| e.into_inner());
                         let matches = match &*guard {
                             Some(p) => match (&p.expected_id, msg.get("id")) {
                                 (Some(exp), Some(got)) => exp == got,
@@ -1088,7 +1080,7 @@ pub(super) async fn spawn_upstream_stdio(
                     }
                 }
                 Err(err) => {
-                    let pending = pending_reader.lock().unwrap().take();
+                    let pending = pending_reader.lock().unwrap_or_else(|e| e.into_inner()).take();
                     if let Some(p) = pending {
                         let _ = p.resp_tx.send(Err(err));
                     }
@@ -1230,7 +1222,7 @@ pub(super) async fn send_stdio_rpc(
     let expected_id = request.get("id").cloned();
     let (resp_tx, resp_rx) = tokio::sync::oneshot::channel();
     {
-        let mut guard = proc_state.pending_rpc.lock().unwrap();
+        let mut guard = proc_state.pending_rpc.lock().unwrap_or_else(|e| e.into_inner());
         *guard = Some(PendingStdioRpc {
             expected_id,
             resp_tx,
@@ -1307,7 +1299,7 @@ pub(super) async fn warm_stdio_tool_annotations(
         if resp.get("error").is_none() {
             if let Some(tools) = resp.pointer("/result/tools").and_then(|v| v.as_array()) {
                 if proc_state.annotations_epoch.load(Ordering::Acquire) == start_epoch {
-                    *proc_state.tool_annotations.lock().unwrap() = extract_annotations_map(tools);
+                    *proc_state.tool_annotations.lock().unwrap_or_else(|e| e.into_inner()) = extract_annotations_map(tools);
                     proc_state.annotations_loaded.store(true, Ordering::Release);
                 }
             }

@@ -208,17 +208,60 @@ impl AegisRuntimeKernel {
                         buf.extend_from_slice(&chunk[..n]);
                     };
                     let head = String::from_utf8_lossy(&buf[..header_end - 4]).to_string();
-                    let content_length: usize = head
-                        .lines()
-                        .find_map(|l| {
-                            let (k, v) = l.split_once(':')?;
-                            if k.trim().eq_ignore_ascii_case("content-length") {
-                                v.trim().parse::<usize>().ok()
-                            } else {
-                                None
+                    let mut head_lines = head.lines();
+                    let req_line = head_lines.next().unwrap_or("");
+                    let parts: Vec<&str> = req_line.split_whitespace().collect();
+                    let method = parts.first().copied().unwrap_or("GET");
+                    let full_target = parts.get(1).copied().unwrap_or("/");
+
+                    let mut headers = HashMap::new();
+                    let mut has_transfer_encoding = false;
+                    let mut parsed_content_length: Option<usize> = None;
+                    let mut malformed_headers: Option<&'static str> = None;
+                    for l in head_lines {
+                        if let Some((hk, hv)) = l.split_once(':') {
+                            let key = hk.trim().to_lowercase();
+                            let val = hv.trim().to_string();
+                            if key == "transfer-encoding" {
+                                has_transfer_encoding = true;
+                            } else if key == "content-length" {
+                                match val.parse::<usize>() {
+                                    Ok(len) => {
+                                        if let Some(prev) = parsed_content_length {
+                                            if prev != len {
+                                                malformed_headers =
+                                                    Some("Conflicting Content-Length headers");
+                                            }
+                                        } else {
+                                            parsed_content_length = Some(len);
+                                        }
+                                    }
+                                    Err(_) => {
+                                        malformed_headers = Some("Invalid Content-Length header");
+                                    }
+                                }
                             }
-                        })
-                        .unwrap_or(0);
+                            headers.insert(key, val);
+                        }
+                    }
+                    if has_transfer_encoding {
+                        malformed_headers = Some("Transfer-Encoding is not supported");
+                    }
+                    if let Some(err_msg) = malformed_headers {
+                        let msg = json!({ "error": err_msg }).to_string();
+                        let _ = stream
+                            .write_all(
+                                format!(
+                                    "HTTP/1.1 400 Bad Request\r\nContent-Type: application/json\r\nContent-Length: {}\r\nX-Content-Type-Options: nosniff\r\nCache-Control: no-store\r\nConnection: close\r\n\r\n{}",
+                                    msg.len(),
+                                    msg
+                                )
+                                .as_bytes(),
+                            )
+                            .await;
+                        return;
+                    }
+                    let content_length = parsed_content_length.unwrap_or(0);
                     if content_length > MAX_HTTP_BODY_BYTES {
                         let msg = format!(
                             "{{\"error\":\"Request body exceeds {} bytes\"}}",
@@ -227,7 +270,7 @@ impl AegisRuntimeKernel {
                         let _ = stream
                             .write_all(
                                 format!(
-                                    "HTTP/1.1 413 Payload Too Large\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                                    "HTTP/1.1 413 Payload Too Large\r\nContent-Type: application/json\r\nContent-Length: {}\r\nX-Content-Type-Options: nosniff\r\nCache-Control: no-store\r\nConnection: close\r\n\r\n{}",
                                     msg.len(),
                                     msg
                                 )
@@ -247,20 +290,22 @@ impl AegisRuntimeKernel {
                         }
                         buf.extend_from_slice(&chunk[..n]);
                     }
-                    let body_end = (header_end + content_length).min(buf.len());
-                    let body_str = String::from_utf8_lossy(&buf[header_end..body_end]).to_string();
-                    let mut head_lines = head.lines();
-                    let req_line = head_lines.next().unwrap_or("");
-                    let parts: Vec<&str> = req_line.split_whitespace().collect();
-                    let method = parts.first().copied().unwrap_or("GET");
-                    let full_target = parts.get(1).copied().unwrap_or("/");
-
-                    let mut headers = HashMap::new();
-                    for l in head_lines {
-                        if let Some((hk, hv)) = l.split_once(':') {
-                            headers.insert(hk.trim().to_lowercase(), hv.trim().to_string());
-                        }
+                    if buf.len() < header_end + content_length {
+                        let msg = json!({ "error": "Incomplete HTTP request body" }).to_string();
+                        let _ = stream
+                            .write_all(
+                                format!(
+                                    "HTTP/1.1 408 Request Timeout\r\nContent-Type: application/json\r\nContent-Length: {}\r\nX-Content-Type-Options: nosniff\r\nCache-Control: no-store\r\nConnection: close\r\n\r\n{}",
+                                    msg.len(),
+                                    msg
+                                )
+                                .as_bytes(),
+                            )
+                            .await;
+                        return;
                     }
+                    let body_end = header_end + content_length;
+                    let body_str = String::from_utf8_lossy(&buf[header_end..body_end]).to_string();
 
                     let mut org_id = headers
                         .get("x-aegis-org")
@@ -941,12 +986,18 @@ impl AegisRuntimeKernel {
                         {
                             let _ = k.paas.set_tenant_plan(w_org, auth_tier).await;
                         }
+                        let allow_local_source = is_operator || auth_mode == DaemonAuth::Disabled;
                         let w_id = payload.get("workspace_id").and_then(|v| v.as_str()).unwrap_or("");
+                        let default_src = if allow_local_source {
+                            ws_path.to_str().unwrap_or("cloud-sync")
+                        } else {
+                            "cloud-sync"
+                        };
                         let w_src = payload
                             .get("source_url")
                             .or_else(|| payload.get("git_url"))
                             .and_then(|v| v.as_str())
-                            .unwrap_or_else(|| ws_path.to_str().unwrap_or("."));
+                            .unwrap_or(default_src);
                         let w_branch = payload.get("branch").and_then(|v| v.as_str()).unwrap_or("main");
                         let w_agents: Vec<String> = payload
                             .get("agents")
@@ -954,7 +1005,15 @@ impl AegisRuntimeKernel {
                             .unwrap_or_else(|| vec!["cloud-coder-1".to_string()]);
                         match k
                             .paas
-                            .provision_workspace(&k, w_org, w_id, w_src, w_branch, w_agents)
+                            .provision_workspace_with_policy(
+                                &k,
+                                w_org,
+                                w_id,
+                                w_src,
+                                w_branch,
+                                w_agents,
+                                allow_local_source,
+                            )
                             .await
                         {
                             Ok(rec) => (
@@ -967,6 +1026,10 @@ impl AegisRuntimeKernel {
                                     "dashboard_url": format!("http://{}/dashboard", local_addr)
                                 })
                                 .to_string(),
+                            ),
+                            Err(e) if e.to_string().contains("LOCAL_SOURCE_FORBIDDEN") => (
+                                "HTTP/1.1 403 Forbidden",
+                                json!({ "error": e.to_string() }).to_string(),
                             ),
                             Err(e) => (
                                 "HTTP/1.1 500 Internal Server Error",
@@ -1425,6 +1488,7 @@ impl AegisRuntimeKernel {
                             .and_then(|v| v.as_str())
                             .unwrap_or("mission-control-dashboard")
                             .to_string();
+                        let mut host_exec_totp_verified_org: Option<String> = None;
                         let lock_err: Option<&'static str> = if k.active_host_exec_runs() > 0 {
                             let found_esc_lock = k
                                 .policy
@@ -1435,6 +1499,12 @@ impl AegisRuntimeKernel {
                                 .find(|e| e.escalation_id == esc_id);
                             let code = payload.get("totp").and_then(|v| v.as_str()).unwrap_or("");
                             let totp_verified = if let Some(ref esc) = found_esc_lock {
+                                let caller_authorized_for_esc = is_operator
+                                    || auth_mode == DaemonAuth::Disabled
+                                    || key_org.as_deref() == Some(esc.org_id.as_str())
+                                    || scoped_ticket.as_ref().is_some_and(|t| {
+                                        t.org_id == esc.org_id && t.escalation_id == esc.escalation_id
+                                    });
                                 let enrolled = k
                                     .paas
                                     .approver_status(&esc.org_id)
@@ -1442,9 +1512,16 @@ impl AegisRuntimeKernel {
                                     .get("enrolled")
                                     .and_then(|v| v.as_bool())
                                     .unwrap_or(false);
-                                enrolled
+                                if caller_authorized_for_esc
+                                    && enrolled
                                     && !code.is_empty()
                                     && k.paas.verify_approver_code(&esc.org_id, code).await.is_ok()
+                                {
+                                    host_exec_totp_verified_org = Some(esc.org_id.clone());
+                                    true
+                                } else {
+                                    false
+                                }
                             } else {
                                 false
                             };
@@ -1473,6 +1550,14 @@ impl AegisRuntimeKernel {
                             let code = payload.get("totp").and_then(|v| v.as_str()).unwrap_or("");
                             if !in_org {
                                 Err(format!("Escalation '{}' not found in org '{}'", esc_id, own))
+                            } else if host_exec_totp_verified_org.as_deref() == Some(own.as_str()) {
+                                if ttl_secs > 0 {
+                                    ttl_secs = ttl_secs.clamp(60, MAX_TOOL_LEASE_TTL_SECS);
+                                } else {
+                                    ttl_secs = 0;
+                                }
+                                actor = format!("tenant-approver:{}", own);
+                                Ok(())
                             } else if code.is_empty() {
                                 Err("Approving as a tenant requires the approver's 6-digit code (`totp`)".to_string())
                             } else {
@@ -1502,6 +1587,14 @@ impl AegisRuntimeKernel {
                                 let code = payload.get("totp").and_then(|v| v.as_str()).unwrap_or("");
                                 if !in_org {
                                     Err(format!("Escalation '{}' not found in org '{}'", esc_id, ticket.org_id))
+                                } else if host_exec_totp_verified_org.as_deref() == Some(ticket.org_id.as_str()) {
+                                    if ttl_secs > 0 {
+                                        ttl_secs = ttl_secs.clamp(60, MAX_TOOL_LEASE_TTL_SECS);
+                                    } else {
+                                        ttl_secs = 0;
+                                    }
+                                    actor = format!("ticket-approver:{}", ticket.org_id);
+                                    Ok(())
                                 } else if code.is_empty() {
                                     Err("Approving requires your 6-digit authenticator code (`totp`)".to_string())
                                 } else {
@@ -2326,8 +2419,13 @@ impl AegisRuntimeKernel {
                         ("HTTP/1.1 404 Not Found", json!({ "error": "Not found" }).to_string())
                     };
 
+                    let csp_header = if content_type.starts_with("text/html") {
+                        "Content-Security-Policy: default-src 'none'; script-src 'unsafe-inline'; style-src 'unsafe-inline' https://fonts.googleapis.com; font-src https://fonts.gstatic.com; img-src 'self' data:; connect-src 'self'; base-uri 'none'; form-action 'self'; frame-ancestors 'none'; object-src 'none'\r\n"
+                    } else {
+                        ""
+                    };
                     let http_resp = format!(
-                        "{status_line}\r\nContent-Type: {content_type}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{resp_body}",
+                        "{status_line}\r\nContent-Type: {content_type}\r\nContent-Length: {}\r\nX-Content-Type-Options: nosniff\r\nX-Frame-Options: DENY\r\nReferrer-Policy: no-referrer\r\nCache-Control: no-store\r\n{csp_header}Connection: close\r\n\r\n{resp_body}",
                         resp_body.len()
                     );
                     let _ = stream.write_all(http_resp.as_bytes()).await;

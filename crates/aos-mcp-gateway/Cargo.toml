@@ -35,4 +35,5 @@ zeroize.workspace = true
 flate2 = "1"
 
 [dev-dependencies]
+aos-core = { workspace = true, features = ["nested-test-sandbox"] }
 tempfile.workspace = true

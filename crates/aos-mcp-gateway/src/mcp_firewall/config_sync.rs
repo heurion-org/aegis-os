@@ -814,7 +814,8 @@ pub fn upsert_client_proxy_entry(
             std::fs::write(config_path, format!("{}\n", serde_json::to_string_pretty(&root)?))?;
         }
         c if claude_project_key(c).is_some() => {
-            let proj = claude_project_key(c).unwrap();
+            let proj = claude_project_key(c)
+                .with_context(|| format!("missing Claude project key for client '{c}'"))?;
             let mut root: Value = if text.trim().is_empty() {
                 json!({ "projects": {} })
             } else {
@@ -828,19 +829,25 @@ pub fn upsert_client_proxy_entry(
             if !projects_val.is_object() {
                 *projects_val = json!({});
             }
-            let projects_obj = projects_val.as_object_mut().expect("projects object");
+            let projects_obj = projects_val
+                .as_object_mut()
+                .context("normalized projects entry is not a JSON object")?;
             let proj_val = projects_obj
                 .entry(proj.to_string())
                 .or_insert_with(|| json!({}));
             if !proj_val.is_object() {
                 *proj_val = json!({});
             }
-            let proj_obj = proj_val.as_object_mut().expect("project entry object");
+            let proj_obj = proj_val
+                .as_object_mut()
+                .context("normalized project entry is not a JSON object")?;
             let servers_val = proj_obj.entry("mcpServers").or_insert_with(|| json!({}));
             if !servers_val.is_object() {
                 *servers_val = json!({});
             }
-            let servers = servers_val.as_object_mut().expect("mcpServers object");
+            let servers = servers_val
+                .as_object_mut()
+                .context("normalized mcpServers entry is not a JSON object")?;
             servers.insert(
                 server_key.to_string(),
                 build_json_proxy_entry(client, bin_str, proxy_args, extra_env),
@@ -865,7 +872,7 @@ pub fn upsert_client_proxy_entry(
             }
             let servers = servers_val
                 .as_object_mut()
-                .expect("mcpServers normalized to object");
+                .context("normalized mcpServers entry is not a JSON object")?;
             servers.insert(
                 server_key.to_string(),
                 build_json_proxy_entry(client, bin_str, proxy_args, extra_env),
@@ -921,7 +928,8 @@ pub fn remove_client_proxy_entry(
             Ok(removed)
         }
         c if claude_project_key(c).is_some() => {
-            let proj = claude_project_key(c).unwrap();
+            let proj = claude_project_key(c)
+                .with_context(|| format!("missing Claude project key for client '{c}'"))?;
             let mut root: Value = serde_json::from_str(&text)?;
             let removed = root
                 .get_mut("projects")
@@ -990,7 +998,8 @@ pub(super) fn restore_client_config_from_origin(
             std::fs::write(path, format!("{}\n", serde_json::to_string_pretty(&root)?))?;
         }
         c if claude_project_key(c).is_some() => {
-            let proj = claude_project_key(c).unwrap();
+            let proj = claude_project_key(c)
+                .with_context(|| format!("missing Claude project key for client '{c}'"))?;
             let mut root: Value = serde_json::from_str(&text)?;
             if let Some(servers) = root
                 .get_mut("projects")

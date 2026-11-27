@@ -197,6 +197,13 @@ impl Mailer {
         if !valid_email(to) {
             bail!("invalid recipient address");
         }
+        let reject_ctrl = |label: &str, val: &str| -> anyhow::Result<()> {
+            if val.chars().any(|c| matches!(c, '\r' | '\n' | '\0')) {
+                bail!("invalid control character in email {label}");
+            }
+            Ok(())
+        };
+        reject_ctrl("subject", subject)?;
         let quote = |s: &str| s.replace('\\', "\\\\").replace('"', "\\\"");
         match self {
             Mailer::Disabled => bail!("Email delivery is not configured on this Aegis Cloud node"),
@@ -207,10 +214,15 @@ impl Mailer {
                 Ok(())
             }
             Mailer::Smtp { host, port, secure, user, pass, from } => {
+                reject_ctrl("smtp host", host)?;
+                reject_ctrl("smtp user", user)?;
+                reject_ctrl("smtp pass", pass)?;
+                reject_ctrl("from", from)?;
                 let from_addr = from
                     .rsplit_once('<')
                     .map(|(_, a)| a.trim_end_matches('>').trim().to_string())
                     .unwrap_or_else(|| from.clone());
+                reject_ctrl("from address", &from_addr)?;
                 let message = format!(
                     "From: {from}\r\nTo: <{to}>\r\nSubject: {subject}\r\nMIME-Version: 1.0\r\nContent-Type: text/plain; charset=utf-8\r\nContent-Transfer-Encoding: 8bit\r\n\r\n{}\r\n",
                     body.replace('\n', "\r\n")
@@ -232,6 +244,8 @@ impl Mailer {
                 result.context("SMTP delivery failed")
             }
             Mailer::Resend { api_key, from } => {
+                reject_ctrl("resend api_key", api_key)?;
+                reject_ctrl("from", from)?;
                 let payload = serde_json::json!({ "from": from, "to": [to], "subject": subject, "text": body });
                 let data = private_temp_file("json", payload.to_string().as_bytes())?;
                 let config = format!(
@@ -247,10 +261,19 @@ impl Mailer {
     }
 }
 
+fn resolve_curl_binary() -> &'static str {
+    for candidate in ["/usr/bin/curl", "/opt/homebrew/bin/curl", "/usr/local/bin/curl"] {
+        if std::path::Path::new(candidate).is_file() {
+            return candidate;
+        }
+    }
+    "curl"
+}
+
 /// Runs `curl -K -` with `config` on stdin so secrets never show up in the process list.
 fn run_curl(config: &str) -> anyhow::Result<()> {
     let config = format!("{config}silent\nshow-error\nmax-time = 30\n");
-    let mut child = Command::new("curl")
+    let mut child = Command::new(resolve_curl_binary())
         .args(["-K", "-"])
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
@@ -1641,5 +1664,22 @@ mod tests {
         Mailer::Directory(dir.path().to_path_buf()).send("a@b.co", "Hi", "link").unwrap();
         let entries: Vec<_> = std::fs::read_dir(dir.path()).unwrap().collect();
         assert_eq!(entries.len(), 1);
+    }
+
+    #[test]
+    fn mailer_rejects_control_chars_in_subject_and_config() {
+        let dir = tempfile::tempdir().unwrap();
+        let err = Mailer::Directory(dir.path().to_path_buf())
+            .send("a@b.co", "Hi\r\nBcc: evil@attacker.tld", "link")
+            .unwrap_err();
+        assert!(err.to_string().contains("control character"));
+
+        let err_api = Mailer::Resend {
+            api_key: "re_abc\nurl = \"http://127.0.0.1\"".to_string(),
+            from: "Aegis <no-reply@heurion.org>".to_string(),
+        }
+        .send("a@b.co", "Hi", "link")
+        .unwrap_err();
+        assert!(err_api.to_string().contains("control character"));
     }
 }

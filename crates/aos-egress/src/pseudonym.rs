@@ -129,7 +129,7 @@ impl PseudonymSessionTable {
                 return existing.clone();
             }
         }
-        let mut guard = self.inner.write().expect("pseudonym lock poisoned");
+        let mut guard = self.inner.write().unwrap_or_else(|e| e.into_inner());
         if let Some(existing) = guard.forward.get(raw) {
             return existing.clone();
         }

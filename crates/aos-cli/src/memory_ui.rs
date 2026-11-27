@@ -84,7 +84,9 @@ pub async fn run(config: UiConfig) -> anyhow::Result<()> {
     tokio::spawn(async move {
         loop {
             tokio::time::sleep(Duration::from_secs(1)).await;
-            if let Ok(requests) = fetch_pending(&poll_state) {
+            let ps = Arc::clone(&poll_state);
+            if let Ok(Ok(requests)) = tokio::task::spawn_blocking(move || fetch_pending(&ps)).await
+            {
                 maybe_open_browser(&poll_state, &poll_url, &requests);
             }
         }
@@ -151,12 +153,32 @@ async fn loopback_only(request: Request, next: Next) -> Response {
 }
 
 fn check_token(state: &UiState, query: &HashMap<String, String>) -> Result<(), ApiError> {
-    if query.get("token").map(String::as_str) == Some(state.ui_token.as_str()) {
+    if query
+        .get("token")
+        .is_some_and(|t| aos_core::security::ct_eq_str(t, &state.ui_token))
+    {
         Ok(())
     } else {
         Err((
             StatusCode::UNAUTHORIZED,
             Json(json!({ "error": { "code": "UNAUTHORIZED", "message": "invalid UI token" } })),
+        ))
+    }
+}
+
+fn validate_consent_id(id: &str) -> Result<(), ApiError> {
+    let valid = !id.is_empty()
+        && id.len() <= 128
+        && !id.contains("..")
+        && id
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'-' | b'_' | b'.'));
+    if valid {
+        Ok(())
+    } else {
+        Err((
+            StatusCode::BAD_REQUEST,
+            Json(json!({ "error": { "code": "INVALID_REQUEST_ID", "message": "invalid consent request id" } })),
         ))
     }
 }
@@ -263,14 +285,25 @@ async fn pending(
     Query(query): Query<HashMap<String, String>>,
 ) -> Result<Json<Value>, ApiError> {
     check_token(&state, &query)?;
-    let requests = fetch_pending(&state).map_err(|error| {
-        (
-            StatusCode::BAD_GATEWAY,
-            Json(
-                json!({ "error": { "code": "MEMORY_UNAVAILABLE", "message": error.to_string() } }),
-            ),
-        )
-    })?;
+    let st = Arc::clone(&state);
+    let requests = tokio::task::spawn_blocking(move || fetch_pending(&st))
+        .await
+        .map_err(|error| {
+            (
+                StatusCode::BAD_GATEWAY,
+                Json(
+                    json!({ "error": { "code": "MEMORY_UNAVAILABLE", "message": error.to_string() } }),
+                ),
+            )
+        })?
+        .map_err(|error| {
+            (
+                StatusCode::BAD_GATEWAY,
+                Json(
+                    json!({ "error": { "code": "MEMORY_UNAVAILABLE", "message": error.to_string() } }),
+                ),
+            )
+        })?;
     Ok(Json(json!({ "requests": requests })))
 }
 
@@ -281,12 +314,23 @@ async fn approve(
     Json(body): Json<Value>,
 ) -> Result<Json<Value>, ApiError> {
     check_token(&state, &query)?;
-    let response = memory_json(
-        &state,
-        "POST",
-        &format!("/v1/consent/requests/{id}/approve"),
-        Some(body),
-    )
+    validate_consent_id(&id)?;
+    let st = Arc::clone(&state);
+    let response = tokio::task::spawn_blocking(move || {
+        memory_json(
+            &st,
+            "POST",
+            &format!("/v1/consent/requests/{id}/approve"),
+            Some(body),
+        )
+    })
+    .await
+    .map_err(|error| {
+        (
+            StatusCode::BAD_GATEWAY,
+            Json(json!({ "error": { "code": "APPROVE_FAILED", "message": error.to_string() } })),
+        )
+    })?
     .map_err(|error| {
         (
             StatusCode::BAD_GATEWAY,
@@ -302,12 +346,23 @@ async fn deny(
     Query(query): Query<HashMap<String, String>>,
 ) -> Result<Json<Value>, ApiError> {
     check_token(&state, &query)?;
-    let response = memory_json(
-        &state,
-        "POST",
-        &format!("/v1/consent/requests/{id}/deny"),
-        Some(json!({})),
-    )
+    validate_consent_id(&id)?;
+    let st = Arc::clone(&state);
+    let response = tokio::task::spawn_blocking(move || {
+        memory_json(
+            &st,
+            "POST",
+            &format!("/v1/consent/requests/{id}/deny"),
+            Some(json!({})),
+        )
+    })
+    .await
+    .map_err(|error| {
+        (
+            StatusCode::BAD_GATEWAY,
+            Json(json!({ "error": { "code": "DENY_FAILED", "message": error.to_string() } })),
+        )
+    })?
     .map_err(|error| {
         (
             StatusCode::BAD_GATEWAY,
@@ -359,5 +414,14 @@ mod tests {
         mark_opened(&state, &requests);
         assert!(state.opened_ids.lock().unwrap().contains("a"));
         assert!(!state.opened_ids.lock().unwrap().contains("b"));
+    }
+
+    #[test]
+    fn validate_consent_id_rejects_traversal_and_injections() {
+        assert!(validate_consent_id("req-123_abc.1").is_ok());
+        assert!(validate_consent_id("").is_err());
+        assert!(validate_consent_id("../admin").is_err());
+        assert!(validate_consent_id("a/b").is_err());
+        assert!(validate_consent_id("a b").is_err());
     }
 }

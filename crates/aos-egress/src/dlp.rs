@@ -4,35 +4,7 @@ use super::*;
 /// unspecified, multicast, or IPv4-mapped equivalents that untrusted outbound proxy traffic
 /// must never reach directly.
 pub fn is_forbidden_outbound_ip(ip: IpAddr) -> bool {
-    match ip {
-        IpAddr::V6(v6) => {
-            if let Some(v4) = v6.to_ipv4_mapped() {
-                return is_forbidden_outbound_ip(IpAddr::V4(v4));
-            }
-            let segs = v6.segments();
-            v6.is_loopback()
-                || v6.is_unspecified()
-                || v6.is_multicast()
-                || v6.is_unicast_link_local()
-                || v6.is_unique_local()
-                || (segs[0] & 0xffc0) == 0xfec0
-                || (segs[0] == 0x2001 && segs[1] == 0x0db8)
-        }
-        IpAddr::V4(v4) => {
-            let o = v4.octets();
-            v4.is_loopback()
-                || v4.is_private()
-                || v4.is_link_local()
-                || v4.is_broadcast()
-                || v4.is_unspecified()
-                || v4.is_multicast()
-                || o[0] == 0
-                || (o[0] == 100 && (o[1] & 0b1100_0000) == 64)
-                || (o[0] == 192 && o[1] == 0 && o[2] == 0)
-                || (o[0] == 198 && (o[1] == 18 || o[1] == 19))
-                || o[0] >= 240
-        }
-    }
+    aos_core::security::is_forbidden_outbound_ip(ip)
 }
 
 pub(crate) fn replace_query_key_param(path_and_query: &str, placeholder: &str, replacement: &str) -> String {
