@@ -1448,6 +1448,8 @@ fn is_reserved_sandbox_env_key(k: &str) -> bool {
         ku.as_str(),
         "HOME"
             | "TMPDIR"
+            | "TMP"
+            | "TEMP"
             | "AOS_SANDBOX_ID"
             | "AOS_ORG_ID"
             | "AOS_AGENT_ID"
@@ -1671,8 +1673,11 @@ impl SandboxInstance for NativeOsSandboxInstance {
                 "PATH",
                 "/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin",
             )
-            .env("HOME", &self.config.agent_home_dir)
-            .env("TMPDIR", ensure_agent_tmp_dir(&self.config.agent_home_dir))
+            .env("HOME", &self.config.agent_home_dir);
+        let agent_tmp = ensure_agent_tmp_dir(&self.config.agent_home_dir);
+        cmd.env("TMPDIR", &agent_tmp)
+            .env("TMP", &agent_tmp)
+            .env("TEMP", &agent_tmp)
             .env("CARGO_TARGET_DIR", &cargo_target_dir)
             .env("PNPM_STORE_DIR", &pnpm_store_dir)
             .env("npm_config_store_dir", &pnpm_store_dir)
@@ -1855,8 +1860,12 @@ impl SandboxInstance for NativeOsSandboxInstance {
                 .current_dir(&work_dir)
                 .env_clear()
                 .env("PATH", &path_val)
-                .env("HOME", &self.config.agent_home_dir)
-                .env("TMPDIR", ensure_agent_tmp_dir(&self.config.agent_home_dir))
+                .env("HOME", &self.config.agent_home_dir);
+            let agent_tmp = ensure_agent_tmp_dir(&self.config.agent_home_dir);
+            fallback
+                .env("TMPDIR", &agent_tmp)
+                .env("TMP", &agent_tmp)
+                .env("TEMP", &agent_tmp)
                 .env("CARGO_TARGET_DIR", &cargo_target_dir)
                 .env("PNPM_STORE_DIR", &pnpm_store_dir)
                 .env("npm_config_store_dir", &pnpm_store_dir)
@@ -3037,6 +3046,9 @@ t.join(timeout=2)
         let agent_tmp = super::ensure_agent_tmp_dir(&home);
         assert_eq!(agent_tmp, home.join("tmp"));
         assert!(agent_tmp.is_dir());
+        assert!(super::is_reserved_sandbox_env_key("TMPDIR"));
+        assert!(super::is_reserved_sandbox_env_key("TMP"));
+        assert!(super::is_reserved_sandbox_env_key("TEMP"));
 
         assert!(super::contains_tmp_permission_error(
             "mkdir: /tmp/t: Operation not permitted"

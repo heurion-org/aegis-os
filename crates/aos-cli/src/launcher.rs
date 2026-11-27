@@ -465,6 +465,8 @@ impl LauncherPlan {
         let mut envs = vec![
             ("HOME".to_string(), AGENT_STAGE.to_string()),
             ("TMPDIR".to_string(), "/tmp".to_string()),
+            ("TMP".to_string(), "/tmp".to_string()),
+            ("TEMP".to_string(), "/tmp".to_string()),
             ("PATH".to_string(), path.join(":")),
             ("XDG_CONFIG_HOME".to_string(), format!("{AGENT_STAGE}/.config")),
             ("XDG_DATA_HOME".to_string(), format!("{AGENT_STAGE}/.local/share")),
@@ -2523,8 +2525,11 @@ pub(super) async fn run_macos_inner(
         push(&mut envs, "AOS_LOOPBACK_PORTS", csv);
         push(&mut envs, "AOS_DEV_PORT", dev_loopback_ports[0].to_string());
     }
-    push(&mut envs, "TMPDIR", agent_home.join("tmp").display().to_string());
-    push(&mut envs, "CLAUDE_CODE_TMPDIR", agent_home.join("tmp").display().to_string());
+    let agent_tmp = agent_home.join("tmp").display().to_string();
+    push(&mut envs, "TMPDIR", agent_tmp.clone());
+    push(&mut envs, "TMP", agent_tmp.clone());
+    push(&mut envs, "TEMP", agent_tmp.clone());
+    push(&mut envs, "CLAUDE_CODE_TMPDIR", agent_tmp);
     push(&mut envs, "HERMES_HOME", agent_home.join(".hermes").display().to_string());
     push(&mut envs, "HERMES_DISABLE_LAZY_INSTALLS", "1".to_string());
     push(&mut envs, "XDG_CONFIG_HOME", agent_home.join(".config").display().to_string());

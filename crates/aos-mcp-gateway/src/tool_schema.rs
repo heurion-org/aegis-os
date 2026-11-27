@@ -179,7 +179,7 @@ impl AegisRuntimeKernel {
             "tools": [
                 {
                     "name": "fs_read",
-                    "description": "[Zero-Prompt] Read a file inside the Agent's Copy-on-Write shadow workspace.",
+                    "description": "[Zero-Prompt] Read a file inside the Agent's Copy-on-Write shadow workspace or `$TMPDIR/...` scratch dir.",
                     "inputSchema": {
                         "type": "object",
                         "properties": {
@@ -195,7 +195,7 @@ impl AegisRuntimeKernel {
                 },
                 {
                     "name": "fs_write",
-                    "description": "[Zero-Prompt] Create or overwrite a file in the Agent's Copy-on-Write shadow workspace without modifying the host.",
+                    "description": "[Zero-Prompt] Create or overwrite a file in the Agent's CoW shadow workspace or `$TMPDIR/...` scratch dir without modifying the host (files under `$TMPDIR/` are excluded from workspace_diff/commit).",
                     "inputSchema": {
                         "type": "object",
                         "properties": {
@@ -212,7 +212,7 @@ impl AegisRuntimeKernel {
                 },
                 {
                     "name": "fs_edit",
-                    "description": "[Zero-Prompt] Surgically replace `target` with `replacement` in a file inside the CoW shadow workspace.",
+                    "description": "[Zero-Prompt] Surgically replace `target` with `replacement` in a file inside the CoW shadow workspace or `$TMPDIR/...` scratch dir.",
                     "inputSchema": {
                         "type": "object",
                         "properties": {
@@ -225,7 +225,7 @@ impl AegisRuntimeKernel {
                 },
                 {
                     "name": "fs_delete",
-                    "description": "[Zero-Prompt] Delete a file inside the Agent's CoW shadow workspace.",
+                    "description": "[Zero-Prompt] Delete a file inside the Agent's CoW shadow workspace or `$TMPDIR/...` scratch dir.",
                     "inputSchema": {
                         "type": "object",
                         "properties": { "path": { "type": "string" } },
@@ -234,7 +234,7 @@ impl AegisRuntimeKernel {
                 },
                 {
                     "name": "fs_glob",
-                    "description": "[Zero-Prompt] List files and uncommitted change summary inside the Agent's CoW shadow workspace.",
+                    "description": "[Zero-Prompt] List files and uncommitted change summary inside the Agent's CoW shadow workspace (or pass `pattern: \"$TMPDIR/...\"` to list agent scratch files).",
                     "inputSchema": {
                         "type": "object",
                         "properties": { "pattern": { "type": "string" } }

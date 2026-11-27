@@ -454,10 +454,14 @@ impl AegisRuntimeKernel {
             .get("replacement")
             .and_then(|v| v.as_str())
             .context("Missing 'replacement'")?;
-        let (clean, full_path) = shadow_path_for_write(env.workspace.shadow_root(), rel_path)?;
+        let (scope, clean, full_path) = resolve_fs_path_for_write(
+            env.workspace.shadow_root(),
+            &env.sandbox.config().agent_home_dir,
+            rel_path,
+        )?;
         let original = tokio::fs::read_to_string(&full_path)
             .await
-            .with_context(|| format!("File '{}' not found in CoW workspace", clean))?;
+            .with_context(|| format!("File '{}' not found", clean))?;
         if !original.contains(target) {
             bail!(
                 "Target snippet not found in '{}' inside CoW shadow workspace",
@@ -466,8 +470,12 @@ impl AegisRuntimeKernel {
         }
         let updated = original.replace(target, replacement);
         aos_core::session::write_bytes_atomic_synced_async(&full_path, updated.into_bytes()).await?;
+        let status = match scope {
+            FsScope::Shadow => "edited_in_cow_shadow",
+            FsScope::TmpDir => "edited_in_agent_tmp",
+        };
         Ok(json!({
-            "status": "edited_in_cow_shadow",
+            "status": status,
             "path": clean,
             "host_modified": false
         }))
@@ -10252,6 +10260,148 @@ time.sleep(60)
                 e.category == aos_core::friction::FrictionCategory::HostExecDenied
                     && e.cmd_bucket == aos_core::friction::CmdBucket::HostExec
             }));
+        }
+    }
+
+    #[tokio::test]
+    async fn fs_tools_support_tmpdir_scratch_without_polluting_shadow_diff() {
+        let tmp = tempfile::tempdir().unwrap();
+        let rt_dir = tmp.path().join("rt");
+        let host_proj = tmp.path().join("host_proj");
+        tokio::fs::create_dir_all(&host_proj).await.unwrap();
+        tokio::fs::write(host_proj.join("README.md"), "# Seed\n")
+            .await
+            .unwrap();
+
+        let kernel = AegisRuntimeKernel::new(&rt_dir).await.unwrap();
+        let agent = AgentIdentity::new("org-tmp", "coder-tmp", "Engineer");
+        kernel
+            .ensure_agent_environment(
+                agent.clone(),
+                &host_proj,
+                IsolationTier::NativeOsSandbox,
+                vec!["*".to_string()],
+            )
+            .await
+            .unwrap();
+
+        // 1. workspace_status exposes writable tmp_dir.
+        let status = kernel
+            .call_tool(&agent, "workspace_status", json!({}))
+            .await
+            .unwrap();
+        let tmp_dir = PathBuf::from(status["tmp_dir"].as_str().unwrap());
+        assert!(tmp_dir.ends_with("tmp"));
+        assert!(tmp_dir.is_dir());
+
+        // 2. fs_write writes into nested $TMPDIR dir without polluting CoW shadow diff.
+        let write_res = kernel
+            .call_tool(
+                &agent,
+                "fs_write",
+                json!({
+                    "path": "$TMPDIR/scratch/note.txt",
+                    "content": "hello tmp\n"
+                }),
+            )
+            .await
+            .unwrap();
+        assert_eq!(write_res["status"], "written_to_agent_tmp");
+        assert_eq!(write_res["path"], "$TMPDIR/scratch/note.txt");
+        assert!(tmp_dir.join("scratch/note.txt").is_file());
+
+        let status_after_write = kernel
+            .call_tool(&agent, "workspace_status", json!({}))
+            .await
+            .unwrap();
+        assert_eq!(status_after_write["uncommitted_changes_count"], 0);
+
+        // 3. fs_read works via both "$TMPDIR/..." and the resolved absolute tmp_dir path.
+        let read_rel = kernel
+            .call_tool(&agent, "fs_read", json!({ "path": "$TMPDIR/scratch/note.txt" }))
+            .await
+            .unwrap();
+        assert_eq!(read_rel["workspace_mode"], "agent_tmp");
+        assert_eq!(read_rel["content"], "hello tmp\n");
+
+        let read_abs = kernel
+            .call_tool(
+                &agent,
+                "fs_read",
+                json!({ "path": tmp_dir.join("scratch/note.txt") }),
+            )
+            .await
+            .unwrap();
+        assert_eq!(read_abs["workspace_mode"], "agent_tmp");
+        assert_eq!(read_abs["content"], "hello tmp\n");
+
+        // 4. fs_edit modifies $TMPDIR file in place.
+        let edit_res = kernel
+            .call_tool(
+                &agent,
+                "fs_edit",
+                json!({
+                    "path": "$TMPDIR/scratch/note.txt",
+                    "target": "hello tmp",
+                    "replacement": "updated tmp"
+                }),
+            )
+            .await
+            .unwrap();
+        assert_eq!(edit_res["status"], "edited_in_agent_tmp");
+        let after_edit = std::fs::read_to_string(tmp_dir.join("scratch/note.txt")).unwrap();
+        assert_eq!(after_edit, "updated tmp\n");
+
+        // 5. fs_glob lists scratch files under "$TMPDIR/...".
+        let glob_res = kernel
+            .call_tool(&agent, "fs_glob", json!({ "pattern": "$TMPDIR/scratch" }))
+            .await
+            .unwrap();
+        assert_eq!(glob_res["files_count"], 1);
+        assert_eq!(glob_res["files"][0], "$TMPDIR/scratch/note.txt");
+
+        // 6. fs_delete removes the $TMPDIR file.
+        let del_res = kernel
+            .call_tool(&agent, "fs_delete", json!({ "path": "$TMPDIR/scratch/note.txt" }))
+            .await
+            .unwrap();
+        assert_eq!(del_res["status"], "deleted_in_agent_tmp");
+        assert!(!tmp_dir.join("scratch/note.txt").exists());
+
+        // 7. Traversal and symlink escapes out of $TMPDIR are strictly refused.
+        assert!(kernel
+            .call_tool(
+                &agent,
+                "fs_write",
+                json!({ "path": "$TMPDIR/../escape.txt", "content": "x" }),
+            )
+            .await
+            .is_err());
+        assert!(kernel
+            .call_tool(&agent, "fs_read", json!({ "path": "$TMPDIR/../escape.txt" }))
+            .await
+            .is_err());
+
+        #[cfg(unix)]
+        {
+            let outside_dir = tempfile::tempdir().unwrap();
+            let outside_file = outside_dir.path().join("secret.txt");
+            std::fs::write(&outside_file, "SECRET").unwrap();
+            let link_path = tmp_dir.join("sym_leak.txt");
+            std::os::unix::fs::symlink(&outside_file, &link_path).unwrap();
+            assert!(kernel
+                .call_tool(
+                    &agent,
+                    "fs_write",
+                    json!({ "path": "$TMPDIR/sym_leak.txt", "content": "pwnd" }),
+                )
+                .await
+                .is_err());
+            assert!(kernel
+                .call_tool(&agent, "fs_read", json!({ "path": "$TMPDIR/sym_leak.txt" }))
+                .await
+                .is_err());
+            assert_eq!(std::fs::read_to_string(&outside_file).unwrap(), "SECRET");
         }
     }
 }

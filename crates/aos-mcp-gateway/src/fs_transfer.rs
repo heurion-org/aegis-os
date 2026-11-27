@@ -59,6 +59,106 @@ pub(crate) fn shadow_path_for_read(root: &Path, host_root: &Path, rel: &str) -> 
     Ok((rel_path.to_string_lossy().into_owned(), real))
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum FsScope {
+    Shadow,
+    TmpDir,
+}
+
+pub(crate) fn strip_tmpdir_prefix(raw: &str) -> Option<&str> {
+    let trimmed = raw.trim();
+    trimmed
+        .strip_prefix("$TMPDIR/")
+        .or_else(|| trimmed.strip_prefix("${TMPDIR}/"))
+}
+
+pub(crate) fn ensure_agent_tmp_dir_no_symlink(agent_home_dir: &Path) -> anyhow::Result<PathBuf> {
+    let tmp_dir = agent_home_dir.join("tmp");
+    if let Ok(meta) = std::fs::symlink_metadata(&tmp_dir) {
+        if meta.file_type().is_symlink() || !meta.is_dir() {
+            bail!(
+                "Agent $TMPDIR '{}' is not a real non-symlink directory",
+                tmp_dir.display()
+            );
+        }
+    } else {
+        std::fs::create_dir_all(&tmp_dir)?;
+    }
+    Ok(tmp_dir)
+}
+
+pub(crate) fn resolve_fs_path_for_write(
+    shadow_root: &Path,
+    agent_home_dir: &Path,
+    raw: &str,
+) -> anyhow::Result<(FsScope, String, PathBuf)> {
+    let trimmed = raw.trim();
+    if trimmed == "$TMPDIR" || trimmed == "${TMPDIR}" {
+        bail!("Path must name a file inside $TMPDIR");
+    }
+    if let Some(rest) = strip_tmpdir_prefix(trimmed) {
+        let tmp_root = ensure_agent_tmp_dir_no_symlink(agent_home_dir)?;
+        let (clean, full) = shadow_path_for_write(&tmp_root, rest)?;
+        return Ok((FsScope::TmpDir, format!("$TMPDIR/{clean}"), full));
+    }
+    let p = Path::new(trimmed);
+    if p.is_absolute() {
+        let tmp_root = ensure_agent_tmp_dir_no_symlink(agent_home_dir)?;
+        if let Some(rel) = strip_root_matching_macos_private(p, &tmp_root) {
+            if !rel.as_os_str().is_empty() {
+                let (clean, full) = shadow_path_for_write(&tmp_root, &rel.to_string_lossy())?;
+                return Ok((FsScope::TmpDir, format!("$TMPDIR/{clean}"), full));
+            }
+        }
+    }
+    let (clean, full) = shadow_path_for_write(shadow_root, raw)?;
+    Ok((FsScope::Shadow, clean, full))
+}
+
+pub(crate) fn resolve_fs_path_for_read(
+    shadow_root: &Path,
+    host_root: &Path,
+    agent_home_dir: &Path,
+    raw: &str,
+) -> anyhow::Result<(FsScope, String, PathBuf)> {
+    let trimmed = raw.trim();
+    if trimmed == "$TMPDIR" || trimmed == "${TMPDIR}" {
+        bail!("Path must name a file inside $TMPDIR");
+    }
+    let tmp_rel = if let Some(rest) = strip_tmpdir_prefix(trimmed) {
+        Some(shadow_relative(rest)?)
+    } else {
+        let p = Path::new(trimmed);
+        if p.is_absolute() {
+            let tmp_root = ensure_agent_tmp_dir_no_symlink(agent_home_dir)?;
+            strip_root_matching_macos_private(p, &tmp_root)
+                .filter(|rel| !rel.as_os_str().is_empty())
+        } else {
+            None
+        }
+    };
+    if let Some(rel_path) = tmp_rel {
+        let tmp_root = ensure_agent_tmp_dir_no_symlink(agent_home_dir)?;
+        let full = tmp_root.join(&rel_path);
+        let real = std::fs::canonicalize(&full)
+            .with_context(|| format!("File '$TMPDIR/{}' not found", rel_path.display()))?;
+        let canon_tmp = std::fs::canonicalize(&tmp_root)?;
+        if !real.starts_with(&canon_tmp) {
+            bail!(
+                "Refusing to read '$TMPDIR/{}': it resolves outside agent $TMPDIR",
+                rel_path.display()
+            );
+        }
+        return Ok((
+            FsScope::TmpDir,
+            format!("$TMPDIR/{}", rel_path.to_string_lossy()),
+            real,
+        ));
+    }
+    let (clean, real) = shadow_path_for_read(shadow_root, host_root, raw)?;
+    Ok((FsScope::Shadow, clean, real))
+}
+
 pub(crate) const MAX_BINARY_EXPORT_BYTES: u64 = 128 * 1024 * 1024;
 pub(crate) const MAX_INLINE_ARTIFACT_FETCH_BYTES: usize = 32 * 1024;
 

@@ -713,11 +713,16 @@ impl AegisRuntimeKernel {
                     .get("encoding")
                     .and_then(|v| v.as_str())
                     .unwrap_or("utf8");
-                let (clean, full_path) = shadow_path_for_read(
+                let (scope, clean, full_path) = resolve_fs_path_for_read(
                     env.workspace.shadow_root(),
                     env.workspace.host_source_root(),
+                    &env.sandbox.config().agent_home_dir,
                     rel_path,
                 )?;
+                let workspace_mode = match scope {
+                    FsScope::Shadow => "cow_shadow",
+                    FsScope::TmpDir => "agent_tmp",
+                };
                 let raw_bytes = tokio::fs::read(&full_path).await?;
                 match encoding {
                     "base64" => Ok(json!({
@@ -725,13 +730,13 @@ impl AegisRuntimeKernel {
                         "encoding": "base64",
                         "size_bytes": raw_bytes.len(),
                         "content_base64": base64::engine::general_purpose::STANDARD.encode(&raw_bytes),
-                        "workspace_mode": "cow_shadow"
+                        "workspace_mode": workspace_mode
                     })),
                     "utf8" => match String::from_utf8(raw_bytes) {
                         Ok(content) => Ok(json!({
                             "path": clean,
                             "content": content,
-                            "workspace_mode": "cow_shadow"
+                            "workspace_mode": workspace_mode
                         })),
                         Err(e) => {
                             let size = e.into_bytes().len();
@@ -773,11 +778,21 @@ impl AegisRuntimeKernel {
                     ),
                 };
                 let byte_len = raw_bytes.len();
-                let (clean, full_path) =
-                    shadow_path_for_write(env.workspace.shadow_root(), rel_path)?;
+                let (scope, clean, full_path) = resolve_fs_path_for_write(
+                    env.workspace.shadow_root(),
+                    &env.sandbox.config().agent_home_dir,
+                    rel_path,
+                )?;
+                if let Some(parent) = full_path.parent() {
+                    tokio::fs::create_dir_all(parent).await?;
+                }
                 aos_core::session::write_bytes_atomic_synced_async(&full_path, raw_bytes).await?;
+                let status = match scope {
+                    FsScope::Shadow => "written_to_cow_shadow",
+                    FsScope::TmpDir => "written_to_agent_tmp",
+                };
                 Ok(json!({
-                    "status": "written_to_cow_shadow",
+                    "status": status,
                     "path": clean,
                     "bytes": byte_len,
                     "encoding": encoding,
@@ -872,6 +887,8 @@ impl AegisRuntimeKernel {
                     "workspace_id": aos_core::session::workspace_id_for_path(&canon_target),
                     "host_source_root": canon_target,
                     "shadow_root": new_env.workspace.shadow_root(),
+                    "tmp_dir": ensure_agent_tmp_dir_no_symlink(&new_env.sandbox.config().agent_home_dir)
+                        .unwrap_or_else(|_| new_env.sandbox.config().agent_home_dir.join("tmp")),
                     "previous_workspace": prev_workspace,
                     "previous_uncommitted_count": prev_uncommitted_count,
                     "umbrella_root": next_umbrella,
@@ -911,13 +928,20 @@ impl AegisRuntimeKernel {
                     .get("path")
                     .and_then(|v| v.as_str())
                     .context("Missing 'path'")?;
-                let (clean, full_path) =
-                    shadow_path_for_write(env.workspace.shadow_root(), rel_path)?;
+                let (scope, clean, full_path) = resolve_fs_path_for_write(
+                    env.workspace.shadow_root(),
+                    &env.sandbox.config().agent_home_dir,
+                    rel_path,
+                )?;
                 if full_path.exists() {
                     tokio::fs::remove_file(&full_path).await?;
                 }
+                let status = match scope {
+                    FsScope::Shadow => "deleted_in_cow_shadow",
+                    FsScope::TmpDir => "deleted_in_agent_tmp",
+                };
                 Ok(json!({
-                    "status": "deleted_in_cow_shadow",
+                    "status": status,
                     "path": clean,
                     "host_modified": false
                 }))
@@ -925,6 +949,29 @@ impl AegisRuntimeKernel {
 
             "fs_glob" | "fs_list" => {
                 let filter = args.get("pattern").and_then(|v| v.as_str()).unwrap_or("");
+                let trimmed_filter = filter.trim();
+                let tmp_sub_filter = if trimmed_filter == "$TMPDIR" || trimmed_filter == "${TMPDIR}"
+                {
+                    Some("")
+                } else {
+                    strip_tmpdir_prefix(trimmed_filter)
+                };
+                if let Some(sub_filter) = tmp_sub_filter {
+                    let tmp_root =
+                        ensure_agent_tmp_dir_no_symlink(&env.sandbox.config().agent_home_dir)?;
+                    let files = CoWWorkspace::collect_files(&tmp_root).await?;
+                    let matched: Vec<String> = files
+                        .into_iter()
+                        .map(|(rel, _)| rel)
+                        .filter(|rel| sub_filter.is_empty() || rel.contains(sub_filter))
+                        .map(|rel| format!("$TMPDIR/{rel}"))
+                        .collect();
+                    return Ok(json!({
+                        "tmp_dir": tmp_root,
+                        "files_count": matched.len(),
+                        "files": matched
+                    }));
+                }
                 let files = CoWWorkspace::collect_files(env.workspace.shadow_root()).await?;
                 let matched: Vec<String> = files
                     .into_iter()
@@ -999,10 +1046,13 @@ impl AegisRuntimeKernel {
                         .collect();
                     serde_json::to_value(slim)?
                 };
+                let tmp_dir = ensure_agent_tmp_dir_no_symlink(&env.sandbox.config().agent_home_dir)
+                    .unwrap_or_else(|_| env.sandbox.config().agent_home_dir.join("tmp"));
                 Ok(json!({
                     "identity": identity,
                     "workspace_id": aos_core::session::workspace_id_for_path(env.workspace.host_source_root()),
                     "shadow_root": env.workspace.shadow_root(),
+                    "tmp_dir": tmp_dir,
                     "host_source_root": env.workspace.host_source_root(),
                     "umbrella_root": umbrella_root,
                     "child_repos": discover_child_git_repos_sync(env.workspace.host_source_root()),
