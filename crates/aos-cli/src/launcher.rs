@@ -54,7 +54,7 @@ mod lifecycle;
 mod staging;
 pub(crate) use approvals::{approval_decide, approval_show, approvals_list, approvals_serve};
 use credentials::*;
-pub(crate) use credentials::{backfill_host_agy_credentials_from_sessions, restore_native_oauth_store_for_agent, restore_or_seed_agy_oauth_cache, restore_or_seed_claude_oauth_cache, stage_agy_conversation_for_resume, sync_credentials};
+pub(crate) use credentials::{backfill_host_agy_credentials_from_sessions, restore_native_oauth_store_for_agent, restore_or_seed_agy_oauth_cache, restore_or_seed_claude_oauth_cache, sync_credentials};
 #[cfg(test)]
 pub(crate) use credentials::extract_agy_conversation_id;
 use egress::*;
@@ -4479,14 +4479,20 @@ pub(super) async fn run_pty_command(
 ) -> anyhow::Result<i32> {
     let mut master: libc::c_int = -1;
     let mut slave: libc::c_int = -1;
+    #[cfg(target_os = "macos")]
     let mut winsize = terminal_size();
+    #[cfg(not(target_os = "macos"))]
+    let winsize = terminal_size();
     if unsafe {
         libc::openpty(
             &mut master,
             &mut slave,
             std::ptr::null_mut(),
             std::ptr::null_mut(),
+            #[cfg(target_os = "macos")]
             &mut winsize,
+            #[cfg(not(target_os = "macos"))]
+            &winsize,
         )
     } != 0
     {
