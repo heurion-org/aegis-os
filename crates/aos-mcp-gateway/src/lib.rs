@@ -454,22 +454,49 @@ impl AegisRuntimeKernel {
             .get("replacement")
             .and_then(|v| v.as_str())
             .context("Missing 'replacement'")?;
-        let (scope, clean, full_path) = resolve_fs_path_for_write(
+        let (scope, clean, _full_path) = resolve_fs_path_for_write(
             env.workspace.shadow_root(),
             &env.sandbox.config().agent_home_dir,
             rel_path,
         )?;
-        let original = tokio::fs::read_to_string(&full_path)
-            .await
-            .with_context(|| format!("File '{}' not found", clean))?;
+        let (base_root, rel_in_base) = anchored_root_and_rel(
+            scope,
+            &clean,
+            env.workspace.shadow_root(),
+            &env.sandbox.config().agent_home_dir,
+        )?;
+        let read_root = base_root.clone();
+        let read_rel = rel_in_base.clone();
+        let raw_bytes = tokio::task::spawn_blocking(move || {
+            aos_core::security::read_file_no_symlink_under_root(&read_root, &read_rel)
+        })
+        .await
+        .context("fs_edit read task failed")?
+        .map_err(|err| {
+            if err.kind() == std::io::ErrorKind::NotFound {
+                anyhow::anyhow!("File '{}' not found", clean)
+            } else {
+                anyhow::Error::new(err)
+            }
+        })?;
+        let original = String::from_utf8(raw_bytes)
+            .with_context(|| format!("File '{}' is not valid UTF-8", clean))?;
         if !original.contains(target) {
             bail!(
                 "Target snippet not found in '{}' inside CoW shadow workspace",
                 clean
             );
         }
-        let updated = original.replace(target, replacement);
-        aos_core::session::write_bytes_atomic_synced_async(&full_path, updated.into_bytes()).await?;
+        let updated = original.replace(target, replacement).into_bytes();
+        tokio::task::spawn_blocking(move || {
+            aos_core::security::write_file_no_symlink_under_root(
+                &base_root,
+                &rel_in_base,
+                &updated,
+            )
+        })
+        .await
+        .context("fs_edit write task failed")??;
         let status = match scope {
             FsScope::Shadow => "edited_in_cow_shadow",
             FsScope::TmpDir => "edited_in_agent_tmp",
@@ -10680,9 +10707,16 @@ time.sleep(60)
 
         // 1. HTML security headers + operator secrets_match case sensitivity
         let (html_head, _) = http_call(addr, "GET", "/approve", None, None).await;
-        assert!(html_head.contains("X-Frame-Options: DENY"), "{html_head}");
-        assert!(html_head.contains("X-Content-Type-Options: nosniff"), "{html_head}");
-        assert!(html_head.contains("Content-Security-Policy:"), "{html_head}");
+        let html_head_lc = html_head.to_ascii_lowercase();
+        assert!(html_head_lc.contains("x-frame-options: deny"), "{html_head}");
+        assert!(
+            html_head_lc.contains("x-content-type-options: nosniff"),
+            "{html_head}"
+        );
+        assert!(
+            html_head_lc.contains("content-security-policy:"),
+            "{html_head}"
+        );
 
         let wrong_case = op.to_ascii_uppercase();
         if wrong_case != op {
@@ -10773,5 +10807,183 @@ time.sleep(60)
         )
         .await;
         assert!(replay_head.contains("403 Forbidden"), "replayed TOTP must fail: {replay_head}");
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn phase2_fs_tools_anchored_no_symlink_and_axum_routing() {
+        use std::os::unix::fs::symlink;
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        fn pick_loopback_bind(slot: usize) -> String {
+            if let Ok(ports) = std::env::var("AOS_LOOPBACK_PORTS") {
+                if let Some(p) = ports
+                    .split(',')
+                    .filter_map(|s| s.trim().parse::<u16>().ok())
+                    .nth(slot)
+                {
+                    return format!("127.0.0.1:{p}");
+                }
+            }
+            "127.0.0.1:0".to_string()
+        }
+
+        let tmp = tempfile::tempdir().unwrap();
+        let ws = tmp.path().join("ws");
+        let outside = tmp.path().join("outside_victim");
+        std::fs::create_dir_all(&ws).unwrap();
+        std::fs::create_dir_all(&outside).unwrap();
+        std::fs::write(outside.join("secret.txt"), "intact").unwrap();
+
+        let kernel = Arc::new(AegisRuntimeKernel::new(&tmp.path().join("rt")).await.unwrap());
+        let id = AgentIdentity::new("phase2-org", "phase2-agent", "tester");
+        let _ = kernel
+            .ensure_agent_environment(
+                id.clone(),
+                &ws,
+                IsolationTier::NativeOsSandbox,
+                vec!["*".to_string()],
+            )
+            .await
+            .unwrap();
+
+        // Plant a symlink dir inside shadow_root -> outside, and verify fs_write / fs_edit / fs_delete refuse it.
+        let shadow_root = {
+            let envs = kernel.agents.read().await;
+            let key = AegisRuntimeKernel::agent_key(&id.org_id, &id.agent_id);
+            envs.get(&key).unwrap().workspace.shadow_root().to_path_buf()
+        };
+        symlink(&outside, shadow_root.join("linked_dir")).unwrap();
+
+        let write_req = json!({
+            "jsonrpc": "2.0",
+            "id": 1,
+            "method": "tools/call",
+            "params": { "name": "fs_write", "arguments": { "path": "linked_dir/secret.txt", "content": "hacked" } }
+        });
+        let w_resp = kernel.handle_jsonrpc_message(&id, write_req).await.unwrap();
+        assert_eq!(w_resp["result"]["isError"], true, "{w_resp}");
+
+        let edit_req = json!({
+            "jsonrpc": "2.0",
+            "id": 2,
+            "method": "tools/call",
+            "params": { "name": "fs_edit", "arguments": { "path": "linked_dir/secret.txt", "target": "intact", "replacement": "hacked" } }
+        });
+        let e_resp = kernel.handle_jsonrpc_message(&id, edit_req).await.unwrap();
+        assert_eq!(e_resp["result"]["isError"], true, "{e_resp}");
+
+        let del_req = json!({
+            "jsonrpc": "2.0",
+            "id": 3,
+            "method": "tools/call",
+            "params": { "name": "fs_delete", "arguments": { "path": "linked_dir/secret.txt" } }
+        });
+        let d_resp = kernel.handle_jsonrpc_message(&id, del_req).await.unwrap();
+        assert_eq!(d_resp["result"]["isError"], true, "{d_resp}");
+        assert_eq!(
+            std::fs::read_to_string(outside.join("secret.txt")).unwrap(),
+            "intact"
+        );
+
+        // Verify axum daemon serves /releases/* and enforces Connection: close & 401/404 parity.
+        let releases_dir = kernel.runtime_data_root.join("releases");
+        std::fs::create_dir_all(&releases_dir).unwrap();
+        std::fs::write(releases_dir.join("test.bin"), b"AOSBIN").unwrap();
+
+        let addr = kernel
+            .clone()
+            .start_http_daemon_with_auth(&pick_loopback_bind(2), ws, DaemonAuth::Required)
+            .await
+            .unwrap();
+
+        let mut s_rel = tokio::net::TcpStream::connect(addr).await.unwrap();
+        s_rel
+            .write_all(
+                format!(
+                    "GET /releases/test.bin HTTP/1.1\r\nHost: {addr}\r\n\r\n"
+                )
+                .as_bytes(),
+            )
+            .await
+            .unwrap();
+        let mut buf_rel = Vec::new();
+        s_rel.read_to_end(&mut buf_rel).await.unwrap();
+        let raw_rel = String::from_utf8_lossy(&buf_rel);
+        assert!(raw_rel.contains("200 OK"), "{raw_rel}");
+        assert!(raw_rel.ends_with("AOSBIN"), "{raw_rel}");
+
+        let mut s_404 = tokio::net::TcpStream::connect(addr).await.unwrap();
+        let op = kernel.operator_token();
+        s_404
+            .write_all(
+                format!(
+                    "GET /no/such/route HTTP/1.1\r\nHost: {addr}\r\nAuthorization: Bearer {op}\r\n\r\n"
+                )
+                .as_bytes(),
+            )
+            .await
+            .unwrap();
+        let mut buf_404 = Vec::new();
+        s_404.read_to_end(&mut buf_404).await.unwrap();
+        assert!(
+            String::from_utf8_lossy(&buf_404).contains("404 Not Found"),
+            "{}",
+            String::from_utf8_lossy(&buf_404)
+        );
+
+        // Anonymous non-public route -> 401
+        let mut s_401 = tokio::net::TcpStream::connect(addr).await.unwrap();
+        s_401
+            .write_all(format!("GET /v1/status HTTP/1.1\r\nHost: {addr}\r\n\r\n").as_bytes())
+            .await
+            .unwrap();
+        let mut buf_401 = Vec::new();
+        s_401.read_to_end(&mut buf_401).await.unwrap();
+        assert!(
+            String::from_utf8_lossy(&buf_401).contains("401 Unauthorized"),
+            "{}",
+            String::from_utf8_lossy(&buf_401)
+        );
+
+        // Oversized Content-Length -> 413 without reading body
+        let mut s_413 = tokio::net::TcpStream::connect(addr).await.unwrap();
+        s_413
+            .write_all(
+                format!(
+                    "POST /mcp HTTP/1.1\r\nHost: {addr}\r\nContent-Length: {}\r\n\r\n{{",
+                    MAX_HTTP_BODY_BYTES + 1
+                )
+                .as_bytes(),
+            )
+            .await
+            .unwrap();
+        let mut buf_413 = Vec::new();
+        s_413.read_to_end(&mut buf_413).await.unwrap();
+        assert!(
+            String::from_utf8_lossy(&buf_413).starts_with("HTTP/1.1 413"),
+            "{}",
+            String::from_utf8_lossy(&buf_413)
+        );
+
+        // Authenticated POST /mcp -> 200 OK JSON-RPC response
+        let rpc_body = json!({ "jsonrpc": "2.0", "id": 99, "method": "tools/list", "params": {} }).to_string();
+        let mut s_mcp = tokio::net::TcpStream::connect(addr).await.unwrap();
+        s_mcp
+            .write_all(
+                format!(
+                    "POST /mcp HTTP/1.1\r\nHost: {addr}\r\nAuthorization: Bearer {op}\r\nContent-Length: {}\r\n\r\n{}",
+                    rpc_body.len(),
+                    rpc_body
+                )
+                .as_bytes(),
+            )
+            .await
+            .unwrap();
+        let mut buf_mcp = Vec::new();
+        s_mcp.read_to_end(&mut buf_mcp).await.unwrap();
+        let raw_mcp = String::from_utf8_lossy(&buf_mcp);
+        assert!(raw_mcp.contains("200 OK"), "{raw_mcp}");
+        assert!(raw_mcp.contains("\"tools\""), "{raw_mcp}");
     }
 }

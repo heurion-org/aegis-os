@@ -131,6 +131,22 @@ pub(crate) fn ensure_agent_tmp_dir_no_symlink(agent_home_dir: &Path) -> anyhow::
     Ok(tmp_dir)
 }
 
+pub(crate) fn anchored_root_and_rel(
+    scope: FsScope,
+    clean: &str,
+    shadow_root: &Path,
+    agent_home_dir: &Path,
+) -> anyhow::Result<(PathBuf, PathBuf)> {
+    match scope {
+        FsScope::Shadow => Ok((shadow_root.to_path_buf(), PathBuf::from(clean))),
+        FsScope::TmpDir => {
+            let tmp_root = ensure_agent_tmp_dir_no_symlink(agent_home_dir)?;
+            let rel = clean.strip_prefix("$TMPDIR/").unwrap_or(clean);
+            Ok((tmp_root, PathBuf::from(rel)))
+        }
+    }
+}
+
 pub(crate) fn resolve_fs_path_for_write(
     shadow_root: &Path,
     agent_home_dir: &Path,

@@ -12,6 +12,7 @@ use crate::AegisRuntimeKernel;
 use anyhow::{bail, Context};
 use aos_core::{AgentIdentity, IsolationTier, PolicyDecision};
 use aos_policy::AegisPolicyKernel;
+use aos_vfs::vault::VaultKeyStore;
 use aos_vfs::CoWWorkspace;
 use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine as _};
 use chrono::Utc;
@@ -19,8 +20,10 @@ use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 use tokio::sync::RwLock;
 use uuid::Uuid;
+use zeroize::Zeroizing;
 
 
 mod billing;
@@ -41,6 +44,8 @@ pub struct PaasControlPlane {
     pub(super) state_file: PathBuf,
     pub(super) workspaces_root: PathBuf,
     pub(super) state: RwLock<PersistedPaasState>,
+    /// Keystore sealing sensitive control-plane secrets (e.g. approver TOTP secrets) at rest.
+    pub(super) key_store: Arc<VaultKeyStore>,
     /// Serializes `reload -> mutate -> flush` across async tasks and processes (combined with `flock`).
     pub(super) io_gate: tokio::sync::Mutex<()>,
     /// Server-side secrets: `(admin, billing_webhook, is_static_admin)`. Never derived from request data.
@@ -54,6 +59,7 @@ impl PaasControlPlane {
     pub fn new(runtime_data_root: &Path) -> Self {
         let state_file = runtime_data_root.join("paas_state.json");
         let workspaces_root = runtime_data_root.join("paas_workspaces");
+        let key_store = Arc::new(VaultKeyStore::for_runtime_root(runtime_data_root));
         let mut initial = std::fs::read(&state_file)
             .ok()
             .and_then(|b| serde_json::from_slice::<PersistedPaasState>(&b).ok())
@@ -68,6 +74,7 @@ impl PaasControlPlane {
             state_file,
             workspaces_root,
             state: RwLock::new(initial),
+            key_store,
             io_gate: tokio::sync::Mutex::new(()),
             secrets: std::sync::RwLock::new((
                 env_admin,
@@ -417,16 +424,31 @@ impl PaasControlPlane {
         total
     }
 
-    /// Creates (or replaces) the org's approver and returns the one-time enrollment payload.
-    pub(super) fn new_approver(state: &mut PersistedPaasState, org_id: &str, email: Option<String>, via: &str) -> Value {
+    pub(super) fn approver_totp_aad(org_id: &str) -> String {
+        format!("paas-approver-totp:{org_id}")
+    }
+
+    /// Creates (or replaces) the org's approver and returns the one-time enrollment payload plus
+    /// the ephemeral plaintext secret bytes (sealed in `state.approvers`).
+    pub(super) fn new_approver(
+        key_store: &VaultKeyStore,
+        state: &mut PersistedPaasState,
+        org_id: &str,
+        email: Option<String>,
+        via: &str,
+    ) -> anyhow::Result<(Value, Zeroizing<Vec<u8>>)> {
         use crate::approver::{base32_encode, generate_secret, otpauth_uri, qr_svg, qr_terminal};
-        let secret = generate_secret();
+        let secret = Zeroizing::new(generate_secret().to_vec());
+        let sealed = key_store
+            .seal_secret(&Self::approver_totp_aad(org_id), &secret)
+            .context("failed to seal approver TOTP secret")?;
         let secret_b32 = base32_encode(&secret);
         let uri = otpauth_uri(org_id, &secret_b32);
         state.approvers.retain(|a| a.org_id != org_id);
         state.approvers.push(ApproverRecord {
             org_id: org_id.to_string(),
-            secret_hex: hex::encode(&secret),
+            secret_hex: String::new(),
+            sealed_secret: Some(sealed),
             email,
             enrolled_via: via.to_string(),
             enrolled_at_ms: Utc::now().timestamp_millis(),
@@ -434,14 +456,15 @@ impl PaasControlPlane {
             failed_attempts: 0,
             locked_until_ms: 0,
         });
-        json!({
+        let payload = json!({
             "org_id": org_id,
             "secret": secret_b32,
             "otpauth_uri": uri,
             "qr_svg": qr_svg(&uri),
             "qr_terminal": qr_terminal(&uri),
             "note": "Shown once. Add it to your authenticator app; approving escalations requires its 6-digit code."
-        })
+        });
+        Ok((payload, secret))
     }
 
     pub async fn approver_status(&self, org_id: &str) -> Value {
@@ -563,6 +586,7 @@ impl PaasControlPlane {
     pub async fn confirm_approver_email_enrollment(&self, token: &str) -> anyhow::Result<Value> {
         let hash = Self::sha256_hex(token.trim());
         let now = Utc::now().timestamp_millis();
+        let key_store = self.key_store.clone();
         self.with_state_mut(move |state| {
             let rec = state
                 .approver_enrollments
@@ -572,23 +596,26 @@ impl PaasControlPlane {
                 .context("This enrollment link is invalid, expired or already used")?;
             // One approver device per org: every outstanding link for it dies with this one.
             state.approver_enrollments.retain(|e| e.org_id != rec.org_id);
-            Ok(Self::new_approver(
+            Self::new_approver(
+                &key_store,
                 state,
                 &rec.org_id,
                 Some(rec.email.clone()),
                 "email",
-            ))
+            )
+            .map(|(v, _)| v)
         })
         .await
     }
 
     /// Checks an approver's TOTP code for `org_id`, with replay protection and a lockout after
-    /// repeated failures.
+    /// repeated failures. Transparently seals any legacy plaintext `secret_hex` on first access.
     pub async fn verify_approver_code(&self, org_id: &str, code: &str) -> anyhow::Result<()> {
         let now = Utc::now();
         let now_ms = now.timestamp_millis();
         let org_owned = org_id.to_string();
         let code_owned = code.to_string();
+        let key_store = self.key_store.clone();
         self.with_state_mut_always_flush(move |state| {
             let approver = state
                 .approvers
@@ -598,7 +625,24 @@ impl PaasControlPlane {
             if approver.locked_until_ms > now_ms {
                 bail!("Too many wrong codes; approvals for this org are locked for a few minutes");
             }
-            let secret = hex::decode(&approver.secret_hex).context("corrupt approver secret")?;
+            let aad = Self::approver_totp_aad(&org_owned);
+            let secret: Zeroizing<Vec<u8>> = if let Some(ref blob) = approver.sealed_secret {
+                key_store
+                    .open_secret(&aad, blob)
+                    .context("failed to unseal approver TOTP secret")?
+            } else if !approver.secret_hex.is_empty() {
+                let raw = Zeroizing::new(
+                    hex::decode(&approver.secret_hex).context("corrupt approver secret")?,
+                );
+                let blob = key_store
+                    .seal_secret(&aad, &raw)
+                    .context("failed to migrate legacy approver secret")?;
+                approver.sealed_secret = Some(blob);
+                approver.secret_hex.clear();
+                raw
+            } else {
+                bail!("corrupt approver secret");
+            };
             match crate::approver::match_totp(&secret, &code_owned, now.timestamp()) {
                 Some(step) if step > approver.last_used_step => {
                     approver.last_used_step = step;
@@ -634,19 +678,16 @@ impl PaasControlPlane {
     #[cfg(test)]
     pub(crate) async fn enroll_approver_for_test(&self, org_id: &str) -> anyhow::Result<String> {
         let org_owned = org_id.to_string();
+        let key_store = self.key_store.clone();
         self.with_state_mut(move |state| {
-            let _ = Self::new_approver(
+            let (_, secret) = Self::new_approver(
+                &key_store,
                 state,
                 &org_owned,
                 Some("ops@example.com".to_string()),
                 "test",
-            );
-            state
-                .approvers
-                .iter()
-                .find(|a| a.org_id == org_owned)
-                .map(|a| a.secret_hex.clone())
-                .context("enrolled approver missing")
+            )?;
+            Ok(hex::encode(secret.as_slice()))
         })
         .await
     }
@@ -1472,5 +1513,66 @@ mod tests {
         }
         assert!(stats["by_category"].get("rogue_pii_key").is_none());
         assert!(stats["by_cmd_bucket"].get("/tmp/secret").is_none());
+    }
+
+    #[tokio::test]
+    async fn phase2_approver_totp_secret_is_sealed_at_rest() {
+        let tmp = tempfile::tempdir().unwrap();
+        let paas = PaasControlPlane::new(tmp.path());
+        let secret_hex = paas.enroll_approver_for_test("seal-org").await.unwrap();
+        let raw_secret = hex::decode(&secret_hex).unwrap();
+
+        // Raw plaintext hex and `secret_hex` key must NOT exist on disk.
+        let disk = std::fs::read_to_string(tmp.path().join("paas_state.json")).unwrap();
+        assert!(!disk.contains(&secret_hex), "plaintext TOTP leaked on disk");
+        assert!(!disk.contains("\"secret_hex\""), "secret_hex key leaked on disk");
+        assert!(disk.contains("\"sealed_secret\""), "sealed_secret missing on disk");
+
+        // Fresh PaasControlPlane on the same runtime root must unseal and verify TOTP + replay guard.
+        let paas2 = PaasControlPlane::new(tmp.path());
+        let step = crate::approver::totp_step(Utc::now().timestamp()) as u64;
+        let code = format!("{:06}", crate::approver::hotp(&raw_secret, step));
+        paas2.verify_approver_code("seal-org", &code).await.unwrap();
+        let replay = paas2.verify_approver_code("seal-org", &code).await;
+        assert!(replay.is_err());
+    }
+
+    #[tokio::test]
+    async fn phase2_legacy_plaintext_approver_auto_migrates_to_sealed_secret() {
+        let tmp = tempfile::tempdir().unwrap();
+        let raw_secret = vec![0x42u8; 20];
+        let legacy_hex = hex::encode(&raw_secret);
+        let legacy_state = serde_json::json!({
+            "approvers": [{
+                "org_id": "legacy-org",
+                "secret_hex": legacy_hex,
+                "email": "legacy@example.com",
+                "enrolled_via": "email",
+                "enrolled_at_ms": 1_700_000_000_000i64,
+                "last_used_step": 0,
+                "failed_attempts": 0,
+                "locked_until_ms": 0
+            }]
+        });
+        std::fs::write(
+            tmp.path().join("paas_state.json"),
+            serde_json::to_vec_pretty(&legacy_state).unwrap(),
+        )
+        .unwrap();
+
+        let paas = PaasControlPlane::new(tmp.path());
+        let step_now = crate::approver::totp_step(Utc::now().timestamp());
+        let code_prev = format!("{:06}", crate::approver::hotp(&raw_secret, (step_now - 1) as u64));
+        paas.verify_approver_code("legacy-org", &code_prev).await.unwrap();
+
+        let migrated_disk = std::fs::read_to_string(tmp.path().join("paas_state.json")).unwrap();
+        assert!(!migrated_disk.contains(&legacy_hex), "legacy plaintext remained after migration");
+        assert!(!migrated_disk.contains("\"secret_hex\""), "secret_hex remained after migration");
+        assert!(migrated_disk.contains("\"sealed_secret\""), "sealed_secret missing after migration");
+
+        // Fresh instance must unseal migrated secret and accept next TOTP step.
+        let paas2 = PaasControlPlane::new(tmp.path());
+        let code_now = format!("{:06}", crate::approver::hotp(&raw_secret, step_now as u64));
+        paas2.verify_approver_code("legacy-org", &code_now).await.unwrap();
     }
 }

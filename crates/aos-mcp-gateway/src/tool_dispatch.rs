@@ -778,15 +778,26 @@ impl AegisRuntimeKernel {
                     ),
                 };
                 let byte_len = raw_bytes.len();
-                let (scope, clean, full_path) = resolve_fs_path_for_write(
+                let (scope, clean, _full_path) = resolve_fs_path_for_write(
                     env.workspace.shadow_root(),
                     &env.sandbox.config().agent_home_dir,
                     rel_path,
                 )?;
-                if let Some(parent) = full_path.parent() {
-                    tokio::fs::create_dir_all(parent).await?;
-                }
-                aos_core::session::write_bytes_atomic_synced_async(&full_path, raw_bytes).await?;
+                let (base_root, rel_in_base) = anchored_root_and_rel(
+                    scope,
+                    &clean,
+                    env.workspace.shadow_root(),
+                    &env.sandbox.config().agent_home_dir,
+                )?;
+                tokio::task::spawn_blocking(move || {
+                    aos_core::security::write_file_no_symlink_under_root(
+                        &base_root,
+                        &rel_in_base,
+                        &raw_bytes,
+                    )
+                })
+                .await
+                .context("fs_write task failed")??;
                 let status = match scope {
                     FsScope::Shadow => "written_to_cow_shadow",
                     FsScope::TmpDir => "written_to_agent_tmp",
@@ -928,14 +939,22 @@ impl AegisRuntimeKernel {
                     .get("path")
                     .and_then(|v| v.as_str())
                     .context("Missing 'path'")?;
-                let (scope, clean, full_path) = resolve_fs_path_for_write(
+                let (scope, clean, _full_path) = resolve_fs_path_for_write(
                     env.workspace.shadow_root(),
                     &env.sandbox.config().agent_home_dir,
                     rel_path,
                 )?;
-                if full_path.exists() {
-                    tokio::fs::remove_file(&full_path).await?;
-                }
+                let (base_root, rel_in_base) = anchored_root_and_rel(
+                    scope,
+                    &clean,
+                    env.workspace.shadow_root(),
+                    &env.sandbox.config().agent_home_dir,
+                )?;
+                tokio::task::spawn_blocking(move || {
+                    aos_core::security::remove_file_no_symlink_under_root(&base_root, &rel_in_base)
+                })
+                .await
+                .context("fs_delete task failed")??;
                 let status = match scope {
                     FsScope::Shadow => "deleted_in_cow_shadow",
                     FsScope::TmpDir => "deleted_in_agent_tmp",

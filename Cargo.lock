@@ -194,6 +194,7 @@ dependencies = [
  "aos-recorder",
  "aos-sandbox",
  "aos-vfs",
+ "axum",
  "base64",
  "chrono",
  "ed25519-dalek",

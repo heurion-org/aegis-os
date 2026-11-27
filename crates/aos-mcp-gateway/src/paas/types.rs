@@ -464,7 +464,12 @@ pub struct ScopedEscalationTicket {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ApproverRecord {
     pub org_id: String,
+    /// Legacy plaintext hex secret (read-only migration path; newly enrolled/migrated records leave this empty).
+    #[serde(default, skip_serializing_if = "String::is_empty")]
     pub secret_hex: String,
+    /// AES-256-GCM sealed TOTP secret anchored by `VaultKeyStore` (AAD: `paas-approver-totp:{org_id}`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub sealed_secret: Option<aos_vfs::vault::SealedSecretBlob>,
     #[serde(default)]
     pub email: Option<String>,
     /// How the approver was enrolled (`email`).
