@@ -155,20 +155,20 @@ impl AegisIpcBus {
                         *self.mailboxes.write().await = parsed.mailboxes;
                         *self.msg_index.write().await = parsed.msg_index;
                         *self.tasks.write().await = parsed.tasks;
-                        *self.state_error.lock().unwrap() = None;
+                        *self.state_error.lock().unwrap_or_else(|e| e.into_inner()) = None;
                     }
                     Err(error) => {
-                        *self.state_error.lock().unwrap() = Some(format!(
+                        *self.state_error.lock().unwrap_or_else(|e| e.into_inner()) = Some(format!(
                             "failed to parse IPC state '{}': {error}",
                             path.display()
                         ));
                     }
                 },
                 Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
-                    *self.state_error.lock().unwrap() = None;
+                    *self.state_error.lock().unwrap_or_else(|e| e.into_inner()) = None;
                 }
                 Err(error) => {
-                    *self.state_error.lock().unwrap() = Some(format!(
+                    *self.state_error.lock().unwrap_or_else(|e| e.into_inner()) = Some(format!(
                         "failed to read IPC state '{}': {error}",
                         path.display()
                     ));
@@ -178,7 +178,12 @@ impl AegisIpcBus {
     }
 
     async fn flush_to_disk(&self) -> anyhow::Result<()> {
-        if let Some(error) = self.state_error.lock().unwrap().clone() {
+        if let Some(error) = self
+            .state_error
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .clone()
+        {
             anyhow::bail!("refusing to overwrite corrupt IPC state: {error}");
         }
         if let Some(ref path) = self.state_file {

@@ -1231,6 +1231,51 @@ mod tests {
         assert_eq!(ok.path_and_query, "/mcp");
     }
 
+    async fn read_full_http_request(sock: &mut tokio::net::TcpStream) -> String {
+        let mut buf = Vec::with_capacity(4096);
+        let mut chunk = [0u8; 4096];
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(2);
+        let mut expected_total: Option<usize> = None;
+        loop {
+            let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
+            if remaining.is_zero() {
+                break;
+            }
+            match tokio::time::timeout(remaining, tokio::io::AsyncReadExt::read(sock, &mut chunk))
+                .await
+            {
+                Ok(Ok(0)) | Ok(Err(_)) | Err(_) => break,
+                Ok(Ok(n)) => {
+                    buf.extend_from_slice(&chunk[..n]);
+                    if expected_total.is_none() {
+                        if let Some(pos) = buf.windows(4).position(|w| w == b"\r\n\r\n") {
+                            let header_end = pos + 4;
+                            let headers = String::from_utf8_lossy(&buf[..header_end]);
+                            let content_len = headers
+                                .lines()
+                                .find_map(|line| {
+                                    let (k, v) = line.split_once(':')?;
+                                    if k.trim().eq_ignore_ascii_case("content-length") {
+                                        v.trim().parse::<usize>().ok()
+                                    } else {
+                                        None
+                                    }
+                                })
+                                .unwrap_or(0);
+                            expected_total = Some(header_end + content_len);
+                        }
+                    }
+                    if let Some(total) = expected_total {
+                        if buf.len() >= total {
+                            break;
+                        }
+                    }
+                }
+            }
+        }
+        String::from_utf8_lossy(&buf).to_string()
+    }
+
     #[tokio::test]
     async fn streaming_chunked_sse_forwards_progress_notifications_and_resets_idle_timeout() {
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -1238,8 +1283,7 @@ mod tests {
 
         tokio::spawn(async move {
             let (mut sock, _) = listener.accept().await.unwrap();
-            let mut req_buf = vec![0u8; 4096];
-            let _ = tokio::io::AsyncReadExt::read(&mut sock, &mut req_buf).await;
+            let _ = read_full_http_request(&mut sock).await;
 
             let write_chunk = |data: &str| {
                 format!("{:x}\r\n{}\r\n", data.len(), data)
@@ -1275,6 +1319,7 @@ mod tests {
                 .unwrap();
             sock.write_all(b"0\r\n\r\n").await.unwrap();
             sock.flush().await.unwrap();
+            let _ = sock.shutdown().await;
         });
 
         let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
@@ -1324,11 +1369,7 @@ mod tests {
         tokio::spawn(async move {
             for idx in 0..3 {
                 let (mut sock, _) = listener.accept().await.unwrap();
-                let mut req_buf = vec![0u8; 4096];
-                let n = tokio::io::AsyncReadExt::read(&mut sock, &mut req_buf)
-                    .await
-                    .unwrap_or(0);
-                let raw = String::from_utf8_lossy(&req_buf[..n]).to_string();
+                let raw = read_full_http_request(&mut sock).await;
                 let resp = match idx {
                     0 => "HTTP/1.1 202 Accepted\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
                     1 => "HTTP/1.1 401 Unauthorized\r\nWWW-Authenticate: Bearer realm=\"heurion\"\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
@@ -1339,6 +1380,7 @@ mod tests {
                 };
                 sock.write_all(resp.as_bytes()).await.unwrap();
                 sock.flush().await.unwrap();
+                let _ = sock.shutdown().await;
             }
         });
 
@@ -1396,11 +1438,7 @@ mod tests {
         tokio::spawn(async move {
             for idx in 0..3 {
                 let (mut sock, _) = listener.accept().await.unwrap();
-                let mut req_buf = vec![0u8; 4096];
-                let n = tokio::io::AsyncReadExt::read(&mut sock, &mut req_buf)
-                    .await
-                    .unwrap_or(0);
-                let raw = String::from_utf8_lossy(&req_buf[..n]).to_string();
+                let raw = read_full_http_request(&mut sock).await;
                 let write_chunk = |data: &str| format!("{:x}\r\n{}\r\n", data.len(), data);
 
                 match idx {
@@ -1411,6 +1449,7 @@ mod tests {
                             "Content-Type: text/event-stream\r\n",
                             "Transfer-Encoding: chunked\r\n",
                             "Mcp-Session-Id: sid-sse\r\n",
+                            "Connection: close\r\n",
                             "\r\n"
                         );
                         sock.write_all(head.as_bytes()).await.unwrap();
@@ -1461,6 +1500,7 @@ mod tests {
                     }
                 }
                 sock.flush().await.unwrap();
+                let _ = sock.shutdown().await;
             }
         });
 

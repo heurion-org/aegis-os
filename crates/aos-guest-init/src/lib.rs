@@ -326,14 +326,16 @@ where
             if n == 0 {
                 break;
             }
-            sink.lock().unwrap().extend_from_slice(&chunk[..n]);
+            sink.lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .extend_from_slice(&chunk[..n]);
         }
     });
     (buf, handle)
 }
 
 fn tail_utf8_safe(buf: &Mutex<Vec<u8>>) -> String {
-    let buf = buf.lock().unwrap();
+    let buf = buf.lock().unwrap_or_else(|e| e.into_inner());
     let mut start = buf.len().saturating_sub(TIMEOUT_TAIL_BYTES);
     while start < buf.len() && (buf[start] & 0xC0) == 0x80 {
         start += 1;
@@ -432,7 +434,13 @@ impl GuestRuntimeState {
                 )
             }
             GuestRpcRequest::Shutdown { .. } => {
-                let pgids: Vec<u32> = self.active_pgids.lock().unwrap().iter().copied().collect();
+                let pgids: Vec<u32> = self
+                    .active_pgids
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .iter()
+                    .copied()
+                    .collect();
                 for pgid in pgids {
                     signal_pgid(pgid, libc::SIGKILL);
                 }
@@ -523,7 +531,10 @@ impl GuestRuntimeState {
             };
             let pid = child.id().unwrap_or(0);
             if pid > 0 {
-                self.active_pgids.lock().unwrap().insert(pid);
+                self.active_pgids
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .insert(pid);
             }
             let pid_out = bg_dir.join(format!("{pid}.stdout.log"));
             let pid_err = bg_dir.join(format!("{pid}.stderr.log"));
@@ -536,7 +547,7 @@ impl GuestRuntimeState {
                     let _ = tokio::fs::write(&pid_exit, st.code().unwrap_or(-1).to_string()).await;
                 }
                 if pid > 0 {
-                    active.lock().unwrap().remove(&pid);
+                    active.lock().unwrap_or_else(|e| e.into_inner()).remove(&pid);
                 }
             });
             let info = serde_json::json!({
@@ -571,7 +582,10 @@ impl GuestRuntimeState {
         };
         let pid = child.id().unwrap_or(0);
         if pid > 0 {
-            self.active_pgids.lock().unwrap().insert(pid);
+            self.active_pgids
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .insert(pid);
         }
         let _pgid_guard = ActivePgidGuard {
             pgid: pid,
@@ -604,8 +618,8 @@ impl GuestRuntimeState {
                     out_task.abort();
                     err_task.abort();
                 }
-                let stdout = std::mem::take(&mut *out_buf.lock().unwrap());
-                let stderr = std::mem::take(&mut *err_buf.lock().unwrap());
+                let stdout = std::mem::take(&mut *out_buf.lock().unwrap_or_else(|e| e.into_inner()));
+                let stderr = std::mem::take(&mut *err_buf.lock().unwrap_or_else(|e| e.into_inner()));
                 GuestRpcResponse::ExecResult {
                     pid,
                     exit_code: status.code(),
@@ -830,7 +844,11 @@ async fn handle_exec_pty_session<R, W>(
 
     let pid = child.id();
     if pid > 0 {
-        state.active_pgids.lock().unwrap().insert(pid);
+        state
+            .active_pgids
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .insert(pid);
     }
     let _pgid_guard = ActivePgidGuard {
         pgid: pid,

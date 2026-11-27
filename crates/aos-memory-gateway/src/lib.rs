@@ -877,6 +877,48 @@ mod tests {
     use base64::engine::general_purpose::URL_SAFE_NO_PAD;
     use ed25519_dalek::{Signer, SigningKey};
 
+    async fn read_full_http_request(sock: &mut tokio::net::TcpStream) -> String {
+        use tokio::io::AsyncReadExt;
+        let mut buf = Vec::with_capacity(4096);
+        let mut chunk = [0u8; 4096];
+        let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(2);
+        let mut expected_total: Option<usize> = None;
+        loop {
+            let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
+            if remaining.is_zero() {
+                break;
+            }
+            match tokio::time::timeout(remaining, sock.read(&mut chunk)).await {
+                Ok(Ok(0)) | Ok(Err(_)) | Err(_) => break,
+                Ok(Ok(n)) => {
+                    buf.extend_from_slice(&chunk[..n]);
+                    if expected_total.is_none() {
+                        if let Some(pos) = buf.windows(4).position(|w| w == b"\r\n\r\n") {
+                            let header_end = pos + 4;
+                            let headers = String::from_utf8_lossy(&buf[..header_end]);
+                            let content_len = headers
+                                .lines()
+                                .find_map(|line| {
+                                    let (k, v) = line.split_once(':')?;
+                                    if k.trim().eq_ignore_ascii_case("content-length") {
+                                        v.trim().parse::<usize>().ok()
+                                    } else {
+                                        None
+                                    }
+                                })
+                                .unwrap_or(0);
+                            expected_total = Some(header_end + content_len);
+                        }
+                    }
+                    if expected_total.is_some_and(|total| buf.len() >= total) {
+                        break;
+                    }
+                }
+            }
+        }
+        String::from_utf8_lossy(&buf).to_string()
+    }
+
     fn scopes(tag: &str) -> MemoryScopes {
         MemoryScopes {
             read: MemoryScope {
@@ -995,14 +1037,14 @@ mod tests {
         let guard_addr = guard.local_addr().unwrap();
         let guard_task = tokio::spawn(async move {
             let (mut socket, _) = guard.accept().await.unwrap();
-            let mut buffer = [0u8; 4096];
-            let read = socket.read(&mut buffer).await.unwrap();
-            let request = String::from_utf8_lossy(&buffer[..read]);
+            let request = read_full_http_request(&mut socket).await;
             assert!(request.contains("GET /v1/memory?tag=notes/projects"));
             socket
                 .write_all(b"HTTP/1.1 200 OK\r\ncontent-length: 11\r\nconnection: close\r\n\r\n{\"ok\":true}")
                 .await
                 .unwrap();
+            socket.flush().await.unwrap();
+            let _ = socket.shutdown().await;
         });
 
         let signing_key = SigningKey::from_bytes(&[7u8; 32]);
@@ -1058,25 +1100,26 @@ mod tests {
         let guard_task = tokio::spawn(async move {
             // 1. Session validation call.
             let (mut socket, _) = guard.accept().await.unwrap();
-            let mut buffer = [0u8; 4096];
-            let read = socket.read(&mut buffer).await.unwrap();
-            let request = String::from_utf8_lossy(&buffer[..read]);
+            let request = read_full_http_request(&mut socket).await;
             assert!(request.contains("POST /v1/tokens/validate"));
             socket
                 .write_all(b"HTTP/1.1 200 OK\r\ncontent-length: 11\r\nconnection: close\r\n\r\n{\"valid\":true}")
                 .await
                 .unwrap();
+            socket.flush().await.unwrap();
+            let _ = socket.shutdown().await;
             drop(socket);
 
             // 2. Actual memory read.
             let (mut socket, _) = guard.accept().await.unwrap();
-            let read = socket.read(&mut buffer).await.unwrap();
-            let request = String::from_utf8_lossy(&buffer[..read]);
+            let request = read_full_http_request(&mut socket).await;
             assert!(request.contains("GET /v1/memory?tag=notes/projects"));
             socket
                 .write_all(b"HTTP/1.1 200 OK\r\ncontent-length: 11\r\nconnection: close\r\n\r\n{\"ok\":true}")
                 .await
                 .unwrap();
+            socket.flush().await.unwrap();
+            let _ = socket.shutdown().await;
         });
 
         let signing_key = SigningKey::from_bytes(&[7u8; 32]);

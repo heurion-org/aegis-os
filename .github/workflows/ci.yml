@@ -22,6 +22,7 @@ jobs:
           export PATH="$HOME/.cargo/bin:$PATH"
           echo "$HOME/.cargo/bin" >> "$GITHUB_PATH"
           rustup show active-toolchain >/dev/null 2>&1 || rustup default stable
+          rustup component add clippy
 
       - name: Install bubblewrap & configure AppArmor userns (Linux)
         if: runner.os == 'Linux'
@@ -31,6 +32,9 @@ jobs:
             printf 'abi <abi/4.0>,\ninclude <tunables/global>\nprofile bwrap /usr/bin/bwrap flags=(unconfined) {\n  userns,\n}\n' | sudo tee /etc/apparmor.d/bwrap >/dev/null
             sudo apparmor_parser -r /etc/apparmor.d/bwrap || true
           fi
+
+      - name: Clippy
+        run: cargo clippy --workspace --all-targets --locked -- -D warnings
 
       - name: Run workspace tests
         env:

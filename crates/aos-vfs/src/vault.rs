@@ -758,7 +758,7 @@ impl VaultKeyStore {
             .open_in_place(
                 Nonce::assume_unique_for_key(nonce_arr),
                 Aad::from(org_id.as_bytes()),
-                &mut *in_out,
+                &mut in_out,
             )
             .map_err(|_| {
                 anyhow::anyhow!(

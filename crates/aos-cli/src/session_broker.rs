@@ -1878,47 +1878,18 @@ fn effect_for_tool_with_session(
 }
 
 fn is_credential_or_ring0_path(raw: &str, norm_s: &str) -> bool {
-    const MARKERS: &[&str] = &[
-        "~/.ssh",
-        "~/.aws",
-        "~/.gnupg",
-        "~/.kube",
-        "/.ssh/",
-        "/.aws/",
-        "/.gnupg/",
-        "/.kube/",
-        ".ssh/",
-        ".aws/",
-        ".gnupg/",
-        ".kube/",
-        "/.config/gh/",
-        "/Library/Keychains",
-        "/oauth_creds.json",
-        "/.credentials.json",
-        "/.codex/auth.json",
-        "/.hermes/auth.json",
-        "/opencode/auth.json",
-        "/plugins_secrets.json",
-        "/human.token",
-        "/agent.token",
-        "/policy_state.json",
-        ".dek.enc.json",
-        "/master.kek",
-        "/.master.kek",
-        "/aegis-broker.json",
-        "/mcp_auth_realms.json",
-        "/mcp_firewall_state.json",
-        "/mcp_bundles.json",
-        "/session_taints.json",
-        "/.ephemeral.kek",
-    ];
+    const RELATIVE_CRED_PREFIXES: &[&str] = &[".ssh/", ".aws/", ".gnupg/", ".kube/"];
     for candidate in [raw, norm_s] {
-        if MARKERS.iter().any(|m| candidate.contains(m))
-            || candidate.ends_with("/.env")
-            || candidate.ends_with("/.ssh")
-            || candidate.ends_with("/.aws")
-            || candidate.ends_with("/.gnupg")
-            || candidate.ends_with("/.kube")
+        let lower = aos_policy::ring0::normalize_for_match(candidate);
+        if aos_policy::ring0::contains_credential_marker(&lower)
+            || aos_policy::ring0::contains_runtime_state_marker(&lower)
+            || aos_policy::ring0::contains_protected_client_config_marker(&lower)
+            || RELATIVE_CRED_PREFIXES.iter().any(|p| lower.contains(p))
+            || lower.ends_with("/.env")
+            || lower.ends_with("/.ssh")
+            || lower.ends_with("/.aws")
+            || lower.ends_with("/.gnupg")
+            || lower.ends_with("/.kube")
         {
             return true;
         }
@@ -3486,5 +3457,24 @@ print("BROKER_PROBE_DONE")
         .expect("WebFetch must map to Effect");
         assert_eq!(wf_net.kind, EffectKind::NetRequest);
         assert_eq!(wf_net.resource, "https://api.example.com/v1");
+
+        for case_path in [
+            "/Users/alice/.SSH/id_rsa",
+            "/Users/alice/.docker/config.json",
+            "/Users/alice/.GEMINI/config/hooks.json",
+        ] {
+            let eff = effect_for_tool_with_session(
+                "read_file",
+                &json!({ "Path": case_path }),
+                &session,
+                session_dir,
+            )
+            .expect("ring0 path must map to Effect");
+            assert_eq!(
+                eff.scope,
+                ResourceScope::Credential,
+                "expected Credential scope for {case_path}"
+            );
+        }
     }
 }

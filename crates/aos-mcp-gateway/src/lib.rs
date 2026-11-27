@@ -15974,6 +15974,52 @@ fn format_capped_mcp_tool_text(
 mod tests {
     use super::*;
 
+    async fn read_full_http_request(sock: &mut tokio::net::TcpStream) -> String {
+        let mut buf = Vec::with_capacity(4096);
+        let mut chunk = [0u8; 4096];
+        let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(2);
+        let mut expected_total: Option<usize> = None;
+        loop {
+            let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
+            if remaining.is_zero() {
+                break;
+            }
+            match tokio::time::timeout(
+                remaining,
+                tokio::io::AsyncReadExt::read(sock, &mut chunk),
+            )
+            .await
+            {
+                Ok(Ok(0)) | Ok(Err(_)) | Err(_) => break,
+                Ok(Ok(n)) => {
+                    buf.extend_from_slice(&chunk[..n]);
+                    if expected_total.is_none() {
+                        if let Some(pos) = buf.windows(4).position(|w| w == b"\r\n\r\n") {
+                            let header_end = pos + 4;
+                            let headers = String::from_utf8_lossy(&buf[..header_end]);
+                            let content_len = headers
+                                .lines()
+                                .find_map(|line| {
+                                    let (k, v) = line.split_once(':')?;
+                                    if k.trim().eq_ignore_ascii_case("content-length") {
+                                        v.trim().parse::<usize>().ok()
+                                    } else {
+                                        None
+                                    }
+                                })
+                                .unwrap_or(0);
+                            expected_total = Some(header_end + content_len);
+                        }
+                    }
+                    if expected_total.is_some_and(|total| buf.len() >= total) {
+                        break;
+                    }
+                }
+            }
+        }
+        String::from_utf8_lossy(&buf).to_string()
+    }
+
     #[test]
     fn test_format_capped_mcp_tool_text_truncates_oversized_payloads() {
         let small = json!({ "status": "ok", "count": 2 });
@@ -16791,22 +16837,20 @@ mod tests {
         let (tx, rx) = tokio::sync::oneshot::channel();
         tokio::spawn(async move {
             let (mut socket, _) = memory_listener.accept().await.unwrap();
-            let mut buf = vec![0u8; 8192];
-            let read = tokio::io::AsyncReadExt::read(&mut socket, &mut buf)
-                .await
-                .unwrap();
-            let request = String::from_utf8_lossy(&buf[..read]).to_string();
+            let request = read_full_http_request(&mut socket).await;
             assert!(request.contains("POST /v1/sessions/revoke-by-task"));
             assert!(request.to_lowercase().contains("x-aegis-task-token: msg-"));
             let body = r#"{"status":"revoked","count":1}"#;
             let response = format!(
-                "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n{}",
+                "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
                 body.len(),
                 body
             );
             tokio::io::AsyncWriteExt::write_all(&mut socket, response.as_bytes())
                 .await
                 .unwrap();
+            tokio::io::AsyncWriteExt::flush(&mut socket).await.unwrap();
+            let _ = tokio::io::AsyncWriteExt::shutdown(&mut socket).await;
             let _ = tx.send(());
         });
         kernel.memory_url = Some(format!("http://{memory_addr}"));
@@ -16878,22 +16922,20 @@ mod tests {
         let (tx, rx) = tokio::sync::oneshot::channel();
         tokio::spawn(async move {
             let (mut socket, _) = listener.accept().await.unwrap();
-            let mut buf = vec![0u8; 8192];
-            let read = tokio::io::AsyncReadExt::read(&mut socket, &mut buf)
-                .await
-                .unwrap();
-            let request = String::from_utf8_lossy(&buf[..read]).to_string();
+            let request = read_full_http_request(&mut socket).await;
             assert!(request.contains("POST /v1/sessions/revoke-by-task"));
             assert!(request.to_lowercase().contains("x-aegis-task-token: task-1:"));
             let body = r#"{"status":"revoked","count":1}"#;
             let response = format!(
-                "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n{}",
+                "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
                 body.len(),
                 body
             );
             tokio::io::AsyncWriteExt::write_all(&mut socket, response.as_bytes())
                 .await
                 .unwrap();
+            tokio::io::AsyncWriteExt::flush(&mut socket).await.unwrap();
+            let _ = tokio::io::AsyncWriteExt::shutdown(&mut socket).await;
             let _ = tx.send(());
         });
         kernel.memory_url = Some(format!("http://{addr}"));

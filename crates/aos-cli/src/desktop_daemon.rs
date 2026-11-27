@@ -366,9 +366,10 @@ async fn health_handler(State(state): State<DesktopDaemonState>) -> Json<Value> 
 async fn sandbox_health_handler() -> Json<Value> {
     #[cfg(target_os = "linux")]
     let (ready, driver, hint) = {
-        let has_bwrap = std::process::Command::new("which")
+        let has_bwrap = tokio::process::Command::new("which")
             .arg("bwrap")
             .output()
+            .await
             .is_ok_and(|o| o.status.success());
         if has_bwrap {
             (true, "linux-bwrap", "Linux bwrap 内核沙盒已就绪")
@@ -1366,7 +1367,7 @@ fn infer_single_child_repo_for_refs(
         })
         .filter(|s| !s.is_empty())
         .collect();
-    normalized_repos.sort_by(|a, b| b.len().cmp(&a.len()));
+    normalized_repos.sort_by_key(|a| std::cmp::Reverse(a.len()));
     normalized_repos.dedup();
     if normalized_repos.is_empty() {
         return None;
@@ -2247,7 +2248,7 @@ async fn approvals_handler(State(state): State<DesktopDaemonState>) -> Json<Valu
             }
         }
     }
-    combined.sort_by(|a, b| b.created_at_ms.cmp(&a.created_at_ms));
+    combined.sort_by_key(|item| std::cmp::Reverse(item.created_at_ms));
     let pending_count = combined.len();
     let history_count = seen_history.len();
     Json(json!({

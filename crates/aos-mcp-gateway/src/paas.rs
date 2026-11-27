@@ -557,15 +557,16 @@ impl PaasControlPlane {
 
     /// Overrides the mailer and public URL loaded from the environment (tests, local setups).
     pub fn set_mailer(&self, mailer: crate::approver::Mailer, public_url: &str) {
-        *self.mailer.write().unwrap() = mailer;
-        *self.public_url.write().unwrap() = public_url.trim_end_matches('/').to_string();
+        *self.mailer.write().unwrap_or_else(|e| e.into_inner()) = mailer;
+        *self.public_url.write().unwrap_or_else(|e| e.into_inner()) =
+            public_url.trim_end_matches('/').to_string();
     }
 
     /// Overrides the static operator/billing secrets loaded from `AOS_ADMIN_SECRET` / `AOS_BILLING_WEBHOOK_SECRET`.
     pub fn set_secrets(&self, admin: &str, billing_webhook: &str) {
         let trimmed_admin = admin.trim().to_string();
         let is_static = !trimmed_admin.is_empty();
-        *self.secrets.write().unwrap() = (
+        *self.secrets.write().unwrap_or_else(|e| e.into_inner()) = (
             trimmed_admin,
             billing_webhook.trim().to_string(),
             is_static,
@@ -574,7 +575,7 @@ impl PaasControlPlane {
 
     /// Sets an auto-generated ephemeral local operator/UI token (does not mark `is_static_admin`).
     pub fn set_ephemeral_admin_secret(&self, admin: &str) {
-        let mut guard = self.secrets.write().unwrap();
+        let mut guard = self.secrets.write().unwrap_or_else(|e| e.into_inner());
         guard.0 = admin.trim().to_string();
         guard.2 = false;
     }
@@ -582,7 +583,7 @@ impl PaasControlPlane {
     /// Rotates the ephemeral local UI operator token after an unsandboxed `host_exec` finishes,
     /// preserving any statically configured `AOS_ADMIN_SECRET` on cloud/operator daemons.
     pub fn rotate_ephemeral_admin_secret_if_dynamic(&self) {
-        let mut guard = self.secrets.write().unwrap();
+        let mut guard = self.secrets.write().unwrap_or_else(|e| e.into_inner());
         if !guard.2 {
             guard.0 = format!("aop_{}{}", Uuid::new_v4().simple(), Uuid::new_v4().simple());
         }
@@ -590,12 +591,12 @@ impl PaasControlPlane {
 
     /// Empty when no admin secret is configured.
     pub fn admin_secret(&self) -> String {
-        self.secrets.read().unwrap().0.clone()
+        self.secrets.read().unwrap_or_else(|e| e.into_inner()).0.clone()
     }
 
     /// Empty when no billing webhook secret is configured.
     pub fn webhook_secret(&self) -> String {
-        self.secrets.read().unwrap().1.clone()
+        self.secrets.read().unwrap_or_else(|e| e.into_inner()).1.clone()
     }
 
     fn sha256_hex(input: &str) -> String {
@@ -1893,7 +1894,11 @@ impl PaasControlPlane {
         if !crate::approver::valid_email(&email) {
             bail!("Invalid email address");
         }
-        let mailer = self.mailer.read().unwrap().clone();
+        let mailer = self
+            .mailer
+            .read()
+            .unwrap_or_else(|e| e.into_inner())
+            .clone();
         if !mailer.is_enabled() {
             bail!("Email enrollment is not configured on this Aegis Cloud node (ask the operator)");
         }
@@ -1947,7 +1952,11 @@ impl PaasControlPlane {
         })
         .await?;
 
-        let link = format!("{}/approver/enroll?token={}", self.public_url.read().unwrap(), token);
+        let link = format!(
+            "{}/approver/enroll?token={}",
+            self.public_url.read().unwrap_or_else(|e| e.into_inner()),
+            token
+        );
         let body = format!(
             "Someone asked to make this address the approver for Aegis Cloud org '{org_clean}'.\n\n\
              Open this link within 30 minutes to enroll your authenticator app:\n{link}\n\n\

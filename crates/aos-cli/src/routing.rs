@@ -201,93 +201,6 @@ fn basename(word: &str) -> &str {
     word.rsplit('/').next().unwrap_or(word)
 }
 
-const CREDENTIAL_MARKERS: &[&str] = &[
-    "/.ssh",
-    "~/.ssh",
-    "/.aws",
-    "~/.aws",
-    "/.gnupg",
-    "/.kube",
-    "/.docker",
-    "/.azure",
-    "/.config/gcloud",
-    "/.config/aegis-os",
-    "/master.kek",
-    "/.master.kek",
-    "/Library/Keychains",
-    "/.config/gh/hosts",
-    "/.git-credentials",
-    "/.netrc",
-    "/.npmrc",
-    "/.pypirc",
-    "/.vault-token",
-    "/.cargo/credentials",
-    "/custom_vault",
-    "/.secrets",
-    "/etc/shadow",
-    "/etc/sudoers",
-    "/oauth_creds.json",
-    "/.credentials.json",
-    "/.codex/auth.json",
-    "/.hermes/auth.json",
-    "/opencode/auth.json",
-    "/plugins_secrets.json",
-];
-
-const PROTECTED_CLIENT_CONFIG_MARKERS: &[&str] = &[
-    "/.gemini/config/hooks.json",
-    "/.gemini/config/mcp_config.json",
-    "/.gemini/settings.json",
-    "/.gemini/antigravity-cli/settings.json",
-    "/.claude/settings.json",
-    "/.claude/settings.local.json",
-    "/.claude/hooks",
-    "/.claude.json",
-    "/.mcp.json",
-    "/.codex/config.toml",
-    "/.codex/hooks",
-    "/opencode.json",
-    "/opencode.jsonc",
-    "/.config/opencode/opencode.json",
-    "/.config/opencode/opencode.jsonc",
-    "/.cursor/mcp.json",
-    "/.vscode/mcp.json",
-    "/.hermes/config.yaml",
-    "/.agents/hooks.json",
-    "/.agent/hooks.json",
-    "/.aegis-bin",
-    "/.git/hooks/",
-    "/.git/config",
-    "/.bashrc",
-    "/.zshrc",
-    "/.profile",
-    "/.zprofile",
-];
-
-const RUNTIME_STATE_MARKERS: &[&str] = &[
-    "/aegis-os-runtime/policy.json",
-    "/aegis-os-runtime/paas_state.json",
-    "/aegis-os-runtime/ipc_state.json",
-    "/aegis-os-runtime/hook_commit_tickets.json",
-    "/aegis-os-runtime/session_bindings.json",
-    "/aegis-os-runtime/active_workspace.txt",
-    "/aegis-os-runtime/audit.jsonl",
-    "/aegis-os-runtime/routing_decisions.jsonl",
-    "/aegis-os-runtime/stop_budgets.json",
-    "/human.token",
-    "/agent.token",
-    "/approval.json",
-    "/advisory.jsonl",
-    "/pending_escalations.jsonl",
-    "/effects.jsonl",
-    "/policy_state.json",
-    "/dek.envelope.json",
-    ".dek.enc.json",
-    ".sparsebundle",
-    ".luks.img",
-    ".gocryptfs",
-];
-
 /// Disallow `AOS_HOST=1` from being used as a blanket sandbox bypass for shell interpreters
 /// or destructive file-mutation utilities.
 const DISALLOWED_HOST_OVERRIDE_BINS: &[&str] = &[
@@ -838,12 +751,12 @@ pub fn classify_run_command(cmd: &str, shadow_root: &Path, host_root: &Path) -> 
             };
         }
     }
-    if CREDENTIAL_MARKERS.iter().any(|m| trimmed.contains(m)) {
+    if aos_policy::ring0::contains_credential_marker(trimmed) {
         return Route::Deny {
             reason: "Blocked by Aegis OS Ring-0 policy: access to host credential stores (~/.ssh, ~/.aws, ~/.gnupg, ~/.kube, Keychains, ...) is forbidden.".to_string(),
         };
     }
-    if RUNTIME_STATE_MARKERS.iter().any(|m| trimmed.contains(m)) {
+    if aos_policy::ring0::contains_runtime_state_marker(trimmed) {
         return Route::Deny {
             reason: "Blocked by Aegis OS Ring-0 policy: direct shell access to Aegis OS runtime state files (`policy.json`, `paas_state.json`, `hook_commit_tickets.json`, ...) is forbidden.".to_string(),
         };
@@ -887,8 +800,8 @@ pub fn classify_enforced_git_redirect(cmd: &str, host_root: &Path) -> Option<Rou
     if trimmed.is_empty() || invokes_approval_cli(trimmed) {
         return None;
     }
-    if CREDENTIAL_MARKERS.iter().any(|m| trimmed.contains(m))
-        || RUNTIME_STATE_MARKERS.iter().any(|m| trimmed.contains(m))
+    if aos_policy::ring0::contains_credential_marker(trimmed)
+        || aos_policy::ring0::contains_runtime_state_marker(trimmed)
     {
         return None;
     }
@@ -1038,8 +951,8 @@ fn strip_nested_test_tmpdir(s: &str) -> &str {
 
 fn is_protected_runtime_state_path(raw: &str, canonical: &str) -> bool {
     for s in [raw, canonical] {
-        let s_checked = strip_nested_test_tmpdir(s);
-        if RUNTIME_STATE_MARKERS.iter().any(|m| s_checked.contains(m)) {
+        let s_checked = aos_policy::ring0::normalize_for_match(strip_nested_test_tmpdir(s));
+        if aos_policy::ring0::contains_runtime_state_marker(&s_checked) {
             return true;
         }
         let in_agent_home_safe_subpath = s_checked.contains("/cow_workspace/upper_workspace/")
@@ -1075,9 +988,8 @@ pub fn classify_native_read(path: &Path, own_org_id: &str) -> Route {
     let raw = path.to_string_lossy();
     let target = canonicalize_lossy(path);
     let t = target.to_string_lossy();
-    if CREDENTIAL_MARKERS
-        .iter()
-        .any(|m| raw.contains(m) || t.contains(m))
+    if aos_policy::ring0::contains_credential_marker(&raw)
+        || aos_policy::ring0::contains_credential_marker(&t)
     {
         return Route::Deny {
             reason: "Blocked by Aegis OS Ring-0 policy: reading host credential stores (~/.ssh, ~/.aws, ~/.gnupg, ~/.kube, Keychains, custom_vault, ...) via native file tools is forbidden.".to_string(),
@@ -1112,17 +1024,15 @@ pub fn classify_native_write(path: &Path, repo_root: &Path) -> Route {
     let root = canonicalize_lossy(repo_root);
     let t = target.to_string_lossy();
 
-    if CREDENTIAL_MARKERS
-        .iter()
-        .any(|m| raw.contains(m) || t.contains(m))
+    if aos_policy::ring0::contains_credential_marker(&raw)
+        || aos_policy::ring0::contains_credential_marker(&t)
     {
         return Route::Deny {
             reason: "Blocked by Aegis OS Ring-0 policy: writing to host credential stores is forbidden.".to_string(),
         };
     }
-    if PROTECTED_CLIENT_CONFIG_MARKERS
-        .iter()
-        .any(|m| raw.contains(m) || t.contains(m))
+    if aos_policy::ring0::contains_protected_client_config_marker(&raw)
+        || aos_policy::ring0::contains_protected_client_config_marker(&t)
     {
         return Route::Deny {
             reason: "Blocked by Aegis OS Ring-0 policy: modifying client lifecycle hooks, git hooks, shell profiles, or permission configurations (`hooks.json`, `settings.json`, `mcp_config.json`, `.git/hooks`) is forbidden.".to_string(),
@@ -1282,15 +1192,12 @@ pub fn classify_workflow_script(
 ) -> Route {
     let trimmed_path = script_path.trim();
     if !trimmed_path.is_empty() {
-        if CREDENTIAL_MARKERS.iter().any(|m| trimmed_path.contains(m)) {
+        if aos_policy::ring0::contains_credential_marker(trimmed_path) {
             return Route::Deny {
                 reason: "Blocked by Aegis OS Ring-0 policy: workflow script path references protected host credential stores.".to_string(),
             };
         }
-        if RUNTIME_STATE_MARKERS
-            .iter()
-            .any(|m| trimmed_path.contains(m))
-        {
+        if aos_policy::ring0::contains_runtime_state_marker(trimmed_path) {
             return Route::Deny {
                 reason: "Blocked by Aegis OS Ring-0 policy: workflow script path references protected Aegis OS runtime state files.".to_string(),
             };
@@ -1304,12 +1211,12 @@ pub fn classify_workflow_script(
                 reason: "Blocked by Aegis OS: approving escalations, granting leases, committing workspaces via CLI, and enrolling approvers is done by a human in their own terminal, not inside a workflow script.".to_string(),
             };
         }
-        if CREDENTIAL_MARKERS.iter().any(|m| text.contains(m)) {
+        if aos_policy::ring0::contains_credential_marker(text) {
             return Route::Deny {
                 reason: "Blocked by Aegis OS Ring-0 policy: workflow script references host credential stores (~/.ssh, ~/.aws, ~/.gnupg, ~/.kube, Keychains, ...).".to_string(),
             };
         }
-        if RUNTIME_STATE_MARKERS.iter().any(|m| text.contains(m)) {
+        if aos_policy::ring0::contains_runtime_state_marker(text) {
             return Route::Deny {
                 reason: "Blocked by Aegis OS Ring-0 policy: workflow script references protected Aegis OS runtime state files.".to_string(),
             };
@@ -2071,6 +1978,25 @@ mod tests {
         assert!(
             fetch_redir.contains("https://api.github.com/repos/foo/bar"),
             "{fetch_redir}"
+        );
+
+        // Case-insensitive APFS/NTFS Ring-0 bypass attempts stay denied across shell/read/write.
+        assert_eq!(
+            classify_run_command("cat ~/.SSH/id_rsa", sh, ws).kind(),
+            "deny_ring0"
+        );
+        assert_eq!(
+            classify_native_read(Path::new("/Users/alice/.SSH/id_rsa"), "acme").kind(),
+            "deny_ring0"
+        );
+        assert_eq!(
+            classify_native_write(Path::new("/Users/alice/.GEMINI/config/hooks.json"), ws).kind(),
+            "deny_ring0"
+        );
+        assert_eq!(
+            classify_native_read(Path::new("/Users/alice/.AEGIS/sessions/s1/HUMAN.TOKEN"), "acme")
+                .kind(),
+            "deny_ring0"
         );
     }
 }

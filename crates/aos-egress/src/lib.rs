@@ -3066,9 +3066,44 @@ mod tests {
         let upstream_addr = upstream.local_addr().unwrap().to_string();
         let upstream_task = tokio::spawn(async move {
             let (mut sock, _) = upstream.accept().await.unwrap();
-            let mut buf = vec![0u8; 8192];
-            let n = sock.read(&mut buf).await.unwrap();
-            let req = String::from_utf8_lossy(&buf[..n]);
+            let mut buf = Vec::with_capacity(4096);
+            let mut chunk = [0u8; 4096];
+            let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(2);
+            let mut expected_total: Option<usize> = None;
+            loop {
+                let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
+                if remaining.is_zero() {
+                    break;
+                }
+                match tokio::time::timeout(remaining, sock.read(&mut chunk)).await {
+                    Ok(Ok(0)) | Ok(Err(_)) | Err(_) => break,
+                    Ok(Ok(n)) => {
+                        buf.extend_from_slice(&chunk[..n]);
+                        if expected_total.is_none() {
+                            if let Some(pos) = buf.windows(4).position(|w| w == b"\r\n\r\n") {
+                                let header_end = pos + 4;
+                                let headers = String::from_utf8_lossy(&buf[..header_end]);
+                                let content_len = headers
+                                    .lines()
+                                    .find_map(|line| {
+                                        let (k, v) = line.split_once(':')?;
+                                        if k.trim().eq_ignore_ascii_case("content-length") {
+                                            v.trim().parse::<usize>().ok()
+                                        } else {
+                                            None
+                                        }
+                                    })
+                                    .unwrap_or(0);
+                                expected_total = Some(header_end + content_len);
+                            }
+                        }
+                        if expected_total.is_some_and(|total| buf.len() >= total) {
+                            break;
+                        }
+                    }
+                }
+            }
+            let req = String::from_utf8_lossy(&buf);
             assert!(req.starts_with("POST /v1/messages HTTP/1.1"));
             assert!(req.contains("Host: api.anthropic.com"));
             sock.write_all(
@@ -3076,6 +3111,8 @@ mod tests {
             )
             .await
             .unwrap();
+            sock.flush().await.unwrap();
+            let _ = sock.shutdown().await;
         });
 
         let client_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -3427,12 +3464,16 @@ mod tests {
                     body.len()
                 );
                 let _ = s.write_all(resp.as_bytes()).await;
+                let _ = s.flush().await;
+                let _ = s.shutdown().await;
             }
             // Connection 2: CONNECT tunnel echo
             if let Ok((mut s, _)) = upstream_listener.accept().await {
                 let mut buf = [0u8; 64];
                 if let Ok(n) = s.read(&mut buf).await {
                     let _ = s.write_all(&buf[..n]).await;
+                    let _ = s.flush().await;
+                    let _ = s.shutdown().await;
                 }
             }
         });

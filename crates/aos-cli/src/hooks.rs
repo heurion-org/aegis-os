@@ -1205,12 +1205,15 @@ pub(crate) fn fs_disk_space_bytes(path: &Path) -> Option<(u64, u64)> {
             let c_path = std::ffi::CString::new(p.as_os_str().as_bytes()).ok()?;
             let mut st: libc::statvfs = unsafe { std::mem::zeroed() };
             if unsafe { libc::statvfs(c_path.as_ptr(), &mut st) } == 0 {
-                let frsize = u64::try_from(st.f_frsize).unwrap_or(0);
-                let bsize = u64::try_from(st.f_bsize).unwrap_or(0);
+                #[allow(clippy::unnecessary_cast)]
+                let (frsize, bsize, avail_blocks, total_blocks) = (
+                    st.f_frsize as u64,
+                    st.f_bsize as u64,
+                    st.f_bavail as u64,
+                    st.f_blocks as u64,
+                );
                 let block_size = if frsize > 0 { frsize } else { bsize };
                 if block_size > 0 {
-                    let avail_blocks = u64::try_from(st.f_bavail).unwrap_or(0);
-                    let total_blocks = u64::try_from(st.f_blocks).unwrap_or(0);
                     return Some((
                         avail_blocks.saturating_mul(block_size),
                         total_blocks.saturating_mul(block_size),

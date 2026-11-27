@@ -167,7 +167,7 @@ impl ActivePgidGuard {
         let reg = registry.cloned();
         if pgid > 0 {
             if let Some(ref r) = reg {
-                r.lock().unwrap().insert(pgid);
+                r.lock().unwrap_or_else(|e| e.into_inner()).insert(pgid);
             }
         }
         Self {
@@ -181,7 +181,9 @@ impl Drop for ActivePgidGuard {
     fn drop(&mut self) {
         if self.pgid > 0 {
             if let Some(ref r) = self.registry {
-                r.lock().unwrap().remove(&self.pgid);
+                r.lock()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .remove(&self.pgid);
             }
         }
     }
@@ -201,14 +203,16 @@ where
             if n == 0 {
                 break;
             }
-            sink.lock().unwrap().extend_from_slice(&chunk[..n]);
+            sink.lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .extend_from_slice(&chunk[..n]);
         }
     });
     (buf, handle)
 }
 
 fn tail_lossy(buf: &Mutex<Vec<u8>>) -> String {
-    let buf = buf.lock().unwrap();
+    let buf = buf.lock().unwrap_or_else(|e| e.into_inner());
     let mut start = buf.len().saturating_sub(TIMEOUT_TAIL_BYTES);
     // Skip UTF-8 continuation bytes so the cut never lands mid-character.
     while start < buf.len() && (buf[start] & 0xC0) == 0x80 {

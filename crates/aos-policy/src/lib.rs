@@ -15,6 +15,8 @@ use std::sync::Arc;
 use tokio::sync::RwLock;
 use uuid::Uuid;
 
+pub mod ring0;
+
 /// Embedded baseline Cedar policy (`policy/default.cedar`).
 pub const DEFAULT_CEDAR_POLICY: &str = include_str!("../../../policy/default.cedar");
 

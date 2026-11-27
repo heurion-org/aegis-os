@@ -128,7 +128,6 @@ dependencies = [
  "serde",
  "serde_json",
  "tempfile",
- "thiserror",
  "tokio",
  "uuid",
 ]
@@ -346,7 +345,6 @@ dependencies = [
  "chrono",
  "hex",
  "libc",
- "rand",
  "ring",
  "serde",
  "serde_json",

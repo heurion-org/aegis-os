@@ -677,7 +677,10 @@ impl MicroVmSandboxInstance {
         let mut ready_pong = None;
         while Instant::now() < deadline {
             let early_exit = {
-                let mut guard = instance.vmm_child.lock().unwrap();
+                let mut guard = instance
+                    .vmm_child
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner());
                 guard.as_mut().and_then(|c| c.try_wait().ok().flatten())
             };
             if let Some(exit) = early_exit {
@@ -845,16 +848,31 @@ impl MicroVmPtyWriter {
 
 impl Drop for MicroVmSandboxInstance {
     fn drop(&mut self) {
-        if let Some(b) = self.egress_bridge.lock().unwrap().take() {
+        if let Some(b) = self
+            .egress_bridge
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .take()
+        {
             drop(b);
         }
-        if let Some(h) = self.mock_guest_handle.lock().unwrap().take() {
+        if let Some(h) = self
+            .mock_guest_handle
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .take()
+        {
             h.abort();
         }
-        if let Some(ref mut c) = *self.vmm_child.lock().unwrap() {
+        if let Some(ref mut c) = *self.vmm_child.lock().unwrap_or_else(|e| e.into_inner()) {
             let _ = c.start_kill();
         }
-        for c in self.aux_children.lock().unwrap().iter_mut() {
+        for c in self
+            .aux_children
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .iter_mut()
+        {
             let _ = c.start_kill();
         }
         if let Some(ref dir) = self.socket_temp_dir {
@@ -1018,17 +1036,34 @@ impl SandboxInstance for MicroVmSandboxInstance {
             VmmBackendKind::MockUnix => {}
         }
 
-        let bridge_opt = self.egress_bridge.lock().unwrap().take();
+        let bridge_opt = self
+            .egress_bridge
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .take();
         drop(bridge_opt);
-        let mock_opt = self.mock_guest_handle.lock().unwrap().take();
+        let mock_opt = self
+            .mock_guest_handle
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .take();
         if let Some(h) = mock_opt {
             h.abort();
         }
-        let child_opt = self.vmm_child.lock().unwrap().take();
+        let child_opt = self
+            .vmm_child
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .take();
         if let Some(mut c) = child_opt {
             let _ = c.kill().await;
         }
-        let aux: Vec<Child> = self.aux_children.lock().unwrap().drain(..).collect();
+        let aux: Vec<Child> = self
+            .aux_children
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .drain(..)
+            .collect();
         for mut c in aux {
             let _ = c.kill().await;
         }
@@ -1237,11 +1272,29 @@ mod tests {
         let proxy_srv = tokio::spawn(async move {
             while let Ok((mut s, _)) = mock_proxy.accept().await {
                 tokio::spawn(async move {
+                    let mut req = Vec::with_capacity(512);
                     let mut buf = [0u8; 512];
-                    let _ = s.read(&mut buf).await;
+                    let deadline = tokio::time::Instant::now() + Duration::from_secs(2);
+                    loop {
+                        let rem = deadline.saturating_duration_since(tokio::time::Instant::now());
+                        if rem.is_zero() {
+                            break;
+                        }
+                        match tokio::time::timeout(rem, s.read(&mut buf)).await {
+                            Ok(Ok(0)) | Ok(Err(_)) | Err(_) => break,
+                            Ok(Ok(n)) => {
+                                req.extend_from_slice(&buf[..n]);
+                                if req.windows(4).any(|w| w == b"\r\n\r\n") {
+                                    break;
+                                }
+                            }
+                        }
+                    }
                     let _ = s
-                        .write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nOK")
+                        .write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\nConnection: close\r\n\r\nOK")
                         .await;
+                    let _ = s.flush().await;
+                    let _ = s.shutdown().await;
                 });
             }
         });
@@ -1427,9 +1480,29 @@ mod tests {
         let mock_srv = tokio::spawn(async move {
             while let Ok((mut s, _)) = mock_proxy.accept().await {
                 tokio::spawn(async move {
+                    let mut req = Vec::with_capacity(256);
                     let mut buf = [0u8; 256];
-                    let _ = s.read(&mut buf).await;
-                    let _ = s.write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nOK").await;
+                    let deadline = tokio::time::Instant::now() + Duration::from_secs(2);
+                    loop {
+                        let rem = deadline.saturating_duration_since(tokio::time::Instant::now());
+                        if rem.is_zero() {
+                            break;
+                        }
+                        match tokio::time::timeout(rem, s.read(&mut buf)).await {
+                            Ok(Ok(0)) | Ok(Err(_)) | Err(_) => break,
+                            Ok(Ok(n)) => {
+                                req.extend_from_slice(&buf[..n]);
+                                if req.windows(4).any(|w| w == b"\r\n\r\n") {
+                                    break;
+                                }
+                            }
+                        }
+                    }
+                    let _ = s
+                        .write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\nConnection: close\r\n\r\nOK")
+                        .await;
+                    let _ = s.flush().await;
+                    let _ = s.shutdown().await;
                 });
             }
         });

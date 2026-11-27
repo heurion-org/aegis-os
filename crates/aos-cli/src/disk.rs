@@ -996,16 +996,27 @@ fn remove_dir_safe(path: &Path) -> anyhow::Result<()> {
     std::fs::remove_dir_all(path).with_context(|| format!("removing '{}'", path.display()))
 }
 
-fn prune_cache_dir_target(
+struct CachePruneTarget<'a> {
     target_dir: PathBuf,
-    category: &str,
+    category: &'a str,
     live: bool,
     live_reason: String,
-    remove_reason_prefix: &str,
+    remove_reason_prefix: &'a str,
+}
+
+fn prune_cache_dir_target(
+    target: CachePruneTarget<'_>,
     opts: &GcOptions,
     now: SystemTime,
     report: &mut GcReport,
 ) {
+    let CachePruneTarget {
+        target_dir,
+        category,
+        live,
+        live_reason,
+        remove_reason_prefix,
+    } = target;
     if !is_real_dir(&target_dir) {
         return;
     }
@@ -1132,11 +1143,15 @@ pub async fn run_gc_plan(opts: &GcOptions) -> anyhow::Result<GcReport> {
                     for slot_dir in slot_dirs {
                         for (category, target_dir) in cache_targets_for_slot(&slot_dir) {
                             prune_cache_dir_target(
-                                target_dir,
-                                category,
-                                live,
-                                format!("agent '{org_id}/{agent_id}' is currently live"),
-                                "offline agent cache/scratch",
+                                CachePruneTarget {
+                                    target_dir,
+                                    category,
+                                    live,
+                                    live_reason: format!(
+                                        "agent '{org_id}/{agent_id}' is currently live"
+                                    ),
+                                    remove_reason_prefix: "offline agent cache/scratch",
+                                },
                                 opts,
                                 now,
                                 &mut report,
@@ -1248,11 +1263,15 @@ pub async fn run_gc_plan(opts: &GcOptions) -> anyhow::Result<GcReport> {
             let any_org_agent_live = live_agents.iter().any(|(o, _)| o == &org_id);
             for target_dir in shared_cache_targets_for_org(&org_path) {
                 prune_cache_dir_target(
-                    target_dir,
-                    "org_shared_cache",
-                    any_org_agent_live,
-                    format!("at least one agent in org '{org_id}' is currently live"),
-                    "offline org shared cache",
+                    CachePruneTarget {
+                        target_dir,
+                        category: "org_shared_cache",
+                        live: any_org_agent_live,
+                        live_reason: format!(
+                            "at least one agent in org '{org_id}' is currently live"
+                        ),
+                        remove_reason_prefix: "offline org shared cache",
+                    },
                     opts,
                     now,
                     &mut report,
