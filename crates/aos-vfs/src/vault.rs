@@ -2259,7 +2259,9 @@ impl OrgVaultManager {
 #[cfg(test)]
 pub mod tests {
     use super::*;
+    #[cfg(target_os = "macos")]
     use crate::CoWWorkspace;
+    #[cfg(target_os = "macos")]
     use aos_core::TransactionalWorkspace;
     use std::collections::HashMap;
     use std::sync::Mutex;
