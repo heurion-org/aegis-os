@@ -737,7 +737,8 @@ async fn handle_exec_pty_session<R, W>(
         ws_xpixel: 0,
         ws_ypixel: 0,
     };
-    if unsafe {
+    #[allow(clippy::unnecessary_mut_passed)]
+    let openpty_rc = unsafe {
         libc::openpty(
             &mut master_fd,
             &mut slave_fd,
@@ -745,8 +746,8 @@ async fn handle_exec_pty_session<R, W>(
             std::ptr::null_mut(),
             &mut winsize,
         )
-    } != 0
-    {
+    };
+    if openpty_rc != 0 {
         let err = std::io::Error::last_os_error();
         let _ = write_json_line(
             wr,
@@ -1184,7 +1185,7 @@ fn load_kernel_modules_early() {
                     libc::syscall(
                         libc::SYS_finit_module,
                         file.as_raw_fd() as libc::c_long,
-                        b"\0".as_ptr().cast::<libc::c_char>(),
+                        c"".as_ptr(),
                         0 as libc::c_int,
                     )
                 };
