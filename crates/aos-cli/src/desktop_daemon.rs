@@ -283,23 +283,23 @@ impl DesktopDaemonState {
     }
 
     async fn save_workspace_registry(&self) -> Result<()> {
-        let guard = self.workspaces.read().await;
-        let entries: Vec<PersistedWorkspaceEntry> = guard
-            .values()
-            .map(|w| PersistedWorkspaceEntry {
-                id: w.id.clone(),
-                name: w.name.clone(),
-                org_id: w.org_id.clone(),
-                path: w.path.clone(),
-                mode: w.mode.clone(),
-                created_at: w.created_at.clone(),
-            })
-            .collect();
+        let entries: Vec<PersistedWorkspaceEntry> = {
+            let guard = self.workspaces.read().await;
+            guard
+                .values()
+                .map(|w| PersistedWorkspaceEntry {
+                    id: w.id.clone(),
+                    name: w.name.clone(),
+                    org_id: w.org_id.clone(),
+                    path: w.path.clone(),
+                    mode: w.mode.clone(),
+                    created_at: w.created_at.clone(),
+                })
+                .collect()
+        };
         let p = self.registry_path();
-        if let Some(parent) = p.parent() {
-            std::fs::create_dir_all(parent)?;
-        }
-        std::fs::write(&p, serde_json::to_vec_pretty(&entries)?)?;
+        aos_core::session::write_bytes_atomic_synced_async(&p, serde_json::to_vec_pretty(&entries)?)
+            .await?;
         Ok(())
     }
 
@@ -333,11 +333,68 @@ impl DesktopDaemonState {
     }
 }
 
+fn is_loopback_host_header(raw_host: &str) -> bool {
+    let host = raw_host.trim();
+    if host.is_empty() {
+        return false;
+    }
+    if let Some(rest) = host.strip_prefix('[') {
+        let Some(end) = rest.find(']') else {
+            return false;
+        };
+        let inside = &rest[..end];
+        let port_part = &rest[end + 1..];
+        if !port_part.is_empty() {
+            let Some(port_str) = port_part.strip_prefix(':') else {
+                return false;
+            };
+            if port_str.is_empty() || port_str.parse::<u16>().is_err() {
+                return false;
+            }
+        }
+        return inside
+            .parse::<std::net::Ipv6Addr>()
+            .is_ok_and(|ip| ip.is_loopback());
+    }
+    if host.eq_ignore_ascii_case("localhost") {
+        return true;
+    }
+    if host
+        .parse::<std::net::Ipv4Addr>()
+        .is_ok_and(|ip| ip.is_loopback())
+    {
+        return true;
+    }
+    if let Some((name, port_str)) = host.rsplit_once(':') {
+        if port_str.is_empty() || port_str.parse::<u16>().is_err() {
+            return false;
+        }
+        return name.eq_ignore_ascii_case("localhost")
+            || name
+                .parse::<std::net::Ipv4Addr>()
+                .is_ok_and(|ip| ip.is_loopback());
+    }
+    false
+}
+
 async fn require_human_token(
     State(state): State<DesktopDaemonState>,
     req: Request,
     next: Next,
 ) -> Response {
+    if let Some(host_val) = req.headers().get(header::HOST) {
+        let is_loopback = host_val
+            .to_str()
+            .ok()
+            .is_some_and(is_loopback_host_header);
+        if !is_loopback {
+            return (
+                StatusCode::FORBIDDEN,
+                Json(json!({ "error": "forbidden: loopback Host header required" })),
+            )
+                .into_response();
+        }
+    }
     let auth = req
         .headers()
         .get(header::AUTHORIZATION)
@@ -1568,66 +1625,115 @@ struct WriteFileRequest {
     content: String,
 }
 
-fn resolve_workspace_file_path(
-    ws_root: &Path,
-    rel: &str,
-) -> Result<PathBuf, (StatusCode, Json<Value>)> {
-    if rel.trim().is_empty() || Path::new(rel).is_absolute() {
+fn validate_workspace_rel_path(rel: &str) -> Result<PathBuf, (StatusCode, Json<Value>)> {
+    let trimmed = rel.trim();
+    if trimmed.is_empty() || Path::new(trimmed).is_absolute() {
         return Err((
             StatusCode::BAD_REQUEST,
             Json(json!({ "error": "relative workspace path required" })),
         ));
     }
+    if trimmed.contains('\\') || trimmed.starts_with('/') {
+        return Err((
+            StatusCode::BAD_REQUEST,
+            Json(json!({ "error": "relative workspace path required" })),
+        ));
+    }
+    for seg in trimmed.split('/') {
+        if seg.is_empty() {
+            return Err((
+                StatusCode::BAD_REQUEST,
+                Json(json!({ "error": "empty path component is forbidden" })),
+            ));
+        }
+        if seg == "." || seg == ".." {
+            return Err((
+                StatusCode::FORBIDDEN,
+                Json(json!({ "error": "path traversal is forbidden" })),
+            ));
+        }
+    }
+    let mut clean = PathBuf::new();
+    for comp in Path::new(trimmed).components() {
+        match comp {
+            std::path::Component::Normal(seg) => {
+                if seg.is_empty() {
+                    return Err((
+                        StatusCode::BAD_REQUEST,
+                        Json(json!({ "error": "empty path component is forbidden" })),
+                    ));
+                }
+                clean.push(seg);
+            }
+            std::path::Component::ParentDir
+            | std::path::Component::RootDir
+            | std::path::Component::Prefix(_)
+            | std::path::Component::CurDir => {
+                return Err((
+                    StatusCode::FORBIDDEN,
+                    Json(json!({ "error": "path traversal is forbidden" })),
+                ));
+            }
+        }
+    }
+    if clean.as_os_str().is_empty() {
+        return Err((
+            StatusCode::BAD_REQUEST,
+            Json(json!({ "error": "relative workspace path required" })),
+        ));
+    }
+    if aos_core::security::is_dotenv_secret_path(trimmed)
+        || aos_core::security::is_git_internal_path(trimmed)
+    {
+        return Err((
+            StatusCode::FORBIDDEN,
+            Json(json!({ "error": "access to .env secrets or .git internals is forbidden" })),
+        ));
+    }
+    Ok(clean)
+}
+
+fn resolve_workspace_file_path(
+    ws_root: &Path,
+    rel: &str,
+) -> Result<PathBuf, (StatusCode, Json<Value>)> {
+    let clean_rel = validate_workspace_rel_path(rel)?;
     let root_canon = ws_root.canonicalize().map_err(|e| {
         (
             StatusCode::NOT_FOUND,
             Json(json!({ "error": format!("workspace root unavailable: {e}") })),
         )
     })?;
-    let candidate = ws_root.join(rel);
-    for comp in Path::new(rel).components() {
-        if matches!(
-            comp,
-            std::path::Component::ParentDir
-                | std::path::Component::RootDir
-                | std::path::Component::Prefix(_)
-        ) {
-            return Err((
-                StatusCode::FORBIDDEN,
-                Json(json!({ "error": "parent directory traversal is forbidden" })),
-            ));
-        }
-    }
-    if candidate.exists() {
-        let canon = candidate.canonicalize().map_err(|e| {
-            (
-                StatusCode::BAD_REQUEST,
-                Json(json!({ "error": format!("invalid target path: {e}") })),
-            )
-        })?;
-        if !canon.starts_with(&root_canon) {
-            return Err((
-                StatusCode::FORBIDDEN,
-                Json(json!({ "error": "symlink target escapes workspace root" })),
-            ));
-        }
-    } else if let Some(parent) = candidate.parent() {
-        if parent.exists() {
-            let parent_canon = parent.canonicalize().map_err(|e| {
-                (
-                    StatusCode::BAD_REQUEST,
-                    Json(json!({ "error": format!("invalid parent path: {e}") })),
-                )
-            })?;
-            if !parent_canon.starts_with(&root_canon) {
+    let mut cur = ws_root.to_path_buf();
+    for comp in clean_rel.components() {
+        cur.push(comp);
+        match std::fs::symlink_metadata(&cur) {
+            Ok(meta) => {
+                if meta.file_type().is_symlink() {
+                    let canon = cur.canonicalize().map_err(|_| {
+                        (
+                            StatusCode::FORBIDDEN,
+                            Json(json!({ "error": "symlink target escapes workspace root" })),
+                        )
+                    })?;
+                    if !canon.starts_with(&root_canon) {
+                        return Err((
+                            StatusCode::FORBIDDEN,
+                            Json(json!({ "error": "symlink target escapes workspace root" })),
+                        ));
+                    }
+                }
+            }
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => break,
+            Err(e) => {
                 return Err((
-                    StatusCode::FORBIDDEN,
-                    Json(json!({ "error": "path escapes workspace root" })),
+                    StatusCode::BAD_REQUEST,
+                    Json(json!({ "error": format!("invalid target path: {e}") })),
                 ));
             }
         }
     }
-    Ok(candidate)
+    Ok(ws_root.join(&clean_rel))
 }
 
 async fn read_workspace_file_handler(
@@ -1646,15 +1752,51 @@ async fn read_workspace_file_handler(
         )
             .into_response();
     };
-    let target = match resolve_workspace_file_path(&ws.path, &q.path) {
+    let rel_path = match validate_workspace_rel_path(&q.path) {
         Ok(p) => p,
         Err(resp) => return resp.into_response(),
     };
-    match tokio::fs::read_to_string(&target).await {
+    let ws_path = ws.path.clone();
+    let read_res = tokio::task::spawn_blocking(move || {
+        aos_core::security::read_file_no_symlink_under_root(&ws_path, &rel_path)
+    })
+    .await;
+    let bytes = match read_res {
+        Ok(Ok(b)) => b,
+        Ok(Err(e)) if e.kind() == std::io::ErrorKind::PermissionDenied => {
+            return (
+                StatusCode::FORBIDDEN,
+                Json(json!({ "error": format!("forbidden reading file: {e}") })),
+            )
+                .into_response();
+        }
+        Ok(Err(e)) if e.kind() == std::io::ErrorKind::NotFound => {
+            return (
+                StatusCode::NOT_FOUND,
+                Json(json!({ "error": format!("failed reading file: {e}") })),
+            )
+                .into_response();
+        }
+        Ok(Err(e)) => {
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(json!({ "error": format!("failed reading file: {e}") })),
+            )
+                .into_response();
+        }
+        Err(e) => {
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(json!({ "error": format!("failed reading file: {e}") })),
+            )
+                .into_response();
+        }
+    };
+    match String::from_utf8(bytes) {
         Ok(content) => Json(json!({ "path": q.path, "content": content })).into_response(),
         Err(e) => (
-            StatusCode::NOT_FOUND,
-            Json(json!({ "error": format!("failed reading file: {e}") })),
+            StatusCode::BAD_REQUEST,
+            Json(json!({ "error": format!("file is not valid UTF-8: {e}") })),
         )
             .into_response(),
     }
@@ -1676,15 +1818,28 @@ async fn write_workspace_file_handler(
         )
             .into_response();
     };
-    let target = match resolve_workspace_file_path(&ws.path, &req.path) {
+    let rel_path = match validate_workspace_rel_path(&req.path) {
         Ok(p) => p,
         Err(resp) => return resp.into_response(),
     };
-    if let Some(parent) = target.parent() {
-        let _ = tokio::fs::create_dir_all(parent).await;
-    }
-    match tokio::fs::write(&target, req.content.as_bytes()).await {
-        Ok(()) => Json(json!({ "ok": true, "path": req.path })).into_response(),
+    let ws_path = ws.path.clone();
+    let bytes = req.content.into_bytes();
+    let write_res = tokio::task::spawn_blocking(move || {
+        aos_core::security::write_file_no_symlink_under_root(&ws_path, &rel_path, &bytes)
+    })
+    .await;
+    match write_res {
+        Ok(Ok(())) => Json(json!({ "ok": true, "path": req.path })).into_response(),
+        Ok(Err(e)) if e.kind() == std::io::ErrorKind::PermissionDenied => (
+            StatusCode::FORBIDDEN,
+            Json(json!({ "error": format!("forbidden writing file: {e}") })),
+        )
+            .into_response(),
+        Ok(Err(e)) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(json!({ "error": format!("failed writing file: {e}") })),
+        )
+            .into_response(),
         Err(e) => (
             StatusCode::INTERNAL_SERVER_ERROR,
             Json(json!({ "error": format!("failed writing file: {e}") })),
@@ -3532,5 +3687,129 @@ echo "Second streamed chunk"
 
         srv.abort();
         outcome.unwrap();
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn phase3_desktop_daemon_blocks_nested_symlink_escape_dotenv_git_and_non_loopback_host() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        let tmp = tempfile::tempdir().unwrap();
+        let rt = tmp.path().join("rt");
+        let home = tmp.path().join("home");
+        let ws_dir = tmp.path().join("ws");
+        let outside_dir = tmp.path().join("outside");
+        std::fs::create_dir_all(&ws_dir).unwrap();
+        std::fs::create_dir_all(&outside_dir).unwrap();
+        std::fs::write(outside_dir.join("secret.txt"), "outside-secret").unwrap();
+        std::fs::write(ws_dir.join(".env"), "API_KEY=secret\n").unwrap();
+        std::fs::create_dir_all(ws_dir.join(".git")).unwrap();
+        std::fs::write(ws_dir.join(".git/config"), "[core]\n").unwrap();
+        std::os::unix::fs::symlink(&outside_dir, ws_dir.join("link")).unwrap();
+
+        let kernel = Arc::new(AegisRuntimeKernel::new(&rt).await.unwrap());
+        let state = DesktopDaemonState {
+            runtime_dir: rt,
+            home_dir: home,
+            human_token: "aht_phase3_token".to_string(),
+            simulate_tasks: true,
+            aegis_bin: None,
+            workspaces: Arc::new(RwLock::new(BTreeMap::new())),
+            workspace_sessions: Arc::new(RwLock::new(HashMap::new())),
+            tasks: Arc::new(RwLock::new(HashMap::new())),
+            task_notify: Arc::new(Notify::new()),
+            kernel,
+        };
+        let listener = bind_test_loopback_listener().await;
+        let port = listener.local_addr().unwrap().port();
+        let srv = tokio::spawn(async move {
+            let _ = axum::serve(listener, build_desktop_router(state)).await;
+        });
+
+        let ws_dir_clone = ws_dir.clone();
+        let outside_clone = outside_dir.clone();
+        let ws_id = tokio::task::spawn_blocking(move || -> anyhow::Result<String> {
+            let base = format!("http://127.0.0.1:{port}");
+            let agent = ureq::AgentBuilder::new()
+                .timeout(Duration::from_secs(5))
+                .build();
+            let auth = "Bearer aht_phase3_token";
+
+            let created: Value = agent
+                .post(&format!("{base}/v1/workspaces"))
+                .set("Authorization", auth)
+                .send_json(json!({ "name": "Phase3", "path": ws_dir_clone }))?
+                .into_json()?;
+            let ws_id = created["workspace"]["id"].as_str().unwrap().to_string();
+
+            // 1. Multi-level non-existent parent symlink escape on PUT must return 403 and not create outside file.
+            let escape_put = agent
+                .put(&format!("{base}/v1/workspaces/{ws_id}/file"))
+                .set("Authorization", auth)
+                .send_json(json!({ "path": "link/new_sub/pwn.txt", "content": "pwned" }));
+            assert!(
+                matches!(escape_put, Err(ureq::Error::Status(403, _))),
+                "expected 403 for symlink escape PUT, got {escape_put:?}"
+            );
+            assert!(!outside_clone.join("new_sub/pwn.txt").exists());
+            assert!(!outside_clone.join("new_sub").exists());
+
+            // Also verify GET through symlink is forbidden.
+            let escape_get = agent
+                .get(&format!("{base}/v1/workspaces/{ws_id}/file?path=link/secret.txt"))
+                .set("Authorization", auth)
+                .call();
+            assert!(
+                matches!(escape_get, Err(ureq::Error::Status(403, _))),
+                "expected 403 for symlink escape GET, got {escape_get:?}"
+            );
+
+            // 2. .env and .git/config PUT and GET must return 403 Forbidden.
+            for sensitive in [".env", ".git/config"] {
+                let get_res = agent
+                    .get(&format!("{base}/v1/workspaces/{ws_id}/file?path={sensitive}"))
+                    .set("Authorization", auth)
+                    .call();
+                assert!(
+                    matches!(get_res, Err(ureq::Error::Status(403, _))),
+                    "expected 403 for GET {sensitive}, got {get_res:?}"
+                );
+                let put_res = agent
+                    .put(&format!("{base}/v1/workspaces/{ws_id}/file"))
+                    .set("Authorization", auth)
+                    .send_json(json!({ "path": sensitive, "content": "overwritten" }));
+                assert!(
+                    matches!(put_res, Err(ureq::Error::Status(403, _))),
+                    "expected 403 for PUT {sensitive}, got {put_res:?}"
+                );
+            }
+
+            Ok(ws_id)
+        })
+        .await
+        .unwrap()
+        .unwrap();
+        assert!(!ws_id.is_empty());
+
+        // 3. Raw TCP request with non-loopback Host header and valid Bearer human_token -> 403 Forbidden.
+        let mut stream = tokio::net::TcpStream::connect(("127.0.0.1", port))
+            .await
+            .unwrap();
+        let req = "GET /v1/health HTTP/1.1\r\nHost: evil.example.com\r\nAuthorization: Bearer aht_phase3_token\r\nConnection: close\r\n\r\n";
+        stream.write_all(req.as_bytes()).await.unwrap();
+        stream.flush().await.unwrap();
+        let mut resp = Vec::new();
+        stream.read_to_end(&mut resp).await.unwrap();
+        let resp_str = String::from_utf8_lossy(&resp);
+        assert!(
+            resp_str.starts_with("HTTP/1.1 403"),
+            "expected 403 Forbidden for non-loopback Host, got:\n{resp_str}"
+        );
+        assert!(
+            resp_str.contains("loopback Host header required"),
+            "expected loopback Host error message, got:\n{resp_str}"
+        );
+
+        srv.abort();
     }
 }

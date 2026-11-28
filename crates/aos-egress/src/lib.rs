@@ -1425,9 +1425,49 @@ impl AegisEgressGateway {
         bind_addr: &str,
         pinned_identity: Option<AgentIdentity>,
     ) -> anyhow::Result<(SocketAddr, tokio::task::JoinHandle<()>)> {
+        const MAX_CONCURRENT_PROXY_CONNS: usize = 256;
+        const PROXY_REQUEST_READ_TIMEOUT: std::time::Duration =
+            std::time::Duration::from_secs(30);
+
+        enum ProxyLineRead {
+            Line(String),
+            Eof,
+            Timeout,
+            Malformed,
+        }
+
+        async fn write_proxy_json_error(
+            stream: &mut TcpStream,
+            status_line: &str,
+            body_json: serde_json::Value,
+        ) {
+            let body = body_json.to_string();
+            let resp = format!(
+                "{status_line}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                body.len()
+            );
+            let _ = stream.write_all(resp.as_bytes()).await;
+        }
+
+        async fn read_proxy_line_with_deadline(
+            reader: &mut BufReader<&mut TcpStream>,
+            deadline: tokio::time::Instant,
+        ) -> ProxyLineRead {
+            match tokio::time::timeout_at(deadline, read_bounded_http_line(reader, 64 * 1024))
+                .await
+            {
+                Ok(Ok(Some(line))) => ProxyLineRead::Line(line),
+                Ok(Ok(None)) => ProxyLineRead::Eof,
+                Err(_) => ProxyLineRead::Timeout,
+                Ok(Err(e)) if e.kind() == std::io::ErrorKind::TimedOut => ProxyLineRead::Timeout,
+                Ok(Err(_)) => ProxyLineRead::Malformed,
+            }
+        }
+
         let listener = TcpListener::bind(bind_addr).await?;
         let local_addr = listener.local_addr()?;
         let gw = self.clone();
+        let conn_sem = Arc::new(tokio::sync::Semaphore::new(MAX_CONCURRENT_PROXY_CONNS));
 
         let handle = tokio::spawn(async move {
             loop {
@@ -1440,15 +1480,34 @@ impl AegisEgressGateway {
                         break;
                     }
                 };
+                let Ok(permit) = conn_sem.clone().try_acquire_owned() else {
+                    drop(stream);
+                    continue;
+                };
                 let gw_conn = gw.clone();
                 let bound_id = pinned_identity.clone();
                 tokio::spawn(async move {
+                    let _permit = permit;
+                    let read_deadline = tokio::time::Instant::now() + PROXY_REQUEST_READ_TIMEOUT;
                     let mut reader = BufReader::new(&mut stream);
 
-                    let Ok(Some(request_line)) = read_bounded_http_line(&mut reader, 64 * 1024).await
-                    else {
-                        return;
-                    };
+                    let request_line =
+                        match read_proxy_line_with_deadline(&mut reader, read_deadline).await {
+                            ProxyLineRead::Line(line) => line,
+                            ProxyLineRead::Eof | ProxyLineRead::Malformed => return,
+                            ProxyLineRead::Timeout => {
+                                write_proxy_json_error(
+                                    reader.get_mut(),
+                                    "HTTP/1.1 408 Request Timeout",
+                                    json!({
+                                        "egress": "request_timeout",
+                                        "reason": "Timed out reading proxy request line"
+                                    }),
+                                )
+                                .await;
+                                return;
+                            }
+                        };
                     let parts: Vec<&str> = request_line.split_whitespace().collect();
                     let method = parts.first().copied().unwrap_or("GET").to_string();
                     let raw_target = parts.get(1).copied().unwrap_or("/").to_string();
@@ -1459,14 +1518,27 @@ impl AegisEgressGateway {
                     let mut malformed_framing = false;
                     let mut body_too_large = false;
                     loop {
-                        let line = match read_bounded_http_line(&mut reader, 64 * 1024).await {
-                            Ok(Some(l)) => l,
-                            Ok(None) => break,
-                            Err(_) => {
-                                malformed_framing = true;
-                                break;
-                            }
-                        };
+                        let line =
+                            match read_proxy_line_with_deadline(&mut reader, read_deadline).await {
+                                ProxyLineRead::Line(l) => l,
+                                ProxyLineRead::Eof => break,
+                                ProxyLineRead::Timeout => {
+                                    write_proxy_json_error(
+                                        reader.get_mut(),
+                                        "HTTP/1.1 408 Request Timeout",
+                                        json!({
+                                            "egress": "request_timeout",
+                                            "reason": "Timed out reading proxy request headers"
+                                        }),
+                                    )
+                                    .await;
+                                    return;
+                                }
+                                ProxyLineRead::Malformed => {
+                                    malformed_framing = true;
+                                    break;
+                                }
+                            };
                         if line.trim().is_empty() {
                             break;
                         }
@@ -1523,30 +1595,28 @@ impl AegisEgressGateway {
                     }
 
                     if malformed_framing || (has_transfer_encoding && seen_content_length.is_some()) {
-                        let body = json!({
-                            "egress": "malformed_http_framing",
-                            "reason": "Ambiguous or invalid Content-Length / Transfer-Encoding framing"
-                        })
-                        .to_string();
-                        let resp = format!(
-                            "HTTP/1.1 400 Bad Request\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
-                            body.len()
-                        );
-                        let _ = reader.get_mut().write_all(resp.as_bytes()).await;
+                        write_proxy_json_error(
+                            reader.get_mut(),
+                            "HTTP/1.1 400 Bad Request",
+                            json!({
+                                "egress": "malformed_http_framing",
+                                "reason": "Ambiguous or invalid Content-Length / Transfer-Encoding framing"
+                            }),
+                        )
+                        .await;
                         return;
                     }
                     let content_length = seen_content_length.unwrap_or(0);
                     if body_too_large {
-                        let body = json!({
-                            "egress": "request_too_large",
-                            "limit_bytes": MAX_PROXY_BODY_BYTES
-                        })
-                        .to_string();
-                        let resp = format!(
-                            "HTTP/1.1 413 Payload Too Large\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
-                            body.len()
-                        );
-                        let _ = reader.get_mut().write_all(resp.as_bytes()).await;
+                        write_proxy_json_error(
+                            reader.get_mut(),
+                            "HTTP/1.1 413 Payload Too Large",
+                            json!({
+                                "egress": "request_too_large",
+                                "limit_bytes": MAX_PROXY_BODY_BYTES
+                            }),
+                        )
+                        .await;
                         return;
                     }
 
@@ -1568,23 +1638,92 @@ impl AegisEgressGateway {
                     if chunked {
                         let mut raw = Vec::new();
                         loop {
-                            let mut size_line = String::new();
-                            if reader.read_line(&mut size_line).await.is_err() {
-                                break;
-                            }
-                            let size = usize::from_str_radix(
-                                size_line.trim().split(';').next().unwrap_or(""),
-                                16,
+                            let size_line = match read_proxy_line_with_deadline(
+                                &mut reader,
+                                read_deadline,
                             )
-                            .unwrap_or(0);
+                            .await
+                            {
+                                ProxyLineRead::Line(l) => l,
+                                ProxyLineRead::Timeout => {
+                                    write_proxy_json_error(
+                                        reader.get_mut(),
+                                        "HTTP/1.1 408 Request Timeout",
+                                        json!({
+                                            "egress": "request_timeout",
+                                            "reason": "Timed out reading chunked request body"
+                                        }),
+                                    )
+                                    .await;
+                                    return;
+                                }
+                                ProxyLineRead::Eof | ProxyLineRead::Malformed => {
+                                    write_proxy_json_error(
+                                        reader.get_mut(),
+                                        "HTTP/1.1 400 Bad Request",
+                                        json!({ "egress": "malformed_chunked_body" }),
+                                    )
+                                    .await;
+                                    return;
+                                }
+                            };
+                            let hex_part = size_line.split(';').next().unwrap_or("").trim();
+                            let size = if hex_part.is_empty()
+                                || !hex_part.bytes().all(|b| b.is_ascii_hexdigit())
+                            {
+                                write_proxy_json_error(
+                                    reader.get_mut(),
+                                    "HTTP/1.1 400 Bad Request",
+                                    json!({ "egress": "malformed_chunked_body" }),
+                                )
+                                .await;
+                                return;
+                            } else {
+                                match usize::from_str_radix(hex_part, 16) {
+                                    Ok(s) => s,
+                                    Err(_) => {
+                                        write_proxy_json_error(
+                                            reader.get_mut(),
+                                            "HTTP/1.1 400 Bad Request",
+                                            json!({ "egress": "malformed_chunked_body" }),
+                                        )
+                                        .await;
+                                        return;
+                                    }
+                                }
+                            };
                             if size == 0 {
                                 // Consume optional trailers.
                                 loop {
-                                    let mut trailer = String::new();
-                                    if reader.read_line(&mut trailer).await.is_err()
-                                        || trailer.trim().is_empty()
+                                    match read_proxy_line_with_deadline(&mut reader, read_deadline)
+                                        .await
                                     {
-                                        break;
+                                        ProxyLineRead::Line(trailer) => {
+                                            if trailer.trim().is_empty() {
+                                                break;
+                                            }
+                                        }
+                                        ProxyLineRead::Timeout => {
+                                            write_proxy_json_error(
+                                                reader.get_mut(),
+                                                "HTTP/1.1 408 Request Timeout",
+                                                json!({
+                                                    "egress": "request_timeout",
+                                                    "reason": "Timed out reading chunked trailers"
+                                                }),
+                                            )
+                                            .await;
+                                            return;
+                                        }
+                                        ProxyLineRead::Eof | ProxyLineRead::Malformed => {
+                                            write_proxy_json_error(
+                                                reader.get_mut(),
+                                                "HTTP/1.1 400 Bad Request",
+                                                json!({ "egress": "malformed_chunked_body" }),
+                                            )
+                                            .await;
+                                            return;
+                                        }
                                     }
                                 }
                                 break;
@@ -1594,31 +1733,145 @@ impl AegisEgressGateway {
                                 break;
                             }
                             let mut buf = vec![0u8; size];
-                            if reader.read_exact(&mut buf).await.is_err() {
-                                break;
+                            match tokio::time::timeout_at(read_deadline, reader.read_exact(&mut buf))
+                                .await
+                            {
+                                Ok(Ok(_)) => {}
+                                Err(_) => {
+                                    write_proxy_json_error(
+                                        reader.get_mut(),
+                                        "HTTP/1.1 408 Request Timeout",
+                                        json!({
+                                            "egress": "request_timeout",
+                                            "reason": "Timed out reading chunked body bytes"
+                                        }),
+                                    )
+                                    .await;
+                                    return;
+                                }
+                                Ok(Err(e)) if e.kind() == std::io::ErrorKind::TimedOut => {
+                                    write_proxy_json_error(
+                                        reader.get_mut(),
+                                        "HTTP/1.1 408 Request Timeout",
+                                        json!({
+                                            "egress": "request_timeout",
+                                            "reason": "Timed out reading chunked body bytes"
+                                        }),
+                                    )
+                                    .await;
+                                    return;
+                                }
+                                Ok(Err(_)) => {
+                                    write_proxy_json_error(
+                                        reader.get_mut(),
+                                        "HTTP/1.1 400 Bad Request",
+                                        json!({ "egress": "malformed_chunked_body" }),
+                                    )
+                                    .await;
+                                    return;
+                                }
                             }
                             raw.extend_from_slice(&buf);
                             let mut crlf = [0u8; 2];
-                            let _ = reader.read_exact(&mut crlf).await;
+                            match tokio::time::timeout_at(
+                                read_deadline,
+                                reader.read_exact(&mut crlf),
+                            )
+                            .await
+                            {
+                                Ok(Ok(_)) if crlf == *b"\r\n" => {}
+                                Err(_) => {
+                                    write_proxy_json_error(
+                                        reader.get_mut(),
+                                        "HTTP/1.1 408 Request Timeout",
+                                        json!({
+                                            "egress": "request_timeout",
+                                            "reason": "Timed out reading chunk CRLF"
+                                        }),
+                                    )
+                                    .await;
+                                    return;
+                                }
+                                Ok(Err(e)) if e.kind() == std::io::ErrorKind::TimedOut => {
+                                    write_proxy_json_error(
+                                        reader.get_mut(),
+                                        "HTTP/1.1 408 Request Timeout",
+                                        json!({
+                                            "egress": "request_timeout",
+                                            "reason": "Timed out reading chunk CRLF"
+                                        }),
+                                    )
+                                    .await;
+                                    return;
+                                }
+                                _ => {
+                                    write_proxy_json_error(
+                                        reader.get_mut(),
+                                        "HTTP/1.1 400 Bad Request",
+                                        json!({ "egress": "malformed_chunked_body" }),
+                                    )
+                                    .await;
+                                    return;
+                                }
+                            }
                         }
                         if body_too_large {
-                            let body = json!({
-                                "egress": "request_too_large",
-                                "limit_bytes": MAX_PROXY_BODY_BYTES
-                            })
-                            .to_string();
-                            let resp = format!(
-                                "HTTP/1.1 413 Payload Too Large\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
-                                body.len()
-                            );
-                            let _ = reader.get_mut().write_all(resp.as_bytes()).await;
+                            write_proxy_json_error(
+                                reader.get_mut(),
+                                "HTTP/1.1 413 Payload Too Large",
+                                json!({
+                                    "egress": "request_too_large",
+                                    "limit_bytes": MAX_PROXY_BODY_BYTES
+                                }),
+                            )
+                            .await;
                             return;
                         }
                         req_body = raw;
                     } else if content_length > 0 {
                         let mut buf = vec![0u8; content_length];
-                        if reader.read_exact(&mut buf).await.is_ok() {
-                            req_body = buf;
+                        match tokio::time::timeout_at(read_deadline, reader.read_exact(&mut buf))
+                            .await
+                        {
+                            Ok(Ok(_)) => {
+                                req_body = buf;
+                            }
+                            Err(_) => {
+                                write_proxy_json_error(
+                                    reader.get_mut(),
+                                    "HTTP/1.1 408 Request Timeout",
+                                    json!({
+                                        "egress": "request_timeout",
+                                        "reason": "Timed out reading request body"
+                                    }),
+                                )
+                                .await;
+                                return;
+                            }
+                            Ok(Err(e)) if e.kind() == std::io::ErrorKind::TimedOut => {
+                                write_proxy_json_error(
+                                    reader.get_mut(),
+                                    "HTTP/1.1 408 Request Timeout",
+                                    json!({
+                                        "egress": "request_timeout",
+                                        "reason": "Timed out reading request body"
+                                    }),
+                                )
+                                .await;
+                                return;
+                            }
+                            Ok(Err(_)) => {
+                                write_proxy_json_error(
+                                    reader.get_mut(),
+                                    "HTTP/1.1 400 Bad Request",
+                                    json!({
+                                        "egress": "truncated_request_body",
+                                        "expected_bytes": content_length
+                                    }),
+                                )
+                                .await;
+                                return;
+                            }
                         }
                     }
                     let req_body_text = String::from_utf8_lossy(&req_body);
@@ -3665,5 +3918,75 @@ Connection: close\r\n\r\n";
         let evs = events.lock().unwrap();
         assert!(evs.iter().any(|e| matches!(e, EgressGuardEvent::CircuitTripped { .. })));
         assert!(evs.iter().any(|e| matches!(e, EgressGuardEvent::BudgetExtended { .. })));
+    }
+
+    fn phase3_loopback_bind_candidates() -> Vec<String> {
+        static NEXT_IDX: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+        let mut candidates = Vec::new();
+        if let Ok(raw) = std::env::var("AOS_LOOPBACK_PORTS") {
+            let ports: Vec<u16> = raw
+                .split(',')
+                .filter_map(|p| p.trim().parse::<u16>().ok())
+                .filter(|p| *p > 0)
+                .collect();
+            if !ports.is_empty() {
+                let start = NEXT_IDX.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                for offset in 0..ports.len() {
+                    let port = ports[(start + offset) % ports.len()];
+                    candidates.push(format!("127.0.0.1:{port}"));
+                }
+            }
+        }
+        candidates.push("127.0.0.1:0".to_string());
+        candidates
+    }
+
+    #[tokio::test]
+    async fn phase3_proxy_rejects_malformed_chunked_and_truncated_body() {
+        let gw = Arc::new(AegisEgressGateway::new());
+        let agent = AgentIdentity::new("acme", "phase3-tester", "Engineer");
+        gw.allow_domains("acme", vec!["example.com".to_string()]).await;
+
+        let mut bound = None;
+        for cand in phase3_loopback_bind_candidates() {
+            if let Ok(res) = gw
+                .clone()
+                .start_local_proxy_abortable(&cand, Some(agent.clone()))
+                .await
+            {
+                bound = Some(res);
+                break;
+            }
+        }
+        let (proxy_addr, handle) = bound.expect("bind local test proxy");
+
+        // 1. Malformed chunked body ("XYZ\r\n") -> 400 Bad Request
+        let mut c1 = TcpStream::connect(proxy_addr).await.unwrap();
+        c1.write_all(
+            b"POST http://example.com/v1/messages HTTP/1.1\r\nHost: example.com\r\nTransfer-Encoding: chunked\r\n\r\nXYZ\r\n",
+        )
+        .await
+        .unwrap();
+        let mut r1 = Vec::new();
+        c1.read_to_end(&mut r1).await.unwrap();
+        let s1 = String::from_utf8_lossy(&r1);
+        assert!(s1.contains("HTTP/1.1 400 Bad Request"), "{s1}");
+        assert!(s1.contains("malformed_chunked_body"), "{s1}");
+
+        // 2. Truncated Content-Length body (Content-Length: 100, only 2 bytes + shutdown) -> 400 Bad Request
+        let mut c2 = TcpStream::connect(proxy_addr).await.unwrap();
+        c2.write_all(
+            b"POST http://example.com/v1/messages HTTP/1.1\r\nHost: example.com\r\nContent-Length: 100\r\n\r\nhi",
+        )
+        .await
+        .unwrap();
+        c2.shutdown().await.unwrap();
+        let mut r2 = Vec::new();
+        c2.read_to_end(&mut r2).await.unwrap();
+        let s2 = String::from_utf8_lossy(&r2);
+        assert!(s2.contains("HTTP/1.1 400 Bad Request"), "{s2}");
+        assert!(s2.contains("truncated_request_body"), "{s2}");
+
+        handle.abort();
     }
 }

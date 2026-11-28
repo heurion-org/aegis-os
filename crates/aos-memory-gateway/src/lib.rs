@@ -241,8 +241,20 @@ fn route_request(method: &str, path: &str) -> Result<GatewayRoute, GatewayError>
     if method == "POST" && path == "/v1/payload" {
         return Ok(GatewayRoute::Payload);
     }
-    if method == "GET" && path.starts_with("/v1/payload/") {
-        return Ok(GatewayRoute::Payload);
+    if method == "GET" {
+        if let Some(id) = path.strip_prefix("/v1/payload/") {
+            let lower = id.to_ascii_lowercase();
+            if id.is_empty()
+                || id.contains('/')
+                || id.contains("..")
+                || lower.contains("%2e")
+                || lower.contains("%2f")
+                || lower.contains("%5c")
+            {
+                return Err(GatewayError::UnsupportedEndpoint);
+            }
+            return Ok(GatewayRoute::Payload);
+        }
     }
     if method == "PUT" {
         if let Some(key) = path.strip_prefix("/v1/memory/") {
@@ -549,9 +561,57 @@ impl GuardTarget {
     }
 }
 
+fn validate_forward_request_line_and_headers(
+    method: &str,
+    path: &str,
+    authorization: Option<&str>,
+) -> bool {
+    if method.is_empty() || method.len() > 16 || !method.bytes().all(|b| b.is_ascii_uppercase()) {
+        return false;
+    }
+    if !path.starts_with('/') {
+        return false;
+    }
+    if path.bytes().any(|b| {
+        b == b'\r'
+            || b == b'\n'
+            || b == b'\0'
+            || b.is_ascii_control()
+            || b.is_ascii_whitespace()
+            || b == b'\\'
+    }) {
+        return false;
+    }
+    let path_only = path.split('?').next().unwrap_or(path);
+    if path_only.split('/').any(|s| s == "..") {
+        return false;
+    }
+    let lower = path.to_ascii_lowercase();
+    if lower.contains("%2e") || lower.contains("%2f") || lower.contains("%5c") {
+        return false;
+    }
+    if let Some(a) = authorization {
+        if a.bytes().any(|b| b == b'\r' || b == b'\n' || b == b'\0') {
+            return false;
+        }
+    }
+    true
+}
+
 fn is_public_route(method: &str, path: &str) -> bool {
-    (method == "POST" && path == "/v1/remote/requests")
-        || (method == "GET" && path.starts_with("/v1/remote/requests/"))
+    if method == "POST" && path == "/v1/remote/requests" {
+        return true;
+    }
+    if method == "GET" {
+        if let Some(id) = path.strip_prefix("/v1/remote/requests/") {
+            return !id.is_empty()
+                && id.len() <= 128
+                && id
+                    .bytes()
+                    .all(|b| b.is_ascii_alphanumeric() || b == b'-' || b == b'_');
+        }
+    }
+    false
 }
 
 async fn write_gateway_error<S>(stream: &mut S, status: &str, error_msg: &str) -> anyhow::Result<()>
@@ -660,6 +720,15 @@ where
             &mut stream,
             "400 Bad Request",
             "malformed or unsupported framing headers",
+        )
+        .await;
+    }
+
+    if !validate_forward_request_line_and_headers(&method, &path, authorization.as_deref()) {
+        return write_gateway_error(
+            &mut stream,
+            "400 Bad Request",
+            "malformed request target or headers",
         )
         .await;
     }
@@ -1301,6 +1370,83 @@ mod tests {
         assert!(matches!(
             authorize_request(&config, &key_request, false, 1_000_000),
             Err(GatewayError::Access(RemoteAccessError::ScopeDenied))
+        ));
+    }
+
+    #[test]
+    fn phase3_public_route_blocks_path_traversal_and_encoded_dots() {
+        assert!(is_public_route("GET", "/v1/remote/requests/req-1"));
+        assert!(!is_public_route("GET", "/v1/remote/requests/../../v1/audit"));
+        assert!(!is_public_route(
+            "GET",
+            "/v1/remote/requests/%2e%2e/v1/sessions"
+        ));
+        assert!(!is_public_route("GET", "/v1/remote/requests/a/b"));
+        assert!(!is_public_route("GET", "/v1/remote/requests/req-1?x=1"));
+        assert!(!is_public_route("GET", "/v1/remote/requests/"));
+    }
+
+    #[test]
+    fn phase3_forward_validator_blocks_crlf_and_traversal() {
+        assert!(validate_forward_request_line_and_headers(
+            "GET",
+            "/v1/memory?tag=notes/projects",
+            Some("Bearer tok-123"),
+        ));
+        assert!(!validate_forward_request_line_and_headers(
+            "GET",
+            "/v1/memory\rX-Evil: 1",
+            None,
+        ));
+        assert!(!validate_forward_request_line_and_headers(
+            "GET",
+            "/v1/memory\nX-Evil: 1",
+            None,
+        ));
+        assert!(!validate_forward_request_line_and_headers(
+            "GET",
+            "/v1/memory\0",
+            None,
+        ));
+        assert!(!validate_forward_request_line_and_headers(
+            "GET",
+            "/v1/memory",
+            Some("Bearer tok\rX-Evil: 1"),
+        ));
+        assert!(!validate_forward_request_line_and_headers(
+            "GET",
+            "/v1/memory",
+            Some("Bearer tok\nX-Evil: 1"),
+        ));
+        assert!(!validate_forward_request_line_and_headers(
+            "GET",
+            "/v1/memory",
+            Some("Bearer tok\0"),
+        ));
+        assert!(!validate_forward_request_line_and_headers(
+            "GET",
+            "/v1/remote/../audit",
+            None,
+        ));
+        assert!(!validate_forward_request_line_and_headers(
+            "GET",
+            "/v1/remote/%2e%2e/audit",
+            None,
+        ));
+        assert!(!validate_forward_request_line_and_headers(
+            "GET",
+            "/v1/remote/%2Faudit",
+            None,
+        ));
+        assert!(!validate_forward_request_line_and_headers(
+            "GET",
+            "/v1/remote\\audit",
+            None,
+        ));
+        assert!(!validate_forward_request_line_and_headers(
+            "GET",
+            "v1/memory",
+            None,
         ));
     }
 }

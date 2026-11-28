@@ -27,7 +27,7 @@ pub struct IssueClaims {
 impl TokenIssuer {
     pub fn load_or_generate(secrets_dir: impl AsRef<Path>) -> anyhow::Result<Self> {
         let dir = secrets_dir.as_ref();
-        std::fs::create_dir_all(dir)?;
+        aos_core::security::create_private_dir_0700(dir)?;
         let private_path = dir.join("ed25519-private.jwk");
         let public_path = dir.join("ed25519-public.jwk");
 
@@ -56,12 +56,18 @@ impl TokenIssuer {
         let public_jwk = public_jwk_for(&signing_key);
         let mut private_jwk = public_jwk.clone();
         private_jwk["d"] = Value::String(URL_SAFE_NO_PAD.encode(signing_key.to_bytes()));
-        std::fs::write(&private_path, serde_json::to_vec_pretty(&private_jwk)?)?;
-        std::fs::write(&public_path, serde_json::to_vec_pretty(&public_jwk)?)?;
+        aos_core::session::write_bytes_atomic_synced(
+            &private_path,
+            &serde_json::to_vec_pretty(&private_jwk)?,
+        )?;
+        aos_core::session::write_bytes_atomic_synced(
+            &public_path,
+            &serde_json::to_vec_pretty(&public_jwk)?,
+        )?;
         #[cfg(unix)]
         {
             use std::os::unix::fs::PermissionsExt;
-            let _ = std::fs::set_permissions(&private_path, std::fs::Permissions::from_mode(0o600));
+            std::fs::set_permissions(&public_path, std::fs::Permissions::from_mode(0o644))?;
         }
         Ok(Self {
             signing_key,
@@ -118,4 +124,51 @@ fn public_jwk_for(signing_key: &SigningKey) -> Value {
         "kid": "aegis-memory-1",
         "x": URL_SAFE_NO_PAD.encode(signing_key.verifying_key().to_bytes()),
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[cfg(unix)]
+    #[test]
+    fn phase3_token_issuer_creates_0700_dir_and_0600_private_jwk() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = tempfile::tempdir().unwrap();
+        let secrets_dir = dir.path().join("secrets");
+
+        let issuer = TokenIssuer::load_or_generate(&secrets_dir).unwrap();
+        let dir_mode = std::fs::metadata(&secrets_dir).unwrap().permissions().mode() & 0o777;
+        assert_eq!(dir_mode, 0o700);
+
+        let priv_mode = std::fs::metadata(secrets_dir.join("ed25519-private.jwk"))
+            .unwrap()
+            .permissions()
+            .mode()
+            & 0o777;
+        assert_eq!(priv_mode, 0o600);
+
+        let pub_mode = std::fs::metadata(secrets_dir.join("ed25519-public.jwk"))
+            .unwrap()
+            .permissions()
+            .mode()
+            & 0o777;
+        assert_eq!(pub_mode, 0o644);
+
+        let reloaded = TokenIssuer::load_or_generate(&secrets_dir).unwrap();
+        let token = issuer
+            .issue(&IssueClaims {
+                session_id: "sess-1".to_string(),
+                agent_id: "agent-1".to_string(),
+                expires_at_ms: Utc::now().timestamp_millis() + 60_000,
+                scopes: MemoryScopes::default(),
+                profile: "local".to_string(),
+                audience: "local".to_string(),
+            })
+            .unwrap();
+        let claims = reloaded.verify(&token).unwrap();
+        assert_eq!(claims.session_id, "sess-1");
+        assert_eq!(claims.agent_id, "agent-1");
+    }
 }

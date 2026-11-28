@@ -896,15 +896,45 @@ where
     let method = parts.first().copied().unwrap_or("GET");
     let target = parts.get(1).copied().unwrap_or("/");
     let mut headers = HashMap::new();
+    let mut parsed_content_length: Option<usize> = None;
     for line in lines {
         if let Some((key, value)) = line.split_once(':') {
-            headers.insert(key.trim().to_ascii_lowercase(), value.trim().to_string());
+            let key_lower = key.trim().to_ascii_lowercase();
+            let val = value.trim();
+            if key_lower == "transfer-encoding" {
+                return write_json(
+                    &mut stream,
+                    "400 Bad Request",
+                    json!({ "error": "Transfer-Encoding is not supported" }),
+                )
+                .await;
+            }
+            if key_lower == "content-length" {
+                if parsed_content_length.is_some()
+                    || val.is_empty()
+                    || !val.bytes().all(|b| b.is_ascii_digit())
+                {
+                    return write_json(
+                        &mut stream,
+                        "400 Bad Request",
+                        json!({ "error": "Invalid Content-Length header" }),
+                    )
+                    .await;
+                }
+                let Ok(cl) = val.parse::<usize>() else {
+                    return write_json(
+                        &mut stream,
+                        "400 Bad Request",
+                        json!({ "error": "Invalid Content-Length header" }),
+                    )
+                    .await;
+                };
+                parsed_content_length = Some(cl);
+            }
+            headers.insert(key_lower, val.to_string());
         }
     }
-    let content_length: usize = headers
-        .get("content-length")
-        .and_then(|v| v.parse().ok())
-        .unwrap_or(0);
+    let content_length: usize = parsed_content_length.unwrap_or(0);
     if content_length > MAX_BODY_BYTES {
         return write_json(
             &mut stream,
@@ -914,16 +944,35 @@ where
         .await;
     }
     let mut body_truncated = false;
+    let mut body_timed_out = false;
     while buf.len() < header_end + content_length {
-        let Ok(Ok(n)) = tokio::time::timeout_at(deadline, stream.read(&mut chunk)).await else {
-            body_truncated = true;
-            break;
-        };
-        if n == 0 {
-            body_truncated = true;
-            break;
+        match tokio::time::timeout_at(deadline, stream.read(&mut chunk)).await {
+            Ok(Ok(0)) | Ok(Err(_)) => {
+                body_truncated = true;
+                break;
+            }
+            Ok(Ok(n)) => {
+                buf.extend_from_slice(&chunk[..n]);
+            }
+            Err(_) => {
+                body_timed_out = true;
+                body_truncated = true;
+                break;
+            }
         }
-        buf.extend_from_slice(&chunk[..n]);
+    }
+    if body_truncated || buf.len() < header_end + content_length {
+        let status = if body_timed_out {
+            "408 Request Timeout"
+        } else {
+            "400 Bad Request"
+        };
+        return write_json(
+            &mut stream,
+            status,
+            json!({ "error": "truncated request body" }),
+        )
+        .await;
     }
     let body_end = (header_end + content_length).min(buf.len());
     let body = String::from_utf8_lossy(&buf[header_end..body_end]).to_string();
@@ -3466,5 +3515,167 @@ print("BROKER_PROBE_DONE")
                 "expected Credential scope for {case_path}"
             );
         }
+    }
+
+    async fn bind_test_loopback_listener() -> TcpListener {
+        let mut candidates = Vec::new();
+        if let Ok(raw) = std::env::var("AOS_LOOPBACK_PORTS") {
+            for port in raw
+                .split(',')
+                .filter_map(|p| p.trim().parse::<u16>().ok())
+                .filter(|p| *p > 0)
+            {
+                candidates.push(format!("127.0.0.1:{port}"));
+            }
+        }
+        candidates.push("127.0.0.1:0".to_string());
+        let mut last_err = None;
+        for cand in candidates {
+            match TcpListener::bind(&cand).await {
+                Ok(listener) => return listener,
+                Err(e) => last_err = Some(e),
+            }
+        }
+        panic!("failed to bind test loopback listener: {:?}", last_err);
+    }
+
+    async fn send_raw_http(addr: std::net::SocketAddr, raw_req: &[u8]) -> (String, Value) {
+        let mut stream = TcpStream::connect(addr).await.unwrap();
+        stream.write_all(raw_req).await.unwrap();
+        stream.shutdown().await.unwrap();
+        let mut resp = Vec::new();
+        stream.read_to_end(&mut resp).await.unwrap();
+        let split = resp.windows(4).position(|w| w == b"\r\n\r\n").unwrap();
+        let head = String::from_utf8_lossy(&resp[..split]).to_string();
+        let status_line = head.lines().next().unwrap_or("").to_string();
+        let body: Value = serde_json::from_slice(&resp[split + 4..]).unwrap_or(Value::Null);
+        (status_line, body)
+    }
+
+    #[tokio::test]
+    async fn phase3_session_broker_rejects_chunked_conflicting_cl_and_truncated_body() {
+        let tmp = tempfile::tempdir().unwrap();
+        let runtime = tmp.path().join("runtime");
+        let session_dir = tmp.path().join("session");
+        let workspace = tmp.path().join("workspace");
+        let shadow = tmp.path().join("shadow");
+        let agent_home = session_dir.join("agent_home");
+        for d in [&runtime, &session_dir, &workspace, &shadow, &agent_home] {
+            std::fs::create_dir_all(d).unwrap();
+        }
+        let kernel = Arc::new(AegisRuntimeKernel::new(&runtime).await.unwrap());
+        let state = Arc::new(BrokerState {
+            runtime_dir: runtime,
+            session: BrokerSession {
+                session_id: "ses_phase3".to_string(),
+                mode: "implement".to_string(),
+                enforcement: "enforced".to_string(),
+                workspace: workspace.display().to_string(),
+                shadow: shadow.display().to_string(),
+                agent_home: agent_home.display().to_string(),
+            },
+            session_dir: session_dir.clone(),
+            identity: AgentIdentity::new("org", "agent", "test"),
+            agent_token: "tok_agent_phase3".to_string(),
+            human_token: Arc::new(std::sync::RwLock::new("tok_human_phase3".to_string())),
+            kernel: kernel.clone(),
+            effects_path: session_dir.join("effects.jsonl"),
+            hello: RwLock::new(None),
+            web_console_addr: RwLock::new(None),
+            startup_bin_mtime: None,
+            hot_reload_home_override: None,
+            egress_gateway: None,
+            mcp_proxy_pool: kernel.mcp_proxy_pool.clone(),
+            fallback_pseudonym_table: Arc::new(aos_egress::PseudonymSessionTable::new()),
+        });
+
+        let listener = bind_test_loopback_listener().await;
+        let addr = listener.local_addr().unwrap();
+        let srv = tokio::spawn(async move {
+            loop {
+                let Ok((stream, _)) = listener.accept().await else {
+                    break;
+                };
+                let st = state.clone();
+                tokio::spawn(async move {
+                    let _ = handle_connection(stream, st).await;
+                });
+            }
+        });
+
+        // 1. Transfer-Encoding: chunked must be rejected with 400 Bad Request.
+        let chunked_req = concat!(
+            "POST /v1/adapter/evaluate HTTP/1.1\r\n",
+            "Host: 127.0.0.1\r\n",
+            "X-Aegis-Token: tok_agent_phase3\r\n",
+            "Transfer-Encoding: chunked\r\n",
+            "Connection: close\r\n\r\n",
+            "2\r\n{}\r\n0\r\n\r\n"
+        );
+        let (st1, body1) = send_raw_http(addr, chunked_req.as_bytes()).await;
+        assert!(st1.contains("400 Bad Request"), "expected 400, got {st1} {body1}");
+        assert_eq!(body1["error"], "Transfer-Encoding is not supported");
+
+        // 2. Conflicting / duplicate / non-numeric Content-Length headers must be rejected with 400 Bad Request.
+        for bad_cl in [
+            "Content-Length: 10\r\nContent-Length: 2",
+            "Content-Length: 2\r\nContent-Length: 2",
+            "Content-Length: +2",
+            "Content-Length: abc",
+        ] {
+            let req = format!(
+                "POST /v1/adapter/evaluate HTTP/1.1\r\nHost: 127.0.0.1\r\nX-Aegis-Token: tok_agent_phase3\r\n{bad_cl}\r\nConnection: close\r\n\r\n{{}}"
+            );
+            let (st2, body2) = send_raw_http(addr, req.as_bytes()).await;
+            assert!(
+                st2.contains("400 Bad Request"),
+                "expected 400 for `{bad_cl}`, got {st2} {body2}"
+            );
+            assert_eq!(body2["error"], "Invalid Content-Length header");
+        }
+
+        // 3. Truncated body on non-MCP routes (e.g. /v1/adapter/evaluate and /v1/escalations) must be rejected.
+        let trunc_adapter = concat!(
+            "POST /v1/adapter/evaluate HTTP/1.1\r\n",
+            "Host: 127.0.0.1\r\n",
+            "X-Aegis-Token: tok_agent_phase3\r\n",
+            "Content-Length: 50\r\n",
+            "Connection: close\r\n\r\n",
+            "{\"tool\":"
+        );
+        let (st3, body3) = send_raw_http(addr, trunc_adapter.as_bytes()).await;
+        assert!(
+            st3.contains("400 Bad Request") || st3.contains("408 Request Timeout"),
+            "expected 400/408 for truncated adapter body, got {st3} {body3}"
+        );
+
+        let trunc_human = concat!(
+            "POST /v1/escalations/esc_1/decide HTTP/1.1\r\n",
+            "Host: 127.0.0.1\r\n",
+            "X-Aegis-Token: tok_human_phase3\r\n",
+            "Content-Length: 40\r\n",
+            "Connection: close\r\n\r\n",
+            "{\"approve\":"
+        );
+        let (st4, body4) = send_raw_http(addr, trunc_human.as_bytes()).await;
+        assert!(
+            st4.contains("400 Bad Request") || st4.contains("408 Request Timeout"),
+            "expected 400/408 for truncated human body, got {st4} {body4}"
+        );
+
+        // 4. Valid request succeeds.
+        let valid_req = concat!(
+            "POST /v1/adapter/heartbeat HTTP/1.1\r\n",
+            "Host: 127.0.0.1\r\n",
+            "X-Aegis-Token: tok_agent_phase3\r\n",
+            "Content-Length: 2\r\n",
+            "Connection: close\r\n\r\n",
+            "{}"
+        );
+        let (st5, body5) = send_raw_http(addr, valid_req.as_bytes()).await;
+        assert!(st5.contains("200 OK"), "expected 200 OK, got {st5} {body5}");
+        assert_eq!(body5["status"], "ok");
+
+        srv.abort();
     }
 }

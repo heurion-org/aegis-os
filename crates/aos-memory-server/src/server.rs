@@ -96,17 +96,6 @@ fn api_error(status: StatusCode, code: &str, message: &str) -> (StatusCode, Json
     )
 }
 
-fn constant_time_eq(a: &str, b: &str) -> bool {
-    if a.is_empty() || b.is_empty() || a.len() != b.len() {
-        return false;
-    }
-    a.as_bytes()
-        .iter()
-        .zip(b.as_bytes().iter())
-        .fold(0u8, |acc, (&x, &y)| acc | (x ^ y))
-        == 0
-}
-
 fn check_admin(state: &AppState, headers: &HeaderMap) -> Result<(), (StatusCode, Json<Value>)> {
     if state.admin_token.is_empty() {
         return Err(api_error(
@@ -119,7 +108,7 @@ fn check_admin(state: &AppState, headers: &HeaderMap) -> Result<(), (StatusCode,
         .get("x-uomp-admin-token")
         .and_then(|value| value.to_str().ok())
         .unwrap_or("");
-    if constant_time_eq(provided, &state.admin_token) {
+    if aos_core::security::ct_eq_str(provided, &state.admin_token) {
         Ok(())
     } else {
         Err(api_error(
@@ -143,7 +132,7 @@ fn check_bridge(state: &AppState, headers: &HeaderMap) -> Result<(), (StatusCode
         .or_else(|| headers.get("x-aegis-bridge-token"))
         .and_then(|value| value.to_str().ok())
         .unwrap_or("");
-    if constant_time_eq(provided, &state.bridge_token) {
+    if aos_core::security::ct_eq_str(provided, &state.bridge_token) {
         Ok(())
     } else {
         Err(api_error(
