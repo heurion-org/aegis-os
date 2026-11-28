@@ -89,6 +89,9 @@ pub async fn handle_cloud_command(
             };
             store.auth = Some(auth.clone());
             save_store(runtime_dir, &store)?;
+            let base_url = api_base(&clean_ep);
+            eprintln!("  Dashboard : {base_url}/dashboard?org={}#key={resolved_key}", identity.org_id);
+            eprintln!("  Mobile/Web: {base_url}/app");
             println!(
                 "{}",
                 serde_json::to_string_pretty(&json!({
@@ -96,6 +99,8 @@ pub async fn handle_cloud_command(
                     "endpoint": clean_ep,
                     "org_id": identity.org_id,
                     "api_key_prefix": &resolved_key[..resolved_key.len().min(14)],
+                    "dashboard_url": format!("{base_url}/dashboard?org={}", identity.org_id),
+                    "app_url": format!("{base_url}/app"),
                 }))?
             );
         }
@@ -106,6 +111,21 @@ pub async fn handle_cloud_command(
             workspace_id,
             agents,
         } => {
+            if let Some(child_repos) = crate::launcher::detect_umbrella_workspace(&canon) {
+                if !child_repos.is_empty() {
+                    let preview = child_repos
+                        .iter()
+                        .take(5)
+                        .cloned()
+                        .collect::<Vec<_>>()
+                        .join(", ");
+                    bail!(
+                        "Current directory '{}' is a multi-repo parent folder ({}). Please `cd` into a specific project folder before running `aegis-os cloud up`.",
+                        canon.display(),
+                        preview
+                    );
+                }
+            }
             let clean_ep = endpoint
                 .or_else(|| store.auth.as_ref().map(|a| a.endpoint.clone()))
                 .unwrap_or_else(|| "https://heurion.org".to_string())
@@ -151,6 +171,7 @@ pub async fn handle_cloud_command(
             };
 
             // 2. Provision Cloud CoW Workspace on the remote node
+            eprintln!("Provisioning cloud workspace '{ws_id}'...");
             let prov_resp = cloud_http_json(
                 "POST",
                 &clean_ep,
@@ -171,8 +192,10 @@ pub async fn handle_cloud_command(
             }
 
             // 3. Push local source-only files to initialize the Cloud Workspace baseline
+            eprintln!("Scanning local source files in '{}'...", canon.display());
             let files = collect_local_source_bundle(&canon).await?;
             let files_count = files.len();
+            eprintln!("Uploading {files_count} source file(s) to {}...", api_base(&clean_ep));
             let sync_resp = sync_up_files_chunked(
                 &clean_ep,
                 &resolved_key,
@@ -1145,7 +1168,47 @@ pub async fn handle_unified_approve(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::atomic::{AtomicUsize, Ordering};
     use std::sync::Arc;
+
+    static CLOUD_TEST_PORT_CURSOR: AtomicUsize = AtomicUsize::new(0);
+
+    async fn start_test_cloud_daemon(
+        kernel: Arc<AegisRuntimeKernel>,
+        workspace: PathBuf,
+    ) -> std::net::SocketAddr {
+        let mut candidates: Vec<String> = Vec::new();
+        if let Ok(list) = std::env::var("AOS_LOOPBACK_PORTS") {
+            let ports: Vec<String> = list
+                .split(',')
+                .map(str::trim)
+                .filter(|s| !s.is_empty())
+                .map(|p| format!("127.0.0.1:{}", p))
+                .collect();
+            if !ports.is_empty() {
+                let start = CLOUD_TEST_PORT_CURSOR.fetch_add(1, Ordering::Relaxed) % ports.len();
+                for offset in 0..ports.len() {
+                    candidates.push(ports[(start + offset) % ports.len()].clone());
+                }
+            }
+        }
+        candidates.push("127.0.0.1:0".to_string());
+        let mut last_err = None;
+        for bind_addr in candidates {
+            match kernel
+                .clone()
+                .start_http_daemon(&bind_addr, workspace.clone())
+                .await
+            {
+                Ok(addr) => return addr,
+                Err(err) => last_err = Some(err),
+            }
+        }
+        panic!(
+            "failed to start test cloud daemon on any candidate address: {:?}",
+            last_err
+        );
+    }
 
     #[test]
     fn heurion_root_endpoint_maps_to_the_aegis_cloud_prefix() {
@@ -1181,11 +1244,7 @@ mod tests {
 
         // Start a real Aegis Cloud HTTP Daemon on an ephemeral port
         let cloud_kernel = Arc::new(AegisRuntimeKernel::new(&cloud_rt).await.unwrap());
-        let cloud_addr = cloud_kernel
-            .clone()
-            .start_http_daemon("127.0.0.1:0", cloud_default_ws)
-            .await
-            .unwrap();
+        let cloud_addr = start_test_cloud_daemon(cloud_kernel.clone(), cloud_default_ws).await;
         let endpoint = format!("http://{}", cloud_addr);
 
         let identity = AgentIdentity::new("my_local_project", "agy-agent", "Lead Agent");
@@ -1303,11 +1362,7 @@ mod tests {
             .unwrap();
 
         let cloud_kernel = Arc::new(AegisRuntimeKernel::new(&cloud_rt).await.unwrap());
-        let cloud_addr = cloud_kernel
-            .clone()
-            .start_http_daemon("127.0.0.1:0", cloud_default_ws)
-            .await
-            .unwrap();
+        let cloud_addr = start_test_cloud_daemon(cloud_kernel.clone(), cloud_default_ws).await;
         let endpoint = format!("http://{}", cloud_addr);
 
         let identity = AgentIdentity::new("fresh_project", "agy-agent", "Lead Agent");
@@ -1519,11 +1574,7 @@ mod tests {
         cloud_kernel
             .paas
             .set_secrets("adm_cloud_e2e", webhook_secret);
-        let cloud_addr = cloud_kernel
-            .clone()
-            .start_http_daemon("127.0.0.1:0", cloud_default_ws)
-            .await
-            .unwrap();
+        let cloud_addr = start_test_cloud_daemon(cloud_kernel.clone(), cloud_default_ws).await;
         let endpoint = format!("http://{}", cloud_addr);
         let identity = AgentIdentity::new("cloud_e2e_org", "agy-agent", "Lead Agent");
 
@@ -1841,6 +1892,35 @@ mod tests {
             commit_ok.to_string().contains("committed_to_host"),
             "Expected committed_to_host after unified TOTP approval, got: {}",
             commit_ok
+        );
+    }
+
+    #[tokio::test]
+    async fn cloud_up_rejects_umbrella_multi_repo_directory() {
+        let tmp = tempfile::tempdir().unwrap();
+        let umbrella = tmp.path().join("workspace");
+        let rt = tmp.path().join("rt");
+        std::fs::create_dir_all(umbrella.join("repo-a/.git")).unwrap();
+        std::fs::create_dir_all(umbrella.join("repo-b/.git")).unwrap();
+        std::fs::create_dir_all(&rt).unwrap();
+
+        let err = handle_cloud_command(
+            CloudAction::Up {
+                endpoint: Some("http://127.0.0.1:1".to_string()),
+                api_key: Some("ak_live_test".to_string()),
+                workspace_id: None,
+                agents: "agy-agent".to_string(),
+            },
+            &AgentIdentity::new("dev-test", "dev-tester", "Developer"),
+            &umbrella,
+            &rt,
+        )
+        .await
+        .expect_err("cloud up in multi-repo umbrella dir must fail fast");
+        let msg = err.to_string();
+        assert!(
+            msg.contains("multi-repo parent folder") && msg.contains("repo-a"),
+            "unexpected error: {msg}"
         );
     }
 }

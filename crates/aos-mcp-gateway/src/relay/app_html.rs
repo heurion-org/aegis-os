@@ -439,129 +439,322 @@ pub const PWA_MANIFEST_JSON: &str = r##"{
   "start_url": "/app",
   "scope": "/app",
   "display": "standalone",
-  "background_color": "#0b0f17",
-  "theme_color": "#0b0f17",
+  "background_color": "#FAF8F4",
+  "theme_color": "#233E33",
   "description": "Zero-Knowledge E2EE cross-device console for any AI Agent running on Aegis OS."
 }"##;
 
 pub const MOBILE_APP_HTML_TEMPLATE: &str = r##"<!DOCTYPE html>
-<html lang="en">
+<html lang="zh-CN">
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
-<meta name="theme-color" content="#0b0f17">
+<meta name="theme-color" content="#233E33">
 <link rel="manifest" href="app/manifest.json">
-<title>Aegis OS · Any Agent, Any Device</title>
+<title>Aegis OS — Remote Console · Heurion Research</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=Inter:wght@300;400;500;600;700&family=JetBrains+Mono:wght@400;500&family=Newsreader:ital,opsz,wght@0,6..72,300;0,6..72,400;1,6..72,300;1,6..72,400&family=Noto+Serif+SC:wght@300;400;500&display=swap" rel="stylesheet">
 <style>
+  /* Heurion Research — Nordic / Scandinavian Editorial Design System (v6) */
   :root {
-    color-scheme: dark;
-    --bg: #0b0f17;
-    --card: #131a26;
-    --border: #232f45;
-    --text: #e6edf7;
-    --muted: #8b9bb4;
-    --accent: #38bdf8;
-    --ok: #34d399;
-    --warn: #fbbf24;
-    --danger: #f87171;
+    --bg-paper: #FAF8F4;
+    --bg-neutral: #EFECE4;
+    --bg-elevated: #FDFCF9;
+    --ink: #151C19;
+    --ink-secondary: #4A534E;
+    --ink-muted: #646D68;
+    --accent: #233E33;
+    --accent-soft: #E3ECE7;
+    --mint: #00C472;
+    --warn: #8B5E1B;
+    --warn-soft: #F7EFE0;
+    --danger: #9E332E;
+    --danger-soft: #F8E9E8;
+    --hairline: #DFDAD0;
+    --font-serif: 'Newsreader', 'Noto Serif SC', Georgia, serif;
+    --font-sans: 'Inter', -apple-system, BlinkMacSystemFont, 'PingFang SC', 'Hiragino Sans GB', sans-serif;
+    --font-mono: 'JetBrains Mono', ui-monospace, SFMono-Regular, Menlo, monospace;
+    --max-w: 1120px;
   }
-  * { box-sizing: border-box; }
+  *, *::before, *::after { box-sizing: border-box; }
+  html { font-size: 16px; background: var(--bg-paper); color: var(--ink); }
   body {
-    margin: 0; font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
-    background: var(--bg); color: var(--text); padding-bottom: 84px;
+    margin: 0;
+    font-family: var(--font-sans);
+    font-weight: 400;
+    line-height: 1.65;
+    background: var(--bg-paper);
+    color: var(--ink);
+    padding-bottom: calc(88px + env(safe-area-inset-bottom, 0px));
+    -webkit-font-smoothing: antialiased;
   }
-  header {
-    position: sticky; top: 0; z-index: 10; background: rgba(11,15,23,0.92);
-    backdrop-filter: blur(8px); border-bottom: 1px solid var(--border);
-    padding: 12px 16px; display: flex; align-items: center; justify-content: space-between;
+  a { color: inherit; text-decoration: none; transition: color 0.18s ease, border-color 0.18s ease, background 0.18s ease; }
+  a:hover { color: var(--accent); }
+  code { font-family: var(--font-mono); font-size: 0.8em; background: var(--bg-neutral); padding: 0.12rem 0.4rem; border: 1px solid var(--hairline); }
+
+  body[data-lang="zh"] [data-en] { display: none !important; }
+  body[data-lang="en"] [data-zh] { display: none !important; }
+
+  .container { max-width: var(--max-w); margin: 0 auto; padding: 0 2.5rem; }
+
+  /* Sticky Editorial Navigation (matches /dashboard & /approve) */
+  .nav {
+    position: sticky; top: 0; z-index: 50;
+    background: rgba(250, 248, 244, 0.94);
+    backdrop-filter: blur(12px); -webkit-backdrop-filter: blur(12px);
+    border-bottom: 1px solid var(--hairline);
   }
-  .brand { font-weight: 700; font-size: 15px; letter-spacing: 0.3px; }
-  .badge { font-size: 11px; padding: 3px 8px; border-radius: 999px; background: #1e293b; color: var(--accent); }
-  main { max-width: 760px; margin: 0 auto; padding: 14px; display: grid; gap: 12px; }
-  .card { background: var(--card); border: 1px solid var(--border); border-radius: 12px; padding: 14px; }
-  h2 { margin: 0 0 10px; font-size: 15px; }
-  label { display: block; font-size: 12px; color: var(--muted); margin-bottom: 4px; }
+  .nav-inner {
+    max-width: var(--max-w); margin: 0 auto; padding: 1.05rem 2.5rem;
+    display: flex; align-items: center; justify-content: space-between; gap: 1.25rem;
+  }
+  .brand-group { display: flex; align-items: center; gap: 0.7rem; white-space: nowrap; flex-shrink: 0; }
+  .brand { display: inline-flex; align-items: center; gap: 0.65rem; color: var(--ink); white-space: nowrap; flex-shrink: 0; }
+  .brand-mark { width: 24px; height: 22px; display: block; flex-shrink: 0; }
+  .brand-word { font: 700 0.9rem var(--font-sans); letter-spacing: 0.22em; text-transform: uppercase; color: var(--ink); }
+  .brand-sep { color: var(--hairline); font-weight: 300; flex-shrink: 0; }
+  .brand-sub {
+    font-family: var(--font-mono); font-size: 0.68rem; letter-spacing: 0.12em; text-transform: uppercase;
+    color: var(--accent); padding: 0.18rem 0.52rem; background: var(--accent-soft);
+    border: 1px solid rgba(35, 62, 51, 0.2); white-space: nowrap; flex-shrink: 0;
+  }
+  .nav-links { display: flex; align-items: center; gap: 1.4rem; flex-wrap: nowrap; }
+  .nav-link { font-size: 0.875rem; letter-spacing: 0.02em; color: var(--ink-secondary); white-space: nowrap; flex-shrink: 0; }
+  .nav-link:hover, .nav-link-active { color: var(--ink); font-weight: 500; }
+  .nav-right { display: flex; align-items: center; gap: 0.65rem; white-space: nowrap; flex-shrink: 0; }
+  .nav-mobile-link { display: none; }
+  .lang-switch {
+    font-family: var(--font-mono); font-size: 0.72rem; letter-spacing: 0.08em;
+    padding: 0.28rem 0.6rem; border: 1px solid var(--hairline); color: var(--ink-secondary);
+    background: transparent; cursor: pointer; white-space: nowrap; flex-shrink: 0;
+  }
+  .lang-switch:hover { border-color: var(--ink); color: var(--ink); background: transparent; }
+
+  .badge {
+    display: inline-flex; align-items: center; gap: 0.35rem;
+    font-family: var(--font-mono); font-size: 0.68rem; letter-spacing: 0.06em;
+    padding: 0.24rem 0.62rem; border: 1px solid var(--hairline);
+    color: var(--ink-secondary); background: var(--bg-paper); white-space: nowrap; flex-shrink: 0;
+  }
+  .badge-ok { color: var(--accent); border-color: rgba(35, 62, 51, 0.32); background: var(--accent-soft); }
+  .badge-warn { color: var(--warn); border-color: rgba(139, 94, 27, 0.35); background: var(--warn-soft); }
+  .badge-err { color: var(--danger); border-color: rgba(158, 51, 46, 0.35); background: var(--danger-soft); }
+
+  /* Console Hero Strip */
+  .console-header {
+    padding: 1.75rem 0 1.4rem;
+    border-bottom: 1px solid var(--hairline);
+    background: linear-gradient(180deg, rgba(239, 236, 228, 0.55) 0%, rgba(250, 248, 244, 0.95) 100%);
+  }
+  .label-caps {
+    font-family: var(--font-mono); font-size: 0.72rem; letter-spacing: 0.14em;
+    text-transform: uppercase; color: var(--ink-muted); margin: 0 0 0.4rem;
+  }
+  .console-title {
+    font-family: var(--font-serif); font-weight: 300; font-size: clamp(1.55rem, 2.3vw, 2.05rem);
+    line-height: 1.2; letter-spacing: -0.02em; color: var(--ink); margin: 0 0 0.35rem;
+  }
+  .console-title em { font-style: italic; font-weight: 400; color: var(--accent); }
+  .dev-meta-line { font-family: var(--font-mono); font-size: 0.74rem; color: var(--ink-muted); word-break: break-all; }
+
+  main { max-width: var(--max-w); margin: 0 auto; padding: 1.75rem 2.5rem 2.5rem; display: grid; gap: 1.25rem; }
+  .card {
+    background: var(--bg-elevated); border: 1px solid var(--hairline); border-radius: 0;
+    padding: 1.35rem 1.5rem; min-width: 0;
+  }
+  .paired-strip {
+    background: var(--accent-soft); border-color: rgba(35, 62, 51, 0.28);
+    border-left: 3px solid var(--accent); padding: 0.85rem 1.25rem;
+  }
+  .sec-head {
+    display: flex; align-items: baseline; justify-content: space-between; gap: 1rem;
+    padding-bottom: 0.7rem; margin-bottom: 1rem; border-bottom: 1px solid var(--hairline); flex-wrap: wrap;
+  }
+  .sec-head-left { display: flex; align-items: baseline; gap: 0.75rem; flex-wrap: wrap; }
+  .sec-num { font-family: var(--font-mono); font-size: 0.72rem; letter-spacing: 0.14em; color: var(--ink-muted); text-transform: uppercase; }
+  h2 { font-family: var(--font-serif); font-weight: 400; font-size: 1.22rem; color: var(--ink); margin: 0; }
+
+  label {
+    display: block; font-family: var(--font-mono); font-size: 0.7rem; letter-spacing: 0.08em;
+    text-transform: uppercase; color: var(--ink-muted); margin-bottom: 0.35rem;
+  }
   input, textarea {
-    width: 100%; background: #0b0f17; color: var(--text); border: 1px solid var(--border);
-    border-radius: 8px; padding: 10px; font-size: 14px; margin-bottom: 10px;
+    width: 100%; background: var(--bg-paper); color: var(--ink); border: 1px solid var(--hairline);
+    border-radius: 0; padding: 0.55rem 0.8rem; font-family: var(--font-mono); font-size: 0.82rem;
+    margin-bottom: 0.85rem; outline: none;
   }
-  .row { display: flex; gap: 8px; align-items: center; flex-wrap: wrap; }
+  input:focus, textarea:focus { border-color: var(--accent); background: #fff; }
+  .row { display: flex; gap: 0.6rem; align-items: center; flex-wrap: wrap; }
+
   button {
-    border: 0; border-radius: 8px; padding: 10px 14px; font-size: 13px; font-weight: 600;
-    cursor: pointer; background: var(--accent); color: #05131f;
+    display: inline-flex; align-items: center; justify-content: center; gap: 0.35rem;
+    border: 1px solid var(--accent); border-radius: 0; padding: 0.5rem 1rem;
+    font-family: var(--font-sans); font-size: 0.8125rem; font-weight: 500; letter-spacing: 0.02em;
+    cursor: pointer; background: var(--accent); color: #F4F1EA; white-space: nowrap;
+    transition: all 0.18s ease;
   }
-  button.secondary { background: #1e293b; color: var(--text); border: 1px solid var(--border); }
-  button.danger { background: var(--danger); color: #190505; }
-  .tabs { display: grid; grid-template-columns: repeat(4, 1fr); gap: 6px; }
-  .tab.active { background: var(--accent); color: #05131f; }
+  button:hover { background: var(--ink); border-color: var(--ink); color: #F4F1EA; }
+  button.secondary {
+    background: var(--bg-paper); color: var(--ink-secondary); border: 1px solid var(--hairline);
+  }
+  button.secondary:hover { border-color: var(--ink); color: var(--ink); background: var(--bg-elevated); }
+  button.danger {
+    background: transparent; color: var(--danger); border: 1px solid rgba(158, 51, 46, 0.42);
+  }
+  button.danger:hover { background: var(--danger-soft); border-color: var(--danger); color: var(--danger); }
+
+  .tabs {
+    display: grid; grid-template-columns: repeat(4, minmax(0, 1fr));
+    border: 1px solid var(--hairline); background: var(--bg-paper);
+  }
+  .tab { border: 0; border-right: 1px solid var(--hairline); padding: 0.55rem 0.6rem; font-size: 0.8rem; }
+  .tab:last-child { border-right: 0; }
+  .tab.secondary { background: transparent; color: var(--ink-secondary); border-top: 0; border-bottom: 0; border-left: 0; }
+  .tab.active { background: var(--accent); color: #F4F1EA; }
+
   .log {
-    background: #070a10; border: 1px solid var(--border); border-radius: 8px;
-    padding: 10px; min-height: 220px; max-height: 52vh; overflow-y: auto;
-    font-family: ui-monospace, SFMono-Regular, Menlo, monospace; font-size: 12px;
+    background: #151C19; color: #F4F1EA; border: 1px solid #151C19; border-radius: 0;
+    padding: 0.9rem 1rem; min-height: 220px; max-height: 52vh; overflow-y: auto;
+    font-family: var(--font-mono); font-size: 0.78rem; line-height: 1.55;
     white-space: pre-wrap; word-break: break-word;
   }
   .prompt-bar {
-    position: fixed; bottom: 0; left: 0; right: 0; background: #0f1521;
-    border-top: 1px solid var(--border); padding: 10px 12px; display: none; gap: 8px;
+    position: fixed; bottom: 0; left: 0; right: 0; z-index: 40;
+    background: rgba(250, 248, 244, 0.96); backdrop-filter: blur(12px); -webkit-backdrop-filter: blur(12px);
+    border-top: 1px solid var(--hairline);
+    padding: 0.7rem 1.25rem calc(0.7rem + env(safe-area-inset-bottom, 0px));
+    display: none; gap: 0.55rem; align-items: center;
   }
-  .prompt-bar input { margin: 0; flex: 1; }
-  .muted { color: var(--muted); font-size: 12px; }
+  .prompt-bar input { margin: 0; flex: 1; background: var(--bg-elevated); }
+  .muted { color: var(--ink-muted); font-size: 0.82rem; }
   .session-item {
-    display: flex; justify-content: space-between; align-items: center; gap: 8px;
-    padding: 10px 0; border-top: 1px solid var(--border);
+    display: flex; justify-content: space-between; align-items: center; gap: 0.85rem; flex-wrap: wrap;
+    padding: 0.75rem 0.9rem; border: 1px solid var(--hairline); background: var(--bg-paper); margin-top: 0.55rem;
   }
+  .session-title { font-family: var(--font-sans); font-weight: 500; font-size: 0.9rem; color: var(--ink); }
+  .foot { background: var(--bg-paper); border-top: 1px solid var(--hairline); padding: 1.75rem 0; }
+  .foot-bar { display: flex; align-items: center; justify-content: space-between; gap: 1.25rem; flex-wrap: wrap; }
+  .foot-right { display: flex; flex-wrap: wrap; align-items: center; gap: 1.2rem; font-size: 0.78rem; color: var(--ink-muted); }
+  .foot-link { font-family: var(--font-mono); font-size: 0.72rem; letter-spacing: 0.06em; color: var(--ink-secondary); }
   .hidden { display: none !important; }
+
+  @media (max-width: 900px) {
+    .container, .nav-inner, main { padding-left: 1.15rem; padding-right: 1.15rem; }
+    .nav-links { display: none; }
+    .nav-mobile-link {
+      display: inline-flex; align-items: center; font-family: var(--font-mono); font-size: 0.72rem;
+      padding: 0.28rem 0.6rem; border: 1px solid var(--hairline); color: var(--ink-secondary); background: var(--bg-paper);
+    }
+    .brand-word { font-size: 0.82rem; letter-spacing: 0.16em; }
+  }
 </style>
 </head>
-<body>
-<header>
-  <div>
-    <div class="brand">AEGIS OS · ZERO-KNOWLEDGE RELAY</div>
-    <div id="dev-meta" class="muted">Initializing WebCrypto identity...</div>
+<body data-lang="zh">
+<header class="nav" role="banner">
+  <div class="nav-inner">
+    <div class="brand-group">
+      <a class="brand" href="https://heurion.org/" aria-label="Heurion Research">
+        <svg class="brand-mark" viewBox="-2 6 96 88" aria-hidden="true">
+          <rect fill="#151C19" x="0" y="10" width="18" height="80" rx="9"/>
+          <rect fill="#151C19" x="62" y="30" width="18" height="60" rx="9"/>
+          <rect fill="#00C472" x="14" y="42" width="52" height="18" rx="9"/>
+          <circle fill="#00C472" cx="80" cy="20" r="11"/>
+        </svg>
+        <span class="brand-word">HEURION</span>
+      </a>
+      <span class="brand-sep">/</span>
+      <a href="https://heurion.org/aegis-os/" class="brand-sub">AEGIS OS</a>
+    </div>
+    <nav class="nav-links" aria-label="Primary Navigation">
+      <a href="https://heurion.org/" class="nav-link"><span data-zh>主站</span><span data-en>Heurion.org</span></a>
+      <a href="https://heurion.org/aegis-os/" class="nav-link"><span data-zh>概览</span><span data-en>Overview</span></a>
+      <a href="https://heurion.org/aegis-os/#pricing" class="nav-link"><span data-zh>方案与购买</span><span data-en>Plans &amp; Buy</span></a>
+      <a id="nav-dashboard" href="dashboard" class="nav-link"><span data-zh>我的控制台</span><span data-en>My Console</span></a>
+      <a href="#" class="nav-link nav-link-active"><span data-zh>远程终端 (/app)</span><span data-en>Remote (/app)</span></a>
+      <a href="https://github.com/heurion-org/aegis-os" target="_blank" rel="noopener" class="nav-link">GitHub ↗</a>
+    </nav>
+    <div class="nav-right">
+      <a id="nav-dashboard-mobile" href="dashboard" class="nav-mobile-link"><span data-zh>控制台</span><span data-en>Console</span></a>
+      <span id="conn-badge" class="badge">Offline</span>
+      <button type="button" class="lang-switch" id="lang-toggle">EN</button>
+    </div>
   </div>
-  <span id="conn-badge" class="badge">Offline</span>
 </header>
 
+<section class="console-header">
+  <div class="container">
+    <p class="label-caps">AEGIS OS · ZERO-KNOWLEDGE E2EE RELAY</p>
+    <h1 class="console-title">
+      <span data-zh>Aegis OS — <em>跨端加密远程控制台</em></span>
+      <span data-en>Aegis OS — <em>Encrypted Remote Console</em></span>
+    </h1>
+    <div id="dev-meta" class="dev-meta-line">Initializing WebCrypto identity...</div>
+  </div>
+</section>
+
 <main>
+  <section id="paired-bar" class="card paired-strip hidden">
+    <div class="row" style="justify-content:space-between;">
+      <span id="paired-summary" class="muted" style="color:var(--accent); font-family:var(--font-mono); font-size:0.78rem;">Paired</span>
+      <button id="btn-toggle-setup" class="secondary" style="padding:0.35rem 0.75rem; font-size:0.76rem;"><span data-zh>配对与密钥设置</span><span data-en>Pair / Key Settings</span></button>
+    </div>
+  </section>
+
   <section id="setup-card" class="card">
-    <h2>1. Connect & Pair Device</h2>
+    <div class="sec-head">
+      <div class="sec-head-left">
+        <span class="sec-num">01 / CONNECT &amp; PAIR</span>
+        <h2><span data-zh>连接账户并配对工作站</span><span data-en>Connect &amp; Pair Device</span></h2>
+      </div>
+    </div>
+    <p class="muted" style="margin:0 0 0.9rem;">
+      <span data-zh>提示：在工作站运行 <code>aegis-os devices pair</code> 后，直接扫码或打开打印的链接即可零输入自动配对。</span>
+      <span data-en>Tip: Run <code>aegis-os devices pair</code> on your workstation and scan the QR or open the printed link to pair with zero manual input.</span>
+    </p>
     <label>Aegis Cloud API Key (`ak_live_...`)</label>
     <input id="api-key" type="password" placeholder="ak_live_...">
     <label>Pairing Code (`aegis-pair:...` from Workstation QR)</label>
     <input id="pair-code" type="text" placeholder="aegis-pair:...">
     <div class="row">
-      <button id="btn-save-key">Save Key & Load Sessions</button>
-      <button id="btn-pair" class="secondary">Claim Pairing Code</button>
+      <button id="btn-save-key"><span data-zh>保存密钥并加载会话</span><span data-en>Save Key &amp; Load Sessions</span></button>
+      <button id="btn-pair" class="secondary"><span data-zh>认领配对码</span><span data-en>Claim Pairing Code</span></button>
     </div>
-    <div id="setup-msg" class="muted" style="margin-top:8px;"></div>
+    <div id="setup-msg" class="muted" style="margin-top:0.65rem; font-family:var(--font-mono); font-size:0.76rem;"></div>
   </section>
 
   <section id="sessions-card" class="card">
-    <div class="row" style="justify-content:space-between;">
-      <h2 style="margin:0;">2. Shared Agent Sessions</h2>
-      <button id="btn-refresh" class="secondary">Refresh</button>
+    <div class="sec-head" style="margin-bottom:0.6rem;">
+      <div class="sec-head-left">
+        <span class="sec-num">02 / SHARED AGENT SESSIONS</span>
+        <h2><span data-zh>共享 Agent 会话</span><span data-en>Shared Agent Sessions</span></h2>
+      </div>
+      <button id="btn-refresh" class="secondary"><span data-zh>刷新</span><span data-en>Refresh</span></button>
     </div>
-    <div id="sessions-list" class="muted" style="margin-top:8px;">No sessions loaded yet.</div>
+    <div id="sessions-list" class="muted">No sessions loaded yet.</div>
   </section>
 
   <section id="detail-card" class="card hidden">
-    <div class="row" style="justify-content:space-between; margin-bottom:10px;">
-      <strong id="active-title">Session</strong>
-      <button id="btn-disconnect" class="secondary">Disconnect</button>
+    <div class="sec-head">
+      <div class="sec-head-left">
+        <span class="sec-num">03 / LIVE E2EE SESSION</span>
+        <h2 id="active-title">Session</h2>
+      </div>
+      <button id="btn-disconnect" class="secondary"><span data-zh>断开连接</span><span data-en>Disconnect</span></button>
     </div>
     <div class="tabs">
-      <button class="tab active" data-tab="timeline">Timeline</button>
-      <button class="tab secondary" data-tab="terminal">Terminal</button>
-      <button class="tab secondary" data-tab="diff">Diff</button>
-      <button class="tab secondary" data-tab="approve">Approve</button>
+      <button class="tab active" data-tab="timeline"><span data-zh>时间线</span><span data-en>Timeline</span></button>
+      <button class="tab secondary" data-tab="terminal"><span data-zh>终端</span><span data-en>Terminal</span></button>
+      <button class="tab secondary" data-tab="diff"><span data-zh>变更 Diff</span><span data-en>Diff</span></button>
+      <button class="tab secondary" data-tab="approve"><span data-zh>边界审批</span><span data-en>Approve</span></button>
     </div>
 
-    <div id="panel-timeline" style="margin-top:10px;">
+    <div id="panel-timeline" style="margin-top:0.9rem;">
       <div id="timeline-log" class="log"></div>
     </div>
 
-    <div id="panel-terminal" class="hidden" style="margin-top:10px;">
-      <div class="row" style="margin-bottom:8px;">
+    <div id="panel-terminal" class="hidden" style="margin-top:0.9rem;">
+      <div class="row" style="margin-bottom:0.65rem;">
         <button class="secondary qkey" data-key="ctrl-c">Ctrl+C</button>
         <button class="secondary qkey" data-key="enter">Enter</button>
         <button class="secondary qkey" data-key="tab">Tab</button>
@@ -570,26 +763,48 @@ pub const MOBILE_APP_HTML_TEMPLATE: &str = r##"<!DOCTYPE html>
       <div id="terminal-log" class="log"></div>
     </div>
 
-    <div id="panel-diff" class="hidden" style="margin-top:10px;">
-      <div class="row" style="margin-bottom:8px;">
-        <button id="btn-fetch-handoff" class="secondary">Decrypt Latest Handoff</button>
+    <div id="panel-diff" class="hidden" style="margin-top:0.9rem;">
+      <div class="row" style="margin-bottom:0.65rem;">
+        <button id="btn-fetch-handoff" class="secondary"><span data-zh>解密最新 Handoff</span><span data-en>Decrypt Latest Handoff</span></button>
       </div>
       <div id="diff-log" class="log"></div>
     </div>
 
-    <div id="panel-approve" class="hidden" style="margin-top:10px;">
+    <div id="panel-approve" class="hidden" style="margin-top:0.9rem;">
       <div class="row">
-        <input id="totp-code" type="text" inputmode="numeric" maxlength="6" placeholder="6-digit TOTP code" style="flex:1;">
-        <button id="btn-load-approvals" class="secondary">Reload</button>
+        <input id="totp-code" type="text" inputmode="numeric" maxlength="6" placeholder="6-digit TOTP code" style="flex:1; margin:0;">
+        <button id="btn-load-approvals" class="secondary"><span data-zh>重新加载</span><span data-en>Reload</span></button>
       </div>
-      <div id="approvals-list" class="muted"></div>
+      <div id="approvals-list" class="muted" style="margin-top:0.75rem;"></div>
     </div>
   </section>
 </main>
 
+<footer class="foot" role="contentinfo">
+  <div class="container">
+    <div class="foot-bar">
+      <a class="brand" href="https://heurion.org/" aria-label="Heurion Research">
+        <svg class="brand-mark" viewBox="-2 6 96 88" aria-hidden="true">
+          <rect fill="#151C19" x="0" y="10" width="18" height="80" rx="9"/>
+          <rect fill="#151C19" x="62" y="30" width="18" height="60" rx="9"/>
+          <rect fill="#00C472" x="14" y="42" width="52" height="18" rx="9"/>
+          <circle fill="#00C472" cx="80" cy="20" r="11"/>
+        </svg>
+        <span class="brand-word">HEURION</span>
+      </a>
+      <div class="foot-right">
+        <span>© 2026 Heurion Research · Aegis OS</span>
+        <a href="https://heurion.org/aegis-os/" class="foot-link"><span data-zh>产品概览</span><span data-en>Overview</span></a>
+        <a id="foot-dash-link" href="dashboard" class="foot-link"><span data-zh>我的控制台</span><span data-en>My Console</span></a>
+        <a href="https://github.com/heurion-org/aegis-os" target="_blank" rel="noopener" class="foot-link">GitHub</a>
+      </div>
+    </div>
+  </div>
+</footer>
+
 <div id="prompt-bar" class="prompt-bar">
   <input id="prompt-input" type="text" placeholder="Send encrypted prompt or command...">
-  <button id="btn-send">Send</button>
+  <button id="btn-send"><span data-zh>发送</span><span data-en>Send</span></button>
   <button id="btn-sigint" class="danger">Stop</button>
 </div>
 
@@ -597,6 +812,40 @@ pub const MOBILE_APP_HTML_TEMPLATE: &str = r##"<!DOCTYPE html>
 <script>
 (function () {
   const API_BASE = location.pathname.replace(/\/app\/?$/, "");
+  let currentLang = localStorage.getItem("aegis_lang") || "zh";
+  function applyLang(lang) {
+    currentLang = lang === "en" ? "en" : "zh";
+    document.body.setAttribute("data-lang", currentLang);
+    document.documentElement.lang = currentLang === "en" ? "en" : "zh-CN";
+    const btn = document.getElementById("lang-toggle");
+    if (btn) btn.textContent = currentLang === "en" ? "中文" : "EN";
+    localStorage.setItem("aegis_lang", currentLang);
+  }
+  applyLang(currentLang);
+  const langToggleBtn = document.getElementById("lang-toggle");
+  if (langToggleBtn) {
+    langToggleBtn.onclick = () => applyLang(currentLang === "zh" ? "en" : "zh");
+  }
+  function updateDashboardNavLinks(apiKey) {
+    const suffix = apiKey ? "#key=" + encodeURIComponent(apiKey) : "";
+    for (const id of ["nav-dashboard", "nav-dashboard-mobile", "foot-dash-link"]) {
+      const el = document.getElementById(id);
+      if (el) el.href = (API_BASE || "") + "/dashboard" + suffix;
+    }
+  }
+  function setConnBadge(text, state) {
+    const el = document.getElementById("conn-badge");
+    if (!el) return;
+    el.textContent = text;
+    el.className = state === "ok"
+      ? "badge badge-ok"
+      : state === "warn"
+        ? "badge badge-warn"
+        : state === "err"
+          ? "badge badge-err"
+          : "badge";
+  }
+  updateDashboardNavLinks("");
   const QKEYS = { "ctrl-c": "\u0003", enter: "\n", tab: "\t", esc: "\u001b" };
   const DB_NAME = "aegis_e2ee_v1_db";
   const STORE = "state";
@@ -652,6 +901,21 @@ pub const MOBILE_APP_HTML_TEMPLATE: &str = r##"<!DOCTYPE html>
     });
   }
 
+  function updatePairedChrome() {
+    const ready = !!(localState.apiKey && localState.trustCert);
+    const bar = document.getElementById("paired-bar");
+    const setup = document.getElementById("setup-card");
+    const sum = document.getElementById("paired-summary");
+    if (ready) {
+      bar.classList.remove("hidden");
+      setup.classList.add("hidden");
+      if (sum) sum.textContent = `Paired · org=${localState.orgId || "default"} · ${localState.deviceId}`;
+    } else {
+      bar.classList.add("hidden");
+      setup.classList.remove("hidden");
+    }
+  }
+
   async function initIdentity() {
     db = await openDb();
     let kp = await dbGet("keyPair");
@@ -668,13 +932,41 @@ pub const MOBILE_APP_HTML_TEMPLATE: &str = r##"<!DOCTYPE html>
 
     document.getElementById("dev-meta").textContent =
       `${localState.deviceId} · FP ${localState.fingerprint}`;
+
+    const rawHash = (location.hash || "").replace(/^#/, "");
+    const hashParams = new URLSearchParams(rawHash);
+    const hashKey = (hashParams.get("key") || "").trim();
+    const hashPair = (hashParams.get("pair") || "").trim();
+    const hashSession = (hashParams.get("session") || "").trim();
+    if (hashKey || hashPair || hashSession) {
+      history.replaceState(null, "", location.pathname + location.search);
+    }
+
+    if (hashKey) {
+      localState.apiKey = hashKey;
+      await persistProfile();
+    }
     if (localState.apiKey) {
       document.getElementById("api-key").value = localState.apiKey;
-      await refreshSessions();
+      updateDashboardNavLinks(localState.apiKey);
     }
-    const hash = location.hash || "";
-    const m = hash.match(/pair=(aegis-pair:[^&]+)/);
-    if (m) document.getElementById("pair-code").value = decodeURIComponent(m[1]);
+    if (hashPair && hashPair.startsWith("aegis-pair:")) {
+      document.getElementById("pair-code").value = hashPair;
+      updatePairedChrome();
+      await claimPairing();
+    } else {
+      updatePairedChrome();
+    }
+
+    if (localState.apiKey) {
+      const sessions = await refreshSessions();
+      if (localState.trustCert && sessions.length > 0 && !activeWs) {
+        const target = (hashSession && sessions.find((s) => s.session_id === hashSession)) || (sessions.length === 1 ? sessions[0] : null);
+        if (target) {
+          await connectSession(target, "interact");
+        }
+      }
+    }
   }
 
   async function apiJson(method, path, body, useAuth = true) {
@@ -709,14 +1001,14 @@ pub const MOBILE_APP_HTML_TEMPLATE: &str = r##"<!DOCTYPE html>
     const listEl = document.getElementById("sessions-list");
     if (!localState.apiKey) {
       listEl.textContent = "Enter your Aegis Cloud API key above.";
-      return;
+      return [];
     }
     try {
       const data = await apiJson("GET", "/v1/sessions");
       const sessions = data.sessions || [];
       if (!sessions.length) {
         listEl.textContent = "No active shared sessions.";
-        return;
+        return [];
       }
       listEl.textContent = "";
       for (const s of sessions) {
@@ -724,6 +1016,7 @@ pub const MOBILE_APP_HTML_TEMPLATE: &str = r##"<!DOCTYPE html>
         row.className = "session-item";
         const info = document.createElement("div");
         const title = document.createElement("div");
+        title.className = "session-title";
         title.textContent = `${s.agent_kind} · ${s.project_name} (${s.host_name})`;
         const sub = document.createElement("div");
         sub.className = "muted";
@@ -747,8 +1040,10 @@ pub const MOBILE_APP_HTML_TEMPLATE: &str = r##"<!DOCTYPE html>
         row.appendChild(btns);
         listEl.appendChild(row);
       }
+      return sessions;
     } catch (err) {
       listEl.textContent = "Error: " + err.message;
+      return [];
     }
   }
 
@@ -791,6 +1086,7 @@ pub const MOBILE_APP_HTML_TEMPLATE: &str = r##"<!DOCTYPE html>
             localState.trustCert = me.trust_cert;
             await persistProfile();
             msg.textContent = "Paired & DeviceTrustCert cached!";
+            updatePairedChrome();
             break;
           }
           await new Promise((r) => setTimeout(r, 1000));
@@ -827,7 +1123,7 @@ pub const MOBILE_APP_HTML_TEMPLATE: &str = r##"<!DOCTYPE html>
     const proto = location.protocol === "https:" ? "wss:" : "ws:";
     const ws = new WebSocket(`${proto}//${location.host}${API_BASE}${tk.ws_path}`);
     activeWs = ws;
-    document.getElementById("conn-badge").textContent = "Handshaking...";
+    setConnBadge("Handshaking...", "warn");
 
     const hs = await AegisE2ee.initiateHandshake({
       clientKeyPair: localState.keyPair,
@@ -858,7 +1154,7 @@ pub const MOBILE_APP_HTML_TEMPLATE: &str = r##"<!DOCTYPE html>
           hostRawPub: AegisE2ee.b64Decode(hostPubB64),
           orgId,
         });
-        document.getElementById("conn-badge").textContent = "E2EE Active";
+        setConnBadge("E2EE Active", "ok");
         document.getElementById("prompt-bar").style.display = mode === "interact" ? "flex" : "none";
       } else if (env.envelope === "encrypted" && activeCipher) {
         const pt = await activeCipher.decryptFrame(env);
@@ -880,7 +1176,7 @@ pub const MOBILE_APP_HTML_TEMPLATE: &str = r##"<!DOCTYPE html>
       }
     };
     ws.onclose = () => {
-      document.getElementById("conn-badge").textContent = "Disconnected";
+      setConnBadge("Disconnected", "err");
       document.getElementById("prompt-bar").style.display = "none";
     };
   }
@@ -895,12 +1191,23 @@ pub const MOBILE_APP_HTML_TEMPLATE: &str = r##"<!DOCTYPE html>
     activeWs.send(JSON.stringify({ envelope: "encrypted", ...frame }));
   }
 
+  const toggleBtn = document.getElementById("btn-toggle-setup");
+  if (toggleBtn) {
+    toggleBtn.onclick = () => {
+      document.getElementById("setup-card").classList.toggle("hidden");
+    };
+  }
   document.getElementById("btn-save-key").onclick = async () => {
     localState.apiKey = document.getElementById("api-key").value.trim();
+    updateDashboardNavLinks(localState.apiKey);
     await persistProfile();
+    updatePairedChrome();
     await refreshSessions();
   };
-  document.getElementById("btn-pair").onclick = claimPairing;
+  document.getElementById("btn-pair").onclick = async () => {
+    await claimPairing();
+    if (localState.apiKey) await refreshSessions();
+  };
   document.getElementById("btn-refresh").onclick = refreshSessions;
   document.getElementById("btn-disconnect").onclick = () => {
     if (activeWs) activeWs.close();
@@ -911,6 +1218,12 @@ pub const MOBILE_APP_HTML_TEMPLATE: &str = r##"<!DOCTYPE html>
     if (!inp.value) return;
     await sendEncryptedInput(inp.value + "\n");
     inp.value = "";
+  };
+  document.getElementById("prompt-input").onkeydown = async (ev) => {
+    if (ev.key === "Enter" && !ev.shiftKey) {
+      ev.preventDefault();
+      document.getElementById("btn-send").click();
+    }
   };
   document.getElementById("btn-sigint").onclick = async () => {
     if (!activeWs || !activeCipher) return;

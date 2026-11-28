@@ -115,10 +115,20 @@ pub(super) async fn approvals_index(
         rows.push_str("<tr><td colspan=5>No approval tickets.</td></tr>");
     }
     Html(format!(
-        "<!doctype html><meta charset=utf-8><title>Aegis Approvals</title>\
-         <style>body{{font-family:system-ui;margin:2rem}}table{{border-collapse:collapse}}td,th{{border:1px solid #ccc;padding:.4rem;vertical-align:top}}button{{margin:.1rem}}</style>\
-         <h1>Aegis Approval Console</h1><p>Local launcher commit tickets.</p>\
-         <table><tr><th>Escalation</th><th>Status</th><th>Evidence</th><th>Paths</th><th>Actions</th></tr>{rows}</table>"
+        "<!doctype html><meta charset=utf-8><meta name=viewport content='width=device-width,initial-scale=1'><title>Aegis Approvals</title>\
+         <style>:root{{--bg:#FAF8F4;--card:#FDFCF9;--ink:#151C19;--muted:#4A534E;--line:#DFDAD0;--accent:#233E33;}}\
+         *{{box-sizing:border-box}}body{{margin:0;padding:2.25rem 1.5rem;background:var(--bg);color:var(--ink);font:15px/1.6 -apple-system,BlinkMacSystemFont,'Inter',sans-serif;}}\
+         .wrap{{max-width:960px;margin:0 auto}}.kicker{{font:11px/1.4 ui-monospace,SFMono-Regular,Menlo,monospace;letter-spacing:.14em;text-transform:uppercase;color:var(--muted)}}\
+         h1{{font:400 1.75rem/1.25 Georgia,serif;margin:0.35rem 0 0.35rem}}p{{color:var(--muted);margin:0 0 1.25rem}}\
+         table{{width:100%;border-collapse:collapse;background:var(--card);border:1px solid var(--line)}}\
+         th,td{{border:1px solid var(--line);padding:.55rem .7rem;text-align:left;vertical-align:top;font-size:.85rem}}\
+         th{{background:#EFECE4;font:600 11px/1.3 ui-monospace,SFMono-Regular,Menlo,monospace;letter-spacing:.08em;text-transform:uppercase;color:var(--muted)}}\
+         code{{font-family:ui-monospace,SFMono-Regular,Menlo,monospace;font-size:.78rem;background:#EFECE4;padding:2px 5px;border:1px solid var(--line)}}\
+         form{{display:inline-block;margin:0 .25rem .25rem 0}}\
+         button{{background:var(--accent);color:#F4F1EA;border:1px solid var(--accent);padding:.35rem .75rem;font-size:.8rem;cursor:pointer}}\
+         button:hover{{background:var(--ink);border-color:var(--ink)}}</style>\
+         <div class=wrap><div class=kicker>AEGIS OS · LOCAL POLICY KERNEL</div><h1>Aegis Approval Console</h1><p>Local launcher commit tickets.</p>\
+         <table><tr><th>Escalation</th><th>Status</th><th>Evidence</th><th>Paths</th><th>Actions</th></tr>{rows}</table></div>"
     ))
 }
 

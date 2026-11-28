@@ -660,14 +660,43 @@ pub(super) async fn get_mobile_app_page() -> Response {
     )
 }
 
-pub(super) async fn get_mobile_app_manifest() -> Response {
+pub(super) async fn get_mobile_app_manifest(headers: axum::http::HeaderMap) -> Response {
+    let referer = headers
+        .get(axum::http::header::REFERER)
+        .and_then(|v| v.to_str().ok())
+        .unwrap_or("");
+    let prefix = headers
+        .get("x-forwarded-prefix")
+        .and_then(|v| v.to_str().ok())
+        .map(|s| s.trim_end_matches('/').to_string())
+        .filter(|s| !s.is_empty())
+        .or_else(|| {
+            referer
+                .contains("/aegis-cloud/app")
+                .then(|| "/aegis-cloud".to_string())
+        });
+    let body = if let Some(pfx) = prefix {
+        serde_json::json!({
+            "name": "Aegis OS Remote Console",
+            "short_name": "Aegis OS",
+            "start_url": format!("{pfx}/app"),
+            "scope": format!("{pfx}/app"),
+            "display": "standalone",
+            "background_color": "#FAF8F4",
+            "theme_color": "#233E33",
+            "description": "Zero-Knowledge E2EE cross-device console for any AI Agent running on Aegis OS."
+        })
+        .to_string()
+    } else {
+        crate::relay::app_html::PWA_MANIFEST_JSON.to_string()
+    };
     (
         StatusCode::OK,
         [(
             header::CONTENT_TYPE,
             HeaderValue::from_static("application/manifest+json"),
         )],
-        crate::relay::app_html::PWA_MANIFEST_JSON,
+        body,
     )
         .into_response()
 }

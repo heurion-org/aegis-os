@@ -140,10 +140,21 @@ pub(super) async fn run_pty_command(
         .await
         {
             Ok(h) => {
+                let web_app_url = load_cloud_auth(&share_opts.runtime_dir)
+                    .map(|a| format!("{}/app", crate::cloud::client::api_base(&a.endpoint)));
                 eprintln!(
                     "  relay:   E2EE shared session ready (`aegis-os attach {}`)",
                     share_opts.session_id
                 );
+                if let Some(url) = web_app_url {
+                    let has_paired_client = crate::relay::device::load_local_device_store(&share_opts.runtime_dir)
+                        .is_some_and(|s| s.trusted_peers.iter().any(|p| !p.is_root && !p.revoked));
+                    if has_paired_client {
+                        eprintln!("  console: {url}");
+                    } else {
+                        eprintln!("  console: {url} (run `aegis-os devices pair` for a 1-click phone/browser QR link)");
+                    }
+                }
                 Some(h)
             }
             Err(err) if share_opts.share => {

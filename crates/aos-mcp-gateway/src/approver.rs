@@ -528,6 +528,7 @@ pub const APPROVE_PAGE_HTML: &str = r##"<!doctype html>
         <a href="https://heurion.org/aegis-os/" class="nav-link">Overview</a>
         <a href="https://heurion.org/aegis-os/tutorial/" class="nav-link">Tutorial</a>
         <a id="dash-link" href="dashboard" class="nav-link">Console &amp; Pricing</a>
+        <a id="app-link" href="app" class="nav-link">Remote (/app)</a>
         <a href="https://github.com/heurion-org/aegis-os" target="_blank" rel="noopener" class="nav-link">GitHub ↗</a>
       </nav>
       <div class="nav-right">
@@ -548,10 +549,10 @@ pub const APPROVE_PAGE_HTML: &str = r##"<!doctype html>
   <main class="approve-main">
     <div class="card" id="auth-box" style="display:none">
       <p class="label-caps">ACCOUNT SYNC</p>
-      <h2>Load Your Account by Email</h2>
-      <p>Enter your work or billing email to load pending boundary escalations for your organization:</p>
+      <h2>Load Your Account by Email or Org ID</h2>
+      <p>Enter your work/billing email or organization ID (e.g. <code>dev-test</code>) to load pending boundary escalations:</p>
       <div class="row">
-        <input type="email" id="lookup-email-input" placeholder="you@company.com" style="flex:1" onkeydown="if(event.key==='Enter')lookupByEmail()">
+        <input type="text" id="lookup-email-input" placeholder="you@company.com or org_id" style="flex:1" onkeydown="if(event.key==='Enter')lookupByEmail()">
         <button onclick="lookupByEmail()">Load Account</button>
       </div>
       <p id="lookup-msg"></p>
@@ -627,6 +628,10 @@ pub const APPROVE_PAGE_HTML: &str = r##"<!doctype html>
     sessionStorage.setItem('aegis_approve_key', authKey);
     history.replaceState(null, '', location.pathname + location.search);
   }
+  const appLinkEl = document.getElementById('app-link');
+  if (appLinkEl) {
+    appLinkEl.href = apiBase + '/app' + (authKey ? '#key=' + encodeURIComponent(authKey) : '');
+  }
 
   let requireTotp = false;
 
@@ -643,7 +648,8 @@ pub const APPROVE_PAGE_HTML: &str = r##"<!doctype html>
     msg.className = '';
     msg.textContent = 'Looking up organization…';
     try {
-      const res = await fetch(apiBase + '/v1/billing/status?email=' + encodeURIComponent(email), { headers: headers() });
+      const param = email.includes('@') ? 'email=' + encodeURIComponent(email) : 'org_id=' + encodeURIComponent(email);
+      const res = await fetch(apiBase + '/v1/billing/status?' + param, { headers: headers() });
       const data = await res.json();
       if (!res.ok) throw new Error(data.error || res.statusText);
       if (data.org_id) {

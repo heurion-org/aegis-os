@@ -411,13 +411,15 @@ pub async fn cmd_devices_pair(
 
     let (host_key, payload, pair_code) =
         pair_start_with_auth(runtime_dir, &auth, name_override, ttl_secs).await?;
+    let base_url = crate::cloud::client::api_base(&auth.endpoint);
+    let pair_url = format!("{}/app#pair={}&key={}", base_url, pair_code, auth.api_key);
 
     eprintln!(
         "Aegis Device Pairing ({} · host={})",
         auth.org_id, payload.host_device_id
     );
     eprintln!("  Host fingerprint: {}", payload.host_fp);
-    if let Ok(code) = QrCode::new(pair_code.as_bytes()) {
+    if let Ok(code) = QrCode::new(pair_url.as_bytes()) {
         let rendered = code
             .render::<unicode::Dense1x2>()
             .dark_color(unicode::Dense1x2::Light)
@@ -426,7 +428,8 @@ pub async fn cmd_devices_pair(
             .build();
         eprintln!("\n{}", rendered);
     }
-    eprintln!("On your laptop, run:\n  aegis-os devices join {}\n", pair_code);
+    eprintln!("Scan QR or open in phone/browser (auto-pairs with zero manual input):\n  {}\n", pair_url);
+    eprintln!("Or on another CLI:\n  aegis-os devices join {}\n", pair_code);
 
     if !wait {
         println!(
@@ -435,6 +438,7 @@ pub async fn cmd_devices_pair(
                 "status": "pairing_started",
                 "pair_id": payload.pair_id,
                 "pair_code": pair_code,
+                "pair_url": pair_url,
                 "host_device_id": payload.host_device_id,
                 "host_fingerprint": payload.host_fp,
             }))?

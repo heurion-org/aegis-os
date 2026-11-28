@@ -827,6 +827,19 @@ async fn test_mobile_app_routes_and_csp() {
         assert_eq!(man_resp.status(), 200);
         let man_json: Value = serde_json::from_str(&man_resp.into_string().unwrap()).unwrap();
         assert_eq!(man_json["start_url"], "/app");
+
+        let prefixed_man = agent
+            .get(&format!("http://{}/app/manifest.json", addr))
+            .set("Referer", "https://heurion.org/aegis-cloud/app")
+            .call()
+            .unwrap();
+        assert_eq!(prefixed_man.status(), 200);
+        let prefixed_json: Value =
+            serde_json::from_str(&prefixed_man.into_string().unwrap()).unwrap();
+        assert_eq!(prefixed_json["start_url"], "/aegis-cloud/app");
+        assert_eq!(prefixed_json["scope"], "/aegis-cloud/app");
+        assert_eq!(prefixed_json["background_color"], "#FAF8F4");
+        assert_eq!(prefixed_json["theme_color"], "#233E33");
         (status, csp, body)
     })
     .await
@@ -839,6 +852,10 @@ async fn test_mobile_app_routes_and_csp() {
         "CSP missing frame-ancestors 'none'"
     );
     assert!(body.contains("AegisE2ee"));
+    assert!(body.contains("HEURION"));
+    assert!(body.contains("lang-toggle"));
+    assert!(body.contains("paired-bar"));
+    assert!(body.contains("nav-dashboard"));
     assert!(body.contains("Timeline"));
     assert!(body.contains("Terminal"));
     assert!(body.contains("Diff"));

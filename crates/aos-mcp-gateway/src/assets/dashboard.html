@@ -100,6 +100,7 @@
     .nav-link { font-size: 0.875rem; letter-spacing: 0.02em; color: var(--ink-secondary); white-space: nowrap; flex-shrink: 0; }
     .nav-link:hover, .nav-link-active { color: var(--ink); font-weight: 500; }
     .nav-right { display: flex; align-items: center; gap: 0.75rem; white-space: nowrap; flex-shrink: 0; }
+    .nav-mobile-link { display: none; }
     .lang-switch {
       font-family: var(--font-mono);
       font-size: 0.72rem;
@@ -454,6 +455,10 @@
     @media (max-width: 980px) {
       .container, .nav-inner { padding-left: 1.25rem; padding-right: 1.25rem; }
       .nav-links { display: none; }
+      .nav-mobile-link {
+        display: inline-flex; align-items: center; font-family: var(--font-mono); font-size: 0.72rem;
+        padding: 0.28rem 0.6rem; border: 1px solid var(--hairline); color: var(--ink-secondary); background: var(--bg-paper);
+      }
       .console-top-grid, .grid-2, .kpi-strip { grid-template-columns: 1fr; }
       .kpi-cell { border-right: none; border-bottom: 1px solid var(--hairline); }
     }
@@ -484,13 +489,15 @@
         <a href="/aegis-os/#pricing" class="nav-link"><span data-zh>方案与购买</span><span data-en>Plans &amp; Buy</span></a>
         <a href="/aegis-os/tutorial/" class="nav-link"><span data-zh>使用教程</span><span data-en>Tutorial</span></a>
         <a href="/aegis-cloud/dashboard" class="nav-link nav-link-active"><span data-zh>我的控制台</span><span data-en>My Console</span></a>
+        <a id="nav-app-link" href="/aegis-cloud/app" class="nav-link"><span data-zh>远程终端 (/app)</span><span data-en>Remote (/app)</span></a>
         <a href="https://github.com/heurion-org/aegis-os" target="_blank" rel="noopener" class="nav-link">GitHub ↗</a>
       </nav>
 
       <div class="nav-right">
+        <a id="nav-app-mobile" href="/aegis-cloud/app" class="nav-mobile-link"><span data-zh>远程终端</span><span data-en>/app</span></a>
         <span id="conn-badge" class="badge"><span data-zh>未连接账户</span><span data-en>Not Connected</span></span>
         <button type="button" class="lang-switch" id="lang-toggle" onclick="toggleLang()">EN</button>
-        <a class="nav-cta" href="/aegis-os/#pricing"><span data-zh>购买 Pro ($29/月) →</span><span data-en>Buy Pro ($29/mo) →</span></a>
+        <a id="nav-cta-link" class="nav-cta" href="/aegis-os/#pricing"><span data-zh>购买 Pro ($29/月) →</span><span data-en>Buy Pro ($29/mo) →</span></a>
       </div>
     </div>
   </header>
@@ -515,13 +522,13 @@
           <div class="auth-bar-box">
             <div style="display:flex; justify-content:space-between; align-items:center; margin-bottom:0.4rem;">
               <span class="label-caps" style="margin:0;">
-                <span data-zh>账户同步：输入您的邮箱（查看审批请求与订阅配额）</span>
-                <span data-en>ACCOUNT: ENTER YOUR EMAIL (APPROVALS &amp; SUBSCRIPTION QUOTAS)</span>
+                <span data-zh>账户同步：输入邮箱或 Org ID（如 dev-test）</span>
+                <span data-en>ACCOUNT: ENTER EMAIL OR ORG ID (E.G. DEV-TEST)</span>
               </span>
               <span id="key-org-hint" style="font-family:var(--font-mono); font-size:0.72rem; color:var(--accent);"></span>
             </div>
             <div class="auth-bar-row">
-              <input id="lookup-email-input" type="email" class="input" style="flex:1; min-width:200px;" placeholder="you@company.com" autocomplete="email" onkeydown="if(event.key==='Enter')lookupBillingStatus()" />
+              <input id="lookup-email-input" type="text" class="input" style="flex:1; min-width:200px;" placeholder="you@company.com or org_id" autocomplete="email" onkeydown="if(event.key==='Enter')lookupBillingStatus()" />
               <button type="button" class="btn btn-primary" onclick="lookupBillingStatus()"><span data-zh>查询账户</span><span data-en>Load Account</span></button>
               <button type="button" class="btn btn-ghost" onclick="disconnectKey()"><span data-zh>清除</span><span data-en>Clear</span></button>
             </div>
@@ -845,6 +852,11 @@
     const apiBase = location.pathname.startsWith('/aegis-cloud') ? '/aegis-cloud' : '';
     const qs = new URLSearchParams(location.search);
     const hashParams = new URLSearchParams(location.hash.replace(/^#/, ''));
+    const k = hashParams.get('key') || sessionStorage.getItem('aegis_approve_key') || '';
+    for (const id of ['nav-app-link', 'nav-app-mobile']) {
+      const el = document.getElementById(id);
+      if (el) el.href = apiBase + '/app' + (k ? '#key=' + encodeURIComponent(k) : '');
+    }
 
     const ESC_PAGE_SIZE = 3;
     const LEASE_PAGE_SIZE = 5;
@@ -972,46 +984,112 @@
     }
 
     function updateSubscriptionAndQuotaUi(planTier, orgId, subscriptionActive, quotas) {
-      const isPro = String(planTier || '').toLowerCase() === 'pro';
-      const tierLabel = isPro ? 'Pro ($29/mo)' : 'Free ($0)';
+      const tier = String(planTier || 'community').toLowerCase();
+      const isEnterprise = tier === 'enterprise' || tier === 'ent';
+      const isTeam = tier === 'team';
+      const isPro = tier === 'pro';
+      const isPaid = isEnterprise || isTeam || isPro;
+
+      const tierLabel = isEnterprise
+        ? 'Enterprise ($499/mo)'
+        : isTeam
+          ? 'Team ($79/mo)'
+          : isPro
+            ? 'Pro ($29/mo)'
+            : 'Free ($0)';
 
       document.getElementById('kpi-plan').textContent = tierLabel;
       if (orgId) document.getElementById('kpi-org').textContent = 'Org: ' + orgId;
 
       const subBadge = document.getElementById('sub-status-badge');
       if (subBadge) {
-        subBadge.className = isPro ? 'badge badge-ok' : 'badge';
+        subBadge.className = isPaid ? 'badge badge-ok' : 'badge';
         subBadge.textContent = (currentLang === 'zh' ? '套餐状态：' : 'Plan: ') + tierLabel;
       }
 
       const subPill = document.getElementById('sub-tier-pill');
-      if (subPill) subPill.textContent = isPro ? 'PRO ($29/MO)' : 'FREE ($0/MO)';
+      if (subPill) {
+        subPill.textContent = isEnterprise
+          ? 'ENTERPRISE ($499/MO)'
+          : isTeam
+            ? 'TEAM ($79/MO)'
+            : isPro
+              ? 'PRO ($29/MO)'
+              : 'FREE ($0/MO)';
+      }
 
       const headingEl = document.getElementById('sub-card-heading');
       if (headingEl) {
-        headingEl.textContent = isPro
-          ? (currentLang === 'zh' ? '当前订阅：Pro 专业版 ($29 / 月)' : 'Current Plan: Pro Plan ($29 / month)')
-          : (currentLang === 'zh' ? '当前订阅：Free 免费版 ($0 / 月)' : 'Current Plan: Free Tier ($0 / month)');
+        headingEl.textContent = isEnterprise
+          ? (currentLang === 'zh' ? '当前订阅：Enterprise 企业版 ($499 / 月)' : 'Current Plan: Enterprise Plan ($499 / month)')
+          : isTeam
+            ? (currentLang === 'zh' ? '当前订阅：Team 团队版 ($79 / 月)' : 'Current Plan: Team Plan ($79 / month)')
+            : isPro
+              ? (currentLang === 'zh' ? '当前订阅：Pro 专业版 ($29 / 月)' : 'Current Plan: Pro Plan ($29 / month)')
+              : (currentLang === 'zh' ? '当前订阅：Free 免费版 ($0 / 月)' : 'Current Plan: Free Tier ($0 / month)');
+      }
+
+      const ctaEl = document.getElementById('nav-cta-link');
+      if (ctaEl) {
+        if (isPaid) {
+          const curKey = sessionStorage.getItem('aegis_approve_key') || '';
+          ctaEl.href = apiBase + '/app' + (curKey ? '#key=' + encodeURIComponent(curKey) : '');
+          ctaEl.innerHTML = '<span data-zh>远程终端 (/app) →</span><span data-en>Remote (/app) →</span>';
+        } else {
+          ctaEl.href = '/aegis-os/#pricing';
+          ctaEl.innerHTML = '<span data-zh>购买 Pro ($29/月) →</span><span data-en>Buy Pro ($29/mo) →</span>';
+        }
       }
 
       document.getElementById('sub-org-val').textContent = orgId || '—';
-      document.getElementById('sub-active-val').textContent = isPro || subscriptionActive ? 'Active (Pro)' : 'Free Tier';
-      document.getElementById('sub-ws-limit').textContent = isPro ? '16 Workspaces' : '1 Workspace';
-      document.getElementById('sub-agent-limit').textContent = isPro ? '8 Agents' : '1 Agent';
-      document.getElementById('sub-syscall-limit').textContent = isPro ? '20,000 / day' : '200 / day';
-      document.getElementById('sub-compute-limit').textContent = isPro ? '36,000s (10 hrs / day)' : '600s (10 min / day)';
+      document.getElementById('sub-active-val').textContent = isEnterprise
+        ? 'Active (Enterprise)'
+        : isTeam
+          ? 'Active (Team)'
+          : (isPro || subscriptionActive ? 'Active (Pro)' : 'Free Tier');
+      document.getElementById('sub-ws-limit').textContent = isEnterprise
+        ? '256 Workspaces'
+        : isTeam
+          ? '64 Workspaces'
+          : isPro
+            ? '16 Workspaces'
+            : '1 Workspace';
+      document.getElementById('sub-agent-limit').textContent = isEnterprise
+        ? '256 Agents'
+        : isTeam
+          ? '32 Agents'
+          : isPro
+            ? '8 Agents'
+            : '1 Agent';
+      document.getElementById('sub-syscall-limit').textContent = isEnterprise
+        ? 'Unlimited'
+        : isTeam
+          ? '100,000 / day'
+          : isPro
+            ? '20,000 / day'
+            : '200 / day';
+      document.getElementById('sub-compute-limit').textContent = isEnterprise
+        ? 'Unlimited'
+        : isTeam
+          ? '180,000s (50 hrs / day)'
+          : isPro
+            ? '36,000s (10 hrs / day)'
+            : '600s (10 min / day)';
 
       const q = quotas || {};
       const usedSys = q.daily_syscalls_used ?? 0;
-      const limSys = q.daily_syscalls_limit ?? (isPro ? 20000 : 200);
+      const defaultSys = isTeam ? 100000 : isPro ? 20000 : 200;
+      const limSys = q.daily_syscalls_limit ?? defaultSys;
       const sysPct = Math.min(100, Math.round((usedSys / Math.max(1, limSys)) * 100));
 
       const usedSec = Math.round((q.daily_exec_ms_used ?? 0) / 1000);
-      const limSec = Math.round((q.daily_exec_ms_limit ?? (isPro ? 36000000 : 600000)) / 1000);
+      const defaultExecMs = isTeam ? 180000000 : isPro ? 36000000 : 600000;
+      const limSec = Math.round((q.daily_exec_ms_limit ?? defaultExecMs) / 1000);
       const compPct = Math.min(100, Math.round((usedSec / Math.max(1, limSec)) * 100));
 
       const actAgents = q.active_agents_count ?? 0;
-      const maxAgents = q.max_concurrent_agents ?? (isPro ? 8 : 1);
+      const defaultAgents = isEnterprise ? 256 : isTeam ? 32 : isPro ? 8 : 1;
+      const maxAgents = q.max_concurrent_agents ?? defaultAgents;
       const agPct = Math.min(100, Math.round((actAgents / Math.max(1, maxAgents)) * 100));
 
       document.getElementById('kpi-syscalls').textContent = usedSys + ' / ' + limSys;
@@ -1029,12 +1107,12 @@
     }
 
     async function lookupBillingStatus() {
-      const email = (document.getElementById('lookup-email-input').value || document.getElementById('pro-email-input').value || '').trim();
+      const ident = (document.getElementById('lookup-email-input').value || document.getElementById('pro-email-input').value || '').trim();
       const msgEl = document.getElementById('lookup-status-msg');
-      if (!email && !currentOrgId) {
+      if (!ident && !currentOrgId) {
         msgEl.style.display = 'block';
         msgEl.style.color = 'var(--danger)';
-        msgEl.textContent = currentLang === 'zh' ? '请输入购买邮箱进行查询。' : 'Please enter your billing email to lookup.';
+        msgEl.textContent = currentLang === 'zh' ? '请输入购买邮箱或 Org ID 进行查询。' : 'Please enter your billing email or org_id to lookup.';
         return;
       }
 
@@ -1044,14 +1122,18 @@
 
       try {
         const params = new URLSearchParams();
-        if (email) params.set('email', email);
-        if (currentOrgId) params.set('org_id', currentOrgId);
+        if (ident) {
+          if (ident.includes('@')) params.set('email', ident);
+          else params.set('org_id', ident);
+        } else if (currentOrgId) {
+          params.set('org_id', currentOrgId);
+        }
         const res = await fetch(apiBase + '/v1/billing/status?' + params.toString(), { headers: authHeaders() });
         const data = await res.json();
         if (!res.ok) throw new Error(data.error || res.statusText);
 
         currentOrgId = data.org_id || currentOrgId;
-        if (email) localStorage.setItem('aegis_user_email', email);
+        if (ident && ident.includes('@')) localStorage.setItem('aegis_user_email', ident);
         if (currentOrgId) sessionStorage.setItem('aegis_org_id', currentOrgId);
         updateSubscriptionAndQuotaUi(data.plan_tier, data.org_id, data.subscription_active, data.quotas);
 
