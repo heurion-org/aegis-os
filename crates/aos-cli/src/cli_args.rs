@@ -115,6 +115,78 @@ pub(crate) enum ApprovalAction {
 }
 
 #[derive(Subcommand)]
+pub(crate) enum DeviceAction {
+    /// Generate a QR pairing code on this Workstation for a laptop or mobile device
+    Pair {
+        /// Friendly name for this Workstation
+        #[arg(long)]
+        name: Option<String>,
+        /// Pairing code validity window in seconds
+        #[arg(long, default_value_t = 300)]
+        ttl_secs: i64,
+        /// Print pairing code and exit immediately without waiting for claim/approval
+        #[arg(long, default_value_t = false)]
+        no_wait: bool,
+    },
+    /// Join an existing trust ring using a pairing code (`aegis-pair:...`)
+    Join {
+        /// Pairing code printed by `aegis-os devices pair`
+        pair_code: String,
+        /// Friendly name for this device (e.g. `macbook-pro`)
+        #[arg(long)]
+        name: Option<String>,
+    },
+    /// List locally pinned and cloud-registered devices
+    List {
+        /// Machine-readable JSON output
+        #[arg(long, default_value_t = false)]
+        json: bool,
+    },
+    /// Revoke a paired device immediately (cuts active relay connections)
+    Revoke {
+        /// Device ID to revoke (e.g. `dev_...`)
+        device_id: String,
+    },
+}
+
+#[derive(Subcommand)]
+pub(crate) enum HandoffAction {
+    /// Package, encrypt client-side, and upload an offline E2EE handoff snapshot for a workspace
+    Push {
+        /// Optional Session ID (defaults to a fresh handoff session ID)
+        session_id: Option<String>,
+        /// Optional summary note included in `.aegis/HANDOFF.md`
+        #[arg(short = 'm', long)]
+        note: Option<String>,
+        /// Pin this handoff so TTL garbage collection preserves it
+        #[arg(long, default_value_t = false)]
+        pin: bool,
+    },
+    /// Download and decrypt an offline E2EE handoff bundle (`--apply` restores files in an isolated branch)
+    Pull {
+        /// Session ID or Handoff ID
+        session_id: String,
+        /// Restore files and `.aegis/HANDOFF.md` into target workspace (creates `aegis/handoff-*` git branch)
+        #[arg(long, default_value_t = false)]
+        apply: bool,
+        /// Target workspace directory (defaults to `--workspace`)
+        #[arg(long)]
+        dir: Option<PathBuf>,
+    },
+    /// List encrypted offline handoff bundles and storage quota usage
+    List {
+        /// Machine-readable JSON output
+        #[arg(long, default_value_t = false)]
+        json: bool,
+    },
+    /// Delete an encrypted handoff bundle and reclaim orphaned chunks
+    Rm {
+        /// Handoff ID (`hnd_...`)
+        handoff_id: String,
+    },
+}
+
+#[derive(Subcommand)]
 pub(crate) enum Commands {
     /// [One-Step Global Setup] Automatically configure AGY, Claude Code, and Codex CLI globally
     Install {
@@ -204,6 +276,18 @@ pub(crate) enum Commands {
         /// MCP Gateway tool exposure profile (`minimal`, `collab`, `standard`)
         #[arg(long)]
         tool_profile: Option<String>,
+        /// Require E2EE cross-device relay sharing for this session (fails if not logged in)
+        #[arg(long, default_value_t = false)]
+        share: bool,
+        /// Keep this session strictly local (do not announce to E2EE cloud relay)
+        #[arg(long, default_value_t = false)]
+        local_only: bool,
+        /// Start the agent in the background and detach immediately (`aegis-os attach <id>` to connect)
+        #[arg(long, default_value_t = false)]
+        detach: bool,
+        /// Internal flag used by `--detach` child process
+        #[arg(long, hide = true, default_value_t = false)]
+        internal_detached_host: bool,
         /// Agent command and arguments, after `--`
         #[arg(trailing_var_arg = true, allow_hyphen_values = true, required = true)]
         cmd: Vec<String>,
@@ -542,6 +626,34 @@ pub(crate) enum Commands {
     Ipc {
         #[command(subcommand)]
         action: IpcAction,
+    },
+
+    /// Manage paired devices in your E2EE cross-device trust ring (`pair`, `join`, `list`, `revoke`)
+    Devices {
+        #[command(subcommand)]
+        action: DeviceAction,
+    },
+
+    /// List live local and shared cloud Agent sessions across your devices
+    Sessions {
+        /// Machine-readable JSON output
+        #[arg(long, default_value_t = false)]
+        json: bool,
+    },
+
+    /// Attach interactively (or read-only with `--observe`) to a live local or E2EE remote session
+    Attach {
+        /// Session ID (e.g. `ses_...`)
+        session_id: String,
+        /// Attach in read-only observe mode (blocks PTY input, resize, and signals)
+        #[arg(long, default_value_t = false)]
+        observe: bool,
+    },
+
+    /// Encrypt, deduplicate, and restore offline session handoff bundles (`push`, `pull`, `list`, `rm`)
+    Handoff {
+        #[command(subcommand)]
+        action: HandoffAction,
     },
 
     /// Manage Aegis Cloud Sandbox bindings (`up`/`down`), source-only sync (`push`/`pull`), and Scale-to-Zero

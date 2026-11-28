@@ -25,7 +25,7 @@ use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader};
 
 
 mod args;
-mod client;
+pub(crate) mod client;
 mod stdio_bridge;
 
 use args::*;

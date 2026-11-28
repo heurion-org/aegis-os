@@ -26,6 +26,7 @@ mod mcp_guard;
 mod memory_cli;
 mod memory_ui;
 mod mission_control;
+mod relay;
 mod routing;
 mod session_broker;
 mod telemetry;
@@ -574,6 +575,10 @@ async fn main() -> anyhow::Result<()> {
             vcpus,
             mem_mb,
             tool_profile,
+            share,
+            local_only,
+            detach,
+            internal_detached_host,
             cmd,
         } => {
             if isolated && no_enforce {
@@ -612,6 +617,10 @@ async fn main() -> anyhow::Result<()> {
                 vcpus,
                 mem_mb,
                 tool_profile,
+                share,
+                local_only,
+                detach,
+                internal_detached_host,
             };
             let code = launcher::run_with_options(
                 &workspace,
@@ -848,6 +857,25 @@ async fn main() -> anyhow::Result<()> {
                 auto_agent_client,
             )
             .await?;
+        }
+
+        Commands::Devices { action } => {
+            relay::handle_devices_command(action, &cli.runtime_dir, &identity).await?;
+        }
+
+        Commands::Sessions { json } => {
+            relay::client::cmd_sessions(&cli.runtime_dir, json).await?;
+        }
+
+        Commands::Attach {
+            session_id,
+            observe,
+        } => {
+            relay::client::cmd_attach(&cli.runtime_dir, &session_id, observe).await?;
+        }
+
+        Commands::Handoff { action } => {
+            relay::handle_handoff_command(action, &cli.runtime_dir, &workspace, &identity).await?;
         }
 
         Commands::Cloud { action } => {

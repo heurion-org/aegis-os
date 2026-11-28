@@ -44,6 +44,7 @@ pub mod mcp_mcpb;
 pub mod mcp_oauth;
 pub mod mcp_registry;
 pub mod paas;
+pub mod relay;
 mod git;
 mod github;
 mod host_exec;
@@ -156,6 +157,7 @@ pub struct AegisRuntimeKernel {
     pub egress: Arc<AegisEgressGateway>,
     pub recorder: Arc<dyn FlightRecorder>,
     pub paas: Arc<PaasControlPlane>,
+    pub relay: Arc<relay::RelayState>,
     pub mcp_firewall: Arc<McpFirewallRegistry>,
     pub mcp_proxy_pool: Arc<McpProxySessionPool>,
     pub mcp_oauth: Arc<McpOAuthManager>,
@@ -207,6 +209,7 @@ impl AegisRuntimeKernel {
         let audit_path = root.join("audit").join("flight_recorder.jsonl");
         let recorder = Arc::new(AegisFlightRecorder::new(Some(audit_path)));
         let paas = Arc::new(PaasControlPlane::new(&root));
+        let relay = Arc::new(relay::RelayState::new(root.join("paas_data")));
         let mcp_firewall = Arc::new(McpFirewallRegistry::new(
             &root,
             policy.clone(),
@@ -229,6 +232,7 @@ impl AegisRuntimeKernel {
             egress: Arc::new(AegisEgressGateway::new()),
             recorder,
             paas,
+            relay,
             mcp_firewall,
             mcp_proxy_pool,
             mcp_oauth,
@@ -2171,6 +2175,7 @@ impl AegisRuntimeKernel {
                     json!({ "uri": "aegis://a2a/tasks", "name": "Google A2A Stateful Tasks" }),
                     json!({ "uri": "aegis://org/shared/catalog", "name": "Organization CAS Artifact Catalog" }),
                     json!({ "uri": "aegis://mcp/installed", "name": "Installed External MCP Servers & Auth Status" }),
+                    json!({ "uri": "aegis://session/handoff", "name": "Cross-Device Session Handoff Context (.aegis/HANDOFF.md)" }),
                 ];
                 json!({
                     "jsonrpc": "2.0",
@@ -2234,6 +2239,37 @@ impl AegisRuntimeKernel {
                             Some(&identity.agent_id),
                         )
                         .await
+                    }
+                    "aegis://session/handoff" | "agentos://session/handoff" => {
+                        let mut found = None;
+                        if let Ok(env) = self.get_agent_environment(identity).await {
+                            for root in [
+                                env.workspace.shadow_root().to_path_buf(),
+                                env.workspace.host_source_root().to_path_buf(),
+                            ] {
+                                let p = root.join(".aegis").join("HANDOFF.md");
+                                if let Ok(meta) = tokio::fs::symlink_metadata(&p).await {
+                                    if !meta.file_type().is_symlink() && meta.len() <= 1024 * 1024 {
+                                        if let Ok(md) = tokio::fs::read_to_string(&p).await {
+                                            found = Some(md);
+                                            break;
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                        match found {
+                            Some(md) => json!({
+                                "present": true,
+                                "path": ".aegis/HANDOFF.md",
+                                "markdown": md,
+                            }),
+                            None => json!({
+                                "present": false,
+                                "path": ".aegis/HANDOFF.md",
+                                "markdown": "",
+                            }),
+                        }
                     }
                     _ => json!({ "error": "Unknown resource URI" }),
                 };

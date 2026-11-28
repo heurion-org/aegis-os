@@ -21,21 +21,21 @@ pub struct CloudWorkspaceBinding {
 }
 
 #[derive(Debug, Default, Clone, Serialize, Deserialize)]
-pub(super) struct CloudBindingsStore {
+pub(crate) struct CloudBindingsStore {
     #[serde(default)]
-    pub(super) auth: Option<CloudAuthConfig>,
+    pub(crate) auth: Option<CloudAuthConfig>,
     #[serde(default)]
-    pub(super) bindings: Vec<CloudWorkspaceBinding>,
+    pub(crate) bindings: Vec<CloudWorkspaceBinding>,
     /// One-time token from the last `cloud subscribe` checkout; needed by `--claim`.
     #[serde(default)]
-    pub(super) pending_claim_token: Option<String>,
+    pub(crate) pending_claim_token: Option<String>,
 }
 
 pub(super) fn store_path(runtime_dir: &Path) -> PathBuf {
     runtime_dir.join("cloud_bindings.json")
 }
 
-pub(super) fn load_store(runtime_dir: &Path) -> CloudBindingsStore {
+pub(crate) fn load_store(runtime_dir: &Path) -> CloudBindingsStore {
     let p = store_path(runtime_dir);
     std::fs::read(&p)
         .ok()
@@ -43,7 +43,68 @@ pub(super) fn load_store(runtime_dir: &Path) -> CloudBindingsStore {
         .unwrap_or_default()
 }
 
-pub(super) fn save_store(runtime_dir: &Path, store: &CloudBindingsStore) -> anyhow::Result<()> {
+pub(crate) fn load_cloud_auth(runtime_dir: &Path) -> Option<CloudAuthConfig> {
+    if let (Ok(ep), Ok(key)) = (
+        std::env::var("AOS_CLOUD_ENDPOINT"),
+        std::env::var("AOS_API_KEY"),
+    ) {
+        let ep = ep.trim().trim_end_matches('/').to_string();
+        let key = key.trim().to_string();
+        if !ep.is_empty() && !key.is_empty() {
+            let org_id = std::env::var("AOS_ORG_ID")
+                .ok()
+                .map(|s| s.trim().to_string())
+                .filter(|s| !s.is_empty())
+                .unwrap_or_else(|| "default-org".to_string());
+            return Some(CloudAuthConfig {
+                endpoint: ep,
+                api_key: key,
+                org_id,
+                updated_at_ms: Utc::now().timestamp_millis(),
+            });
+        }
+    }
+    load_store(runtime_dir)
+        .auth
+        .filter(|a| !a.endpoint.trim().is_empty() && !a.api_key.trim().is_empty())
+}
+
+pub(crate) fn cloud_ws_url(endpoint: &str, ws_path: &str) -> anyhow::Result<String> {
+    let base = api_base(endpoint);
+    let ws_base = if let Some(rest) = base.strip_prefix("https://") {
+        format!("wss://{}", rest)
+    } else if let Some(rest) = base.strip_prefix("http://") {
+        format!("ws://{}", rest)
+    } else {
+        anyhow::bail!("Unsupported cloud endpoint scheme '{}'", endpoint);
+    };
+    let path = if ws_path.starts_with('/') {
+        ws_path.to_string()
+    } else {
+        format!("/{}", ws_path)
+    };
+    Ok(format!("{}{}", ws_base.trim_end_matches('/'), path))
+}
+
+pub(crate) async fn cloud_http_json_checked(
+    method: &str,
+    endpoint: &str,
+    path: &str,
+    api_key: Option<&str>,
+    extra_headers: &[(&str, &str)],
+    body: Option<&Value>,
+) -> anyhow::Result<Value> {
+    let val = cloud_http_json(method, endpoint, path, api_key, extra_headers, body).await?;
+    if let Some(err) = val.get("error").and_then(|v| v.as_str()) {
+        if let Some(code) = val.get("code").and_then(|v| v.as_str()) {
+            anyhow::bail!("{}: {}", code, err);
+        }
+        anyhow::bail!("{}", err);
+    }
+    Ok(val)
+}
+
+pub(crate) fn save_store(runtime_dir: &Path, store: &CloudBindingsStore) -> anyhow::Result<()> {
     let p = store_path(runtime_dir);
     aos_core::session::write_json_pretty_atomic_sync(&p, store)
 }

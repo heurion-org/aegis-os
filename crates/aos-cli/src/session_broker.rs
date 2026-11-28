@@ -277,6 +277,14 @@ impl SessionBroker {
 
         let kernel = Arc::new(AegisRuntimeKernel::new(runtime_dir).await?);
 
+        #[cfg(not(test))]
+        crate::relay::host::spawn_mcp_session_registration(
+            runtime_dir.to_path_buf(),
+            session.session_id.clone(),
+            identity.agent_id.clone(),
+            PathBuf::from(&session.workspace),
+        );
+
         // Attach the launcher's existing CoW shadow to the kernel so MCP tools and native tools
         // operate on the same workspace. Creating a second shadow here would silently fork state.
         let ws = Arc::new(

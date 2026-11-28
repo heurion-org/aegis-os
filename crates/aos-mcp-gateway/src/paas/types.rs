@@ -94,6 +94,60 @@ impl PlanTier {
         }
     }
 
+    pub fn max_paired_devices(&self) -> usize {
+        match self {
+            Self::Community => 1,
+            Self::Pro => 5,
+            Self::Team => 25,
+            Self::Enterprise => usize::MAX,
+        }
+    }
+
+    pub fn max_shared_sessions(&self) -> usize {
+        match self {
+            Self::Community => 0,
+            Self::Pro => 8,
+            Self::Team => 32,
+            Self::Enterprise => 256,
+        }
+    }
+
+    pub fn max_handoff_total_bytes(&self) -> u64 {
+        match self {
+            Self::Community => 0,
+            Self::Pro => 5 * 1024 * 1024 * 1024,
+            Self::Team => 25 * 1024 * 1024 * 1024,
+            Self::Enterprise => 200 * 1024 * 1024 * 1024,
+        }
+    }
+
+    pub fn max_handoff_core_bytes(&self) -> u64 {
+        match self {
+            Self::Community => 0,
+            Self::Pro => 32 * 1024 * 1024,
+            Self::Team => 64 * 1024 * 1024,
+            Self::Enterprise => 128 * 1024 * 1024,
+        }
+    }
+
+    pub fn max_handoff_bundle_bytes(&self) -> u64 {
+        match self {
+            Self::Community => 0,
+            Self::Pro => 512 * 1024 * 1024,
+            Self::Team => 1024 * 1024 * 1024,
+            Self::Enterprise => 4 * 1024 * 1024 * 1024,
+        }
+    }
+
+    pub fn handoff_ttl_secs(&self) -> i64 {
+        match self {
+            Self::Community => 0,
+            Self::Pro => 14 * 86_400,
+            Self::Team => 30 * 86_400,
+            Self::Enterprise => 90 * 86_400,
+        }
+    }
+
     pub fn as_str(&self) -> &'static str {
         match self {
             Self::Community => "community",

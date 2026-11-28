@@ -26,6 +26,8 @@ pub(crate) fn is_public_route(method: &str, target: &str) -> bool {
     let path = route_path(target);
     let get_public = path == "/"
         || path == "/approve"
+        || path == "/app"
+        || path.starts_with("/app/")
         || [
             "/dashboard",
             "/ui",
@@ -48,11 +50,13 @@ pub(crate) fn is_public_route(method: &str, target: &str) -> bool {
     ]
     .iter()
     .any(|p| path.starts_with(p));
+    let relay_ws = method == "GET" && path == "/v1/relay/ws";
+    let pair_claim = method == "POST" && path == "/v1/devices/pair/claim";
     // Exact path check for zero-PII friction submissions so `/v1/telemetry/friction/stats` stays operator-only.
     let friction_post = method == "POST" && path == "/v1/telemetry/friction";
     // Key signup: the route itself only lets anonymous callers mint an org's *first* key.
     let signup = method == "POST" && path.starts_with("/v1/tenants/keys");
-    (method == "GET" && get_public) || any_public || friction_post || signup
+    (method == "GET" && get_public) || any_public || relay_ws || pair_claim || friction_post || signup
 }
 
 /// Routes no tenant key may use: simulating approvals, resetting approvers, fleet-wide GC, and
@@ -126,6 +130,7 @@ fn attach_security_headers(mut resp: Response) -> Response {
         .get(header::CONTENT_TYPE)
         .and_then(|v| v.to_str().ok())
         .is_some_and(|ct| ct.starts_with("text/html"));
+    let is_switching = resp.status() == StatusCode::SWITCHING_PROTOCOLS;
     let hdrs = resp.headers_mut();
     hdrs.insert(
         header::X_CONTENT_TYPE_OPTIONS,
@@ -137,12 +142,14 @@ fn attach_security_headers(mut resp: Response) -> Response {
         HeaderValue::from_static("no-referrer"),
     );
     hdrs.insert(header::CACHE_CONTROL, HeaderValue::from_static("no-store"));
-    hdrs.insert(header::CONNECTION, HeaderValue::from_static("close"));
+    if !is_switching {
+        hdrs.insert(header::CONNECTION, HeaderValue::from_static("close"));
+    }
     if is_html {
         hdrs.insert(
             header::CONTENT_SECURITY_POLICY,
             HeaderValue::from_static(
-                "default-src 'none'; script-src 'unsafe-inline'; style-src 'unsafe-inline' https://fonts.googleapis.com; font-src https://fonts.gstatic.com; img-src 'self' data:; connect-src 'self'; base-uri 'none'; form-action 'self'; frame-ancestors 'none'; object-src 'none'",
+                "default-src 'none'; script-src 'unsafe-inline'; style-src 'unsafe-inline' https://fonts.googleapis.com; font-src https://fonts.gstatic.com; img-src 'self' data:; connect-src 'self' wss: ws:; manifest-src 'self'; base-uri 'none'; form-action 'self'; frame-ancestors 'none'; object-src 'none'",
             ),
         );
     }
@@ -193,6 +200,17 @@ pub(super) async fn guard_and_auth_middleware(
             }
             Some(_) => {}
         }
+    }
+
+    // Preserve Hyper's OnUpgrade extension for WebSocket handshakes (`/v1/relay/ws`) by skipping
+    // body buffering; the handler validates its single-use `?ticket=...` query credential itself.
+    if parts.method == axum::http::Method::GET && route_path(parts.uri.path()) == "/v1/relay/ws" {
+        let rebuilt = Request::from_parts(parts, body);
+        let resp = next.run(rebuilt).await;
+        if resp.status() == StatusCode::SWITCHING_PROTOCOLS {
+            return resp;
+        }
+        return attach_security_headers(resp);
     }
 
     let body_bytes = match tokio::time::timeout(

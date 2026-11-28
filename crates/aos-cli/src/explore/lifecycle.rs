@@ -341,6 +341,7 @@ pub(super) async fn resume_exploration_path(
         vcpus: record.spec.vcpus,
         mem_mb: record.spec.mem_mb,
         tool_profile: None,
+        ..Default::default()
     };
     let code = launcher::run_with_options(
         &record.spec.host_source_root,

@@ -36,7 +36,9 @@ ed25519-dalek = "2"
 tokio-rustls = "0.26"
 rustls-pemfile = "2"
 rusqlite = { version = "0.32", features = ["bundled"] }
-axum = "0.7"
+axum = { version = "0.7", features = ["ws"] }
+tokio-tungstenite = { version = "0.24", features = ["rustls-tls-webpki-roots"] }
+futures-util = "0.3"
 rand = "0.8"
 ureq = { version = "2", features = ["json"] }
 hex = "0.4"

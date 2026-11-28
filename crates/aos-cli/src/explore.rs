@@ -511,6 +511,7 @@ pub(crate) async fn execute_explore_run(
         vcpus: req.vcpus,
         mem_mb: req.mem_mb,
         tool_profile: None,
+        ..Default::default()
     };
     let (mut dlp_cfg, pricing_overrides) =
         launcher::resolve_session_dlp_settings(&project, &egress_opts)?;

@@ -38,7 +38,7 @@ use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
 use std::fs::File;
 use std::io::{self, IsTerminal, Write};
-use std::os::fd::{AsRawFd, FromRawFd};
+use std::os::fd::AsRawFd;
 use std::os::unix::process::CommandExt;
 use std::path::{Path, PathBuf};
 use std::process::{ExitStatus, Stdio};
@@ -52,7 +52,8 @@ mod artifacts;
 mod credentials;
 mod egress;
 mod lifecycle;
-mod pty;
+pub(crate) mod pty;
+pub(crate) mod pty_hub;
 mod session_ops;
 mod staging;
 pub(crate) use approvals::{approval_decide, approval_show, approvals_list, approvals_serve};
@@ -227,6 +228,10 @@ pub(crate) struct RunEgressOptions {
     pub vcpus: u32,
     pub mem_mb: u64,
     pub tool_profile: Option<String>,
+    pub share: bool,
+    pub local_only: bool,
+    pub detach: bool,
+    pub internal_detached_host: bool,
 }
 
 /// Seeds a fresh session's `dst_cow_base` zero-copy from an existing CoW workspace base
@@ -964,6 +969,9 @@ pub(crate) async fn run_with_options(
     command: &[String],
     egress_opts: &RunEgressOptions,
 ) -> anyhow::Result<i32> {
+    if egress_opts.detach && !egress_opts.internal_detached_host {
+        return spawn_detached_run_host(runtime_dir).await;
+    }
     let host_home = host_home()?;
     run_inner(
         workspace,
@@ -977,6 +985,101 @@ pub(crate) async fn run_with_options(
         egress_opts,
     )
     .await
+}
+
+async fn spawn_detached_run_host(runtime_dir: &Path) -> anyhow::Result<i32> {
+    let exe = std::env::current_exe().context("locating current aegis-os executable")?;
+    let sessions_dir = runtime_dir.join("sessions");
+    let before: std::collections::HashSet<String> = std::fs::read_dir(&sessions_dir)
+        .ok()
+        .into_iter()
+        .flatten()
+        .flatten()
+        .filter_map(|e| e.file_name().into_string().ok())
+        .collect();
+
+    let mut child_args: Vec<std::ffi::OsString> = Vec::new();
+    let mut inserted_internal = false;
+    let mut after_double_dash = false;
+    for arg in std::env::args_os().skip(1) {
+        if !after_double_dash && arg == "--" {
+            if !inserted_internal {
+                child_args.push("--internal-detached-host".into());
+                inserted_internal = true;
+            }
+            after_double_dash = true;
+            child_args.push(arg);
+            continue;
+        }
+        if !after_double_dash && arg == "--detach" {
+            continue;
+        }
+        if !after_double_dash && !inserted_internal && arg == "run" {
+            child_args.push(arg);
+            child_args.push("--internal-detached-host".into());
+            inserted_internal = true;
+            continue;
+        }
+        child_args.push(arg);
+    }
+
+    let logs_dir = runtime_dir.join("logs");
+    std::fs::create_dir_all(&logs_dir)?;
+    let log_path = logs_dir.join(format!("detached-{}.log", chrono::Utc::now().timestamp_millis()));
+    let stdout_file = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(&log_path)?;
+    let stderr_file = stdout_file.try_clone()?;
+
+    let mut cmd = std::process::Command::new(exe);
+    cmd.args(&child_args)
+        .stdin(Stdio::null())
+        .stdout(Stdio::from(stdout_file))
+        .stderr(Stdio::from(stderr_file));
+    unsafe {
+        cmd.pre_exec(|| {
+            if libc::setsid() == -1 {
+                return Err(std::io::Error::last_os_error());
+            }
+            Ok(())
+        });
+    }
+    let _child = cmd.spawn().context("spawning detached background session")?;
+
+    let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(5);
+    let mut found_sid: Option<String> = None;
+    while tokio::time::Instant::now() < deadline {
+        if let Ok(entries) = std::fs::read_dir(&sessions_dir) {
+            for entry in entries.flatten() {
+                let name = entry.file_name().to_string_lossy().to_string();
+                if before.contains(&name) {
+                    continue;
+                }
+                let sjson = entry.path().join("session.json");
+                let sock = entry.path().join("pty.sock");
+                if sjson.exists() && sock.exists() {
+                    found_sid = Some(name);
+                    break;
+                }
+            }
+        }
+        if found_sid.is_some() {
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+    }
+
+    println!(
+        "{}",
+        serde_json::to_string_pretty(&json!({
+            "status": "detached",
+            "session_id": found_sid,
+            "log_file": log_path.display().to_string(),
+            "attach_cmd": found_sid.as_deref().map(|s| format!("aegis-os attach {}", s)),
+        }))?
+    );
+    Ok(0)
 }
 
 
@@ -1304,8 +1407,7 @@ pub(super) async fn run_inner(
             host_home,
             &dlp_cfg,
             &pricing_overrides,
-            egress_opts.seed_from_cow_base.as_deref(),
-            egress_opts.tool_profile.as_deref(),
+            egress_opts,
         )
         .await;
     }
@@ -1710,13 +1812,24 @@ pub(super) async fn run_inner(
 
     // Real terminals get a PTY so TUI clients keep raw mode, mouse input and window resizing.
     // Pipes / CI keep the inherited-stdio path to avoid injecting terminal control sequences.
-    if std::io::stdin().is_terminal() && std::io::stdout().is_terminal() {
+    if egress_opts.internal_detached_host
+        || (std::io::stdin().is_terminal() && std::io::stdout().is_terminal())
+    {
         let mut args = plan.linux_args();
         // `run_pty_command` allocates a dedicated PTY pair (`openpty`) and calls `setsid()` +
         // `TIOCSCTTY` on the child's slave fd, which already isolates the host terminal from
         // `TIOCSTI`. Stripping `--new-session` prevents `bwrap` from calling `setsid()` a second
         // time and detaching `/dev/tty` inside the sandbox.
         args.retain(|a| a != "--new-session");
+        let share_opts = PtyShareOptions {
+            runtime_dir: runtime_dir.to_path_buf(),
+            session_id: session_id.clone(),
+            project_name: host_name.clone(),
+            agent_kind: identity.agent_id.clone(),
+            share: egress_opts.share,
+            local_only: egress_opts.local_only,
+            headless_detached: egress_opts.internal_detached_host,
+        };
         return run_pty_command(
             &plan.bwrap.to_string_lossy(),
             &args,
@@ -1729,6 +1842,7 @@ pub(super) async fn run_inner(
             &project,
             &shadow,
             exit_telemetry.as_ref(),
+            &share_opts,
         )
         .await;
     }
@@ -2257,9 +2371,10 @@ pub(super) async fn run_macos_inner(
     host_home: &Path,
     dlp_cfg: &DlpGatewayConfig,
     pricing_overrides: &std::collections::HashMap<String, ModelRate>,
-    seed_from_cow_base: Option<&Path>,
-    tool_profile: Option<&str>,
+    egress_opts: &RunEgressOptions,
 ) -> anyhow::Result<i32> {
+    let seed_from_cow_base = egress_opts.seed_from_cow_base.as_deref();
+    let tool_profile = egress_opts.tool_profile.as_deref();
     let harvested_secrets = harvest_host_secrets(host_home, command);
     let session_id = format!("ses_{}", &uuid::Uuid::new_v4().simple().to_string()[..12]);
     let session_dir = runtime_dir.join("sessions").join(&session_id);
@@ -2670,7 +2785,23 @@ pub(super) async fn run_macos_inner(
 
     let mut args = vec!["-p".to_string(), seatbelt];
     args.extend(exec_command);
-    if std::io::stdin().is_terminal() && std::io::stdout().is_terminal() {
+    if egress_opts.internal_detached_host
+        || (std::io::stdin().is_terminal() && std::io::stdout().is_terminal())
+    {
+        let project_name = project
+            .file_name()
+            .and_then(|s| s.to_str())
+            .unwrap_or("workspace")
+            .to_string();
+        let share_opts = PtyShareOptions {
+            runtime_dir: runtime_dir.to_path_buf(),
+            session_id: session_id.clone(),
+            project_name,
+            agent_kind: identity.agent_id.clone(),
+            share: egress_opts.share,
+            local_only: egress_opts.local_only,
+            headless_detached: egress_opts.internal_detached_host,
+        };
         run_pty_command(
             "/usr/bin/sandbox-exec",
             &args,
@@ -2683,6 +2814,7 @@ pub(super) async fn run_macos_inner(
             project,
             &shadow,
             Some(&exit_telemetry),
+            &share_opts,
         )
         .await
     } else {

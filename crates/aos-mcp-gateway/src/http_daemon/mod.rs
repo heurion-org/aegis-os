@@ -3,13 +3,14 @@ use axum::extract::{DefaultBodyLimit, Extension, Path as AxumPath, State};
 use axum::http::{header, HeaderValue, StatusCode};
 use axum::middleware;
 use axum::response::{IntoResponse, Response};
-use axum::routing::{any, delete, get, post};
+use axum::routing::{any, delete, get, post, put};
 use axum::Router;
 
 mod approvals;
 mod auth;
 mod billing;
 mod mcp;
+mod relay;
 mod status;
 mod workspaces;
 
@@ -76,6 +77,8 @@ pub(super) fn build_router(state: DaemonState) -> Router {
     Router::new()
         // Static / status / discovery / telemetry
         .route("/", get(status::dashboard))
+        .route("/app", get(relay::get_mobile_app_page))
+        .route("/app/manifest.json", get(relay::get_mobile_app_manifest))
         .route("/dashboard", get(status::dashboard))
         .route("/dashboard/*rest", get(status::dashboard))
         .route("/ui", get(status::dashboard))
@@ -123,6 +126,39 @@ pub(super) fn build_router(state: DaemonState) -> Router {
         .route("/v1/workspaces/sync-up", post(workspaces::post_sync_up))
         .route("/v1/workspaces/diff", any(workspaces::workspaces_diff))
         .route("/v1/workspaces/pr", post(workspaces::post_pr))
+        // Devices, sessions & zero-knowledge E2EE WebSocket relay
+        .route("/v1/devices/register", post(relay::post_device_register))
+        .route("/v1/devices/pair/start", post(relay::post_pair_start))
+        .route("/v1/devices/pair/claim", post(relay::post_pair_claim))
+        .route("/v1/devices/pair/approve", post(relay::post_pair_approve))
+        .route("/v1/devices/pair/:pair_id", get(relay::get_pair_status))
+        .route("/v1/devices", get(relay::get_devices))
+        .route("/v1/devices/:id", delete(relay::delete_device))
+        .route(
+            "/v1/sessions",
+            post(relay::post_sessions).get(relay::get_sessions),
+        )
+        .route(
+            "/v1/sessions/:id/heartbeat",
+            post(relay::post_session_heartbeat),
+        )
+        .route("/v1/sessions/:id", delete(relay::delete_session))
+        .route("/v1/relay/tickets", post(relay::post_relay_tickets))
+        .route("/v1/relay/ws", get(relay::get_relay_ws))
+        .route(
+            "/v1/sessions/:id/handoff/chunks/check",
+            post(relay::post_handoff_chunks_check),
+        )
+        .route(
+            "/v1/sessions/:id/handoff/chunks/:sha256",
+            put(relay::put_handoff_chunk).get(relay::get_handoff_chunk),
+        )
+        .route(
+            "/v1/sessions/:id/handoff",
+            post(relay::post_handoff_commit).get(relay::get_handoff_manifest),
+        )
+        .route("/v1/handoffs", get(relay::get_handoffs_list))
+        .route("/v1/handoffs/:handoff_id", delete(relay::delete_handoff))
         // Approvers, escalations, leases
         .route(
             "/approver/enroll",
@@ -193,7 +229,7 @@ impl AegisRuntimeKernel {
         let listener = tokio::net::TcpListener::bind(bind_addr).await?;
         let local_addr = listener.local_addr()?;
 
-        // Background Scale-to-Zero Idle Workspace Hibernation Daemon (scans every 60s)
+        // Background Scale-to-Zero Idle Workspace & Expired Handoff GC Daemon (scans every 60s)
         let k_gc = self.clone();
         tokio::spawn(async move {
             let mut ticker = tokio::time::interval(std::time::Duration::from_secs(60));
@@ -201,6 +237,7 @@ impl AegisRuntimeKernel {
             loop {
                 ticker.tick().await;
                 let _ = k_gc.paas.hibernate_idle_workspaces(&k_gc, None).await;
+                let _ = k_gc.relay.handoff.gc_expired(Utc::now().timestamp_millis()).await;
             }
         });
 

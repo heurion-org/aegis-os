@@ -1,4 +1,19 @@
 use super::*;
+use super::pty_hub::{DetachEscapeFilter, PtyHub};
+use crate::cloud::client::load_cloud_auth;
+use crate::relay::host::RelayHostHandle;
+use aos_mcp_gateway::relay::SessionMode;
+
+#[derive(Debug, Clone)]
+pub(super) struct PtyShareOptions {
+    pub runtime_dir: PathBuf,
+    pub session_id: String,
+    pub project_name: String,
+    pub agent_kind: String,
+    pub share: bool,
+    pub local_only: bool,
+    pub headless_detached: bool,
+}
 
 #[cfg_attr(not(target_os = "macos"), allow(dead_code))]
 #[allow(clippy::too_many_arguments)]
@@ -51,13 +66,13 @@ pub(super) async fn run_plain_command(
     Ok(effective)
 }
 
-pub(super) struct RawTerminalGuard {
-    pub(super) fd: libc::c_int,
-    pub(super) orig: Option<libc::termios>,
+pub(crate) struct RawTerminalGuard {
+    pub(crate) fd: libc::c_int,
+    pub(crate) orig: Option<libc::termios>,
 }
 
 impl RawTerminalGuard {
-    pub(super) fn enter(fd: libc::c_int) -> Self {
+    pub(crate) fn enter(fd: libc::c_int) -> Self {
         let mut orig: libc::termios = unsafe { std::mem::zeroed() };
         if unsafe { libc::tcgetattr(fd, &mut orig) } != 0 {
             return Self { fd, orig: None };
@@ -97,182 +112,164 @@ pub(super) async fn run_pty_command(
     host_project: &Path,
     shadow: &Path,
     telemetry: Option<&ExitTelemetryContext>,
+    share_opts: &PtyShareOptions,
 ) -> anyhow::Result<i32> {
-    let mut master: libc::c_int = -1;
-    let mut slave: libc::c_int = -1;
-    #[cfg(target_os = "macos")]
-    let mut winsize = terminal_size();
-    #[cfg(not(target_os = "macos"))]
     let winsize = terminal_size();
-    if unsafe {
-        libc::openpty(
-            &mut master,
-            &mut slave,
-            std::ptr::null_mut(),
-            std::ptr::null_mut(),
-            #[cfg(target_os = "macos")]
-            &mut winsize,
-            #[cfg(not(target_os = "macos"))]
-            &winsize,
+    let (hub, mut wait_handle) = PtyHub::spawn(
+        program,
+        args,
+        cwd,
+        envs,
+        winsize,
+        Some(session_dir),
+    )?;
+
+    let relay_handle: Option<RelayHostHandle> = if share_opts.local_only {
+        None
+    } else if let Some(auth) = load_cloud_auth(&share_opts.runtime_dir) {
+        match RelayHostHandle::start(
+            &share_opts.runtime_dir,
+            auth,
+            hub.clone(),
+            share_opts.session_id.clone(),
+            share_opts.agent_kind.clone(),
+            share_opts.project_name.clone(),
+            None,
+            SessionMode::Pty,
         )
-    } != 0
-    {
-        return Err(std::io::Error::last_os_error()).context("allocating a PTY");
-    }
-    set_fd_cloexec(master);
-    set_fd_cloexec(slave);
-
-    // Seed the slave PTY with the caller's initial termios before switching the host terminal
-    // into raw passthrough mode (`cfmakeraw`), so arrow keys, Esc, and terminal capability
-    // replies are forwarded byte-by-byte to the sandbox PTY without local canonical buffering or
-    // echo on the host tty.
-    let mut term: libc::termios = unsafe { std::mem::zeroed() };
-    if unsafe { libc::tcgetattr(libc::STDIN_FILENO, &mut term) } == 0 {
-        let _ = unsafe { libc::tcsetattr(slave, libc::TCSANOW, &term) };
-    }
-    let raw_guard = RawTerminalGuard::enter(libc::STDIN_FILENO);
-
-    let master_file = unsafe { File::from_raw_fd(master) };
-    let slave_file = unsafe { File::from_raw_fd(slave) };
-    let stdin = slave_file.try_clone()?;
-    let stdout = slave_file.try_clone()?;
-    let stderr = slave_file.try_clone()?;
-
-    let mut cmd = std::process::Command::new(program);
-    cmd.args(args)
-        .current_dir(cwd)
-        .env_clear()
-        .stdin(Stdio::from(stdin))
-        .stdout(Stdio::from(stdout))
-        .stderr(Stdio::from(stderr));
-    for (key, value) in envs {
-        cmd.env(key, value);
-    }
-    unsafe {
-        cmd.pre_exec(|| {
-            if libc::setsid() == -1 {
-                return Err(std::io::Error::last_os_error());
+        .await
+        {
+            Ok(h) => {
+                eprintln!(
+                    "  relay:   E2EE shared session ready (`aegis-os attach {}`)",
+                    share_opts.session_id
+                );
+                Some(h)
             }
-            if libc::ioctl(0, libc::TIOCSCTTY as libc::c_ulong, 0) == -1 {
-                return Err(std::io::Error::last_os_error());
+            Err(err) if share_opts.share => {
+                hub.shutdown();
+                return Err(err).context("starting E2EE cloud relay for --share");
             }
-            for sig in [
-                libc::SIGCHLD,
-                libc::SIGHUP,
-                libc::SIGINT,
-                libc::SIGQUIT,
-                libc::SIGTERM,
-                libc::SIGALRM,
-            ] {
-                libc::signal(sig, libc::SIG_DFL);
+            Err(err) => {
+                eprintln!("  relay:   disabled ({})", err);
+                None
             }
-            Ok(())
+        }
+    } else if share_opts.share {
+        hub.shutdown();
+        anyhow::bail!(
+            "aos run --share requires cloud login (`aegis-os cloud login` or `aegis-os cloud subscribe`)"
+        );
+    } else {
+        None
+    };
+
+    let mut local_attached = !share_opts.headless_detached;
+    let mut raw_guard = if local_attached {
+        Some(RawTerminalGuard::enter(libc::STDIN_FILENO))
+    } else {
+        None
+    };
+
+    let mut out_rx = hub.subscribe_output();
+    let (in_tx, mut in_rx) = tokio::sync::mpsc::channel::<Vec<u8>>(128);
+    let (detach_tx, mut detach_rx) = tokio::sync::oneshot::channel::<()>();
+
+    if local_attached {
+        std::thread::spawn(move || {
+            use std::io::Read;
+            let mut input = std::io::stdin();
+            let mut buf = [0u8; 1024];
+            let mut filter = DetachEscapeFilter::new();
+            loop {
+                match input.read(&mut buf) {
+                    Ok(0) => break,
+                    Ok(n) => {
+                        let (forward, detached) = filter.feed(&buf[..n]);
+                        if !forward.is_empty() && in_tx.blocking_send(forward).is_err() {
+                            break;
+                        }
+                        if detached {
+                            let _ = detach_tx.send(());
+                            break;
+                        }
+                    }
+                    Err(err) if err.kind() == std::io::ErrorKind::Interrupted => continue,
+                    Err(_) => break,
+                }
+            }
         });
+    } else {
+        drop(detach_tx);
     }
-    let mut child = cmd.spawn().context("spawning bwrap under a PTY")?;
-    drop(slave_file);
 
-    let mut reader = master_file.try_clone()?;
-    let mut writer = master_file.try_clone()?;
-    std::thread::spawn(move || {
-        use std::io::{Read, Write};
-        let mut buf = [0u8; 8192];
-        let mut out = std::io::stdout();
-        loop {
-            match reader.read(&mut buf) {
-                Ok(0) => break,
-                Ok(n) => {
-                    if out.write_all(&buf[..n]).is_err() {
-                        break;
-                    }
-                    let _ = out.flush();
-                }
-                Err(err) if err.kind() == std::io::ErrorKind::Interrupted => continue,
-                Err(_) => break,
-            }
-        }
-    });
-    std::thread::spawn(move || {
-        use std::io::{Read, Write};
-        let mut buf = [0u8; 1024];
-        let mut input = std::io::stdin();
-        loop {
-            match input.read(&mut buf) {
-                Ok(0) => break,
-                Ok(n) => {
-                    if writer.write_all(&buf[..n]).is_err() {
-                        break;
-                    }
-                    let _ = writer.flush();
-                }
-                Err(err) if err.kind() == std::io::ErrorKind::Interrupted => continue,
-                Err(_) => break,
-            }
-        }
-    });
-
-    let pid = child.id();
-    let mut wait = tokio::task::spawn_blocking(move || child.wait());
     let mut first_interrupt = true;
     let mut sigwinch =
         tokio::signal::unix::signal(tokio::signal::unix::SignalKind::window_change())?;
     let mut sigterm = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())?;
+    let mut stdout = std::io::stdout();
 
-    loop {
+    let status = loop {
         tokio::select! {
-            status = &mut wait => {
-                let status = status??;
-                drop(raw_guard);
-                let code = exit_code(status);
-                sync_credentials(agent_home, host_home, orig_command);
-                let pending = print_exit_summary(session_dir, host_project, shadow, telemetry).await;
-                let effective = if code == 0 && pending > 0 { 10 } else { code };
-                update_session_state(session_dir, "exited", Some(effective));
-                return Ok(effective);
+            res = &mut wait_handle => {
+                break res??;
+            }
+            _ = &mut detach_rx, if local_attached => {
+                local_attached = false;
+                drop(raw_guard.take());
+                eprintln!(
+                    "\r\n[Aegis local terminal detached; session '{}' continues running — reattach with `aegis-os attach {}`]",
+                    share_opts.session_id, share_opts.session_id
+                );
+            }
+            chunk = out_rx.recv(), if local_attached => {
+                match chunk {
+                    Ok(bytes) => {
+                        use std::io::Write;
+                        if stdout.write_all(&bytes).is_err() {
+                            local_attached = false;
+                            drop(raw_guard.take());
+                        }
+                        let _ = stdout.flush();
+                    }
+                    Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => continue,
+                    Err(tokio::sync::broadcast::error::RecvError::Closed) => {
+                        local_attached = false;
+                    }
+                }
+            }
+            Some(bytes) = in_rx.recv(), if local_attached => {
+                let _ = hub.send_input(bytes).await;
             }
             signal = tokio::signal::ctrl_c() => {
                 if signal.is_err() {
-                    let status = wait.await??;
-                    drop(raw_guard);
-                    let code = exit_code(status);
-                    sync_credentials(agent_home, host_home, orig_command);
-                    let pending = print_exit_summary(session_dir, host_project, shadow, telemetry).await;
-                    let effective = if code == 0 && pending > 0 { 10 } else { code };
-                    update_session_state(session_dir, "exited", Some(effective));
-                    return Ok(effective);
+                    break wait_handle.await??;
                 }
-                if pid > 0 {
-                    let sig = if first_interrupt { libc::SIGINT } else { libc::SIGKILL };
-                    first_interrupt = false;
-                    unsafe {
-                        libc::kill(pid as libc::pid_t, sig);
-                    }
-                }
+                let sig = if first_interrupt { libc::SIGINT } else { libc::SIGKILL };
+                first_interrupt = false;
+                hub.signal_sync(sig);
             }
-            _ = sigwinch.recv() => {
-                let ws = terminal_size();
-                let _ = unsafe {
-                    libc::ioctl(
-                        master_file.as_raw_fd(),
-                        libc::TIOCSWINSZ as libc::c_ulong,
-                        &ws,
-                    )
-                };
-                if pid > 0 {
-                    unsafe {
-                        libc::kill(pid as libc::pid_t, libc::SIGWINCH);
-                    }
-                }
+            _ = sigwinch.recv(), if local_attached => {
+                hub.resize_sync(terminal_size());
             }
             _ = sigterm.recv() => {
-                if pid > 0 {
-                    unsafe {
-                        libc::kill(pid as libc::pid_t, libc::SIGTERM);
-                    }
-                }
+                hub.signal_sync(libc::SIGTERM);
             }
         }
+    };
+
+    drop(raw_guard.take());
+    if let Some(rh) = relay_handle {
+        rh.shutdown().await;
     }
+    hub.shutdown();
+
+    let code = exit_code(status);
+    sync_credentials(agent_home, host_home, orig_command);
+    let pending = print_exit_summary(session_dir, host_project, shadow, telemetry).await;
+    let effective = if code == 0 && pending > 0 { 10 } else { code };
+    update_session_state(session_dir, "exited", Some(effective));
+    Ok(effective)
 }
 
 pub(super) fn exit_code(status: ExitStatus) -> i32 {
